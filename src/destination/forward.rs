@@ -59,11 +59,11 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         || args.detach
         || args.restricted_grant.is_some()
         || args.no_tcp
-        || args.tcp_plain
+        || args.no_tcp_encryption
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --tcp-plain, --peer-auth, or --coordinate-at");
+        bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
     if args.owner || args.group || args.devices || args.inplace {
         bail!("return authorization does not accept ownership, special-file preservation, or --inplace");

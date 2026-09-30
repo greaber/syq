@@ -12,6 +12,7 @@ mod local;
 pub(crate) mod map;
 mod metadata_copy;
 pub(crate) mod metadata_fields;
+pub(crate) mod outage;
 mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;
@@ -229,7 +230,7 @@ impl Options {
             "rsh",
             "syq_path",
             "no_bootstrap",
-            "tcp_plain",
+            "no_tcp_encryption",
             "no_tcp",
             "tcp_ports",
             "tcp_congestion",

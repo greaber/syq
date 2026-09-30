@@ -105,7 +105,7 @@ In addition to the shared arguments above, it accepts:
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
 | `syq_path` | Remote executable path |
-| `no_bootstrap`, `tcp_plain`, `no_tcp` | Boolean remote/transport controls |
+| `no_bootstrap`, `no_tcp_encryption`, `no_tcp` | Boolean remote/transport controls |
 | `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
 | `receiver_max_entries`, `receiver_max_bytes` | Receiver ceilings: integer entries, native size string or integer bytes |
 | `receiver_receipt` | `"sizes"` or `"hashes"` |
@@ -150,7 +150,7 @@ source basename, so they require an exact destination path.
 returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
-`syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `tcp_plain`,
+`syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `no_tcp_encryption`,
 `tcp_ports`, `tcp_congestion`, `auth_from` (S3), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,

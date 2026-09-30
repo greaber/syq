@@ -103,6 +103,40 @@ impl Hasher {
     }
 }
 
+/// Plain HTTP carries only TCP's weak checksum and no authentication. Uploads
+/// over it send Content-MD5 from the start: the destination checks it, and the
+/// request signature covers it, so the bytes cannot be changed in transit.
+pub(super) fn plain_http(endpoint: Option<&str>) -> bool {
+    // The local test servers speak plain HTTP; this lets them exercise the
+    // HTTPS behavior too.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    endpoint
+        .and_then(|s| url::Url::parse(s).ok())
+        .is_some_and(|url| url.scheme() == "http")
+}
+
+/// The destination received bytes that differ from the request's checksum.
+/// A resend usually succeeds; the caller warns so repeated corruption shows.
+pub(super) fn corrupted<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> Option<&str> {
+    error
+        .as_service_error()
+        .and_then(|e| e.code())
+        .filter(|code| {
+            matches!(
+                *code,
+                "BadDigest" | "XAmzContentChecksumMismatch" | "XAmzContentSHA256Mismatch"
+            )
+        })
+}
+
 /// Some buckets, such as AWS buckets with an Object Lock default retention
 /// period, reject uploads without Content-MD5 or a checksum. Any other cause of
 /// the same error recurs on the Content-MD5 retry and is reported then.
@@ -160,6 +194,21 @@ mod tests {
         assert!(Algorithm::None.hasher().is_none());
         assert_eq!(Algorithm::Md5.header(Algorithm::Sha256, Some("x")), None);
         assert_eq!(serde_json::to_value(Algorithm::None).unwrap(), "none");
+    }
+    #[test]
+    fn only_plain_http_endpoints_send_content_md5_from_the_start() {
+        if std::env::var_os("SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS").is_some() {
+            return;
+        }
+        for (endpoint, plain) in [
+            (None, false),
+            (Some("https://storage.example"), false),
+            (Some("http://127.0.0.1:9000"), true),
+            (Some("HTTP://storage.example"), true),
+            (Some("not a url"), false),
+        ] {
+            assert_eq!(plain_http(endpoint), plain, "{endpoint:?}");
+        }
     }
     #[test]
     fn r2_uses_content_md5_including_jurisdiction_endpoints() {

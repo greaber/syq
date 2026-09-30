@@ -1817,3 +1817,52 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
         }
     }
 }
+
+/// Pushing to a host that already heads the completion cache leaves the file
+/// untouched. A damaged cache is replaced instead of blocking later updates.
+#[test]
+fn completion_cache_skips_repeated_hosts_and_replaces_damaged_files() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let ssh = fake_ssh(&t);
+    write(&t.path("source"), b"data");
+    let cache = t.path("cache/syq/completion-endpoints.json");
+    let push = |destination: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--no-progress",
+                "--no-tcp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+            ])
+            .arg(t.path("source"))
+            .args(["--to", "fake.example", "--as"])
+            .arg(t.path(destination))
+            .env("HOME", t.path("home"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+    };
+
+    push("first");
+    let written = fs::metadata(&cache).unwrap().ino();
+    push("second");
+    assert_eq!(fs::metadata(&cache).unwrap().ino(), written);
+
+    write(&cache, b"{");
+    push("third");
+    let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
+    assert_output_ok(&listed);
+    assert_eq!(listed.stdout, b"fake.example\n");
+}

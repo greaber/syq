@@ -1056,7 +1056,7 @@ pub struct RemoteDiagnostics {
 pub enum DataTransport {
     Ssh,
     EncryptedTcp,
-    PlaintextTcp,
+    UnencryptedTcp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1164,7 +1164,7 @@ impl RemoteSpec {
             Some(info) if !info.failed && (info.key.is_some() || info.reverse.is_some()) => {
                 DataTransport::EncryptedTcp
             }
-            Some(info) if !info.failed => DataTransport::PlaintextTcp,
+            Some(info) if !info.failed => DataTransport::UnencryptedTcp,
             _ => DataTransport::Ssh,
         }
     }
@@ -1596,7 +1596,9 @@ impl RemoteSpec {
         }
         let mut cmd = if self.local_process {
             let mut command = Command::new(std::env::current_exe()?);
-            command.args(&server_args);
+            // The same executable receives, so this internal flag is always
+            // understood; it keeps the data listener on loopback.
+            command.args(&server_args).arg("--local-receiver");
             command
         } else {
             if self

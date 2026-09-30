@@ -1051,8 +1051,8 @@ fn run_remote(
     if args.no_tcp {
         remote.push("--no-tcp".into());
     }
-    if args.tcp_plain {
-        remote.push("--tcp-plain".into());
+    if args.no_tcp_encryption {
+        remote.push("--no-tcp-encryption".into());
     }
     if let Some(algorithm) = &args.tcp_congestion {
         remote.push(format!("--tcp-congestion={algorithm}"));

@@ -117,6 +117,9 @@ struct ServeSession {
     handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     ssh_worker_ticket: Option<std::result::Result<String, String>>,
     allow_tcp: bool,
+    /// A local copy's receiver: listen for data on loopback only and
+    /// advertise no interface addresses.
+    loopback_only: bool,
     named_socket: Option<std::os::unix::net::UnixStream>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
@@ -168,7 +171,8 @@ impl Drop for ConnectionPermit {
     }
 }
 
-pub fn run() -> Result<()> {
+/// `local_receiver` marks the child process that receives a local copy.
+pub fn run(local_receiver: bool) -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
         io::stdin(),
@@ -181,6 +185,7 @@ pub fn run() -> Result<()> {
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: true,
+            loopback_only: local_receiver,
             named_socket: None,
             authority: None,
             descriptor_session: descriptor_session.clone(),
@@ -210,6 +215,7 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
             handshake_pending: None,
             ssh_worker_ticket: Some(ticket),
             allow_tcp: true,
+            loopback_only: false,
             named_socket: None,
             authority: Some(Arc::clone(&authority)),
             descriptor_session: descriptor_session.clone(),
@@ -238,6 +244,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
+            loopback_only: false,
             named_socket: None,
             authority: Some(authority.clone()),
             descriptor_session: descriptor_session.clone(),
@@ -277,6 +284,7 @@ pub(crate) fn run_named(
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
+            loopback_only: false,
             named_socket: Some(socket),
             authority: Some(Arc::clone(&authority)),
             descriptor_session: descriptor_session.clone(),
@@ -314,6 +322,7 @@ pub(crate) fn run_named_tcp(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
+            loopback_only: false,
             named_socket: Some(channel),
             authority: Some(authority),
             descriptor_session: descriptor_session.clone(),
@@ -349,6 +358,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         handshake_pending,
         ssh_worker_ticket,
         allow_tcp,
+        loopback_only,
         named_socket,
         authority,
         descriptor_session,
@@ -707,6 +717,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     token,
                     port_lo,
                     port_hi,
+                    loopback_only,
                     debug,
                     w.compress,
                     congestion_control.as_deref(),
@@ -716,7 +727,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     Ok((port, families, congestion_control)) => {
                         w.write_msg(&Response::TcpListening {
                             port,
-                            addrs: local_addrs(families),
+                            // The local client connects to loopback directly.
+                            addrs: if loopback_only {
+                                Vec::new()
+                            } else {
+                                local_addrs(families)
+                            },
                             congestion_control,
                         })?
                     }
@@ -1006,7 +1022,11 @@ fn serve<R: Read + Send + 'static, W: Write>(
 /// platform default. A port where either family is already taken is skipped
 /// so the two listeners always share one port number; a family the host cannot
 /// bind at all (no IPv6, say) is simply left out.
-pub(crate) fn bind_data_listeners(lo: u16, hi: u16) -> Result<(u16, Vec<TcpListener>)> {
+pub(crate) fn bind_data_listeners(
+    lo: u16,
+    hi: u16,
+    loopback_only: bool,
+) -> Result<(u16, Vec<TcpListener>)> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let mut last_error = None;
     // Port 0 asks the kernel for an ephemeral port: the first family's bind
@@ -1021,7 +1041,13 @@ pub(crate) fn bind_data_listeners(lo: u16, hi: u16) -> Result<(u16, Vec<TcpListe
         let mut port = requested;
         let mut listeners: Vec<TcpListener> = Vec::new();
         let mut in_use = false;
-        for domain in [Domain::IPV4, Domain::IPV6] {
+        // A local copy's client connects to 127.0.0.1 only.
+        let domains: &[Domain] = if loopback_only {
+            &[Domain::IPV4]
+        } else {
+            &[Domain::IPV4, Domain::IPV6]
+        };
+        for &domain in domains {
             let bound = (|| -> std::io::Result<TcpListener> {
                 let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
                 // As std's TcpListener::bind does: a port with lingering
@@ -1029,7 +1055,12 @@ pub(crate) fn bind_data_listeners(lo: u16, hi: u16) -> Result<(u16, Vec<TcpListe
                 #[cfg(unix)]
                 socket.set_reuse_address(true)?;
                 let address: SocketAddr = if domain == Domain::IPV4 {
-                    (Ipv4Addr::UNSPECIFIED, port).into()
+                    let ip = if loopback_only {
+                        Ipv4Addr::LOCALHOST
+                    } else {
+                        Ipv4Addr::UNSPECIFIED
+                    };
+                    (ip, port).into()
                 } else {
                     socket.set_only_v6(true)?;
                     (Ipv6Addr::UNSPECIFIED, port).into()
@@ -1069,13 +1100,14 @@ fn tcp_listen(
     token: Vec<u8>,
     lo: u16,
     hi: u16,
+    loopback_only: bool,
     debug: bool,
     compress: bool,
     congestion_control: Option<&str>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 ) -> Result<(u16, BoundFamilies, Option<String>)> {
-    let (port, listeners) = bind_data_listeners(lo, hi)?;
+    let (port, listeners) = bind_data_listeners(lo, hi, loopback_only)?;
     // Passive connections inherit the listener's congestion controller. Set
     // and verify it on every listener before advertising the port so even
     // handshake-time behavior uses the requested algorithm.
@@ -1166,10 +1198,19 @@ fn accept_data_connections(
             Ok((stream, _)) if stream.set_nonblocking(false).is_ok() => stream,
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // Wake as soon as a peer connects; a sleep here delayed every
+                // data connection. The timeout keeps the closure checks above.
+                crate::sys::wait_readable(
+                    std::os::fd::AsRawFd::as_raw_fd(&listener),
+                    Duration::from_millis(25),
+                );
+                continue;
+            }
+            // Back off rather than spin on persistent errors such as EMFILE.
+            Err(_) => {
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
             }
-            Err(_) => continue,
         };
         let handshake_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let id = next_id.fetch_add(1, Relaxed);
@@ -1285,6 +1326,7 @@ fn serve_tcp(
             handshake_pending: Some(handshake_pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
+            loopback_only: false,
             named_socket: None,
             authority,
             descriptor_session,

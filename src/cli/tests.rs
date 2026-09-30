@@ -478,34 +478,47 @@ fn native_hash_selects_content_comparison() {
 }
 
 #[test]
-fn payload_checks_and_encryption_are_independent() {
-    for plain in [false, true] {
-        for integrity in [false, true] {
-            let mut argv = vec![
-                "source",
-                "--into",
-                "destination",
-                "--integrity-checking=compare=xxh3-128",
-            ];
-            if plain {
-                argv.push("--tcp-plain");
-            }
-            if integrity {
-                argv.push("--integrity-checking=transfer=blake3");
-            }
-            let args = parse_native_copy(
-                &argv
-                    .iter()
-                    .map(std::ffi::OsString::from)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            assert_eq!(args.tcp_plain, plain);
-            assert_eq!(args.transfer_integrity, integrity);
-            assert_eq!(args.hash_algorithm, crate::hashing::HashAlgorithm::Xxh3);
-            assert!(args.checksum);
+fn unencrypted_tcp_checks_payloads_unless_transfer_is_chosen() {
+    use crate::hashing::HashAlgorithm::{Blake3, Xxh3};
+    let os = |argv: &[&str]| argv.iter().map(OsString::from).collect::<Vec<_>>();
+    for (encrypted, transfer, expected) in [
+        (true, None, None),
+        (false, None, Some(Xxh3)),
+        (false, Some("off"), None),
+        (false, Some("blake3"), Some(Blake3)),
+        (true, Some("blake3"), Some(Blake3)),
+    ] {
+        let mut native = vec!["source", "--into", "destination"];
+        let mut rsync = vec!["source", "destination"];
+        if !encrypted {
+            native.push("--no-tcp-encryption");
+            rsync.push("--syq-no-tcp-encryption");
+        }
+        let option = transfer.map(|value| format!("--integrity-checking=transfer={value}"));
+        if let Some(option) = &option {
+            native.push(option);
+            rsync.push(option);
+        }
+        for args in [
+            parse_native_copy(&os(&native)).unwrap(),
+            Args::parse_rsync(&os(&rsync)).unwrap(),
+        ] {
+            assert_eq!(args.no_tcp_encryption, !encrypted);
+            assert_eq!(args.transfer_integrity, expected.is_some(), "{transfer:?}");
+            assert_eq!(args.transfer_hash_type, expected, "{transfer:?}");
         }
     }
+    // The comparison algorithm stays independent of transport encryption.
+    let args = parse_native_copy(&os(&[
+        "source",
+        "--into",
+        "destination",
+        "--no-tcp-encryption",
+        "--integrity-checking=compare=xxh3-128",
+    ]))
+    .unwrap();
+    assert!(args.checksum);
+    assert_eq!(args.hash_algorithm, Xxh3);
 }
 
 #[test]

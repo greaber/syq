@@ -52,7 +52,7 @@ def hashing(root, source, temporary):
     sha256 = hashlib.sha256(payload).hexdigest()
     md5 = hashlib.md5(payload).hexdigest()
     wrong_md5 = hashlib.md5(b"different bytes").hexdigest()
-    for name, flags in [("encrypted", []), ("plain", ["--tcp-plain"])]:
+    for name, flags in [("encrypted", []), ("plain", ["--no-tcp-encryption"])]:
         print(f"hash policy: ordinary {name} TCP", flush=True)
         destination = root + "/hash-" + name
         command = ["syq", "cp", "--if-exists=update", "--no-progress", "--performance-tuning", "workers=1", "-C", str(local.parent), "--mapping", "-", "--to", "destination", "--into", root,

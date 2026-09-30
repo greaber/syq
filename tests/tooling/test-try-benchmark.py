@@ -35,6 +35,11 @@ if args == ['persist', 'off']:
     print('SSH connection persistence is off'); sys.exit(0)
 assert json.loads(config.read_text()) == {'enabled': False}
 assert '--pscope' not in args
+# Releases through v0.7.1 spell metadata selection --preserve; later builds
+# use --copy-metadata and refuse --preserve.
+if ('--copy-metadata=permissions' if os.environ.get('BENCH_TEST_OLD') else '--preserve=permissions') in args:
+    print('error: unexpected metadata option', file=sys.stderr); sys.exit(2)
+if '--dry-run' in args: sys.exit(0)
 if os.environ.get('BENCH_TEST_ENV_LOG'):
     with open(os.environ['BENCH_TEST_ENV_LOG'], 'a') as log:
         log.write(json.dumps({'config': str(config), 'runtime': os.environ['XDG_RUNTIME_DIR']})+'\n')
@@ -142,7 +147,9 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result.stdout.count('test double: copy statistics'), 1)
         self.assertEqual(result.stdout.count(', trial 1/1'), 1)
         self.assertNotIn('large rsync', result.stdout)
-        copies = [args for args in map(json.loads, log.read_text().splitlines()) if args[0] == 'cp']
+        # The metadata-option probe is a dry run, not a copy.
+        copies = [args for args in map(json.loads, log.read_text().splitlines())
+                  if args[0] == 'cp' and '--dry-run' not in args]
         self.assertEqual(len(copies), 2)  # setup and one scored copy
         for args in copies:
             self.assertIn('--no-tcp', args)
@@ -159,7 +166,8 @@ class BenchmarkTests(unittest.TestCase):
                                      '--workload', 'both', '--', '--no-tcp',
                                      env=dict(self.env, BENCH_TEST_ARGS_LOG=str(log)))
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                copies = [a for a in map(json.loads, log.read_text().splitlines()) if a[0] == 'cp']
+                copies = [a for a in map(json.loads, log.read_text().splitlines())
+                          if a[0] == 'cp' and '--dry-run' not in a]
                 destinations = [Path(a[a.index('--into-existing')+1]).name for a in copies]
                 self.assertEqual(destinations, ['probe', 'warmup', 'trial', 'warmup', 'trial'])
                 self.assertTrue(all('--no-tcp' in a for a in copies))
@@ -355,6 +363,21 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn('Results (seconds', result.stdout)
         self.assertIn('copying timing unavailable', result.stdout)
         self.assert_clean()
+
+    def test_metadata_option_matches_the_installed_syq(self):
+        for old, option in [(False, '--copy-metadata=permissions'), (True, '--preserve=permissions')]:
+            with self.subTest(old=old):
+                log = self.root / f'args-{old}.log'
+                env = dict(self.env, BENCH_TEST_ARGS_LOG=str(log))
+                if old:
+                    env['BENCH_TEST_OLD'] = '1'
+                result = self.invoke('--tool', 'syq', env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                copies = [args for args in map(json.loads, log.read_text().splitlines())
+                          if '--into-existing' in args]
+                self.assertTrue(copies)
+                self.assertTrue(all(option in args for args in copies), copies)
+                self.assert_clean()
 
     def test_invalid_timing_is_rejected(self):
         definitions = SCRIPT.read_text().removesuffix('main "$@"\n')

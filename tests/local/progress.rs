@@ -272,10 +272,9 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
 
     assert_output_ok(&out);
     assert!(!t.path("dst").exists());
-    assert_eq!(
-        t.path("ip.log").exists(),
-        cfg!(target_os = "linux"),
-        "only Linux receivers may spawn the iproute2 probe"
+    assert!(
+        !t.path("ip.log").exists(),
+        "receivers list interfaces in process and never run ip"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -304,9 +303,6 @@ fn double_verbose_dry_run_reports_ssh_fallback_without_extra_connection() {
 fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // Suppress discovery so this specifically exercises the IPv6 SSH arrival
-    // address. It must be listened on and selected.
-    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     write(&t.path("src"), b"v6");
     let remote = format!("diagnostic.invalid:{}", t.s("dst"));
 
@@ -324,6 +320,8 @@ fn double_verbose_dry_run_reports_ipv6_arrival_address_as_reachable() {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("FAKE_SSH_CONNECTION", "::1 40000 ::1 22")
+        // Suppress discovery so this specifically exercises the IPv6 SSH
+        // arrival address. It must be listened on and selected.
         .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .run()

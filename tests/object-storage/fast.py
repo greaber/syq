@@ -29,7 +29,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"hello")
                 self.wfile.flush()
                 download_started.set()
-                assert self.rfile.read(1) == b""
+                # The cancelled client closes its socket: an orderly EOF, or a
+                # reset when unread response bytes were still queued.
+                try:
+                    assert self.rfile.read(1) == b""
+                except ConnectionResetError:
+                    pass
                 download_finished.set()
                 return
             self.wfile.write(b"bad" if scenario=="download-truncated" else b"hello world")
@@ -83,7 +88,9 @@ thread=threading.Thread(target=server.serve_forever);thread.start()
 try:
     with tempfile.TemporaryDirectory(prefix="syq-s3-fast-") as temp:
         root=pathlib.Path(temp).resolve(); source=root/"source"; source.write_bytes(os.urandom(11*2**20))
-        env={**os.environ,"AWS_ACCESS_KEY_ID":"fixture","AWS_SECRET_ACCESS_KEY":"fixture","AWS_REGION":"us-east-1","AWS_EC2_METADATA_DISABLED":"true","AWS_ENDPOINT_URL_S3":"http://127.0.0.1:"+str(server.server_address[1]),"XDG_CACHE_HOME":str(root/"cache")}
+        env={**os.environ,"AWS_ACCESS_KEY_ID":"fixture","AWS_SECRET_ACCESS_KEY":"fixture","AWS_REGION":"us-east-1","AWS_EC2_METADATA_DISABLED":"true","AWS_ENDPOINT_URL_S3":"http://127.0.0.1:"+str(server.server_address[1]),"XDG_CACHE_HOME":str(root/"cache"),
+             # This server speaks plain HTTP; test the HTTPS upload behavior.
+             "SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS":"1"}
         base=[binary,"cp","--no-progress","--performance-tuning", "s3-retries=0,s3-part-size=5M,s3-parts-per-object=2"]
         for scenario in ["upload", "upload-delayed", "upload-single", "upload-single-delayed", "upload-single-failure", "upload-failure", "upload-interrupted", "download", "download-truncated", "download-interrupted"]:
             shutil.rmtree(root/"cache",ignore_errors=True)

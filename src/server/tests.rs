@@ -72,6 +72,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
+                loopback_only: false,
                 named_socket: None,
                 authority: Some(server_authority),
                 descriptor_session: DescriptorSessionSlot::default(),
@@ -157,9 +158,17 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
     assert!(!target.exists(), "revoked writes must not publish the file");
 }
 
+// A local copy's receiver must not open its data port to the network.
+#[test]
+fn local_receiver_data_listeners_bind_loopback_only() {
+    let (port, listeners) = bind_data_listeners(0, 0, true).unwrap();
+    let bound: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+    assert_eq!(bound, vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+}
+
 #[test]
 fn data_listeners_share_one_port_across_families() {
-    let (port, listeners) = bind_data_listeners(0, 0).unwrap();
+    let (port, listeners) = bind_data_listeners(0, 0, false).unwrap();
     assert_ne!(port, 0);
     let ports: Vec<u16> = listeners
         .iter()
@@ -239,6 +248,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
+                loopback_only: false,
                 named_socket: None,
                 authority: None,
                 descriptor_session: server_session,
@@ -499,6 +509,7 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
+                loopback_only: false,
                 named_socket: None,
                 authority: None,
                 descriptor_session: DescriptorSessionSlot::default(),
@@ -564,6 +575,7 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
+                loopback_only: false,
                 named_socket: None,
                 authority: None,
                 descriptor_session: DescriptorSessionSlot::default(),
@@ -862,6 +874,7 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
         0,
         0,
         false,
+        false,
         true,
         None,
         Some(authority.clone()),
@@ -965,6 +978,7 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: false,
+                loopback_only: false,
                 named_socket: None,
                 authority: None,
                 descriptor_session: shared,

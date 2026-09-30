@@ -329,9 +329,6 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
     for tcp in [false, true] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
-        // Require the SSH arrival address even where Linux interface discovery
-        // could otherwise hide an incomplete fake SSH session.
-        executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
         let data = prng(1 << 20, 967);
         write(&t.path("source"), &data);
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
@@ -363,6 +360,8 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+            // Advertise only the SSH arrival address.
+            .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"));
         if tcp {

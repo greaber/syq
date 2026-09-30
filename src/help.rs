@@ -231,10 +231,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 "resource_limits_arg" => "Resource limits",
                 "integrity_checking_arg" | "hash" => "Integrity checking",
                 "performance_tuning" | "block_size" => "Performance tuning",
-                "auth_from" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp" | "tcp_plain"
-                | "tcp_ports" | "tcp_congestion" | "pscope" | "compress" | "no_compress" => {
-                    "SSH and transport"
-                }
+                "auth_from" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
+                | "no_tcp_encryption" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
+                | "no_compress" => "SSH and transport",
                 "coordinate_at"
                 | "detach"
                 | "peer_auth"
@@ -301,7 +300,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         | "syq_path"
         | "no_bootstrap"
         | "no_tcp"
-        | "tcp_plain"
+        | "no_tcp_encryption"
         | "tcp_ports"
         | "tcp_congestion"
         | "pscope"

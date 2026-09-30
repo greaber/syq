@@ -75,7 +75,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); controls agent forwarding when set |
 | `--rsync-path <PATH>` | Use this exact syq executable on the remote instead of the managed helper |
 | `--syq-no-bootstrap` | Syq extension: require syq on the remote PATH instead of installing a versioned helper |
-| `--syq-tcp-plain` | Syq extension: use TCP data connections without encryption (trusted networks only) |
+| `--syq-no-tcp-encryption` | Syq extension: send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer |
 | `--syq-no-tcp` | Syq extension: send all data over ssh instead of separate TCP data connections |
 | `--syq-tcp-ports <LO-HI>` | Syq extension: port range the remote listens on for TCP data connections<br><br>[default: 47600-47699] |
 | `--syq-tcp-congestion <ALGO>` | Syq extension: use this congestion-control algorithm for TCP data sockets (Linux only) |

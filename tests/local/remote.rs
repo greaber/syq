@@ -640,7 +640,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
-        .args(["--syq-tcp-plain", "--stats", "-avv"])
+        .args(["--syq-no-tcp-encryption", "--stats", "-avv"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -665,9 +665,11 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("transport: plaintext TCP planned (reachability preflight passed)"),
+        stderr.contains("transport: unencrypted TCP planned (reachability preflight passed)"),
         "{stderr}"
     );
+    // Without encryption, a fast payload check replaces authenticated records.
+    assert!(stderr.contains("payload checks: xxh3-128"), "{stderr}");
     assert!(
         stderr.contains("concurrency: starting with 16 connections (auto-tuned)"),
         "{stderr}"
@@ -688,7 +690,7 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
-            "--syq-tcp-plain",
+            "--syq-no-tcp-encryption",
             "--inplace",
             "-a",
             "--performance-tuning",
@@ -853,7 +855,7 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
-            "--syq-tcp-plain",
+            "--syq-no-tcp-encryption",
             "--syq-tcp-congestion=reno",
             "--stats",
             "-avv",
@@ -1219,7 +1221,6 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
 fn streaming_copies_local_trees_and_remote_ranges() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     for (name, size) in [("large", (17 << 20) + 123), ("small", 777), ("empty", 0)] {
         write(&t.path(&format!("source/{name}")), &prng(size, 941));
     }
@@ -1262,6 +1263,8 @@ fn streaming_copies_local_trees_and_remote_ranges() {
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
                 .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                // Advertise only the SSH arrival address.
+                .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
                 .env("XDG_CONFIG_HOME", t.path("config"))
                 .env("XDG_CACHE_HOME", t.path("cache"));
             let out = command.run().unwrap();
@@ -1413,9 +1416,6 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
 fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // Exercise the SSH arrival address even where Linux interface discovery
-    // could otherwise mask a missing address in the fake SSH session.
-    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     let data = prng(9 * 1024 * 1024 + 123, 904);
     write(&t.path("source"), &data);
     for tcp in [false, true] {
@@ -1456,6 +1456,8 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                     .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                     .env("FAKE_RSH_LOG", t.path("rsh.log"))
                     .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                    // Advertise only the SSH arrival address.
+                    .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
                     .env("XDG_CONFIG_HOME", t.path("config"))
                     .env("XDG_CACHE_HOME", t.path("cache"));
                 let out = command.run().unwrap();
@@ -1492,7 +1494,6 @@ fn streaming_remote_scan_starts_after_transport_setup() {
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
-        executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
         for i in 0..3 {
             write(
                 &t.path(&format!("src/f{i}")),
@@ -2446,7 +2447,11 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
                 .env("XDG_CACHE_HOME", t.path("cache"));
             if tcp {
                 command
-                    .args(["--syq-tcp-plain", "--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
+                    .args([
+                        "--syq-no-tcp-encryption",
+                        "--syq-tcp-ports",
+                        EPHEMERAL_TCP_PORTS,
+                    ])
                     .env("SYQ_TEST_REQUIRE_TCP", "1");
             } else {
                 command.arg("--syq-no-tcp");

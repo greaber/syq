@@ -47,6 +47,7 @@ use std::{
 /// Tests pass this with `--s3-write-header`; the server rejects it on any
 /// request other than PutObject, CopyObject, or CreateMultipartUpload.
 const WRITE_PROBE: &str = "x-syq-write-probe";
+const TREAT_HTTP_AS_HTTPS: &str = "SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS";
 
 struct Server {
     address: String,
@@ -159,6 +160,9 @@ impl Server {
             .env("AWS_CONFIG_FILE", temp.join("no-config"))
             .env("AWS_SHARED_CREDENTIALS_FILE", temp.join("no-credentials"))
             .env("XDG_CACHE_HOME", temp.join("cache"))
+            // These servers speak plain HTTP; test the HTTPS upload behavior.
+            // Tests of plain-HTTP uploads remove this.
+            .env(TREAT_HTTP_AS_HTTPS, "1")
             .current_dir(temp);
         if mode == "cp" && explicit {
             command.args(["--performance-tuning", "s3-part-size=5M"]);
@@ -1573,6 +1577,84 @@ fn serve(
             return;
         }
     }
+    if fault == "timeout-get" {
+        // Listing answers, then every object GET times out on the service's
+        // side, an error S3 sends with HTTP 400 and retries are meant for.
+        let target = first.split_whitespace().nth(1).unwrap();
+        if method == "GET" && target.contains("list-type=") {
+            let entries: String = (0..40)
+                .map(|n| format!("<Contents><Key>data/f{n}</Key><Size>1</Size><ETag>&quot;e&quot;</ETag></Contents>"))
+                .collect();
+            let body = format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+            );
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else if method == "GET" {
+            probes.fetch_add(1, Ordering::Relaxed);
+            reply(
+                &mut socket,
+                400,
+                &[],
+                b"<Error><Code>RequestTimeout</Code></Error>",
+                false,
+            );
+        } else {
+            reply(&mut socket, 404, &[], b"", method == "HEAD");
+        }
+        return;
+    }
+    if fault == "unavailable-put" || fault == "unavailable-copy" {
+        // Planning succeeds, then every upload, or every source HEAD a
+        // server-side copy starts with, fails as if the service were down.
+        let length: usize = headers
+            .get("content-length")
+            .map_or(0, |n| n.parse().unwrap());
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).unwrap();
+        let unavailable = || b"<Error><Code>ServiceUnavailable</Code></Error>".as_slice();
+        match method {
+            "GET" => {
+                let entries: String = if first
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .starts_with("/source")
+                {
+                    (0..40)
+                        .map(|n| {
+                            format!(
+                                "<Contents><Key>data/f{n}</Key><Size>1</Size><ETag>&quot;source&quot;</ETag></Contents>"
+                            )
+                        })
+                        .collect()
+                } else {
+                    String::new()
+                };
+                let body = format!(
+                    "<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+                );
+                reply(&mut socket, 200, &[], body.as_bytes(), false);
+            }
+            "HEAD"
+                if fault == "unavailable-copy"
+                    && first
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .starts_with("/source/data/") =>
+            {
+                probes.fetch_add(1, Ordering::Relaxed);
+                reply(&mut socket, 503, &[], b"", true);
+            }
+            "HEAD" => reply(&mut socket, 404, &[], b"", true),
+            "PUT" => {
+                probes.fetch_add(1, Ordering::Relaxed);
+                reply(&mut socket, 503, &[], unavailable(), false);
+            }
+            _ => panic!("unexpected {first}"),
+        }
+        return;
+    }
     if fault == "object-lock-upload" {
         match method {
             "HEAD" => reply(&mut socket, 404, &[], b"", true),
@@ -1625,6 +1707,26 @@ fn serve(
             _ => None,
         } {
             reply(&mut socket, status, &[], b"", false);
+            return;
+        }
+        if fault == "upload-corrupt-once" && !gate.0.swap(true, Ordering::SeqCst) {
+            reply(
+                &mut socket,
+                400,
+                &[],
+                b"<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match what we received.</Message></Error>",
+                false,
+            );
+            return;
+        }
+        if fault == "upload-corrupt-once" {
+            reply(
+                &mut socket,
+                200,
+                &[("ETag".into(), "\"stored\"".into())],
+                b"",
+                false,
+            );
             return;
         }
         if fault == "upload-timeout-code-once" {
@@ -2936,6 +3038,35 @@ fn uploads_add_content_md5_when_the_destination_requires_a_checksum() {
 }
 
 #[test]
+fn plain_http_uploads_send_content_md5_from_the_start() {
+    let server = Server::start("object-lock-upload");
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    for name in ["first", "second", "third"] {
+        std::fs::write(temp.path().join("source").join(name), name.repeat(1000)).unwrap();
+    }
+    let output = server
+        .command(temp.path())
+        .env_remove(TREAT_HTTP_AS_HTTPS)
+        .args(["--s3-endpoint", &server.address])
+        .args([
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "prefix",
+        ])
+        .capture_output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Acquire));
+    // The server accepted only uploads with a correct Content-MD5 and never
+    // had to reject one first.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn s3_mapping_preserves_expected_hashes_in_failed_results() {
     use sha2::Digest as _;
     let server = Server::start("single-ok");
@@ -3489,6 +3620,137 @@ fn s3_upload_retries_request_timeout_error_codes_within_the_budget() {
             "retries {retries}"
         );
     }
+}
+
+#[test]
+fn s3_upload_retries_corrupted_data_with_a_warning_within_the_budget() {
+    for (retries, expected_exit, requests) in [(1, 0, 3), (0, 23, 2)] {
+        let temp = crate::test_support::tempdir().unwrap();
+        std::fs::write(temp.path().join("source"), b"small body").unwrap();
+        let server = Server::start("upload-corrupt-once");
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args(["--s3-endpoint", &server.address])
+            .args(["source", "--to", "s3://bucket", "--as", "object"])
+            .capture_output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "retries {retries}: {}",
+            output_text(&output)
+        );
+        // One HEAD, the PUT answered with BadDigest, and at most one resend.
+        assert_eq!(server.requests.load(Ordering::Relaxed), requests);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("syq: warning: object: the destination received corrupted data (BadDigest); retrying"),
+            retries > 0,
+            "{}",
+            output_text(&output)
+        );
+    }
+}
+
+#[test]
+fn copies_stop_when_requests_keep_failing_after_their_retries() {
+    // Upload PUTs and download GETs are retried by syq; the HEADs that start
+    // server-side copies by the SDK, including with SDK retries disabled. A
+    // service-side timeout counts like a 503. Either way, eight
+    // requests in a row that exhaust their retries without an answer stop the
+    // copy before the remaining objects are tried, and each request counts
+    // once however many attempts it made.
+    for (fault, retries) in [
+        ("unavailable-put", 1),
+        ("unavailable-copy", 1),
+        ("unavailable-copy", 0),
+        ("timeout-get", 1),
+    ] {
+        let temp = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("source")).unwrap();
+        for n in 0..40 {
+            std::fs::write(temp.path().join("source").join(format!("f{n}")), b"x").unwrap();
+        }
+        let server = Server::start(fault);
+        let mut command = server.command_with_retries(temp.path(), retries);
+        command
+            .args(["--s3-endpoint", &server.address])
+            .args(["--performance-tuning", "s3-objects=1"]);
+        let output = match fault {
+            "unavailable-copy" => command.args([
+                "--from",
+                "s3://source",
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "prefix",
+            ]),
+            "timeout-get" => command.args([
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "copy",
+            ]),
+            _ => command.args([
+                "--srcs-in",
+                "source",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "prefix",
+            ]),
+        }
+        .capture_output()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("8 S3 requests in a row failed after all their retries"),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // One object at a time: the copy stops at the eighth failed request,
+        // give or take the next object already started.
+        let failing = server.probes.load(Ordering::Relaxed) as u32;
+        let per_request = retries + 1;
+        assert!(
+            (8 * per_request..=9 * per_request).contains(&failing),
+            "{fault} with {retries} retries: {failing} failing attempts"
+        );
+    }
+    // Objects still in flight when the copy stops share its one message.
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    for n in 0..40 {
+        std::fs::write(temp.path().join("source").join(format!("f{n}")), b"x").unwrap();
+    }
+    let server = Server::start("unavailable-put");
+    let output = server
+        .command_with_retries(temp.path(), 2)
+        .args(["--s3-endpoint", &server.address])
+        .args(["--performance-tuning", "s3-objects=16"])
+        .args([
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "prefix",
+        ])
+        .capture_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("cancelled"), "{}", output_text(&output));
 }
 
 #[test]

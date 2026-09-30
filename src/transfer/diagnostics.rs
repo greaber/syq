@@ -150,11 +150,11 @@ pub(super) fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
     };
     let transport = spec.data_transport();
     match transport {
-        DataTransport::EncryptedTcp | DataTransport::PlaintextTcp => {
+        DataTransport::EncryptedTcp | DataTransport::UnencryptedTcp => {
             let name = if transport == DataTransport::EncryptedTcp {
                 "encrypted TCP"
             } else {
-                "plaintext TCP"
+                "unencrypted TCP"
             };
             crate::output::diagnostic!(
                 "  transport: {name} {route_state} (reachability preflight passed)"
@@ -182,6 +182,12 @@ pub(super) fn print_remote_diagnostics(spec: &RemoteSpec, args: &Args) {
                 crate::output::diagnostic!("  transport: SSH {route_state}");
             }
         }
+    }
+    if args.transfer_integrity {
+        crate::output::diagnostic!(
+            "  payload checks: {}",
+            args.transfer_hash_type.unwrap_or_default().as_str()
+        );
     }
 }
 

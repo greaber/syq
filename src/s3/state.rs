@@ -30,16 +30,10 @@ impl State {
         Self::new(None)
     }
     pub fn open(identity: &[u8]) -> Result<Self> {
-        let base = std::env::var_os("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".cache"))
-            });
-        match base {
+        match crate::user_dirs::cache_dir() {
             Some(base) => Self::open_at(base.join("syq/s3"), identity),
             None => {
-                warn("HOME and absolute XDG_CACHE_HOME are unset");
+                warn("no home directory or absolute XDG_CACHE_HOME");
                 Ok(Self::new(None))
             }
         }

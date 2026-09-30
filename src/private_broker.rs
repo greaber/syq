@@ -274,7 +274,9 @@ fn accept_connections<F>(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
+                // Wake as soon as a client or the shutdown connection arrives;
+                // a sleep here delayed every descriptor claim and every close.
+                crate::sys::wait_readable(listener.as_raw_fd(), Duration::from_millis(5));
             }
             Err(_) => break,
         }

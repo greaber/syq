@@ -51,6 +51,12 @@ filesystem copies; use `s3-requests` for the shared S3 data-request count.
 | `s3-part-size` | Automatic | 5 MiB–5 GiB per upload part or download range |
 | `s3-retries` | `10` | 0–100 retries for transient failures and throttling; 0 disables retries |
 
+Retries wait longer each time, so with the default budget a single request can
+keep retrying for a minute or more. If 8 requests in a row fail after all their
+retries, each with no connection, a timeout, or a server error or throttling
+response, `syq cp` and `syq rm` stop instead of trying the remaining objects;
+rerun the command once the service is available.
+
 The concurrency limits are nested. For example:
 
 ```sh
@@ -104,8 +110,8 @@ network context during a copy prevents saving a new hint for its initial path.
 `--resource-limits workers=N` caps the starting count and subsequent exploration.
 
 `SYQ_TUNING_CACHE` sets the base path for history; an empty value disables
-history and remembered starts. `XDG_CACHE_HOME` changes the default parent
-directory.
+history and remembered starts. An absolute `XDG_CACHE_HOME` changes the default
+parent directory.
 
 Syq can keep idle connections ready for later tuning changes. These connections
 and their helper processes still use resources, so the active worker count is

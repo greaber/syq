@@ -47,8 +47,11 @@ impl Session {
             Arc::default(),
             cancellation.clone(),
             authorization.clone(),
+            // A stream is one object; a failing request already ends it.
+            None,
         )
         .await?;
+        let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Self {
             client,
             authorization,
@@ -62,7 +65,7 @@ impl Session {
             options,
             cancellation,
             bandwidth: controls.bandwidth(),
-            content_md5: Default::default(),
+            content_md5: content_md5.into(),
         })
     }
     pub(crate) fn share_admission(&mut self, other: &Self) {
@@ -596,6 +599,7 @@ async fn upload(
         let comparison = comparison_digest(plan, &first.bytes);
         let _request = plan.session.requests.acquire().await?;
         let mut retry_with_md5 = false;
+        let mut corrupt_attempts = 0;
         let published = loop {
             let fallback = (algorithm == Algorithm::None
                 && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
@@ -629,6 +633,18 @@ async fn upload(
                         && super::checksum::requires_checksum(&e) =>
                 {
                     retry_with_md5 = true;
+                }
+                Err(e)
+                    if corrupt_attempts < options.retries
+                        && super::checksum::corrupted(&e).is_some() =>
+                {
+                    crate::output::diagnostic!(
+                        "syq: warning: {}: the destination received corrupted data ({}); retrying",
+                        plan.key,
+                        super::checksum::corrupted(&e).unwrap_or_default()
+                    );
+                    super::backoff(corrupt_attempts).await;
+                    corrupt_attempts += 1;
                 }
                 result => {
                     // Content-MD5 fixed the rejection, so send it from now on.
@@ -957,6 +973,7 @@ async fn upload_part(
     let comparison = comparison_digest(plan, &data.bytes);
     let _request = plan.session.requests.acquire().await?;
     let mut retry_with_md5 = false;
+    let mut corrupt_attempts = 0;
     let output = loop {
         let fallback = (algorithm == Algorithm::None
             && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
@@ -985,6 +1002,18 @@ async fn upload_part(
                     && super::checksum::requires_checksum(&e) =>
             {
                 retry_with_md5 = true;
+            }
+            Err(e)
+                if corrupt_attempts < plan.options.retries
+                    && super::checksum::corrupted(&e).is_some() =>
+            {
+                crate::output::diagnostic!(
+                    "syq: warning: {}: the destination received corrupted data in part {number} ({}); retrying",
+                    plan.key,
+                    super::checksum::corrupted(&e).unwrap_or_default()
+                );
+                super::backoff(corrupt_attempts).await;
+                corrupt_attempts += 1;
             }
             result => {
                 if result.is_ok() && fallback.is_some() {
