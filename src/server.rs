@@ -1041,7 +1041,13 @@ pub(crate) fn bind_data_listeners(
         let mut port = requested;
         let mut listeners: Vec<TcpListener> = Vec::new();
         let mut in_use = false;
-        for domain in [Domain::IPV4, Domain::IPV6] {
+        // A local copy's client connects to 127.0.0.1 only.
+        let domains: &[Domain] = if loopback_only {
+            &[Domain::IPV4]
+        } else {
+            &[Domain::IPV4, Domain::IPV6]
+        };
+        for &domain in domains {
             let bound = (|| -> std::io::Result<TcpListener> {
                 let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
                 // As std's TcpListener::bind does: a port with lingering
@@ -1057,12 +1063,7 @@ pub(crate) fn bind_data_listeners(
                     (ip, port).into()
                 } else {
                     socket.set_only_v6(true)?;
-                    let ip = if loopback_only {
-                        Ipv6Addr::LOCALHOST
-                    } else {
-                        Ipv6Addr::UNSPECIFIED
-                    };
-                    (ip, port).into()
+                    (Ipv6Addr::UNSPECIFIED, port).into()
                 };
                 socket.bind(&SockAddr::from(address))?;
                 socket.listen(128)?;

@@ -127,8 +127,8 @@ fn advertised_addrs(
     }
     // The address ssh arrived on is reachable by construction (loopback
     // included: the client is then on this host). Advertise it even when the
-    // listing did not name it (no `ip` tool, or an address on an interface
-    // the listing filtered out).
+    // listing did not name it (enumeration failed, or an address on an
+    // interface the listing filtered out).
     if let Some(ip) = ssh_ip {
         if families.accepts(ip) && !addrs.iter().any(|a| a.0 == ip) {
             addrs.push((ip, 0, 0));

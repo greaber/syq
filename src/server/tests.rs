@@ -162,12 +162,8 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
 #[test]
 fn local_receiver_data_listeners_bind_loopback_only() {
     let (port, listeners) = bind_data_listeners(0, 0, true).unwrap();
-    assert!(!listeners.is_empty());
-    for listener in &listeners {
-        let local = listener.local_addr().unwrap();
-        assert!(local.ip().is_loopback(), "{local}");
-        assert_eq!(local.port(), port);
-    }
+    let bound: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+    assert_eq!(bound, vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
 }
 
 #[test]

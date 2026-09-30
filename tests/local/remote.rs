@@ -1219,7 +1219,6 @@ fn automatic_streaming_needs_no_tuning_flags_and_keeps_short_remote_ranges() {
 fn streaming_copies_local_trees_and_remote_ranges() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     for (name, size) in [("large", (17 << 20) + 123), ("small", 777), ("empty", 0)] {
         write(&t.path(&format!("source/{name}")), &prng(size, 941));
     }
@@ -1262,6 +1261,8 @@ fn streaming_copies_local_trees_and_remote_ranges() {
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
                 .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                // Advertise only the SSH arrival address.
+                .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
                 .env("XDG_CONFIG_HOME", t.path("config"))
                 .env("XDG_CACHE_HOME", t.path("cache"));
             let out = command.run().unwrap();
@@ -1413,9 +1414,6 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
 fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // Exercise the SSH arrival address even where Linux interface discovery
-    // could otherwise mask a missing address in the fake SSH session.
-    executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
     let data = prng(9 * 1024 * 1024 + 123, 904);
     write(&t.path("source"), &data);
     for tcp in [false, true] {
@@ -1456,6 +1454,8 @@ fn tuning_options_copy_remote_ranges_over_tcp_and_ssh() {
                     .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                     .env("FAKE_RSH_LOG", t.path("rsh.log"))
                     .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+                    // Advertise only the SSH arrival address.
+                    .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
                     .env("XDG_CONFIG_HOME", t.path("config"))
                     .env("XDG_CACHE_HOME", t.path("cache"));
                 let out = command.run().unwrap();
@@ -1492,7 +1492,6 @@ fn streaming_remote_scan_starts_after_transport_setup() {
     ] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
-        executable(&t.path("remote-bin/ip"), b"#!/bin/sh\nexit 1\n");
         for i in 0..3 {
             write(
                 &t.path(&format!("src/f{i}")),
