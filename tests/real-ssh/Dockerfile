@@ -42,7 +42,6 @@ RUN apt-get update \
         libnotify-bin \
         fish \
         iptables \
-        iproute2 \
         netcat-openbsd \
         openssh-client \
         openssh-server \
