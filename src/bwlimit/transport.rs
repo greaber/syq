@@ -100,7 +100,25 @@ pub(crate) fn socket_closed(socket: &std::net::TcpStream) -> bool {
     let mask = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
     #[cfg(target_os = "linux")]
     let mask = mask | libc::POLLRDHUP;
-    result > 0 && fd.revents & mask != 0
+    if result > 0 && fd.revents & mask != 0 {
+        return true;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // BSD/macOS poll need not report HUP for a peer's FIN. A nonblocking
+        // peek observes EOF without changing shared descriptor flags.
+        let mut byte = 0u8;
+        return unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        } == 0;
+    }
+    #[cfg(target_os = "linux")]
+    false
 }
 
 /// Place below compression and buffering. TCP record buffering must also be
@@ -109,7 +127,7 @@ pub(crate) struct PacedWriter<W, S> {
     pub(crate) inner: W,
     pub(crate) budget: std::sync::Arc<Budget>,
     pub(crate) stopped: S,
-    pub(crate) enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) handshake_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
@@ -118,9 +136,9 @@ impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
             return Ok(0);
         }
         if self
-            .enabled
+            .handshake_pending
             .as_ref()
-            .is_some_and(|active| !active.load(std::sync::atomic::Ordering::Acquire))
+            .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
         {
             return self.inner.write(bytes);
         }
@@ -132,9 +150,9 @@ impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
 
     fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
         if self
-            .enabled
+            .handshake_pending
             .as_ref()
-            .is_some_and(|active| !active.load(std::sync::atomic::Ordering::Acquire))
+            .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
         {
             return self.inner.write_vectored(buffers);
         }
@@ -213,7 +231,7 @@ mod tests {
     #[test]
     fn cancellation_writes_nothing_and_is_not_retryable() {
         let mut writer = PacedWriter {
-            enabled: None,
+            handshake_pending: None,
             inner: Vec::new(),
             budget: std::sync::Arc::new(Budget::new(1024)),
             stopped: || true,
@@ -229,7 +247,7 @@ mod tests {
         budget.reserve(Instant::now(), budget.chunk());
         let checks = std::cell::Cell::new(0);
         let mut writer = PacedWriter {
-            enabled: None,
+            handshake_pending: None,
             inner: Vec::new(),
             budget,
             stopped: || {
@@ -249,7 +267,7 @@ mod tests {
         let budget = std::sync::Arc::new(Budget::new(u64::MAX));
         let input = vec![42; 3 * MAX_CHUNK as usize + 17];
         let mut writer = PacedWriter {
-            enabled: None,
+            handshake_pending: None,
             inner: Vec::new(),
             budget,
             stopped: || false,
@@ -263,7 +281,7 @@ mod tests {
         // Vec's default vectored writer only writes the first slice, exercising
         // partial progress as well as the boundary across header and body.
         let mut writer = PacedWriter {
-            enabled: None,
+            handshake_pending: None,
             inner: Vec::new(),
             budget: std::sync::Arc::new(Budget::new(u64::MAX)),
             stopped: || false,
@@ -288,7 +306,7 @@ mod tests {
         let socket = server.try_clone().unwrap();
         let writer = std::thread::spawn(move || {
             let mut writer = PacedWriter {
-                enabled: None,
+                handshake_pending: None,
                 inner: server,
                 budget: std::sync::Arc::new(Budget::new(1)),
                 stopped: || socket_closed(&socket),

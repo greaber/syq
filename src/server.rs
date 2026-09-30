@@ -1333,7 +1333,7 @@ fn serve_tcp(
         Box::new(crate::bwlimit::transport::PacedWriter {
             inner: stream.try_clone()?,
             budget,
-            enabled: Some(authed.clone()),
+            handshake_pending: Some(handshake_pending.clone()),
             stopped: move || {
                 session.is_closed() || crate::bwlimit::transport::socket_closed(&socket)
             },

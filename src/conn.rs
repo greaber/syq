@@ -2010,13 +2010,13 @@ impl RemoteSpec {
             ),
             None => (None, None),
         };
-        let pacing_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pacing_handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let output: Box<dyn Write + Send> =
             if let Some(pacing) = info.pacing.as_ref().filter(|p| !p.remote_sender) {
                 let scheduler = pacing.scheduler.clone();
                 let socket = stream.try_clone()?;
                 Box::new(crate::bwlimit::transport::PacedWriter {
-                    enabled: Some(pacing_enabled.clone()),
+                    handshake_pending: Some(pacing_handshake.clone()),
                     inner: stream.try_clone()?,
                     budget: pacing.budget.clone(),
                     stopped: move || {
@@ -2053,7 +2053,7 @@ impl RemoteSpec {
         };
         let conn = hello(conn, compress, info.token.clone(), role.clone())?;
         // Authenticate within the fixed handshake deadline even at tiny caps.
-        pacing_enabled.store(true, std::sync::atomic::Ordering::Release);
+        pacing_handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         Ok(conn)
     }
