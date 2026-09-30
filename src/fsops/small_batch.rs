@@ -4,6 +4,7 @@
 //! burst of changes instead of competing for it once per file. File data and
 //! inode metadata are written between the two bursts, outside any turn.
 use super::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError>;
