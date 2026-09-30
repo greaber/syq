@@ -168,6 +168,96 @@ fn unusable_explicit_scope_is_an_error() {
     assert!(!t.path("rsh.log").exists());
 }
 
+/// An --rsh ssh command shares and persists connections like the default ssh.
+/// Each set of its options gets its own persistent connection, so a login made
+/// with one key or jump host is never reused by a command asking for another.
+#[test]
+fn rsh_ssh_options_keep_separate_persistent_connections() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let ssh = fake_ssh(&t);
+    let scope = ephemeral_scope(&t);
+    write(&t.path("src"), b"shared");
+    let copy = |rsh: Option<&str>, destination: &str| {
+        write(&t.path("rsh.log"), b"");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--no-progress",
+            "--no-tcp",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+        ]);
+        // A scope needs a command whose connections syq can share.
+        if !rsh.is_some_and(|rsh| rsh.contains("Control")) {
+            command.arg("--pscope").arg(&scope);
+        }
+        if let Some(rsh) = rsh {
+            command.arg("--rsh").arg(format!("{} {rsh}", ssh.display()));
+        }
+        let out = command
+            .arg(t.path("src"))
+            .args(["--to", "fake", "--as"])
+            .arg(t.path(destination))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        let sockets: std::collections::BTreeSet<String> = log
+            .lines()
+            .filter_map(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                let at = words.iter().position(|word| *word == "-S")?;
+                words.get(at + 1).map(|socket| socket.to_string())
+            })
+            .collect();
+        (sockets, log)
+    };
+
+    let (default, _) = copy(None, "default");
+    let (first, _) = copy(Some("-o ServerAliveInterval=7"), "first");
+    let (again, _) = copy(Some("-o ServerAliveInterval=7"), "again");
+    let (other, _) = copy(Some("-o ServerAliveInterval=9"), "other");
+    for sockets in [&default, &first, &other] {
+        assert_eq!(sockets.len(), 1, "{sockets:?}");
+    }
+    assert_eq!(first, again);
+    assert_ne!(first, default);
+    assert_ne!(first, other);
+    assert_ne!(other, default);
+    assert_eq!(read(&t.path("again")), b"shared");
+
+    // Options that set up sharing themselves keep full control of it.
+    let (own, log) = copy(Some("-o ControlPath=none"), "own");
+    assert!(own.is_empty(), "{log}");
+
+    let scope_text = scope.to_str().unwrap();
+    let status = persistence_command(&t, &["status", "--pscope", scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&status);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains("(ssh options: -o 'ServerAliveInterval=7')"),
+        "{status}"
+    );
+    assert!(
+        status.contains("(ssh options: -o 'ServerAliveInterval=9')"),
+        "{status}"
+    );
+    let closed = persistence_command(&t, &["off", "--pscope", scope_text])
+        .run()
+        .unwrap();
+    assert_output_ok(&closed);
+    assert!(!scope.exists());
+}
+
 #[test]
 fn local_copy_does_not_read_the_global_persistence_configuration() {
     let t = Tmp::new();

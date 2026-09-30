@@ -200,6 +200,10 @@ pub struct Args {
     /// invoking machine renders it from the verified attested terminal).
     #[arg(skip)]
     pub suppress_summary: bool,
+    /// Internal: this run is a remote-to-remote coordinator, whose `--rsh`
+    /// was chosen by the invoking machine.
+    #[arg(skip)]
+    pub delegated: bool,
     /// Native coordinator placement.
     #[arg(skip)]
     pub coordinate_at: CoordinateAt,
@@ -375,7 +379,7 @@ pub struct Args {
     /// in-place write leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
-    /// Remote shell command (default: ssh); when set, it controls agent forwarding and syq neither shares nor persists connections
+    /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
@@ -405,8 +409,8 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`
-    #[arg(long = "syq-pscope", value_name = "PATH", conflicts_with = "rsh")]
+    /// Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command
+    #[arg(long = "syq-pscope", value_name = "PATH")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
     #[arg(skip)]
@@ -1300,7 +1304,7 @@ struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
-    /// Remote shell command (default: ssh); when set, the command owns SSH and agent policy and syq neither shares nor persists connections
+    /// Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
@@ -1546,7 +1550,7 @@ struct NativeMapCommand {
     /// Filter emitted mapping entries with a source expression
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
-    /// Remote shell command (default: ssh); when set, syq neither shares nor persists connections
+    /// Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing
     #[arg(long, value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
@@ -2137,9 +2141,6 @@ fn parse_descriptor_copy(
     } else {
         None
     };
-    if parsed.pscope.is_some() && parsed.remote.rsh.is_some() {
-        bail!("--pscope cannot be used with --rsh");
-    }
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeCp;
     // Output descriptors belong to their opener. Named stream destinations
@@ -2226,9 +2227,6 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         prune,
         max_delete,
     } = parsed;
-    if pscope.is_some() && remote.rsh.is_some() {
-        bail!("--pscope cannot be used with --rsh");
-    }
     if copy.delegated_operands_b64 {
         decode_delegated_operands(&mut copy)?;
     }
@@ -2370,6 +2368,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
     args.native_results = results.map(OsStringExt::into_vec);
     args.native_results_fd = results_fd;
     args.suppress_summary = copy.suppress_summary;
+    args.delegated = copy.delegated_operands_b64;
     args.pscope = pscope;
     args.native_source_cwd = copy.selection.source.cwd.clone().map(OsStringExt::into_vec);
     args.native_source_root = copy

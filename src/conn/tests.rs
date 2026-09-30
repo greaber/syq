@@ -1659,7 +1659,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
-    let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None).unwrap();
+    let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, &[]).unwrap();
     let socket = crate::session_pool::socket_path(&multiplexer.path);
     let mut spec = RemoteSpec::local_receiver(true);
     spec.local_process = false;
@@ -1686,12 +1686,12 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     crate::persistence::initialize_scope(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
     // path is cleared so a fresh master can bind.
-    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None).unwrap();
+    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, &[]).unwrap();
     std::fs::write(&probe.path, b"stale").unwrap();
-    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None).unwrap();
+    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, &[]).unwrap();
     assert_eq!(probe.path, multiplexer.path);
     let alternate_port =
-        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222)).unwrap();
+        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), &[]).unwrap();
     assert_ne!(multiplexer.path, alternate_port.path);
     assert!(!multiplexer.path.exists());
     assert_eq!(
@@ -2105,4 +2105,39 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
     assert!(session.contains("target=linux-aarch64") && !session.contains("uname"));
     // Development builds keep asking the host.
     assert_eq!(spec.session_command_for(&server, false), before);
+}
+
+#[test]
+fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
+    let words = |command: &str| shell_words::split(command).unwrap();
+    for shared in [
+        "ssh",
+        "/usr/bin/ssh -p 2222 -i key",
+        "ssh -J jump -F config -o ServerAliveInterval=5",
+        "ssh -4Cv",
+        "ssh -oUser=alice",
+        "ssh -o 'ProxyCommand ssh -W %h:%p gateway'",
+    ] {
+        assert!(shareable_ssh_options(&words(shared)).is_some(), "{shared}");
+    }
+    for own in [
+        "ssh -M",
+        "ssh -4M",
+        "ssh -S /tmp/socket",
+        "ssh -Snone",
+        "ssh -O check",
+        "ssh -o ControlMaster=auto",
+        "ssh -ocontrolpath=/tmp/socket",
+        "ssh -o 'ControlPersist 10'",
+        "tsh ssh",
+        "ssh host",
+        "ssh -- -p",
+        "ssh -p",
+    ] {
+        assert!(shareable_ssh_options(&words(own)).is_none(), "{own}");
+    }
+    assert_eq!(
+        shareable_ssh_options(&words("ssh -p 2222")).unwrap(),
+        ["-p", "2222"]
+    );
 }

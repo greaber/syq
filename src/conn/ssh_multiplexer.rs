@@ -25,6 +25,64 @@ pub(super) const PERSISTENT_SSH_OPTIONS: &[&str] = &[
     "ServerAliveCountMax=3",
 ];
 
+/// The options of an `--rsh` command that syq can treat as its default `ssh`
+/// plus those options: shared and persistent connections work as usual, with
+/// persistent ones kept separately for each set of options. None when the
+/// program is not OpenSSH, or when the options set up connection sharing
+/// themselves (`-M`, `-S`, `-O`, or `ControlMaster`/`ControlPath`/
+/// `ControlPersist`), so that the command keeps full control of it.
+pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<&[String]> {
+    let (program, options) = rsh.split_first()?;
+    if !program.ends_with("ssh") {
+        return None;
+    }
+    // The option letters that take a value in OpenSSH's ssh(1).
+    const VALUED: &[u8] = b"bceilmopBDEFIJLOPQRSwW";
+    let mut index = 0;
+    while index < options.len() {
+        let argument = options[index].as_str();
+        index += 1;
+        // An operand or `--` means this is not a plain list of options.
+        let letters = argument
+            .strip_prefix('-')
+            .filter(|letters| !letters.is_empty() && !letters.starts_with('-'))?;
+        for (at, letter) in letters.bytes().enumerate() {
+            if letter == b'M' {
+                return None;
+            }
+            if VALUED.contains(&letter) {
+                let value = if at + 1 < letters.len() {
+                    &letters[at + 1..]
+                } else {
+                    index += 1;
+                    options.get(index - 1)?.as_str()
+                };
+                if matches!(letter, b'S' | b'O') || (letter == b'o' && configures_sharing(value)) {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+    Some(options)
+}
+
+/// Whether an `--rsh` command string is one syq can share (see
+/// [`shareable_ssh_options`]).
+pub(crate) fn rsh_shares_connections(rsh: &str) -> bool {
+    shell_words::split(rsh).is_ok_and(|words| shareable_ssh_options(&words).is_some())
+}
+
+fn configures_sharing(option: &str) -> bool {
+    let name = option
+        .split(|c: char| c == '=' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    ["ControlMaster", "ControlPath", "ControlPersist"]
+        .iter()
+        .any(|sharing| name.eq_ignore_ascii_case(sharing))
+}
+
 /// The oldest OpenSSH release whose client speaks the agent session-bind
 /// extension and host-bound public-key authentication. Constrained agent
 /// forwarding relies on both, on the local machine and on the coordinator
@@ -135,20 +193,24 @@ impl SshMultiplexer {
         })
     }
 
+    /// `options` are the `--rsh` command's own ssh options, which select a
+    /// separate persistent connection. Receiving connects with plain `ssh`,
+    /// so it starts only for connections without them.
     pub(crate) fn persistent(
         scope: &std::path::Path,
         user: Option<&str>,
         host: &str,
         port: Option<u16>,
+        options: &[String],
     ) -> Result<Self> {
-        let path = crate::persistence::prepare_endpoint(scope, user, host, port)?;
+        let path = crate::persistence::prepare_endpoint(scope, user, host, port, options)?;
         let global = crate::persistence::is_global_scope(scope)?;
         Ok(Self {
             _directory: None,
             path,
             persistent: true,
             idle_timeout: if global { "yes" } else { "300" },
-            automatic_receiving: global,
+            automatic_receiving: global && options.is_empty(),
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
         })

@@ -72,14 +72,14 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `-z, --compress` | Compress remote data in transit automatically (default) |
 | `--no-compress` | Disable transport compression |
-| `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls agent forwarding and syq neither shares nor persists connections |
+| `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing |
 | `--rsync-path <PATH>` | Use this exact syq executable on the remote instead of the managed helper |
 | `--syq-no-bootstrap` | Syq extension: require syq on the remote PATH instead of installing a versioned helper |
 | `--syq-no-tcp-encryption` | Syq extension: send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer |
 | `--syq-no-tcp` | Syq extension: send all data over ssh instead of separate TCP data connections |
 | `--syq-tcp-ports <LO-HI>` | Syq extension: port range the remote listens on for TCP data connections<br><br>[default: 47600-47699] |
 | `--syq-tcp-congestion <ALGO>` | Syq extension: use this congestion-control algorithm for TCP data sockets (Linux only) |
-| `--syq-pscope <PATH>` | Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral` |
+| `--syq-pscope <PATH>` | Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command |
 
 ## Performance tuning
 

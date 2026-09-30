@@ -1741,6 +1741,7 @@ fn connect_completion_endpoint(
             endpoint.user.as_deref(),
             &endpoint.host,
             endpoint.port,
+            &[],
         )?),
         None => Arc::new(SshMultiplexer::new()?),
     };
