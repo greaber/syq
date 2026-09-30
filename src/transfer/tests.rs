@@ -81,6 +81,7 @@ struct PipelineState {
     latency: Option<std::time::Duration>,
     ready: std::collections::VecDeque<std::time::Instant>,
     abort_on_receive: Option<Arc<Sched>>,
+    stop_on_receive: Option<(usize, Arc<Sched>, Option<usize>)>,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -166,6 +167,18 @@ impl Conn for PipelineConn {
         }
         if let Some(sched) = state.abort_on_receive.take() {
             sched.abort();
+        }
+        if state
+            .stop_on_receive
+            .as_ref()
+            .is_some_and(|(at, _, _)| *at == state.received)
+        {
+            let (_, sched, failed_file) = state.stop_on_receive.take().unwrap();
+            if let Some(idx) = failed_file {
+                sched.fail_file(idx);
+            } else {
+                sched.abort();
+            }
         }
         Ok(state.replies.pop_front().expect("unexpected receive"))
     }
@@ -2163,6 +2176,7 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
         ] {
             let sched = Arc::new(Sched::new(512, 8192));
             let mut job = pipeline_job(b"source", 1536);
+            // A final file must not take precedence over an owned partial.
             if matches!(
                 basis,
                 "final" | "owned-partial" | "candidate-with-final" | "candidate-reuse-off"
@@ -2269,6 +2283,7 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
                 .requests
                 .iter()
                 .any(|r| matches!(r, Request::ReadComparedRange { .. })));
+            // Pay the budget before sending, not after receiving the payload.
             assert!(
                 source.sent_at[read].duration_since(source.sent_at[read - 1])
                     >= std::time::Duration::from_millis(100),
@@ -2289,6 +2304,14 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
                 .requests
                 .iter()
                 .any(|r| matches!(r, Request::SeedBasis { .. })));
+            let allowed_final = matches!(basis, "final" | "candidate-with-final");
+            assert!(
+                destination.requests.iter().any(|r| matches!(
+                    r, Request::StageBasis { allow_final, .. } if *allow_final == allowed_final
+                )),
+                "{basis}: {:?}",
+                destination.requests
+            );
         }
     }
 }
@@ -2469,4 +2492,119 @@ fn capped_comparison_hash_errors_drain_both_endpoints_without_writes() {
             assert_eq!(state.requests.len(), 1);
         }
     }
+}
+
+#[test]
+fn capped_comparisons_stop_admitting_requests_and_drain_after_cancellation() {
+    for failed_file in [None, Some(0)] {
+        for phase in ["hash", "payload", "write"] {
+            let (sched, range, _) = pipeline_ranges(&[(0, 8192)]);
+            sched.jobs.lock().unwrap()[0].compare_ranges = true;
+            let src = Arc::new(Mutex::new(PipelineState::default()));
+            let dst = Arc::new(Mutex::new(PipelineState {
+                peer: Some(src.clone()),
+                ..Default::default()
+            }));
+            let stop = if phase == "write" { &dst } else { &src };
+            stop.lock().unwrap().stop_on_receive = Some((
+                if phase == "hash" { 1 } else { 2 },
+                sched.clone(),
+                failed_file,
+            ));
+            src.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Hashes(vec![[1; 32]; 16]));
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Hashes(vec![[2; 32]; 16]));
+            for off in (0..8192).step_by(512) {
+                let data = vec![1; 512];
+                src.lock().unwrap().replies.push_back(Response::Block {
+                    off,
+                    hash: content_digest(&data),
+                    data,
+                });
+                dst.lock().unwrap().replies.push_back(Response::Ok);
+            }
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
+            let opts = Arc::get_mut(&mut worker.opts).unwrap();
+            opts.src_remote = true;
+            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
+            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1 << 30)));
+            worker.progress.bytes_total.store(8192, Relaxed);
+            worker.transfer_range(&range, &mut 0).unwrap();
+            worker.finish_file(0).unwrap();
+            let source = src.lock().unwrap();
+            let destination = dst.lock().unwrap();
+            let admitted_at_stop = match phase {
+                "hash" => 1,
+                "payload" => source.sent_at_receive[1],
+                "write" => destination.peer_sent_at_receive[1],
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                source.requests.len(),
+                admitted_at_stop,
+                "{phase} {failed_file:?}"
+            );
+            assert_eq!(
+                source.received,
+                source.requests.len(),
+                "drain source replies"
+            );
+            assert_eq!(
+                destination.received,
+                destination.requests.len(),
+                "drain write replies"
+            );
+            assert!(!destination
+                .requests
+                .iter()
+                .any(|r| matches!(r, Request::Finalize { .. })));
+            if phase != "write" {
+                assert_eq!(destination.requests.len(), 1, "no writes after stop");
+            }
+        }
+    }
+}
+
+#[test]
+fn cancelled_comparison_drains_prefetched_hashes_without_new_writes() {
+    let (sched, range, job) = pipeline_ranges(&[(0, 8192)]);
+    sched.jobs.lock().unwrap()[0].compare_ranges = true;
+    let src = Arc::new(Mutex::new(PipelineState {
+        abort_on_receive: Some(sched.clone()),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    dst.lock().unwrap().replies.extend([
+        Response::Hashes(vec![[2; 32]; 4]),
+        Response::Hashes(vec![[2; 32]; 4]),
+    ]);
+    for off in (0..2048).step_by(512) {
+        src.lock().unwrap().replies.push_back(Response::Block {
+            off,
+            hash: [1; 32],
+            data: vec![1; 512],
+        });
+    }
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let mut credited = 0;
+    worker.transfer_range(&range, &mut credited).unwrap();
+    worker.finish_file(0).unwrap();
+    assert_eq!(credited, 0);
+    assert_eq!(job.done.load(Relaxed), 0);
+    for state in [&src, &dst] {
+        let state = state.lock().unwrap();
+        assert!(state.replies.is_empty());
+        assert_eq!(state.received, state.requests.len());
+    }
+    assert!(dst
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|r| matches!(r, Request::HashWindow { .. })));
 }

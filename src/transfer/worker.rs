@@ -1541,9 +1541,10 @@ impl Worker {
         let mut writes = std::collections::VecDeque::new();
         let mut next_window = None;
         let mut pending_hash = false;
+        let stopped = |worker: &Self| worker.sched.is_aborted() || worker.sched.is_failed(idx);
         let result = (|| -> Result<()> {
-            loop {
-                if self.sched.is_aborted() || self.sched.is_failed(idx) {
+            'windows: loop {
+                if stopped(self) {
                     break;
                 }
                 let (start, end, hashes, source_hashes) = if let Some((start, end, hashes)) =
@@ -1580,6 +1581,9 @@ impl Worker {
                         (start, end, hashes, None)
                     }
                 };
+                if stopped(self) {
+                    break;
+                }
                 // This response precedes the write acknowledgments below.
                 // The receiver hashes ahead while the source reads this window.
                 let ahead = if prefetch {
@@ -1615,12 +1619,21 @@ impl Worker {
                     });
                 loop {
                     while reads.len() < read_depth {
+                        // A paced window can take minutes. Stop before spending
+                        // more budget or admitting another request, then drain
+                        // only requests already sent through the cleanup below.
+                        if stopped(self) {
+                            break 'windows;
+                        }
                         let Some((off, len, expected, known_match)) = blocks.next() else {
                             break;
                         };
                         if !known_match {
                             let request = if paced_source {
                                 self.limit(len);
+                                if stopped(self) {
+                                    break 'windows;
+                                }
                                 Request::ReadRange {
                                     path: job.src.clone(),
                                     source: self.source_reference(job),
@@ -1655,6 +1668,9 @@ impl Worker {
                     } else {
                         ok(self.src.recv()?, "compare source block")?
                     };
+                    if stopped(self) {
+                        break 'windows;
+                    }
                     match reply {
                         Response::RangeMatched { off, len } if !paced_source || known_match => {
                             validate_range_reply(expected_off, expected_len, off, len as usize)?;
@@ -1684,6 +1700,9 @@ impl Worker {
                             self.benchmark.range_requests += 1;
                             if !paced_source {
                                 self.limit(expected_len);
+                                if stopped(self) {
+                                    break 'windows;
+                                }
                             }
                             self.dst.send(Request::WriteRange {
                                 path: job.dst.clone(),
