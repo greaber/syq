@@ -87,12 +87,11 @@ struct PersistenceConfig {
     enabled: bool,
 }
 
-/// An `--rsh` ssh command's own options and the directory they were given
-/// in: relative paths in them, such as `-F ssh.conf` or `-i key`, depend on it.
+/// An `--rsh` ssh command's own options, with relative file paths made
+/// absolute (see `conn::persistent_ssh_options`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SshOptions {
     pub(crate) options: Vec<String>,
-    pub(crate) directory: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,13 +100,11 @@ pub(crate) struct EndpointRecord {
     pub(crate) user: Option<String>,
     pub(crate) host: String,
     pub(crate) port: Option<u16>,
-    /// The `--rsh` ssh command's own options for this connection and the
-    /// directory they were given in. Omitted for default connections, which
-    /// keep the original record format.
+    /// The `--rsh` ssh command's own options for this connection, with
+    /// relative file paths made absolute. Omitted for default connections,
+    /// which keep the original record format.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) ssh_options: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) ssh_options_directory: Option<PathBuf>,
 }
 
 impl EndpointRecord {
@@ -117,14 +114,12 @@ impl EndpointRecord {
             host: host.to_owned(),
             port,
             ssh_options: ssh.map(|ssh| ssh.options.clone()).unwrap_or_default(),
-            ssh_options_directory: ssh.map(|ssh| ssh.directory.clone()),
         }
     }
 
     fn ssh(&self) -> Option<SshOptions> {
-        Some(SshOptions {
+        (!self.ssh_options.is_empty()).then(|| SshOptions {
             options: self.ssh_options.clone(),
-            directory: self.ssh_options_directory.clone()?,
         })
     }
 
@@ -745,10 +740,9 @@ fn secure_directory(path: &Path, create: bool, tighten: bool) -> Result<File> {
     Ok(directory)
 }
 
-/// An `--rsh` ssh command's options, with the directory they were given in,
-/// select a separate connection, so a login made with one key, jump host, or
-/// configuration is never reused by a command that asked for another. Without
-/// them the key is unchanged.
+/// An `--rsh` ssh command's options select a separate connection, so a login
+/// made with one key, jump host, or configuration is never reused by a command
+/// that asked for another. Without them the key is unchanged.
 fn endpoint_key(
     user: Option<&str>,
     host: &str,
@@ -766,9 +760,6 @@ fn endpoint_key(
     }
     if let Some(ssh) = ssh {
         hasher.update(b"\0ssh-options");
-        let directory = ssh.directory.as_os_str().as_encoded_bytes();
-        hasher.update((directory.len() as u64).to_be_bytes());
-        hasher.update(directory);
         for option in &ssh.options {
             hasher.update((option.len() as u64).to_be_bytes());
             hasher.update(option.as_bytes());
@@ -871,12 +862,9 @@ fn socket_is_live(path: &Path) -> bool {
 #[derive(Serialize)]
 struct ConnectionStatus {
     endpoint: String,
-    /// The `--rsh` ssh command's own options for this connection, and the
-    /// directory they were given in.
+    /// The `--rsh` ssh command's own options for this connection.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ssh_options: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ssh_options_directory: Option<PathBuf>,
     state: String,
     ssh_connected: bool,
     receiving_enabled: Option<bool>,
@@ -929,7 +917,6 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         connections.push(ConnectionStatus {
             endpoint: record.label(),
             ssh_options: record.ssh_options.clone(),
-            ssh_options_directory: record.ssh_options_directory.clone(),
             state: state.to_owned(),
             ssh_connected: ssh_live,
             receiving_enabled,
@@ -956,11 +943,10 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     crate::output::human_stdout!("connections: {}", connections.len());
     for connection in connections {
         let mut line = format!("  {}", connection.endpoint);
-        if let Some(directory) = &connection.ssh_options_directory {
+        if !connection.ssh_options.is_empty() {
             line.push_str(&format!(
-                " (ssh options: {}; in {})",
-                shell_words::join(&connection.ssh_options),
-                directory.display()
+                " (ssh options: {})",
+                shell_words::join(&connection.ssh_options)
             ));
         }
         line.push_str(&format!("  {}", connection.state));
@@ -989,7 +975,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             }
         }
         // Only a copy with the same --rsh options reopens such a connection.
-        if connection.state == "inactive" && connection.ssh_options_directory.is_none() {
+        if connection.state == "inactive" && connection.ssh_options.is_empty() {
             line.push_str(&format!(
                 "; run syq persist connect {}",
                 shell_words::quote(&connection.endpoint)

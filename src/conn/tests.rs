@@ -2164,3 +2164,43 @@ fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
             .persist
     );
 }
+
+#[test]
+fn persistent_ssh_options_resolve_relative_file_paths() {
+    let words = |command: &str| shell_words::split(command).unwrap();
+    let directory = std::path::Path::new("/project");
+    let resolve = |command: &str| {
+        persistent_ssh_options(&words(command), Some(directory)).map(|o| o.join(" "))
+    };
+    // Options that name no local file do not depend on the directory.
+    assert_eq!(
+        resolve("-p 2222 -J jump -o ServerAliveInterval=5").unwrap(),
+        "-p 2222 -J jump -o ServerAliveInterval=5"
+    );
+    assert_eq!(
+        persistent_ssh_options(&words("-p 2222"), None).unwrap(),
+        ["-p", "2222"]
+    );
+    for (given, key) in [
+        ("-F ssh.conf", "-F /project/ssh.conf"),
+        ("-issh-key", "-i/project/ssh-key"),
+        ("-4i key", "-4i /project/key"),
+        ("-o IdentityFile=key", "-o IdentityFile=/project/key"),
+        (
+            "-o 'UserKnownHostsFile a /etc/b'",
+            "-o UserKnownHostsFile=/project/a /etc/b",
+        ),
+        (
+            "-i ~/.ssh/id -F /etc/ssh.conf",
+            "-i ~/.ssh/id -F /etc/ssh.conf",
+        ),
+        (
+            "-o IdentityAgent=$SSH_AUTH_SOCK",
+            "-o IdentityAgent=$SSH_AUTH_SOCK",
+        ),
+    ] {
+        assert_eq!(resolve(given).unwrap(), key, "{given}");
+    }
+    // Without a directory a relative path cannot be keyed.
+    assert!(persistent_ssh_options(&words("-F ssh.conf"), None).is_none());
+}

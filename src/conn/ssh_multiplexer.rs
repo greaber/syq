@@ -106,6 +106,81 @@ pub(crate) fn rsh_persists_connections(rsh: &str) -> bool {
         .is_ok_and(|words| shareable_ssh_options(&words).is_some_and(|sharing| sharing.persist))
 }
 
+/// The options that identify a persistent connection. Relative paths to local
+/// files, as in `-F ssh.conf` or `-i key`, resolve against the working
+/// directory, so they are made absolute: the same options given in another
+/// directory can name different files, and must not reuse this connection.
+/// None when such a path cannot be made absolute.
+pub(crate) fn persistent_ssh_options(
+    options: &[String],
+    directory: Option<&std::path::Path>,
+) -> Option<Vec<String>> {
+    // Option letters whose value is a local file, and `-o` names likewise.
+    const FILE_LETTERS: &[u8] = b"EFIi";
+    const FILE_OPTIONS: &[&str] = &[
+        "CertificateFile",
+        "GlobalKnownHostsFile",
+        "IdentityAgent",
+        "IdentityFile",
+        "PKCS11Provider",
+        "RevokedHostKeys",
+        "SecurityKeyProvider",
+        "UserKnownHostsFile",
+        "XAuthLocation",
+    ];
+    const VALUED: &[u8] = b"bceilmopBDEFIJLOPQRSwW";
+    let absolute = |path: &str| -> Option<String> {
+        if path.starts_with(['/', '~', '%', '$']) || path.eq_ignore_ascii_case("none") {
+            return Some(path.to_owned());
+        }
+        directory?.join(path).to_str().map(str::to_owned)
+    };
+    let mut resolved = Vec::with_capacity(options.len());
+    let mut index = 0;
+    while index < options.len() {
+        let argument = &options[index];
+        index += 1;
+        let letters = argument.strip_prefix('-').unwrap_or_default();
+        let Some(at) = letters.bytes().position(|letter| VALUED.contains(&letter)) else {
+            resolved.push(argument.clone());
+            continue;
+        };
+        let letter = letters.as_bytes()[at];
+        let (value, inline) = if at + 1 < letters.len() {
+            (letters[at + 1..].to_owned(), true)
+        } else {
+            index += 1;
+            (options.get(index - 1)?.clone(), false)
+        };
+        let value = if FILE_LETTERS.contains(&letter) {
+            absolute(&value)?
+        } else if letter == b'o' {
+            let (name, setting) = option_name(&value);
+            if FILE_OPTIONS
+                .iter()
+                .any(|file| name.eq_ignore_ascii_case(file))
+            {
+                let paths = setting
+                    .split_whitespace()
+                    .map(absolute)
+                    .collect::<Option<Vec<_>>>()?;
+                format!("{name}={}", paths.join(" "))
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        if inline {
+            resolved.push(format!("-{}{value}", &letters[..=at]));
+        } else {
+            resolved.push(argument.clone());
+            resolved.push(value);
+        }
+    }
+    Some(resolved)
+}
+
 /// An `-o` option's name and value. OpenSSH accepts leading whitespace and
 /// either `=` or whitespace between them.
 fn option_name(option: &str) -> (&str, &str) {

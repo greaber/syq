@@ -236,15 +236,18 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     assert_ne!(other, default);
     assert_eq!(read(&t.path("again")), b"shared");
 
-    // Relative paths in options depend on the directory, so the same options
-    // given elsewhere get their own connection.
+    // Options that name no file mean the same in any directory.
     let (elsewhere, _) = copy_in(
         "elsewhere",
         Some("-o ServerAliveInterval=7"),
         "elsewhere-copy",
     );
-    assert_eq!(elsewhere.len(), 1);
-    assert_ne!(elsewhere, first);
+    assert_eq!(elsewhere, first);
+    // A relative file path does not: each directory names its own file.
+    let (key_here, _) = copy(Some("-o IdentityFile=key"), "key-here");
+    let (key_there, _) = copy_in("elsewhere", Some("-o IdentityFile=key"), "key-there");
+    assert_eq!(key_here.len(), 1);
+    assert_ne!(key_here, key_there);
 
     // Options that set up sharing themselves keep full control of it.
     let (own, log) = copy(Some("-o ControlPath=none"), "own");
@@ -288,11 +291,11 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     assert_output_ok(&status);
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(
-        status.contains("(ssh options: -o 'ServerAliveInterval=7'; in "),
+        status.contains("(ssh options: -o 'ServerAliveInterval=7')"),
         "{status}"
     );
     assert!(
-        status.contains("(ssh options: -o 'ServerAliveInterval=9'; in "),
+        status.contains("(ssh options: -o 'ServerAliveInterval=9')"),
         "{status}"
     );
     let closed = persistence_command(&t, &["off", "--pscope", scope_text])

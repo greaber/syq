@@ -333,8 +333,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 );
             }
             // An --rsh ssh command shares and persists connections like the
-            // default ssh, keyed by its options and the directory they were
-            // given in. A remote-to-remote coordinator's shell was chosen for
+            // default ssh, keyed by its options with relative file paths made
+            // absolute. A remote-to-remote coordinator's shell was chosen for
             // it by the invoking machine and never persists a login on the
             // server.
             let sharing: Option<(Option<crate::persistence::SshOptions>, bool)> = match &args.rsh {
@@ -342,20 +342,18 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 Some(_) if args.delegated || args.restricted_grant.is_some() => None,
                 Some(_) => crate::conn::shareable_ssh_options(&rsh).map(|sharing| {
                     if sharing.options.is_empty() {
-                        (None, sharing.persist)
-                    } else {
-                        match std::env::current_dir() {
-                            Ok(directory) => (
-                                Some(crate::persistence::SshOptions {
-                                    options: sharing.options.to_vec(),
-                                    directory,
-                                }),
-                                sharing.persist,
-                            ),
-                            // Without the directory, relative paths in the
-                            // options cannot be keyed; share only this run.
-                            Err(_) => (None, false),
-                        }
+                        return (None, sharing.persist);
+                    }
+                    let directory = std::env::current_dir().ok();
+                    match crate::conn::persistent_ssh_options(sharing.options, directory.as_deref())
+                    {
+                        Some(options) => (
+                            Some(crate::persistence::SshOptions { options }),
+                            sharing.persist,
+                        ),
+                        // A relative path that cannot be made absolute cannot
+                        // be keyed safely; share only within this run.
+                        None => (None, false),
                     }
                 }),
             };

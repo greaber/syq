@@ -11,10 +11,11 @@ syq persist connect server
 You can close the terminal afterward. To enable persistence for connections
 opened by later syq commands instead, run `syq persist on`. Persistence also
 applies to an `--rsh` (or rsync `-e`) command that runs `ssh` with its own
-options, such as `-e 'ssh -p 2222 -i key'`. Each set of options, together with
-the directory the command runs in, keeps its own connection, so a login made
-with one key, jump host, or configuration file is never reused by a command
-that asked for another. Receiving and the pool of ready sessions use only
+options, such as `-e 'ssh -p 2222 -i key'`. Each set of options keeps its own
+connection, so a login made with one key, jump host, or configuration file is
+never reused by a command that asked for another. A relative path to a file in
+the options, such as `-F ssh.conf`, names a different file in each directory,
+so it counts as different options there. Receiving and the pool of ready sessions use only
 connections made with your plain `ssh`. With `-v` or a debug `LogLevel`, a
 command shares its connection only while it runs, so debug output does not
 outlive it. Options that set up SSH connection sharing themselves (`-M`, `-S`,
