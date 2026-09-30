@@ -323,6 +323,44 @@ fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("could not install ~/.local/bin/syq"));
 }
 
+/// The local helper cache only saves later downloads. When it cannot be
+/// written, the upload still happens from a download verified in memory.
+#[test]
+fn helper_upload_works_without_a_writable_local_cache_or_config() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+    for directory in ["cache", "config"] {
+        fs::create_dir_all(t.path(directory)).unwrap();
+        fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    write(&t.path("src"), b"uncached helper");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+    for directory in ["cache", "config"] {
+        fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"uncached helper");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert!(!cached_local_helper(&t).exists());
+    assert_eq!(fs::read_dir(t.path("config")).unwrap().count(), 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot cache the downloaded remote helper"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn remote_corrupted_local_helper_cache_is_discarded_and_refetched() {
     let t = Tmp::new();
