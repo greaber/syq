@@ -5610,13 +5610,53 @@ fn directory_changes_share_each_directory_between_two_threads() {
 }
 
 #[cfg(target_os = "linux")]
+fn deleted_file_is_open(path: &Path) -> bool {
+    // Inodes can be reused by parallel tests after the donor is closed. The
+    // unique fixture path still identifies it after unlink or replacement.
+    let mut deleted = path.as_os_str().to_os_string();
+    deleted.push(" (deleted)");
+    fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+        let fd = entry.unwrap().path();
+        match fs::read_link(&fd) {
+            Ok(target) => target.as_os_str() == deleted,
+            // Other tests can close descriptors while we enumerate them.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => panic!("read descriptor {}: {error}", fd.display()),
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deleted_file_descriptor_check_distinguishes_replacement_and_other_files() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"donor").unwrap();
+    let donor = File::open(&path).unwrap();
+    assert!(!deleted_file_is_open(&path));
+    fs::remove_file(&path).unwrap();
+    assert!(deleted_file_is_open(&path));
+
+    fs::write(&path, b"replacement").unwrap();
+    let replacement = File::open(&path).unwrap();
+    let other_path = tree.path().join("other");
+    fs::write(&other_path, b"other").unwrap();
+    let other = File::open(&other_path).unwrap();
+    fs::remove_file(&other_path).unwrap();
+    assert!(deleted_file_is_open(&path));
+
+    drop(donor);
+    assert!(!deleted_file_is_open(&path));
+    assert!(deleted_file_is_open(&other_path));
+    drop((replacement, other));
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn comparison_workers_release_donor_descriptors_before_publication() {
-    use std::os::unix::fs::MetadataExt;
     let tree = crate::test_support::tempdir().unwrap();
     let path = tree.path().join("file");
     fs::write(&path, b"abcdefgh").unwrap();
-    let old = fs::metadata(&path).unwrap();
     let id = [103; 16];
     let mut creator = destination_ops(tree.path());
     assert!(matches!(
@@ -5676,16 +5716,7 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
     assert_eq!(fs::read(&path).unwrap(), b"abcdWXYZ");
     // Keep all sessions alive while checking every descriptor, including those
     // owned by workers which never execute Finalize.
-    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
-        if let Ok(meta) = fs::metadata(entry.path()) {
-            assert_ne!(
-                (meta.dev(), meta.ino()),
-                (old.dev(), old.ino()),
-                "donor still open: {:?}",
-                entry.path()
-            );
-        }
-    }
+    assert!(!deleted_file_is_open(&path), "donor still open: {path:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -5694,7 +5725,6 @@ fn unconsumed_comparison_windows_do_not_pin_deleted_donors_after_failure() {
     let tree = crate::test_support::tempdir().unwrap();
     let path = tree.path().join("file");
     fs::write(&path, b"abcdefgh").unwrap();
-    let old = fs::metadata(&path).unwrap();
     let mut ops = destination_ops(tree.path());
     let id = [104; 16];
     for off in [0, 4] {
@@ -5726,16 +5756,10 @@ fn unconsumed_comparison_windows_do_not_pin_deleted_donors_after_failure() {
     ));
     fs::remove_file(&path).unwrap();
     assert_eq!(ops.comparison_window.as_ref().unwrap().blocks.len(), 2);
-    for entry in fs::read_dir("/proc/self/fd").unwrap().flatten() {
-        if let Ok(meta) = fs::metadata(entry.path()) {
-            assert_ne!(
-                (meta.dev(), meta.ino()),
-                (old.dev(), old.ino()),
-                "unconsumed comparison pinned deleted donor: {:?}",
-                entry.path()
-            );
-        }
-    }
+    assert!(
+        !deleted_file_is_open(&path),
+        "unconsumed comparison pinned deleted donor: {path:?}"
+    );
 }
 
 #[cfg(target_os = "macos")]
