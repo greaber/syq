@@ -360,7 +360,9 @@ impl Worker {
         let mut writes = std::collections::VecDeque::new();
         let result = (|| -> Result<()> {
             'issuing: loop {
-                while reads.len() < read_window {
+                // A retired worker finishes its issued groups, but leaves the
+                // unread suffix available to peers instead of refilling the pipe.
+                while self.gate.allowed(self.id) && reads.len() < read_window {
                     let Some(group) = groups.next() else { break };
                     let mut requests = Vec::new();
                     for job in &jobs[group.clone()] {
@@ -506,6 +508,10 @@ impl Worker {
     }
 
     pub(super) fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
+        // Issued reads/writes and the final source recheck can outlive a count
+        // reduction. Use the existing whole-file drain guard until all of their
+        // progress is recorded, so a lower-count sample cannot include this slot.
+        let _draining = self.gate.whole_file(self.id);
         #[cfg(debug_assertions)]
         crate::fsops::record_test_event(
             "SYQ_TEST_WORKER_EVENTS",

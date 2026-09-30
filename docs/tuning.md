@@ -314,6 +314,8 @@ from older logical-byte-cap history.
 Small-file copies can continue exploring worker counts after files have been
 assigned to batches, while unread work can still be shared with other workers.
 Requests already in flight do not count as work an additional worker can take.
+After reducing the count, measurements wait for retiring batch workers to finish
+their outstanding requests.
 A long copy alone does not guarantee a saved starting count: that requires
 sufficient usable measurements at more than one worker count.
 

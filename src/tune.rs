@@ -1153,7 +1153,7 @@ impl Gate {
             .any(|slot| slot.whole_file)
     }
 
-    fn measurement_ready(&self, n: usize) -> bool {
+    pub(crate) fn measurement_ready(&self, n: usize) -> bool {
         self.ready_through(n) && !self.whole_files_draining(n)
     }
 
