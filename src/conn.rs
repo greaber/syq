@@ -1378,17 +1378,34 @@ impl RemoteSpec {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
         if self.bootstrap_helper {
-            // Every session reaches the host that answered the first
-            // handshake. A release helper was chosen by the same mapping that
-            // names its platform, so later sessions can skip `uname`. A
-            // development build may run as the `self` target instead.
-            let target = crate::identity::uses_release_helpers()
-                .then(|| self.diagnostics.lock().unwrap().peer.clone())
-                .flatten()
-                .and_then(|peer| remote_helper::Target::key_for_platform(&peer.platform));
-            return remote_helper::launcher(args, target);
+            return remote_helper::launcher(args, None);
         }
         format!("syq {}", shell_words::join(args))
+    }
+
+    /// The command for another session of this run. After a handshake, a
+    /// release build launches the helper it identified without asking the
+    /// host for its platform again. Anything that outlives the run, such as
+    /// the session pool's key or the receive service, keeps
+    /// `program_command`, which does not depend on an earlier handshake.
+    fn session_command(&self, args: &[String]) -> String {
+        self.session_command_for(args, crate::identity::uses_release_helpers())
+    }
+
+    fn session_command_for(&self, args: &[String], release_helpers: bool) -> String {
+        if self.syq_path.is_none() && self.bootstrap_helper && release_helpers {
+            // Every session reaches the host that answered the first
+            // handshake, and a release helper was chosen by the same mapping
+            // that names its platform. A development build may run as the
+            // `self` target on a platform its handshake does not name.
+            let peer = self.diagnostics.lock().unwrap().peer.clone();
+            if let Some(target) =
+                peer.and_then(|peer| remote_helper::Target::key_for_platform(&peer.platform))
+            {
+                return remote_helper::launcher(args, Some(target));
+            }
+        }
+        self.program_command(args)
     }
 
     /// `limited`: take a connect slot (data connections). The control
@@ -1622,7 +1639,7 @@ impl RemoteSpec {
                 // SSH_ORIGINAL_COMMAND; sshd replaces the requested executable.
                 format!("syq {}", shell_words::join(&server_args))
             } else {
-                self.program_command(&server_args)
+                self.session_command(&server_args)
             };
             command.arg(remote_command);
             command
