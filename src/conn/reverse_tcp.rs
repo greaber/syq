@@ -18,7 +18,7 @@ impl RemoteSpec {
         ports: (u16, u16),
         congestion_control: Option<&str>,
     ) -> Result<PendingTcpSetup> {
-        let (port, listeners) = crate::server::bind_data_listeners(ports.0, ports.1)?;
+        let (port, listeners) = crate::server::bind_data_listeners(ports.0, ports.1, false)?;
         let mut effective = None;
         for listener in &listeners {
             effective = effective.or(configure_tcp_congestion(listener, congestion_control)?);

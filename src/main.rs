@@ -259,7 +259,9 @@ fn main() {
             && argv.get(2).and_then(|arg| arg.to_str()) == Some("--server"));
     if server_mode {
         fsops::reserve_startup_descriptors();
-        if let Err(e) = server::run() {
+        let local_receiver = argv.get(1).and_then(|arg| arg.to_str()) == Some("--server")
+            && argv.get(2).and_then(|arg| arg.to_str()) == Some("--local-receiver");
+        if let Err(e) = server::run(local_receiver) {
             crate::output::diagnostic!("syq server: {e:#}");
             std::process::exit(1);
         }
