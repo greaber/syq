@@ -347,12 +347,10 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     let directory = std::env::current_dir().ok();
                     match crate::conn::persistent_ssh_options(sharing.options, directory.as_deref())
                     {
-                        Some(options) => (
-                            Some(crate::persistence::SshOptions { options }),
-                            sharing.persist,
-                        ),
-                        // A relative path that cannot be made absolute cannot
-                        // be keyed safely; share only within this run.
+                        Some(options) => (Some(options), sharing.persist),
+                        // A relative path or command directory that cannot be
+                        // recorded cannot be keyed safely; share only within
+                        // this run.
                         None => (None, false),
                     }
                 }),

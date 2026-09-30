@@ -2170,7 +2170,10 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
     let words = |command: &str| shell_words::split(command).unwrap();
     let directory = std::path::Path::new("/project");
     let resolve = |command: &str| {
-        persistent_ssh_options(&words(command), Some(directory)).map(|o| o.join(" "))
+        persistent_ssh_options(&words(command), Some(directory)).map(|o| {
+            assert_eq!(o.directory, None, "{command}");
+            o.options.join(" ")
+        })
     };
     // Options that name no local file do not depend on the directory.
     assert_eq!(
@@ -2178,7 +2181,9 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
         "-p 2222 -J jump -o ServerAliveInterval=5"
     );
     assert_eq!(
-        persistent_ssh_options(&words("-p 2222"), None).unwrap(),
+        persistent_ssh_options(&words("-p 2222"), None)
+            .unwrap()
+            .options,
         ["-p", "2222"]
     );
     for (given, key) in [
@@ -2203,4 +2208,19 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
     }
     // Without a directory a relative path cannot be keyed.
     assert!(persistent_ssh_options(&words("-F ssh.conf"), None).is_none());
+    // A local command can refer to the directory in any way, so it ties the
+    // connection to the directory itself.
+    for command in [
+        "-o ProxyCommand=./proxy",
+        "-o 'ProxyCommand ssh -W %h:%p jump'",
+        "-o 'localcommand=make sync'",
+        "-o KnownHostsCommand=./hosts",
+    ] {
+        let options = persistent_ssh_options(&words(command), Some(directory)).unwrap();
+        assert_eq!(options.directory.as_deref(), Some("/project"), "{command}");
+        assert!(
+            persistent_ssh_options(&words(command), None).is_none(),
+            "{command}"
+        );
+    }
 }

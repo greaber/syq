@@ -88,10 +88,12 @@ struct PersistenceConfig {
 }
 
 /// An `--rsh` ssh command's own options, with relative file paths made
-/// absolute (see `conn::persistent_ssh_options`).
+/// absolute, and the working directory when an option runs a local command
+/// (see `conn::persistent_ssh_options`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SshOptions {
     pub(crate) options: Vec<String>,
+    pub(crate) directory: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +107,10 @@ pub(crate) struct EndpointRecord {
     /// which keep the original record format.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) ssh_options: Vec<String>,
+    /// The directory a local command in those options, such as a
+    /// ProxyCommand, runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ssh_options_directory: Option<String>,
 }
 
 impl EndpointRecord {
@@ -114,12 +120,14 @@ impl EndpointRecord {
             host: host.to_owned(),
             port,
             ssh_options: ssh.map(|ssh| ssh.options.clone()).unwrap_or_default(),
+            ssh_options_directory: ssh.and_then(|ssh| ssh.directory.clone()),
         }
     }
 
     fn ssh(&self) -> Option<SshOptions> {
         (!self.ssh_options.is_empty()).then(|| SshOptions {
             options: self.ssh_options.clone(),
+            directory: self.ssh_options_directory.clone(),
         })
     }
 
@@ -760,6 +768,11 @@ fn endpoint_key(
     }
     if let Some(ssh) = ssh {
         hasher.update(b"\0ssh-options");
+        if let Some(directory) = &ssh.directory {
+            hasher.update(b"\0directory");
+            hasher.update((directory.len() as u64).to_be_bytes());
+            hasher.update(directory.as_bytes());
+        }
         for option in &ssh.options {
             hasher.update((option.len() as u64).to_be_bytes());
             hasher.update(option.as_bytes());
@@ -862,9 +875,12 @@ fn socket_is_live(path: &Path) -> bool {
 #[derive(Serialize)]
 struct ConnectionStatus {
     endpoint: String,
-    /// The `--rsh` ssh command's own options for this connection.
+    /// The `--rsh` ssh command's own options for this connection, and the
+    /// directory a local command among them runs in.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ssh_options: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_options_directory: Option<String>,
     state: String,
     ssh_connected: bool,
     receiving_enabled: Option<bool>,
@@ -917,6 +933,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         connections.push(ConnectionStatus {
             endpoint: record.label(),
             ssh_options: record.ssh_options.clone(),
+            ssh_options_directory: record.ssh_options_directory.clone(),
             state: state.to_owned(),
             ssh_connected: ssh_live,
             receiving_enabled,
@@ -945,9 +962,13 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         let mut line = format!("  {}", connection.endpoint);
         if !connection.ssh_options.is_empty() {
             line.push_str(&format!(
-                " (ssh options: {})",
+                " (ssh options: {}",
                 shell_words::join(&connection.ssh_options)
             ));
+            if let Some(directory) = &connection.ssh_options_directory {
+                line.push_str(&format!("; run in {directory}"));
+            }
+            line.push(')');
         }
         line.push_str(&format!("  {}", connection.state));
         if kind == "ephemeral" {

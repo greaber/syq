@@ -248,6 +248,13 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     let (key_there, _) = copy_in("elsewhere", Some("-o IdentityFile=key"), "key-there");
     assert_eq!(key_here.len(), 1);
     assert_ne!(key_here, key_there);
+    // Nor does a local command, which may refer to files there.
+    let (proxy_here, _) = copy(Some("-o ProxyCommand=./proxy"), "proxy-here");
+    let (proxy_there, _) = copy_in("elsewhere", Some("-o ProxyCommand=./proxy"), "proxy-there");
+    let (proxy_again, _) = copy(Some("-o ProxyCommand=./proxy"), "proxy-again");
+    assert_eq!(proxy_here.len(), 1);
+    assert_ne!(proxy_here, proxy_there);
+    assert_eq!(proxy_here, proxy_again);
 
     // Options that set up sharing themselves keep full control of it.
     let (own, log) = copy(Some("-o ControlPath=none"), "own");

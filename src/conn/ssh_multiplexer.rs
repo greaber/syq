@@ -110,11 +110,17 @@ pub(crate) fn rsh_persists_connections(rsh: &str) -> bool {
 /// files, as in `-F ssh.conf` or `-i key`, resolve against the working
 /// directory, so they are made absolute: the same options given in another
 /// directory can name different files, and must not reuse this connection.
-/// None when such a path cannot be made absolute.
+/// Options that run a local command, such as `ProxyCommand=./proxy`, can refer
+/// to the directory in ways that cannot be resolved, so they tie the connection
+/// to the directory itself. None when a path or that directory cannot be
+/// recorded.
 pub(crate) fn persistent_ssh_options(
     options: &[String],
     directory: Option<&std::path::Path>,
-) -> Option<Vec<String>> {
+) -> Option<crate::persistence::SshOptions> {
+    // `-o` names whose value is a command run on this machine.
+    const COMMAND_OPTIONS: &[&str] = &["KnownHostsCommand", "LocalCommand", "ProxyCommand"];
+    let mut runs_command = false;
     // Option letters whose value is a local file, and `-o` names likewise.
     const FILE_LETTERS: &[u8] = b"EFIi";
     const FILE_OPTIONS: &[&str] = &[
@@ -156,6 +162,9 @@ pub(crate) fn persistent_ssh_options(
             absolute(&value)?
         } else if letter == b'o' {
             let (name, setting) = option_name(&value);
+            runs_command |= COMMAND_OPTIONS
+                .iter()
+                .any(|command| name.eq_ignore_ascii_case(command));
             if FILE_OPTIONS
                 .iter()
                 .any(|file| name.eq_ignore_ascii_case(file))
@@ -178,7 +187,15 @@ pub(crate) fn persistent_ssh_options(
             resolved.push(value);
         }
     }
-    Some(resolved)
+    let directory = if runs_command {
+        Some(directory?.to_str()?.to_owned())
+    } else {
+        None
+    };
+    Some(crate::persistence::SshOptions {
+        options: resolved,
+        directory,
+    })
 }
 
 /// An `-o` option's name and value. OpenSSH accepts leading whitespace and
