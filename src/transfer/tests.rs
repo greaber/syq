@@ -1002,6 +1002,77 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
 }
 
 #[test]
+fn same_machine_batches_reach_the_receiver_in_groups_idle_workers_can_take() {
+    // A same-machine copy reads in process and writes to a receiver process
+    // over a pipelined data connection. Its batch is still split by files, so
+    // a worker that took a large batch has groups to hand to idle workers; a
+    // batch for another machine keeps only its byte limit.
+    for same_host in [true, false] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let jobs: Vec<_> = (0..130)
+            .map(|i| pipeline_job(format!("file{i}").as_bytes(), 512))
+            .collect();
+        for job in &jobs {
+            sched.push_file(job.clone());
+        }
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        assert_eq!(sched.begin_fast_batch(1, 130), 130);
+        let mut batch = vec![0];
+        batch.extend(sched.take_small(512, 129, u64::MAX));
+        assert_eq!(batch.len(), 130);
+        sched.mark_fast(129);
+        let expected_groups: Vec<usize> = if same_host {
+            vec![64, 64, 2]
+        } else {
+            vec![130]
+        };
+        let src = Arc::new(Mutex::new(PipelineState {
+            synchronous: true,
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        for &files in &expected_groups {
+            src.lock().unwrap().replies.push_back(Response::SmallBlocks(
+                (0..files)
+                    .map(|_| {
+                        let data = vec![0; 512];
+                        Ok(SmallBlock {
+                            hash: content_digest(&data),
+                            data,
+                        })
+                    })
+                    .collect(),
+            ));
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Applied(vec![None; files]));
+        }
+        src.lock().unwrap().replies.push_back(Response::Stats(
+            jobs.iter().map(|job| Some(job.entry.clone())).collect(),
+        ));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        Arc::get_mut(&mut worker.opts).unwrap().same_host = same_host;
+        worker.fast_batch(&mut batch).unwrap();
+        let groups: Vec<usize> = dst
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::PutSmallBatch(puts) => Some(puts.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, expected_groups, "same_host={same_host}");
+        assert_eq!(worker.progress.files_done.load(Relaxed), 130);
+        sched.complete_fast_batch(batch.len());
+        assert!(sched.finished());
+    }
+}
+
+#[test]
 fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
     for failure in ["none", "source-drop", "destination-drop"] {
         let sched = Arc::new(Sched::new(512, 8192));

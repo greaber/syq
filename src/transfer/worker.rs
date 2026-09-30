@@ -535,13 +535,15 @@ impl Worker {
             // Both calls run synchronously: splitting cannot overlap work.
             u64::MAX
         };
-        // Same-machine requests cost no round trip, so their groups can stay
-        // small enough to share out when every file is queued at once.
-        // Pipelined groups keep their byte limit: each costs a round trip.
-        let group_files = if pipelined {
-            usize::MAX
-        } else {
+        // A same-machine copy sends to a receiver process on this machine,
+        // over a pipelined data connection whose requests cost no network
+        // round trip, so its groups stay small enough in files to share out
+        // when every file is queued at once. Groups bound for another machine
+        // keep only their byte limit: each costs a round trip.
+        let group_files = if self.opts.same_host {
             LOCAL_GROUP_FILES
+        } else {
+            usize::MAX
         };
         let mut groups = Vec::new();
         let mut start = 0;
