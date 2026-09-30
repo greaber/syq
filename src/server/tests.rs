@@ -666,6 +666,7 @@ fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
             &seen,
             Some(authority.clone()),
             DescriptorSessionSlot::default(),
+            None,
             std::time::Instant::now() + Duration::from_secs(1),
         );
         if high != 0 {
@@ -739,6 +740,7 @@ fn tcp_partial_handshakes_time_out_without_reserving_ids() {
                     &seen,
                     None,
                     DescriptorSessionSlot::default(),
+                    None,
                     std::time::Instant::now() + Duration::from_millis(100),
                 );
                 tx.send((result, seen.into_inner().unwrap())).unwrap();
@@ -778,6 +780,7 @@ fn tcp_hello_clears_timeouts_only_after_authentication() {
                 &seen,
                 Some(authority),
                 DescriptorSessionSlot::default(),
+                None,
                 std::time::Instant::now() + Duration::from_millis(100),
             )
         });
@@ -876,6 +879,7 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
         false,
         false,
         true,
+        None,
         None,
         Some(authority.clone()),
         descriptor_session.clone(),

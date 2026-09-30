@@ -1,5 +1,8 @@
 //! Aggregate transfer-rate limiting shared by all copy workers.
 
+pub(crate) mod activity;
+pub(crate) mod transport;
+
 use anyhow::{bail, Result};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

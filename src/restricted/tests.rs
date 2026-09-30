@@ -185,6 +185,7 @@ fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut authority = tcp_test_authority(temporary.path());
     let listener = |algorithm: Option<&str>| Request::TcpListen {
+        send_rate: None,
         key: Some(vec![0; crate::tcp_records::KEY_LEN]),
         token: vec![0; 16],
         port_lo: 47_600,
@@ -205,6 +206,11 @@ fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
     authority
         .authorize(&mut listener(Some("cubic")), true)
         .unwrap();
+    let mut paced = listener(Some("cubic"));
+    if let Request::TcpListen { send_rate, .. } = &mut paced {
+        *send_rate = Some(1024);
+    }
+    assert!(authority.authorize(&mut paced, true).is_err());
 }
 
 #[test]
@@ -3786,6 +3792,7 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
     fs::create_dir(&root).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let mut listener = Request::TcpListen {
+        send_rate: None,
         key: Some(vec![7; crate::tcp_records::KEY_LEN]),
         token: vec![8; 16],
         port_lo: 47_600,
@@ -3800,6 +3807,7 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
 
     let wrong_range = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let mut listener = Request::TcpListen {
+        send_rate: None,
         key: Some(vec![7; crate::tcp_records::KEY_LEN]),
         token: vec![8; 16],
         port_lo: 1,
@@ -3810,6 +3818,7 @@ fn authority_binds_one_encrypted_listener_and_known_metadata_flags() {
 
     let congestion_override = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let mut listener = Request::TcpListen {
+        send_rate: None,
         key: Some(vec![7; crate::tcp_records::KEY_LEN]),
         token: vec![8; 16],
         port_lo: 47_600,

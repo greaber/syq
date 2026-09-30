@@ -127,9 +127,10 @@ Use `--resource-limits bandwidth=RATE` to leave bandwidth for other work:
 syq cp data --to server --into /backup --resource-limits bandwidth=10M
 ```
 
-This limits file data to 10 MiB/s across the copy's workers. It controls the
-average copy rate; buffering and protocol overhead can cause network bursts.
-See [Resource limits](resource-limits.md) for all units and supported routes.
+For ordinary TCP copies, this limits compressed transport bytes to 10 MiB/s
+across workers. Other routes count file data before compression. Buffering can
+still cause short bursts. See [Resource limits](resource-limits.md) for accounting
+details, units, and supported routes.
 
 <a id="options-that-change-the-tradeoff"></a>
 

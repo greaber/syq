@@ -2204,7 +2204,12 @@ impl RestrictedAuthority {
                 port_lo,
                 port_hi,
                 congestion_control,
+                send_rate,
             } => {
+                anyhow::ensure!(
+                    send_rate.is_none(),
+                    "signed copies retain their authorized bandwidth policy"
+                );
                 if !over_ssh {
                     bail!("TCP listener request is allowed only on the signed control connection");
                 }

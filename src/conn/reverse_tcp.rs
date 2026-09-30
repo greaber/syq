@@ -41,6 +41,7 @@ impl RemoteSpec {
             crate::destination::tcp::probe(&grant, port, ports, advertised, requested)
         });
         Ok(PendingTcpSetup {
+            pacing: None,
             reverse: Some(reverse),
             port,
             // Every worker gets a fresh key over SSH.
@@ -70,6 +71,7 @@ impl RemoteSpec {
             observation.clone(),
         );
         let conn = RemoteConn {
+            transport_stop: None,
             observation,
             child: None,
             w: FrameWriter::new(

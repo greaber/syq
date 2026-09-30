@@ -284,7 +284,9 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
 ```
 
 Explicit batch settings replace the small-copy shortcut with worker batches.
-With a bandwidth cap, each batch contains at most one file. Batch controls
+With logical-byte bandwidth pacing, each batch contains at most one file.
+Ordinary TCP pushes and pulls keep multi-file batches while pacing compressed
+transport bytes. Batch controls
 cannot combine with `copy-path=ranges` or `copy-path=streaming`;
 `auto-streaming` accepts them.
 
@@ -302,9 +304,26 @@ size, `batch-bytes`, and `request-size`.
 worker. Lower values allow finer sharing; higher values reduce assignments.
 Splits align to comparison blocks and need twice the minimum remaining size.
 
+Capped TCP copies tune from continuous transport-byte activity so waiting for a
+large batch acknowledgment does not look like an idle link. Completion counters
+still report acknowledged file data. Saved starting counts require the same
+bandwidth limit and compression setting; a capped plateau does not select the
+starting count for an uncapped copy. Transport-byte history is also kept separate
+from older logical-byte-cap history.
+
+A long capped copy does not necessarily produce a saved starting count. Once
+workers have claimed all queued files, the tuner currently excludes small-file
+batches from its remaining-work estimate, even while they are transferring.
+Their activity is still recorded, but those observations cannot establish a
+worker-count preference. Saving a starting count requires sufficient usable
+measurements at more than one worker count.
+
 ### Average rate and burst patterns
 
-With a [bandwidth cap](resource-limits.md), `bw-pacing` controls when data is sent:
+Ordinary TCP pushes and pulls pace compressed bytes at the sender without
+changing copy request sizes or batching. `bw-pacing` does not change that pacing.
+For the other routes listed in [Resource limits](resource-limits.md), `bw-pacing`
+controls logical-byte pacing:
 
 - `125ms` (default): send smaller requests at regular intervals. The first
   request starts immediately, so short copies can exceed the average rate.

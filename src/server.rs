@@ -698,6 +698,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 port_lo,
                 port_hi,
                 congestion_control,
+                send_rate,
             } => {
                 if !allow_tcp {
                     w.write_msg(&Response::Err(
@@ -712,6 +713,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     ))?;
                     continue;
                 }
+                if send_rate == Some(0) || (send_rate.is_some() && authority.is_some()) {
+                    w.write_msg(&Response::Err(
+                        "invalid transport bandwidth configuration".into(),
+                    ))?;
+                    continue;
+                }
                 match tcp_listen(
                     key,
                     token,
@@ -721,6 +728,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     debug,
                     w.compress,
                     congestion_control.as_deref(),
+                    send_rate,
                     authority.clone(),
                     descriptor_session.clone(),
                 ) {
@@ -1104,9 +1112,13 @@ fn tcp_listen(
     debug: bool,
     compress: bool,
     congestion_control: Option<&str>,
+    send_rate: Option<u64>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 ) -> Result<(u16, BoundFamilies, Option<String>)> {
+    let pacing = send_rate.map(|rate| Arc::new(crate::bwlimit::transport::Budget::new(rate)));
+    #[cfg(debug_assertions)]
+    let loopback_only = loopback_only || std::env::var_os("SYQ_TEST_TCP_LOOPBACK_ONLY").is_some();
     let (port, listeners) = bind_data_listeners(lo, hi, loopback_only)?;
     // Passive connections inherit the listener's congestion controller. Set
     // and verify it on every listener before advertising the port so even
@@ -1150,6 +1162,7 @@ fn tcp_listen(
             authority.clone(),
             descriptor_session.clone(),
         );
+        let pacing = pacing.clone();
         std::thread::spawn(move || {
             accept_data_connections(
                 listener,
@@ -1163,6 +1176,7 @@ fn tcp_listen(
                 seen,
                 authority,
                 descriptor_session,
+                pacing,
             )
         });
     }
@@ -1182,6 +1196,7 @@ fn accept_data_connections(
     seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
+    pacing: Option<Arc<crate::bwlimit::transport::Budget>>,
 ) {
     loop {
         if descriptor_session.is_closed()
@@ -1232,6 +1247,7 @@ fn accept_data_connections(
             authority.clone(),
             descriptor_session.clone(),
         );
+        let pacing = pacing.clone();
         std::thread::spawn(move || {
             if let Err(e) = serve_tcp(
                 stream,
@@ -1243,6 +1259,7 @@ fn accept_data_connections(
                 &seen,
                 authority.clone(),
                 descriptor_session,
+                pacing,
                 handshake_deadline,
             ) {
                 if debug {
@@ -1265,6 +1282,7 @@ fn serve_tcp(
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
+    pacing: Option<Arc<crate::bwlimit::transport::Budget>>,
     handshake_deadline: std::time::Instant,
 ) -> Result<()> {
     // The listening socket is nonblocking so its owner can notice session
@@ -1308,13 +1326,27 @@ fn serve_tcp(
         None => (None, None),
     };
     let reader = RecordReader::new(handshake_reader, rc);
-    let writer = RecordWriter::new(stream.try_clone()?, wc);
+    let authed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output: Box<dyn Write + Send> = if let Some(budget) = pacing {
+        let session = descriptor_session.clone();
+        let socket = stream.try_clone()?;
+        Box::new(crate::bwlimit::transport::PacedWriter {
+            inner: stream.try_clone()?,
+            budget,
+            handshake_pending: Some(handshake_pending.clone()),
+            stopped: move || {
+                session.is_closed() || crate::bwlimit::transport::socket_closed(&socket)
+            },
+        })
+    } else {
+        Box::new(stream.try_clone()?)
+    };
+    let writer = RecordWriter::new(output, wc);
     // Free the id only if the connection NEVER authenticated, so an
     // unauthenticated peer can't reserve ids. Once the token authenticated, the
     // id is retained permanently even if a later request fails — otherwise an
     // on-path attacker could corrupt an authenticated stream to free the id and
     // then replay captured records under it.
-    let authed = std::sync::atomic::AtomicBool::new(false);
     let res = serve(
         reader,
         writer,

@@ -422,6 +422,7 @@ fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
     )
     .is_err());
     conn.send(Request::TcpListen {
+        send_rate: None,
         key: Some(vec![0; 32]),
         token: vec![1; 32],
         port_lo: 0,
@@ -847,7 +848,7 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
         let mut control = spec.connect_with(false, false).unwrap();
         if tcp {
             let pending = spec
-                .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+                .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
                 .unwrap();
             spec.finish_tcp_setup(pending).unwrap();
         }
@@ -925,7 +926,7 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         spec.restricted_grant = Some(route(registration, approved.token.clone()));
         let mut control = spec.connect_with(false, false).unwrap();
         let pending = spec
-            .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+            .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
             .unwrap();
         spec.finish_tcp_setup(pending).unwrap();
         assert_eq!(
@@ -991,7 +992,7 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
-        .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+        .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
         .unwrap();
     spec.finish_tcp_setup(pending).unwrap();
     // Replace the selected route with a reserved, non-listening socket. Setup
@@ -1051,7 +1052,7 @@ fn named_tcp_workers_connect_concurrently() {
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
-        .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+        .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
         .unwrap();
     spec.finish_tcp_setup(pending).unwrap();
     let start = Arc::new(std::sync::Barrier::new(8));
@@ -1096,7 +1097,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
-        .begin_tcp_setup(&mut control, false, (47600, 47699), None)
+        .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
         .unwrap();
     spec.finish_tcp_setup(pending).unwrap();
     let port = spec.tcp.lock().unwrap().as_ref().unwrap().port;
