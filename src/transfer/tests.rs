@@ -2295,9 +2295,10 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
 
 #[test]
 fn capped_comparison_windows_bound_requests_and_keep_comparison_granularity() {
-    const BLOCK: u64 = 64 << 10;
-    const START: u64 = 140 << 30;
-    const WINDOW: u64 = crate::proto::MAX_READ_BYTES / 2;
+    // An odd comparison size must not get a short block at each window edge.
+    const BLOCK: u64 = (64 << 10) + 1;
+    const START: u64 = (140 << 30) / BLOCK * BLOCK;
+    const WINDOW: u64 = crate::proto::MAX_READ_BYTES / 2 / BLOCK * BLOCK;
     const LEN: u64 = 2 * WINDOW + 17;
     for depth in [1, 4] {
         for final_basis in [false, true] {
@@ -2381,6 +2382,7 @@ fn capped_comparison_windows_bound_requests_and_keep_comparison_granularity() {
                         off, len, block, ..
                     } => {
                         assert!(*off >= START);
+                        assert_eq!((off - START) % BLOCK, 0);
                         assert!(*len <= WINDOW);
                         assert_eq!(*block, BLOCK);
                     }

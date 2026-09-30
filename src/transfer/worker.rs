@@ -1525,7 +1525,8 @@ impl Worker {
         // use one larger window to amortize the hash exchange independently of
         // small pacing requests, with the same default total buffer ceiling.
         let window = if paced_source {
-            crate::proto::MAX_READ_BYTES / 2
+            // Keep configured comparison boundaries even for sizes such as 96K.
+            (crate::proto::MAX_READ_BYTES / 2 / block).max(1) * block
         } else {
             block
                 .saturating_mul(read_depth.max(hash_depth) as u64)

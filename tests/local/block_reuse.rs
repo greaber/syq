@@ -735,3 +735,36 @@ fn capped_pull_resumes_matching_partial_windows_with_reuse_off() {
     assert_eq!(read(&partial), donor);
     assert_eq!(partial_files(&t.0), vec![partial]);
 }
+
+#[test]
+fn capped_pull_keeps_odd_comparison_blocks_aligned_across_windows() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let source = prng(33 << 20, 868);
+    let mut old = source.clone();
+    old[0] ^= 1;
+    write(&t.path("src"), &source);
+    write(&t.path("dst"), &old);
+    set_mtime(&t.path("dst"), 1);
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--rsync-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--syq-no-bootstrap",
+            "--bwlimit=16M",
+            "--performance-tuning=request-size=64K,comparison-block-size=96K,bw-pacing=average",
+            &format!("fake:{}", t.s("src")),
+            &t.s("dst"),
+        ],
+    )
+    .env("SYQ_DEBUG", "1")
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), source);
+    assert_eq!(tuning_observed(&out)["range_requests"], 2);
+    assert!(partial_files(&t.0).is_empty());
+}
