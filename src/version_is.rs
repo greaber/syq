@@ -1,6 +1,6 @@
 //! Numeric release-version predicates: comma is AND, single `|` is OR.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 
 pub(crate) fn check(expression: &str) -> Result<()> {
     let version = numeric_version(env!("CARGO_PKG_VERSION"))
@@ -44,6 +44,15 @@ fn numeric_version(raw: &str) -> Result<[u64; 3]> {
     Ok(version)
 }
 
+enum Operator {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
 fn matches(expression: &str, version: [u64; 3]) -> Result<bool> {
     let mut any = false;
     for group in expression.split('|') {
@@ -51,20 +60,28 @@ fn matches(expression: &str, version: [u64; 3]) -> Result<bool> {
         for comparison in group.split(',') {
             let comparison = comparison.trim();
             ensure!(!comparison.is_empty(), "expected a comparison");
-            let (operator, raw) = ["==", "!=", "<=", ">=", "<", ">"]
-                .into_iter()
-                .find_map(|operator| comparison.strip_prefix(operator).map(|raw| (operator, raw)))
-                .unwrap_or(("==", comparison));
+            let (operator, raw) = [
+                ("==", Operator::Equal),
+                ("!=", Operator::NotEqual),
+                ("<=", Operator::LessEqual),
+                (">=", Operator::GreaterEqual),
+                ("<", Operator::Less),
+                (">", Operator::Greater),
+            ]
+            .into_iter()
+            .find_map(|(prefix, operator)| {
+                comparison.strip_prefix(prefix).map(|raw| (operator, raw))
+            })
+            .unwrap_or((Operator::Equal, comparison));
             let other = numeric_version(raw.trim())?;
             // Validate every comparison, even in an already decided group.
             all &= match operator {
-                "==" => version == other,
-                "!=" => version != other,
-                "<" => version < other,
-                "<=" => version <= other,
-                ">" => version > other,
-                ">=" => version >= other,
-                _ => bail!("unknown comparison operator {operator:?}"),
+                Operator::Equal => version == other,
+                Operator::NotEqual => version != other,
+                Operator::Less => version < other,
+                Operator::LessEqual => version <= other,
+                Operator::Greater => version > other,
+                Operator::GreaterEqual => version >= other,
             };
         }
         any |= all;

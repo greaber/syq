@@ -910,9 +910,9 @@ fn version_is_failure_precedes_downloads_updates_environment_and_copying() {
     let source = fixture.temp.path("source");
     let destination = fixture.temp.path("destination");
     fs::write(&source, b"source contents").unwrap();
-    for (expression, expected) in [
-        (&missing[..], "does not satisfy"),
-        ("^1.0.0", "invalid --version-is"),
+    for (expression, expected, status) in [
+        (&missing[..], "does not satisfy", 1),
+        ("^1.0.0", "invalid --version-is", 2),
     ] {
         let output = Command::new(&fixture.installed)
             .args(["--version-is", expression, "cp"])
@@ -925,6 +925,7 @@ fn version_is_failure_precedes_downloads_updates_environment_and_copying() {
             .capture_output()
             .unwrap();
         assert_failure_contains(&output, expected);
+        assert_eq!(output.status.code(), Some(status));
         assert!(!destination.exists());
     }
     assert!(!fixture.temp.path("cache").exists());

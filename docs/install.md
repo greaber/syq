@@ -50,7 +50,7 @@ Use `--version-is EXPR` to check the release version of the syq executable you
 invoked before it runs your command:
 
 ```sh
-syq --version-is '0.7.1' cp photos --into backup
+syq --version-is '>=0.7.1' cp photos --into backup
 syq --version-is '>=0.7.1, <0.8.0' cp photos --into backup
 syq --version-is '>=0.7.1, <0.8.0 | >=1.0.0, <2.0.0' cp photos --into backup
 ```
