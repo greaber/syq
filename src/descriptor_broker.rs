@@ -63,6 +63,7 @@ enum RegisteredDescriptorKind {
     SourceLeaf,
     StreamRead,
     StreamWrite,
+    Bandwidth,
 }
 
 impl RegisteredDescriptorKind {
@@ -72,6 +73,7 @@ impl RegisteredDescriptorKind {
             Self::SourceLeaf => 1,
             Self::StreamRead => 2,
             Self::StreamWrite => 3,
+            Self::Bandwidth => 4,
         }
     }
 
@@ -81,6 +83,7 @@ impl RegisteredDescriptorKind {
             1 => Some(Self::SourceLeaf),
             2 => Some(Self::StreamRead),
             3 => Some(Self::StreamWrite),
+            4 => Some(Self::Bandwidth),
             _ => None,
         }
     }
@@ -180,11 +183,13 @@ impl RegisteredRootRegistry {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The single session budget is not a filesystem authority root.
         let new_len = state
             .roots
-            .len()
-            .checked_add(roots.len())
-            .context("descriptor session root count overflow")?;
+            .values()
+            .chain(roots.iter())
+            .filter(|entry| entry.kind != RegisteredDescriptorKind::Bandwidth)
+            .count();
         if new_len > self.max_roots {
             bail!(
                 "descriptor session root limit ({}) exceeded; split the operation into fewer distinct roots",
@@ -281,6 +286,10 @@ impl DescriptorTicket {
     /// per registry and therefore cannot establish this relationship alone.
     pub(crate) fn same_session(&self, other: &Self) -> bool {
         self.socket_path == other.socket_path && self.secret == other.secret
+    }
+
+    pub(crate) fn is_bandwidth(&self) -> bool {
+        self.kind == RegisteredDescriptorKind::Bandwidth
     }
 
     pub(crate) fn is_directory(&self) -> bool {
@@ -398,9 +407,12 @@ impl DescriptorSession {
 /// creates the descriptor broker lazily when it registers a root. TCP workers
 /// share this slot and clone the root directly; a fresh independent-worker
 /// process has an empty slot and acquires the same root over the broker socket.
+type SendBudget = (Arc<crate::bwlimit::transport::Budget>, DescriptorTicket);
+
 #[derive(Clone)]
 pub(crate) struct DescriptorSessionSlot {
     session: Arc<Mutex<Option<DescriptorSession>>>,
+    bandwidth: Arc<Mutex<Option<SendBudget>>>,
     closed: Arc<AtomicBool>,
     max_roots: usize,
     max_connections: usize,
@@ -410,6 +422,7 @@ impl Default for DescriptorSessionSlot {
     fn default() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            bandwidth: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
             max_roots: DEFAULT_MAX_ROOTS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -430,12 +443,46 @@ impl DescriptorSessionSlot {
         })
     }
 
+    /// All sending helpers in this endpoint session debit the same budget.
+    pub(crate) fn send_budget(&self, rate: u64) -> Result<SendBudget> {
+        anyhow::ensure!(rate > 0, "bandwidth rate must be positive");
+        let mut budget = self.bandwidth.lock().unwrap();
+        if let Some((existing, ticket)) = budget.as_ref() {
+            anyhow::ensure!(!self.is_closed(), "descriptor session is closed");
+            anyhow::ensure!(
+                existing.rate() == rate,
+                "session bandwidth rate is already configured"
+            );
+            return Ok((existing.clone(), ticket.clone()));
+        }
+        let (shared, file) = crate::bwlimit::transport::Budget::shared(rate)?;
+        let ticket = self.register_file(file, RegisteredDescriptorKind::Bandwidth)?;
+        let shared = Arc::new(shared);
+        *budget = Some((shared.clone(), ticket.clone()));
+        Ok((shared, ticket))
+    }
+
     /// Stream tickets carry only one already-open regular file, never a path
     /// or directory authority. The kind fixes the worker's read/write direction.
     pub(crate) fn register_stream(&self, file: File, write: bool) -> Result<DescriptorTicket> {
+        self.register_file(
+            file,
+            if write {
+                RegisteredDescriptorKind::StreamWrite
+            } else {
+                RegisteredDescriptorKind::StreamRead
+            },
+        )
+    }
+
+    fn register_file(
+        &self,
+        file: File,
+        kind: RegisteredDescriptorKind,
+    ) -> Result<DescriptorTicket> {
         anyhow::ensure!(
             file.metadata()?.is_file(),
-            "stream capability requires a regular file"
+            "descriptor capability requires a regular file"
         );
         anyhow::ensure!(
             !self.closed.load(Ordering::Acquire),
@@ -453,11 +500,6 @@ impl DescriptorSessionSlot {
             )?);
         }
         let session = session.as_ref().unwrap();
-        let kind = if write {
-            RegisteredDescriptorKind::StreamWrite
-        } else {
-            RegisteredDescriptorKind::StreamRead
-        };
         let id = session
             .registry
             .register_entries(vec![RegisteredRoot {
@@ -586,6 +628,9 @@ impl DescriptorSessionSlot {
     /// its private socket directory.
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        if let Some((budget, _)) = self.bandwidth.lock().unwrap().take() {
+            budget.close();
+        }
         let session = self
             .session
             .lock()
@@ -1357,6 +1402,34 @@ mod tests {
         assert!(listener_clone.is_closed());
         assert!(!broker_directory.exists());
         assert!(listener_clone.acquire(&ticket).is_err());
+    }
+
+    #[test]
+    fn bandwidth_budget_is_shared_typed_and_revoked_with_its_session() {
+        let slot = DescriptorSessionSlot {
+            max_roots: 1,
+            ..Default::default()
+        };
+        assert!(slot.send_budget(0).is_err());
+        let (owner, ticket) = slot.send_budget(1024).unwrap();
+        let (again, same) = slot.send_budget(1024).unwrap();
+        assert!(Arc::ptr_eq(&owner, &again));
+        assert_eq!(ticket.root_id(), same.root_id());
+        assert!(slot.send_budget(2048).is_err());
+        // A bandwidth allocation must not consume the last filesystem root slot.
+        let temp = crate::test_support::tempdir().unwrap();
+        slot.register(File::open(temp.path()).unwrap()).unwrap();
+        let mut wrong = ticket.clone();
+        wrong.kind = RegisteredDescriptorKind::StreamWrite;
+        assert!(acquire_descriptor(&wrong).is_err());
+        assert!(ticket.stream_write().is_err());
+        let independent =
+            crate::bwlimit::transport::Budget::from_shared(&acquire_descriptor(&ticket).unwrap())
+                .unwrap();
+        assert_eq!(independent.rate(), 1024);
+        slot.close();
+        assert!(independent.wait(1, || false).is_err());
+        assert!(acquire_descriptor(&ticket).is_err());
     }
 
     #[test]

@@ -1768,6 +1768,7 @@ fn connect_completion_endpoint(
         helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer),
         quiet: true,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),

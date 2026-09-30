@@ -206,6 +206,9 @@ fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
     authority
         .authorize(&mut listener(Some("cubic")), true)
         .unwrap();
+    assert!(authority
+        .authorize(&mut Request::CreateSendBudget { rate: 1024 }, true)
+        .is_err());
     let mut paced = listener(Some("cubic"));
     if let Request::TcpListen { send_rate, .. } = &mut paced {
         *send_rate = Some(1024);

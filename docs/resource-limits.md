@@ -18,18 +18,18 @@ Supply comma-separated `KEY=VALUE` pairs:
 syq cp data --to server --into backup --resource-limits bandwidth=10M
 ```
 
-For ordinary TCP pushes and pulls, this limits outgoing data-connection bytes to
-10 MiB/s across all workers. It counts compressed bytes, including syq framing
-and TCP encryption records, but excludes connection setup, SSH control traffic,
-and IP/TCP headers.
+For ordinary SSH and TCP copies, this limits outgoing bytes to 10 MiB/s
+across all workers, including when workers use both transports. It counts
+compressed bytes and syq framing. TCP also counts its encryption records;
+SSH counts bytes passed to OpenSSH, excluding OpenSSH encryption overhead.
+Connection setup, separate control traffic, and IP/TCP headers are excluded.
+The small-copy shortcut counts its combined control and file-data traffic.
 Compressible files can therefore copy at a higher logical rate. Small bursts
 remain possible because the operating system buffers network writes.
 
-SSH, local, S3, relay, named receiving, descriptor, and signed-receiver copies
-still count logical file-data bytes before compression. If a TCP copy falls back
-to SSH while other TCP workers remain active, each transport currently has its
-own allowance; the combined rate can exceed the configured cap during that
-mixed-transport period.
+Remote-to-remote relays apply the rate to each network leg separately. Local,
+S3, named receiving, descriptor, and signed-receiver copies count logical
+file-data bytes before compression.
 
 ## Concurrency ceilings
 

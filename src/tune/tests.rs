@@ -41,6 +41,7 @@ fn remote(host: &str, tcp: bool) -> Endpoint {
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: true,
+        pacing: Default::default(),
         tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp.then(|| crate::conn::TcpInfo {
             pacing: None,
             reverse: None,

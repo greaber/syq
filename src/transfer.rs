@@ -385,6 +385,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 helper_install: Default::default(),
                 ssh_multiplexer,
                 quiet: args.quiet,
+                pacing: Default::default(),
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
@@ -642,7 +643,9 @@ fn small_copy_eligible(
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
-        && args.bwlimit_bytes == 0
+        && (args.bwlimit_bytes == 0
+            || matches!(dst_ep, Endpoint::Remote(spec)
+            if spec.restricted_grant.is_none() && spec.forwarded.is_none()))
         && args.max_size.is_none()
         && args.min_size.is_none()
         && !args.follows_native_destination_paths()
@@ -1750,7 +1753,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection (TCP sender pacing keeps unshrunk requests): request-size={} bytes (ordinary, after logical pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning before transport selection (sender pacing keeps unshrunk requests): request-size={} bytes (ordinary, after logical pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
@@ -2096,14 +2099,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     configure_preservation(&mut *src, opts.inode_preservation, opts.sparse, false)?;
                     configure_preservation(&mut *dst, opts.inode_preservation, opts.sparse, true)?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
-                    let transport_paced = if opts.src_remote {
-                        src.transport_paced()
-                    } else {
-                        dst.transport_paced()
-                    };
+                    let transport_paced = (opts.src_remote || opts.dst_remote)
+                        && (!opts.src_remote || src.transport_paced())
+                        && (!opts.dst_remote || dst.transport_paced());
                     if transport_paced && id == 0 && opts.verbose > 0 {
                         crate::output::diagnostic!(
-                            "syq: TCP sender bandwidth cap counts compressed transport bytes: request-size={}, streaming-block-size={}; normal batching applies",
+                            "syq: Sender bandwidth cap counts compressed transport bytes: request-size={}, streaming-block-size={}; normal batching applies",
                             opts.tuning.request_size(opts.block, None, opts.restricted_receiver),
                             opts.tuning.streaming_request_size(opts.block, None, opts.restricted_receiver),
                         );
@@ -2249,9 +2250,55 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
         );
     }
+    // Configure each ordinary network leg before selecting TCP or SSH. Source
+    // helpers share one mapped budget; coordinator sends share one local budget.
+    // Signed/named routes keep their separately authorized resource policy.
+    let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
+        Endpoint::Remote(spec) => {
+            spec.local_process || (spec.restricted_grant.is_none() && spec.forwarded.is_none())
+        }
+        _ => true,
+    });
+    let transport_budget = (args.bwlimit_bytes > 0
+        && ordinary
+        && args.restricted_grant.is_none()
+        && (opts.src_remote || opts.dst_remote))
+        .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
+    if let Some(budget) = &transport_budget {
+        for (ep, ctl, source) in [
+            (&src_ep, &mut src_ctl, true),
+            (&dst_ep, &mut dst_ctl, false),
+        ] {
+            if let Endpoint::Remote(spec) = ep {
+                if spec.local_process {
+                    continue;
+                }
+                let source_budget = if source {
+                    match ctl.call(Request::CreateSendBudget {
+                        rate: budget.rate(),
+                    })? {
+                        Response::SendBudget(ticket) => Some(ticket),
+                        Response::Err(error) => bail!("configure source bandwidth: {error}"),
+                        _ => bail!("unexpected source bandwidth reply"),
+                    }
+                } else {
+                    None
+                };
+                *spec.pacing.lock().unwrap() = Some(crate::conn::TransportPacing {
+                    budget: budget.clone(),
+                    remote_sender: source,
+                    source_budget,
+                    scheduler: Arc::downgrade(&sched),
+                });
+            }
+        }
+    }
     // The bounded offer replaces the destination configuration turn. Its
     // selected payloads use this control connection without data workers.
     if small_copy_candidate {
+        if let Some(budget) = &transport_budget {
+            dst_ctl.pace_outgoing(budget.clone(), Arc::downgrade(&sched))?;
+        }
         match attempt_small_copy(
             &args,
             &opts,
@@ -2286,12 +2333,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
     let mut pending_tcp_setups = Vec::new();
     if let Some(ports) = tcp_ports {
-        // First migrate ordinary single-remote copies. Signed receiver limits,
-        // local copies, relays, and named return routes retain their existing policy.
-        let transport_budget = (args.bwlimit_bytes > 0
-            && args.restricted_grant.is_none()
-            && opts.src_remote != opts.dst_remote)
-            .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
         for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
             if let Endpoint::Remote(spec) = ep {
                 match spec.begin_tcp_setup(
@@ -2299,22 +2340,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     args.no_tcp_encryption,
                     ports,
                     args.tcp_congestion.as_deref(),
-                    transport_budget
-                        .as_ref()
-                        .filter(|_| {
-                            !spec.local_process
-                                && spec.forwarded.is_none()
-                                && !crate::destination::is_named(&spec.restricted_grant)
-                        })
-                        .map(|budget| crate::conn::TcpPacing {
-                            budget: budget.clone(),
-                            remote_sender: opts.src_remote,
-                            scheduler: Arc::downgrade(&sched),
-                        }),
+                    spec.pacing.lock().unwrap().clone(),
                 ) {
                     Ok(pending) => pending_tcp_setups.push((spec.clone(), pending)),
                     Err(error) => {
-                        handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?;
+                        handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?
                     }
                 }
             }
@@ -3391,9 +3421,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     (
                         !opts.dry_run
                             && !opts.tuning.force_ranges()
-                            && bwlimit.is_none()
+                            && (bwlimit.is_none() || transport_budget.is_some())
                             && jobs.iter().enumerate().all(|(idx, job)| {
-                                job.entry.size <= fast_file_size_limit(&opts, bwlimit.as_deref())
+                                job.entry.size <= fast_file_size_limit(&opts, None)
                                     && jobs.destination(idx).is_none()
                                     && (!opts.inplace
                                         || (job.target_condition == TargetCondition::Any

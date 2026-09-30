@@ -271,6 +271,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
             token: Vec::new(),
             role: ConnectionRole::SourceWorker {
                 roots: vec![source],
+                send_budget: None,
             },
         })
         .unwrap();
@@ -595,6 +596,7 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
             token: Vec::new(),
             role: ConnectionRole::SourceWorker {
                 roots: vec![source],
+                send_budget: None,
             },
         })
         .unwrap();

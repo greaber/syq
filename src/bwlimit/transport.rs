@@ -1,6 +1,8 @@
 //! Sender-side byte pacing, independent of file and request boundaries.
 use std::io::{self, Write};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "shared.rs"]
+mod shared;
 use std::time::{Duration, Instant};
 
 // At high rates leave a complete encrypted TCP record in one socket write.
@@ -13,12 +15,27 @@ const CANCEL_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) struct Budget {
     rate: u64,
     burst: u64,
-    state: Mutex<State>,
+    state: Counter,
 }
 
-struct State {
-    at: Instant,
-    credit: f64,
+enum Counter {
+    Local(AtomicU64),
+    Shared(shared::Shared),
+}
+
+fn clock_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // One system monotonic clock, independent of process start time.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) },
+        0
+    );
+    (time.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(time.tv_nsec as u64)
 }
 
 impl Budget {
@@ -28,11 +45,33 @@ impl Budget {
         Self {
             rate,
             burst,
-            state: Mutex::new(State {
-                at: Instant::now(),
-                credit: burst as f64,
-            }),
+            state: Counter::Local(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn shared(rate: u64) -> io::Result<(Self, std::fs::File)> {
+        assert!(rate > 0);
+        let (state, file) = shared::Shared::create(rate)?;
+        let mut budget = Self::new(rate);
+        budget.state = Counter::Shared(state);
+        Ok((budget, file))
+    }
+
+    pub(crate) fn from_shared(file: &std::fs::File) -> io::Result<Self> {
+        let state = shared::Shared::open(file)?;
+        let mut budget = Self::new(state.rate());
+        budget.state = Counter::Shared(state);
+        Ok(budget)
+    }
+
+    pub(crate) fn close(&self) {
+        if let Counter::Shared(state) = &self.state {
+            state.closed().store(true, Ordering::Release);
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        matches!(&self.state, Counter::Shared(state) if state.closed().load(Ordering::Acquire))
     }
 
     pub(crate) fn rate(&self) -> u64 {
@@ -45,34 +84,43 @@ impl Budget {
 
     /// Debit before writing. Concurrent callers reserve successive time slots;
     /// neither the number of workers nor their request sizes enlarge credit.
-    fn reserve(&self, now: Instant, bytes: usize) -> Duration {
+    fn reserve(&self, now: u64, bytes: usize) -> Duration {
         assert!(bytes <= self.chunk());
-        let mut state = self.state.lock().unwrap();
-        let observed = now.max(state.at);
-        let elapsed = observed.duration_since(state.at).as_secs_f64();
-        state.credit = (state.credit + elapsed * self.rate as f64).min(self.burst as f64);
-        state.at = observed;
-        state.credit -= bytes as f64;
-        observed.duration_since(now)
-            + Duration::from_secs_f64((-state.credit / self.rate as f64).max(0.0))
+        let nanos = |bytes: u64| {
+            ((u128::from(bytes) * 1_000_000_000).div_ceil(u128::from(self.rate))) as u64
+        };
+        let cost = nanos(bytes as u64);
+        let floor = now.saturating_sub(nanos(self.burst));
+        let counter = match &self.state {
+            Counter::Local(next) => next,
+            Counter::Shared(state) => state.next(),
+        };
+        let mut old = counter.load(Ordering::Relaxed);
+        loop {
+            let next = old.max(floor).saturating_add(cost);
+            match counter.compare_exchange_weak(old, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Duration::from_nanos(next.saturating_sub(now)),
+                Err(current) => old = current,
+            }
+        }
     }
 
     pub(crate) fn wait(&self, bytes: usize, stopped: impl Fn() -> bool) -> io::Result<()> {
-        if stopped() {
+        if stopped() || self.is_closed() {
             return Err(cancelled());
         }
         let now = Instant::now();
-        let delay = self.reserve(now, bytes);
+        let delay = self.reserve(clock_ns(), bytes);
         if delay.is_zero() {
             return Ok(());
         }
         while now.elapsed() < delay {
-            if stopped() {
+            if stopped() || self.is_closed() {
                 return Err(cancelled());
             }
             std::thread::sleep(delay.saturating_sub(now.elapsed()).min(CANCEL_INTERVAL));
         }
-        if stopped() {
+        if stopped() || self.is_closed() {
             Err(cancelled())
         } else {
             Ok(())
@@ -129,14 +177,14 @@ pub(crate) fn socket_closed(socket: &std::net::TcpStream) -> bool {
 
 /// Place below compression and buffering. TCP record buffering must also be
 /// above this writer, otherwise a large record would accumulate before a burst.
-pub(crate) struct PacedWriter<W, S> {
+pub(crate) struct PacedWriter<W, S, B = std::sync::Arc<Budget>> {
     pub(crate) inner: W,
-    pub(crate) budget: std::sync::Arc<Budget>,
+    pub(crate) budget: B,
     pub(crate) stopped: S,
     pub(crate) handshake_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
+impl<W: Write, S: Fn() -> bool, B: std::borrow::Borrow<Budget>> Write for PacedWriter<W, S, B> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
@@ -148,8 +196,8 @@ impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
         {
             return self.inner.write(bytes);
         }
-        let n = bytes.len().min(self.budget.chunk());
-        self.budget.wait(n, &self.stopped)?;
+        let n = bytes.len().min(self.budget.borrow().chunk());
+        self.budget.borrow().wait(n, &self.stopped)?;
         self.inner.write_all(&bytes[..n])?;
         Ok(n)
     }
@@ -168,18 +216,18 @@ impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
         let mut count = 0;
         let mut bytes = 0;
         for buffer in buffers.iter().filter(|buffer| !buffer.is_empty()) {
-            let n = buffer.len().min(self.budget.chunk() - bytes);
+            let n = buffer.len().min(self.budget.borrow().chunk() - bytes);
             slices[count] = io::IoSlice::new(&buffer[..n]);
             count += 1;
             bytes += n;
-            if count == slices.len() || bytes == self.budget.chunk() {
+            if count == slices.len() || bytes == self.budget.borrow().chunk() {
                 break;
             }
         }
         if bytes == 0 {
             return Ok(0);
         }
-        self.budget.wait(bytes, &self.stopped)?;
+        self.budget.borrow().wait(bytes, &self.stopped)?;
         let mut remaining = &mut slices[..count];
         while !remaining.is_empty() {
             match self.inner.write_vectored(remaining) {
@@ -197,6 +245,43 @@ impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
     }
 }
 
+/// The SSH source attaches its session budget after the version-checked Hello.
+/// OnceLock permits exactly one attachment, without a lock or IPC per write.
+pub(crate) struct SessionWriter<W, S> {
+    pub(crate) inner: W,
+    pub(crate) budget: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<Budget>>>,
+    pub(crate) stopped: S,
+}
+impl<W: Write, S: Fn() -> bool> Write for SessionWriter<W, S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self.budget.get() {
+            None => self.inner.write(bytes),
+            Some(budget) => PacedWriter {
+                inner: &mut self.inner,
+                budget: &**budget,
+                stopped: &self.stopped,
+                handshake_pending: None,
+            }
+            .write(bytes),
+        }
+    }
+    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self.budget.get() {
+            None => self.inner.write_vectored(buffers),
+            Some(budget) => PacedWriter {
+                inner: &mut self.inner,
+                budget: &**budget,
+                stopped: &self.stopped,
+                handshake_pending: None,
+            }
+            .write_vectored(buffers),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,11 +289,11 @@ mod tests {
     #[test]
     fn reservations_share_credit_and_bound_idle_bursts() {
         let budget = Budget::new(1_000_000);
-        let now = Instant::now();
+        let now = 1_000_000_000;
         assert_eq!(budget.reserve(now, 10_000), Duration::ZERO);
         assert_eq!(budget.reserve(now, 10_000), Duration::from_millis(10));
         assert_eq!(budget.reserve(now, 10_000), Duration::from_millis(20));
-        let later = now + Duration::from_secs(30);
+        let later = now + 30_000_000_000;
         assert_eq!(budget.reserve(later, 10_000), Duration::ZERO);
         assert_eq!(budget.reserve(later, 10_000), Duration::from_millis(10));
     }
@@ -216,8 +301,8 @@ mod tests {
     #[test]
     fn out_of_order_callers_do_not_backdate_reservations() {
         let budget = Budget::new(1_000_000);
-        let now = Instant::now();
-        let later = now + Duration::from_millis(20);
+        let now = 1_000_000_000;
+        let later = now + 20_000_000;
         assert_eq!(budget.reserve(later, 10_000), Duration::ZERO);
         assert_eq!(budget.reserve(now, 10_000), Duration::from_millis(30));
     }
@@ -225,12 +310,9 @@ mod tests {
     #[test]
     fn slower_sender_pays_no_per_write_sleep() {
         let budget = Budget::new(1_000_000);
-        let now = Instant::now();
+        let now = 1_000_000_000;
         for i in 0..100 {
-            assert_eq!(
-                budget.reserve(now + Duration::from_millis(i * 20), 10_000),
-                Duration::ZERO
-            );
+            assert_eq!(budget.reserve(now + i * 20_000_000, 10_000), Duration::ZERO);
         }
     }
 
@@ -250,7 +332,7 @@ mod tests {
     #[test]
     fn cancellation_during_wait_never_reaches_output() {
         let budget = std::sync::Arc::new(Budget::new(100));
-        budget.reserve(Instant::now(), budget.chunk());
+        budget.reserve(clock_ns(), budget.chunk());
         let checks = std::cell::Cell::new(0);
         let mut writer = PacedWriter {
             handshake_pending: None,
@@ -338,6 +420,52 @@ mod tests {
         }
         assert!(writer.is_finished(), "sender ignored peer shutdown");
         assert!(writer.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn separate_mappings_reserve_one_budget_and_close_together() {
+        let (owner, file) = Budget::shared(1_000_000).unwrap();
+        let peer = Budget::from_shared(&file).unwrap();
+        let now = 1_000_000_000;
+        assert_eq!(owner.reserve(now, 10_000), Duration::ZERO);
+        assert_eq!(peer.reserve(now, 10_000), Duration::from_millis(10));
+        assert_eq!(owner.reserve(now, 10_000), Duration::from_millis(20));
+        drop(file); // Mapping lifetime is independent of the handed-off fd.
+        owner.close();
+        assert_eq!(
+            peer.wait(1, || false).unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[test]
+    fn shared_counter_accounts_for_concurrent_reservations() {
+        let (_owner, file) = Budget::shared(1_000_000).unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let peer = Budget::from_shared(&file).unwrap();
+            workers.push(std::thread::spawn(move || {
+                (0..500)
+                    .map(|_| peer.reserve(1_000_000_000, 10_000))
+                    .max()
+                    .unwrap()
+            }));
+        }
+        let last = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .max()
+            .unwrap();
+        assert_eq!(last, Duration::from_millis(39990));
+    }
+
+    #[test]
+    fn invalid_shared_budget_files_are_rejected() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(Budget::from_shared(&file).is_err());
+        let (_, valid) = Budget::shared(1024).unwrap();
+        file.set_len(valid.metadata().unwrap().len()).unwrap();
+        assert!(Budget::from_shared(&file).is_err());
     }
 
     #[test]

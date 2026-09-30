@@ -814,6 +814,7 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
@@ -837,7 +838,10 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         .connect_tcp(
             &info,
             false,
-            ConnectionRole::SourceWorker { roots: Vec::new() },
+            ConnectionRole::SourceWorker {
+                roots: Vec::new(),
+                send_budget: None,
+            },
         )
         .expect_err("unregistered congestion control should fail locally");
     let message = format!("{error:#}");
@@ -1477,6 +1481,7 @@ fn ssh_inherits_host_key_policy() {
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
@@ -1530,6 +1535,7 @@ fn worker_tcp_fallback_survives_broken_stderr() {
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: false,
+        pacing: Default::default(),
         tcp: std::sync::Arc::new(std::sync::Mutex::new(Some(TcpInfo {
             pacing: None,
             reverse: None,
@@ -1551,7 +1557,10 @@ fn worker_tcp_fallback_survives_broken_stderr() {
     assert!(endpoint
         .connect_with_role(
             false,
-            ConnectionRole::SourceWorker { roots: Vec::new() },
+            ConnectionRole::SourceWorker {
+                roots: Vec::new(),
+                send_budget: None
+            },
             false
         )
         .is_err());
@@ -1575,6 +1584,7 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
         helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer),
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
@@ -1647,7 +1657,10 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
     let result = spec.connect_retried(
         false,
         true,
-        ConnectionRole::SourceWorker { roots: Vec::new() },
+        ConnectionRole::SourceWorker {
+            roots: Vec::new(),
+            send_budget: None,
+        },
         true,
     );
     assert!(result.is_err()); // The independent attempt reports a missing helper.
@@ -1722,6 +1735,7 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
         helper_install: Default::default(),
         ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
@@ -1807,6 +1821,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         helper_install: Default::default(),
         ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
@@ -2096,6 +2111,7 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),
@@ -2122,6 +2138,18 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
 #[test]
 fn transport_paced_receive_stops_when_scheduler_aborts() {
     let mut connection = connection_replaying(&[]);
+    // A stalled SSH client must be terminated too; otherwise Drop waits for it
+    // while the source is still filling a bandwidth-limited response frame.
+    connection.child = Some(
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_guarded()
+            .unwrap(),
+    );
+
     // Leave the channel open without completing a frame: a throttled source
     // may take minutes to finish one. Abort must not wait for that frame.
     let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
