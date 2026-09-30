@@ -2165,6 +2165,62 @@ fn native_direct_remote_forwards_overwrite_policies() {
     }
 }
 
+/// A missing remote root takes the same fresh-tree planning as an empty one:
+/// a directory shared by two source batches is created by the first and
+/// re-inspected, not re-created, by the second.
+#[test]
+fn missing_remote_directory_reports_shared_directory_created_once() {
+    for policy in ["--no-progress", "--if-exists=keep"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        write(&t.path("a/shared/a"), b"a");
+        write(&t.path("b/shared/b"), b"b");
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("a"),
+                "--srcs-in",
+                &t.s("b"),
+                "--to",
+                "host",
+                "--into",
+                &t.s("dst"),
+                "--results",
+                &t.s("results.ndjson"),
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--no-tcp",
+                policy,
+                "-q",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/shared/a")), b"a");
+        assert_eq!(read(&t.path("dst/shared/b")), b"b");
+        let created: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|record: &serde_json::Value| {
+                record["type"] == "operation_result"
+                    && record["action"] == "create_directory"
+                    && record["disposition"] == "succeeded"
+            })
+            .collect();
+        assert_eq!(created.len(), 1, "{policy}: {created:?}");
+        assert_eq!(created[0]["dst"]["value"], "shared");
+    }
+}
+
 /// A signed receiver never answers the emptiness probe, so a fresh tree
 /// there is a missing destination. Its descendants need no lookups either,
 /// whatever existing-file policy the grant forwards.
