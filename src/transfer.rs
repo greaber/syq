@@ -638,7 +638,6 @@ fn small_copy_eligible(
         && !args.checksum
         && !args.ignore_existing
         && !args.existing
-        && !args.stats
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
@@ -992,6 +991,9 @@ fn attempt_small_copy(
         );
     }
     progress.files_excluded.fetch_add(excluded as u64, Relaxed);
+    progress
+        .scanned
+        .fetch_add((srcs.len() + excluded) as u64, Relaxed);
     announce_detached_ready()?;
     print_small_copy_diagnostics(args, dst_ep);
 
@@ -1145,8 +1147,19 @@ fn attempt_small_copy(
     }
     drop(_native_work);
     progress.finish(exit_code == 0);
+    let elapsed = progress.start.elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
-        print_transfer_summary(&terminal, progress.start.elapsed().as_secs_f64(), "");
+        print_transfer_summary(&terminal, elapsed, "");
+    }
+    if args.stats && !args.quiet {
+        print_statistics(
+            args,
+            opts,
+            progress,
+            elapsed,
+            "none (small files sent on the control connection)",
+            "\n  tcp statistics: unavailable (data used the control connection)",
+        );
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
@@ -1159,6 +1172,58 @@ fn show_statistics(args: &Args) -> bool {
     // invoking machine prints the verified receipt. That receipt does not
     // contain diagnostics, so requested statistics still come from here.
     !args.suppress_summary || args.restricted_grant.is_some()
+}
+
+/// The `--stats` block after the summary line: the counters that line
+/// renders, plus how the data travelled. `connections` and `tcp_stats` come
+/// from the path that carried the copy, since a copy that never started data
+/// workers has neither a worker count nor data sockets to report.
+fn print_statistics(
+    args: &Args,
+    opts: &Opts,
+    progress: &Progress,
+    elapsed: f64,
+    connections: &str,
+    tcp_stats: &str,
+) {
+    if show_statistics(args) && !opts.dry_run {
+        if let Some(ms) = progress.copying_elapsed_ms() {
+            crate::output::human_stdout!(
+                "  copying interval: {:.3}s (may overlap planning)",
+                ms as f64 / 1000.0
+            );
+        }
+    }
+    // --stats is additional human output, not the summary line the local
+    // attested settlement re-renders; a delegated coordinator keeps it.
+    let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
+        if opts.dry_run {
+            (
+                "files needing content work",
+                "files with unchanged content",
+                "logical bytes needing content work",
+                "logical bytes with unchanged content",
+                progress.bytes_total.load(Relaxed),
+            )
+        } else {
+            (
+                "files to transfer",
+                "files unchanged",
+                "bytes transferred",
+                "bytes unchanged",
+                progress.bytes_done.load(Relaxed),
+            )
+        };
+    crate::output::human_stdout!(
+        "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {connections}{tcp_stats}",
+        commas(progress.scanned.load(Relaxed)),
+        commas(progress.files_total.load(Relaxed)),
+        commas(progress.files_unchanged.load(Relaxed)),
+        commas(progress.files_excluded.load(Relaxed)),
+        commas(bytes_work),
+        commas(progress.bytes_unchanged.load(Relaxed)),
+        elapsed,
+    );
 }
 
 /// The one summary line a completed copy prints, rendered from the same
@@ -3711,7 +3776,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let elapsed = progress.start.elapsed().as_secs_f64();
-    let done = progress.bytes_done.load(Relaxed);
     if !args.quiet && !aborted && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
@@ -3741,65 +3805,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && show_statistics(&args) && !args.quiet && !opts.dry_run {
-        if let Some(ms) = progress.copying_elapsed_ms() {
-            crate::output::human_stdout!(
-                "  copying interval: {:.3}s (may overlap planning)",
-                ms as f64 / 1000.0
-            );
-        }
+    if args.stats && !args.quiet && !aborted {
+        let connections = match &tuned {
+            Some(p) => format!(
+                "auto: settled at {} (path {}, peak {})",
+                p.settled(),
+                p.history
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+                p.peak
+            ),
+            None => args.connections.to_string(),
+        };
+        let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
+            matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
+        });
+        let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
+        print_statistics(&args, &opts, &progress, elapsed, &connections, &tcp_stats);
     }
     print_benchmark_observations(&opts);
-    // --stats is additional human output, not the summary line the local
-    // attested settlement re-renders; a delegated coordinator keeps it.
-    if !args.quiet && !aborted && args.stats {
-        let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
-            if opts.dry_run {
-                (
-                    "files needing content work",
-                    "files with unchanged content",
-                    "logical bytes needing content work",
-                    "logical bytes with unchanged content",
-                    progress.bytes_total.load(Relaxed),
-                )
-            } else {
-                (
-                    "files to transfer",
-                    "files unchanged",
-                    "bytes transferred",
-                    "bytes unchanged",
-                    done,
-                )
-            };
-        let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
-                matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
-            });
-        let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        crate::output::human_stdout!(
-                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
-                commas(progress.scanned.load(Relaxed)),
-                commas(progress.files_total.load(Relaxed)),
-                commas(progress.files_unchanged.load(Relaxed)),
-                commas(progress.files_excluded.load(Relaxed)),
-                commas(bytes_work),
-                commas(progress.bytes_unchanged.load(Relaxed)),
-                elapsed,
-                match &tuned {
-                    Some(p) => format!(
-                        "auto: settled at {} (path {}, peak {})",
-                        p.settled(),
-                        p.history
-                            .iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" -> "),
-                        p.peak
-                    ),
-                    None => args.connections.to_string(),
-                },
-                tcp_stats,
-            );
-    }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }

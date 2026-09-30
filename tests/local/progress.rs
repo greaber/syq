@@ -604,10 +604,30 @@ fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
             assert_output_ok(&output);
             assert_eq!(
                 stderr_of(&output).contains("small copy: published"),
-                option.is_none(),
+                matches!(option, None | Some("--stats")),
                 "wrong dispatch for {option:?}: {}",
                 stderr_of(&output)
             );
+            if option == Some("--stats") {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout.contains(&format!(
+                        "  scanned entries: 1\n  files to transfer: {}\n  files unchanged: {}\n  files excluded: 0\n  bytes transferred: {}\n  bytes unchanged: {}\n",
+                        u64::from(!matches),
+                        u64::from(matches),
+                        if matches { 0 } else { 3 },
+                        if matches { 3 } else { 0 },
+                    )),
+                    "{stdout}"
+                );
+                assert!(
+                    stdout.contains(
+                        "  connections: none (small files sent on the control connection)\n  tcp statistics: unavailable (data used the control connection)\n"
+                    ),
+                    "{stdout}"
+                );
+                assert_eq!(stdout.contains("copying interval:"), !matches, "{stdout}");
+            }
             let skipped = matches && option != Some("--hash");
             let unchanged = skipped || option == Some("--dry-run");
             assert_eq!(read(&t.path("remote-home/dest/source")), if unchanged { old } else { b"new" },
