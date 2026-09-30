@@ -1063,6 +1063,18 @@ impl Worker {
         let mut off = 0;
         while off < job.entry.size {
             let len = (if off == 0 { block } else { window }).min(job.entry.size - off);
+            // Send the destination request first: a local source hashes in
+            // place during `send`, and the destination is always a separate
+            // process, so this order lets both hashes run concurrently.
+            self.dst.send(Request::HashAndHold {
+                off,
+                path: job.dst.clone(),
+                copy_id: self.copy_id(),
+                block,
+                len,
+                condition: job.target_condition,
+                guard: job.container_guard.clone(),
+            })?;
             self.src.send(Request::HashBlocks {
                 off,
                 path: job.src.clone(),
@@ -1073,15 +1085,6 @@ impl Worker {
                 len,
                 attempt: job.attempt,
                 guard: None,
-            })?;
-            self.dst.send(Request::HashAndHold {
-                off,
-                path: job.dst.clone(),
-                copy_id: self.copy_id(),
-                block,
-                len,
-                condition: job.target_condition,
-                guard: job.container_guard.clone(),
             })?;
             // Drain both endpoints even when one reports an ordinary file error.
             let source = self.src.recv();
@@ -1379,6 +1382,10 @@ impl Worker {
     ) -> Result<BlockDiff> {
         let block = self.opts.block;
         let size = job.entry.size;
+        // Send the destination request first: a local source hashes in place
+        // during `send`, and the destination is always a separate process, so
+        // this order lets both hashes run concurrently.
+        self.dst.send(destination_request)?;
         self.src.send(Request::HashBlocks {
             off: 0,
             path: job.src.clone(),
@@ -1390,7 +1397,6 @@ impl Worker {
             attempt: job.attempt,
             guard: None,
         })?;
-        self.dst.send(destination_request)?;
         // Both requests are in flight. Always consume both responses before
         // interpreting either one so an ordinary endpoint error cannot leave
         // this reusable worker connection one response behind.
@@ -2207,14 +2213,17 @@ impl Worker {
     }
 
     pub(super) fn contents_match(&mut self, job: &WorkerJob) -> Result<bool> {
-        self.src.send(Request::FileHash {
-            path: job.src.clone(),
-            source: self.source_reference(job),
-            guard: None,
-        })?;
+        // Send the destination request first: a local source hashes in place
+        // during `send`, and the destination is always a separate process, so
+        // this order lets both hashes run concurrently.
         self.dst.send(Request::FileHash {
             path: job.dst.clone(),
             source: None,
+            guard: None,
+        })?;
+        self.src.send(Request::FileHash {
+            path: job.src.clone(),
+            source: self.source_reference(job),
             guard: None,
         })?;
         // Drain both replies even when one endpoint reports a per-file error.
