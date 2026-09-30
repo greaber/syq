@@ -34,6 +34,13 @@ pub trait Conn: Send {
     fn transport_paced(&self) -> bool {
         false
     }
+    fn pace_outgoing(
+        &mut self,
+        _budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
+        _scheduler: std::sync::Weak<crate::sched::Sched>,
+    ) -> Result<()> {
+        bail!("outgoing transport pacing requires a remote connection")
+    }
     fn observe(
         &mut self,
         _observations: &crate::transfer_observations::Observations,
@@ -673,6 +680,9 @@ impl RemoteConn {
                     if let Some(socket) = &self.tcp_socket {
                         let _ = socket.shutdown(std::net::Shutdown::Both);
                     }
+                    if let Some(child) = &mut self.child {
+                        let _ = child.kill();
+                    }
                     return Err(self.io_err(
                         std::io::Error::new(
                             std::io::ErrorKind::ConnectionAborted,
@@ -708,6 +718,31 @@ impl RemoteConn {
 impl Conn for RemoteConn {
     fn transport_paced(&self) -> bool {
         self.transport_stop.is_some()
+    }
+    fn pace_outgoing(
+        &mut self,
+        budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
+        scheduler: std::sync::Weak<crate::sched::Sched>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.transport_stop.is_none() && self.tcp_socket.is_none(),
+            "sender budget already configured or not an SSH control connection"
+        );
+        let old = std::mem::replace(
+            &mut self.w,
+            FrameWriter::new(Box::new(std::io::sink()), false),
+        );
+        let compress = old.compress;
+        let stopped = scheduler.clone();
+        let writer = crate::bwlimit::transport::PacedWriter {
+            inner: old.into_inner()?,
+            budget,
+            handshake_pending: None,
+            stopped: move || stopped.upgrade().is_none_or(|s| s.is_aborted()),
+        };
+        self.w = FrameWriter::with_preamble_written(Box::new(writer), compress);
+        self.transport_stop = Some(scheduler);
+        Ok(())
     }
     fn observe(
         &mut self,
@@ -1068,11 +1103,21 @@ pub struct TcpProbe {
 /// Copy-scoped outgoing budget. Pulls configure its rate on the source helper;
 /// pushes share the local budget across all destination connections.
 #[derive(Clone)]
-pub(crate) struct TcpPacing {
+pub(crate) struct TransportPacing {
     pub(crate) activity: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub(crate) budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
     pub(crate) remote_sender: bool,
+    pub(crate) source_budget: Option<crate::descriptor_broker::DescriptorTicket>,
     pub(crate) scheduler: std::sync::Weak<crate::sched::Sched>,
+}
+
+impl std::fmt::Debug for TransportPacing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportPacing")
+            .field("rate", &self.budget.rate())
+            .field("remote_sender", &self.remote_sender)
+            .finish_non_exhaustive()
+    }
 }
 
 /// TCP listener state whose route probes are running in the background.
@@ -1082,7 +1127,7 @@ pub(crate) struct TcpPacing {
 /// the probe join handle here lets destination preflight cover the bounded
 /// reachability window without weakening route selection.
 pub(crate) struct PendingTcpSetup {
-    pacing: Option<TcpPacing>,
+    pacing: Option<TransportPacing>,
     reverse: Option<std::sync::Arc<ReverseTcp>>,
     port: u16,
     key: Option<Vec<u8>>,
@@ -1140,6 +1185,7 @@ pub struct RemoteSpec {
     pub quiet: bool,
     /// Shared across clones so workers see the TCP setup done on the control connection.
     pub tcp: std::sync::Arc<std::sync::Mutex<Option<TcpInfo>>>,
+    pub(crate) pacing: std::sync::Arc<std::sync::Mutex<Option<TransportPacing>>>,
     /// User-facing facts gathered by the same connection path the transfer uses.
     pub diagnostics: std::sync::Arc<std::sync::Mutex<RemoteDiagnostics>>,
     /// A pooled control session taken ahead of time on the main thread, for
@@ -1175,6 +1221,7 @@ impl RemoteSpec {
             helper_install: Default::default(),
             ssh_multiplexer: None,
             quiet,
+            pacing: Default::default(),
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
@@ -1462,7 +1509,10 @@ impl RemoteSpec {
     /// on first use if the remote lacks it.
     pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
         let role = if limited {
-            ConnectionRole::SourceWorker { roots: Vec::new() }
+            ConnectionRole::SourceWorker {
+                roots: Vec::new(),
+                send_budget: None,
+            }
         } else {
             ConnectionRole::Control
         };
@@ -1704,16 +1754,44 @@ impl RemoteSpec {
             }
         })?;
         let stdin = child.stdin.take().unwrap();
+        let pacing = (!matches!(role, ConnectionRole::Control))
+            .then(|| self.pacing.lock().unwrap().clone())
+            .flatten();
+        let handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer: Box<dyn Write + Send> =
+            if let Some(pacing) = pacing.as_ref().filter(|p| !p.remote_sender) {
+                let scheduler = pacing.scheduler.clone();
+                Box::new(crate::bwlimit::transport::PacedWriter {
+                    inner: crate::bwlimit::activity::ActivityIo {
+                        inner: stdin,
+                        bytes: pacing.activity.clone(),
+                        handshake_pending: handshake.clone(),
+                    },
+                    budget: pacing.budget.clone(),
+                    handshake_pending: Some(handshake.clone()),
+                    stopped: move || scheduler.upgrade().is_none_or(|s| s.is_aborted()),
+                })
+            } else {
+                Box::new(stdin)
+            };
         let stdout = child.stdout.take().unwrap();
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+        let stdout = crate::bwlimit::activity::ActivityIo {
+            inner: stdout,
+            bytes: pacing
+                .as_ref()
+                .filter(|p| p.remote_sender)
+                .and_then(|p| p.activity.clone()),
+            handshake_pending: handshake.clone(),
+        };
         let (rx, reader) =
             spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone());
         let conn = RemoteConn {
-            transport_stop: None,
+            transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: Some(child),
-            w: FrameWriter::new(Box::new(stdin), compress),
+            w: FrameWriter::new(writer, compress),
             rx: Some(rx),
             reader: Some(reader),
             label: self.label(),
@@ -1726,7 +1804,12 @@ impl RemoteSpec {
             multiplexed_ssh: ssh_connection == SshConnection::Worker,
             detached: false,
         };
+        let mut role = role;
+        if let ConnectionRole::SourceWorker { send_budget, .. } = &mut role {
+            *send_budget = pacing.as_ref().and_then(|p| p.source_budget.clone());
+        }
         let conn = hello(conn, compress, Vec::new(), role)?;
+        handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         if ssh_connection == SshConnection::Control
             && !self.local_process
@@ -1765,7 +1848,7 @@ impl RemoteSpec {
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
-        pacing: Option<TcpPacing>,
+        pacing: Option<TransportPacing>,
     ) -> Result<PendingTcpSetup> {
         *self.tcp.lock().unwrap() = None;
         {
@@ -1795,7 +1878,7 @@ impl RemoteSpec {
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
-        pacing: Option<TcpPacing>,
+        pacing: Option<TransportPacing>,
     ) -> Result<PendingTcpSetup> {
         if crate::destination::is_named(&self.restricted_grant) {
             anyhow::ensure!(!plain, "named destinations require encrypted TCP");
@@ -1980,6 +2063,14 @@ impl RemoteSpec {
         compress: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        #[cfg(debug_assertions)]
+        if !self.local_process && std::env::var_os("SYQ_TEST_TCP_FAIL_AFTER_ONE_WORKER").is_some() {
+            static ATTEMPTS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if ATTEMPTS.fetch_add(1, Ordering::Relaxed) > 0 {
+                bail!("injected TCP worker connection failure");
+            }
+        }
         if let Some(reverse) = &info.reverse {
             return self.connect_reverse_tcp(reverse, compress, role);
         }
@@ -2282,7 +2373,7 @@ fn next_tcp_connection_id(next: &std::sync::atomic::AtomicU32) -> Result<u32> {
 
 #[derive(Clone)]
 pub struct TcpInfo {
-    pub(crate) pacing: Option<TcpPacing>,
+    pub(crate) pacing: Option<TransportPacing>,
     pub(crate) reverse: Option<std::sync::Arc<ReverseTcp>>,
     /// Reachable, speed-filtered data addresses to spread connections across.
     pub addrs: Vec<String>,
@@ -2483,7 +2574,10 @@ impl Endpoint {
     ) -> Result<Box<dyn Conn>> {
         self.connect_with_role(
             compress,
-            ConnectionRole::SourceWorker { roots },
+            ConnectionRole::SourceWorker {
+                roots,
+                send_budget: None,
+            },
             first_worker,
         )
     }
@@ -2520,7 +2614,7 @@ impl Endpoint {
                     ConnectionRole::DestinationWorker { .. } => {
                         unreachable!("destination workers require an isolated receiver")
                     }
-                    ConnectionRole::SourceWorker { roots } => {
+                    ConnectionRole::SourceWorker { roots, .. } => {
                         conn.ops.initialize_sources(&roots).map_err(|error| {
                             WorkerInitializationError(format!(
                                 "initialize local source worker: {error:#}"

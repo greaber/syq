@@ -893,6 +893,7 @@ fn run_remote(
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: args.quiet,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),

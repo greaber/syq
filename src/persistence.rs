@@ -336,6 +336,7 @@ fn connect(
         helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer.clone()),
         quiet: false,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),

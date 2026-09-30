@@ -27,17 +27,18 @@ for benchmark_mode in push pull; do
         --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
         -- --no-tcp --performance-tuning workers=2 --performance-tuning batch-files=256,batch-bytes=2M
 done
-# A new route can learn during warm-up before the first scored copy. Speed up
-# only the debug tuner's sample clock and cap traffic to keep this lab bounded.
-# Keep the default warm-up target: in this lab, learning needs more than 30 s
-# of copying. These are correctness checks, not performance measurements.
+# A new route can learn during warm-up before the first scored copy. Keep the
+# normal sample clock: history requires seconds of exposure at each setting,
+# even when a debug override makes live decisions faster. Use a high enough cap
+# that the time-sized warm-up grows past the batches already claimed by workers.
+# The warm-up remains bounded to 1 GiB. These are correctness checks, not timings.
 for benchmark_mode in push pull; do
     benchmark_cache="$home/benchmark-tuning-$benchmark_mode.json"
-    SYQ_TUNING_CACHE="$benchmark_cache" SYQ_TEST_TUNE_SAMPLE_MS=100 \
+    SYQ_TUNING_CACHE="$benchmark_cache" \
         bash /usr/local/libexec/syq-try-benchmark --yes \
         --mode "$benchmark_mode" --host destination --workload small --size quick \
         --tool syq --rounds 1 --source-dir "$benchmark_parent" --dest-dir "/tmp/benchmark scratch's" \
-        -- --no-tcp --resource-limits bandwidth=2M
+        -- --no-tcp --resource-limits bandwidth=16M
     # Tuning history lives beside the cache path; export is its supported reader.
     SYQ_TUNING_CACHE="$benchmark_cache" syq tuning-cache export |
         python3 -c '

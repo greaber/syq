@@ -2163,6 +2163,9 @@ impl RestrictedAuthority {
         self.check_deadline()?;
         let bounded_basis = matches!(request, Request::StageBasis { .. });
         match request {
+            Request::CreateSendBudget { .. } => {
+                bail!("signed copies retain their authorized bandwidth policy");
+            }
             Request::ConfigureHashing(policy) => {
                 if *policy != self.hash_policy() {
                     bail!("hash policy differs from the authorized copy");

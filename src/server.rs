@@ -28,11 +28,15 @@ impl RequestReader {
         mut reader: FrameReader<R>,
         tcp_socket: Option<TcpStream>,
         named_socket: Option<std::os::unix::net::UnixStream>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let thread = std::thread::spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
             let failed = msg.is_err();
+            if failed {
+                disconnected.store(true, std::sync::atomic::Ordering::Release);
+            }
             if tx.send(msg).is_err() || failed {
                 break;
             }
@@ -365,7 +369,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
     } = session;
     let mut r = FrameReader::new(r);
     r.set_limit(MAX_HANDSHAKE_FRAME);
-    let mut w = FrameWriter::new(w, false);
+    let sending_budget = Arc::new(std::sync::OnceLock::new());
+    let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = disconnected.clone();
+    let mut w = FrameWriter::new(
+        crate::bwlimit::transport::SessionWriter {
+            inner: w,
+            budget: sending_budget.clone(),
+            stopped: move || stopped.load(std::sync::atomic::Ordering::Acquire),
+        },
+        false,
+    );
     // Send our build identity before waiting for the client's first postcard
     // frame. Both peers can therefore diagnose version skew even when their
     // Request or Response enum layouts no longer agree.
@@ -434,6 +448,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
     }
+    let mut initial_sending_budget = None;
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
             w.write_msg(&Response::Err(
@@ -441,7 +456,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
             ))?;
             bail!("command-restricted receiver rejected supplied source roots");
         }
-        ConnectionRole::SourceWorker { roots } => {
+        ConnectionRole::SourceWorker { roots, send_budget } => {
+            if let Some(ticket) = send_budget {
+                anyhow::ensure!(over_ssh, "SSH sender budget supplied over TCP");
+                anyhow::ensure!(ticket.is_bandwidth(), "not a bandwidth budget ticket");
+                let file = descriptor_session.acquire(ticket)?;
+                initial_sending_budget = Some(Arc::new(
+                    crate::bwlimit::transport::Budget::from_shared(&file)?,
+                ));
+            }
             if let Err(error) = ops.initialize_sources(roots) {
                 w.write_msg(&Response::Err(format!(
                     "initialize source worker: {error:#}"
@@ -535,12 +558,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
         pending.store(false, std::sync::atomic::Ordering::Release);
     }
 
+    if let Some(budget) = initial_sending_budget {
+        sending_budget
+            .set(budget)
+            .map_err(|_| anyhow::anyhow!("sender budget already attached"))?;
+    }
+
     // Requests are parsed on a reader thread so incoming data keeps flowing
     // while a block is being hashed and written. TCP readers are shut down and
     // joined by the guard on every exit path.
     r.set_limit(MAX_FRAME);
     let telemetry_socket = tcp_socket.as_ref().and_then(|s| s.try_clone().ok());
-    let reader = RequestReader::spawn(r, tcp_socket, named_socket);
+    let reader = RequestReader::spawn(r, tcp_socket, named_socket, disconnected);
     let server_actor = ops.observations.actor("server");
     let mut w = ObservedWriter {
         compress: w.compress,
@@ -567,6 +596,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             && matches!(
                 &req,
                 Request::TcpListen { .. }
+                    | Request::CreateSendBudget { .. }
                     | Request::DescriptorCopy(_)
                     | Request::ListDir { .. }
                     | Request::ListDirDetails { .. }
@@ -638,6 +668,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
         }
         match req {
             Request::Shutdown => break,
+            Request::CreateSendBudget { rate } => {
+                let response = if authority.is_none() && over_ssh {
+                    match descriptor_session.send_budget(rate) {
+                        Ok((_, ticket)) => Response::SendBudget(ticket),
+                        Err(error) => Response::Err(format!("{error:#}")),
+                    }
+                } else {
+                    Response::Err("sender budget requires an ordinary control session".into())
+                };
+                w.write_msg(&response)?;
+            }
             Request::ReadStream(mut stream) => {
                 if !is_source_worker {
                     w.write_msg(&Response::Err(
@@ -1116,7 +1157,13 @@ fn tcp_listen(
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 ) -> Result<(u16, BoundFamilies, Option<String>)> {
-    let pacing = send_rate.map(|rate| Arc::new(crate::bwlimit::transport::Budget::new(rate)));
+    let pacing = send_rate
+        .map(|rate| {
+            descriptor_session
+                .send_budget(rate)
+                .map(|(budget, _)| budget)
+        })
+        .transpose()?;
     #[cfg(debug_assertions)]
     let loopback_only = loopback_only || std::env::var_os("SYQ_TEST_TCP_LOOPBACK_ONLY").is_some();
     let (port, listeners) = bind_data_listeners(lo, hi, loopback_only)?;

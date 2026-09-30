@@ -652,6 +652,8 @@ pub enum ConnectionRole {
         /// before HelloOk. Local and same-process TCP workers clone in process;
         /// a fresh SSH helper finishes SCM_RIGHTS receipt while single-threaded.
         roots: Vec<RegisteredSourceRoot>,
+        /// Shared sender budget for a fresh SSH helper; TCP shares it in process.
+        send_budget: Option<DescriptorTicket>,
     },
     /// A data connection used to mutate a destination endpoint. Unrestricted
     /// receivers require an exact registered root; restricted receivers derive
@@ -1081,6 +1083,10 @@ pub enum WireRequest<Data> {
         len: u32,
         expected: ContentDigest,
     },
+    /// Allocate one source-side budget shared by TCP and independent SSH workers.
+    CreateSendBudget {
+        rate: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1366,6 +1372,7 @@ pub enum Response {
         off: u64,
         len: u32,
     },
+    SendBudget(crate::descriptor_broker::DescriptorTicket),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1706,6 +1713,11 @@ pub struct FrameWriter<W: Write> {
 }
 
 impl<W: Write> FrameWriter<W> {
+    /// Flush before wrapping an already-authenticated control transport.
+    pub(crate) fn into_inner(self) -> io::Result<W> {
+        self.w.into_inner().map_err(|error| error.into_error())
+    }
+
     fn compressor() -> crate::compression::Compressor {
         // SYQ_HELPER_RELEASE=v0.6.0 explicitly selects released helpers. Their
         // codec byte only accepts raw and Zstd; preserve that concrete case.

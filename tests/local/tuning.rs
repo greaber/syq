@@ -381,24 +381,9 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
             "{terminal}"
         );
         let observed = tuning_observed(&out);
-        if tcp {
-            // The TCP sender paces bytes without shrinking requests or forcing
-            // this otherwise batchable file onto the streaming range path.
-            assert_eq!(observed["small_batches"], 1, "{out:?}");
-        } else {
-            assert!(
-                observed["streaming_ranges"].as_u64().unwrap() > 0,
-                "{out:?}"
-            );
-            assert_eq!(observed["range_requests"], 0, "{out:?}");
-            assert_eq!(observed["max_request_bytes"], 64 << 10, "{out:?}");
-            assert!(
-                stderr_of(&out).contains("streaming above 262144 bytes"),
-                "{out:?}"
-            );
-        }
-        // This verifies the whole-copy average, not a socket-ingress burst cap:
-        // SSH streams ahead of paced destination writes; TCP paces the sender.
+        // Both TCP and SSH pace the compressed sender stream, so a cap no
+        // longer shrinks requests or forces this file out of its normal batch.
+        assert_eq!(observed["small_batches"], 1, "{out:?}");
     }
 }
 

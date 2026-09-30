@@ -655,6 +655,7 @@ fn connect(target: &str, install: bool) -> Result<i32> {
         helper_install: Default::default(),
         ssh_multiplexer: None,
         quiet: true,
+        pacing: Default::default(),
         tcp: Default::default(),
         diagnostics: Default::default(),
         primed_control: Default::default(),

@@ -285,7 +285,7 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
 
 Explicit batch settings replace the small-copy shortcut with worker batches.
 With logical-byte bandwidth pacing, each batch contains at most one file.
-Ordinary TCP pushes and pulls keep multi-file batches while pacing compressed
+Ordinary SSH and TCP copies keep multi-file batches while pacing compressed
 transport bytes. Batch controls
 cannot combine with `copy-path=ranges` or `copy-path=streaming`;
 `auto-streaming` accepts them.
@@ -304,7 +304,7 @@ size, `batch-bytes`, and `request-size`.
 worker. Lower values allow finer sharing; higher values reduce assignments.
 Splits align to comparison blocks and need twice the minimum remaining size.
 
-Capped TCP copies tune from continuous transport-byte activity so waiting for a
+Capped SSH and TCP copies tune from continuous transport-byte activity so waiting for a
 large batch acknowledgment does not look like an idle link. Completion counters
 still report acknowledged file data. Saved starting counts require the same
 bandwidth limit and compression setting; a capped plateau does not select the
@@ -320,8 +320,9 @@ measurements at more than one worker count.
 
 ### Average rate and burst patterns
 
-Ordinary TCP pushes and pulls pace compressed bytes at the sender without
-changing copy request sizes or batching. `bw-pacing` does not change that pacing.
+Ordinary SSH and TCP copies pace compressed bytes at the sender without
+changing copy request sizes or batching. `bw-pacing` does not change that pacing;
+syq prints a notice if you explicitly set it for these copies.
 For the other routes listed in [Resource limits](resource-limits.md), `bw-pacing`
 controls logical-byte pacing:
 

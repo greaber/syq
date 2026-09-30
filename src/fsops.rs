@@ -2108,6 +2108,7 @@ impl FsOps {
             | Request::ShrinkReadStream { .. }
             | Request::MappingChunk { .. }
             | Request::ConfigurePreservation { .. }
+            | Request::CreateSendBudget { .. }
             | Request::StopReadStream => {}
         }
         Ok(())

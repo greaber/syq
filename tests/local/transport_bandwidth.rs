@@ -1,13 +1,13 @@
 use super::*;
 use std::time::Duration;
 
-fn command(t: &Tmp, pull: bool, rate: &str) -> Command {
-    let mut cmd = automatic_command(t, pull, rate);
+fn command(t: &Tmp, mode: u8, pull: bool, rate: &str) -> Command {
+    let mut cmd = automatic_command(t, mode, pull, rate);
     cmd.arg("--performance-tuning=workers=4");
     cmd
 }
 
-fn automatic_command(t: &Tmp, pull: bool, rate: &str) -> Command {
+fn automatic_command(t: &Tmp, mode: u8, pull: bool, rate: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
     cmd.args(["cp", "-v", "--no-progress", "--rsh"])
         .arg(fake_rsh(t))
@@ -28,6 +28,17 @@ fn automatic_command(t: &Tmp, pull: bool, rate: &str) -> Command {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"));
+    match mode {
+        0 => {}
+        1 => {
+            cmd.arg("--no-tcp").env_remove("SYQ_TEST_REQUIRE_TCP");
+        }
+        2 => {
+            cmd.env_remove("SYQ_TEST_REQUIRE_TCP")
+                .env("SYQ_TEST_TCP_FAIL_AFTER_ONE_WORKER", "1");
+        }
+        _ => unreachable!(),
+    }
     if pull {
         cmd.args(["--from", "127.0.0.1"]);
     }
@@ -48,14 +59,14 @@ fn paths(t: &Tmp, pull: bool, directory: bool) -> Vec<String> {
 }
 
 #[test]
-fn tcp_cap_is_aggregate_and_keeps_small_file_batches() {
-    for pull in [false, true] {
+fn network_cap_is_aggregate_and_keeps_small_file_batches() {
+    for (mode, pull) in (0..3).flat_map(|mode| [false, true].map(|pull| (mode, pull))) {
         let t = Tmp::new();
         for n in 0..64 {
             write(&t.path(&format!("src/{n}")), &prng(16 << 10, 1200 + n));
         }
         let start = std::time::Instant::now();
-        let out = command(&t, pull, "1M")
+        let out = command(&t, mode, pull, "1M")
             .arg("--no-compress")
             .arg("--performance-tuning=batch-files=4")
             .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
@@ -63,7 +74,16 @@ fn tcp_cap_is_aggregate_and_keeps_small_file_batches() {
             .run()
             .unwrap();
         assert_output_ok(&out);
+        assert!(!stderr_of(&out).contains("bw-pacing has no effect"));
         assert_same_tree(&t.path("src"), &t.path("dst"));
+        if mode == 2 {
+            let stderr = stderr_of(&out);
+            assert!(stderr.contains("data connection via tcp"), "{stderr}");
+            assert!(
+                stderr.contains("injected TCP worker connection failure"),
+                "{stderr}"
+            );
+        }
         assert!(
             start.elapsed() >= Duration::from_millis(900),
             "aggregate rate exceeded: {out:?}"
@@ -84,16 +104,21 @@ fn tcp_cap_is_aggregate_and_keeps_small_file_batches() {
 }
 
 #[test]
-fn tcp_compression_is_charged_after_compressing() {
-    for pull in [false, true] {
+fn network_compression_is_charged_after_compressing() {
+    for (mode, pull) in (0..3).flat_map(|mode| [false, true].map(|pull| (mode, pull))) {
         let t = Tmp::new();
         write(&t.path("src"), &vec![b'x'; 4 << 20]);
-        let mut cmd = command(&t, pull, "1M");
-        cmd.args(paths(&t, pull, false));
+        let mut cmd = command(&t, mode, pull, "1M");
+        cmd.arg("--performance-tuning=bw-pacing=average")
+            .args(paths(&t, pull, false));
         let start = std::time::Instant::now();
         let out = cmd.run().unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+        assert_eq!(
+            stderr_of(&out).matches("bw-pacing has no effect").count(),
+            1
+        );
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "logical bytes appear to be paced: {out:?}"
@@ -102,14 +127,14 @@ fn tcp_compression_is_charged_after_compressing() {
 }
 
 #[test]
-fn high_tcp_cap_keeps_single_read_comparison() {
-    for pull in [false, true] {
+fn high_network_cap_keeps_single_read_comparison() {
+    for (mode, pull) in (0..3).flat_map(|mode| [false, true].map(|pull| (mode, pull))) {
         let t = Tmp::new();
         let source = prng(8 << 20, 1301);
         write(&t.path("src"), &source);
         write(&t.path("dst"), &vec![0; source.len()]);
         set_mtime(&t.path("dst"), 1);
-        let out = command(&t, pull, "1G")
+        let out = command(&t, mode, pull, "1G")
             .args(paths(&t, pull, false))
             .env("SYQ_TEST_COMPARED_READ_EVENTS", t.path("reads"))
             .run()
@@ -133,18 +158,113 @@ fn high_tcp_cap_keeps_single_read_comparison() {
     }
 }
 
+#[test]
+fn capped_small_push_keeps_the_control_connection_shortcut() {
+    let t = Tmp::new();
+    let data = prng(256 << 10, 4441);
+    write(&t.path("src"), &data);
+    let start = std::time::Instant::now();
+    let out = command(&t, 1, false, "128K")
+        .arg("--no-compress")
+        .args(paths(&t, false, false))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), data);
+    assert_eq!(tuning_observed(&out)["native_small_copies"], 1, "{out:?}");
+    assert!(
+        start.elapsed() >= Duration::from_millis(1800),
+        "shortcut bypassed cap: {out:?}"
+    );
+}
+
+#[test]
+fn relay_caps_both_legs_and_keeps_comparison_pipelining() {
+    for mode in [0, 1] {
+        let t = Tmp::new();
+        let source = prng(2 << 20, 1401);
+        write(&t.path("src"), &source);
+        write(&t.path("dst"), &vec![0; source.len()]);
+        set_mtime(&t.path("dst"), 1);
+        let start = std::time::Instant::now();
+        let out = command(&t, mode, true, "1M")
+            .arg("--no-compress")
+            .args([
+                &t.s("src"),
+                "--to",
+                "127.0.0.1",
+                "--as",
+                &t.s("dst"),
+                "--coordinate-at",
+                "local",
+            ])
+            .env("SYQ_TEST_COMPARED_READ_EVENTS", t.path("reads"))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), source);
+        assert!(
+            start.elapsed() >= Duration::from_millis(1800),
+            "relay exceeded cap: {out:?}"
+        );
+        assert!(fs::read_to_string(t.path("reads"))
+            .unwrap()
+            .contains("compare "));
+    }
+}
+
+#[test]
+fn declining_small_copy_leaves_control_traffic_unpaced() {
+    let t = Tmp::new();
+    let mut sources = Vec::new();
+    // Each file exceeds the small-copy ceiling but the destination already
+    // matches. No data should move; long names make the later stat/planning
+    // requests alone take much longer than the deadline if control is paced.
+    for n in 0..64 {
+        let name = format!("{n:02}-{}", "x".repeat(160));
+        for directory in ["src", "dst"] {
+            let path = t.path(&format!("{directory}/{name}"));
+            write(&path, b"");
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(2 << 20)
+                .unwrap();
+            set_mtime(&path, 1);
+        }
+        sources.push(t.s(&format!("src/{name}")));
+    }
+    let mut cmd = command(&t, 1, false, "1"); // 1 KiB/s
+    let child = cmd
+        .arg("--no-compress")
+        .args(&sources)
+        .args(["--to", "127.0.0.1", "--into", &t.s("dst")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait_for_child_output(child, Duration::from_secs(8));
+    assert_output_ok(&out);
+    assert_eq!(tuning_observed(&out)["native_small_copies"], 0, "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("128 MiB unchanged (64 files)"),
+        "{out:?}"
+    );
+}
+
 // Exercise normal small-file batches: completion acknowledgments can be seconds
 // apart under a cap, while the transport and tuner must keep seeing activity.
 #[cfg(debug_assertions)]
 #[test]
 fn capped_batches_provide_continuous_tuning_activity() {
-    for pull in [false, true] {
+    for (mode, pull) in (0..2).flat_map(|mode| [false, true].map(|pull| (mode, pull))) {
         let t = Tmp::new();
         for n in 0..8192 {
             write(&t.path(&format!("src/{n}")), &prng(8192, 8000 + n));
         }
         let history = t.path("history.sqlite");
-        let out = automatic_command(&t, pull, "4M")
+        let out = automatic_command(&t, mode, pull, "4M")
             .arg("--no-compress")
             .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
             .env("SYQ_TUNING_HISTORY", &history)

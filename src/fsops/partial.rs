@@ -2860,6 +2860,7 @@ impl FsOps {
             | Request::WriteStreamFence
             | Request::ShrinkReadStream { .. }
             | Request::MappingChunk { .. }
+            | Request::CreateSendBudget { .. }
             | Request::StopReadStream => Err(anyhow!("unexpected request")),
         };
         match r {
