@@ -2380,6 +2380,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 && !crate::destination::is_named(&spec.restricted_grant)
                         })
                         .map(|budget| crate::conn::TcpPacing {
+                            activity: Some(progress.tuning_transport_bytes.clone()),
                             budget: budget.clone(),
                             remote_sender: opts.src_remote,
                             scheduler: Arc::downgrade(&sched),
@@ -3014,6 +3015,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_TCP.min(args.automatic_worker_limit());
             gate.set_active(args.connections);
         }
+        let transport_activity = [&src_ep, &dst_ep].iter().any(|endpoint| {
+            real_remote_spec(endpoint).is_some_and(|spec| {
+                spec.tcp
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|info| !info.failed && info.pacing.is_some())
+            })
+        });
+        progress.tuning_transport.store(transport_activity, Relaxed);
         let tuning_key = (autotune && args.tuning_options.is_none())
             .then(|| tune::network_path_key(&src_ep, &dst_ep))
             .flatten();
@@ -3027,11 +3038,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 destination_filesystem
                     .as_ref()
                     .map(|fs| fs.identity.as_str()),
-                format!(
+                tune::history::activity_mode(format!(
                     "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}",
                     opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
                     args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type
-                ),
+                ), transport_activity),
             );
             history.context(&key);
             history.event(

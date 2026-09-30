@@ -302,6 +302,13 @@ size, `batch-bytes`, and `request-size`.
 worker. Lower values allow finer sharing; higher values reduce assignments.
 Splits align to comparison blocks and need twice the minimum remaining size.
 
+Capped TCP copies tune from continuous transport-byte activity so waiting for a
+large batch acknowledgment does not look like an idle link. Completion counters
+still report acknowledged file data. Saved starting counts require the same
+bandwidth limit and compression setting; a capped plateau does not select the
+starting count for an uncapped copy. Transport-byte history is also kept separate
+from older logical-byte-cap history.
+
 ### Average rate and burst patterns
 
 Ordinary TCP pushes and pulls pace compressed bytes at the sender without

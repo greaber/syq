@@ -559,6 +559,16 @@ fn diagnostic(error: &anyhow::Error) {
     }
 }
 
+/// Keep transport-byte caps/scores separate from logical-byte measurements.
+/// The existing mode already includes the numeric cap and compression setting.
+/// Old readers query the old mode, so neither direction reinterprets history.
+pub(crate) fn activity_mode(mut mode: String, transport: bool) -> String {
+    if transport {
+        mode.push_str(";bandwidth-accounting=transport-v1;activity=wire-bytes-v1");
+    }
+    mode
+}
+
 pub(crate) fn context_key(
     recorder: &Recorder,
     src: &crate::conn::Endpoint,

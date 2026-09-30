@@ -1069,6 +1069,7 @@ pub struct TcpProbe {
 /// pushes share the local budget across all destination connections.
 #[derive(Clone)]
 pub(crate) struct TcpPacing {
+    pub(crate) activity: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub(crate) budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
     pub(crate) remote_sender: bool,
     pub(crate) scheduler: std::sync::Weak<crate::sched::Sched>,
@@ -2017,7 +2018,11 @@ impl RemoteSpec {
                 let socket = stream.try_clone()?;
                 Box::new(crate::bwlimit::transport::PacedWriter {
                     handshake_pending: Some(pacing_handshake.clone()),
-                    inner: stream.try_clone()?,
+                    inner: crate::bwlimit::activity::ActivityIo {
+                        inner: stream.try_clone()?,
+                        bytes: pacing.activity.clone(),
+                        handshake_pending: pacing_handshake.clone(),
+                    },
                     budget: pacing.budget.clone(),
                     stopped: move || {
                         scheduler.upgrade().is_none_or(|s| s.is_aborted())
@@ -2029,7 +2034,18 @@ impl RemoteSpec {
             };
         let writer = RecordWriter::new(output, wc);
         let tcp_socket = stream.try_clone()?;
-        let reader = RecordReader::new(stream, rc);
+        let reader = RecordReader::new(
+            crate::bwlimit::activity::ActivityIo {
+                inner: stream,
+                bytes: info
+                    .pacing
+                    .as_ref()
+                    .filter(|p| p.remote_sender)
+                    .and_then(|p| p.activity.clone()),
+                handshake_pending: pacing_handshake.clone(),
+            },
+            rc,
+        );
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, reader) =
