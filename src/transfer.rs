@@ -2827,22 +2827,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    // Create a missing directory destination — never in the read-only modes,
-    // and never under --existing. With several sources, wait until the complete
-    // scan has passed its final-destination conflict checks.
-    let create_root = dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing;
-    let dry_run_creates_root =
-        args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
+    // Missing directories are created only when the copy may write at all:
+    // never in a dry run, and never under --existing, which updates existing
+    // files and creates nothing. With several sources, wait until the
+    // complete scan has passed its final-destination conflict checks.
+    let may_create_directories = !args.dry_run && !args.existing;
+    let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
+    let create_root = root_creatable && !args.dry_run;
+    let dry_run_creates_root = root_creatable && args.dry_run;
     let root_create_condition = TargetCondition::Any;
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
-        && !args.dry_run
-        && !args.existing
+        && may_create_directories
         && defer_destination_mutations;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
-            && !args.dry_run
-            && !args.existing
+            && may_create_directories
             && !defer_operator_directory_creation;
         if create_operator_directory_now {
             let condition = if dst_is_dir {
@@ -2900,18 +2900,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    let destination_tree_known_missing = dst.is_remote()
-        && dst_initially_missing
-        && !opts.ignore_existing
-        && !opts.update
-        && !opts.checksum;
+    let remote_root_initially_missing = dst.is_remote() && dst_initially_missing;
     // Buffered planning performs no destination mutations and starts no
     // workers. Let route probes overlap that scan, while preserving the early
     // worker startup used for initially missing destination trees. Restricted
     // receivers already settled their probes before destination creation.
     // Detached copies keep their readiness notification ahead of the scan.
     let defer_transport_setup = defer_destination_mutations
-        && !destination_tree_known_missing
+        && !remote_root_initially_missing
         && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
         && !pending_tcp_setups.is_empty();
     let history_context = std::cell::RefCell::new(None);
@@ -3055,7 +3051,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let workers_started = std::cell::Cell::new(false);
     if transport_setup.as_ref().is_some_and(|(tcp, _, _)| *tcp)
-        && destination_tree_known_missing
+        && remote_root_initially_missing
         && !opts.dry_run
         && !opts.inplace
         && (!destination_anchor_required || destination_anchor.get().is_some())
@@ -3122,15 +3118,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         opts: &opts,
         destination_supports_confined_socket_nodes,
         destination_metadata_platform,
-        destination_tree_known_missing,
-        destination_children_known_missing: fresh_destination
-            && opts.expressions.update.is_none()
-            && !opts.existing
-            && !opts.ignore_existing
-            && !opts.update
-            && !opts.checksum
-            && !opts.inplace
-            && !opts.restricted_receiver,
+        // Existing-file policies (-u, --checksum, --ignore-existing,
+        // --existing, --inplace, --copy-if) need no per-entry lookup: each
+        // makes the default decision for an absent destination.
+        destination_children_known_missing: fresh_destination,
+        destination_root_known_missing: dst_initially_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
@@ -3313,11 +3305,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && fresh_destination
             && !workers_started.get()
             && !opts.dry_run
-            && !opts.inplace
-            && !opts.checksum
-            && !opts.update
-            && !opts.ignore_existing
-            && !opts.existing
         {
             let (files, bytes, all_small) =
                 st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
@@ -3338,7 +3325,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             None
         };
         if let Err(error) = st.replay_buffered(|| {
-            if let Some(initial) = local_start {
+            // Replay has created a deferred root by now. Without one (for
+            // example --existing against a missing destination) there is
+            // nothing for workers to anchor to and nothing for them to do.
+            let anchored = !destination_anchor_required || destination_anchor.get().is_some();
+            if let (Some(initial), true) = (local_start, anchored) {
                 spawn_workers(initial, refine_start);
                 workers_started.set(true);
                 sched.release_preflighted_work();

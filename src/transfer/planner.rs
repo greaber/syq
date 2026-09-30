@@ -22,13 +22,12 @@ pub(super) struct Planner<'a> {
     /// Directory copies blocked by a destination file or symlink. The conflict
     /// is reported at the parent; its descendants must not be copied.
     pub(super) blocked_directory_paths: std::collections::HashSet<PathBytes>,
-    /// A remote destination root was missing at preflight, so mapped paths
-    /// cannot supply comparison bases. Local fresh trees retain the root
-    /// lookup separately below so its existing metadata is preserved.
-    pub(super) destination_tree_known_missing: bool,
     /// The destination was missing or empty at preflight. Its root may
     /// still have metadata to preserve; only descendants are known absent.
     pub(super) destination_children_known_missing: bool,
+    /// The destination root itself was missing at preflight. Until this copy
+    /// creates it, planning treats it as absent without another lookup.
+    pub(super) destination_root_known_missing: bool,
     /// Called after jobs are queued; starts streaming only when useful work exists.
     pub(super) start_streaming: &'a dyn Fn(),
     pub(super) source_partials: u64,
@@ -1576,19 +1575,11 @@ impl Planner<'_> {
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
         if !dirs.is_empty() {
-            let stats = if self.destination_tree_known_missing {
-                // Preflight can create the root before this batch. Reuse its
-                // identity check so an implicit parent is not sent as an
-                // absent-only mkdir after we have already created it.
-                dirs.iter()
-                    .map(|(path, _, _)| {
-                        (path == &self.dst_root)
-                            .then(|| root_entry.clone())
-                            .flatten()
-                    })
-                    .collect()
-            } else if self.destination_children_known_missing {
-                self.stat_fresh_descendants(dirs.iter().map(|(path, _, _)| path))?
+            let stats = if self.destination_children_known_missing {
+                self.stat_fresh_descendants(
+                    root_entry.as_ref(),
+                    dirs.iter().map(|(path, _, _)| path),
+                )?
             } else if let Some(stats) = dir_stats {
                 stats
             } else {
@@ -1611,10 +1602,11 @@ impl Planner<'_> {
         if others.is_empty() {
             return Ok(());
         }
-        let stats = if self.destination_tree_known_missing {
-            vec![None; others.len()]
-        } else if self.destination_children_known_missing {
-            self.stat_fresh_descendants(others.iter().map(|planned| &planned.dst))?
+        let stats = if self.destination_children_known_missing {
+            self.stat_fresh_descendants(
+                root_entry.as_ref(),
+                others.iter().map(|planned| &planned.dst),
+            )?
         } else if let Some(stats) = &mut other_stats {
             others
                 .iter()
@@ -2791,7 +2783,6 @@ impl Planner<'_> {
             || !self.opts.dst_remote
             || self.buffer.is_some()
             || self.opts.dry_run
-            || self.destination_tree_known_missing
             || self.destination_children_known_missing
             || self.container_guard.is_some()
         {
@@ -3544,18 +3535,36 @@ impl Planner<'_> {
         Ok(n)
     }
 
+    /// Destination stats for a fresh tree: every descendant is absent. The
+    /// root keeps its lookup so an existing empty root's metadata is
+    /// preserved, unless it was missing at preflight: then it is absent until
+    /// this copy creates it, after which the mutation-root identity check has
+    /// already observed it this batch. Earlier batches may have created a
+    /// shared directory; inspect it again so creation accounting and
+    /// metadata decisions see that state.
     fn stat_fresh_descendants<'p>(
         &mut self,
+        root_entry: Option<&Entry>,
         paths: impl Iterator<Item = &'p PathBytes> + Clone,
     ) -> Result<Vec<Option<Entry>>> {
         let mut stats = vec![None; paths.clone().count()];
-        // Earlier batches may have created a shared directory. Inspect it
-        // again so creation accounting and metadata decisions see that state.
-        let (positions, inspect): (Vec<_>, Vec<_>) = paths
-            .enumerate()
-            .filter(|(_, path)| *path == &self.dst_root || self.created_dirs.contains(*path))
-            .map(|(index, path)| (index, path.clone()))
-            .unzip();
+        let mut positions = Vec::new();
+        let mut inspect = Vec::new();
+        for (index, path) in paths.enumerate() {
+            if path == &self.dst_root {
+                match root_entry {
+                    Some(root) => stats[index] = Some(root.clone()),
+                    None if self.destination_root_known_missing => {}
+                    None => {
+                        positions.push(index);
+                        inspect.push(path.clone());
+                    }
+                }
+            } else if self.created_dirs.contains(path) {
+                positions.push(index);
+                inspect.push(path.clone());
+            }
+        }
         if !inspect.is_empty() {
             for (index, entry) in positions.into_iter().zip(self.stat_many(inspect)?) {
                 stats[index] = entry;
