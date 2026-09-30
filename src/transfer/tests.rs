@@ -2153,8 +2153,6 @@ fn comparing_pull_pipelines_remote_reads_with_a_synchronous_destination() {
 
 #[test]
 fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads() {
-    // A relay must pay before receiving data, just like a pull. Its local
-    // forwarding write must not be the first place the limit is applied.
     for relay in [false, true] {
         for basis in [
             "final",
@@ -2165,7 +2163,6 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
         ] {
             let sched = Arc::new(Sched::new(512, 8192));
             let mut job = pipeline_job(b"source", 1536);
-            // Even a final file must not take precedence over an owned partial.
             if matches!(
                 basis,
                 "final" | "owned-partial" | "candidate-with-final" | "candidate-reuse-off"
@@ -2178,6 +2175,24 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             let src = Arc::new(Mutex::new(PipelineState::default()));
             let dst = Arc::new(Mutex::new(PipelineState::default()));
             let data = vec![3; 512];
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Prepared(Preparation {
+                    partial_size: (basis == "owned-partial").then_some(1536),
+                    has_candidates: basis.starts_with("candidate"),
+                }));
+            if matches!(basis, "final" | "candidate-with-final") {
+                // A first-block mismatch ends the preliminary equality probe.
+                src.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Hashes(vec![[1; 32]]));
+                dst.lock().unwrap().replies.push_back(Response::HeldHashes {
+                    hashes: vec![[9; 32]],
+                    len: 1536,
+                });
+            }
             src.lock().unwrap().replies.extend([
                 Response::Hashes(vec![[1; 32], [2; 32], content_digest(&data)]),
                 Response::Block {
@@ -2187,31 +2202,22 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
                 },
                 Response::Stats(vec![Some(job.entry.clone())]),
             ]);
+            dst.lock().unwrap().replies.extend([
+                Response::BasisStaged {
+                    compare_final: basis == "final",
+                },
+                Response::Hashes(vec![[1; 32], [2; 32], [9; 32]]),
+            ]);
+            if basis == "final" {
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .extend([Response::Ok, Response::Ok]); // reuse
+            }
             dst.lock()
                 .unwrap()
                 .replies
-                .push_back(Response::Prepared(Preparation {
-                    partial_size: (basis == "owned-partial").then_some(1536),
-                    has_candidates: basis.starts_with("candidate"),
-                }));
-            if matches!(basis, "final" | "candidate-with-final") {
-                dst.lock().unwrap().replies.push_back(Response::HeldHashes {
-                    hashes: vec![[1; 32], [2; 32], [9; 32]],
-                    len: 1536,
-                });
-            }
-            dst.lock().unwrap().replies.extend([
-                Response::SeededBasis(SeededBasis {
-                    hashes: if basis == "final" {
-                        vec![[1; 32], [2; 32]]
-                    } else {
-                        vec![[1; 32], [2; 32], [9; 32]]
-                    },
-                    selected_final: basis == "final",
-                }),
-                Response::Ok, // write
-                Response::Ok, // finalize
-            ]);
+                .extend([Response::Ok, Response::Ok]); // write, finalize
             let mut worker = pipeline_worker(&sched, &src, &dst, false);
             let opts = Arc::get_mut(&mut worker.opts).unwrap();
             opts.src_remote = true;
@@ -2227,47 +2233,238 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             assert!(sched.finished());
             assert_eq!(worker.progress.bytes_unchanged.load(Relaxed), 1024);
             assert_eq!(worker.progress.bytes_done.load(Relaxed), 512);
-            assert!(!worker.job(0).compare_ranges);
+            assert!(worker.job(0).compare_ranges);
             let source = src.lock().unwrap();
-            assert!(
-                matches!(
-                    source.requests.as_slice(),
-                    [
-                        Request::HashBlocks {
-                            block: 512,
-                            len: 1536,
-                            ..
-                        },
-                        Request::ReadRange {
-                            off: 1024,
-                            len: 512,
-                            ..
-                        },
-                        Request::StatMany { .. },
-                    ]
-                ),
-                "{basis}: {:?}",
-                source.requests
+            let read = source
+                .requests
+                .iter()
+                .position(|r| matches!(r, Request::ReadRange { .. }))
+                .unwrap();
+            assert!(matches!(
+                source.requests[read],
+                Request::ReadRange {
+                    off: 1024,
+                    len: 512,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                source.requests[read - 1],
+                Request::HashBlocks {
+                    off: 0,
+                    block: 512,
+                    len: 1536,
+                    ..
+                }
+            ));
+            assert_eq!(
+                source
+                    .requests
+                    .iter()
+                    .filter(|r| matches!(r, Request::ReadRange { .. }))
+                    .count(),
+                1
             );
-            // The budget must be paid before sending the data request, not after
-            // receiving its response. No upper bound assumes a quiet test machine.
+            assert!(!source
+                .requests
+                .iter()
+                .any(|r| matches!(r, Request::ReadComparedRange { .. })));
             assert!(
-                source.sent_at[1].duration_since(source.sent_at[0])
+                source.sent_at[read].duration_since(source.sent_at[read - 1])
                     >= std::time::Duration::from_millis(100),
                 "{basis}"
             );
             assert!(source.replies.is_empty());
             let destination = dst.lock().unwrap();
             assert!(destination.replies.is_empty());
+            assert!(destination.requests.iter().any(|r| matches!(
+                r,
+                Request::HashWindow {
+                    block: 512,
+                    len: 1536,
+                    ..
+                }
+            )));
             assert!(!destination
                 .requests
                 .iter()
-                .any(|r| matches!(r, Request::StageBasis { .. } | Request::HashWindow { .. })));
-            if !matches!(basis, "final" | "candidate-with-final") {
-                assert!(destination.requests.iter().any(|r| matches!(r,
-                    Request::SeedBasis { final_ranges: Some(ranges), .. } if ranges.is_empty()
-                )));
+                .any(|r| matches!(r, Request::SeedBasis { .. })));
+        }
+    }
+}
+
+#[test]
+fn capped_comparison_windows_bound_requests_and_keep_comparison_granularity() {
+    const BLOCK: u64 = 64 << 10;
+    const START: u64 = 140 << 30;
+    const WINDOW: u64 = crate::proto::MAX_READ_BYTES / 2;
+    const LEN: u64 = 2 * WINDOW + 17;
+    for depth in [1, 4] {
+        for final_basis in [false, true] {
+            let (sched, handle, job) = pipeline_ranges(&[(START, START + LEN)]);
+            {
+                let mut jobs = sched.jobs.lock().unwrap();
+                jobs[0].compare_ranges = true;
+                jobs[0].compare_final = final_basis;
             }
+            let src = Arc::new(Mutex::new(PipelineState::default()));
+            let dst = Arc::new(Mutex::new(PipelineState::default()));
+            let mut off = START;
+            while off < START + LEN {
+                let end = (off + WINDOW).min(START + LEN);
+                let count = (end - off).div_ceil(BLOCK) as usize;
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Hashes(vec![[1; 32]; count]));
+                let hashes = (off..end)
+                    .step_by(BLOCK as usize)
+                    .map(|pos| {
+                        if (pos - START) / BLOCK == 1 || pos == START + 2 * WINDOW {
+                            [2; 32]
+                        } else {
+                            [1; 32]
+                        }
+                    })
+                    .collect();
+                src.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Hashes(hashes));
+                for pos in (off..end).step_by(BLOCK as usize) {
+                    if (pos - START) / BLOCK == 1 || pos == START + 2 * WINDOW {
+                        for chunk in (pos..(pos + BLOCK).min(end)).step_by(512) {
+                            let data = vec![2; ((pos + BLOCK).min(end) - chunk).min(512) as usize];
+                            src.lock().unwrap().replies.push_back(Response::Block {
+                                off: chunk,
+                                hash: content_digest(&data),
+                                data,
+                            });
+                            dst.lock().unwrap().replies.push_back(Response::Ok);
+                        }
+                    } else if final_basis {
+                        dst.lock().unwrap().replies.push_back(Response::Ok);
+                    }
+                }
+                off = end;
+            }
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
+            let opts = Arc::get_mut(&mut worker.opts).unwrap();
+            opts.src_remote = true;
+            opts.block = BLOCK;
+            opts.tuning.request_size = Some(512);
+            opts.tuning.pipeline_depth = Some(depth);
+            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
+            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1 << 30)));
+            worker.progress.bytes_total.store(LEN, Relaxed);
+            let mut credited = 0;
+            worker.transfer_range(&handle, &mut credited).unwrap();
+            assert_eq!(credited, BLOCK + 17);
+            assert_eq!(job.done.load(Relaxed), LEN);
+            assert_eq!(
+                worker.progress.bytes_unchanged.load(Relaxed),
+                LEN - BLOCK - 17
+            );
+            for state in [&src, &dst] {
+                let state = state.lock().unwrap();
+                assert!(state.replies.is_empty());
+                assert_eq!(state.received, state.requests.len());
+                assert!(
+                    state.max_pending <= depth,
+                    "pending {} depth {depth}",
+                    state.max_pending
+                );
+            }
+            for request in &src.lock().unwrap().requests {
+                match request {
+                    Request::HashBlocks {
+                        off, len, block, ..
+                    } => {
+                        assert!(*off >= START);
+                        assert!(*len <= WINDOW);
+                        assert_eq!(*block, BLOCK);
+                    }
+                    Request::ReadRange { off, len, .. } => {
+                        assert!((off - START) / BLOCK == 1 || *off == START + 2 * WINDOW);
+                        assert!(*len <= 512);
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn capped_comparison_errors_drain_only_actual_source_requests() {
+    let (sched, handle, _) = pipeline_ranges(&[(0, 2048)]);
+    {
+        let mut jobs = sched.jobs.lock().unwrap();
+        jobs[0].compare_ranges = true;
+        jobs[0].compare_final = true;
+    }
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    src.lock().unwrap().replies.extend([
+        Response::Hashes(vec![[1; 32], [2; 32], [1; 32], [2; 32]]),
+        Response::Err("injected source read failure".into()),
+        Response::Block {
+            off: 1536,
+            hash: [2; 32],
+            data: vec![2; 512],
+        },
+        Response::Stats(vec![]), // next operation; must not be drained
+    ]);
+    dst.lock().unwrap().replies.extend([
+        Response::Hashes(vec![[1; 32]; 4]),
+        Response::Ok, // first matching block reused
+        Response::Stats(vec![]),
+    ]);
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.src_remote = true;
+    opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1 << 30)));
+    worker.progress.bytes_total.store(2048, Relaxed);
+    let mut credited = 0;
+    let error = worker.transfer_range(&handle, &mut credited).unwrap_err();
+    assert!(format!("{error:#}").contains("injected source read failure"));
+    assert_eq!(credited, 0);
+    assert_eq!(worker.progress.bytes_unchanged.load(Relaxed), 512);
+    for state in [&src, &dst] {
+        let state = state.lock().unwrap();
+        assert_eq!(state.received, state.requests.len());
+        assert_eq!(state.replies.len(), 1);
+        assert!(matches!(state.replies[0], Response::Stats(_)));
+    }
+}
+
+#[test]
+fn capped_comparison_hash_errors_drain_both_endpoints_without_writes() {
+    for source_fails in [false, true] {
+        let (sched, handle, _) = pipeline_ranges(&[(0, 2048)]);
+        sched.jobs.lock().unwrap()[0].compare_ranges = true;
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        for (state, fails) in [(&src, source_fails), (&dst, !source_fails)] {
+            state.lock().unwrap().replies.push_back(if fails {
+                Response::Err("injected window hash error".into())
+            } else {
+                Response::Hashes(vec![[1; 32]; 4])
+            });
+        }
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        Arc::get_mut(&mut worker.opts).unwrap().src_remote = true;
+        worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1 << 30)));
+        let mut credited = 0;
+        let error = worker.transfer_range(&handle, &mut credited).unwrap_err();
+        assert!(format!("{error:#}").contains("injected window hash error"));
+        assert_eq!(credited, 0);
+        for state in [&src, &dst] {
+            let state = state.lock().unwrap();
+            assert!(state.replies.is_empty());
+            assert_eq!(state.received, 1);
+            assert_eq!(state.requests.len(), 1);
         }
     }
 }

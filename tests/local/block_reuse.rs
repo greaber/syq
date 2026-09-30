@@ -638,7 +638,7 @@ fn stale_partial_does_not_replace_an_identical_final_with_different_metadata() {
 #[test]
 fn bandwidth_limited_pulls_transfer_only_differing_blocks() {
     for pacing in ["average", "125ms"] {
-        for changed in [0, 1 << 19, 1 << 20] {
+        for changed in [0usize, 1, 1 << 19, 1 << 20] {
             let t = Tmp::new();
             let rsh = fake_rsh(&t);
             let source = prng(1 << 20, 863);
@@ -673,7 +673,7 @@ fn bandwidth_limited_pulls_transfer_only_differing_blocks() {
             assert_eq!(read(&t.path("dst")), source);
             assert_eq!(
                 tuning_observed(&out)["range_requests"],
-                changed / (128 << 10)
+                changed.div_ceil(256 << 10) * 2
             );
             assert!(partial_files(&t.0).is_empty());
         }
@@ -682,7 +682,7 @@ fn bandwidth_limited_pulls_transfer_only_differing_blocks() {
 
 #[test]
 fn bandwidth_limited_relays_transfer_only_differing_blocks() {
-    for changed in [0, 1 << 19, 1 << 20] {
+    for changed in [0usize, 1, 1 << 19, 1 << 20] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
         let source = prng(1 << 20, 865);
@@ -707,8 +707,31 @@ fn bandwidth_limited_relays_transfer_only_differing_blocks() {
         assert_eq!(read(&t.path("dst")), source);
         assert_eq!(
             tuning_observed(&out)["range_requests"],
-            changed / (128 << 10)
+            changed.div_ceil(256 << 10) * 2
         );
         assert!(partial_files(&t.0).is_empty());
     }
+}
+
+#[test]
+fn capped_pull_resumes_matching_partial_windows_with_reuse_off() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let source = prng(1 << 20, 866);
+    let mut donor = source.clone();
+    donor[1 << 19..].fill(0);
+    write(&t.path("src"), &source);
+    let partial = t.path(".dst.syq-tmp.abcdefghijklmnop");
+    write(&partial, &donor);
+    let out = remote_syq_command(&t, &rsh, &[
+        "-a", "--rsync-path", env!("CARGO_BIN_EXE_syq"), "--syq-no-bootstrap",
+        "--bwlimit=1M",
+        "--performance-tuning=block-reuse=off,request-size=64K,comparison-block-size=256K,bw-pacing=average",
+        &format!("fake:{}", t.s("src")), &t.s("dst"),
+    ]).env("SYQ_DEBUG", "1").run().unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), source);
+    assert_eq!(tuning_observed(&out)["range_requests"], 8);
+    assert_eq!(read(&partial), donor);
+    assert_eq!(partial_files(&t.0), vec![partial]);
 }

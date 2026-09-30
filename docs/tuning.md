@@ -229,12 +229,13 @@ Set `request-size` too: it otherwise follows the comparison block size.
 Both endpoints still read the full file to compare it. Most staged updates and
 partial resume compare bounded windows; their hash memory does not grow with
 file size. Bandwidth-limited pulls and relays compare before requesting source
-data, so matching blocks do not consume the bandwidth budget. These copies and
-explicit whole-file comparisons (`--hash`, protected-existing-file policies,
+data, so matching blocks do not consume the bandwidth budget. Explicit whole-file
+comparisons (`--hash`, protected-existing-file policies,
 and in-place reuse) have a hash-response limit: at 64 KiB, files must be smaller
 than 130 GiB. Increasing `comparison-block-size` increases that limit proportionally.
-A smaller effective request size, including
-bandwidth pacing, also reduces staged comparison granularity.
+For bandwidth-limited pulls and relays, comparison memory is bounded and
+request size does not change comparison granularity. For other staged updates,
+a smaller effective request size also reduces comparison granularity.
 
 In `syq rsync`, `-B` / `--block-size` selects the comparison block size.
 Do not combine it with `comparison-block-size`.
