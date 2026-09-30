@@ -296,6 +296,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         copy_checksum_unsupported: Default::default(),
         content_md5: Default::default(),
         copy_tagging_unsupported: Default::default(),
+        outage: Default::default(),
         cancelled: Default::default(),
         cancel_wake: Default::default(),
         uploads: Default::default(),

@@ -368,6 +368,7 @@ impl Engine {
                     crate::s3::diagnostics::elapsed(started, "download_range", attempt_length);
                     self.tuning.requests.completed(length);
                     self.progress.add_bytes(length);
+                    self.outage.responded();
                     return Ok(hash);
                 }
                 Err(e)
@@ -388,7 +389,15 @@ impl Engine {
                     }
                     attempt += 1;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A permanent GET error is still an answer from the service.
+                    if e.downcast_ref::<Permanent>().is_some() {
+                        self.outage.responded();
+                    } else {
+                        self.outage.exhausted();
+                    }
+                    return Err(e);
+                }
             }
         }
     }

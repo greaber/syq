@@ -1577,6 +1577,36 @@ fn serve(
             return;
         }
     }
+    if fault.starts_with("unavailable-") {
+        // Listing answers, then every PUT (or every HEAD) fails as if the
+        // service were down.
+        let length: usize = headers
+            .get("content-length")
+            .map_or(0, |n| n.parse().unwrap());
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).unwrap();
+        let unavailable = || b"<Error><Code>ServiceUnavailable</Code></Error>".as_slice();
+        match method {
+            "GET" => reply(
+                &mut socket,
+                200,
+                &[],
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                false,
+            ),
+            "HEAD" if fault == "unavailable-head" => {
+                probes.fetch_add(1, Ordering::Relaxed);
+                reply(&mut socket, 503, &[], b"", true);
+            }
+            "HEAD" => reply(&mut socket, 404, &[], b"", true),
+            "PUT" => {
+                probes.fetch_add(1, Ordering::Relaxed);
+                reply(&mut socket, 503, &[], unavailable(), false);
+            }
+            _ => panic!("unexpected {first}"),
+        }
+        return;
+    }
     if fault == "object-lock-upload" {
         match method {
             "HEAD" => reply(&mut socket, 404, &[], b"", true),
@@ -3570,6 +3600,56 @@ fn s3_upload_retries_corrupted_data_with_a_warning_within_the_budget() {
             retries > 0,
             "{}",
             output_text(&output)
+        );
+    }
+}
+
+#[test]
+fn copies_stop_when_requests_keep_failing_after_their_retries() {
+    // PUTs are retried by syq; HEADs by the SDK. Either way, eight requests in
+    // a row that exhaust their retries without an answer stop the copy before
+    // the remaining objects are tried.
+    for (fault, retries) in [("unavailable-put", 0), ("unavailable-head", 1)] {
+        let temp = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("source")).unwrap();
+        for n in 0..40 {
+            std::fs::write(temp.path().join("source").join(format!("f{n}")), b"x").unwrap();
+        }
+        let server = Server::start(fault);
+        let output = server
+            .command_with_retries(temp.path(), retries)
+            .args(["--s3-endpoint", &server.address])
+            .args(["--performance-tuning", "s3-objects=1"])
+            .args([
+                "--srcs-in",
+                "source",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "prefix",
+            ])
+            .capture_output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(
+                "8 S3 requests in a row failed after all retries with no response from the service; stopping"
+            ),
+            "{fault}: {}",
+            output_text(&output)
+        );
+        // One object at a time: the copy stops at the eighth failed request,
+        // give or take the next object already started.
+        let failing = server.probes.load(Ordering::Relaxed) as u32;
+        let per_request = retries + 1;
+        assert!(
+            (8 * per_request..=9 * per_request).contains(&failing),
+            "{fault}: {failing} failing requests"
         );
     }
 }

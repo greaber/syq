@@ -411,12 +411,13 @@ pub(super) fn run(args: Args) -> Result<i32> {
     let result = runtime.block_on(async {
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let deleting = std::cell::Cell::new(false);
+        let outage = std::sync::Arc::new(super::outage::Outage::default());
         let work = async {
             let mut options = args.s3.clone().unwrap();
             let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
             let uploads = std::sync::Arc::new(super::upload_http::Cancellation::default());
             let authorization = super::authorization::connect(&args, &options).await?;
-            let (client, note) = client::connect_authorized(&mut options, control.clone(), uploads, authorization.clone()).await?;
+            let (client, note) = client::connect_authorized(&mut options, control.clone(), uploads, authorization.clone(), Some(outage.clone())).await?;
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
                 progress.println(&note);
             }
@@ -526,6 +527,13 @@ pub(super) fn run(args: Args) -> Result<i32> {
                     let _ = work.await;
                 }
                 bail!("S3 removal terminated");
+            },
+            _ = outage.stopped() => {
+                cancelled.store(true, Relaxed);
+                if deleting.get() {
+                    let _ = work.await;
+                }
+                bail!("{}", super::outage::Outage::message());
             },
         }
     });

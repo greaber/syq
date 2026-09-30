@@ -12,6 +12,7 @@ mod local;
 pub(crate) mod map;
 mod metadata_copy;
 pub(crate) mod metadata_fields;
+pub(crate) mod outage;
 mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;

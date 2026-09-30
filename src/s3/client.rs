@@ -10,7 +10,7 @@ use aws_smithy_runtime_api::{
         interceptors::{
             context::{
                 BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
-                InterceptorContext,
+                FinalizerInterceptorContextRef, InterceptorContext,
             },
             Intercept,
         },
@@ -74,6 +74,38 @@ struct ControlStart(tokio::time::Instant);
 impl aws_smithy_types::config_bag::Storable for ControlStart {
     type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
 }
+/// Report each SDK-retried request's final outcome. Requests sent without SDK
+/// retries are retried by syq, which reports them itself.
+#[derive(Debug)]
+struct ObserveOutage(std::sync::Arc<super::outage::Outage>);
+impl Intercept for ObserveOutage {
+    fn name(&self) -> &'static str {
+        "SyqS3Outage"
+    }
+    fn read_after_execution(
+        &self,
+        context: &FinalizerInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        if cfg
+            .load::<RetryConfig>()
+            .is_none_or(|retry| retry.max_attempts() <= 1)
+        {
+            return Ok(());
+        }
+        let answered = context
+            .response()
+            .is_some_and(|r| !super::outage::transient_status(r.status().as_u16()));
+        if answered || context.output_or_error().is_some_and(|r| r.is_ok()) {
+            self.0.responded();
+        } else {
+            self.0.exhausted();
+        }
+        Ok(())
+    }
+}
+
 impl Intercept for ControlLatency {
     fn name(&self) -> &'static str {
         "SyqS3ControlLatency"
@@ -267,7 +299,7 @@ pub(super) async fn connect(
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
     uploads: std::sync::Arc<super::upload_http::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
-    connect_authorized(options, control, uploads, None).await
+    connect_authorized(options, control, uploads, None, None).await
 }
 
 pub(super) async fn connect_authorized(
@@ -275,6 +307,7 @@ pub(super) async fn connect_authorized(
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
     uploads: std::sync::Arc<super::upload_http::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
+    outage: Option<std::sync::Arc<super::outage::Outage>>,
 ) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
@@ -334,6 +367,9 @@ pub(super) async fn connect_authorized(
             write: options.write_headers.clone(),
         })
         .interceptor(ControlLatency(control));
+    if let Some(outage) = outage {
+        config = config.interceptor(ObserveOutage(outage));
+    }
 
     let endpoint = options
         .endpoint

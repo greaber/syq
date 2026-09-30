@@ -57,6 +57,7 @@ pub(super) struct Engine {
     authorization: Option<Arc<super::authorization::Authorization>>,
     /// The destination rejected an upload without a checksum; send Content-MD5.
     content_md5: std::sync::atomic::AtomicBool,
+    outage: Arc<super::outage::Outage>,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -195,11 +196,13 @@ impl Engine {
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let uploads = Arc::new(super::upload_http::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
+        let outage = Arc::new(super::outage::Outage::default());
         let (client, note) = client::connect_authorized(
             &mut options,
             control.clone(),
             uploads.clone(),
             authorization.clone(),
+            Some(outage.clone()),
         )
         .await?;
         if let Some(note) = note.filter(|_| args.verbose > 0) {
@@ -222,6 +225,7 @@ impl Engine {
             copy_checksum_unsupported: Default::default(),
             content_md5: content_md5.into(),
             copy_tagging_unsupported: Default::default(),
+            outage,
         }))
     }
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -229,17 +233,36 @@ impl Engine {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::pin!(work);
+        let outage = self.outage.clone();
         let interrupted = tokio::select! {
             result = &mut work => return result,
-            _ = tokio::signal::ctrl_c() => "interrupted",
-            _ = terminate.recv() => "terminated",
+            _ = tokio::signal::ctrl_c() => Some("interrupted"),
+            _ = terminate.recv() => Some("terminated"),
+            _ = outage.stopped() => None,
         };
         self.cancelled.store(true, Relaxed);
         self.cancel_wake.notify_waiters();
         self.uploads.cancel();
         // Drain started requests, including synchronous file bodies, before exit.
         let _ = work.await;
-        bail!("S3 copy {interrupted}; rerun the command to continue")
+        match interrupted {
+            Some(interrupted) => bail!("S3 copy {interrupted}; rerun the command to continue"),
+            None => bail!("{}", super::outage::Outage::message()),
+        }
+    }
+    /// Report a request that syq retried itself and has now given up on.
+    fn report_final<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+        &self,
+        error: &aws_sdk_s3::error::SdkError<
+            E,
+            aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+        >,
+    ) {
+        if retryable(error) {
+            self.outage.exhausted();
+        } else {
+            self.outage.responded();
+        }
     }
     fn check_cancelled(&self) -> Result<()> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "S3 copy cancelled");
@@ -1143,6 +1166,7 @@ impl Engine {
                 }
                 match result {
                     Ok(_) => {
+                        self.outage.responded();
                         // Content-MD5 fixed the rejection, so send it from now on.
                         if fallback.is_some() {
                             self.content_md5.store(true, Relaxed);
@@ -1172,7 +1196,10 @@ impl Engine {
                         super::backoff(attempt).await;
                         attempt += 1;
                     }
-                    Err(e) => return Err(e.into_service_error()).context("S3 PUT failed"),
+                    Err(e) => {
+                        self.report_final(&e);
+                        return Err(e.into_service_error()).context("S3 PUT failed");
+                    }
                 }
             }
             self.tuning.requests.completed(size);
@@ -1312,6 +1339,7 @@ impl Engine {
                                 }
                                 match result {
                                     Ok(output) => {
+                                        self.outage.responded();
                                         let etag =
                                             output.e_tag().context("S3 part omitted ETag")?;
                                         if fallback.is_some() {
@@ -1373,8 +1401,9 @@ impl Engine {
                                         attempt += 1;
                                     }
                                     Err(e) => {
+                                        self.report_final(&e);
                                         return Err(e.into_service_error())
-                                            .context("upload part; rerun the command to resume")
+                                            .context("upload part; rerun the command to resume");
                                     }
                                 }
                             }
@@ -2845,7 +2874,7 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     error
         .raw_response()
         .map(|r| r.status().as_u16())
-        .is_none_or(|s| matches!(s, 408 | 429 | 500 | 502 | 503 | 504))
+        .is_none_or(super::outage::transient_status)
         || error
             .as_service_error()
             .and_then(|e| e.code())
