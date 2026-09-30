@@ -32,10 +32,22 @@ and recovery records, and completion caches, to help performance. When syq
 cannot read or write it, copying and removal still succeed.
 
 Any other write requirement is discussed with the maintainer first and recorded
-here. The accepted one is installing a missing SSH helper, which needs a
-durable writable location on the server; the temporary directory is not a
-lasting place for it. When the server's home is unwritable, install syq there
-separately and use `--syq-path` or `--no-bootstrap`.
+here. The accepted ones are:
+
+- Installing a missing SSH helper needs a durable writable location on the
+  server; the temporary directory is not a lasting place for it. When the
+  server cannot download the helper itself, syq downloads and verifies it on
+  the invoking machine and keeps it in the user cache there. When the server's
+  home is unwritable, install syq there separately and use `--syq-path` or
+  `--no-bootstrap`.
+- Copies between two servers through the command-restricted receiver, the
+  default, keep security state: enrollment keys on the invoking machine, and
+  the installed receiver and its replay-protection records in the destination
+  account. They also collect the receiver's receipt in the temporary directory.
+  Replay protection cannot be optional, so this state must be writable;
+  `--peer-auth broker` or `own-credentials` copy without the receiver.
+- `--detach` writes the detached copy's log under `~/.syq` on the coordinating
+  server, because that log is the only record of how the copy ended.
 
 Why: the temporary directory is the conventional place for a program's
 short-lived files, so a little space there is unsurprising. Caches and records
