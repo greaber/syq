@@ -145,30 +145,130 @@ fn local_medium_unsupported_keeps_full_size_range_requests() {
 }
 
 #[test]
-fn checksum_and_paced_medium_files_keep_batches() {
-    for control in ["--checksum", "--resource-limits=bandwidth=1G"] {
-        let t = Tmp::new();
-        write(&t.path("src/file"), &prng(1 << 20, 80));
-        let out = compat_command()
+fn paced_medium_files_keep_batches() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), &prng(1 << 20, 80));
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--performance-tuning=workers=1",
+            "--no-progress",
+            "--resource-limits=bandwidth=1G",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+    assert_eq!(observed["small_batches"], 1);
+}
+
+/// A content check decides which files are copied, not how.
+#[cfg(target_os = "linux")]
+#[test]
+fn checksum_keeps_the_local_copy_path() {
+    let t = Tmp::new();
+    let data = prng(1 << 20, 81);
+    write(&t.path("src/file"), &data);
+    set_mtime(&t.path("src/file"), 1_600_000_000);
+    let run = || {
+        compat_command()
             .args([
                 "-a",
                 "--syq-no-tcp",
                 "--performance-tuning=workers=1",
                 "--no-progress",
-                control,
+                "--checksum",
                 &t.s("src/"),
                 &t.s("dst/"),
             ])
             .env("SYQ_DEBUG", "1")
             .run()
-            .unwrap();
-        assert_output_ok(&out);
-        assert_same_tree(&t.path("src"), &t.path("dst"));
-        let observed = tuning_observed(&out);
-        assert_eq!(observed["local_whole_files"], 0);
-        assert_eq!(observed["range_requests"], 0);
-        assert_eq!(observed["small_batches"], 1);
+            .unwrap()
+    };
+
+    // A fresh file has nothing to compare and takes the whole-file copy.
+    let out = run();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 1, "{out:?}");
+    assert_eq!(observed["range_requests"], 0);
+
+    // An identical file is compared and left in place.
+    let before = fs::metadata(t.path("dst/file")).unwrap();
+    let out = run();
+    assert_output_ok(&out);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0, "{out:?}");
+    assert_eq!(observed["range_requests"], 0);
+    assert_eq!(
+        fs::metadata(t.path("dst/file")).unwrap().ino(),
+        before.ino()
+    );
+
+    // A changed file with matching size and time is compared, then copied
+    // whole like any other changed local file.
+    let mut changed = data.clone();
+    changed[data.len() / 2] ^= 0xff;
+    write(&t.path("dst/file"), &changed);
+    set_mtime(&t.path("dst/file"), 1_600_000_000);
+    let out = run();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), data);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 1, "{out:?}");
+    assert_eq!(observed["range_requests"], 0);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+/// When the receiver cannot copy directly, the range fallback reuses the
+/// equality probe's verdict instead of hashing both files again.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn checksum_compares_once_when_local_copy_is_unsupported() {
+    let t = Tmp::new();
+    for i in 0..2 {
+        let data = prng(4 << 20, i);
+        write(&t.path(&format!("src/file{i}")), &data);
+        let mut changed = data.clone();
+        changed[i as usize * 1024] ^= 0xff;
+        write(&t.path(&format!("dst/file{i}")), &changed);
+        set_mtime(&t.path(&format!("src/file{i}")), 1_600_000_000);
+        set_mtime(&t.path(&format!("dst/file{i}")), 1_600_000_000);
     }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--performance-tuning=workers=2",
+            "--block-size=4M",
+            "--performance-tuning=request-size=4M",
+            "--no-progress",
+            "--checksum",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
+        .env("SYQ_TEST_BASIS_HASH_EVENTS", t.path("hashes"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["small_batches"], 0);
+    let hashes = fs::read_to_string(t.path("hashes")).unwrap();
+    assert_eq!(hashes.lines().count(), 2, "{hashes}");
+    assert!(partial_files(&t.0).is_empty());
 }
 
 #[test]
@@ -418,11 +518,7 @@ fn macos_clone_copies_without_reading_ranges_and_preserves_metadata() {
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn ineligible_local_copies_do_not_claim_source_capabilities() {
-    let mut options = vec![
-        "--checksum",
-        "--bwlimit=1G",
-        "--performance-tuning=copy-path=ranges",
-    ];
+    let mut options = vec!["--bwlimit=1G", "--performance-tuning=copy-path=ranges"];
     if cfg!(target_os = "macos") {
         options.push("--inplace");
     }
@@ -438,16 +534,21 @@ fn ineligible_local_copies_do_not_claim_source_capabilities() {
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), data);
     }
-    // Positive control: an eligible copy really reaches the guarded initializer.
-    let t = Tmp::new();
-    write(&t.path("src"), &prng(5 << 20, 1235));
-    let out = compat_command()
-        .args(["-a", "--no-progress", &t.s("src"), &t.s("dst")])
-        .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("test rejected unnecessary copy-source capabilities"));
+    // Positive control: an eligible copy really reaches the guarded
+    // initializer, and a content check leaves the copy eligible.
+    for option in [None, Some("--checksum")] {
+        let t = Tmp::new();
+        write(&t.path("src"), &prng(5 << 20, 1235));
+        let out = compat_command()
+            .args(["-a", "--no-progress"])
+            .args(option)
+            .args([&t.s("src"), &t.s("dst")])
+            .env("SYQ_TEST_REJECT_COPY_SOURCES", "1")
+            .run()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(stderr_of(&out).contains("test rejected unnecessary copy-source capabilities"));
+    }
 }
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -458,7 +559,6 @@ fn macos_clone_preserves_copy_controls_and_no_preserve_metadata() {
     }
     for args in [
         vec!["--inplace"],
-        vec!["--checksum"],
         vec!["--bwlimit=1G"],
         vec!["--performance-tuning=copy-path=ranges"],
     ] {

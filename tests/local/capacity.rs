@@ -156,7 +156,6 @@ fn capacity_failure_reports_other_settled_apply_outcomes_before_aborting() {
 #[test]
 fn copy_local_disk_exdev_preserves_range_controls() {
     for (args, synchronous) in [
-        (vec!["--checksum"], false),
         (vec!["--resource-limits", "bandwidth=1G"], false),
         (vec![], true),
     ] {

@@ -857,6 +857,58 @@ impl Worker {
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
         let inplace = job.inplace;
+        let reuse_blocks = self
+            .opts
+            .tuning
+            .reuse_destination_blocks(self.opts.same_host);
+        let final_file = job
+            .dst_entry
+            .as_deref()
+            .filter(|entry| entry.kind == Kind::File);
+        // An explicit content check decides whether an existing file needs
+        // copying; it does not change how the copy is made. Without block
+        // reuse a differing file is replaced whole, so on the same host probe
+        // equality and stop at the first difference rather than hashing both
+        // files to the end; the windows cost no round trips there. A matching
+        // file finishes through its retained inode. Remote copies keep their
+        // single exchange below.
+        let mut known_different = false;
+        if self.opts.checksum && self.opts.same_host && !reuse_blocks && size > 0 {
+            if let Some(existing) = final_file {
+                let matched = existing.size == size
+                    && match self.matches_final_windows(&job) {
+                        Ok(matched) => matched,
+                        Err(error) => {
+                            self.sched.ranges_ready(idx, vec![]);
+                            if self.transport_dead() {
+                                self.sched.requeue(idx);
+                            }
+                            return Err(error);
+                        }
+                    };
+                if matched {
+                    if let Err(error) = self.finish_matched_basis(idx, &job) {
+                        self.sched.ranges_ready(idx, vec![]);
+                        if self.transport_dead() {
+                            self.sched.requeue(idx);
+                        }
+                        return Err(error);
+                    }
+                    job.done.store(size, Relaxed);
+                    self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                    self.progress.bytes_total.fetch_sub(size, Relaxed);
+                    self.sched.ranges_ready(idx, vec![]);
+                    if let Err(error) = self.finish_matched_file(idx) {
+                        if self.transport_dead() {
+                            self.sched.requeue_finish(idx, true);
+                        }
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                known_different = true;
+            }
+        }
         // Same-machine copy: let the receiver move the bytes directly (kernel
         // offload, or an eligible sequential userspace writer) instead of
         // framing, hashing and scheduling them through the transport.
@@ -864,14 +916,7 @@ impl Worker {
         // uses the regular userspace path (also useful for mounted NFS paths).
         // Reuse needs comparison only when there is a final file to compare.
         // Fresh files can still use the whole-file shortcut with reuse enabled.
-        let compare_existing = job
-            .dst_entry
-            .as_ref()
-            .is_some_and(|entry| entry.kind == Kind::File)
-            && self
-                .opts
-                .tuning
-                .reuse_destination_blocks(self.opts.same_host);
+        let compare_existing = final_file.is_some() && reuse_blocks;
         if !compare_existing
             && self
                 .opts
@@ -923,11 +968,11 @@ impl Worker {
             // destination. A matching read-only file needs only metadata work.
             // Prepare binds any writes to this held inode, and the comparison
             // below is reused rather than hashing the contents a second time.
-            let reuse_blocks = self
-                .opts
-                .tuning
-                .reuse_destination_blocks(self.opts.same_host);
-            let inplace_ranges = if inplace && final_is_file && (reuse_blocks || self.opts.checksum)
+            // A file the equality probe above found different is not compared
+            // again.
+            let inplace_ranges = if inplace
+                && final_is_file
+                && (reuse_blocks || (self.opts.checksum && !known_different))
             {
                 let diff = self.diff_final_and_hold(&job)?;
                 if diff.ranges.is_empty() && diff.held_len == Some(size) {
@@ -999,10 +1044,14 @@ impl Worker {
                 // An explicit checksum may still establish a complete match.
                 // A differing final file contributes no blocks to the output.
                 if self.opts.checksum && final_is_file {
-                    let diff = self.diff_final_and_hold(&job)?;
-                    if diff.ranges.is_empty() && diff.held_len == Some(size) {
-                        self.finish_matched_basis(idx, &job)?;
-                        return Ok((vec![], false));
+                    // Same-host files were probed before the copy decision;
+                    // remote copies and empty files compare here.
+                    if !known_different {
+                        let diff = self.diff_final_and_hold(&job)?;
+                        if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                            self.finish_matched_basis(idx, &job)?;
+                            return Ok((vec![], false));
+                        }
                     }
                     let prepared = self.prepare_file(&job, true)?;
                     if prepared.partial_size.is_some() || prepared.has_candidates {
