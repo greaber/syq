@@ -262,9 +262,18 @@ fn managed_remote_helper_install_is_cached() {
     assert_eq!(probes, 1);
 
     write(&t.path("src"), b"second");
+    let log_before = fs::read_to_string(t.path("rsh.log")).unwrap().len();
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
+    // Only the first session asks the host for its platform; later ones
+    // launch the helper its handshake identified.
+    let launches = fs::read_to_string(t.path("rsh.log")).unwrap()[log_before..].to_owned();
+    assert_eq!(launches.matches("uname").count(), 1, "{launches}");
+    assert!(
+        launches.contains(&format!("target={}\n", helper_target())),
+        "{launches}"
+    );
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
@@ -417,7 +426,7 @@ fn development_build_attempts_upload_for_an_unlisted_platform() {
     let rsh = fake_rsh(&t);
     executable(
         &t.path("remote-bin/uname"),
-        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; -sm) echo Linux riscv64;; esac\n",
     );
     write(&t.path("src"), b"custom target");
     let remote = format!("fake:{}", t.s("dst"));
@@ -440,7 +449,7 @@ fn development_build_rejects_cross_platform_upload() {
     };
     executable(
         &t.path("remote-bin/uname"),
-        format!("#!/bin/sh\ncase \"$1\" in -s) echo {other_os};; -m) echo x86_64;; esac\n")
+        format!("#!/bin/sh\ncase \"$1\" in -s) echo {other_os};; -m) echo x86_64;; -sm) echo {other_os} x86_64;; esac\n")
             .as_bytes(),
     );
     write(&t.path("src"), b"must not copy");
@@ -464,7 +473,7 @@ fn development_build_does_not_install_an_unrunnable_upload() {
     // Model an unlisted host on which the uploaded binary cannot execute.
     executable(
         &t.path("remote-bin/uname"),
-        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; -sm) echo Linux riscv64;; esac\n",
     );
     executable(&t.path("remote-bin/chmod"), b"#!/bin/sh\nexit 0\n");
     write(&t.path("src"), b"must not copy");

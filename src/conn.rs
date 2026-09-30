@@ -1378,7 +1378,15 @@ impl RemoteSpec {
             return format!("{} {}", shell_words::quote(p), shell_words::join(args));
         }
         if self.bootstrap_helper {
-            return remote_helper::launcher(args);
+            // Every session reaches the host that answered the first
+            // handshake. A release helper was chosen by the same mapping that
+            // names its platform, so later sessions can skip `uname`. A
+            // development build may run as the `self` target instead.
+            let target = crate::identity::uses_release_helpers()
+                .then(|| self.diagnostics.lock().unwrap().peer.clone())
+                .flatten()
+                .and_then(|peer| remote_helper::Target::key_for_platform(&peer.platform));
+            return remote_helper::launcher(args, target);
         }
         format!("syq {}", shell_words::join(args))
     }
