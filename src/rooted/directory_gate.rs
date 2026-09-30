@@ -22,13 +22,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 // capacity.
 const MUTATORS: usize = 2;
 
-// Replacing a file frees its inode. ext4 without an orphan file does that
-// under one lock for the whole filesystem, and its throughput falls once
-// more than about eight threads replace files at once, whichever directories
-// they work in. Roots on other filesystems do not take this permit: XFS and
-// tmpfs replaced files faster with every worker, and on NFS the bound changed
-// nothing. Whether an ext4 filesystem has an orphan file is not visible from
-// here, so every ext4 root takes it.
+// Replacing a file frees its inode. On ext4 the throughput of that falls
+// once more than about eight threads replace files at once, whichever
+// directories they work in, with or without the orphan_file feature. Roots
+// on other filesystems do not take this permit: XFS, tmpfs and ZFS replaced
+// files as fast or faster with every worker, and on NFS the bound changed
+// nothing.
 const REPLACERS: usize = 8;
 
 thread_local! {
