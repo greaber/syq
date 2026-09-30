@@ -143,16 +143,17 @@ impl FsOps {
         };
         let (root, directory) = (first.root.clone(), first.relative.clone());
         let mut stages = Vec::with_capacity(run.len());
-        // A turn only schedules. If it cannot be taken, the operations
-        // themselves report what is wrong with the path.
-        let turn = root.mutation_turn(&directory).ok();
-        for (index, target) in run {
-            match self.create_small_stage(&puts[index], target) {
-                Ok(stage) => stages.push((index, stage)),
-                Err(error) => results[index] = Err(wire_error(&error)),
+        {
+            // A turn only schedules. If it cannot be taken, the operations
+            // themselves report what is wrong with the path.
+            let _turn = root.mutation_turn(&directory).ok();
+            for (index, target) in run {
+                match self.create_small_stage(&puts[index], target) {
+                    Ok(stage) => stages.push((index, stage)),
+                    Err(error) => results[index] = Err(wire_error(&error)),
+                }
             }
         }
-        drop(turn);
         stages.retain(
             |(index, stage)| match self.write_small_stage(&puts[*index], stage) {
                 Ok(()) => true,
@@ -163,22 +164,22 @@ impl FsOps {
             },
         );
         let mut published = Vec::with_capacity(stages.len());
-        // Replacing files contends across the whole filesystem on some
-        // filesystems, so a burst that replaces any waits for admission there
-        // first. New names need none.
-        let replacement = stages
-            .iter()
-            .any(|(index, _)| puts[*index].replaces)
-            .then(|| root.replacement_turn());
-        let turn = root.mutation_turn(&directory).ok();
-        for (index, stage) in stages {
-            match self.publish_small_stage(&puts[index], &stage) {
-                Ok(()) => published.push((index, stage)),
-                Err(error) => results[index] = Err(wire_error(&error)),
+        {
+            // Replacing files contends across the whole filesystem on some
+            // filesystems, so a burst that replaces any waits for admission
+            // there first. New names need none.
+            let _replacement = stages
+                .iter()
+                .any(|(index, _)| puts[*index].replaces)
+                .then(|| root.replacement_turn());
+            let _turn = root.mutation_turn(&directory).ok();
+            for (index, stage) in stages {
+                match self.publish_small_stage(&puts[index], &stage) {
+                    Ok(()) => published.push((index, stage)),
+                    Err(error) => results[index] = Err(wire_error(&error)),
+                }
             }
         }
-        drop(turn);
-        drop(replacement);
         for (index, stage) in published {
             results[index] = self
                 .finish_small_stage(&puts[index], stage)
