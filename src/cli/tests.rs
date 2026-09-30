@@ -652,19 +652,26 @@ fn native_rm_rejects_remote_helper_selection_for_local_removal() {
 }
 
 #[test]
-fn native_persistence_scope_rejects_an_explicit_remote_shell() {
-    let argv = [
-        "--pscope=/tmp/scope",
-        "--rsh=ssh -J jump",
-        "source",
-        "--into",
-        "destination",
-    ]
-    .map(std::ffi::OsString::from);
-    let error = parse_native_copy(&argv).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("--pscope cannot be used with --rsh"));
+fn native_persistence_scope_requires_a_shareable_remote_shell() {
+    let parse = |rsh: &str| {
+        let argv = [
+            "--pscope=/tmp/scope".to_string(),
+            format!("--rsh={rsh}"),
+            "source".into(),
+            "--into".into(),
+            "destination".into(),
+        ]
+        .map(std::ffi::OsString::from);
+        let mut args = parse_native_copy(&argv).unwrap();
+        crate::persistence::mark_explicit_scope(&mut args)
+    };
+    parse("ssh -J jump").unwrap();
+    for own in ["ssh -S /tmp/socket", "tsh ssh"] {
+        assert!(parse(own)
+            .unwrap_err()
+            .to_string()
+            .contains("--pscope requires the default ssh"));
+    }
 }
 
 #[test]
