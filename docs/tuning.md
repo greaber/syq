@@ -287,9 +287,9 @@ cannot combine with `copy-path=ranges` or `copy-path=streaming`;
 `auto-streaming` accepts them.
 
 Remote copies batch new files up to the smaller of `request-size` and
-`batch-bytes`; same-machine copies batch files up to 64 KiB. Larger limits allow
-more data to be held in memory; interrupted whole-file copies restart from the
-beginning. A file that already exists at the destination joins a batch when syq
+`batch-bytes`; on Linux, same-machine copies without `--hash` or a bandwidth cap
+batch files up to 64 KiB. Larger limits allow more data to be held in memory;
+interrupted whole-file copies restart from the beginning. A file that already exists at the destination joins a batch when syq
 replaces it without reading it first, as same-machine copies do by default.
 Files that need comparison (block reuse or `--hash`), files protected by an
 `--if-exists` policy, and preserved hard links are handled one at a time. On macOS, files above the batching
