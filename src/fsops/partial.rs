@@ -534,6 +534,11 @@ impl FsOps {
                 .map(|file| (file, FileLocation::Path(p.clone()), p))?
         };
         require_open_target(&file, &label, condition)?;
+        #[cfg(debug_assertions)]
+        record_test_event(
+            "SYQ_TEST_BASIS_HASH_EVENTS",
+            format_args!("hash {off} {len}"),
+        )?;
         file.seek(SeekFrom::Start(off))?;
         let hashes = hash_reader_observed(
             &mut file,
@@ -984,6 +989,9 @@ impl FsOps {
         let _copy = self
             .operation
             .span(crate::transfer_observations::Stage::FilesystemCopy);
+        // An equality probe that found a difference may have retained the
+        // destination inode; the replacement is staged and published by name.
+        self.held_basis.take();
         let CopyLocalPolicy {
             inplace,
             allow_sequential_nfs_fallback,
@@ -1347,6 +1355,7 @@ impl FsOps {
         let _copy = self
             .operation
             .span(crate::transfer_observations::Stage::FilesystemCopy);
+        self.held_basis.take();
         #[cfg(debug_assertions)]
         record_test_event("SYQ_TEST_COPY_LOCAL_REQUESTS", format_args!("copy-local"))?;
         // This operation stages a new inode; callers must stream in-place

@@ -4,7 +4,6 @@
 #[derive(Clone, Copy)]
 pub(crate) struct CopyPolicy {
     pub same_host: bool,
-    pub checksum: bool,
     pub force_ranges: bool,
     pub bandwidth_limited: bool,
     pub receiver_copy_disabled: bool,
@@ -27,7 +26,6 @@ impl CopyPolicy {
         self.same_host
             && !self.receiver_copy_disabled
             && !self.force_ranges
-            && !self.checksum
             && !self.bandwidth_limited
     }
 
@@ -74,7 +72,6 @@ mod tests {
     fn options_requiring_range_processing_prevent_direct_copy() {
         let direct = CopyPolicy {
             same_host: true,
-            checksum: false,
             force_ranges: false,
             bandwidth_limited: false,
             receiver_copy_disabled: false,
@@ -87,10 +84,6 @@ mod tests {
             },
             CopyPolicy {
                 same_host: false,
-                ..direct
-            },
-            CopyPolicy {
-                checksum: true,
                 ..direct
             },
             CopyPolicy {
