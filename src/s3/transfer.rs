@@ -1732,7 +1732,6 @@ impl Engine {
         let retain_times =
             !self.options.route.is_server_copy() && self.args.expressions.uses_source_s3_time();
         let mut claims = BTreeMap::new();
-        let mut excluded_subtrees = HashSet::new();
         let same_bucket = self.options.route.source_bucket() == Some(self.options.bucket.as_str());
         let mut copy_sources = Vec::new();
         let mut copy_targets = Vec::new();
@@ -1781,6 +1780,9 @@ impl Engine {
             } else {
                 String::new()
             };
+            // An exclusion under one root says nothing about the same object
+            // selected through another root with different anchoring.
+            let mut excluded_subtrees = HashSet::new();
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -1890,7 +1892,7 @@ impl Engine {
                         ));
                     }
                     if self.args.delete {
-                        prune.scope(path.as_bytes(), key.as_bytes());
+                        prune.scope(path.as_bytes());
                     }
                     Box::new(listed.into_entries().filter_map(
                         move |(object, size, service_time)| {
@@ -1934,16 +1936,6 @@ impl Engine {
                 };
             for object in objects {
                 let (key, size, path, kind, directory, service_time, source_object) = object?;
-                if !already_filtered {
-                    if let Some(excluded) =
-                        client::exclusion(matcher.as_ref(), &key, directory, &excluded_subtrees)
-                    {
-                        self.progress
-                            .files_excluded
-                            .fetch_add(excluded.count(&mut excluded_subtrees), Relaxed);
-                        continue;
-                    }
-                }
                 if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     prune.protect(path.as_bytes());

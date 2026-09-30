@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, ffi::OsStr, os::unix::ffi::OsStrExt};
 
 #[derive(Clone, Default)]
 pub(super) struct Plan {
-    pub scopes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub scopes: Vec<Vec<u8>>,
     pub claims: BTreeSet<Vec<u8>>,
     protected: BTreeSet<Vec<u8>>,
     files: BTreeSet<Vec<u8>>,
@@ -20,8 +20,8 @@ pub(super) fn beneath<'a>(path: &'a [u8], root: &[u8]) -> Option<&'a [u8]> {
 }
 
 impl Plan {
-    pub fn scope(&mut self, destination: &[u8], source: &[u8]) {
-        self.scopes.push((destination.to_vec(), source.to_vec()));
+    pub fn scope(&mut self, destination: &[u8]) {
+        self.scopes.push(destination.to_vec());
         self.claim(destination);
     }
     pub fn claim(&mut self, path: &[u8]) {
@@ -76,22 +76,18 @@ impl Plan {
         directory: bool,
         matcher: Option<&ignore::gitignore::Gitignore>,
     ) -> bool {
-        // Use the most specific mapping's source path, just as the copy scan does.
-        let Some((root, source)) = self
+        // Each destination scope corresponds to a selected source root. Nested
+        // roots restart anchoring, just as they do during source selection.
+        let Some(root) = self
             .scopes
             .iter()
-            .filter(|(root, _)| beneath(path, root).is_some())
-            .max_by_key(|(root, _)| root.len())
+            .filter(|root| beneath(path, root).is_some())
+            .max_by_key(|root| root.len())
         else {
             return false;
         };
-        let suffix = beneath(path, root).unwrap();
-        let mut label = source.clone();
-        if !label.is_empty() && !suffix.is_empty() {
-            label.push(b'/');
-        }
-        label.extend_from_slice(suffix);
-        matcher.is_some_and(|m| crate::scan::path_is_ignored(m, &label, directory))
+        let relative = beneath(path, root).unwrap();
+        matcher.is_some_and(|m| crate::scan::path_is_ignored(m, relative, directory))
     }
 }
 
@@ -130,7 +126,7 @@ mod tests {
     #[test]
     fn object_and_prefix_claims_are_distinct() {
         let mut plan = Plan::default();
-        plan.scope(b"root", b"source");
+        plan.scope(b"root");
         plan.claim_file(b"root/file");
         plan.claim(b"root/dir");
         plan.claim_file(b"root/dir/child");
@@ -146,7 +142,7 @@ mod tests {
     #[test]
     fn protected_children_keep_ancestors_without_protecting_siblings() {
         let mut plan = Plan::default();
-        plan.scope(b"backup/tree", b"source");
+        plan.scope(b"backup/tree");
         plan.protect(b"backup/tree/old/ignored");
         assert!(plan.keeps(b"backup/tree/old"));
         assert!(plan.keeps(b"backup/tree/old/ignored/child"));
@@ -156,12 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn ignores_use_source_names_and_keep_recovery_descendants() {
+    fn ignores_are_relative_to_each_scope_and_keep_recovery_descendants() {
         let mut plan = Plan::default();
-        plan.scope(b"renamed", b"source");
-        let matcher = crate::scan::build_ignore(&["/source/ignored/".into()]).unwrap();
+        plan.scope(b"renamed");
+        let matcher = crate::scan::build_ignore(&["/ignored/".into()]).unwrap();
         assert!(plan.ignores(b"renamed/ignored/child", false, matcher.as_ref()));
         assert!(!plan.ignores(b"renamed/extra", false, matcher.as_ref()));
+        assert!(!plan.ignores(b"renamed/nested/ignored/child", false, matcher.as_ref()));
+        plan.scope(b"renamed/ignored");
+        assert!(!plan.ignores(b"renamed/ignored", true, matcher.as_ref()));
+        assert!(!plan.ignores(b"renamed/ignored/child", false, matcher.as_ref()));
+        assert!(plan.ignores(b"renamed/ignored/ignored/child", false, matcher.as_ref()));
+        plan.scope(b"other");
+        assert!(plan.ignores(b"other/ignored/child", false, matcher.as_ref()));
         assert!(recovery(b"old/.syq-swap-123-4/data"));
         assert!(recovery(b"old/.syq-s3-123.partial"));
         assert!(!recovery(b"old/normal.partial"));

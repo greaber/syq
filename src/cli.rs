@@ -1204,7 +1204,7 @@ struct NativeCopyOperationalArgs {
     /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     stats: bool,
-    /// Skip paths matching a gitignore-style pattern (repeatable)
+    /// Skip paths within each source root using a gitignore-style pattern (repeatable)
     #[arg(long = "ignore", value_name = "PATTERN")]
     ignore: Vec<String>,
     /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)

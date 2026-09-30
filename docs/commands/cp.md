@@ -36,7 +36,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
 | `--where <EXPR>` | Select non-directory source entries with a typed expression; directories follow normal copy rules |
-| `--ignore <PATTERN>` | Skip paths matching a gitignore-style pattern (repeatable) |
+| `--ignore <PATTERN>` | Skip paths within each source root using a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 

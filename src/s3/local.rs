@@ -318,19 +318,18 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
         if source.expected_hash.is_some() && source.kind() != ObjectKind::File {
             bail!("an expected digest requires a regular file");
         }
-        if args.delete
-            && source.kind() == ObjectKind::Dir
-            && !matcher
-                .as_ref()
-                .is_some_and(|m| crate::scan::path_is_ignored(m, &source.label, true))
-        {
-            prune.scope(source.key.as_bytes(), &source.label);
+        if args.delete && source.kind() == ObjectKind::Dir {
+            prune.scope(source.key.as_bytes());
         }
-        let mut stack = vec![(source, selection == SourceSelection::Contents)];
-        while let Some((mut source, contents)) = stack.pop() {
-            if matcher.as_ref().is_some_and(|m| {
-                crate::scan::path_is_ignored(m, &source.label, source.kind() == ObjectKind::Dir)
-            }) {
+        let mut stack = vec![(source, selection == SourceSelection::Contents, true)];
+        while let Some((mut source, contents, selected_root)) = stack.pop() {
+            // Like a filesystem scan, match descendants relative to the selected
+            // directory. Explicit sources (including mapping entries) are roots.
+            if !selected_root
+                && matcher.as_ref().is_some_and(|m| {
+                    crate::scan::path_is_ignored(m, &source.path, source.kind() == ObjectKind::Dir)
+                })
+            {
                 prune.protect(source.key.as_bytes());
                 continue;
             }
@@ -370,7 +369,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                         child.label.push(b'/');
                     }
                     child.label.extend_from_slice(&name);
-                    stack.push((child, false));
+                    stack.push((child, false, false));
                 }
                 if contents {
                     continue;

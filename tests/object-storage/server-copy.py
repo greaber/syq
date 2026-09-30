@@ -176,13 +176,13 @@ def check():
             assert error.code == 404, error
         else:
             raise AssertionError('foreign descendant survived prune')
-        # Filtering every source must not turn --as-existing into a directory check.
+        # Ignore rules do not exclude explicitly selected files.
         c.run(['--from', remote, name, '--to', remote, '--as-existing', name + '-copy',
                '--ignore=*'])
         local_file = root / 'filtered-file'
         local_file.write_bytes(b'filtered')
         c.run([local_file, '--to', remote, '--as-existing', name + '-copy', '--ignore=*'])
-        assert c.request('GET', name + '-copy')[1] == b'same body'
+        assert c.request('GET', name + '-copy')[1] == b'filtered'
         # Exact target keys may prefix another source key without overwriting it.
         mapped = c.PREFIX + '/exact-map'
         c.request('PUT', mapped + '/source', b'first')

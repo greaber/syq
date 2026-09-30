@@ -1501,17 +1501,14 @@ fn serve(
                         )
                     }
                 }
-                "listing-ignored-root" | "listing-empty" => {
-                    assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
-                    (
-                        if fault == "listing-empty" {
-                            String::new()
-                        } else {
-                            object("data/archive/file")
-                        },
-                        false,
-                    )
-                }
+                "listing-ignored-root" | "listing-empty" => (
+                    if fault == "listing-empty" {
+                        String::new()
+                    } else {
+                        object("data/archive/file")
+                    },
+                    false,
+                ),
                 "listing-exists" => {
                     assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
                     (object("data/other"), true)
@@ -4083,14 +4080,15 @@ fn s3_upload_destination_discovery_is_bounded() {
 }
 
 #[test]
-fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
-    for (fault, sources, rule, success, excluded, requests) in [
+fn s3_ignore_anchoring_restarts_at_each_selected_source() {
+    for (fault, sources, rule, success, excluded, transferred, requests) in [
         (
             "listing-ignored-root",
             vec!["--srcs-in", "data", "--srcs-in", "data"],
-            "data/",
+            "/archive/",
             true,
-            1,
+            2,
+            0,
             4,
         ),
         (
@@ -4098,7 +4096,8 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
             vec!["data/archive/a", "data/archive/b"],
             "archive/",
             true,
-            1,
+            0,
+            2,
             2,
         ),
         (
@@ -4107,6 +4106,16 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
             "data/",
             false,
             0,
+            0,
+            2,
+        ),
+        (
+            "listing-ignored-root",
+            vec!["--srcs-in", "data"],
+            "data/",
+            true,
+            0,
+            1,
             2,
         ),
     ] {
@@ -4135,7 +4144,10 @@ fn s3_ignored_subtree_counts_span_selectors_and_require_existence() {
         let terminal: serde_json::Value =
             serde_json::from_str(records.lines().last().unwrap()).unwrap();
         assert_eq!(terminal["files_excluded"], excluded, "{fault}: {terminal}");
-        assert_eq!(terminal["files_transferred"], 0, "{fault}: {terminal}");
+        assert_eq!(
+            terminal["files_transferred"], transferred,
+            "{fault}: {terminal}"
+        );
     }
 }
 
@@ -5161,7 +5173,7 @@ fn server_copy_multipart_preserves_tag_characters() {
 }
 
 #[test]
-fn server_copy_filters_exact_and_mapping_overlap() {
+fn server_copy_ignore_does_not_hide_exact_or_mapping_overlap() {
     for mapping in [false, true] {
         for filter in [None, Some(("--ignore", "original"))] {
             let server = Server::start("server-copy");
@@ -5192,14 +5204,11 @@ fn server_copy_filters_exact_and_mapping_overlap() {
             }
             let output = server.cp(temp.path(), &args);
             let diagnostic = output_text(&output);
-            assert_eq!(
-                output.status.success(),
-                filter.is_some(),
+            assert!(
+                !output.status.success(),
                 "mapping={mapping}, filter={filter:?}: {diagnostic}"
             );
-            if filter.is_none() {
-                assert!(diagnostic.contains("overlap"), "{diagnostic}");
-            }
+            assert!(diagnostic.contains("overlap"), "{diagnostic}");
         }
     }
 }

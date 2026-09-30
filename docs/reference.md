@@ -228,7 +228,10 @@ syq cp --ignore-from .gitignore --srcs-in project --into backup
 syq cp --ignore node_modules --ignore '*.o' --srcs-in project --into backup
 ```
 
-Patterns use gitignore syntax. Rules run in command-line order; the last
+Patterns use gitignore syntax and match paths relative to each selected source
+directory, for both filesystem and S3 copies. For example, `/build/` excludes
+the top-level `build` directory inside every selected source. Explicitly selected
+sources themselves are never ignored. Rules run in command-line order; the last
 match wins. `!` re-includes a path.
 
 | Pattern | Matches |

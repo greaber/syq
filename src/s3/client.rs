@@ -819,11 +819,22 @@ impl Exclusion<'_> {
 
 pub(super) fn exclusion<'a>(
     matcher: Option<&ignore::gitignore::Gitignore>,
+    prefix: &str,
     key: &'a str,
     directory: bool,
     known_subtrees: &std::collections::HashSet<String>,
 ) -> Option<Exclusion<'a>> {
     let matcher = matcher?;
+    let relative = key.strip_prefix(prefix)?;
+    let relative = if directory {
+        relative.trim_end_matches('/')
+    } else {
+        relative
+    };
+    // A selected prefix and its ancestors are never filtered.
+    if relative.is_empty() {
+        return None;
+    }
     let key = if directory {
         key.trim_end_matches('/')
     } else {
@@ -839,13 +850,13 @@ pub(super) fn exclusion<'a>(
             return Some(Exclusion::Subtree(parent));
         }
     }
-    for (separator, _) in key.match_indices('/') {
-        let ancestor = &key[..separator];
+    for (separator, _) in relative.match_indices('/') {
+        let ancestor = &relative[..separator];
         if !ancestor.is_empty() && matcher.matched(ancestor, true).is_ignore() {
-            return Some(Exclusion::Subtree(ancestor));
+            return Some(Exclusion::Subtree(&key[..prefix.len() + separator]));
         }
     }
-    if !key.is_empty() && matcher.matched(key, directory).is_ignore() {
+    if matcher.matched(relative, directory).is_ignore() {
         Some(if directory {
             Exclusion::Subtree(key)
         } else {
@@ -1122,13 +1133,6 @@ pub(super) async fn list_with_times(
         found: false,
         excluded: 0,
     };
-    if let Some(excluded) = exclusion(matcher, prefix, true, excluded_subtrees) {
-        result.found = prefix_exists(client, bucket, prefix).await?;
-        if result.found {
-            result.excluded += excluded.count(excluded_subtrees);
-        }
-        return Ok(result);
-    }
     let mut probes_remaining = 4;
     let mut pending = vec![prefix.to_owned()];
     while let Some(current) = pending.pop() {
@@ -1153,6 +1157,7 @@ pub(super) async fn list_with_times(
                     object.key().is_some_and(|key| {
                         if let Some(Exclusion::Subtree(boundary)) = exclusion(
                             matcher,
+                            prefix,
                             key,
                             object.size() == Some(0) && key.ends_with('/'),
                             excluded_subtrees,
@@ -1192,7 +1197,7 @@ pub(super) async fn list_with_times(
                                 && child.ends_with('/'),
                             "S3 listing returned an invalid common prefix"
                         );
-                        if exclusion(matcher, child, true, excluded_subtrees).is_some() {
+                        if exclusion(matcher, prefix, child, true, excluded_subtrees).is_some() {
                             excluded += 1;
                         } else {
                             included += 1;
@@ -1243,7 +1248,9 @@ pub(super) async fn list_with_times(
                 );
                 let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
                 let directory = is_directory_marker(key, size);
-                if let Some(excluded) = exclusion(matcher, key, directory, excluded_subtrees) {
+                if let Some(excluded) =
+                    exclusion(matcher, prefix, key, directory, excluded_subtrees)
+                {
                     // A filename-only exclusion still encounters the key and
                     // preserves its path validation. Pruned descendants do not.
                     if excluded == Exclusion::File {
@@ -1270,7 +1277,7 @@ pub(super) async fn list_with_times(
                         && child.ends_with('/'),
                     "S3 listing returned an invalid common prefix"
                 );
-                if let Some(excluded) = exclusion(matcher, child, true, excluded_subtrees) {
+                if let Some(excluded) = exclusion(matcher, prefix, child, true, excluded_subtrees) {
                     result.excluded += excluded.count(excluded_subtrees);
                 } else {
                     pending.push(child.to_owned());
@@ -1681,12 +1688,12 @@ mod tests {
                     .unwrap()
                     .unwrap();
             let mut known_subtrees = std::collections::HashSet::new();
-            let actual = exclusion(Some(&matcher), key, directory, &known_subtrees);
+            let actual = exclusion(Some(&matcher), "", key, directory, &known_subtrees);
             assert_eq!(actual, expected, "{rules:?} {key}");
             if let Some(excluded) = actual {
                 excluded.count(&mut known_subtrees);
                 assert_eq!(
-                    exclusion(Some(&matcher), key, directory, &known_subtrees),
+                    exclusion(Some(&matcher), "", key, directory, &known_subtrees),
                     expected
                 );
             }
@@ -1704,6 +1711,64 @@ mod tests {
                 "{rules:?} {key} directory={directory}"
             );
         }
+    }
+
+    #[test]
+    fn exclusion_anchors_patterns_inside_the_selected_prefix() {
+        use super::{exclusion, Exclusion};
+        let matcher = crate::scan::build_ignore(&[
+            "/build/".into(),
+            "logs/*".into(),
+            "!logs/keep/".into(),
+            "project/".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        let mut known = std::collections::HashSet::new();
+        for (key, directory, expected) in [
+            ("parent/project/", true, None),
+            (
+                "parent/project/build/",
+                true,
+                Some(Exclusion::Subtree("parent/project/build")),
+            ),
+            (
+                "parent/project/build/file",
+                false,
+                Some(Exclusion::Subtree("parent/project/build")),
+            ),
+            ("parent/project/nested/build/file", false, None),
+            ("parent/project/logs/drop", false, Some(Exclusion::File)),
+            ("parent/project/logs/keep/file", false, None),
+            ("parent/project/src/file", false, None),
+        ] {
+            let actual = exclusion(Some(&matcher), "parent/project/", key, directory, &known);
+            assert_eq!(actual, expected, "{key}");
+            if let Some(excluded) = actual {
+                excluded.count(&mut known);
+            }
+        }
+        let all = crate::scan::build_ignore(&["*".into()]).unwrap().unwrap();
+        assert_eq!(
+            exclusion(
+                Some(&all),
+                "parent/project/",
+                "parent/project/",
+                true,
+                &known
+            ),
+            None
+        );
+        assert_eq!(
+            exclusion(
+                Some(&all),
+                "parent/project/",
+                "parent/project/file",
+                false,
+                &known
+            ),
+            Some(Exclusion::File)
+        );
     }
 
     #[test]

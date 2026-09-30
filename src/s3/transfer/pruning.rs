@@ -82,7 +82,7 @@ impl Engine {
                 !plan
                     .scopes
                     .iter()
-                    .any(|(scope, _)| prune::beneath(path, scope).is_some())
+                    .any(|scope| prune::beneath(path, scope).is_some())
             }) {
                 if let Some(meta) = metadata_optional(&dst.root, &RelativePath::new(path)?)? {
                     identities.insert((meta.dev, meta.ino));
@@ -91,7 +91,7 @@ impl Engine {
         }
         let mut found = Vec::new();
         let mut seen = BTreeSet::new();
-        for (scope, _) in plan.scopes.clone() {
+        for scope in plan.scopes.clone() {
             if let Some(dst) = destination {
                 let mut stack = vec![scope];
                 while let Some(path) = stack.pop() {
@@ -226,7 +226,7 @@ impl Engine {
         // snapshot and still skips deletions if any copy failed.
         if self.upload_keys.get().is_none() {
             let mut keys = HashMap::new();
-            for (scope, _) in &plan.scopes {
+            for scope in &plan.scopes {
                 let key = std::str::from_utf8(scope)?;
                 let prefix = if key.is_empty() {
                     String::new()
