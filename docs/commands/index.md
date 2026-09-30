@@ -16,7 +16,7 @@ and `...` allows repetition.
 
 <!-- CLI: syq -->
 ```text
-syq [--use-version VERSION] <COMMAND> [OPTIONS]
+syq [--version-is EXPR] [--use-version VERSION] <COMMAND> [OPTIONS]
 syq --self-update
 ```
 
@@ -38,7 +38,8 @@ syq --self-update
 
 | Argument / option | Meaning |
 |---|---|
-| `--use-version <VERSION>` | Run an exact official release, downloading it if needed (must be the first argument) |
+| `--version-is <EXPR>` | Require the invoked release to match EXPR before running anything or selecting --use-version. Bare x.y.z means exact equality; operators: == != < <= > >=. Commas mean AND; \| means OR, with AND binding more tightly. Quote expressions in the shell. Development builds are unsupported. Put --version-is and --use-version before the command and other options, in either order. |
+| `--use-version <VERSION>` | Run an exact official release, downloading it if needed (before the command and other options) |
 | `--self-update` | Install the newest signed release (standalone installs); Homebrew: brew upgrade syq |
 
 **Help and version**

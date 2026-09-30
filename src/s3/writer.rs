@@ -282,7 +282,7 @@ fn direct_file(file: &File, size: u64) -> Result<Option<File>> {
         let output = match std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_DIRECT)
-            .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .open(crate::sys::proc_fd_path(file))
         {
             Ok(file) => file,
             Err(e)
