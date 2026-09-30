@@ -104,8 +104,8 @@ network context during a copy prevents saving a new hint for its initial path.
 `--resource-limits workers=N` caps the starting count and subsequent exploration.
 
 `SYQ_TUNING_CACHE` sets the base path for history; an empty value disables
-history and remembered starts. `XDG_CACHE_HOME` changes the default parent
-directory.
+history and remembered starts. An absolute `XDG_CACHE_HOME` changes the default
+parent directory.
 
 Syq can keep idle connections ready for later tuning changes. These connections
 and their helper processes still use resources, so the active worker count is

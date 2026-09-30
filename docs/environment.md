@@ -28,7 +28,7 @@ helpers, or other programs; the rest of the environment is passed through.
 | `SYQ_TUNING_HISTORY_SIZE` | History retention target, default `10M` |
 | `SYQ_DEBUG` | Add internal diagnostics to stderr |
 | `SYQ_S3_DIAGNOSTICS=1` | Add S3 request diagnostics to stderr |
-| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` | Relocate cache, preference, and runtime files; a relative `XDG_CACHE_HOME` is ignored |
 
 Diagnostic formats can change between versions. For scripts, use
 [automation results](automation.md). Usual system variables such as `HOME`,
@@ -51,9 +51,10 @@ Default locations include:
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
 | `~/.local/share/syq/restricted/` | Receiver enrollment state |
 
-Copies can proceed when optional caches cannot be written. They do need a
-little space for private sockets in the temporary directory on each machine:
-`TMPDIR` when it is set, otherwise `/tmp`. Persistent connections need a
+Copies can proceed when optional caches cannot be written, and syq does not
+create a missing home directory to hold them. Copies do need a little space for
+private sockets in the temporary directory on each machine: `TMPDIR` when it is
+set, otherwise `/tmp`. Persistent connections need a
 writable runtime directory. If `syq persist on` enabled persistence but syq
 cannot use its setting or runtime directory, a copy warns and connects without
 persistence. See [Enrollment](remote-reference.md#enrollment)
