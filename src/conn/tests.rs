@@ -2204,15 +2204,13 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
     }
     // Without a directory a relative path cannot be keyed.
     assert!(persistent_ssh_options(&words("-i key"), None).is_none());
-    // A configuration file can use the directory in settings syq does not
-    // read, even when it is named by an absolute path.
+    // A configuration file is keyed by its path, like the default config;
+    // a relative path names a different file in each directory.
     for (given, key) in [
         ("-F ssh.conf", "-F /project/ssh.conf"),
         ("-F /etc/shared.conf", "-F /etc/shared.conf"),
     ] {
-        let options = persistent_ssh_options(&words(given), Some(directory)).unwrap();
-        assert_eq!(options.options.join(" "), key);
-        assert_eq!(options.directory.as_deref(), Some("/project"), "{given}");
+        assert_eq!(resolve(given).unwrap(), key, "{given}");
     }
     // A local command can refer to the directory in any way, so it ties the
     // connection to the directory itself.

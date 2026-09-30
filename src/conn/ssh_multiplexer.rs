@@ -111,10 +111,10 @@ pub(crate) fn rsh_persists_connections(rsh: &str) -> bool {
 /// directory, so they are made absolute: the same options given in another
 /// directory can name different files, and must not reuse this connection.
 /// Options that run a local command, such as `ProxyCommand=./proxy`, can refer
-/// to the directory in ways that cannot be resolved, and so can the contents of
-/// a configuration file named with `-F`, which syq does not read. Either ties
-/// the connection to the directory itself. None when a path or that directory
-/// cannot be recorded.
+/// to the directory in ways that cannot be resolved, so they tie the connection
+/// to the directory itself. A configuration file named with `-F` is treated
+/// like the default `~/.ssh/config`: its own settings are not examined. None
+/// when a path or that directory cannot be recorded.
 pub(crate) fn persistent_ssh_options(
     options: &[String],
     directory: Option<&std::path::Path>,
@@ -159,7 +159,6 @@ pub(crate) fn persistent_ssh_options(
             index += 1;
             (options.get(index - 1)?.clone(), false)
         };
-        uses_directory |= letter == b'F';
         let value = if FILE_LETTERS.contains(&letter) {
             absolute(&value)?
         } else if letter == b'o' {
