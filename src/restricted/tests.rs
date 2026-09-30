@@ -937,6 +937,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
             dev: 1,
             ino: 2,
         }),
+        replaces: false,
     }]);
     authority.authorize(&mut small, false).unwrap();
     let Request::PutSmallBatch(puts) = small else {
@@ -1229,6 +1230,7 @@ fn small_put(path: &Path) -> Request {
         inplace: false,
         condition: proto::TargetCondition::Any,
         guard: None,
+        replaces: false,
     }])
 }
 
@@ -2784,6 +2786,7 @@ fn receipt_policy_records_each_outcome_and_closure_state_then_encrypts_it() {
         inplace: false,
         condition: proto::TargetCondition::Any,
         guard: None,
+        replaces: false,
     };
     let mut batch = Request::PutSmallBatch(vec![put(&copied), put(&failed)]);
     let settlement = authority.authorize(&mut batch, false).unwrap();
@@ -3521,6 +3524,7 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
         inplace: false,
         condition: proto::TargetCondition::Any,
         guard: None,
+        replaces: false,
     };
     let mut files =
         Request::PutSmallBatch(vec![put(&existing_file, 0o7777), put(&new_file, 0o7777)]);
@@ -3957,6 +3961,7 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
         inplace: false,
         condition: proto::TargetCondition::Any,
         guard: None,
+        replaces: false,
     }]);
     assert!(authority.authorize(&mut small, false).is_err());
 

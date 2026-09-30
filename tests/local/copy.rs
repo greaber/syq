@@ -70,6 +70,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .arg(&rsh)
         .args([
             "--syq-no-tcp",
+            "--no-compress",
             "-a",
             "--syq-no-bootstrap",
             "--block-size=64K",

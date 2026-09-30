@@ -288,15 +288,26 @@ transport bytes. Batch controls
 cannot combine with `copy-path=ranges` or `copy-path=streaming`;
 `auto-streaming` accepts them.
 
-Remote new-file copies can batch files up to the smaller of `request-size` and
-`batch-bytes`. Larger limits allow more data to be held in memory; interrupted
-whole-file copies restart from the beginning. On macOS, files above the batching
+Remote copies batch new files up to the smaller of `request-size` and
+`batch-bytes`; on Linux, same-machine copies without `--hash` or a bandwidth cap
+batch files up to 64 KiB. Larger limits allow more data to be held in memory;
+interrupted whole-file copies restart from the beginning. A file that already exists at the destination joins a batch when syq
+replaces it without reading it first, as same-machine copies do by default.
+Files that need comparison (block reuse or `--hash`), files protected by an
+`--if-exists` policy, and preserved hard links are handled one at a time. On macOS, files above the batching
 limit can use APFS cloning. That limit is the smallest of the comparison block
 size, `batch-bytes`, and `request-size`.
 
 `split-min-size` controls how small a region an idle worker can take from another
 worker. Lower values allow finer sharing; higher values reduce assignments.
 Splits align to comparison blocks and need twice the minimum remaining size.
+
+Capped SSH and TCP copies tune from continuous transport-byte activity so waiting for a
+large batch acknowledgment does not look like an idle link. Completion counters
+still report acknowledged file data. Saved starting counts require the same
+bandwidth limit and compression setting; a capped plateau does not select the
+starting count for an uncapped copy. Transport-byte history is also kept separate
+from older logical-byte-cap history.
 
 ### Average rate and burst patterns
 

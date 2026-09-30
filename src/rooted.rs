@@ -155,7 +155,8 @@ impl RelativePath {
         Ok(Self { components })
     }
 
-    fn leaf(&self) -> Result<(&[Vec<u8>], &[u8])> {
+    /// The components of the holding directory, and the entry's own name.
+    pub(crate) fn leaf(&self) -> Result<(&[Vec<u8>], &[u8])> {
         let (leaf, parents) = self
             .components
             .split_last()
@@ -187,12 +188,28 @@ impl RelativePath {
     }
 }
 
+/// Scheduling only: a turn grants no authority over the directory, and every
+/// change made during it still resolves and checks its path through `Root`.
+pub(crate) struct MutationTurn {
+    #[cfg(any(target_os = "linux", test))]
+    _turn: directory_gate::Turn,
+}
+
+/// Scheduling only, like a turn: admission to replacing files on the root's
+/// filesystem.
+pub(crate) struct ReplacementTurn {
+    #[cfg(any(target_os = "linux", test))]
+    _permit: Option<directory_gate::Permit>,
+}
+
 /// An existing directory opened once as the authority boundary.
 pub(crate) struct Root {
     directory: File,
     identity: RootIdentity,
     #[cfg(target_os = "linux")]
     partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
+    #[cfg(target_os = "linux")]
+    bounds_replacement: OnceLock<bool>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, target_os = "linux"))]
@@ -226,6 +243,8 @@ impl Root {
             directory,
             #[cfg(target_os = "linux")]
             partial_name_limits: OnceLock::new(),
+            #[cfg(target_os = "linux")]
+            bounds_replacement: OnceLock::new(),
             #[cfg(all(test, target_os = "linux"))]
             test_name_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, target_os = "linux"))]
@@ -257,6 +276,50 @@ impl Root {
     fn mutation_permit(&self, path: &RelativePath) -> Result<directory_gate::Permit> {
         let (parents, _) = path.leaf()?;
         Ok(directory_gate::acquire(self.identity, parents))
+    }
+
+    /// Whether replacing files beneath this root is bounded per filesystem.
+    /// XFS frees inodes per allocation group and replaced files faster with
+    /// every worker; the bound would cost it up to a fifth. Every other
+    /// filesystem is bounded: the collapse it prevents on ext4 costs more than
+    /// double, and no other measured filesystem lost anything to it.
+    #[cfg(any(target_os = "linux", test))]
+    fn bounds_replacement(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            *self.bounds_replacement.get_or_init(|| {
+                let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                // SAFETY: fstatfs writes only into the local struct.
+                unsafe {
+                    libc::fstatfs(self.directory.as_raw_fd(), stats.as_mut_ptr()) != 0
+                        || stats.assume_init().f_type as u32 != libc::XFS_SUPER_MAGIC as u32
+                }
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// Wait to replace files beneath this root, where its filesystem needs
+    /// that. Take it before a directory turn, and only around publication.
+    pub(crate) fn replacement_turn(&self) -> ReplacementTurn {
+        ReplacementTurn {
+            #[cfg(any(target_os = "linux", test))]
+            _permit: self
+                .bounds_replacement()
+                .then(|| directory_gate::replacement(self.identity.dev)),
+        }
+    }
+
+    /// Take a turn changing the directory that holds `path`, for a caller
+    /// about to create or publish several of its entries. Release it before
+    /// writing file data: other contenders for the directory wait meanwhile.
+    pub(crate) fn mutation_turn(&self, path: &RelativePath) -> Result<MutationTurn> {
+        let (_parents, _) = path.leaf()?;
+        Ok(MutationTurn {
+            #[cfg(any(target_os = "linux", test))]
+            _turn: directory_gate::turn(self.identity, _parents),
+        })
     }
 
     pub(crate) fn identity(&self) -> RootIdentity {
@@ -398,6 +461,22 @@ impl Root {
     /// Create a new regular leaf. Existing leaves of every type are refused.
     /// Special permission bits require the explicit metadata operations.
     pub(crate) fn create_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
+        self.create_file_with_access(path, mode, libc::O_RDWR)
+    }
+
+    /// Create a new regular leaf for a writer that never reads it back. An
+    /// NFS server can answer a read-write open with a delegation, which the
+    /// client must return before the file is renamed into place.
+    pub(crate) fn create_write_only_file(&self, path: &RelativePath, mode: u32) -> Result<File> {
+        self.create_file_with_access(path, mode, libc::O_WRONLY)
+    }
+
+    fn create_file_with_access(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+        access: libc::c_int,
+    ) -> Result<File> {
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(path)?;
         // O_CREAT | O_EXCL either creates a new regular file or fails. Unlike
@@ -406,7 +485,7 @@ impl Root {
         let file = self
             .open_leaf(
                 path,
-                libc::O_RDWR
+                access
                     | libc::O_CREAT
                     | libc::O_EXCL
                     | libc::O_NOFOLLOW
@@ -1311,7 +1390,7 @@ impl Root {
             Err(error) => return Err(error.into()),
         }
         #[cfg(target_os = "linux")]
-        let source_name = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        let source_name = CString::new(crate::sys::proc_fd_path(&file))?;
         #[cfg(not(target_os = "linux"))]
         let source_parent = self.resolve_parent(source)?;
         #[cfg(any(target_os = "linux", test))]
@@ -1619,6 +1698,12 @@ pub(crate) struct ResolvedParent<'a> {
 impl ResolvedParent<'_> {
     pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
         metadata_at(self.directory.as_raw_fd(), &self.leaf)
+    }
+
+    /// The directory that holds the leaf, for inspecting where a new entry
+    /// would live. Mutations still go through `Root`.
+    pub(crate) fn directory(&self) -> &File {
+        &self.directory
     }
 
     pub(crate) fn open_metadata(&self) -> io::Result<File> {

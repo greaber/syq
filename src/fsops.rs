@@ -38,6 +38,7 @@ mod limits;
 mod operator;
 mod partial;
 mod paths;
+mod small_batch;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
@@ -205,6 +206,8 @@ fn discard_rooted_copy_partial(
     expected_dev: u64,
     expected_ino: u64,
 ) -> Result<()> {
+    #[cfg(debug_assertions)]
+    record_test_event("SYQ_TEST_COPY_LOCAL_DISCARDS", format_args!("discard"))?;
     match root.metadata_optional(relative)? {
         Some(current)
             if is_safe_rooted_partial(current)
@@ -323,8 +326,9 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
     }
 }
 
+/// The mount `file` was opened through, on kernels that name mounts.
 #[cfg(target_os = "linux")]
-fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
+fn mount_id(file: &File) -> Option<u64> {
     let mut stat = std::mem::MaybeUninit::<libc::statx>::uninit();
     let result = unsafe {
         libc::statx(
@@ -335,13 +339,26 @@ fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
             stat.as_mut_ptr(),
         )
     };
-    if result == 0 {
-        let stat = unsafe { stat.assume_init() };
-        if stat.stx_mask & libc::STATX_MNT_ID != 0 {
-            return FileSystemKey::Mount(stat.stx_mnt_id);
-        }
+    if result != 0 {
+        return None;
     }
-    FileSystemKey::Device(dev)
+    let stat = unsafe { stat.assume_init() };
+    (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id)
+}
+
+#[cfg(target_os = "linux")]
+fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
+    mount_id(file).map_or(FileSystemKey::Device(dev), FileSystemKey::Mount)
+}
+
+/// The filesystem a new entry of `directory` would live on, with its traits.
+#[cfg(target_os = "linux")]
+fn directory_file_system(directory: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
+    let key = match mount_id(directory) {
+        Some(mount) => FileSystemKey::Mount(mount),
+        None => FileSystemKey::Device(directory.metadata()?.dev()),
+    };
+    Ok((key, file_system_traits(directory, key)))
 }
 
 #[cfg(target_os = "linux")]
@@ -2551,7 +2568,8 @@ impl FsOps {
     }
 
     /// Ops within a batch are independent (the planner orders batches so that
-    /// parents come first), so they run in parallel too.
+    /// parents come first), so they run in parallel too. Those that change
+    /// directory entries share their directory between at most two threads.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
@@ -2589,8 +2607,8 @@ impl FsOps {
             }
             return out;
         }
-        let cres = parallel_map(&create_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+        let cres = parallel_by_directory(ops, &create_idx, |op| {
+            apply_one(op, guard, destination_root.clone(), destination_prefix)
                 .err()
                 .as_ref()
                 .map(wire_error)
@@ -2663,8 +2681,90 @@ fn stat_with_parent(
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
+fn metadata_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(PAR_THREADS)
+            .thread_name(|index| format!("syq-metadata-{index}"))
+            .build()
+            .expect("metadata worker pool")
+    })
+}
+
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     parallel_map_init(items, || (), |_, item| f(item))
+}
+
+/// Run the selected operations, which add or remove directory entries. The
+/// kernel adds one directory's entries one at a time, so threads beyond the
+/// second only contend for it: directories spread over the pool, and each is
+/// worked on by at most two of its threads. Removals keep the pool's plain
+/// distribution; the work of freeing a removed file's blocks happens after
+/// the directory is unlocked and does spread over threads.
+fn parallel_by_directory<R: Send>(
+    ops: &[Op],
+    selected: &[usize],
+    f: impl Fn(&Op) -> R + Sync,
+) -> Vec<R> {
+    if selected.len() < PAR_MIN {
+        return selected.iter().map(|&index| f(&ops[index])).collect();
+    }
+    let mut directories = HashMap::<&[u8], Vec<usize>>::new();
+    let mut removals = Vec::new();
+    for (position, &index) in selected.iter().enumerate() {
+        let op = &ops[index];
+        if matches!(op, Op::Remove { .. } | Op::Unlink { .. } | Op::Rmdir { .. }) {
+            removals.push(position);
+            continue;
+        }
+        let path = op_path(op);
+        let directory = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .map_or(&path[..0], |separator| &path[..separator]);
+        directories.entry(directory).or_default().push(position);
+    }
+    let removal_chunk = removals.len().div_ceil(PAR_THREADS).max(1);
+    let shares: Vec<Vec<usize>> = removals
+        .chunks(removal_chunk)
+        .map(<[usize]>::to_vec)
+        .chain(directories.into_values().flat_map(|mut positions| {
+            if positions.len() < 2 * PAR_MIN {
+                return vec![positions];
+            }
+            // XFS gives each new directory the next allocation group in turn,
+            // and the files of a directory allocate from its group. Workers
+            // fill neighbouring directories at the same time, so directories
+            // created in name order would put them into the same few groups
+            // together. A scattered order leaves no pattern to fall into.
+            positions.sort_unstable_by_key(|position| {
+                (*position as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            });
+            let second = positions.split_off(positions.len() / 2);
+            vec![positions, second]
+        }))
+        .collect();
+    use rayon::prelude::*;
+    let done: Vec<Vec<(usize, R)>> = metadata_pool().install(|| {
+        shares
+            .par_iter()
+            .map(|share| {
+                share
+                    .iter()
+                    .map(|&position| (position, f(&ops[selected[position]])))
+                    .collect()
+            })
+            .collect()
+    });
+    let mut results: Vec<Option<R>> = selected.iter().map(|_| None).collect();
+    for (position, result) in done.into_iter().flatten() {
+        results[position] = Some(result);
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("every selected operation ran"))
+        .collect()
 }
 
 // State belongs to one bounded input chunk and is discarded before returning.
@@ -2681,15 +2781,7 @@ fn parallel_map_init<T: Sync, R: Send, S>(
     }
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(PAR_THREADS)
-            .thread_name(|index| format!("syq-metadata-{index}"))
-            .build()
-            .expect("metadata worker pool")
-    });
-    pool.install(|| {
+    metadata_pool().install(|| {
         items
             .par_chunks(chunk)
             .flat_map_iter(|chunk| {

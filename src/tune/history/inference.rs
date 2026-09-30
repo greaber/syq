@@ -318,6 +318,37 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_history_never_crosses_caps_or_accounting_modes() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let mut capped = super::super::tests::key("a");
+        capped.mode = activity_mode("compress=false;bandwidth=2097152".into(), true);
+        let writer = record(&path, &capped, None, true, &[(2, 100.0), (4, 100.0)]);
+        assert!(writer.starting_count(&capped, true).is_some());
+        for mode in [
+            activity_mode("compress=false;bandwidth=0".into(), false),
+            activity_mode("compress=false;bandwidth=4194304".into(), true),
+            // The same number formerly limited logical file bytes.
+            activity_mode("compress=false;bandwidth=2097152".into(), false),
+        ] {
+            let other = ContextKey {
+                mode,
+                ..capped.clone()
+            };
+            assert!(writer.starting_count(&other, true).is_none());
+        }
+        let uncapped = ContextKey {
+            mode: activity_mode("compress=false;bandwidth=0".into(), false),
+            ..capped.clone()
+        };
+        record(&path, &uncapped, None, true, &[(16, 100.0), (32, 200.0)]);
+        assert_eq!(writer.starting_count(&uncapped, true).unwrap().workers, 32);
+        // A newer capped plateau cannot vote down that uncapped starting count.
+        record(&path, &capped, None, true, &[(2, 100.0), (4, 100.0)]);
+        assert_eq!(writer.starting_count(&uncapped, true).unwrap().workers, 32);
+    }
+
+    #[test]
     fn fast_rollback_measurements_change_the_next_start() {
         use crate::tune::{evidence::Evidence, Policy};
         for prefix in [vec![], vec![100.0]] {

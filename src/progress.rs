@@ -22,6 +22,10 @@ pub struct Progress {
     /// `bytes_done` back, but retransmitting the same range is not fresh useful
     /// throughput and cannot advance this meter until progress passes the mark.
     tuning_high_water: AtomicU64,
+    /// Capped network copies score continuous transport activity instead of
+    /// delayed batch acknowledgments. Display/results still use file progress.
+    pub(crate) tuning_transport_bytes: Arc<AtomicU64>,
+    pub(crate) tuning_transport: AtomicBool,
     pub bytes_unchanged: AtomicU64,
     pub files_total: AtomicU64,
     // Confirmed completion for display/results. Tuned transfers normally use
@@ -125,6 +129,8 @@ impl Progress {
             bytes_total: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             tuning_high_water: AtomicU64::new(0),
+            tuning_transport_bytes: Arc::new(AtomicU64::new(0)),
+            tuning_transport: AtomicBool::new(false),
             bytes_unchanged: AtomicU64::new(0),
             files_total: AtomicU64::new(0),
             files_done: AtomicU64::new(0),
@@ -549,10 +555,19 @@ impl crate::tune::Meter for Progress {
         self.tuning_history.get().cloned()
     }
     fn bytes(&self) -> u64 {
-        self.tuning_high_water.load(Relaxed)
+        if self.tuning_transport.load(Relaxed) {
+            self.tuning_transport_bytes.load(Relaxed)
+        } else {
+            self.tuning_high_water.load(Relaxed)
+        }
     }
     fn files(&self) -> u64 {
-        self.tuning_files_high_water.load(Relaxed)
+        if self.tuning_transport.load(Relaxed) {
+            // Batch file credit would reintroduce the same completion spikes.
+            0
+        } else {
+            self.tuning_files_high_water.load(Relaxed)
+        }
     }
     fn set_active(&self, n: usize) {
         self.active_workers.store(n as u64, Relaxed);
@@ -678,6 +693,23 @@ mod tests {
         // A measured sub-millisecond copy is distinct from absent timing.
         progress.copy_last_ns.store(began + 999_999, Relaxed);
         assert_eq!(progress.copying_elapsed_ms(), Some(0));
+    }
+
+    #[test]
+    fn capped_transport_activity_does_not_claim_completed_files() {
+        let progress = Progress::new(false, false, None);
+        progress.tuning_transport.store(true, Relaxed);
+        progress.tuning_transport_bytes.store(1024, Relaxed);
+        assert_eq!(Meter::bytes(&*progress), 1024);
+        assert_eq!(Meter::files(&*progress), 0);
+        assert_eq!(progress.bytes_done.load(Relaxed), 0);
+        assert_eq!(progress.files_done.load(Relaxed), 0);
+        progress.add_bytes(512);
+        progress.add_files(4);
+        assert_eq!(Meter::bytes(&*progress), 1024);
+        assert_eq!(Meter::files(&*progress), 0);
+        assert_eq!(progress.bytes_done.load(Relaxed), 512);
+        assert_eq!(progress.files_done.load(Relaxed), 4);
     }
 
     #[test]

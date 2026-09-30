@@ -64,6 +64,10 @@ const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
 // Bound a window of small-file groups independently of the logical batch.
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
+/// Files per group of a same-machine small-file batch. A worker that took a
+/// large batch while others were still connecting hands its later groups to
+/// them; with one group per batch it kept them all.
+const LOCAL_GROUP_FILES: usize = 64;
 
 /// Upper bound: each file needs one worker, and each simultaneous range must
 /// contain at least min_split bytes. Balanced/aligned splitting can use fewer.
@@ -2372,6 +2376,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     None
                 };
                 *spec.pacing.lock().unwrap() = Some(crate::conn::TransportPacing {
+                    // Count one data leg: destination sends for pushes/relays,
+                    // source receipts for pulls. A relay must not count twice.
+                    activity: (!source || !opts.dst_remote)
+                        .then(|| progress.tuning_transport_bytes.clone()),
                     budget: budget.clone(),
                     remote_sender: source,
                     source_budget,
@@ -3054,6 +3062,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = tune::START_TCP.min(args.automatic_worker_limit());
             gate.set_active(args.connections);
         }
+        let transport_activity = transport_budget.is_some();
+        progress.tuning_transport.store(transport_activity, Relaxed);
         let tuning_key = (autotune && args.tuning_options.is_none())
             .then(|| tune::network_path_key(&src_ep, &dst_ep))
             .flatten();
@@ -3067,11 +3077,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 destination_filesystem
                     .as_ref()
                     .map(|fs| fs.identity.as_str()),
-                format!(
+                tune::history::activity_mode(format!(
                     "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}",
                     opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
                     args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type
-                ),
+                ), transport_activity),
             );
             history.context(&key);
             history.event(
