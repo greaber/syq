@@ -965,9 +965,14 @@ fn version_is_allows_a_matching_copy_and_preserves_flag_like_filenames() {
     fs::write(&source, b"payload").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .current_dir(temp.path())
-        .args(["--version-is", env!("CARGO_PKG_VERSION"), "cp", "--as"])
+        .args([
+            "--version-is",
+            env!("CARGO_PKG_VERSION"),
+            "cp",
+            "--src=--version-is=0.0.0",
+            "--as",
+        ])
         .arg(&destination)
-        .args(["--", "--version-is=0.0.0"])
         .env("SYQ_TEST_RELEASE_BUILD", "1")
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
