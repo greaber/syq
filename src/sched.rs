@@ -15,6 +15,8 @@ pub(crate) struct TuningWork {
     pub scan_done: bool,
     pub remaining_bytes: u64,
     pub queued_files: usize,
+    pub unread_batch_files: usize,
+    pub unread_batch_bytes: u64,
     pub work_units: usize,
     pub minimum_split: u64,
     pub workers: usize,
@@ -228,9 +230,14 @@ pub struct RangeState {
 
 pub type RangeHandle = Arc<Mutex<RangeState>>;
 
+struct FastGroup {
+    files: std::ops::Range<usize>,
+    bytes: u64,
+}
+
 pub struct FastBatchState {
     files: Vec<(u64, usize)>,
-    groups: VecDeque<std::ops::Range<usize>>,
+    groups: VecDeque<FastGroup>,
     owned: Vec<bool>,
 }
 
@@ -238,7 +245,7 @@ impl FastBatchState {
     /// Claim immediately before issuing the source request. Once claimed, a
     /// group cannot be stolen, even while its read or write is outstanding.
     pub fn claim(&mut self) -> Option<std::ops::Range<usize>> {
-        self.groups.pop_front()
+        self.groups.pop_front().map(|group| group.files)
     }
 }
 
@@ -745,6 +752,15 @@ impl Sched {
     ) -> (std::ops::Range<usize>, FastBatchHandle) {
         let first = groups.pop_front().expect("nonempty fast batch");
         let shareable = !groups.is_empty();
+        // Keep totals with each shareable group, so sampling costs O(groups),
+        // not O(files). Claiming or stealing removes its totals with the group.
+        let groups = groups
+            .into_iter()
+            .map(|group| FastGroup {
+                bytes: files[group.clone()].iter().map(|(size, _)| *size).sum(),
+                files: group,
+            })
+            .collect();
         let handle = Arc::new(Mutex::new(FastBatchState {
             owned: vec![true; files.len()],
             files,
@@ -771,8 +787,8 @@ impl Sched {
             let Some(group) = batch.groups.pop_back() else {
                 continue;
             };
-            batch.owned[group.clone()].fill(false);
-            let files = &batch.files[group];
+            batch.owned[group.files.clone()].fill(false);
+            let files = &batch.files[group.files];
             // All files were already counted as probes for the old owner.
             // Keep the returned file as a probe; return its siblings to the
             // ordinary queue and remove every stolen file from fast ownership.
@@ -819,6 +835,8 @@ impl Sched {
             scan_done: g.scan_done,
             remaining_bytes: 0,
             queued_files: 0,
+            unread_batch_files: 0,
+            unread_batch_bytes: 0,
             work_units: 0,
             minimum_split: self.min_split,
             workers: n,
@@ -841,11 +859,23 @@ impl Sched {
                 r.end.saturating_sub(r.pos)
             })
             .sum::<u64>();
+        // A worker's unread batch groups remain available to peers even when
+        // the main queue is empty. Use the same groups that next() can steal;
+        // already-issued requests and groups withdrawn after errors don't count.
+        for handle in &g.fast_groups {
+            let batch = handle.lock().unwrap();
+            for group in &batch.groups {
+                evidence.unread_batch_files += group.files.len();
+                evidence.unread_batch_bytes += group.bytes;
+            }
+        }
+        bytes += evidence.unread_batch_bytes;
+        let available_files = g.files.len() + evidence.unread_batch_files;
         evidence.remaining_bytes = bytes;
         evidence.queued_files = g.files.len();
         evidence.activity =
-            bytes.saturating_add((g.files.len() as u64).saturating_mul(file_credit));
-        evidence.work_units = g.files.len() + g.ranges.len() + g.inflight.len();
+            bytes.saturating_add((available_files as u64).saturating_mul(file_credit));
+        evidence.work_units = available_files + g.ranges.len() + g.inflight.len();
         evidence.parallel =
             evidence.work_units >= n || bytes >= (n as u64).saturating_mul(self.min_split);
         evidence.sufficient = evidence.parallel && evidence.activity >= minimum_activity;

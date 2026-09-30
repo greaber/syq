@@ -1111,3 +1111,79 @@ fn nearby_batches_match_a_flat_reference_with_limits_and_retries() {
         assert!(sched.finished());
     }
 }
+
+#[test]
+fn tuning_counts_only_unissued_batch_work_through_claims_and_steals() {
+    let sched = Sched::new(64, 128);
+    for i in 0..6 {
+        sched.push_file(test_job(format!("file{i}").as_bytes(), 512));
+    }
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(_)));
+    assert_eq!(sched.begin_fast_batch(1, 6), 6);
+    assert_eq!(sched.take_small(512, 5, u64::MAX).len(), 5);
+    sched.mark_fast(5);
+    let (_, handle) = sched.share_fast_groups(
+        (0..6).map(|i| (512, i)).collect(),
+        [0..2, 2..4, 4..6].into(),
+    );
+    let work = sched.tuning_work(4, 4 * (512 + 100), 100);
+    assert_eq!(work.queued_files, 0);
+    assert_eq!(work.unread_batch_files, 4);
+    assert_eq!(work.unread_batch_bytes, 2048);
+    assert_eq!(work.remaining_bytes, 2048);
+    assert_eq!(work.activity, 2448);
+    assert!(work.sufficient);
+    assert!(!sched.work_left_for(4, 2449, 100));
+
+    assert_eq!(handle.lock().unwrap().claim(), Some(2..4));
+    let work = sched.tuning_work(2, 1024, 0);
+    assert_eq!(work.unread_batch_files, 2);
+    assert_eq!(work.remaining_bytes, 1024);
+    assert!(work.sufficient);
+
+    // A steal moves one file into a probe and the other into the queue. Neither
+    // may remain counted as unread batch work, or be counted twice.
+    assert!(matches!(sched.next(), Item::File(4)));
+    let work = sched.tuning_work(1, 512, 0);
+    assert_eq!(work.unread_batch_files, 0);
+    assert_eq!(work.unread_batch_bytes, 0);
+    assert_eq!(work.queued_files, 1);
+    assert_eq!(work.remaining_bytes, 512);
+    assert!(work.sufficient);
+    assert!(matches!(sched.next(), Item::File(5)));
+    assert!(!sched.work_left_for(1, 1, 0));
+    // Until these ordinary probes finish, capacity may still be useful for
+    // ranges they could expose. Only the original owner's issued work remains.
+    sched.ranges_ready(4, Vec::new());
+    sched.ranges_ready(5, Vec::new());
+    assert!(!sched.needs_worker_capacity());
+    assert_eq!(
+        sched.finish_fast_groups(&handle),
+        vec![true, true, true, true, false, false]
+    );
+    sched.complete_fast_batch(4);
+    assert!(sched.finished());
+}
+
+#[test]
+fn zero_byte_batch_work_counts_files_and_withdrawn_groups_stop_counting() {
+    let sched = Sched::new(64, 128);
+    let (_, handle) =
+        sched.share_fast_groups(vec![(0, 0), (0, 1), (0, 2)], [0..1, 1..2, 2..3].into());
+    // Incomplete planning still cannot establish a throughput comparison.
+    assert!(!sched.tuning_work(2, 0, 512).parallel);
+    sched.scan_done();
+    let work = sched.tuning_work(2, 1024, 512);
+    assert_eq!(work.remaining_bytes, 0);
+    assert_eq!(work.unread_batch_files, 2);
+    assert!(work.sufficient);
+    assert!(!sched.work_left_for(3, 0, 512));
+    // An errored owner withdraws its unread groups before deciding which files
+    // to retry. They must not qualify tuning until actually requeued.
+    sched.finish_fast_groups(&handle);
+    let work = sched.tuning_work(1, 0, 512);
+    assert_eq!(work.unread_batch_files, 0);
+    assert!(!work.parallel);
+    assert!(!sched.needs_worker_capacity());
+}

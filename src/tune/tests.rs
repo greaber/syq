@@ -1332,3 +1332,68 @@ fn noisy_hold_scores_preserve_failed_probe_deadlines() {
     policy.observe(200.0);
     assert!(policy.n > 8, "fresh exploration must resume when due");
 }
+
+#[test]
+fn driver_explores_while_all_queued_files_belong_to_shareable_batches() {
+    struct ActiveCopy {
+        sched: Arc<Sched>,
+        started: Instant,
+    }
+    impl Meter for ActiveCopy {
+        fn bytes(&self) -> u64 {
+            let elapsed = self.started.elapsed();
+            // A finite deadline turns missing exploration into an assertion
+            // failure, even if a regression discards every observation.
+            if elapsed >= Duration::from_secs(5) {
+                self.sched.abort();
+            }
+            (elapsed.as_secs_f64() * 1_000_000.0) as u64
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, n: usize) {
+            if n > 2 {
+                self.sched.abort();
+            }
+        }
+    }
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    for i in 0..32 {
+        sched.push_file(crate::sched::tests::test_job(
+            format!("file{i}").as_bytes(),
+            1 << 20,
+        ));
+    }
+    sched.scan_done();
+    assert!(matches!(sched.next(), crate::sched::Item::File(_)));
+    sched.begin_fast_batch(1, 32);
+    assert_eq!(sched.take_small(1 << 20, 31, u64::MAX).len(), 31);
+    sched.mark_fast(31);
+    let (_, handle) = sched.share_fast_groups(
+        (0..32).map(|i| (1 << 20, i)).collect(),
+        (0..32).map(|i| i..i + 1).collect(),
+    );
+    let gate = Gate::new(2);
+    gate.mark_ready(0);
+    gate.mark_ready(1);
+    let meter = Arc::new(ActiveCopy {
+        sched: sched.clone(),
+        started: Instant::now(),
+    });
+    let policy = run_with_interval(
+        Policy::new(2, 1, 4),
+        gate.clone(),
+        sched.clone(),
+        meter,
+        |id| gate.mark_ready(id),
+        Duration::from_millis(25),
+    );
+    assert_eq!(
+        policy.active(),
+        4,
+        "a nonempty batch must not hide an upward probe"
+    );
+    sched.finish_fast_groups(&handle);
+    sched.complete_fast_batch(32);
+}
