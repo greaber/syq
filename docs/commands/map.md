@@ -53,7 +53,7 @@ syq map [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--rsh <COMMAND>` | Remote shell command (default: ssh); when set, syq neither shares nor persists connections |
+| `--rsh <COMMAND>` | Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
 

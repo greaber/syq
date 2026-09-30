@@ -12,6 +12,9 @@ pub(crate) struct SshMultiplexer {
     pub(super) persistent: bool,
     pub(super) idle_timeout: &'static str,
     pub(super) automatic_receiving: bool,
+    /// Pool spares open sessions with syq's own fixed options, so the pool
+    /// serves only connections made without an `--rsh` command's options.
+    pub(super) session_pool: bool,
     pub(super) reuse_for_workers: AtomicBool,
     pub(super) workers_rejected: AtomicBool,
 }
@@ -24,6 +27,188 @@ pub(super) const PERSISTENT_SSH_OPTIONS: &[&str] = &[
     "-o",
     "ServerAliveCountMax=3",
 ];
+
+/// How syq may share an `--rsh` ssh command's connections.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SshSharing<'a> {
+    /// The command's own ssh options, passed through on every session.
+    pub(crate) options: &'a [String],
+    /// Whether a connection may outlive this run. A debug log level would keep
+    /// writing to the first command's terminal from the background, so such
+    /// commands share connections only within the run.
+    pub(crate) persist: bool,
+}
+
+/// The options of an `--rsh` command that syq can treat as its default `ssh`
+/// plus those options: shared and persistent connections work as usual, with
+/// persistent ones kept separately for each set of options. None when the
+/// program is not OpenSSH, or when the options set up connection sharing
+/// themselves (`-M`, `-S`, `-O`, or `ControlMaster`/`ControlPath`/
+/// `ControlPersist`), so that the command keeps full control of it.
+pub(crate) fn shareable_ssh_options(rsh: &[String]) -> Option<SshSharing<'_>> {
+    let (program, options) = rsh.split_first()?;
+    if !program.ends_with("ssh") {
+        return None;
+    }
+    // The option letters that take a value in OpenSSH's ssh(1).
+    const VALUED: &[u8] = b"bceilmopBDEFIJLOPQRSwW";
+    let mut persist = true;
+    let mut index = 0;
+    while index < options.len() {
+        let argument = options[index].as_str();
+        index += 1;
+        // An operand or `--` means this is not a plain list of options.
+        let letters = argument
+            .strip_prefix('-')
+            .filter(|letters| !letters.is_empty() && !letters.starts_with('-'))?;
+        for (at, letter) in letters.bytes().enumerate() {
+            match letter {
+                b'M' => return None,
+                b'v' => persist = false,
+                _ => {}
+            }
+            if VALUED.contains(&letter) {
+                let value = if at + 1 < letters.len() {
+                    &letters[at + 1..]
+                } else {
+                    index += 1;
+                    options.get(index - 1)?.as_str()
+                };
+                if matches!(letter, b'S' | b'O') {
+                    return None;
+                }
+                if letter == b'o' {
+                    let (name, setting) = option_name(value);
+                    if ["ControlMaster", "ControlPath", "ControlPersist"]
+                        .iter()
+                        .any(|sharing| name.eq_ignore_ascii_case(sharing))
+                    {
+                        return None;
+                    }
+                    let setting = setting.to_ascii_lowercase();
+                    if name.eq_ignore_ascii_case("LogLevel")
+                        && (setting.starts_with("debug") || setting == "verbose")
+                    {
+                        persist = false;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    Some(SshSharing { options, persist })
+}
+
+/// Whether syq can keep a persistent connection for an `--rsh` command
+/// string (see [`shareable_ssh_options`]).
+pub(crate) fn rsh_persists_connections(rsh: &str) -> bool {
+    shell_words::split(rsh)
+        .is_ok_and(|words| shareable_ssh_options(&words).is_some_and(|sharing| sharing.persist))
+}
+
+/// The options that identify a persistent connection. Relative paths to local
+/// files, as in `-F ssh.conf` or `-i key`, resolve against the working
+/// directory, so they are made absolute: the same options given in another
+/// directory can name different files, and must not reuse this connection.
+/// Options that run a local command, such as `ProxyCommand=./proxy`, can refer
+/// to the directory in ways that cannot be resolved, so they tie the connection
+/// to the directory itself. A configuration file named with `-F` is treated
+/// like the default `~/.ssh/config`: its own settings are not examined. None
+/// when a path or that directory cannot be recorded.
+pub(crate) fn persistent_ssh_options(
+    options: &[String],
+    directory: Option<&std::path::Path>,
+) -> Option<crate::persistence::SshOptions> {
+    // `-o` names whose value is a command run on this machine.
+    const COMMAND_OPTIONS: &[&str] = &["KnownHostsCommand", "LocalCommand", "ProxyCommand"];
+    let mut uses_directory = false;
+    // Option letters whose value is a local file, and `-o` names likewise.
+    const FILE_LETTERS: &[u8] = b"EFIi";
+    const FILE_OPTIONS: &[&str] = &[
+        "CertificateFile",
+        "GlobalKnownHostsFile",
+        "IdentityAgent",
+        "IdentityFile",
+        "PKCS11Provider",
+        "RevokedHostKeys",
+        "SecurityKeyProvider",
+        "UserKnownHostsFile",
+        "XAuthLocation",
+    ];
+    const VALUED: &[u8] = b"bceilmopBDEFIJLOPQRSwW";
+    let absolute = |path: &str| -> Option<String> {
+        if path.starts_with(['/', '~', '%', '$']) || path.eq_ignore_ascii_case("none") {
+            return Some(path.to_owned());
+        }
+        directory?.join(path).to_str().map(str::to_owned)
+    };
+    let mut resolved = Vec::with_capacity(options.len());
+    let mut index = 0;
+    while index < options.len() {
+        let argument = &options[index];
+        index += 1;
+        let letters = argument.strip_prefix('-').unwrap_or_default();
+        let Some(at) = letters.bytes().position(|letter| VALUED.contains(&letter)) else {
+            resolved.push(argument.clone());
+            continue;
+        };
+        let letter = letters.as_bytes()[at];
+        let (value, inline) = if at + 1 < letters.len() {
+            (letters[at + 1..].to_owned(), true)
+        } else {
+            index += 1;
+            (options.get(index - 1)?.clone(), false)
+        };
+        let value = if FILE_LETTERS.contains(&letter) {
+            absolute(&value)?
+        } else if letter == b'o' {
+            let (name, setting) = option_name(&value);
+            uses_directory |= COMMAND_OPTIONS
+                .iter()
+                .any(|command| name.eq_ignore_ascii_case(command));
+            if FILE_OPTIONS
+                .iter()
+                .any(|file| name.eq_ignore_ascii_case(file))
+            {
+                let paths = setting
+                    .split_whitespace()
+                    .map(absolute)
+                    .collect::<Option<Vec<_>>>()?;
+                format!("{name}={}", paths.join(" "))
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        if inline {
+            resolved.push(format!("-{}{value}", &letters[..=at]));
+        } else {
+            resolved.push(argument.clone());
+            resolved.push(value);
+        }
+    }
+    let directory = if uses_directory {
+        Some(directory?.to_str()?.to_owned())
+    } else {
+        None
+    };
+    Some(crate::persistence::SshOptions {
+        options: resolved,
+        directory,
+    })
+}
+
+/// An `-o` option's name and value. OpenSSH accepts leading whitespace and
+/// either `=` or whitespace between them.
+fn option_name(option: &str) -> (&str, &str) {
+    let option = option.trim_start();
+    let end = option
+        .find(|c: char| c == '=' || c.is_whitespace())
+        .unwrap_or(option.len());
+    let value = option[end..].trim_start_matches(|c: char| c == '=' || c.is_whitespace());
+    (&option[..end], value.trim())
+}
 
 /// The oldest OpenSSH release whose client speaks the agent session-bind
 /// extension and host-bound public-key authentication. Constrained agent
@@ -130,25 +315,32 @@ impl SshMultiplexer {
             persistent: false,
             idle_timeout: "no",
             automatic_receiving: false,
+            session_pool: false,
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
         })
     }
 
+    /// `ssh` holds an `--rsh` command's own ssh options, which select a
+    /// separate persistent connection. Receiving and the session pool open
+    /// sessions with plain `ssh` and syq's own options, so they serve only
+    /// connections without them.
     pub(crate) fn persistent(
         scope: &std::path::Path,
         user: Option<&str>,
         host: &str,
         port: Option<u16>,
+        ssh: Option<&crate::persistence::SshOptions>,
     ) -> Result<Self> {
-        let path = crate::persistence::prepare_endpoint(scope, user, host, port)?;
+        let path = crate::persistence::prepare_endpoint(scope, user, host, port, ssh)?;
         let global = crate::persistence::is_global_scope(scope)?;
         Ok(Self {
             _directory: None,
             path,
             persistent: true,
             idle_timeout: if global { "yes" } else { "300" },
-            automatic_receiving: global,
+            automatic_receiving: global && ssh.is_none(),
+            session_pool: ssh.is_none(),
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
         })

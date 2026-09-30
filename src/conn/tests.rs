@@ -1670,7 +1670,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
-    let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None).unwrap();
+    let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
     let socket = crate::session_pool::socket_path(&multiplexer.path);
     let mut spec = RemoteSpec::local_receiver(true);
     spec.local_process = false;
@@ -1697,12 +1697,12 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     crate::persistence::initialize_scope(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
     // path is cleared so a fresh master can bind.
-    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None).unwrap();
+    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
     std::fs::write(&probe.path, b"stale").unwrap();
-    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None).unwrap();
+    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
     assert_eq!(probe.path, multiplexer.path);
     let alternate_port =
-        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222)).unwrap();
+        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), None).unwrap();
     assert_ne!(multiplexer.path, alternate_port.path);
     assert!(!multiplexer.path.exists());
     assert_eq!(
@@ -1769,6 +1769,7 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
         persistent: true,
         idle_timeout: "300",
         automatic_receiving: false,
+        session_pool: true,
         reuse_for_workers: AtomicBool::new(false),
         workers_rejected: AtomicBool::new(false),
     }));
@@ -1792,6 +1793,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         persistent: true,
         idle_timeout: "300",
         automatic_receiving: false,
+        session_pool: true,
         reuse_for_workers: AtomicBool::new(false),
         workers_rejected: AtomicBool::new(false),
     };
@@ -2137,4 +2139,124 @@ fn transport_paced_receive_stops_when_scheduler_aborts() {
     }
     assert!(receiving.is_finished(), "receive ignored scheduler abort");
     assert!(receiving.join().unwrap().is_err());
+}
+
+#[test]
+fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
+    let words = |command: &str| shell_words::split(command).unwrap();
+    for shared in [
+        "ssh",
+        "/usr/bin/ssh -p 2222 -i key",
+        "ssh -J jump -F config -o ServerAliveInterval=5",
+        "ssh -4Cv",
+        "ssh -oUser=alice",
+        "ssh -o 'ProxyCommand ssh -W %h:%p gateway'",
+    ] {
+        assert!(shareable_ssh_options(&words(shared)).is_some(), "{shared}");
+    }
+    for own in [
+        "ssh -M",
+        "ssh -4M",
+        "ssh -S /tmp/socket",
+        "ssh -Snone",
+        "ssh -O check",
+        "ssh -o ControlMaster=auto",
+        "ssh -ocontrolpath=/tmp/socket",
+        "ssh -o 'ControlPersist 10'",
+        "ssh -o ' ControlPath=none'",
+        "tsh ssh",
+        "ssh host",
+        "ssh -- -p",
+        "ssh -p",
+    ] {
+        assert!(shareable_ssh_options(&words(own)).is_none(), "{own}");
+    }
+    assert_eq!(
+        shareable_ssh_options(&words("ssh -p 2222")).unwrap(),
+        SshSharing {
+            options: &words("-p 2222"),
+            persist: true
+        }
+    );
+    // A debug log level shares connections only within the run.
+    for verbose in [
+        "ssh -v",
+        "ssh -4vC",
+        "ssh -o LogLevel=DEBUG2",
+        "ssh -o 'LogLevel verbose'",
+    ] {
+        assert!(
+            !shareable_ssh_options(&words(verbose)).unwrap().persist,
+            "{verbose}"
+        );
+    }
+    assert!(
+        shareable_ssh_options(&words("ssh -o LogLevel=QUIET"))
+            .unwrap()
+            .persist
+    );
+}
+
+#[test]
+fn persistent_ssh_options_resolve_relative_file_paths() {
+    let words = |command: &str| shell_words::split(command).unwrap();
+    let directory = std::path::Path::new("/project");
+    let resolve = |command: &str| {
+        persistent_ssh_options(&words(command), Some(directory)).map(|o| {
+            assert_eq!(o.directory, None, "{command}");
+            o.options.join(" ")
+        })
+    };
+    // Options that name no local file do not depend on the directory.
+    assert_eq!(
+        resolve("-p 2222 -J jump -o ServerAliveInterval=5").unwrap(),
+        "-p 2222 -J jump -o ServerAliveInterval=5"
+    );
+    assert_eq!(
+        persistent_ssh_options(&words("-p 2222"), None)
+            .unwrap()
+            .options,
+        ["-p", "2222"]
+    );
+    for (given, key) in [
+        ("-issh-key", "-i/project/ssh-key"),
+        ("-4i key", "-4i /project/key"),
+        ("-o IdentityFile=key", "-o IdentityFile=/project/key"),
+        (
+            "-o 'UserKnownHostsFile a /etc/b'",
+            "-o UserKnownHostsFile=/project/a /etc/b",
+        ),
+        ("-i ~/.ssh/id", "-i ~/.ssh/id"),
+        (
+            "-o IdentityAgent=$SSH_AUTH_SOCK",
+            "-o IdentityAgent=$SSH_AUTH_SOCK",
+        ),
+    ] {
+        assert_eq!(resolve(given).unwrap(), key, "{given}");
+    }
+    // Without a directory a relative path cannot be keyed.
+    assert!(persistent_ssh_options(&words("-i key"), None).is_none());
+    // A configuration file is keyed by its path, like the default config;
+    // a relative path names a different file in each directory.
+    for (given, key) in [
+        ("-F ssh.conf", "-F /project/ssh.conf"),
+        ("-F /etc/shared.conf", "-F /etc/shared.conf"),
+    ] {
+        assert_eq!(resolve(given).unwrap(), key, "{given}");
+    }
+    // A local command can refer to the directory in any way, so it ties the
+    // connection to the directory itself.
+    for command in [
+        "-o ProxyCommand=./proxy",
+        "-o 'ProxyCommand ssh -W %h:%p jump'",
+        "-o 'localcommand=make sync'",
+        "-o KnownHostsCommand=./hosts",
+    ] {
+        let options = persistent_ssh_options(&words(command), Some(directory)).unwrap();
+        assert_eq!(options.directory.as_deref(), Some("/project"), "{command}");
+        assert!(
+            persistent_ssh_options(&words(command), None).is_none(),
+            "{command}"
+        );
+    }
 }

@@ -236,9 +236,11 @@ Both endpoints still read the full file to compare it. Most staged updates and
 partial resume compare bounded windows; their hash memory does not grow with
 file size. Bandwidth-limited pulls and relays compare before requesting source
 data, so matching blocks do not consume the bandwidth budget. These copies and
-explicit whole-file comparisons (`--hash`, protected-existing-file policies,
-and in-place reuse) have a hash-response limit: at 64 KiB, files must be smaller
-than 130 GiB. Increasing `comparison-block-size` increases that limit proportionally.
+explicit whole-file comparisons (protected-existing-file policies, in-place
+reuse, and `--hash` other than for same-machine copies without block reuse,
+which compare in bounded windows) have a hash-response limit: at 64 KiB, files
+must be smaller than 130 GiB. Increasing `comparison-block-size` increases that
+limit proportionally.
 A smaller effective request size, including
 bandwidth pacing, also reduces staged comparison granularity.
 

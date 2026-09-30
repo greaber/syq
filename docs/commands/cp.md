@@ -102,7 +102,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file hashes<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- hashes: Sizes plus a closure-time BLAKE3 hash of every regular file |
 | `--auth-from <auto\|ssh\|@NAME>` | Authorize through @NAME (also S3 copies), or use local SSH access (default: auto) |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
-| `--rsh <COMMAND>` | Remote shell command (default: ssh); when set, the command owns SSH and agent policy and syq neither shares nor persists connections |
+| `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
 | `--no-tcp-encryption` | Send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer |

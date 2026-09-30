@@ -9,9 +9,20 @@ syq persist connect server
 ```
 
 You can close the terminal afterward. To enable persistence for connections
-opened by later syq commands instead, run `syq persist on`. Persistence applies
-to connections syq makes with its default `ssh`; a command given `--rsh` (or
-rsync's `-e`) connects with that command each time instead.
+opened by later syq commands instead, run `syq persist on`. Persistence also
+applies to an `--rsh` (or rsync `-e`) command that runs `ssh` with its own
+options, such as `-e 'ssh -p 2222 -i key'`. Each set of options keeps its own
+connection, so a login made with one key, jump host, or configuration file is
+never reused by a command that asked for another. A relative path to a file in
+the options, such as `-F ssh.conf`, names a different file in each directory,
+so it counts as different options there. So does an option that runs a local
+command, such as `ProxyCommand`, because the command may use files in the
+directory it runs in. Receiving and the pool of ready sessions use only
+connections made with your plain `ssh`. With `-v` or a debug `LogLevel`, a
+command shares its connection only while it runs, so debug output does not
+outlive it. Options that set up SSH connection sharing themselves (`-M`, `-S`,
+`-O`, `ControlMaster`, `ControlPath`, or `ControlPersist`), and remote shells
+other than `ssh`, connect with that command each time instead.
 
 Persistence also speeds up [remote path completion](install.md#shell-completion):
 completion reuses the open connection, avoiding a new SSH login for each lookup.

@@ -2580,12 +2580,13 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
 #[cfg(debug_assertions)]
 #[test]
 fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
-    let policies: [&[&str]; 5] = [
+    let policies: [&[&str]; 6] = [
         &[],
         &["--copy-if", "not dst.exists"],
         &["--if-exists=keep"],
         &["--if-exists=update-if-older"],
         &["--inplace"],
+        &["--hash"],
     ];
     let mut cases = vec![("populated", &policies[0])];
     for destination in ["missing", "empty"] {
