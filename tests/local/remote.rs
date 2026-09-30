@@ -2672,11 +2672,11 @@ fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
 fn missing_remote_target_is_not_looked_up_again_during_planning() {
     for (label, sources, placement, extra) in [
         (
-            // --stats keeps the single file out of the small-copy offer.
+            // Explicit range copying keeps this case on the planning path.
             "file",
             &["--src", "src/file"][..],
             &["--as", "dst-file"][..],
-            &["--stats"][..],
+            &["--performance-tuning=copy-path=ranges"][..],
         ),
         (
             "dry-run",

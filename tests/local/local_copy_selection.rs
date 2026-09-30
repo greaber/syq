@@ -52,6 +52,68 @@ fn local_batch_boundary_and_scheduler_agree() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn small_existing_files_are_replaced_in_batches() {
+    let t = Tmp::new();
+    for i in 0..8 {
+        write(&t.path(&format!("src/file{i}")), &prng(1000, i));
+        // The same length with other contents and an older time: only
+        // reading the destination could tell, and a same-host copy does not.
+        write(&t.path(&format!("dst/file{i}")), &prng(1000, 50 + i));
+        set_mtime(&t.path(&format!("dst/file{i}")), 1_000_000_000);
+    }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert!(partial_files(&t.0).is_empty());
+    let observed = tuning_observed(&out);
+    assert!(observed["small_batches"].as_u64().unwrap() > 0, "{out:?}");
+    assert_eq!(observed["local_whole_files"], 0);
+    assert_eq!(observed["range_requests"], 0);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn unsupported_offload_is_attempted_once_not_for_every_file() {
+    let t = Tmp::new();
+    for i in 0..6 {
+        write(&t.path(&format!("src/file{i}")), &prng(200 << 10, i));
+        write(&t.path(&format!("dst/file{i}")), &prng(100 << 10, 50 + i));
+    }
+    let out = compat_command()
+        .args([
+            "-a",
+            "--syq-no-tcp",
+            "--performance-tuning=workers=1",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+        .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
+        .env("SYQ_TEST_COPY_LOCAL_DISCARDS", t.path("discards"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert!(partial_files(&t.0).is_empty());
+    // The first file discovers that this pair cannot offload. Later files
+    // must not create a sidecar just to remove it again.
+    let discards = fs::read_to_string(t.path("discards")).unwrap();
+    assert_eq!(discards.lines().count(), 1, "{discards}");
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
 fn local_medium_unsupported_keeps_full_size_range_requests() {
     let t = Tmp::new();
     for i in 0..2 {

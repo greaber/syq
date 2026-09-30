@@ -64,6 +64,10 @@ const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 
 // Bound a window of small-file groups independently of the logical batch.
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
+/// Files per group of a same-machine small-file batch. A worker that took a
+/// large batch while others were still connecting hands its later groups to
+/// them; with one group per batch it kept them all.
+const LOCAL_GROUP_FILES: usize = 64;
 
 /// Upper bound: each file needs one worker, and each simultaneous range must
 /// contain at least min_split bytes. Balanced/aligned splitting can use fewer.
