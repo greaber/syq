@@ -2187,7 +2187,6 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
         ["-p", "2222"]
     );
     for (given, key) in [
-        ("-F ssh.conf", "-F /project/ssh.conf"),
         ("-issh-key", "-i/project/ssh-key"),
         ("-4i key", "-4i /project/key"),
         ("-o IdentityFile=key", "-o IdentityFile=/project/key"),
@@ -2195,10 +2194,7 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
             "-o 'UserKnownHostsFile a /etc/b'",
             "-o UserKnownHostsFile=/project/a /etc/b",
         ),
-        (
-            "-i ~/.ssh/id -F /etc/ssh.conf",
-            "-i ~/.ssh/id -F /etc/ssh.conf",
-        ),
+        ("-i ~/.ssh/id", "-i ~/.ssh/id"),
         (
             "-o IdentityAgent=$SSH_AUTH_SOCK",
             "-o IdentityAgent=$SSH_AUTH_SOCK",
@@ -2207,7 +2203,17 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
         assert_eq!(resolve(given).unwrap(), key, "{given}");
     }
     // Without a directory a relative path cannot be keyed.
-    assert!(persistent_ssh_options(&words("-F ssh.conf"), None).is_none());
+    assert!(persistent_ssh_options(&words("-i key"), None).is_none());
+    // A configuration file can use the directory in settings syq does not
+    // read, even when it is named by an absolute path.
+    for (given, key) in [
+        ("-F ssh.conf", "-F /project/ssh.conf"),
+        ("-F /etc/shared.conf", "-F /etc/shared.conf"),
+    ] {
+        let options = persistent_ssh_options(&words(given), Some(directory)).unwrap();
+        assert_eq!(options.options.join(" "), key);
+        assert_eq!(options.directory.as_deref(), Some("/project"), "{given}");
+    }
     // A local command can refer to the directory in any way, so it ties the
     // connection to the directory itself.
     for command in [

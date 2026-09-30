@@ -111,16 +111,17 @@ pub(crate) fn rsh_persists_connections(rsh: &str) -> bool {
 /// directory, so they are made absolute: the same options given in another
 /// directory can name different files, and must not reuse this connection.
 /// Options that run a local command, such as `ProxyCommand=./proxy`, can refer
-/// to the directory in ways that cannot be resolved, so they tie the connection
-/// to the directory itself. None when a path or that directory cannot be
-/// recorded.
+/// to the directory in ways that cannot be resolved, and so can the contents of
+/// a configuration file named with `-F`, which syq does not read. Either ties
+/// the connection to the directory itself. None when a path or that directory
+/// cannot be recorded.
 pub(crate) fn persistent_ssh_options(
     options: &[String],
     directory: Option<&std::path::Path>,
 ) -> Option<crate::persistence::SshOptions> {
     // `-o` names whose value is a command run on this machine.
     const COMMAND_OPTIONS: &[&str] = &["KnownHostsCommand", "LocalCommand", "ProxyCommand"];
-    let mut runs_command = false;
+    let mut uses_directory = false;
     // Option letters whose value is a local file, and `-o` names likewise.
     const FILE_LETTERS: &[u8] = b"EFIi";
     const FILE_OPTIONS: &[&str] = &[
@@ -158,11 +159,12 @@ pub(crate) fn persistent_ssh_options(
             index += 1;
             (options.get(index - 1)?.clone(), false)
         };
+        uses_directory |= letter == b'F';
         let value = if FILE_LETTERS.contains(&letter) {
             absolute(&value)?
         } else if letter == b'o' {
             let (name, setting) = option_name(&value);
-            runs_command |= COMMAND_OPTIONS
+            uses_directory |= COMMAND_OPTIONS
                 .iter()
                 .any(|command| name.eq_ignore_ascii_case(command));
             if FILE_OPTIONS
@@ -187,7 +189,7 @@ pub(crate) fn persistent_ssh_options(
             resolved.push(value);
         }
     }
-    let directory = if runs_command {
+    let directory = if uses_directory {
         Some(directory?.to_str()?.to_owned())
     } else {
         None
