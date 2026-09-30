@@ -209,7 +209,7 @@ pub(crate) struct Root {
     #[cfg(target_os = "linux")]
     partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
     #[cfg(target_os = "linux")]
-    serializes_replacement: OnceLock<bool>,
+    bounds_replacement: OnceLock<bool>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, target_os = "linux"))]
@@ -244,7 +244,7 @@ impl Root {
             #[cfg(target_os = "linux")]
             partial_name_limits: OnceLock::new(),
             #[cfg(target_os = "linux")]
-            serializes_replacement: OnceLock::new(),
+            bounds_replacement: OnceLock::new(),
             #[cfg(all(test, target_os = "linux"))]
             test_name_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, target_os = "linux"))]
@@ -278,20 +278,21 @@ impl Root {
         Ok(directory_gate::acquire(self.identity, parents))
     }
 
-    /// Whether this root's filesystem frees inodes under one lock for the
-    /// whole filesystem, as ext4 does. Replacing files there is bounded per
-    /// filesystem; elsewhere replacements scaled with the workers, or the
-    /// bound made no difference.
+    /// Whether replacing files beneath this root is bounded per filesystem.
+    /// XFS frees inodes per allocation group and replaced files faster with
+    /// every worker; the bound would cost it up to a fifth. Every other
+    /// filesystem is bounded: the collapse it prevents on ext4 costs more than
+    /// double, and no other measured filesystem lost anything to it.
     #[cfg(any(target_os = "linux", test))]
-    fn serializes_replacement(&self) -> bool {
+    fn bounds_replacement(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            *self.serializes_replacement.get_or_init(|| {
+            *self.bounds_replacement.get_or_init(|| {
                 let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
                 // SAFETY: fstatfs writes only into the local struct.
                 unsafe {
-                    libc::fstatfs(self.directory.as_raw_fd(), stats.as_mut_ptr()) == 0
-                        && stats.assume_init().f_type as u32 == libc::EXT4_SUPER_MAGIC as u32
+                    libc::fstatfs(self.directory.as_raw_fd(), stats.as_mut_ptr()) != 0
+                        || stats.assume_init().f_type as u32 != libc::XFS_SUPER_MAGIC as u32
                 }
             })
         }
@@ -305,7 +306,7 @@ impl Root {
         ReplacementTurn {
             #[cfg(any(target_os = "linux", test))]
             _permit: self
-                .serializes_replacement()
+                .bounds_replacement()
                 .then(|| directory_gate::replacement(self.identity.dev)),
         }
     }

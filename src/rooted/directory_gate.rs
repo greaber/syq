@@ -24,10 +24,10 @@ const MUTATORS: usize = 2;
 
 // Replacing a file frees its inode. On ext4 the throughput of that falls
 // once more than about eight threads replace files at once, whichever
-// directories they work in, with or without the orphan_file feature. Roots
-// on other filesystems do not take this permit: XFS, tmpfs and ZFS replaced
-// files as fast or faster with every worker, and on NFS the bound changed
-// nothing.
+// directories they work in, with or without the orphan_file feature; btrfs
+// gains a little from the same bound, and tmpfs, ZFS and NFS are unmoved by
+// it. XFS roots do not take this permit: they free inodes per allocation
+// group and replaced files faster with every worker.
 const REPLACERS: usize = 8;
 
 thread_local! {
