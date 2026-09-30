@@ -56,7 +56,7 @@ fn stream_ready(fd: i32, events: i16, timeout_ms: i32) -> i32 {
     unsafe { libc::FD_SET(fd % libc::FD_SETSIZE as i32, &mut sets[block]) };
     let mut timeout = libc::timeval {
         tv_sec: (timeout_ms / 1000).into(),
-        tv_usec: ((timeout_ms % 1000) * 1000).into(),
+        tv_usec: (timeout_ms % 1000) * 1000,
     };
     let null = std::ptr::null_mut();
     let (read, write) = if events == libc::POLLIN {
