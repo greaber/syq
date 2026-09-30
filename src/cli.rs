@@ -375,7 +375,7 @@ pub struct Args {
     /// in-place write leaves a newer-looking final file those filters would then skip forever
     #[arg(long, conflicts_with_all = ["update", "ignore_existing"])]
     pub inplace: bool,
-    /// Remote shell command (default: ssh); controls agent forwarding when set
+    /// Remote shell command (default: ssh); when set, it controls agent forwarding and syq neither shares nor persists connections
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Use this exact syq executable on the remote instead of the managed helper
@@ -1300,7 +1300,7 @@ struct NativeRemoteArgs {
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
     coordinate_at: CoordinateAt,
-    /// Remote shell command (default: ssh); the command owns SSH and agent policy when set
+    /// Remote shell command (default: ssh); when set, the command owns SSH and agent policy and syq neither shares nor persists connections
     #[arg(long = "rsh", value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
@@ -1546,7 +1546,7 @@ struct NativeMapCommand {
     /// Filter emitted mapping entries with a source expression
     #[arg(long = "where", value_name = "EXPR")]
     where_expression: Option<String>,
-    /// Remote shell command (default: ssh)
+    /// Remote shell command (default: ssh); when set, syq neither shares nor persists connections
     #[arg(long, value_name = "COMMAND")]
     rsh: Option<String>,
     #[command(flatten)]
