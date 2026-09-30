@@ -2,6 +2,12 @@ use super::*;
 use std::time::Duration;
 
 fn command(t: &Tmp, pull: bool, rate: &str) -> Command {
+    let mut cmd = automatic_command(t, pull, rate);
+    cmd.arg("--performance-tuning=workers=4");
+    cmd
+}
+
+fn automatic_command(t: &Tmp, pull: bool, rate: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
     cmd.args(["cp", "-v", "--no-progress", "--rsh"])
         .arg(fake_rsh(t))
@@ -10,7 +16,6 @@ fn command(t: &Tmp, pull: bool, rate: &str) -> Command {
             env!("CARGO_BIN_EXE_syq"),
             "--tcp-ports",
             EPHEMERAL_TCP_PORTS,
-            "--performance-tuning=workers=4",
             "--resource-limits",
             &format!("bandwidth={rate}"),
         ])
@@ -125,5 +130,60 @@ fn high_tcp_cap_keeps_single_read_comparison() {
             })
             .sum();
         assert_eq!(total, source.len() as u64, "{events}");
+    }
+}
+
+// Exercise normal small-file batches: completion acknowledgments can be seconds
+// apart under a cap, while the transport and tuner must keep seeing activity.
+#[cfg(debug_assertions)]
+#[test]
+fn capped_batches_provide_continuous_tuning_activity() {
+    for pull in [false, true] {
+        let t = Tmp::new();
+        for n in 0..8192 {
+            write(&t.path(&format!("src/{n}")), &prng(8192, 8000 + n));
+        }
+        let history = t.path("history.sqlite");
+        let out = automatic_command(&t, pull, "4M")
+            .arg("--no-compress")
+            .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+            .env("SYQ_TUNING_HISTORY", &history)
+            .env("SYQ_TEST_TUNE_SAMPLE_MS", "100")
+            .args(paths(&t, pull, true))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        let db = rusqlite::Connection::open(history).unwrap();
+        let observations: Vec<serde_json::Value> = db
+            .prepare("SELECT data FROM events WHERE json_extract(data,'$.kind')='observation'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect();
+        assert!(observations.len() >= 20, "{out:?}");
+        let active = observations
+            .iter()
+            .filter(|event| event["data"]["rate"].as_f64().unwrap() > 0.0)
+            .count();
+        assert!(
+            active * 2 > observations.len(),
+            "bursty completion accounting: {observations:?}"
+        );
+        assert!(
+            observations.iter().any(|event| {
+                event["data"]["usable"] == true && event["data"]["rate"].as_f64().unwrap() > 0.0
+            }),
+            "no positive baseline for tuning: {observations:?}"
+        );
+        let mode: String = db
+            .query_row("SELECT mode FROM runs LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert!(mode.contains("bandwidth=4194304;"), "{mode}");
+        assert!(
+            mode.contains("bandwidth-accounting=transport-v1;activity=wire-bytes-v1"),
+            "{mode}"
+        );
     }
 }
