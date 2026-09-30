@@ -10,7 +10,15 @@ use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 /// Wait until `fd` is readable or `timeout` passes. If `poll` itself fails,
 /// sleep for the timeout instead, so a caller's retry loop cannot spin.
 pub(crate) fn wait_readable(fd: RawFd, timeout: std::time::Duration) {
-    wait_any_readable(&[fd], timeout);
+    // The accept loops call this on every idle wake; keep it allocation-free.
+    poll_readable(
+        &mut [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }],
+        timeout,
+    );
 }
 
 /// Wait until any of `fds` is readable or `timeout` passes, as
@@ -24,6 +32,10 @@ pub(crate) fn wait_any_readable(fds: &[RawFd], timeout: std::time::Duration) {
             revents: 0,
         })
         .collect();
+    poll_readable(&mut ready, timeout);
+}
+
+fn poll_readable(ready: &mut [libc::pollfd], timeout: std::time::Duration) {
     let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
     // SAFETY: ready is a live array of initialized pollfd entries.
     if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, millis) } < 0
