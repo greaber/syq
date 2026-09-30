@@ -9,7 +9,8 @@ use aws_smithy_runtime_api::{
     client::{
         interceptors::{
             context::{
-                BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
+                BeforeDeserializationInterceptorContextRef,
+                BeforeSerializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
                 FinalizerInterceptorContextRef, InterceptorContext,
             },
             Intercept,
@@ -49,7 +50,30 @@ impl ClassifyRetry for Throttling {
 /// SDK cannot rewind a file body; downloads need it because a response body
 /// can fail after the headers arrive. Every other request keeps SDK retries.
 pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
-    aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
+    aws_sdk_s3::config::Builder::new()
+        .retry_config(RetryConfig::disabled())
+        .interceptor(OwnRetries)
+}
+
+/// Marks a request retried by syq's own loop, which reports its outcome to
+/// the outage stop itself.
+#[derive(Debug)]
+struct OwnRetries;
+impl aws_smithy_types::config_bag::Storable for OwnRetries {
+    type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
+}
+impl Intercept for OwnRetries {
+    fn name(&self) -> &'static str {
+        "SyqOwnRetries"
+    }
+    fn read_before_execution(
+        &self,
+        _: &BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        cfg.interceptor_state().store_put(OwnRetries);
+        Ok(())
+    }
 }
 
 /// Only establishing a connection has a deadline. Request headers, response
@@ -74,8 +98,8 @@ struct ControlStart(tokio::time::Instant);
 impl aws_smithy_types::config_bag::Storable for ControlStart {
     type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
 }
-/// Report each SDK-retried request's final outcome. Requests sent without SDK
-/// retries are retried by syq, which reports them itself.
+/// Report each SDK-retried request's final outcome. Requests marked by
+/// `OwnRetries` are reported by syq's own retry loop instead.
 #[derive(Debug)]
 struct ObserveOutage(std::sync::Arc<super::outage::Outage>);
 impl Intercept for ObserveOutage {
@@ -88,19 +112,14 @@ impl Intercept for ObserveOutage {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
-        if cfg
-            .load::<RetryConfig>()
-            .is_none_or(|retry| retry.max_attempts() <= 1)
-        {
+        if cfg.load::<OwnRetries>().is_some() {
             return Ok(());
         }
-        let answered = context
-            .response()
-            .is_some_and(|r| !super::outage::transient_status(r.status().as_u16()));
-        if answered || context.output_or_error().is_some_and(|r| r.is_ok()) {
+        if context.output_or_error().is_some_and(|r| r.is_ok()) {
             self.0.responded();
         } else {
-            self.0.exhausted();
+            self.0
+                .finished(context.response().map(|r| r.status().as_u16()));
         }
         Ok(())
     }

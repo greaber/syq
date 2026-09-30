@@ -258,11 +258,8 @@ impl Engine {
             aws_smithy_runtime_api::client::orchestrator::HttpResponse,
         >,
     ) {
-        if retryable(error) {
-            self.outage.exhausted();
-        } else {
-            self.outage.responded();
-        }
+        self.outage
+            .finished(error.raw_response().map(|r| r.status().as_u16()));
     }
     fn check_cancelled(&self) -> Result<()> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "S3 copy cancelled");

@@ -191,6 +191,9 @@ impl Engine {
             let mut next_check = Duration::from_secs(1);
             let attempt_offset = offset + done;
             let attempt_length = length - done;
+            // The status of this attempt's GET, once one was sent. A body
+            // that fails after the headers still came from a live service.
+            let mut status = initial.as_ref().map(|_| 200);
             let result = async {
                 let body = if let Some(body) = initial.take() {
                     body
@@ -209,6 +212,7 @@ impl Engine {
                         .send()
                         .await
                         .map_err(|e| {
+                            status = e.raw_response().map(|r| r.status().as_u16());
                             if retryable(&e) {
                                 anyhow::Error::new(e.into_service_error())
                             } else {
@@ -216,6 +220,7 @@ impl Engine {
                                     .into()
                             }
                         })?;
+                    status = Some(200);
                     if response.content_length() != Some(attempt_length as i64)
                         || response.e_tag() != Some(object.etag.as_str())
                         || (length > 0
@@ -394,7 +399,7 @@ impl Engine {
                     if e.downcast_ref::<Permanent>().is_some() {
                         self.outage.responded();
                     } else {
-                        self.outage.exhausted();
+                        self.outage.finished(status);
                     }
                     return Err(e);
                 }

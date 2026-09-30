@@ -1577,9 +1577,9 @@ fn serve(
             return;
         }
     }
-    if fault.starts_with("unavailable-") {
-        // Listing answers, then every PUT (or every HEAD) fails as if the
-        // service were down.
+    if fault == "unavailable-put" || fault == "unavailable-copy" {
+        // Planning succeeds, then every upload, or every source HEAD a
+        // server-side copy starts with, fails as if the service were down.
         let length: usize = headers
             .get("content-length")
             .map_or(0, |n| n.parse().unwrap());
@@ -1587,14 +1587,36 @@ fn serve(
         socket.read_exact(&mut body).unwrap();
         let unavailable = || b"<Error><Code>ServiceUnavailable</Code></Error>".as_slice();
         match method {
-            "GET" => reply(
-                &mut socket,
-                200,
-                &[],
-                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
-                false,
-            ),
-            "HEAD" if fault == "unavailable-head" => {
+            "GET" => {
+                let entries: String = if first
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .starts_with("/source")
+                {
+                    (0..40)
+                        .map(|n| {
+                            format!(
+                                "<Contents><Key>data/f{n}</Key><Size>1</Size><ETag>&quot;source&quot;</ETag></Contents>"
+                            )
+                        })
+                        .collect()
+                } else {
+                    String::new()
+                };
+                let body = format!(
+                    "<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+                );
+                reply(&mut socket, 200, &[], body.as_bytes(), false);
+            }
+            "HEAD"
+                if fault == "unavailable-copy"
+                    && first
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .starts_with("/source/data/") =>
+            {
                 probes.fetch_add(1, Ordering::Relaxed);
                 reply(&mut socket, 503, &[], b"", true);
             }
@@ -3606,28 +3628,33 @@ fn s3_upload_retries_corrupted_data_with_a_warning_within_the_budget() {
 
 #[test]
 fn copies_stop_when_requests_keep_failing_after_their_retries() {
-    // PUTs are retried by syq; HEADs by the SDK. Either way, eight requests in
-    // a row that exhaust their retries without an answer stop the copy before
-    // the remaining objects are tried.
-    for (fault, retries) in [("unavailable-put", 0), ("unavailable-head", 1)] {
+    // Upload PUTs are retried by syq; the HEADs that start server-side copies
+    // by the SDK, including with SDK retries disabled. Either way, eight
+    // requests in a row that exhaust their retries without an answer stop the
+    // copy before the remaining objects are tried, and each request counts
+    // once however many attempts it made.
+    for (fault, retries) in [
+        ("unavailable-put", 1),
+        ("unavailable-copy", 1),
+        ("unavailable-copy", 0),
+    ] {
         let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("source")).unwrap();
         for n in 0..40 {
             std::fs::write(temp.path().join("source").join(format!("f{n}")), b"x").unwrap();
         }
         let server = Server::start(fault);
-        let output = server
-            .command_with_retries(temp.path(), retries)
+        let mut command = server.command_with_retries(temp.path(), retries);
+        command
             .args(["--s3-endpoint", &server.address])
-            .args(["--performance-tuning", "s3-objects=1"])
-            .args([
-                "--srcs-in",
-                "source",
-                "--to",
-                "s3://bucket",
-                "--into",
-                "prefix",
-            ])
+            .args(["--performance-tuning", "s3-objects=1"]);
+        if fault == "unavailable-copy" {
+            command.args(["--from", "s3://source", "--srcs-in", "data"]);
+        } else {
+            command.args(["--srcs-in", "source"]);
+        }
+        let output = command
+            .args(["--to", "s3://bucket", "--into", "prefix"])
             .capture_output()
             .unwrap();
         assert_eq!(
@@ -3637,9 +3664,8 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
             output_text(&output)
         );
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains(
-                "8 S3 requests in a row failed after all retries with no response from the service; stopping"
-            ),
+            String::from_utf8_lossy(&output.stderr)
+                .contains("8 S3 requests in a row failed after all their retries"),
             "{fault}: {}",
             output_text(&output)
         );
@@ -3649,7 +3675,7 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
         let per_request = retries + 1;
         assert!(
             (8 * per_request..=9 * per_request).contains(&failing),
-            "{fault}: {failing} failing requests"
+            "{fault} with {retries} retries: {failing} failing attempts"
         );
     }
     // Objects still in flight when the copy stops share its one message.

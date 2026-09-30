@@ -2,10 +2,9 @@
 //! retries on a service that is down.
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
-/// Requests that fail transiently after all their retries, with no response
-/// from the service in between, before a batch stops. Each such request has
-/// already spent its whole retry budget, so a partial outage or throttling that
-/// still lets some requests through never reaches this.
+/// Requests that fail after their retries without an answer from the service,
+/// with none answered in between, before a batch stops. A partial outage or
+/// throttling that still lets some requests through never reaches this.
 pub(crate) const LIMIT: u32 = 8;
 
 #[derive(Debug, Default)]
@@ -21,7 +20,17 @@ impl Outage {
         self.failures.store(0, Relaxed);
     }
 
-    /// A request failed transiently, or got no response, after its retries.
+    /// Report a request's final outcome from the status of its last response.
+    pub(crate) fn finished(&self, status: Option<u16>) {
+        if status.is_some_and(|s| !transient_status(s)) {
+            self.responded();
+        } else {
+            self.exhausted();
+        }
+    }
+
+    /// A request got no response, or only a server error or throttling, on
+    /// every attempt.
     pub(crate) fn exhausted(&self) {
         if self.failures.fetch_add(1, Relaxed) + 1 >= LIMIT && !self.stopped.swap(true, Relaxed) {
             // The batch has one waiter; a stored permit covers a later wait.
@@ -36,7 +45,7 @@ impl Outage {
 
     pub(crate) fn message() -> String {
         format!(
-            "{LIMIT} S3 requests in a row failed after all retries with no response from the service; stopping because it appears unavailable. Rerun the command to continue"
+            "{LIMIT} S3 requests in a row failed after all their retries, each with no connection, a timeout, or a server error or throttling response; stopping because the service appears unavailable. Rerun the command to continue"
         )
     }
 }
