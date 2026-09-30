@@ -336,6 +336,9 @@ pub struct SmallPut {
     pub inplace: bool,
     pub condition: TargetCondition,
     pub guard: Option<ContainerGuard>,
+    /// The sender saw a file at this path while planning. The receiver only
+    /// schedules by it: what publication does is decided by `condition`.
+    pub replaces: bool,
 }
 
 /// Contents and integrity hash for one successful `SmallRead`.

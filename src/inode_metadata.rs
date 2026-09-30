@@ -121,11 +121,7 @@ impl InodeMetadata {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
-    use std::{
-        ffi::CString,
-        io,
-        os::{fd::AsRawFd, unix::fs::MetadataExt},
-    };
+    use std::{ffi::CString, io, os::unix::fs::MetadataExt};
     const ACCESS: &[u8] = b"system.posix_acl_access";
     const DEFAULT: &[u8] = b"system.posix_acl_default";
     const ATTRIBUTE_LIMIT: usize = 65536;
@@ -133,7 +129,7 @@ mod platform {
     // Resolving the procfs descriptor link selects the held inode, including
     // O_PATH|O_NOFOLLOW symlink inodes; it never follows their stored target.
     fn handle(file: &File) -> CString {
-        CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap()
+        CString::new(crate::sys::proc_fd_path(file)).unwrap()
     }
     fn selected(name: &[u8], privileged: bool) -> bool {
         if privileged {

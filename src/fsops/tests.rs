@@ -1166,6 +1166,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         inplace: false,
         condition: TargetCondition::Absent,
         guard: None,
+        replaces: false,
     }]);
 
     let mut unrooted = FsOps::new();
@@ -1252,6 +1253,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         inplace: false,
         condition: TargetCondition::Any,
         guard: None,
+        replaces: false,
     };
     let response = rooted.handle(&Request::PutSmallBatch(vec![
         put(b"logical/file", 0o640, flags::RECEIVER_MODE),
@@ -2020,6 +2022,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             inplace: false,
             condition: TargetCondition::Absent,
             guard: None,
+            replaces: false,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("small")).unwrap(), b"small-data");
@@ -2043,6 +2046,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 ino: existing.ino(),
             },
             guard: None,
+            replaces: false,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("existing")).unwrap(), b"new");
@@ -2162,6 +2166,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             inplace: false,
             condition: TargetCondition::Absent,
             guard: None,
+            replaces: false,
         })
         .is_err());
     assert!(!outside.join("escaped").exists());
@@ -5553,6 +5558,97 @@ fn equality_windows_keep_the_same_destination_inode() {
         );
         assert!(format!("{response:?}").contains("invalid hash interval"));
     }
+}
+
+#[test]
+fn directory_changes_share_each_directory_between_two_threads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mkdir = |path: String| Op::Mkdir {
+        path: path.into_bytes(),
+        mode: 0o755,
+        condition: TargetCondition::Any,
+    };
+    // Two busy directories, many directories of one entry each, and
+    // operations that the selection leaves out.
+    let mut ops = Vec::new();
+    for index in 0..300 {
+        ops.push(mkdir(format!("busy/a{index}")));
+        ops.push(mkdir(format!("skipped/{index}")));
+        ops.push(mkdir(format!("other/b{index}")));
+        ops.push(mkdir(format!("single{index}/leaf")));
+        // Removals are not bounded per directory; they only need their
+        // results back in order.
+        ops.push(Op::Unlink {
+            path: format!("busy/old{index}").into_bytes(),
+        });
+    }
+    let selected: Vec<usize> = (0..ops.len()).filter(|index| index % 5 != 1).collect();
+    let active = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let peak = [AtomicUsize::new(0), AtomicUsize::new(0)];
+    let results = parallel_by_directory(&ops, &selected, |op| {
+        let path = op_path(op);
+        let busy = [&b"busy/a"[..], b"other/"]
+            .iter()
+            .position(|directory| path.starts_with(directory));
+        if let Some(directory) = busy {
+            let now = active[directory].fetch_add(1, Ordering::SeqCst) + 1;
+            peak[directory].fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            active[directory].fetch_sub(1, Ordering::SeqCst);
+        }
+        path.to_vec()
+    });
+    let expected: Vec<_> = selected
+        .iter()
+        .map(|&index| op_path(&ops[index]).to_vec())
+        .collect();
+    assert_eq!(results, expected);
+    // The pool is shared, so a busy one may give a directory one thread.
+    for directory in &peak {
+        assert!((1..=2).contains(&directory.load(Ordering::SeqCst)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn deleted_file_is_open(path: &Path) -> bool {
+    // Inodes can be reused by parallel tests after the donor is closed. The
+    // unique fixture path still identifies it after unlink or replacement.
+    let mut deleted = path.as_os_str().to_os_string();
+    deleted.push(" (deleted)");
+    fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+        let fd = entry.unwrap().path();
+        match fs::read_link(&fd) {
+            Ok(target) => target.as_os_str() == deleted,
+            // Other tests can close descriptors while we enumerate them.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => panic!("read descriptor {}: {error}", fd.display()),
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn deleted_file_descriptor_check_distinguishes_replacement_and_other_files() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let path = tree.path().join("file");
+    fs::write(&path, b"donor").unwrap();
+    let donor = File::open(&path).unwrap();
+    assert!(!deleted_file_is_open(&path));
+    fs::remove_file(&path).unwrap();
+    assert!(deleted_file_is_open(&path));
+
+    fs::write(&path, b"replacement").unwrap();
+    let replacement = File::open(&path).unwrap();
+    let other_path = tree.path().join("other");
+    fs::write(&other_path, b"other").unwrap();
+    let other = File::open(&other_path).unwrap();
+    fs::remove_file(&other_path).unwrap();
+    assert!(deleted_file_is_open(&path));
+
+    drop(donor);
+    assert!(!deleted_file_is_open(&path));
+    assert!(deleted_file_is_open(&other_path));
+    drop((replacement, other));
 }
 
 #[cfg(target_os = "linux")]
