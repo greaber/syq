@@ -2625,25 +2625,32 @@ impl FsOps {
                 off,
                 len,
                 expected,
-            } => self
-                .read_range(path, source.as_ref(), *attempt, *off, *len)
-                .map(|reply| match reply {
-                    Response::Block { off, hash, data } => {
-                        let comparison = if self.hash_policy.transfer_integrity
-                            && self.hash_policy.payload_algorithm() == self.hash_policy.algorithm
-                        {
-                            hash
-                        } else {
-                            self.hash_policy.algorithm.hash(&data)
-                        };
-                        if comparison == *expected {
-                            Response::RangeMatched { off, len: *len }
-                        } else {
-                            Response::Block { off, hash, data }
+            } => (|| {
+                #[cfg(debug_assertions)]
+                record_test_event(
+                    "SYQ_TEST_COMPARED_READ_EVENTS",
+                    format_args!("compare {off} {len}"),
+                )?;
+                self.read_range(path, source.as_ref(), *attempt, *off, *len)
+                    .map(|reply| match reply {
+                        Response::Block { off, hash, data } => {
+                            let comparison = if self.hash_policy.transfer_integrity
+                                && self.hash_policy.payload_algorithm()
+                                    == self.hash_policy.algorithm
+                            {
+                                hash
+                            } else {
+                                self.hash_policy.algorithm.hash(&data)
+                            };
+                            if comparison == *expected {
+                                Response::RangeMatched { off, len: *len }
+                            } else {
+                                Response::Block { off, hash, data }
+                            }
                         }
-                    }
-                    other => other,
-                }),
+                        other => other,
+                    })
+            })(),
             Request::SeedBasis {
                 path,
                 copy_id,

@@ -87,6 +87,7 @@ impl Receiver {
         // Reuse the approved transport constraints and one-listener allowance.
         authority.authorize(
             &mut crate::proto::Request::TcpListen {
+                send_rate: None,
                 key: Some(vec![0; crate::tcp_records::KEY_LEN]),
                 token: vec![0; 16],
                 port_lo: request.ports.0,
@@ -110,6 +111,7 @@ impl Receiver {
             bail!("no advertised data address is reachable");
         }
         let info = TcpInfo {
+            pacing: None,
             reverse: None,
             addrs,
             port: request.port,

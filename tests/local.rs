@@ -1013,3 +1013,7 @@ mod expressions;
 
 #[path = "local/block_reuse.rs"]
 mod block_reuse;
+
+#[cfg(debug_assertions)]
+#[path = "local/transport_bandwidth.rs"]
+mod transport_bandwidth;

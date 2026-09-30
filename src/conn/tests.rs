@@ -167,6 +167,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
     assert!(matches!(reply.value, Response::SmallBlocks(_)));
     reader.join().unwrap(); // The following reply and EOF are already queued.
     let mut conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
@@ -691,6 +692,7 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let writes = Arc::new(AtomicUsize::new(0));
     let mut conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: None,
         w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
@@ -819,6 +821,7 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let info = TcpInfo {
+        pacing: None,
         reverse: None,
         addrs: vec!["127.0.0.1".into()],
         port: 9,
@@ -879,6 +882,7 @@ fn only_the_local_receiver_disables_requested_tcp_compression() {
             // in-process receiver and keeps the requested compression.
             spec.local_process = local_process;
             let info = TcpInfo {
+                pacing: None,
                 reverse: None,
                 addrs: vec!["127.0.0.1".into()],
                 port,
@@ -957,6 +961,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     );
     let conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: None,
         w: FrameWriter::new(Box::new(socket), false),
@@ -1010,6 +1015,7 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
         crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     );
     let conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: None,
         w: FrameWriter::new(Box::new(socket), false),
@@ -1055,6 +1061,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         .spawn_guarded()
         .unwrap();
     let mut conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: Some(child),
         w: FrameWriter::new(Box::new(std::io::sink()), false),
@@ -1095,6 +1102,7 @@ fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
         .unwrap();
     let stdin = child.stdin.take().unwrap();
     let conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: Some(child),
         w: FrameWriter::new(Box::new(stdin), false),
@@ -1223,6 +1231,7 @@ fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         );
         let mut connection = RemoteConn {
+            transport_stop: None,
             observation: Default::default(),
             child: None,
             w: FrameWriter::new(Box::new(writer), false),
@@ -1298,6 +1307,7 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
         drop(writer);
         let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
         let mut remote = RemoteConn {
+            transport_stop: None,
             observation: Default::default(),
             child: None,
             w: FrameWriter::new(Box::new(Vec::new()), false),
@@ -1521,6 +1531,7 @@ fn worker_tcp_fallback_survives_broken_stderr() {
         ssh_multiplexer: None,
         quiet: false,
         tcp: std::sync::Arc::new(std::sync::Mutex::new(Some(TcpInfo {
+            pacing: None,
             reverse: None,
             addrs: vec!["invalid address".into()], // Fail resolution without DNS or a socket.
             port: 0,
@@ -2009,6 +2020,7 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
     drop(writer);
     let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
     let conn = RemoteConn {
+        transport_stop: None,
         observation: Default::default(),
         child: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
@@ -2105,4 +2117,24 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
     assert!(session.contains("target=linux-aarch64") && !session.contains("uname"));
     // Development builds keep asking the host.
     assert_eq!(spec.session_command_for(&server, false), before);
+}
+
+#[test]
+fn transport_paced_receive_stops_when_scheduler_aborts() {
+    let mut connection = connection_replaying(&[]);
+    // Leave the channel open without completing a frame: a throttled source
+    // may take minutes to finish one. Abort must not wait for that frame.
+    let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
+    connection.rx = Some(receiver);
+    let scheduler = std::sync::Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
+    connection.transport_stop = Some(std::sync::Arc::downgrade(&scheduler));
+    let receiving = std::thread::spawn(move || connection.recv());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    scheduler.abort();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !receiving.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(receiving.is_finished(), "receive ignored scheduler abort");
+    assert!(receiving.join().unwrap().is_err());
 }

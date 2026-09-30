@@ -362,6 +362,7 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
             .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
             // Advertise only the SSH arrival address.
             .env("SYQ_TEST_NO_INTERFACE_ADDRESSES", "1")
+            .env("SYQ_TEST_TCP_LOOPBACK_ONLY", "1")
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"));
         if tcp {
@@ -380,18 +381,24 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
             "{terminal}"
         );
         let observed = tuning_observed(&out);
-        assert!(
-            observed["streaming_ranges"].as_u64().unwrap() > 0,
-            "{out:?}"
-        );
-        assert_eq!(observed["range_requests"], 0, "{out:?}");
-        assert_eq!(observed["max_request_bytes"], 64 << 10, "{out:?}");
-        assert!(
-            stderr_of(&out).contains("streaming above 262144 bytes"),
-            "{out:?}"
-        );
+        if tcp {
+            // The TCP sender paces bytes without shrinking requests or forcing
+            // this otherwise batchable file onto the streaming range path.
+            assert_eq!(observed["small_batches"], 1, "{out:?}");
+        } else {
+            assert!(
+                observed["streaming_ranges"].as_u64().unwrap() > 0,
+                "{out:?}"
+            );
+            assert_eq!(observed["range_requests"], 0, "{out:?}");
+            assert_eq!(observed["max_request_bytes"], 64 << 10, "{out:?}");
+            assert!(
+                stderr_of(&out).contains("streaming above 262144 bytes"),
+                "{out:?}"
+            );
+        }
         // This verifies the whole-copy average, not a socket-ingress burst cap:
-        // the source streams ahead while this worker paces destination writes.
+        // SSH streams ahead of paced destination writes; TCP paces the sender.
     }
 }
 

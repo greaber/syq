@@ -33,6 +33,10 @@ impl Budget {
         }
     }
 
+    pub(crate) fn rate(&self) -> u64 {
+        self.rate
+    }
+
     pub(crate) fn chunk(&self) -> usize {
         self.burst as usize
     }
@@ -79,12 +83,33 @@ fn cancelled() -> io::Error {
     )
 }
 
+/// Observe peer shutdown without consuming protocol bytes or changing the
+/// socket's blocking mode (which is shared by its cloned descriptors).
+pub(crate) fn socket_closed(socket: &std::net::TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        fd.events |= libc::POLLRDHUP;
+    }
+    let result = unsafe { libc::poll(&mut fd, 1, 0) };
+    let mask = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    #[cfg(target_os = "linux")]
+    let mask = mask | libc::POLLRDHUP;
+    result > 0 && fd.revents & mask != 0
+}
+
 /// Place below compression and buffering. TCP record buffering must also be
 /// above this writer, otherwise a large record would accumulate before a burst.
 pub(crate) struct PacedWriter<W, S> {
     pub(crate) inner: W,
     pub(crate) budget: std::sync::Arc<Budget>,
     pub(crate) stopped: S,
+    pub(crate) enabled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
@@ -92,10 +117,55 @@ impl<W: Write, S: Fn() -> bool> Write for PacedWriter<W, S> {
         if bytes.is_empty() {
             return Ok(0);
         }
+        if self
+            .enabled
+            .as_ref()
+            .is_some_and(|active| !active.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return self.inner.write(bytes);
+        }
         let n = bytes.len().min(self.budget.chunk());
         self.budget.wait(n, &self.stopped)?;
         self.inner.write_all(&bytes[..n])?;
         Ok(n)
+    }
+
+    fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if self
+            .enabled
+            .as_ref()
+            .is_some_and(|active| !active.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return self.inner.write_vectored(buffers);
+        }
+        // TCP records supply a header and body. Keep them in the same syscall
+        // without allocating or copying, while still bounding the total write.
+        let mut slices = [io::IoSlice::new(&[]); 2];
+        let mut count = 0;
+        let mut bytes = 0;
+        for buffer in buffers.iter().filter(|buffer| !buffer.is_empty()) {
+            let n = buffer.len().min(self.budget.chunk() - bytes);
+            slices[count] = io::IoSlice::new(&buffer[..n]);
+            count += 1;
+            bytes += n;
+            if count == slices.len() || bytes == self.budget.chunk() {
+                break;
+            }
+        }
+        if bytes == 0 {
+            return Ok(0);
+        }
+        self.budget.wait(bytes, &self.stopped)?;
+        let mut remaining = &mut slices[..count];
+        while !remaining.is_empty() {
+            match self.inner.write_vectored(remaining) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => io::IoSlice::advance_slices(&mut remaining, n),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -143,6 +213,7 @@ mod tests {
     #[test]
     fn cancellation_writes_nothing_and_is_not_retryable() {
         let mut writer = PacedWriter {
+            enabled: None,
             inner: Vec::new(),
             budget: std::sync::Arc::new(Budget::new(1024)),
             stopped: || true,
@@ -158,6 +229,7 @@ mod tests {
         budget.reserve(Instant::now(), budget.chunk());
         let checks = std::cell::Cell::new(0);
         let mut writer = PacedWriter {
+            enabled: None,
             inner: Vec::new(),
             budget,
             stopped: || {
@@ -177,12 +249,60 @@ mod tests {
         let budget = std::sync::Arc::new(Budget::new(u64::MAX));
         let input = vec![42; 3 * MAX_CHUNK as usize + 17];
         let mut writer = PacedWriter {
+            enabled: None,
             inner: Vec::new(),
             budget,
             stopped: || false,
         };
         writer.write_all(&input).unwrap();
         assert_eq!(writer.inner, input);
+    }
+
+    #[test]
+    fn vectored_records_preserve_headers_and_partial_writes() {
+        // Vec's default vectored writer only writes the first slice, exercising
+        // partial progress as well as the boundary across header and body.
+        let mut writer = PacedWriter {
+            enabled: None,
+            inner: Vec::new(),
+            budget: std::sync::Arc::new(Budget::new(u64::MAX)),
+            stopped: || false,
+        };
+        let header = [1, 2, 3, 4];
+        let body = vec![42; MAX_CHUNK as usize + 17];
+        let mut buffers = [io::IoSlice::new(&header), io::IoSlice::new(&body)];
+        let mut remaining = &mut buffers[..];
+        while !remaining.is_empty() {
+            let n = writer.write_vectored(remaining).unwrap();
+            assert!(n <= MAX_CHUNK as usize);
+            io::IoSlice::advance_slices(&mut remaining, n);
+        }
+        assert_eq!(writer.inner, [header.as_slice(), &body].concat());
+    }
+
+    #[test]
+    fn peer_shutdown_cancels_a_throttled_record() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let socket = server.try_clone().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut writer = PacedWriter {
+                enabled: None,
+                inner: server,
+                budget: std::sync::Arc::new(Budget::new(1)),
+                stopped: || socket_closed(&socket),
+            };
+            writer.write_all(&[42; 1024])
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !writer.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(writer.is_finished(), "sender ignored peer shutdown");
+        assert!(writer.join().unwrap().is_err());
     }
 
     #[test]

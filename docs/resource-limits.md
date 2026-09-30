@@ -8,7 +8,7 @@ Supply comma-separated `KEY=VALUE` pairs:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `bandwidth` | `0` (unlimited) | Aggregate logical file-data bytes per second across the copy's workers |
+| `bandwidth` | `0` (unlimited) | Aggregate byte rate across the copy's workers; accounting depends on the transport |
 | `workers` | Automatic | Ceiling of 1–65536 filesystem copy-worker slots |
 | `s3-requests` | Automatic | Ceiling of 1–65536 simultaneous S3 data requests across objects; excludes metadata requests and idle sockets |
 | `s3-objects` | Automatic | Ceiling of 1–65536 S3 objects in progress, including preparation and finalization |
@@ -18,8 +18,17 @@ Supply comma-separated `KEY=VALUE` pairs:
 syq cp data --to server --into backup --resource-limits bandwidth=10M
 ```
 
-This limits the average copy rate to 10 MiB/s. It counts bytes before compression,
-encryption, and protocol overhead; it does not cap every network burst.
+For ordinary TCP pushes and pulls, this limits outgoing data-connection bytes to
+10 MiB/s across all workers. It counts compressed bytes, including syq framing
+and TCP encryption records, but excludes connection setup, SSH control traffic, and IP/TCP headers.
+Compressible files can therefore copy at a higher logical rate. Small bursts
+remain possible because the operating system buffers network writes.
+
+SSH, local, S3, relay, named receiving, descriptor, and signed-receiver copies
+still count logical file-data bytes before compression. If a TCP copy falls back
+to SSH while other TCP workers remain active, each transport currently has its
+own allowance; the combined rate can exceed the configured cap during that
+mixed-transport period.
 
 ## Concurrency ceilings
 

@@ -30,6 +30,10 @@ pub(crate) use ssh_multiplexer::*;
 pub(crate) use tcp_socket::*;
 
 pub trait Conn: Send {
+    /// True when this data connection has a sender-side transport budget.
+    fn transport_paced(&self) -> bool {
+        false
+    }
     fn observe(
         &mut self,
         _observations: &crate::transfer_observations::Observations,
@@ -385,6 +389,7 @@ impl ReceivedResponse {
 }
 
 pub struct RemoteConn {
+    transport_stop: Option<std::sync::Weak<crate::sched::Sched>>,
     rpc_observation: Option<RpcObservation>,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
     child: Option<Child>,
@@ -568,6 +573,7 @@ impl RemoteConn {
             let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
         });
         RemoteConn {
+            transport_stop: None,
             observation,
             child: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
@@ -657,12 +663,39 @@ impl RemoteConn {
 
     fn receive_response(&mut self) -> Result<ReceivedResponse> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
-        match self
-            .rx
-            .as_ref()
-            .context("response reader is collecting streaming writes")?
-            .recv()
-        {
+        let response = if let Some(stop) = &self.transport_stop {
+            let rx = self
+                .rx
+                .as_ref()
+                .context("response reader is collecting streaming writes")?;
+            loop {
+                if stop.upgrade().is_none_or(|s| s.is_aborted()) {
+                    if let Some(socket) = &self.tcp_socket {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                    }
+                    return Err(self.io_err(
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "transfer cancelled",
+                        )
+                        .into(),
+                    ));
+                }
+                match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                    Ok(value) => break Ok(value),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err(std::sync::mpsc::RecvError)
+                    }
+                }
+            }
+        } else {
+            self.rx
+                .as_ref()
+                .context("response reader is collecting streaming writes")?
+                .recv()
+        };
+        match response {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => Err(self.io_err(e.into())),
             Err(_) => Err(self.io_err(
@@ -673,6 +706,9 @@ impl RemoteConn {
 }
 
 impl Conn for RemoteConn {
+    fn transport_paced(&self) -> bool {
+        self.transport_stop.is_some()
+    }
     fn observe(
         &mut self,
         observations: &crate::transfer_observations::Observations,
@@ -1029,6 +1065,15 @@ pub struct TcpProbe {
     pub candidates: Vec<TcpCandidate>,
 }
 
+/// Copy-scoped outgoing budget. Pulls configure its rate on the source helper;
+/// pushes share the local budget across all destination connections.
+#[derive(Clone)]
+pub(crate) struct TcpPacing {
+    pub(crate) budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
+    pub(crate) remote_sender: bool,
+    pub(crate) scheduler: std::sync::Weak<crate::sched::Sched>,
+}
+
 /// TCP listener state whose route probes are running in the background.
 ///
 /// The listener must be requested over the authenticated control connection,
@@ -1036,6 +1081,7 @@ pub struct TcpProbe {
 /// the probe join handle here lets destination preflight cover the bounded
 /// reachability window without weakening route selection.
 pub(crate) struct PendingTcpSetup {
+    pacing: Option<TcpPacing>,
     reverse: Option<std::sync::Arc<ReverseTcp>>,
     port: u16,
     key: Option<Vec<u8>>,
@@ -1580,6 +1626,7 @@ impl RemoteSpec {
                 observation.clone(),
             );
             let conn = RemoteConn {
+                transport_stop: None,
                 observation,
                 child: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
@@ -1661,6 +1708,7 @@ impl RemoteSpec {
         let (rx, reader) =
             spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone());
         let conn = RemoteConn {
+            transport_stop: None,
             observation,
             child: Some(child),
             w: FrameWriter::new(Box::new(stdin), compress),
@@ -1715,6 +1763,7 @@ impl RemoteSpec {
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
+        pacing: Option<TcpPacing>,
     ) -> Result<PendingTcpSetup> {
         *self.tcp.lock().unwrap() = None;
         {
@@ -1722,7 +1771,7 @@ impl RemoteSpec {
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.begin_tcp_setup_inner(ctl, plain, ports, congestion_control);
+        let result = self.begin_tcp_setup_inner(ctl, plain, ports, congestion_control, pacing);
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }
@@ -1744,6 +1793,7 @@ impl RemoteSpec {
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
+        pacing: Option<TcpPacing>,
     ) -> Result<PendingTcpSetup> {
         if crate::destination::is_named(&self.restricted_grant) {
             anyhow::ensure!(!plain, "named destinations require encrypted TCP");
@@ -1763,6 +1813,10 @@ impl RemoteSpec {
             port_lo: ports.0,
             port_hi: ports.1,
             congestion_control: congestion_control.map(str::to_owned),
+            send_rate: pacing
+                .as_ref()
+                .filter(|p| p.remote_sender)
+                .map(|p| p.budget.rate()),
         })?;
         let (port, advertised, remote_congestion_control) = match resp {
             Response::TcpCongestionRejected(error) => return Err(TcpCongestionError(error).into()),
@@ -1779,6 +1833,7 @@ impl RemoteSpec {
         let spec = self.clone();
         let probe = std::thread::spawn(move || spec.probe_tcp_addresses(advertised, port));
         Ok(PendingTcpSetup {
+            pacing,
             reverse: None,
             port,
             key,
@@ -1839,6 +1894,7 @@ impl RemoteSpec {
 
     fn finish_tcp_setup_inner(&self, pending: PendingTcpSetup) -> Result<()> {
         let PendingTcpSetup {
+            pacing,
             reverse,
             port,
             key,
@@ -1874,6 +1930,7 @@ impl RemoteSpec {
             );
         }
         *self.tcp.lock().unwrap() = Some(TcpInfo {
+            pacing,
             reverse,
             addrs,
             port,
@@ -1953,7 +2010,24 @@ impl RemoteSpec {
             ),
             None => (None, None),
         };
-        let writer = RecordWriter::new(stream.try_clone()?, wc);
+        let pacing_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output: Box<dyn Write + Send> =
+            if let Some(pacing) = info.pacing.as_ref().filter(|p| !p.remote_sender) {
+                let scheduler = pacing.scheduler.clone();
+                let socket = stream.try_clone()?;
+                Box::new(crate::bwlimit::transport::PacedWriter {
+                    enabled: Some(pacing_enabled.clone()),
+                    inner: stream.try_clone()?,
+                    budget: pacing.budget.clone(),
+                    stopped: move || {
+                        scheduler.upgrade().is_none_or(|s| s.is_aborted())
+                            || crate::bwlimit::transport::socket_closed(&socket)
+                    },
+                })
+            } else {
+                Box::new(stream.try_clone()?)
+            };
+        let writer = RecordWriter::new(output, wc);
         let tcp_socket = stream.try_clone()?;
         let reader = RecordReader::new(stream, rc);
         let observation =
@@ -1961,6 +2035,7 @@ impl RemoteSpec {
         let (rx, reader) =
             spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
         let conn = RemoteConn {
+            transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: None,
             w: FrameWriter::new(Box::new(writer), compress),
@@ -1977,6 +2052,8 @@ impl RemoteSpec {
             detached: false,
         };
         let conn = hello(conn, compress, info.token.clone(), role.clone())?;
+        // Authenticate within the fixed handshake deadline even at tiny caps.
+        pacing_enabled.store(true, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         Ok(conn)
     }
@@ -2188,6 +2265,7 @@ fn next_tcp_connection_id(next: &std::sync::atomic::AtomicU32) -> Result<u32> {
 
 #[derive(Clone)]
 pub struct TcpInfo {
+    pub(crate) pacing: Option<TcpPacing>,
     pub(crate) reverse: Option<std::sync::Arc<ReverseTcp>>,
     /// Reachable, speed-filtered data addresses to spread connections across.
     pub addrs: Vec<String>,
