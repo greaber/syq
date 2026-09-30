@@ -2831,11 +2831,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    let destination_tree_known_missing = dst.is_remote()
-        && dst_initially_missing
-        && !opts.ignore_existing
-        && !opts.update
-        && !opts.checksum;
+    // Existing-file policies (-u, --checksum, --ignore-existing, --existing,
+    // --inplace, --copy-if) need no destination lookup here: every decision
+    // they make about an absent destination is the default decision.
+    let destination_tree_known_missing = dst.is_remote() && dst_initially_missing;
     // Buffered planning performs no destination mutations and starts no
     // workers. Let route probes overlap that scan, while preserving the early
     // worker startup used for initially missing destination trees. Restricted
@@ -3054,14 +3053,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         destination_supports_confined_socket_nodes,
         destination_metadata_platform,
         destination_tree_known_missing,
-        destination_children_known_missing: fresh_destination
-            && opts.expressions.update.is_none()
-            && !opts.existing
-            && !opts.ignore_existing
-            && !opts.update
-            && !opts.checksum
-            && !opts.inplace
-            && !opts.restricted_receiver,
+        destination_children_known_missing: fresh_destination,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
@@ -3244,10 +3236,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && fresh_destination
             && !workers_started.get()
             && !opts.dry_run
-            && !opts.inplace
-            && !opts.checksum
-            && !opts.update
-            && !opts.ignore_existing
+            // --existing creates no root to anchor workers to.
             && !opts.existing
         {
             let (files, bytes, all_small) =

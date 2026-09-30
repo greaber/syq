@@ -533,3 +533,94 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
         .unwrap_or_else(|| panic!("missing first connection: {stderr}"));
     assert!(prepare < first_ready, "{stderr}");
 }
+
+/// Existing-file policies decide nothing for an absent destination, so a
+/// fresh destination tree needs no per-entry lookups under them either.
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_destination_skips_descendant_lookups_under_existing_file_policies() {
+    for option in ["-u", "--ignore-existing", "--inplace", "-c", "--existing"] {
+        for destination in ["missing", "empty", "populated"] {
+            let t = Tmp::new();
+            write(&t.path("src/nested/file"), b"payload");
+            write(&t.path("src/top"), b"top");
+            if destination != "missing" {
+                fs::create_dir(t.path("dst")).unwrap();
+            }
+            if destination == "populated" {
+                write(&t.path("dst/sentinel"), b"keep");
+            }
+            let source = format!("{}/", t.s("src"));
+            let target = format!("{}/", t.s("dst"));
+            let output = compat_command()
+                .args(["-rlt", option, &source, &target, "--no-progress"])
+                .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            let copied = option != "--existing";
+            assert_eq!(
+                t.path("dst/nested/file").exists(),
+                copied,
+                "{option} {destination}"
+            );
+            if copied {
+                assert_eq!(read(&t.path("dst/nested/file")), b"payload");
+                assert_eq!(read(&t.path("dst/top")), b"top");
+            }
+            if destination == "populated" {
+                assert_eq!(read(&t.path("dst/sentinel")), b"keep");
+            }
+            // --existing writes nothing, so an existing directory is not
+            // probed for emptiness and is inspected like any other.
+            let fresh = destination == "missing" || (destination == "empty" && copied);
+            let lookups = fs::read_to_string(t.path("lookups")).unwrap_or_default();
+            let widest = widest_destination_lookup(&lookups);
+            assert_eq!(
+                widest <= 1,
+                fresh,
+                "{option} {destination}: widest lookup {widest}\n{lookups}"
+            );
+        }
+    }
+}
+
+/// `--copy-if` evaluates an absent destination as `dst.exists = false`
+/// without inspecting it.
+#[cfg(debug_assertions)]
+#[test]
+fn fresh_destination_skips_descendant_lookups_under_copy_if() {
+    for populated in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/nested/file"), b"payload");
+        write(&t.path("src/top"), b"top");
+        fs::create_dir(t.path("dst")).unwrap();
+        if populated {
+            write(&t.path("dst/sentinel"), b"keep");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+                "--copy-if",
+                "not dst.exists",
+                "--no-progress",
+            ])
+            .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/nested/file")), b"payload");
+        assert_eq!(read(&t.path("dst/top")), b"top");
+        let lookups = fs::read_to_string(t.path("lookups")).unwrap_or_default();
+        let widest = widest_destination_lookup(&lookups);
+        assert_eq!(
+            widest <= 1,
+            !populated,
+            "populated={populated}: widest lookup {widest}\n{lookups}"
+        );
+    }
+}

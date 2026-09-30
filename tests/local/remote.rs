@@ -2165,6 +2165,57 @@ fn native_direct_remote_forwards_overwrite_policies() {
     }
 }
 
+/// A signed receiver never answers the emptiness probe, so a fresh tree
+/// there is a missing destination. Its descendants need no lookups either,
+/// whatever existing-file policy the grant forwards.
+#[cfg(debug_assertions)]
+#[test]
+fn native_direct_missing_destination_skips_descendant_lookups() {
+    for policy in [
+        "--no-progress",
+        "--if-exists=keep",
+        "--if-exists=update-if-older",
+        "--inplace",
+    ] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let helper = cached_remote_helper(&t);
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
+        write(&t.path("src/nested/file"), b"payload");
+        write(&t.path("src/top"), b"top");
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args([
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--from",
+                "fake",
+                "--srcs-in",
+                &t.s("src"),
+                "--to",
+                "fake",
+                "--into",
+                &t.s("dst"),
+                policy,
+                "-q",
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+            .run()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{policy}: {}", stderr_of(&out));
+        assert_eq!(read(&t.path("dst/nested/file")), b"payload");
+        assert_eq!(read(&t.path("dst/top")), b"top");
+        let lookups = fs::read_to_string(t.path("lookups")).unwrap_or_default();
+        let widest = widest_destination_lookup(&lookups);
+        assert!(widest <= 1, "{policy}: widest lookup {widest}\n{lookups}");
+    }
+}
+
 #[test]
 fn native_ignores_internal_rsh_environment() {
     for explicit_rsh in [false, true] {
@@ -2473,12 +2524,26 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
 #[cfg(debug_assertions)]
 #[test]
 fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
-    for (populated, predicate) in [(false, false), (true, false), (false, true)] {
+    let policies: [&[&str]; 5] = [
+        &[],
+        &["--copy-if", "not dst.exists"],
+        &["--if-exists=keep"],
+        &["--if-exists=update-if-older"],
+        &["--inplace"],
+    ];
+    let mut cases = vec![("populated", &policies[0])];
+    for destination in ["missing", "empty"] {
+        cases.extend(policies.iter().map(|policy| (destination, policy)));
+    }
+    for (destination, policy) in cases {
+        let populated = destination == "populated";
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
         write(&t.path("src/nested/one"), b"one");
         write(&t.path("src/two"), b"two");
-        fs::create_dir(t.path("dst")).unwrap();
+        if destination != "missing" {
+            fs::create_dir(t.path("dst")).unwrap();
+        }
         if populated {
             write(&t.path("dst/sentinel"), b"keep");
         }
@@ -2499,9 +2564,7 @@ fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
             "--no-tcp",
             "--no-progress",
         ]);
-        if predicate {
-            command.args(["--copy-if", "not dst.exists"]);
-        }
+        command.args(*policy);
         let output = command
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
@@ -2520,8 +2583,14 @@ fn empty_remote_directory_skips_redundant_destination_batch_lookup() {
         let lookups = fs::read_to_string(t.path("lookups")).unwrap();
         assert_eq!(
             lookups.lines().any(|line| line.starts_with("batch ")),
-            populated || predicate,
-            "populated={populated}, predicate={predicate}: {lookups}"
+            populated,
+            "{destination} {policy:?}: {lookups}"
+        );
+        let widest = widest_destination_lookup(&lookups);
+        assert_eq!(
+            widest <= 1,
+            !populated,
+            "{destination} {policy:?}: widest lookup {widest}\n{lookups}"
         );
     }
 }

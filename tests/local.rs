@@ -531,6 +531,24 @@ fn remote_syq(t: &Tmp, rsh: &Path, args: &[&str]) -> Output {
         .expect("run syq through fake remote shell")
 }
 
+/// The widest destination lookup recorded through `SYQ_TEST_DESTINATION_LOOKUPS`:
+/// the largest path count on any `stat`, `lookup`, or `batch` line.
+#[cfg(debug_assertions)]
+fn widest_destination_lookup(lookups: &str) -> usize {
+    lookups
+        .lines()
+        .filter(|line| {
+            line.starts_with("stat ") || line.starts_with("lookup ") || line.starts_with("batch ")
+        })
+        .flat_map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .filter_map(|n| n.parse().ok())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn assert_output_ok(out: &Output) {
     assert!(
         out.status.success(),
