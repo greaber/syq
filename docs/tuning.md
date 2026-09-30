@@ -309,6 +309,13 @@ bandwidth limit and compression setting; a capped plateau does not select the
 starting count for an uncapped copy. Transport-byte history is also kept separate
 from older logical-byte-cap history.
 
+A long capped copy does not necessarily produce a saved starting count. Once
+workers have claimed all queued files, the tuner currently excludes small-file
+batches from its remaining-work estimate, even while they are transferring.
+Their activity is still recorded, but those observations cannot establish a
+worker-count preference. Saving a starting count requires sufficient usable
+measurements at more than one worker count.
+
 ### Average rate and burst patterns
 
 Ordinary TCP pushes and pulls pace compressed bytes at the sender without

@@ -171,12 +171,10 @@ fn capped_batches_provide_continuous_tuning_activity() {
             active * 2 > observations.len(),
             "bursty completion accounting: {observations:?}"
         );
-        assert!(
-            observations.iter().any(|event| {
-                event["data"]["usable"] == true && event["data"]["rate"].as_f64().unwrap() > 0.0
-            }),
-            "no positive baseline for tuning: {observations:?}"
-        );
+        // Workers may claim the entire queue before the first observation.
+        // Those samples still verify accounting, but the remaining-work gate
+        // can exclude them from worker-count comparisons and cache inference.
+        // Learning eligibility is tested separately with sufficient queued work.
         let mode: String = db
             .query_row("SELECT mode FROM runs LIMIT 1", [], |row| row.get(0))
             .unwrap();
