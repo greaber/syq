@@ -600,7 +600,7 @@ class NativeClientTests(unittest.TestCase):
             rsh="ssh -F config",
             syq_path="/opt/syq",
             no_bootstrap=True,
-            tcp_plain=True,
+            no_tcp_encryption=True,
             tcp_ports="49000-49010",
             tcp_congestion="bbr",
         )
@@ -610,7 +610,7 @@ class NativeClientTests(unittest.TestCase):
             "--rsh",
             "--syq-path",
             "--no-bootstrap",
-            "--tcp-plain",
+            "--no-tcp-encryption",
             "--tcp-ports",
             "--tcp-congestion",
         ):

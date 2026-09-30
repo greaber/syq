@@ -35,7 +35,7 @@ Without --yes, unanswered choices are prompted through /dev/tty (also with curl 
 
 After --, tune syq with --performance-tuning, --resource-limits,
 --tcp-ports, --tcp-congestion (each takes a value), or --no-tcp, --no-compress,
---tcp-plain, --inplace, --stats, --no-progress, -v/-vv/--verbose.
+--no-tcp-encryption, --inplace, --stats, --no-progress, -v/-vv/--verbose.
 These options also apply to syq setup/warm-up/calibration; rsync and cp are unchanged.
 Add -v/-vv/--verbose after -- to show full commands and scratch paths.
 Use --tool syq --rounds 1 --size quick for one scored syq copy per workload.
@@ -497,7 +497,7 @@ main() {
                             verbose=true; show_syq_summary=true; syq_extra+=("$1"); shift ;;
                         --stats)
                             show_syq_summary=true; syq_extra+=("$1"); shift ;;
-                        --no-tcp|--no-compress|--tcp-plain|--inplace|--no-progress)
+                        --no-tcp|--no-compress|--no-tcp-encryption|--inplace|--no-progress)
                             syq_extra+=("$1"); shift ;;
                         *) fail "Unsupported syq benchmark option: $1 (see --help for tuning options)" ;;
                     esac

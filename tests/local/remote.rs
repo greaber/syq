@@ -640,7 +640,7 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
         .arg("--rsync-path")
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
-        .args(["--syq-tcp-plain", "--stats", "-avv"])
+        .args(["--syq-no-tcp-encryption", "--stats", "-avv"])
         .arg(t.s("src"))
         .arg(&remote)
         .arg("--no-progress")
@@ -665,9 +665,11 @@ fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("transport: plaintext TCP planned (reachability preflight passed)"),
+        stderr.contains("transport: unencrypted TCP planned (reachability preflight passed)"),
         "{stderr}"
     );
+    // Without encryption, a fast payload check replaces authenticated records.
+    assert!(stderr.contains("payload checks: xxh3-128"), "{stderr}");
     assert!(
         stderr.contains("concurrency: starting with 16 connections (auto-tuned)"),
         "{stderr}"
@@ -688,7 +690,7 @@ fn inplace_copy_to_missing_remote_destination_waits_for_planned_work() {
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
-            "--syq-tcp-plain",
+            "--syq-no-tcp-encryption",
             "--inplace",
             "-a",
             "--performance-tuning",
@@ -853,7 +855,7 @@ fn tcp_congestion_override_is_applied_on_both_socket_ends_and_reported() {
         .arg(env!("CARGO_BIN_EXE_syq"))
         .args(["--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
         .args([
-            "--syq-tcp-plain",
+            "--syq-no-tcp-encryption",
             "--syq-tcp-congestion=reno",
             "--stats",
             "-avv",
@@ -2446,7 +2448,11 @@ fn checksum_inplace_compares_before_writing_over_ssh_and_tcp() {
                 .env("XDG_CACHE_HOME", t.path("cache"));
             if tcp {
                 command
-                    .args(["--syq-tcp-plain", "--syq-tcp-ports", EPHEMERAL_TCP_PORTS])
+                    .args([
+                        "--syq-no-tcp-encryption",
+                        "--syq-tcp-ports",
+                        EPHEMERAL_TCP_PORTS,
+                    ])
                     .env("SYQ_TEST_REQUIRE_TCP", "1");
             } else {
                 command.arg("--syq-no-tcp");

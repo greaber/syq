@@ -151,7 +151,7 @@ fn transport_label(endpoint: &Endpoint) -> Option<&'static str> {
         Endpoint::Remote(spec) if spec.local_process => None,
         Endpoint::Remote(spec) => Some(match spec.data_transport() {
             DataTransport::Ssh => "ssh",
-            DataTransport::EncryptedTcp | DataTransport::PlaintextTcp => "tcp",
+            DataTransport::EncryptedTcp | DataTransport::UnencryptedTcp => "tcp",
         }),
     }
 }

@@ -1500,7 +1500,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     if args.restricted_grant.is_some()
-        && (args.tcp_plain || original_srcs[0].is_remote() || !dst.is_remote())
+        && (args.no_tcp_encryption || original_srcs[0].is_remote() || !dst.is_remote())
     {
         bail!(
             "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted data connections"
@@ -2272,7 +2272,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if let Endpoint::Remote(spec) = ep {
                 match spec.begin_tcp_setup(
                     &mut **ctl,
-                    args.tcp_plain,
+                    args.no_tcp_encryption,
                     ports,
                     args.tcp_congestion.as_deref(),
                 ) {
@@ -4523,7 +4523,7 @@ fn display_plan_target(loc: &Location, path: &[u8], args: &Args) -> String {
 fn remote_data_transport(spec: &RemoteSpec) -> &'static str {
     match spec.data_transport() {
         DataTransport::EncryptedTcp => "encrypted TCP",
-        DataTransport::PlaintextTcp => "plaintext TCP",
+        DataTransport::UnencryptedTcp => "unencrypted TCP",
         DataTransport::Ssh => "ssh",
     }
 }

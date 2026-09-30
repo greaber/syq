@@ -193,7 +193,7 @@ impl Session {
                 let result = spec
                     .begin_tcp_setup(
                         &mut *control.connection,
-                        self.args.tcp_plain,
+                        self.args.no_tcp_encryption,
                         conn::parse_ports(&self.args.tcp_ports)?,
                         self.args.tcp_congestion.as_deref(),
                     )

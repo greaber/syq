@@ -118,7 +118,7 @@ class HashArgumentsTests(unittest.TestCase):
         argv = json.loads(self.log.read_bytes())
         self.assertNotIn("--hash", argv)
         self.assertEqual(argv[argv.index("--integrity-checking") + 1], "compare=xxh3-128,transfer=sha256")
-        self.assertNotIn("--tcp-plain", argv)
+        self.assertNotIn("--no-tcp-encryption", argv)
         self.client.cp("source", as_="destination", integrity_checking="compare=sha256")
         argv = json.loads(self.log.read_bytes())
         self.assertNotIn("--hash", argv)

@@ -105,8 +105,9 @@ with your laptop’s approval, direct encrypted TCP must be reachable.
 
 Use `--no-tcp` to select SSH data transport or `--tcp-ports LO-HI` to choose a
 port range. On Linux, `--tcp-congestion ALGO` selects an available congestion
-control algorithm. `--tcp-plain` disables data encryption and authentication;
-use it only on a trusted network. Restricted receivers refuse it.
+control algorithm. `--no-tcp-encryption` disables data encryption and
+authentication; use it only on a trusted network. Restricted receivers refuse
+it.
 
 ## Local copies and NFS
 
