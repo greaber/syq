@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import subprocess
 import tempfile
 
 import check as checks
@@ -62,7 +63,9 @@ def check_source_roots():
         # locally, on upload, on download, and between buckets/prefixes.
         local = root / 'local'
         seed_local(local)
-        checks.run([*selectors, '--into', local, *options])
+        subprocess.run([checks.SYQ, 'cp', '--no-progress',
+                        *map(str, [*selectors, '--into', local, *options])],
+                       check=True, timeout=180)
         check_local(local)
         uploaded = prefix + '/uploaded'
         seed_remote(uploaded)
