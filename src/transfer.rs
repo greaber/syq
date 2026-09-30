@@ -1151,9 +1151,13 @@ fn attempt_small_copy(
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(&terminal, elapsed, "");
     }
+    print_copying_interval(args, opts, progress);
+    if let Some(benchmark) = &opts.benchmark {
+        benchmark.lock().unwrap().native_small_copies += 1;
+    }
+    print_benchmark_observations(opts);
     if args.stats && !args.quiet {
         print_statistics(
-            args,
             opts,
             progress,
             elapsed,
@@ -1174,19 +1178,10 @@ fn show_statistics(args: &Args) -> bool {
     !args.suppress_summary || args.restricted_grant.is_some()
 }
 
-/// The `--stats` block after the summary line: the counters that line
-/// renders, plus how the data travelled. `connections` and `tcp_stats` come
-/// from the path that carried the copy, since a copy that never started data
-/// workers has neither a worker count nor data sockets to report.
-fn print_statistics(
-    args: &Args,
-    opts: &Opts,
-    progress: &Progress,
-    elapsed: f64,
-    connections: &str,
-    tcp_stats: &str,
-) {
-    if show_statistics(args) && !opts.dry_run {
+/// The `--stats` copying-interval line, printed even for a copy that was
+/// aborted: the interval is a fact about the data that did move.
+fn print_copying_interval(args: &Args, opts: &Opts, progress: &Progress) {
+    if args.stats && show_statistics(args) && !args.quiet && !opts.dry_run {
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -1194,6 +1189,19 @@ fn print_statistics(
             );
         }
     }
+}
+
+/// The `--stats` block after the summary line: the counters that line
+/// renders, plus how the data travelled. `connections` and `tcp_stats` come
+/// from the path that carried the copy, since a copy that never started data
+/// workers has neither a worker count nor data sockets to report.
+fn print_statistics(
+    opts: &Opts,
+    progress: &Progress,
+    elapsed: f64,
+    connections: &str,
+    tcp_stats: &str,
+) {
     // --stats is additional human output, not the summary line the local
     // attested settlement re-renders; a delegated coordinator keeps it.
     let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
@@ -2322,10 +2330,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
                     );
                 }
-                if let Some(benchmark) = &opts.benchmark {
-                    benchmark.lock().unwrap().native_small_copies += 1;
-                }
-                print_benchmark_observations(&opts);
                 return Ok(code);
             }
             SmallCopy::Declined => configure_hashing(&mut *dst_ctl, opts.hash_policy)?,
@@ -3805,6 +3809,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
+    print_copying_interval(&args, &opts, &progress);
+    print_benchmark_observations(&opts);
     if args.stats && !args.quiet && !aborted {
         let connections = match &tuned {
             Some(p) => format!(
@@ -3823,9 +3829,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
         });
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        print_statistics(&args, &opts, &progress, elapsed, &connections, &tcp_stats);
+        print_statistics(&opts, &progress, elapsed, &connections, &tcp_stats);
     }
-    print_benchmark_observations(&opts);
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
