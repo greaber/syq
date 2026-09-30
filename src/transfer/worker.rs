@@ -523,15 +523,26 @@ impl Worker {
             .max(jobs.iter().map(|j| j.entry.size).sum());
         // Each group keeps whole files, so publication and per-file hashes
         // are unchanged. Larger batches feed bounded read/write windows rather
-        // than reading their entire payload before the first write.
-        let group_bytes =
-            if self.src.supports_request_pipelining() || self.dst.supports_request_pipelining() {
-                // Return the first group before collecting a full read window.
-                FAST_BATCH_READ_BYTES / crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64
-            } else {
-                // Both calls run synchronously: splitting cannot overlap work.
-                u64::MAX
-            };
+        // than reading their entire payload before the first write. Idle
+        // workers take a batch's later groups, so a batch is one group only
+        // where nothing would be gained by splitting it.
+        let pipelined =
+            self.src.supports_request_pipelining() || self.dst.supports_request_pipelining();
+        let group_bytes = if pipelined {
+            // Return the first group before collecting a full read window.
+            FAST_BATCH_READ_BYTES / crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64
+        } else {
+            // Both calls run synchronously: splitting cannot overlap work.
+            u64::MAX
+        };
+        // Same-machine requests cost no round trip, so their groups can stay
+        // small enough to share out when every file is queued at once.
+        // Pipelined groups keep their byte limit: each costs a round trip.
+        let group_files = if pipelined {
+            usize::MAX
+        } else {
+            LOCAL_GROUP_FILES
+        };
         let mut groups = Vec::new();
         let mut start = 0;
         let mut bytes = 0u64;
@@ -547,7 +558,8 @@ impl Worker {
             if i > start
                 && (bytes.saturating_add(file_bytes)
                     > group_bytes.min(crate::proto::MAX_READ_BYTES)
-                    || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES)
+                    || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES
+                    || i - start >= group_files)
             {
                 groups.push(start..i);
                 start = i;
