@@ -1153,7 +1153,7 @@ impl Gate {
             .any(|slot| slot.whole_file)
     }
 
-    fn measurement_ready(&self, n: usize) -> bool {
+    pub(crate) fn measurement_ready(&self, n: usize) -> bool {
         self.ready_through(n) && !self.whole_files_draining(n)
     }
 
@@ -1232,18 +1232,28 @@ pub fn run(
     gate: Arc<Gate>,
     sched: Arc<Sched>,
     meter: Arc<dyn Meter>,
+    spawn: impl FnMut(usize),
+) -> Policy {
+    run_with_interval(policy, gate, sched, meter, spawn, sample_interval())
+}
+
+fn run_with_interval(
+    policy: Policy,
+    gate: Arc<Gate>,
+    sched: Arc<Sched>,
+    meter: Arc<dyn Meter>,
     mut spawn: impl FnMut(usize),
+    sample: Duration,
 ) -> Policy {
     let mut policy = policy;
-    policy.advance_time(Duration::ZERO, sample_interval());
-    let mut trace = trace::Trace::new(meter.history(), &policy, sample_interval());
+    policy.advance_time(Duration::ZERO, sample);
+    let mut trace = trace::Trace::new(meter.history(), &policy, sample);
     let mut sampler = Sampler::default();
     sampler.reset();
     let mut last = (meter.bytes(), meter.files());
     let mut sample_start = std::time::Instant::now();
     let mut active = policy.active();
     let mut collapse_samples = 0;
-    let sample = sample_interval();
     let poll = Duration::from_millis(250).min(sample);
     let mut last_rate = None;
     let policy_start = Instant::now();

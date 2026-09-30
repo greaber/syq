@@ -81,6 +81,8 @@ struct PipelineState {
     latency: Option<std::time::Duration>,
     ready: std::collections::VecDeque<std::time::Instant>,
     abort_on_receive: Option<Arc<Sched>>,
+    tuning_check: Option<(Arc<Sched>, Arc<Gate>, usize)>,
+    tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -150,6 +152,13 @@ impl Conn for PipelineConn {
             if *at == state.received {
                 gate.set_active(*active);
             }
+        }
+        if let Some((sched, gate, active)) = &state.tuning_check {
+            let snapshot = (
+                sched.tuning_work(*active, 0, 0),
+                gate.measurement_ready(*active),
+            );
+            state.tuning_snapshots.push(snapshot);
         }
         let sent = state.requests.len();
         state.sent_at_receive.push(sent);
@@ -2340,5 +2349,152 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
                 )));
             }
         }
+    }
+}
+
+#[test]
+fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
+    for (synchronous_source, retirement) in [
+        (true, "source"),
+        (false, "source"),
+        (true, "destination"),
+        (false, "destination"),
+        (true, "before"),
+        (false, "before"),
+    ] {
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        let jobs: Vec<_> = (0..512)
+            .map(|i| pipeline_job(format!("file{i}").as_bytes(), 32 << 10))
+            .collect();
+        for job in &jobs {
+            sched.push_file(job.clone());
+        }
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        assert_eq!(sched.begin_fast_batch(1, jobs.len()), jobs.len());
+        let mut batch = vec![0];
+        batch.extend(sched.take_small(32 << 10, jobs.len() - 1, u64::MAX));
+        sched.mark_fast(batch.len() - 1);
+        let original = batch.clone();
+        let gate = Gate::new(2);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        if retirement == "before" {
+            gate.set_active(1);
+        }
+        let src = Arc::new(Mutex::new(PipelineState {
+            synchronous: synchronous_source,
+            // Request retirement at either endpoint, or before the batch starts.
+            gate_changes: if retirement == "source" {
+                vec![(1, gate.clone(), 1)]
+            } else {
+                vec![]
+            },
+            tuning_check: Some((sched.clone(), gate.clone(), 1)),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            gate_changes: if retirement == "destination" {
+                vec![(1, gate.clone(), 1)]
+            } else {
+                vec![]
+            },
+            tuning_check: Some((sched.clone(), gate.clone(), 1)),
+            ..Default::default()
+        }));
+        let issued_groups = match (retirement, synchronous_source) {
+            ("before", _) => 0,
+            ("source", true) => 1,
+            ("source", false) | ("destination", true) => 4,
+            ("destination", false) => 7, // Four writes and three read-ahead groups.
+            _ => unreachable!(),
+        };
+        let issued_files = issued_groups * 32;
+        for _ in 0..issued_groups {
+            src.lock().unwrap().replies.push_back(Response::SmallBlocks(
+                (0..32)
+                    .map(|_| {
+                        let data = vec![42; 32 << 10];
+                        Ok(SmallBlock {
+                            hash: content_digest(&data),
+                            data,
+                        })
+                    })
+                    .collect(),
+            ));
+            dst.lock()
+                .unwrap()
+                .replies
+                .push_back(Response::Applied(vec![None; 32]));
+        }
+        if issued_files > 0 {
+            src.lock().unwrap().replies.push_back(Response::Stats(
+                original[..issued_files]
+                    .iter()
+                    .map(|&i| Some(jobs[i].entry.clone()))
+                    .collect(),
+            ));
+        }
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.id = 1;
+        worker.gate = gate.clone();
+        worker.fast_batch(&mut batch).unwrap();
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            issued_files as u64
+        );
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            (issued_files as u64) << 15
+        );
+        let source = src.lock().unwrap();
+        assert_eq!(
+            source.requests.len(),
+            issued_groups + usize::from(issued_files > 0),
+            "only issued reads and the final source recheck"
+        );
+        assert_eq!(
+            source.received,
+            source.requests.len(),
+            "source replies drained"
+        );
+        assert!(source.tuning_snapshots.iter().all(|(_, ready)| !ready));
+        drop(source);
+        let destination = dst.lock().unwrap();
+        assert_eq!(destination.requests.len(), issued_groups);
+        assert_eq!(
+            destination.received,
+            destination.requests.len(),
+            "destination replies drained"
+        );
+        assert!(destination.tuning_snapshots.iter().all(|(_, ready)| !ready));
+        drop(destination);
+        if retirement != "before" {
+            let endpoint = if retirement == "source" { &src } else { &dst };
+            let state = endpoint.lock().unwrap();
+            let (work, ready) = &state.tuning_snapshots[0];
+            assert_eq!(work.queued_files, 0);
+            assert_eq!(work.unread_batch_files, jobs.len() - issued_files);
+            assert!(work.parallel, "another worker can use the unread groups");
+            assert!(!ready, "the retiring worker still contributes traffic");
+        }
+        assert!(
+            gate.measurement_ready(1),
+            "lower-count observations may begin after drain"
+        );
+        sched.complete_fast_batch(batch.len());
+        let mut pending: std::collections::BTreeSet<_> =
+            original[issued_files..].iter().copied().collect();
+        while !pending.is_empty() {
+            let Item::File(idx) = sched.next() else {
+                panic!("unissued work must remain available")
+            };
+            assert!(
+                pending.remove(&idx),
+                "no completed or duplicate file requeued"
+            );
+            assert!(sched.ranges_ready(idx, vec![]).is_none());
+        }
+        assert!(sched.finished());
     }
 }
