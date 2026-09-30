@@ -3652,6 +3652,30 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
             "{fault}: {failing} failing requests"
         );
     }
+    // Objects still in flight when the copy stops share its one message.
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    for n in 0..40 {
+        std::fs::write(temp.path().join("source").join(format!("f{n}")), b"x").unwrap();
+    }
+    let server = Server::start("unavailable-put");
+    let output = server
+        .command_with_retries(temp.path(), 2)
+        .args(["--s3-endpoint", &server.address])
+        .args(["--performance-tuning", "s3-objects=16"])
+        .args([
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "prefix",
+        ])
+        .capture_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("cancelled"), "{}", output_text(&output));
 }
 
 #[test]

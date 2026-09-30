@@ -515,6 +515,9 @@ impl Engine {
                     self.progress.files_unchanged.fetch_add(1, Relaxed);
                 }
             }
+            // Objects cut short by cancellation share the run's one message
+            // and are copied again by the rerun it asks for.
+            Err(_) if self.cancelled.load(Relaxed) => {}
             Err(error) => {
                 let message = format!("S3 {dst}: {error:#}");
                 self.progress.error(&message);
