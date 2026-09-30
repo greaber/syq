@@ -838,7 +838,8 @@ fn broker_bounds_idle_clients_and_drop_closes_them() {
     excess
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    excess.write_all(&[0]).unwrap();
+    // The broker rejects excess clients without reading a request. Writing
+    // here would race that close and could fail with BrokenPipe.
     assert_closed(&mut excess);
 
     for client in &clients {
