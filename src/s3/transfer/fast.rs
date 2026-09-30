@@ -191,9 +191,9 @@ impl Engine {
             let mut next_check = Duration::from_secs(1);
             let attempt_offset = offset + done;
             let attempt_length = length - done;
-            // The status of this attempt's GET, once one was sent. A body
-            // that fails after the headers still came from a live service.
-            let mut status = initial.as_ref().map(|_| 200);
+            // Whether this attempt's GET succeeded. A body or local write that
+            // fails afterwards is not a sign that the service is down.
+            let mut answered = initial.is_some();
             let result = async {
                 let body = if let Some(body) = initial.take() {
                     body
@@ -212,7 +212,6 @@ impl Engine {
                         .send()
                         .await
                         .map_err(|e| {
-                            status = e.raw_response().map(|r| r.status().as_u16());
                             if retryable(&e) {
                                 anyhow::Error::new(e.into_service_error())
                             } else {
@@ -220,7 +219,7 @@ impl Engine {
                                     .into()
                             }
                         })?;
-                    status = Some(200);
+                    answered = true;
                     if response.content_length() != Some(attempt_length as i64)
                         || response.e_tag() != Some(object.etag.as_str())
                         || (length > 0
@@ -396,11 +395,8 @@ impl Engine {
                 }
                 Err(e) => {
                     // A permanent GET error is still an answer from the service.
-                    if e.downcast_ref::<Permanent>().is_some() {
-                        self.outage.responded();
-                    } else {
-                        self.outage.finished(status);
-                    }
+                    self.outage
+                        .failed(!answered && e.downcast_ref::<Permanent>().is_none());
                     return Err(e);
                 }
             }

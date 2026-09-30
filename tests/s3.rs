@@ -1577,6 +1577,32 @@ fn serve(
             return;
         }
     }
+    if fault == "timeout-get" {
+        // Listing answers, then every object GET times out on the service's
+        // side, an error S3 sends with HTTP 400 and retries are meant for.
+        let target = first.split_whitespace().nth(1).unwrap();
+        if method == "GET" && target.contains("list-type=") {
+            let entries: String = (0..40)
+                .map(|n| format!("<Contents><Key>data/f{n}</Key><Size>1</Size><ETag>&quot;e&quot;</ETag></Contents>"))
+                .collect();
+            let body = format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>"
+            );
+            reply(&mut socket, 200, &[], body.as_bytes(), false);
+        } else if method == "GET" {
+            probes.fetch_add(1, Ordering::Relaxed);
+            reply(
+                &mut socket,
+                400,
+                &[],
+                b"<Error><Code>RequestTimeout</Code></Error>",
+                false,
+            );
+        } else {
+            reply(&mut socket, 404, &[], b"", method == "HEAD");
+        }
+        return;
+    }
     if fault == "unavailable-put" || fault == "unavailable-copy" {
         // Planning succeeds, then every upload, or every source HEAD a
         // server-side copy starts with, fails as if the service were down.
@@ -3628,8 +3654,9 @@ fn s3_upload_retries_corrupted_data_with_a_warning_within_the_budget() {
 
 #[test]
 fn copies_stop_when_requests_keep_failing_after_their_retries() {
-    // Upload PUTs are retried by syq; the HEADs that start server-side copies
-    // by the SDK, including with SDK retries disabled. Either way, eight
+    // Upload PUTs and download GETs are retried by syq; the HEADs that start
+    // server-side copies by the SDK, including with SDK retries disabled. A
+    // service-side timeout counts like a 503. Either way, eight
     // requests in a row that exhaust their retries without an answer stop the
     // copy before the remaining objects are tried, and each request counts
     // once however many attempts it made.
@@ -3637,6 +3664,7 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
         ("unavailable-put", 1),
         ("unavailable-copy", 1),
         ("unavailable-copy", 0),
+        ("timeout-get", 1),
     ] {
         let temp = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("source")).unwrap();
@@ -3648,15 +3676,36 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
         command
             .args(["--s3-endpoint", &server.address])
             .args(["--performance-tuning", "s3-objects=1"]);
-        if fault == "unavailable-copy" {
-            command.args(["--from", "s3://source", "--srcs-in", "data"]);
-        } else {
-            command.args(["--srcs-in", "source"]);
+        let output = match fault {
+            "unavailable-copy" => command.args([
+                "--from",
+                "s3://source",
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "prefix",
+            ]),
+            "timeout-get" => command.args([
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "copy",
+            ]),
+            _ => command.args([
+                "--srcs-in",
+                "source",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "prefix",
+            ]),
         }
-        let output = command
-            .args(["--to", "s3://bucket", "--into", "prefix"])
-            .capture_output()
-            .unwrap();
+        .capture_output()
+        .unwrap();
         assert_eq!(
             output.status.code(),
             Some(1),

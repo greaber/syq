@@ -109,7 +109,7 @@ impl Intercept for ObserveOutage {
     fn read_after_execution(
         &self,
         context: &FinalizerInterceptorContextRef<'_>,
-        _: &RuntimeComponents,
+        components: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
         if cfg.load::<OwnRetries>().is_some() {
@@ -118,8 +118,13 @@ impl Intercept for ObserveOutage {
         if context.output_or_error().is_some_and(|r| r.is_ok()) {
             self.0.responded();
         } else {
+            // Classify the final error as the SDK's retry strategy does.
+            let action = aws_smithy_runtime::client::retries::classifiers::run_classifiers_on_ctx(
+                components.retry_classifiers(),
+                context.inner(),
+            );
             self.0
-                .finished(context.response().map(|r| r.status().as_u16()));
+                .failed(matches!(action, RetryAction::RetryIndicated(_)));
         }
         Ok(())
     }

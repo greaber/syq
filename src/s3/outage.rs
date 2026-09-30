@@ -20,17 +20,18 @@ impl Outage {
         self.failures.store(0, Relaxed);
     }
 
-    /// Report a request's final outcome from the status of its last response.
-    pub(crate) fn finished(&self, status: Option<u16>) {
-        if status.is_some_and(|s| !transient_status(s)) {
-            self.responded();
-        } else {
+    /// Report a failed request: `retryable` when its retry policy would have
+    /// tried it again, so it ran out of retries rather than got an answer.
+    pub(crate) fn failed(&self, retryable: bool) {
+        if retryable {
             self.exhausted();
+        } else {
+            self.responded();
         }
     }
 
-    /// A request got no response, or only a server error or throttling, on
-    /// every attempt.
+    /// A request failed on errors its retries are meant for, such as no
+    /// connection, a timeout, a server error, or throttling, until it gave up.
     pub(crate) fn exhausted(&self) {
         if self.failures.fetch_add(1, Relaxed) + 1 >= LIMIT && !self.stopped.swap(true, Relaxed) {
             // The batch has one waiter; a stored permit covers a later wait.
