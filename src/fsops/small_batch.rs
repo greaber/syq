@@ -90,8 +90,14 @@ impl FsOps {
             }
             let reserved = ReservedDescriptors::up_to(BURST - 1);
             let mut run: Vec<(usize, RootedTarget)> = Vec::with_capacity(1 + reserved.0);
+            // A run stays in one directory and names each target once: a
+            // repeated target would share its sidecar with the earlier one.
+            // The target carried over from the last run is its first name.
             let mut names = HashSet::new();
-            run.extend(carried.take());
+            if let Some((index, target)) = carried.take() {
+                names.extend(sibling_name(&target, &target).map(<[u8]>::to_vec));
+                run.push((index, target));
+            }
             while run.len() <= reserved.0 && next < puts.len() && staged(&puts[next]) {
                 let index = next;
                 next += 1;
@@ -102,8 +108,6 @@ impl FsOps {
                         continue;
                     }
                 };
-                // A run stays in one directory and names each target once: a
-                // repeated target would share its sidecar with the earlier one.
                 let joins = match run.first() {
                     Some((_, first)) => {
                         sibling_name(first, &target).is_some_and(|name| names.insert(name.to_vec()))
@@ -343,20 +347,51 @@ mod tests {
 
     #[test]
     fn a_repeated_target_is_published_before_it_is_staged_again() {
-        let temporary = crate::test_support::tempdir().unwrap();
-        let puts = [
-            put("file", b"a long first version"),
-            put("other", b"independent"),
-            put("file", b"last"),
-        ];
-        let results = receiver(temporary.path()).put_small_batch(&puts);
-        assert_eq!(results, vec![Ok(None); 3]);
-        assert_eq!(fs::read(temporary.path().join("file")).unwrap(), b"last");
-        assert_eq!(
-            fs::read(temporary.path().join("other")).unwrap(),
-            b"independent"
-        );
-        assert_eq!(entries(temporary.path()), 2);
+        // The third case repeats a target immediately after a run break, so
+        // the carried target is the one that must not be joined.
+        for (puts, files) in [
+            (
+                vec![
+                    put("file", b"a long first version"),
+                    put("other", b"independent"),
+                    put("file", b"last"),
+                ],
+                2,
+            ),
+            (
+                vec![
+                    put("file", b"one"),
+                    put("file", b"two"),
+                    put("file", b"last"),
+                ],
+                1,
+            ),
+            (
+                vec![
+                    put("a/x", b"a"),
+                    put("b/y", b"a long first version"),
+                    put("b/y", b"last"),
+                ],
+                2,
+            ),
+        ] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            for name in ["a", "b"] {
+                fs::create_dir(temporary.path().join(name)).unwrap();
+            }
+            let results = receiver(temporary.path()).put_small_batch(&puts);
+            assert_eq!(results, vec![Ok(None); puts.len()]);
+            let last = puts.last().unwrap();
+            assert_eq!(
+                fs::read(temporary.path().join(OsStr::from_bytes(&last.path))).unwrap(),
+                last.data
+            );
+            let published: usize = entries(temporary.path())
+                + entries(&temporary.path().join("a"))
+                + entries(&temporary.path().join("b"))
+                - 2;
+            assert_eq!(published, files, "{puts:?}");
+        }
     }
 
     #[test]
