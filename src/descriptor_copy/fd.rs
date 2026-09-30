@@ -232,7 +232,10 @@ impl Descriptor {
                 revents: 0,
             };
             let rc = unsafe { libc::poll(&mut poll, 1, 100) };
-            if rc > 0 {
+            // macOS FIFO readiness can remain unset while a large write is
+            // pending. Retry the nonblocking I/O after the bounded wait too;
+            // waiting only for a readiness event can deadlock both ends.
+            if rc >= 0 {
                 return Ok(());
             }
             if rc < 0 {
@@ -405,6 +408,51 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn owned_fifo_reads_large_writes_and_eof() {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("input");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let file = File::options()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut input = Descriptor::owned(file, true, cancelled.clone()).unwrap();
+        // Exceed the FIFO buffer so the writer must wait for reads. Keep the
+        // write in one call, as a producer feeding an S3 multipart upload does.
+        let payload = vec![0x5a; 5 * 1024 * 1024 + 11];
+        let expected = payload.clone();
+        let (connected, writer_ready) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut file = File::options().write(true).open(path).unwrap();
+            connected.send(()).unwrap();
+            file.write_all(&payload)
+        });
+        // Do not read a FIFO with no writer: that would be immediate EOF.
+        writer_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (finished, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let bytes = input.read_bytes(6 * 1024 * 1024, true);
+            let _ = finished.send(bytes);
+        });
+        let bytes = result.recv_timeout(Duration::from_secs(5));
+        // On failure, retire the reader and release a blocked writer before
+        // asserting, so a regression cannot leave either thread behind.
+        cancelled.store(true, Relaxed);
+        reader.join().unwrap();
+        let written = writer.join().unwrap();
+        let bytes = bytes.expect("large FIFO read stalled").unwrap();
+        written.unwrap();
+        assert_eq!(bytes, expected);
+    }
+
     #[test]
     fn stream_descriptor_uses_current_offset_without_truncation() {
         use std::io::{Seek, SeekFrom};
