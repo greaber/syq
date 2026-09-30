@@ -2682,10 +2682,12 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
     parallel_map_init(items, || (), |_, item| f(item))
 }
 
-/// Run the selected operations, which create or remove directory entries.
-/// The kernel changes one directory's entries one at a time, so threads
-/// beyond the second only contend for it. Directories spread over the pool,
-/// and each is worked on by at most two of its threads.
+/// Run the selected operations, which add or remove directory entries. The
+/// kernel adds one directory's entries one at a time, so threads beyond the
+/// second only contend for it: directories spread over the pool, and each is
+/// worked on by at most two of its threads. Removals keep the pool's plain
+/// distribution; the work of freeing a removed file's blocks happens after
+/// the directory is unlocked and does spread over threads.
 fn parallel_by_directory<R: Send>(
     ops: &[Op],
     selected: &[usize],
@@ -2695,17 +2697,25 @@ fn parallel_by_directory<R: Send>(
         return selected.iter().map(|&index| f(&ops[index])).collect();
     }
     let mut directories = HashMap::<&[u8], Vec<usize>>::new();
+    let mut removals = Vec::new();
     for (position, &index) in selected.iter().enumerate() {
-        let path = op_path(&ops[index]);
+        let op = &ops[index];
+        if matches!(op, Op::Remove { .. } | Op::Unlink { .. } | Op::Rmdir { .. }) {
+            removals.push(position);
+            continue;
+        }
+        let path = op_path(op);
         let directory = path
             .iter()
             .rposition(|byte| *byte == b'/')
             .map_or(&path[..0], |separator| &path[..separator]);
         directories.entry(directory).or_default().push(position);
     }
-    let shares: Vec<Vec<usize>> = directories
-        .into_values()
-        .flat_map(|mut positions| {
+    let removal_chunk = removals.len().div_ceil(PAR_THREADS).max(1);
+    let shares: Vec<Vec<usize>> = removals
+        .chunks(removal_chunk)
+        .map(<[usize]>::to_vec)
+        .chain(directories.into_values().flat_map(|mut positions| {
             if positions.len() < 2 * PAR_MIN {
                 return vec![positions];
             }
@@ -2719,7 +2729,7 @@ fn parallel_by_directory<R: Send>(
             });
             let second = positions.split_off(positions.len() / 2);
             vec![positions, second]
-        })
+        }))
         .collect();
     use rayon::prelude::*;
     let done: Vec<Vec<(usize, R)>> = metadata_pool().install(|| {

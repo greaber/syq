@@ -5576,13 +5576,18 @@ fn directory_changes_share_each_directory_between_two_threads() {
         ops.push(mkdir(format!("skipped/{index}")));
         ops.push(mkdir(format!("other/b{index}")));
         ops.push(mkdir(format!("single{index}/leaf")));
+        // Removals are not bounded per directory; they only need their
+        // results back in order.
+        ops.push(Op::Unlink {
+            path: format!("busy/old{index}").into_bytes(),
+        });
     }
-    let selected: Vec<usize> = (0..ops.len()).filter(|index| index % 4 != 1).collect();
+    let selected: Vec<usize> = (0..ops.len()).filter(|index| index % 5 != 1).collect();
     let active = [AtomicUsize::new(0), AtomicUsize::new(0)];
     let peak = [AtomicUsize::new(0), AtomicUsize::new(0)];
     let results = parallel_by_directory(&ops, &selected, |op| {
         let path = op_path(op);
-        let busy = [&b"busy/"[..], b"other/"]
+        let busy = [&b"busy/a"[..], b"other/"]
             .iter()
             .position(|directory| path.starts_with(directory));
         if let Some(directory) = busy {
