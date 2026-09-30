@@ -1356,7 +1356,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         progress
             .observations
             .human_summary
-            .store(show_statistics(&args), Relaxed);
+            .store(show_statistics(&args) && !args.quiet, Relaxed);
         progress.observations.enable();
     }
     // The detach and remote-coordinator combinations were refused at

@@ -683,6 +683,22 @@ fn quiet_suppresses_notices_but_not_errors() {
         !error.stderr.is_empty(),
         "quiet mode must still report errors"
     );
+
+    // Statistics are human output too: quiet keeps their worker and endpoint
+    // summary off stderr, not only the counters off stdout.
+    write(&t.path("src/file"), b"data");
+    let stats = syq(&["-q", "--stats", &t.s("src/"), &t.s("stats/")]);
+    assert_output_ok(&stats);
+    assert!(
+        stats.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&stats.stdout)
+    );
+    assert!(
+        stats.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
 }
 
 #[test]
