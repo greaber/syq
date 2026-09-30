@@ -262,9 +262,18 @@ fn managed_remote_helper_install_is_cached() {
     assert_eq!(probes, 1);
 
     write(&t.path("src"), b"second");
+    let log_before = fs::read_to_string(t.path("rsh.log")).unwrap().len();
     let out = remote_syq(&t, &rsh, &["-avv", &t.s("src"), &remote]);
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"second");
+    // Only the first session asks the host for its platform; later ones
+    // launch the helper its handshake identified.
+    let launches = fs::read_to_string(t.path("rsh.log")).unwrap()[log_before..].to_owned();
+    assert_eq!(launches.matches("uname").count(), 1, "{launches}");
+    assert!(
+        launches.contains(&format!("target={}\n", helper_target())),
+        "{launches}"
+    );
     assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\n");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!(
@@ -312,6 +321,44 @@ fn remote_helper_optional_command_install_failure_does_not_fail_copy() {
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), b"copy succeeds");
     assert!(String::from_utf8_lossy(&out.stderr).contains("could not install ~/.local/bin/syq"));
+}
+
+/// The local helper cache only saves later downloads. When it cannot be
+/// written, the upload still happens from a download verified in memory.
+#[test]
+fn helper_upload_works_without_a_writable_local_cache_or_config() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+    for directory in ["cache", "config"] {
+        fs::create_dir_all(t.path(directory)).unwrap();
+        fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    write(&t.path("src"), b"uncached helper");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq(&t, &rsh, &["-a", "-q", &t.s("src"), &remote]);
+    for directory in ["cache", "config"] {
+        fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"uncached helper");
+    assert_eq!(
+        read(&cached_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    assert!(!cached_local_helper(&t).exists());
+    assert_eq!(fs::read_dir(t.path("config")).unwrap().count(), 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot cache the downloaded remote helper"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -417,7 +464,7 @@ fn development_build_attempts_upload_for_an_unlisted_platform() {
     let rsh = fake_rsh(&t);
     executable(
         &t.path("remote-bin/uname"),
-        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; -sm) echo Linux riscv64;; esac\n",
     );
     write(&t.path("src"), b"custom target");
     let remote = format!("fake:{}", t.s("dst"));
@@ -440,7 +487,7 @@ fn development_build_rejects_cross_platform_upload() {
     };
     executable(
         &t.path("remote-bin/uname"),
-        format!("#!/bin/sh\ncase \"$1\" in -s) echo {other_os};; -m) echo x86_64;; esac\n")
+        format!("#!/bin/sh\ncase \"$1\" in -s) echo {other_os};; -m) echo x86_64;; -sm) echo {other_os} x86_64;; esac\n")
             .as_bytes(),
     );
     write(&t.path("src"), b"must not copy");
@@ -464,7 +511,7 @@ fn development_build_does_not_install_an_unrunnable_upload() {
     // Model an unlisted host on which the uploaded binary cannot execute.
     executable(
         &t.path("remote-bin/uname"),
-        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
+        b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; -sm) echo Linux riscv64;; esac\n",
     );
     executable(&t.path("remote-bin/chmod"), b"#!/bin/sh\nexit 0\n");
     write(&t.path("src"), b"must not copy");

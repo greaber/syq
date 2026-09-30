@@ -183,7 +183,9 @@ def failed_copies():
                 '--srcs-in', str(source), '--to', 'destination', '--into', destination,
                 '--performance-tuning=workers=1,comparison-block-size=1M', '--no-progress', *transport]
             with tempfile.TemporaryFile() as log:
-                process = subprocess.Popen([*command, '--resource-limits=bandwidth=2M'],
+                # Keep this compressible fixture in flight long enough to interrupt
+                # even when the bandwidth limit counts compressed transport bytes.
+                process = subprocess.Popen([*command, '--no-compress', '--resource-limits=bandwidth=2M'],
                     stdout=log, stderr=log, start_new_session=True, env=env)
                 try:
                     deadline = time.monotonic() + 30

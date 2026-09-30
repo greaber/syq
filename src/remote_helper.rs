@@ -64,6 +64,18 @@ impl Target {
         })
     }
 
+    /// The cache target of a helper that reported `platform` in its
+    /// handshake (see `identity::platform`).
+    pub fn key_for_platform(platform: &str) -> Option<&'static str> {
+        let (os, arch) = platform.split_once('-')?;
+        let os = match os {
+            "linux" => "Linux",
+            "macos" => "Darwin",
+            other => other,
+        };
+        Self::for_bootstrap(os, arch).map(|target| target.key)
+    }
+
     pub fn can_upload_self(self) -> bool {
         self.key == "self" || Some(self) == Self::local()
     }
@@ -108,25 +120,32 @@ printf "syq-helper-tools:%s:%s:%s\n" "$downloader" "$hasher" "$decompressor"'"#
 
 /// Run this release's helper from its deterministic cache path.  The target
 /// selection deliberately lives in this command so a cache hit needs no probe
-/// connection before the real server connection.
-pub fn launcher(args: &[String]) -> String {
-    let script = format!(
-        r#"case "$(uname -s):$(uname -m)" in
-Linux:x86_64) target=linux-x86_64 ;;
-Linux:aarch64|Linux:arm64) target=linux-aarch64 ;;
-Darwin:x86_64) target=macos-x86_64 ;;
-Darwin:arm64|Darwin:aarch64) target=macos-arm64 ;;
+/// connection before the real server connection. Once a handshake has named
+/// the host's platform, later sessions pass `target` and skip `uname`.
+pub fn launcher(args: &[String], target: Option<&str>) -> String {
+    let select = match target {
+        Some(target) => format!("target={target}"),
+        None => format!(
+            r#"case "$(uname -sm)" in
+"Linux x86_64") target=linux-x86_64 ;;
+"Linux aarch64"|"Linux arm64") target=linux-aarch64 ;;
+"Darwin x86_64") target=macos-x86_64 ;;
+"Darwin arm64"|"Darwin aarch64") target=macos-arm64 ;;
 *) {unknown_target} ;;
-esac
+esac"#,
+            unknown_target = if crate::identity::uses_release_helpers() {
+                format!("exit {HELPER_MISSING_EXIT}")
+            } else {
+                "target=self".into()
+            },
+        ),
+    };
+    let script = format!(
+        r#"{select}
 program="$HOME/.cache/syq/helpers/{release}/$target/syq"
 [ -x "$program" ] || exit {HELPER_MISSING_EXIT}
 exec "$program" "$@""#,
         release = cache_key(),
-        unknown_target = if crate::identity::uses_release_helpers() {
-            format!("exit {HELPER_MISSING_EXIT}")
-        } else {
-            "target=self".into()
-        },
     );
     format!(
         "sh -c {} syq {}",
@@ -411,11 +430,55 @@ mod tests {
 
     #[test]
     fn launcher_uses_versioned_path_and_quotes_arguments() {
-        let command = launcher(&["--server".into(), "argument with spaces".into()]);
+        let command = launcher(&["--server".into(), "argument with spaces".into()], None);
         assert!(command.contains(&cache_key()));
         assert!(command.contains(DOWNLOAD_CACHE_GENERATION));
         assert!(command.contains("linux-x86_64"));
         assert!(command.contains("'argument with spaces'"));
+        assert_eq!(command.matches("uname").count(), 1);
+    }
+
+    #[test]
+    fn launcher_with_a_known_target_runs_no_uname() {
+        let command = launcher(&["--server".into()], Some("linux-aarch64"));
+        assert!(!command.contains("uname"));
+        assert!(command.contains("target=linux-aarch64"));
+    }
+
+    #[test]
+    fn handshake_platforms_map_to_cache_targets() {
+        for (platform, key) in [
+            ("linux-x86_64", "linux-x86_64"),
+            ("linux-aarch64", "linux-aarch64"),
+            ("macos-x86_64", "macos-x86_64"),
+            ("macos-aarch64", "macos-arm64"),
+        ] {
+            assert_eq!(Target::key_for_platform(platform), Some(key));
+        }
+        assert_eq!(Target::key_for_platform("nonsense"), None);
+    }
+
+    /// The launcher must select the same target on the host that runs it as
+    /// the mapping from that host's own handshake platform.
+    #[test]
+    fn launcher_selects_the_local_target_with_one_uname() {
+        let Some(expected) = Target::local() else {
+            return;
+        };
+        let script = launcher(&["--version".into()], None);
+        let script = script
+            .replace("exec \"$program\" \"$@\"", "printf %s \"$target\"")
+            .replace("[ -x \"$program\" ] || exit 125", "");
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected.key);
+        assert_eq!(
+            Target::key_for_platform(&crate::identity::platform()),
+            Some(expected.key)
+        );
     }
 
     #[test]

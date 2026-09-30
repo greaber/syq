@@ -642,7 +642,6 @@ fn small_copy_eligible(
         && !args.checksum
         && !args.ignore_existing
         && !args.existing
-        && !args.stats
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
@@ -996,6 +995,9 @@ fn attempt_small_copy(
         );
     }
     progress.files_excluded.fetch_add(excluded as u64, Relaxed);
+    progress
+        .scanned
+        .fetch_add((srcs.len() + excluded) as u64, Relaxed);
     announce_detached_ready()?;
     print_small_copy_diagnostics(args, dst_ep);
 
@@ -1149,8 +1151,23 @@ fn attempt_small_copy(
     }
     drop(_native_work);
     progress.finish(exit_code == 0);
+    let elapsed = progress.start.elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
-        print_transfer_summary(&terminal, progress.start.elapsed().as_secs_f64(), "");
+        print_transfer_summary(&terminal, elapsed, "");
+    }
+    print_copying_interval(args, opts, progress);
+    if let Some(benchmark) = &opts.benchmark {
+        benchmark.lock().unwrap().native_small_copies += 1;
+    }
+    print_benchmark_observations(opts);
+    if args.stats && !args.quiet {
+        print_statistics(
+            opts,
+            progress,
+            elapsed,
+            "none (small files sent on the control connection)",
+            "\n  tcp statistics: unavailable (data used the control connection)",
+        );
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
@@ -1163,6 +1180,62 @@ fn show_statistics(args: &Args) -> bool {
     // invoking machine prints the verified receipt. That receipt does not
     // contain diagnostics, so requested statistics still come from here.
     !args.suppress_summary || args.restricted_grant.is_some()
+}
+
+/// The `--stats` copying-interval line, printed even for a copy that was
+/// aborted: the interval is a fact about the data that did move.
+fn print_copying_interval(args: &Args, opts: &Opts, progress: &Progress) {
+    if args.stats && show_statistics(args) && !args.quiet && !opts.dry_run {
+        if let Some(ms) = progress.copying_elapsed_ms() {
+            crate::output::human_stdout!(
+                "  copying interval: {:.3}s (may overlap planning)",
+                ms as f64 / 1000.0
+            );
+        }
+    }
+}
+
+/// The `--stats` block after the summary line: the counters that line
+/// renders, plus how the data travelled. `connections` and `tcp_stats` come
+/// from the path that carried the copy, since a copy that never started data
+/// workers has neither a worker count nor data sockets to report.
+fn print_statistics(
+    opts: &Opts,
+    progress: &Progress,
+    elapsed: f64,
+    connections: &str,
+    tcp_stats: &str,
+) {
+    // --stats is additional human output, not the summary line the local
+    // attested settlement re-renders; a delegated coordinator keeps it.
+    let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
+        if opts.dry_run {
+            (
+                "files needing content work",
+                "files with unchanged content",
+                "logical bytes needing content work",
+                "logical bytes with unchanged content",
+                progress.bytes_total.load(Relaxed),
+            )
+        } else {
+            (
+                "files to transfer",
+                "files unchanged",
+                "bytes transferred",
+                "bytes unchanged",
+                progress.bytes_done.load(Relaxed),
+            )
+        };
+    crate::output::human_stdout!(
+        "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {connections}{tcp_stats}",
+        commas(progress.scanned.load(Relaxed)),
+        commas(progress.files_total.load(Relaxed)),
+        commas(progress.files_unchanged.load(Relaxed)),
+        commas(progress.files_excluded.load(Relaxed)),
+        commas(bytes_work),
+        commas(progress.bytes_unchanged.load(Relaxed)),
+        elapsed,
+    );
 }
 
 /// The one summary line a completed copy prints, rendered from the same
@@ -1287,7 +1360,7 @@ pub fn run(mut args: Args) -> Result<i32> {
         progress
             .observations
             .human_summary
-            .store(show_statistics(&args), Relaxed);
+            .store(show_statistics(&args) && !args.quiet, Relaxed);
         progress.observations.enable();
     }
     // The detach and remote-coordinator combinations were refused at
@@ -2261,10 +2334,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
                     );
                 }
-                if let Some(benchmark) = &opts.benchmark {
-                    benchmark.lock().unwrap().native_small_copies += 1;
-                }
-                print_benchmark_observations(&opts);
                 return Ok(code);
             }
             SmallCopy::Declined => configure_hashing(&mut *dst_ctl, opts.hash_policy)?,
@@ -2762,22 +2831,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
 
-    // Create a missing directory destination — never in the read-only modes,
-    // and never under --existing. With several sources, wait until the complete
-    // scan has passed its final-destination conflict checks.
-    let create_root = dst_root_entry.is_none() && dst_is_dir && !args.dry_run && !args.existing;
-    let dry_run_creates_root =
-        args.dry_run && dst_root_entry.is_none() && dst_is_dir && !args.existing;
+    // Missing directories are created only when the copy may write at all:
+    // never in a dry run, and never under --existing, which updates existing
+    // files and creates nothing. With several sources, wait until the
+    // complete scan has passed its final-destination conflict checks.
+    let may_create_directories = !args.dry_run && !args.existing;
+    let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
+    let create_root = root_creatable && !args.dry_run;
+    let dry_run_creates_root = root_creatable && args.dry_run;
     let root_create_condition = TargetCondition::Any;
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
-        && !args.dry_run
-        && !args.existing
+        && may_create_directories
         && defer_destination_mutations;
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
-            && !args.dry_run
-            && !args.existing
+            && may_create_directories
             && !defer_operator_directory_creation;
         if create_operator_directory_now {
             let condition = if dst_is_dir {
@@ -2835,18 +2904,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    let destination_tree_known_missing = dst.is_remote()
-        && dst_initially_missing
-        && !opts.ignore_existing
-        && !opts.update
-        && !opts.checksum;
+    let remote_root_initially_missing = dst.is_remote() && dst_initially_missing;
     // Buffered planning performs no destination mutations and starts no
     // workers. Let route probes overlap that scan, while preserving the early
     // worker startup used for initially missing destination trees. Restricted
     // receivers already settled their probes before destination creation.
     // Detached copies keep their readiness notification ahead of the scan.
     let defer_transport_setup = defer_destination_mutations
-        && !destination_tree_known_missing
+        && !remote_root_initially_missing
         && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
         && !pending_tcp_setups.is_empty();
     let history_context = std::cell::RefCell::new(None);
@@ -2990,7 +3055,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let workers_started = std::cell::Cell::new(false);
     if transport_setup.as_ref().is_some_and(|(tcp, _, _)| *tcp)
-        && destination_tree_known_missing
+        && remote_root_initially_missing
         && !opts.dry_run
         && !opts.inplace
         && (!destination_anchor_required || destination_anchor.get().is_some())
@@ -3057,15 +3122,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         opts: &opts,
         destination_supports_confined_socket_nodes,
         destination_metadata_platform,
-        destination_tree_known_missing,
-        destination_children_known_missing: fresh_destination
-            && opts.expressions.update.is_none()
-            && !opts.existing
-            && !opts.ignore_existing
-            && !opts.update
-            && !opts.checksum
-            && !opts.inplace
-            && !opts.restricted_receiver,
+        // Existing-file policies (-u, --checksum, --ignore-existing,
+        // --existing, --inplace, --copy-if) need no per-entry lookup: each
+        // makes the default decision for an absent destination.
+        destination_children_known_missing: fresh_destination,
+        destination_root_known_missing: dst_initially_missing,
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
@@ -3248,11 +3309,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             && fresh_destination
             && !workers_started.get()
             && !opts.dry_run
-            && !opts.inplace
-            && !opts.checksum
-            && !opts.update
-            && !opts.ignore_existing
-            && !opts.existing
         {
             let (files, bytes, all_small) =
                 st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
@@ -3273,7 +3329,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             None
         };
         if let Err(error) = st.replay_buffered(|| {
-            if let Some(initial) = local_start {
+            // Replay has created a deferred root by now. Without one (for
+            // example --existing against a missing destination) there is
+            // nothing for workers to anchor to and nothing for them to do.
+            let anchored = !destination_anchor_required || destination_anchor.get().is_some();
+            if let (Some(initial), true) = (local_start, anchored) {
                 spawn_workers(initial, refine_start);
                 workers_started.set(true);
                 sched.release_preflighted_work();
@@ -3715,7 +3775,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
 
     let elapsed = progress.start.elapsed().as_secs_f64();
-    let done = progress.bytes_done.load(Relaxed);
     if !args.quiet && !aborted && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {
@@ -3745,64 +3804,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    if args.stats && show_statistics(&args) && !args.quiet && !opts.dry_run {
-        if let Some(ms) = progress.copying_elapsed_ms() {
-            crate::output::human_stdout!(
-                "  copying interval: {:.3}s (may overlap planning)",
-                ms as f64 / 1000.0
-            );
-        }
-    }
+    print_copying_interval(&args, &opts, &progress);
     print_benchmark_observations(&opts);
-    // --stats is additional human output, not the summary line the local
-    // attested settlement re-renders; a delegated coordinator keeps it.
-    if !args.quiet && !aborted && args.stats {
-        let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
-            if opts.dry_run {
-                (
-                    "files needing content work",
-                    "files with unchanged content",
-                    "logical bytes needing content work",
-                    "logical bytes with unchanged content",
-                    progress.bytes_total.load(Relaxed),
-                )
-            } else {
-                (
-                    "files to transfer",
-                    "files unchanged",
-                    "bytes transferred",
-                    "bytes unchanged",
-                    done,
-                )
-            };
+    if args.stats && !args.quiet && !aborted {
+        let connections = match &tuned {
+            Some(p) => format!(
+                "auto: settled at {} (path {}, peak {})",
+                p.settled(),
+                p.history
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> "),
+                p.peak
+            ),
+            None => args.connections.to_string(),
+        };
         let has_ssh_data = [&src_ep, &dst_ep].into_iter().any(|endpoint| {
-                matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
-            });
+            matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
+        });
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        crate::output::human_stdout!(
-                "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {}{}",
-                commas(progress.scanned.load(Relaxed)),
-                commas(progress.files_total.load(Relaxed)),
-                commas(progress.files_unchanged.load(Relaxed)),
-                commas(progress.files_excluded.load(Relaxed)),
-                commas(bytes_work),
-                commas(progress.bytes_unchanged.load(Relaxed)),
-                elapsed,
-                match &tuned {
-                    Some(p) => format!(
-                        "auto: settled at {} (path {}, peak {})",
-                        p.settled(),
-                        p.history
-                            .iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" -> "),
-                        p.peak
-                    ),
-                    None => args.connections.to_string(),
-                },
-                tcp_stats,
-            );
+        print_statistics(&opts, &progress, elapsed, &connections, &tcp_stats);
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);

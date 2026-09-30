@@ -72,7 +72,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 |---|---|
 | `-z, --compress` | Compress remote data in transit automatically (default) |
 | `--no-compress` | Disable transport compression |
-| `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); controls agent forwarding when set |
+| `-e, --rsh <COMMAND>` | Remote shell command (default: ssh); when set, it controls agent forwarding and syq neither shares nor persists connections |
 | `--rsync-path <PATH>` | Use this exact syq executable on the remote instead of the managed helper |
 | `--syq-no-bootstrap` | Syq extension: require syq on the remote PATH instead of installing a versioned helper |
 | `--syq-no-tcp-encryption` | Syq extension: send TCP data without encryption or authentication (trusted networks only); checks payloads with xxh3-128 unless --integrity-checking sets transfer |

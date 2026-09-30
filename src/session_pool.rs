@@ -359,13 +359,12 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let bound_ino = fs::symlink_metadata(&socket)?.ino();
-    let mut idle = IDLE;
     #[cfg(debug_assertions)]
-    if let Some(seconds) = std::env::var_os("SYQ_TEST_POOL_IDLE_SECS")
+    let idle = std::env::var_os("SYQ_TEST_POOL_IDLE_SECS")
         .and_then(|value| value.to_str()?.parse::<u64>().ok())
-    {
-        idle = Duration::from_secs(seconds);
-    }
+        .map_or(IDLE, Duration::from_secs);
+    #[cfg(not(debug_assertions))]
+    let idle = IDLE;
     let mut pool = Pool {
         endpoint,
         control,

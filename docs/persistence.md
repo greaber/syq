@@ -9,7 +9,9 @@ syq persist connect server
 ```
 
 You can close the terminal afterward. To enable persistence for connections
-opened by later syq commands instead, run `syq persist on`.
+opened by later syq commands instead, run `syq persist on`. Persistence applies
+to connections syq makes with its default `ssh`; a command given `--rsh` (or
+rsync's `-e`) connects with that command each time instead.
 
 Persistence also speeds up [remote path completion](install.md#shell-completion):
 completion reuses the open connection, avoiding a new SSH login for each lookup.

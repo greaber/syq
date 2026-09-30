@@ -287,6 +287,13 @@ impl FsOps {
         follow: bool,
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
+        #[cfg(debug_assertions)]
+        if sources.is_none() {
+            crate::fsops::record_test_event(
+                "SYQ_TEST_DESTINATION_LOOKUPS",
+                format_args!("stat {}", paths.len()),
+            )?;
+        }
         let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
         if self.inode_preservation.any() {
             anyhow::ensure!(

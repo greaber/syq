@@ -315,7 +315,7 @@ apply their authorized rate and request-size limits.
 ### Recording a comparison
 
 Use the same reporting options and fresh destinations for each run.
-Prefer `-v`; `--stats` can change which copy optimizations run.
+`--stats` adds counters without changing the transfer route.
 With overrides, `-v` reports effective settings and a final
 `syq: tuning observed:` diagnostic. Check elapsed time, exit status, and copied
 contents. See [Quick comparison](speed.md#quick-comparison) for the benchmark script.

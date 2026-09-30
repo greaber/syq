@@ -12,13 +12,35 @@ use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 /// Wait until `fd` is readable or `timeout` passes. If `poll` itself fails,
 /// sleep for the timeout instead, so a caller's retry loop cannot spin.
 pub(crate) fn wait_readable(fd: RawFd, timeout: std::time::Duration) {
-    let mut ready = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    // The accept loops call this on every idle wake; keep it allocation-free.
+    poll_readable(
+        &mut [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }],
+        timeout,
+    );
+}
+
+/// Wait until any of `fds` is readable or `timeout` passes, as
+/// [`wait_readable`] does for one descriptor.
+pub(crate) fn wait_any_readable(fds: &[RawFd], timeout: std::time::Duration) {
+    let mut ready: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    poll_readable(&mut ready, timeout);
+}
+
+fn poll_readable(ready: &mut [libc::pollfd], timeout: std::time::Duration) {
     let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
-    if unsafe { libc::poll(&mut ready, 1, millis) } < 0
+    // SAFETY: ready is a live array of initialized pollfd entries.
+    if unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as libc::nfds_t, millis) } < 0
         && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
     {
         std::thread::sleep(timeout);

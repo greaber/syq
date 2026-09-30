@@ -2,6 +2,10 @@
 
 Syq has no general configuration file. It uses your SSH configuration for SSH
 connections and AWS configuration for S3; see [S3 options](object-storage.md#s3-options).
+Commands without an `--rsh` option, such as `syq rm`, `syq receiver`, and
+`syq persist`, as well as shell completion and [receiving](receive.md), always
+run your `ssh`, so set per-host keys, ports, and jump hosts in your SSH
+configuration.
 
 ## Add options through the environment
 

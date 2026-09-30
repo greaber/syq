@@ -114,6 +114,9 @@ impl ReverseTcp {
         // uses its own nonce direction (0); file protocol directions remain 1/2.
         // A new key per open also makes late arrivals and captured proofs useless.
         loop {
+            // Authenticate first: this also collects a socket another worker
+            // delivered while holding the same lock.
+            self.poll_authentication()?;
             if let Ok(stream) = receive.try_recv() {
                 let remaining = deadline
                     .checked_duration_since(Instant::now())
@@ -127,9 +130,24 @@ impl ReverseTcp {
                 Instant::now() < deadline,
                 "timed out accepting the receiving machine's TCP worker"
             );
-            self.poll_authentication()?;
-            std::thread::sleep(Duration::from_millis(5));
+            self.wait_for_arrivals();
         }
+    }
+
+    /// Wait for a new connection or more proof bytes. Another worker may
+    /// authenticate this worker's socket and deliver it over its channel,
+    /// which poll cannot see, so wait at most 5 ms before checking again.
+    fn wait_for_arrivals(&self) {
+        use std::os::fd::AsRawFd;
+        let mut fds: Vec<_> = self.listeners.iter().map(|l| l.as_raw_fd()).collect();
+        fds.extend(
+            self.authenticating
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|arrival| arrival.stream.as_raw_fd()),
+        );
+        crate::sys::wait_any_readable(&fds, Duration::from_millis(5));
     }
 
     fn poll_authentication(&self) -> Result<()> {

@@ -324,70 +324,98 @@ fn helper_from_release(target: Target, release: &VerifiedRelease) -> Result<Trus
     })
 }
 
-/// Return a locally cached, verified, uncompressed helper. The archive and
-/// binary hashes both come from the signed manifest, so this is safe for a
-/// different target from the client and never uploads the running executable.
+/// Return a verified, uncompressed helper. The archive and binary hashes both
+/// come from the signed manifest, so this is safe for a different target from
+/// the client and never uploads the running executable. The local cache only
+/// saves later downloads: when it cannot be read or written, the helper is
+/// downloaded and verified in memory instead.
 pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
-    let cache_path = verified_helper_path(helper)?;
-    fs::read(&cache_path)
-        .with_context(|| format!("read cached remote helper {}", cache_path.display()))
-}
-
-fn verified_helper_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
-    let cache_path = helper_cache_path(helper)?;
-    if cache_path.is_file() {
-        match verify_file_as(&cache_path, &helper.binary, "cached remote helper") {
-            Ok(()) => {
-                return Ok(cache_path);
-            }
-            Err(error) => {
-                crate::output::diagnostic!(
-                    "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
-                );
-                fs::remove_file(&cache_path).with_context(|| {
-                    format!("remove invalid cached helper {}", cache_path.display())
-                })?;
-            }
+    let cache_path = helper_cache_path(helper).ok();
+    if let Some(binary) = cache_path
+        .as_deref()
+        .and_then(|path| cached_helper(path, helper))
+    {
+        return Ok(binary);
+    }
+    let binary = download_helper(helper)?;
+    if let Some(path) = &cache_path {
+        if let Err(error) = store_helper(path, &binary) {
+            crate::output::diagnostic!(
+                "syq: warning: cannot cache the downloaded remote helper ({error:#}); continuing without caching it"
+            );
         }
     }
+    Ok(binary)
+}
 
-    let parent = cache_path
-        .parent()
-        .ok_or_else(|| anyhow!("the remote helper cache path has no parent directory"))?;
-    create_private_dir(parent)?;
-    let archive = TempFile::new(parent, ".gz")?;
-    let binary = TempFile::new(parent, ".bin")?;
+/// A cached helper that still matches the signed manifest.
+fn cached_helper(path: &Path, helper: &TrustedCurrentHelper) -> Option<Vec<u8>> {
+    if !path.is_file() {
+        return None;
+    }
+    match verify_file_as(path, &helper.binary, "cached remote helper") {
+        Ok(()) => fs::read(path).ok(),
+        Err(error) => {
+            crate::output::diagnostic!(
+                "syq: warning: cached remote helper failed integrity verification ({error}); discarding it"
+            );
+            let _ = fs::remove_file(path);
+            None
+        }
+    }
+}
+
+/// `--use-version` runs the helper from the cache, so it needs the cache.
+fn verified_helper_path(helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+    let cache_path = helper_cache_path(helper)?;
+    if cached_helper(&cache_path, helper).is_some() {
+        return Ok(cache_path);
+    }
+    let binary = download_helper(helper)?;
+    store_helper(&cache_path, &binary)?;
+    Ok(cache_path)
+}
+
+/// Download, verify, and decompress a helper in memory. The signed sizes bound
+/// both the download and the decompressed result.
+fn download_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
     let url = format!(
         "{}/{}/{}",
         release_downloads(),
         helper.tag,
         helper.archive.name
     );
-    fetch(&url, &archive, FetchMode::Interactive, helper.archive.size)?;
-    verify_file_as(
-        archive.path(),
+    let archive = fetch_bytes(&url, FetchMode::Interactive, helper.archive.size)?;
+    verify_bytes_as(
+        &archive,
         &helper.archive,
         "downloaded remote helper archive",
     )?;
-
-    let input = File::open(archive.path()).context("open downloaded remote helper archive")?;
-    let decoder = GzDecoder::new(BufReader::new(input));
-    let output = binary.writer()?;
-    let mut output = BufWriter::new(output);
-    std::io::copy(&mut decoder.take(helper.binary.size + 1), &mut output)
+    let mut binary = Vec::new();
+    GzDecoder::new(archive.as_slice())
+        .take(helper.binary.size + 1)
+        .read_to_end(&mut binary)
         .context("decompress the remote helper")?;
-    output.flush().context("flush the remote helper")?;
+    verify_bytes_as(&binary, &helper.binary, "downloaded remote helper")?;
+    Ok(binary)
+}
+
+fn store_helper(cache_path: &Path, binary: &[u8]) -> Result<()> {
+    let parent = cache_path
+        .parent()
+        .ok_or_else(|| anyhow!("the remote helper cache path has no parent directory"))?;
+    create_private_dir(parent)?;
+    let temporary = TempFile::new(parent, ".bin")?;
+    let mut output = temporary.writer()?;
     output
-        .get_ref()
-        .sync_all()
-        .context("sync the remote helper")?;
+        .write_all(binary)
+        .context("write the remote helper")?;
+    output.sync_all().context("sync the remote helper")?;
     drop(output);
-    verify_file_as(binary.path(), &helper.binary, "downloaded remote helper")?;
-    let binary = binary.seal_executable()?;
-    fs::rename(binary.path(), &cache_path)
+    let temporary = temporary.seal_executable()?;
+    fs::rename(temporary.path(), cache_path)
         .with_context(|| format!("cache verified remote helper at {}", cache_path.display()))?;
-    sync_parent(parent)?;
-    Ok(cache_path)
+    sync_parent(parent)
 }
 
 /// An explicit version selection uses a signed manifest cached beside the
@@ -409,17 +437,12 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     };
     let bytes = match &cached {
         Some(bytes) => bytes.clone(),
-        None => {
-            let temporary = TempFile::new(&std::env::temp_dir(), ".json")?;
-            fetch(
-                &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
-                &temporary,
-                FetchMode::Interactive,
-                MAX_MANIFEST_BYTES,
-            )
-            .map_err(|error| selection_download_error(version, error))?;
-            fs::read(temporary.path())?
-        }
+        None => fetch_bytes(
+            &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
+            FetchMode::Interactive,
+            MAX_MANIFEST_BYTES,
+        )
+        .map_err(|error| selection_download_error(version, error))?,
     };
     let manifest = verified_manifest(&bytes, key.as_ref())?;
     let found = validate_manifest(&manifest)?;
@@ -486,16 +509,11 @@ fn fetch_latest(mode: FetchMode) -> Result<VerifiedRelease> {
 
 fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
     let key = embedded_public_key()?;
-    let temp_dir = config_dir()?;
-    create_private_dir(&temp_dir)?;
-    let manifest_temp = TempFile::new(&temp_dir, ".json")?;
-    fetch(
+    let manifest_bytes = fetch_bytes(
         &format!("{base_url}/{MANIFEST_NAME}"),
-        &manifest_temp,
         mode,
         MAX_MANIFEST_BYTES,
     )?;
-    let manifest_bytes = fs::read(manifest_temp.path()).context("read release manifest")?;
     let manifest = verified_manifest(&manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
     Ok(VerifiedRelease { manifest, version })
@@ -747,6 +765,24 @@ fn download_artifact(
     Ok(binary)
 }
 
+fn verify_bytes_as(bytes: &[u8], expected: &ReleaseFile, description: &str) -> Result<()> {
+    if bytes.len() as u64 != expected.size {
+        bail!(
+            "{description} has size {}, expected {}",
+            bytes.len(),
+            expected.size
+        );
+    }
+    let actual: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if actual != expected.sha256 {
+        bail!("{description} failed SHA-256 verification");
+    }
+    Ok(())
+}
+
 fn verify_file_as(path: &Path, expected: &ReleaseFile, description: &str) -> Result<()> {
     let metadata = fs::metadata(path).with_context(|| format!("stat {description}"))?;
     if metadata.len() != expected.size {
@@ -834,6 +870,36 @@ fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64
 /// manifest, so an unverified response cannot fill the disk before its
 /// signature or digest is checked.
 fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Result<()> {
+    let mut sink = destination;
+    fetch_into(url, &mut sink, mode, limit)
+}
+
+/// Download a bounded file into memory.
+fn fetch_bytes(url: &str, mode: FetchMode, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fetch_into(url, &mut bytes, mode, limit)?;
+    Ok(bytes)
+}
+
+/// Where a download is written; each attempt starts it over.
+trait DownloadSink {
+    fn restart(&mut self) -> Result<Box<dyn Write + '_>>;
+}
+
+impl DownloadSink for &TempFile {
+    fn restart(&mut self) -> Result<Box<dyn Write + '_>> {
+        Ok(Box::new(BufWriter::new(self.writer()?)))
+    }
+}
+
+impl DownloadSink for Vec<u8> {
+    fn restart(&mut self) -> Result<Box<dyn Write + '_>> {
+        self.clear();
+        Ok(Box::new(self))
+    }
+}
+
+fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u64) -> Result<()> {
     #[cfg(debug_assertions)]
     if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
         let name = url
@@ -841,12 +907,14 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
             .next()
             .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
             .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
+        let mut output = sink.restart()?;
         copy_bounded(
             &mut File::open(PathBuf::from(root).join(name))?,
-            &mut destination.writer()?,
+            &mut output,
             limit,
         )
         .with_context(|| format!("copy test release fixture {name}"))?;
+        output.flush()?;
         return Ok(());
     }
 
@@ -877,13 +945,12 @@ fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Resu
                 request = request.header("x-syq-target", target);
             }
             let mut response = request.call().with_context(|| format!("request {url}"))?;
-            let file = destination.writer()?;
-            let mut file = BufWriter::new(file);
-            copy_bounded(&mut response.body_mut().as_reader(), &mut file, limit)
+            let mut output = sink.restart()?;
+            copy_bounded(&mut response.body_mut().as_reader(), &mut output, limit)
                 .with_context(|| format!("download {url}"))?;
-            file.flush().with_context(|| {
-                format!("flush downloaded file {}", destination.path().display())
-            })?;
+            output
+                .flush()
+                .with_context(|| format!("save download {url}"))?;
             Ok(())
         })();
         match result {
