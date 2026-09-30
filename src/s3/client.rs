@@ -9,8 +9,9 @@ use aws_smithy_runtime_api::{
     client::{
         interceptors::{
             context::{
-                BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
-                InterceptorContext,
+                BeforeDeserializationInterceptorContextRef,
+                BeforeSerializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
+                FinalizerInterceptorContextRef, InterceptorContext,
             },
             Intercept,
         },
@@ -49,7 +50,30 @@ impl ClassifyRetry for Throttling {
 /// SDK cannot rewind a file body; downloads need it because a response body
 /// can fail after the headers arrive. Every other request keeps SDK retries.
 pub(super) fn without_sdk_retries() -> aws_sdk_s3::config::Builder {
-    aws_sdk_s3::config::Builder::new().retry_config(RetryConfig::disabled())
+    aws_sdk_s3::config::Builder::new()
+        .retry_config(RetryConfig::disabled())
+        .interceptor(OwnRetries)
+}
+
+/// Marks a request retried by syq's own loop, which reports its outcome to
+/// the outage stop itself.
+#[derive(Debug)]
+struct OwnRetries;
+impl aws_smithy_types::config_bag::Storable for OwnRetries {
+    type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
+}
+impl Intercept for OwnRetries {
+    fn name(&self) -> &'static str {
+        "SyqOwnRetries"
+    }
+    fn read_before_execution(
+        &self,
+        _: &BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        cfg.interceptor_state().store_put(OwnRetries);
+        Ok(())
+    }
 }
 
 /// Only establishing a connection has a deadline. Request headers, response
@@ -74,6 +98,38 @@ struct ControlStart(tokio::time::Instant);
 impl aws_smithy_types::config_bag::Storable for ControlStart {
     type Storer = aws_smithy_types::config_bag::StoreReplace<Self>;
 }
+/// Report each SDK-retried request's final outcome. Requests marked by
+/// `OwnRetries` are reported by syq's own retry loop instead.
+#[derive(Debug)]
+struct ObserveOutage(std::sync::Arc<super::outage::Outage>);
+impl Intercept for ObserveOutage {
+    fn name(&self) -> &'static str {
+        "SyqS3Outage"
+    }
+    fn read_after_execution(
+        &self,
+        context: &FinalizerInterceptorContextRef<'_>,
+        components: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        if cfg.load::<OwnRetries>().is_some() {
+            return Ok(());
+        }
+        if context.output_or_error().is_some_and(|r| r.is_ok()) {
+            self.0.responded();
+        } else {
+            // Classify the final error as the SDK's retry strategy does.
+            let action = aws_smithy_runtime::client::retries::classifiers::run_classifiers_on_ctx(
+                components.retry_classifiers(),
+                context.inner(),
+            );
+            self.0
+                .failed(matches!(action, RetryAction::RetryIndicated(_)));
+        }
+        Ok(())
+    }
+}
+
 impl Intercept for ControlLatency {
     fn name(&self) -> &'static str {
         "SyqS3ControlLatency"
@@ -267,7 +323,7 @@ pub(super) async fn connect(
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
     uploads: std::sync::Arc<super::upload_http::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
-    connect_authorized(options, control, uploads, None).await
+    connect_authorized(options, control, uploads, None, None).await
 }
 
 pub(super) async fn connect_authorized(
@@ -275,6 +331,7 @@ pub(super) async fn connect_authorized(
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
     uploads: std::sync::Arc<super::upload_http::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
+    outage: Option<std::sync::Arc<super::outage::Outage>>,
 ) -> Result<(Client, Option<String>)> {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &options.profile {
@@ -334,6 +391,9 @@ pub(super) async fn connect_authorized(
             write: options.write_headers.clone(),
         })
         .interceptor(ControlLatency(control));
+    if let Some(outage) = outage {
+        config = config.interceptor(ObserveOutage(outage));
+    }
 
     let endpoint = options
         .endpoint

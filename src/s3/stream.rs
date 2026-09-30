@@ -47,6 +47,8 @@ impl Session {
             Arc::default(),
             cancellation.clone(),
             authorization.clone(),
+            // A stream is one object; a failing request already ends it.
+            None,
         )
         .await?;
         let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());

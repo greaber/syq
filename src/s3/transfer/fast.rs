@@ -191,6 +191,9 @@ impl Engine {
             let mut next_check = Duration::from_secs(1);
             let attempt_offset = offset + done;
             let attempt_length = length - done;
+            // Whether this attempt's GET succeeded. A body or local write that
+            // fails afterwards is not a sign that the service is down.
+            let mut answered = initial.is_some();
             let result = async {
                 let body = if let Some(body) = initial.take() {
                     body
@@ -216,6 +219,7 @@ impl Engine {
                                     .into()
                             }
                         })?;
+                    answered = true;
                     if response.content_length() != Some(attempt_length as i64)
                         || response.e_tag() != Some(object.etag.as_str())
                         || (length > 0
@@ -368,6 +372,7 @@ impl Engine {
                     crate::s3::diagnostics::elapsed(started, "download_range", attempt_length);
                     self.tuning.requests.completed(length);
                     self.progress.add_bytes(length);
+                    self.outage.responded();
                     return Ok(hash);
                 }
                 Err(e)
@@ -388,7 +393,12 @@ impl Engine {
                     }
                     attempt += 1;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A permanent GET error is still an answer from the service.
+                    self.outage
+                        .failed(!answered && e.downcast_ref::<Permanent>().is_none());
+                    return Err(e);
+                }
             }
         }
     }
