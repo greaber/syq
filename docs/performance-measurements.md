@@ -33,8 +33,10 @@ investigate insufficient work supply.
 `source_request` and `source_response` cover sending a request and awaiting its
 response. `destination_send` and `destination_ack` cover sending writes and waiting
 for replies; synchronous local work can occur inside these calls. `pacing` covers
-bandwidth-limit waits. `other_work` is remaining worker activity. A source-response
-wait alone cannot distinguish storage, CPU, transport or downstream backpressure.
+logical-byte bandwidth waits. Ordinary TCP copies wait inside transport writes:
+these waits contribute to `destination_send` on pushes and `source_response` on
+pulls. `other_work` is remaining worker activity. A source-response wait alone
+cannot distinguish storage, CPU, transport or downstream backpressure.
 
 ## Endpoint operations
 
