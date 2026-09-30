@@ -2067,3 +2067,42 @@ fn fragmented_metadata_replies_preserve_counts_and_errors() {
         .call(Request::Shutdown)
         .is_err());
 }
+
+/// Later sessions of a run skip `uname`, but the session pool's key must not
+/// change after a handshake: the next command asks the pool before it has one.
+#[test]
+fn only_sessions_within_a_run_use_the_handshake_platform() {
+    let spec = RemoteSpec {
+        local_process: false,
+        user: None,
+        host: "remote.example".into(),
+        port: None,
+        rsh: vec!["ssh".into()],
+        syq_path: None,
+        bootstrap_helper: true,
+        restricted_grant: None,
+        helper_install: Default::default(),
+        ssh_multiplexer: None,
+        quiet: false,
+        tcp: Default::default(),
+        diagnostics: Default::default(),
+        primed_control: Default::default(),
+        forwarded: None,
+        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+    };
+    let server = ["--server".to_string()];
+    let before = spec.pool_endpoint().program;
+    assert_eq!(spec.session_command_for(&server, true), before);
+    spec.diagnostics.lock().unwrap().peer = Some(PeerInfo {
+        identity: crate::identity::build().into(),
+        platform: "linux-aarch64".into(),
+        supports_confined_socket_nodes: true,
+        ssh_worker_ticket: None,
+    });
+    assert_eq!(spec.pool_endpoint().program, before);
+    assert!(before.contains("uname"));
+    let session = spec.session_command_for(&server, true);
+    assert!(session.contains("target=linux-aarch64") && !session.contains("uname"));
+    // Development builds keep asking the host.
+    assert_eq!(spec.session_command_for(&server, false), before);
+}
