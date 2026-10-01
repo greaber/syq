@@ -9,6 +9,9 @@ pub(super) struct Planner<'a> {
     pub(super) sched: &'a Sched,
     pub(super) progress: &'a Progress,
     pub(super) opts: &'a Opts,
+    /// Compile once, only when a native scan selects a non-directory root.
+    /// The outer None means uninitialized; Some(None) means no ignore rules.
+    pub(super) selected_file_ignore: Option<Option<ignore::gitignore::Gitignore>>,
     /// Capability reported by the destination receiver's authenticated
     /// handshake. The coordinator may be running on a different platform.
     pub(super) destination_supports_confined_socket_nodes: bool,
@@ -510,6 +513,16 @@ impl Planner<'_> {
         }
     }
 
+    fn selected_file_is_ignored(&mut self, path: &[u8]) -> Result<bool> {
+        if self.selected_file_ignore.is_none() {
+            self.selected_file_ignore = Some(crate::scan::build_ignore(&self.opts.ignore)?);
+        }
+        Ok(crate::scan::selected_file_is_ignored(
+            self.selected_file_ignore.as_ref().unwrap().as_ref(),
+            path,
+        ))
+    }
+
     pub(super) fn scan_source(
         &mut self,
         src: &mut dyn Conn,
@@ -590,12 +603,8 @@ impl Planner<'_> {
                         });
                         if root.kind != Kind::Dir
                             && selection != SourceSelection::Rsync
-                            && crate::scan::selected_file_is_ignored(
-                                crate::scan::build_ignore(&ignore)?.as_ref(),
-                                src_root,
-                            )
+                            && pl.selected_file_is_ignored(src_root)?
                         {
-                            pl.progress.files_excluded.fetch_add(1, Relaxed);
                             pl.progress.paths_ignored.fetch_add(1, Relaxed);
                             pl.dst_seen
                                 .entry(join(dst_root, &sub))

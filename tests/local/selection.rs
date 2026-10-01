@@ -672,9 +672,52 @@ fn native_ignore_filters_explicit_files_by_source_basename() {
     let records = fs::read_to_string(results).unwrap();
     let terminal: serde_json::Value =
         serde_json::from_str(records.lines().last().unwrap()).unwrap();
-    assert_eq!(terminal["files_excluded"], 1);
+    assert_eq!(terminal["files_excluded"], 0);
     assert_eq!(terminal["files_transferred"], 0);
     assert!(!t.path("preview").exists());
+}
+
+#[test]
+fn native_ignore_exclusions_match_for_named_and_scanned_files() {
+    let t = Tmp::new();
+    write(&t.path("source/report.txt"), b"ignored");
+    for named in [false, true] {
+        for dry_run in [false, true] {
+            let destination = t.s(&format!("destination-{named}-{dry_run}"));
+            let results = t.s(&format!("results-{named}-{dry_run}.jsonl"));
+            let source = t.s(if named { "source/report.txt" } else { "source" });
+            let mut args = vec![
+                "cp",
+                if named { "--src" } else { "--srcs-in" },
+                &source,
+                "--into",
+                &destination,
+                "--ignore",
+                "*.txt",
+                "--results",
+                &results,
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let output = run_native_ok(&args);
+            if dry_run {
+                assert_eq!(
+                    output
+                        .lines()
+                        .find(|line| line.trim_start().starts_with("exclusions:")),
+                    Some("  exclusions: 1 path/subtree skipped by ignore rules"),
+                    "{output}"
+                );
+            }
+            let records = fs::read_to_string(results).unwrap();
+            let terminal: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            assert_eq!(terminal["files_excluded"], 0, "{terminal}");
+            assert_eq!(terminal["files_transferred"], 0, "{terminal}");
+            assert!(!Path::new(&destination).join("report.txt").exists());
+        }
+    }
 }
 
 #[test]

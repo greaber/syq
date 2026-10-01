@@ -3200,6 +3200,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched: &sched,
         progress: &progress,
         opts: &opts,
+        selected_file_ignore: None,
         destination_supports_confined_socket_nodes,
         destination_metadata_platform,
         // Existing-file policies (-u, --checksum, --ignore-existing,
