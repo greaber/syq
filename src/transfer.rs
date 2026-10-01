@@ -1955,12 +1955,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let src_ctl = t
             .join()
             .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
-        progress
-            .clock
-            .helper_install
-            .set([&src_ep, &dst_ep].into_iter().filter_map(|ep| {
-                real_remote_spec(ep).and_then(|spec| spec.diagnostics().helper_installation)
-            }));
+        for installation in [&src_ep, &dst_ep].into_iter().filter_map(|ep| {
+            real_remote_spec(ep).and_then(|spec| spec.diagnostics().helper_installation)
+        }) {
+            progress.clock.helper_install.record(installation);
+        }
         match (src_ctl, dst_ctl) {
             (Ok((a, sources)), Ok(b)) => (a, sources, b),
             (Err(e), _) | (_, Err(e)) => {

@@ -270,7 +270,7 @@ carry the same object, with measurements advancing while that work runs:
 | Field | What it measures |
 |---|---|
 | `total_ms` | The coordinator's measured run, including helper installation, setup, planning, transfer, and finalization |
-| `setup_ms` | Preparing endpoints, establishing control and initial worker connections, and choosing the data transport; excludes helper installation |
+| `setup_ms` | Preparing endpoints, establishing control and worker connections (including connections added during copying), and choosing the data transport; excludes helper installation |
 | `planning_ms` | Discovering source entries, inspecting destinations, deciding what to copy, and preparing the work, including directories created during planning |
 | `transfer_ms` | From the first selected file operation to the last completed file operation, including reads, hashing, writes, per-file metadata, waits, and retries |
 | `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, directory metadata, and receipts |
@@ -292,9 +292,11 @@ it is not the entire process lifetime. Use an external timer to include process
 startup, input handling, and shutdown. For an attached receiver-attested result,
 total covers the invoking machine's coordination and settlement instead.
 
-The filesystem progress bar and summary use `transfer_ms` for elapsed time and
-average transfer speed. Initial setup and finalization therefore do not dilute
-the transfer rate. A copy with no selected file work reports zero transfer time.
+The filesystem progress bar and summary use `transfer_ms` for elapsed time.
+While copying, progress estimates the recent transfer rate; once file work
+finishes, it reports the average over the completed transfer, as the summary
+does. Initial setup and finalization do not dilute the transfer rate.
+A copy with no selected file work reports zero transfer time.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs

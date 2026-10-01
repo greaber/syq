@@ -335,6 +335,16 @@ impl Progress {
     }
 
     fn rate(&self, t: &mut TermState, now: Instant, done: u64) -> f64 {
+        if let (Some(start), Some(end)) = (self.transfer_start.get(), self.transfer_end.get()) {
+            // Once file work has settled, show its average rate, matching the
+            // summary. Finalization redraws must not extend the rate window.
+            let seconds = end.saturating_duration_since(*start).as_secs_f64();
+            return if seconds > 0.0 {
+                done as f64 / seconds
+            } else {
+                0.0
+            };
+        }
         if t.samples
             .back()
             .is_some_and(|&(_, previous)| done < previous)
@@ -779,6 +789,14 @@ mod tests {
         progress.finish_transfer();
         assert_eq!(progress.timings().transfer_ms, Some(2_000));
         assert_eq!(progress.display_elapsed(), Duration::from_secs(2));
+        let mut term = progress.term.lock().unwrap();
+        for delay in [0, 4, 30] {
+            assert_eq!(
+                progress.rate(&mut term, ended + Duration::from_secs(delay), 400),
+                200.0,
+                "finalization must not dilute the completed transfer rate"
+            );
+        }
         assert!(progress.start.elapsed() >= Duration::from_secs(60));
     }
 

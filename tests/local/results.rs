@@ -1483,6 +1483,18 @@ fn finalization_time_does_not_dilute_transfer_time() {
         .find(|r| r["type"] == "progress")
         .unwrap();
     assert_eq!(&final_progress["timings"], timings);
+    // The emitted rate uses the same frozen interval, including while the
+    // finalization barrier holds. Allow for transfer_ms rounding down.
+    for record in records.iter().filter(|r| {
+        r["type"] == "progress" && r["timings"]["finalization_ms"].as_u64().unwrap() >= 1000
+    }) {
+        let rate = record["rate_bytes_per_second"].as_u64().unwrap();
+        let bytes = record["bytes_done"].as_u64().unwrap();
+        assert!(rate >= bytes * 1000 / (transfer + 1), "{record}");
+        if transfer > 0 {
+            assert!(rate <= (bytes * 1000).div_ceil(transfer), "{record}");
+        }
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!("transfer {:.3}s", transfer as f64 / 1000.0)),

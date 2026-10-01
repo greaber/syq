@@ -379,6 +379,24 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertTrue(all(option in args for args in copies), copies)
                 self.assert_clean()
 
+    def test_copying_interval_reads_released_and_current_results(self):
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        records = self.root / 'timings.json'
+        for milliseconds in [0, 5321]:
+            for version, timing in [(2, {'copying_elapsed_ms': milliseconds}),
+                                    (4, {'timings': {'transfer_ms': milliseconds}})]:
+                with self.subTest(version=version, milliseconds=milliseconds):
+                    records.write_text(json.dumps(dict(
+                        type='result', status='success', schema_version=version,
+                        **timing)) + '\n')
+                    for required in ['', 'required']:
+                        result = subprocess.run(
+                            ['/bin/bash', '-c', definitions + '\ncopying_interval "$1" "$2"',
+                             'timing-test', str(records), required],
+                            env=self.env, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, f'{milliseconds}\n')
+
     def test_invalid_timing_is_rejected(self):
         definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
         records = self.root / 'timings.json'

@@ -44,10 +44,6 @@ impl Measurement {
         self.0.lock().unwrap().push((span.0, Some(span.1)));
     }
 
-    pub fn set(&self, spans: impl Iterator<Item = (Instant, Instant)>) {
-        *self.0.lock().unwrap() = spans.map(|(start, end)| (start, Some(end))).collect();
-    }
-
     fn spans(&self, start: Instant, end: Instant) -> Vec<(Instant, Instant)> {
         let mut spans: Vec<_> = self
             .0
@@ -152,13 +148,10 @@ mod tests {
             origin + Duration::from_secs(10),
             origin + Duration::from_secs(20),
         ));
-        clock.helper_install.set(
-            [(
-                origin + Duration::from_secs(5),
-                origin + Duration::from_secs(30),
-            )]
-            .into_iter(),
-        );
+        clock.helper_install.record((
+            origin + Duration::from_secs(5),
+            origin + Duration::from_secs(30),
+        ));
         clock.end.set(origin + Duration::from_secs(40)).unwrap();
         let timings = clock.snapshot(origin, Some(Duration::ZERO));
         assert_eq!(timings.setup_ms, Some(25_000));
@@ -171,16 +164,16 @@ mod tests {
         let origin = Instant::now() - Duration::from_secs(60);
         let at = |n| origin + Duration::from_secs(n);
         let clock = Clock::default();
-        clock
-            .setup
-            .set([(at(0), at(5)), (at(15), at(20)), (at(30), at(40))].into_iter());
-        clock
-            .helper_install
-            .set([(at(5), at(15)), (at(10), at(30)), (at(45), at(55))].into_iter());
-        clock
-            .planning
-            .set([(at(18), at(35)), (at(30), at(45))].into_iter());
-        clock.finalization.set([(at(48), at(70))].into_iter());
+        for span in [(at(0), at(5)), (at(15), at(20)), (at(30), at(40))] {
+            clock.setup.record(span);
+        }
+        for span in [(at(5), at(15)), (at(10), at(30)), (at(45), at(55))] {
+            clock.helper_install.record(span);
+        }
+        for span in [(at(18), at(35)), (at(30), at(45))] {
+            clock.planning.record(span);
+        }
+        clock.finalization.record((at(48), at(70)));
         clock.end.set(at(50)).unwrap();
         let measured = clock.snapshot(origin, Some(Duration::from_secs(20)));
         assert_eq!(measured.total_ms, 50_000);
