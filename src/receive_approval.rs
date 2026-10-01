@@ -260,8 +260,9 @@ impl Summary {
             }
         };
         match &self.details {
-            // The title is the subject: "syq on hetz ... wants to download".
-            // Paths sit indented on their own lines, then the command.
+            // The title is the subject, "syq on hetz ... wants to download",
+            // unless a directory line comes between. Paths sit indented on
+            // their own lines, then the command.
             Details::Copy { .. } => {
                 let (_, directory) = self.title_and_directory();
                 let verb = if self.remote {
@@ -269,7 +270,11 @@ impl Summary {
                 } else {
                     "wants to download"
                 };
-                let mut request = String::from(verb);
+                let mut request = if directory.is_some() {
+                    format!("syq {verb}")
+                } else {
+                    verb.to_owned()
+                };
                 for source in &self.sources {
                     request.push_str(&format!("\n\n    {source}"));
                 }
@@ -1144,7 +1149,7 @@ mod tests {
         assert_eq!(summary.title(), "syq on server");
         assert_eq!(
             summary.desktop_description(false),
-            format!("in ~/projects/very-long-directory-name\n\n{body}")
+            format!("in ~/projects/very-long-directory-name\n\nsyq {body}")
         );
         summary.server_cwd = String::new();
         assert_eq!(summary.title(), "syq on server");
