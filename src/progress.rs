@@ -210,11 +210,18 @@ impl Progress {
     }
 
     pub fn timings(&self) -> Timings {
-        self.clock.snapshot(
+        let transfer = self.transfer_elapsed();
+        let mut timings = self.clock.snapshot(
             self.start,
             self.separate_transfer_timing
-                .then(|| self.transfer_elapsed().unwrap_or_default()),
-        )
+                .then(|| transfer.unwrap_or_default()),
+        );
+        // Engines without coordinator setup/planning measurements can still
+        // report the file-work interval they already measure (for example S3).
+        if !self.separate_transfer_timing {
+            timings.transfer_ms = transfer.map(|elapsed| elapsed.as_millis() as u64);
+        }
+        timings
     }
 
     fn transfer_elapsed(&self) -> Option<Duration> {
@@ -260,7 +267,7 @@ impl Progress {
     }
 
     pub fn copying_interval(&self) -> CopyingInterval<'_> {
-        if self.separate_transfer_timing && self.transfer_start.get().is_none() {
+        if self.transfer_start.get().is_none() {
             self.begin_transfer();
         }
         self.copy_first_ns.fetch_min(self.copy_clock_ns(), Relaxed);
@@ -797,6 +804,20 @@ mod tests {
         // A measured sub-millisecond copy is distinct from absent timing.
         progress.copy_last_ns.store(began + 999_999, Relaxed);
         assert_eq!(progress.copying_elapsed_ms(), Some(0));
+    }
+
+    #[test]
+    fn engines_without_coordinator_measurements_preserve_transfer_timing() {
+        let progress = Progress::new(false, false, None);
+        assert!(progress.timings().transfer_ms.is_none());
+        drop(progress.copying_interval());
+        progress.finish_transfer();
+        let timings = progress.timings();
+        assert!(timings.transfer_ms.is_some());
+        assert!(timings.setup_ms.is_none());
+        assert!(timings.planning_ms.is_none());
+        assert!(timings.finalization_ms.is_none());
+        assert!(timings.helper_install_ms.is_none());
     }
 
     #[test]

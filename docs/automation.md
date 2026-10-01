@@ -284,8 +284,9 @@ copying can begin while planning continues. Installation on two hosts also count
 once where it overlaps.
 
 Filesystem copy coordinators report all six fields, including zero for work that
-was not needed or took less than a millisecond. Other engines, removal, and receiver-attested results report
-`total_ms` and omit unavailable measurements. Total starts with the executing
+was not needed or took less than a millisecond. S3 copies also report `transfer_ms` once file work starts. Other engines,
+removal, and receiver-attested results report `total_ms` and omit unavailable
+measurements. Total starts with the executing
 coordinator's run clock, after argument/input validation for a filesystem copy;
 it is not the entire process lifetime. Use an external timer to include process
 startup, input handling, and shutdown. For an attached receiver-attested result,
