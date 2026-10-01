@@ -9,8 +9,8 @@ import tempfile
 import time
 
 
-def run(*args, success=True):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=40)
+def run(*args, success=True, stdin=None):
+    result = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=40)
     assert (result.returncode == 0) == success, (args, result)
     return result.stdout
 
@@ -95,6 +95,10 @@ run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")
 print("case: automatic authorization uses working source SSH without requesting approval", flush=True)
+# Forwarding a credential does not also transfer host trust. Reuse the
+# destination key already trusted by the runner in this isolated lab.
+trusted_destination = run("ssh-keygen", "-F", "destination", "-f", str(Path.home() / ".ssh/known_hosts"))
+run("ssh", "source", "umask 077; cat >> ~/.ssh/known_hosts", stdin=trusted_destination)
 run("ssh", "-A", "source", "timeout 20 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
     "--to destination --as /tmp/syq-real-ssh/forward/source-ssh")
 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []

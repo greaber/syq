@@ -1389,6 +1389,10 @@ fn announce_detached_ready() -> Result<()> {
 }
 
 pub fn run(mut args: Args) -> Result<i32> {
+    // Authorization selection may open the destination SSH connection. Count
+    // that setup in elapsed time and end-to-end throughput.
+    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
+    let progress = Progress::new(show_progress, args.progress, args.width);
     // Re-exec before consuming stdin or opening results. A failed handoff still
     // settles the normal automation stream below.
     let handoff = crate::destination::handoff::copy(&mut args);
@@ -1401,11 +1405,9 @@ pub fn run(mut args: Args) -> Result<i32> {
             return Ok(2);
         }
     }
-    // Create results and progress before reporting any setup failure, so a
-    // failure in this process settles with a terminal record (spec: automation
-    // results). A successful exec hands that responsibility to the helper.
-    let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(show_progress, args.progress, args.width);
+    // Open results before reporting any setup failure, so a failure in this
+    // process settles with a terminal record (spec: automation results).
+    // A successful exec hands that responsibility to the helper.
     if args.stats || debug() {
         progress
             .observations

@@ -1117,7 +1117,7 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
     let script = t.path("bin/ssh");
-    executable(&script, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nexec \"$SYQ_TEST_REMOTE_BINARY\" --server\n");
+    executable(&script, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nsleep 0.2\nexec \"$SYQ_TEST_REMOTE_BINARY\" --server\n");
     let mut paths = vec![t.path("bin")];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let paths = std::env::join_paths(paths).unwrap();
@@ -1159,10 +1159,23 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
             "--tcp-ports",
             EPHEMERAL_TCP_PORTS,
             "--performance-tuning=workers=1",
+            "--results=result.ndjson",
         ];
         args.extend(compression);
         let output = run(&args);
         assert_output_ok(&output);
+        let terminal: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(t.path("result.ndjson"))
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            terminal["elapsed_ms"].as_u64().unwrap() >= 175,
+            "SSH setup disappeared from elapsed time: {terminal}"
+        );
         assert_eq!(fs::read(t.path("destination")).unwrap(), b"payload");
         assert_eq!(
             fs::read_to_string(t.path("ssh-used")).unwrap(),
@@ -1195,9 +1208,28 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
     );
 
     // A helper that exits unsuccessfully is not an SSH authentication failure.
-    executable(&script, b"#!/bin/sh\nexit 42\n");
-    let failed = run(&["cp", "source", "--to", "127.0.0.1"]);
+    executable(&script, b"#!/bin/sh\nsleep 0.2\nexit 42\n");
+    let failed = run(&[
+        "cp",
+        "source",
+        "--to",
+        "127.0.0.1",
+        "--results=failed.ndjson",
+    ]);
     assert!(!failed.status.success());
+    let terminal: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(t.path("failed.ndjson"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(terminal["status"], "failed");
+    assert!(
+        terminal["elapsed_ms"].as_u64().unwrap() >= 175,
+        "failed SSH setup disappeared from elapsed time: {terminal}"
+    );
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
