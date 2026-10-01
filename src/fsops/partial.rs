@@ -443,10 +443,17 @@ impl FsOps {
                     // without exclusive creation, and used as created only
                     // when the open landed on a new empty file of ours. Its
                     // metadata, read at once, serves publication. Anything
-                    // else at the name takes the checked reuse below.
+                    // else at the name takes the checked reuse below. Other
+                    // range workers reopen the sidecar by name for writing,
+                    // so it keeps owner write until publication sets the
+                    // final mode, as an in-place file does.
+                    let staged = mode | 0o200;
                     self.uncache_rooted(&target.root, relative);
-                    match self.open_or_create_write_only_partial(&target.root, relative, mode) {
-                        Ok((file, created)) if is_fresh_partial(&created, mode) => {
+                    match self.open_or_create_write_only_partial(&target.root, relative, staged) {
+                        Ok((file, created))
+                            if is_fresh_partial(&created, staged)
+                                && created.mode() & 0o200 != 0 =>
+                        {
                             return Ok(Some((file, None, Some(created))));
                         }
                         Ok(_) => {}

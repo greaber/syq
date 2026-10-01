@@ -234,6 +234,38 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
         b"contents"
     );
 
+    // A read-only final mode: the sidecar keeps owner write, so a range
+    // worker that reopens it by name can still write, and publication sets
+    // the final mode.
+    assert_eq!(
+        prepare(&mut operations, b"readonly", 0o444).partial_size,
+        None
+    );
+    let (partial, _) = rooted_partial_target(
+        &operations
+            .destination_mutation_target(b"readonly", None)
+            .unwrap(),
+        &copy_id,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::metadata(directory.path().join(partial.to_path_buf()))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    let root = operations.destination_root.clone().unwrap();
+    drop(operations.uncache_rooted(&root, &partial));
+    write(&mut operations, b"readonly");
+    publish(&mut operations, b"readonly", 0o444).unwrap();
+    let published = fs::metadata(directory.path().join("readonly")).unwrap();
+    assert_eq!(published.mode() & 0o7777, 0o444);
+    assert_eq!(
+        fs::read(directory.path().join("readonly")).unwrap(),
+        b"contents"
+    );
+
     // A directory at the target name is refused with the same message.
     fs::create_dir(directory.path().join("dir")).unwrap();
     prepare(&mut operations, b"dir", 0o644);
