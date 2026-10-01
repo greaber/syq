@@ -1187,3 +1187,76 @@ fn zero_byte_batch_work_counts_files_and_withdrawn_groups_stop_counting() {
     assert!(!work.parallel);
     assert!(!sched.needs_worker_capacity());
 }
+
+#[test]
+fn claimed_publication_keeps_consumers_alive_until_return_completion_or_abort() {
+    for matched in [false, true] {
+        for disposition in ["return", "complete", "retry", "abort"] {
+            let sched = Arc::new(Sched::new(512, 8192));
+            sched.push_file(test_job(b"source", 4096));
+            sched.scan_done();
+            assert!(matches!(sched.next(), Item::File(0)));
+            sched.ranges_ready(0, vec![]);
+            sched.requeue_finish(0, matched);
+            let claimed = sched.next();
+            assert!(matches!(claimed, Item::Finish { idx: 0, .. }));
+            assert!(!sched.finished(), "the tuner must see claimed publication");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let peer = {
+                let sched = sched.clone();
+                std::thread::spawn(move || tx.send(sched.next()).unwrap())
+            };
+            // Wait for the actual scheduler sleep, rather than assuming a
+            // thread ran because a fixed amount of time passed.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let waiting = sched.inner.lock().unwrap().waiting_workers;
+                if waiting == 1 {
+                    break;
+                }
+                if rx.try_recv().is_ok() {
+                    peer.join().unwrap();
+                    panic!("consumer exited while publication was claimed");
+                }
+                if std::time::Instant::now() >= deadline {
+                    sched.abort();
+                    peer.join().unwrap();
+                    panic!("consumer did not wait: waiting_workers={waiting}");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            match disposition {
+                "return" => sched.return_unstarted(claimed),
+                "complete" => sched.finish_done(),
+                "retry" => {
+                    sched.requeue_finish(0, matched);
+                    sched.finish_done();
+                }
+                "abort" => sched.abort(),
+                _ => unreachable!(),
+            }
+            let item = rx.recv_timeout(Duration::from_secs(2));
+            if item.is_err() {
+                sched.abort();
+            }
+            peer.join().unwrap();
+            match item.expect("publication disposition must wake the consumer") {
+                Item::Finish {
+                    idx: 0,
+                    matched: actual,
+                } if matches!(disposition, "return" | "retry") => {
+                    assert_eq!(actual, matched);
+                    assert!(!sched.finished());
+                    sched.finish_done();
+                }
+                Item::Exit if matches!(disposition, "complete" | "abort") => {
+                    if disposition == "abort" {
+                        sched.finish_done();
+                    }
+                }
+                _ => panic!("unexpected item for {disposition}"),
+            }
+            assert!(sched.finished(), "{disposition} leaked a publication claim");
+        }
+    }
+}

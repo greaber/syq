@@ -2618,10 +2618,8 @@ fn retired_dispatch_returns_unstarted_work_without_endpoint_requests() {
             "range" => Item::Range(sched.ranges_ready(0, vec![(0, 4096)]).unwrap()),
             _ => {
                 sched.ranges_ready(0, vec![]);
-                Item::Finish {
-                    idx: 0,
-                    matched: kind == "matched-finish",
-                }
+                sched.requeue_finish(0, kind == "matched-finish");
+                sched.next()
             }
         };
         let gate = Gate::new(2);
@@ -2634,7 +2632,12 @@ fn retired_dispatch_returns_unstarted_work_without_endpoint_requests() {
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         worker.id = 1;
         worker.gate = gate.clone();
+        assert!(
+            !sched.finished(),
+            "the tuner must see the claimed {kind} before the worker returns it"
+        );
         worker.process_item(item).unwrap();
+        assert!(!sched.finished(), "returned {kind} work remains runnable");
         assert!(src.lock().unwrap().requests.is_empty());
         assert!(dst.lock().unwrap().requests.is_empty());
         assert!(gate.measurement_ready(1));
@@ -2650,6 +2653,8 @@ fn retired_dispatch_returns_unstarted_work_without_endpoint_requests() {
             }
             Item::Finish { idx: 0, matched } if kind.ends_with("finish") => {
                 assert_eq!(matched, kind == "matched-finish");
+                assert!(!sched.finished(), "claimed publication is still live");
+                sched.finish_done();
             }
             _ => panic!("lost or changed returned {kind} assignment"),
         }
@@ -2697,9 +2702,14 @@ fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
             worker.id = 1;
             worker.gate = gate.clone();
             worker.progress.files_total.store(1, Relaxed);
-            worker
-                .process_item(Item::Finish { idx: 0, matched })
-                .unwrap();
+            sched.requeue_finish(0, matched);
+            let item = sched.next();
+            assert!(!sched.finished());
+            worker.process_item(item).unwrap();
+            assert!(
+                sched.finished(),
+                "publication claim leaked on success or failure"
+            );
             assert!(!gate.allowed(1));
             assert!(gate.measurement_ready(1));
             assert_eq!(
@@ -2722,5 +2732,103 @@ fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
             assert_eq!(src.lock().unwrap().received, 1, "source recheck ran");
             assert_eq!(dst.lock().unwrap().received, usize::from(!matched));
         }
+    }
+}
+
+#[test]
+fn returned_last_publication_is_completed_by_the_remaining_worker() {
+    for matched in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let job = pipeline_job(b"source", 4096);
+        job.done.store(4096, Relaxed);
+        sched.push_file(job.clone());
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        sched.ranges_ready(0, vec![]);
+        sched.requeue_finish(0, matched);
+        let item = sched.next();
+        let gate = Gate::new(2);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        gate.set_active(1);
+        // This is the reviewer's race: worker 1 has the last publication,
+        // but is retired before dispatch. The tuner must not observe completion.
+        assert!(!sched.finished());
+        let src = Arc::new(Mutex::new(PipelineState {
+            replies: [Response::Stats(vec![Some(job.entry.clone())])].into(),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            replies: if matched {
+                Default::default()
+            } else {
+                [Response::Ok].into()
+            },
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.id = 1;
+        worker.gate = gate;
+        worker.progress.files_total.store(1, Relaxed);
+        worker.process_item(item).unwrap();
+        assert!(!sched.finished());
+        assert!(src.lock().unwrap().requests.is_empty());
+        assert!(dst.lock().unwrap().requests.is_empty());
+        worker.id = 0;
+        worker.process_item(sched.next()).unwrap();
+        assert!(sched.finished());
+        assert!(matches!(sched.next(), Item::Exit));
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            u64::from(!matched)
+        );
+        assert_eq!(
+            worker.progress.files_unchanged.load(Relaxed),
+            u64::from(matched)
+        );
+    }
+}
+
+#[test]
+fn publication_connection_failure_releases_claim_after_queuing_retry() {
+    for matched in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let job = pipeline_job(b"source", 4096);
+        job.done.store(4096, Relaxed);
+        sched.push_file(job.clone());
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        sched.ranges_ready(0, vec![]);
+        sched.requeue_finish(0, matched);
+        let src = Arc::new(Mutex::new(PipelineState {
+            fail_receive: Some(1),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            replies: if matched {
+                Default::default()
+            } else {
+                [Response::Ok].into()
+            },
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let error = worker.process_item(sched.next()).unwrap_err();
+        assert!(error.to_string().contains("injected connection loss"));
+        assert!(!sched.finished(), "retry is still runnable");
+        // Replace the failed source connection, then consume the same publication.
+        *src.lock().unwrap() = PipelineState {
+            replies: [Response::Stats(vec![Some(job.entry.clone())])].into(),
+            ..Default::default()
+        };
+        if !matched {
+            dst.lock().unwrap().replies.push_back(Response::Ok);
+        }
+        worker.progress.files_total.store(1, Relaxed);
+        worker.process_item(sched.next()).unwrap();
+        assert!(
+            sched.finished(),
+            "failed claim must not leak into the retry"
+        );
     }
 }
