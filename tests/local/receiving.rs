@@ -1147,19 +1147,21 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
     let listener = UnixListener::bind(socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
 
-    for compression in ["--compress", "--no-compress"] {
-        let output = run(&[
+    for compression in [None, Some("--no-compress")] {
+        let destination = t.s("destination");
+        let mut args = vec![
             "cp",
             "source",
             "--to",
             "127.0.0.1",
             "--as",
-            &t.s("destination"),
+            &destination,
             "--tcp-ports",
             EPHEMERAL_TCP_PORTS,
             "--performance-tuning=workers=1",
-            compression,
-        ]);
+        ];
+        args.extend(compression);
+        let output = run(&args);
         assert_output_ok(&output);
         assert_eq!(fs::read(t.path("destination")).unwrap(), b"payload");
         assert_eq!(
