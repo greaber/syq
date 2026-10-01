@@ -1433,13 +1433,23 @@ impl Worker {
         job: &WorkerJob,
         create_if_missing: bool,
     ) -> Result<crate::proto::Preparation> {
+        // An in-place file is created in its final mode; a sidecar in its
+        // staged mode, the final bits unless group preservation keeps it
+        // private until the chown, so that publication needs no chmod.
+        let mode = if job.inplace {
+            self.create_mode(job)
+        } else {
+            let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
+            meta.mode = self.create_mode(job);
+            crate::fsops::staged_file_mode(&meta, self.publication_flags(job))
+        };
         match ok(
             self.dst.call(Request::Prepare {
                 path: job.dst.clone(),
                 size: job.entry.size,
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
-                mode: self.create_mode(job),
+                mode,
                 attempt: job.attempt,
                 create_if_missing,
                 guard: job.container_guard.clone(),
