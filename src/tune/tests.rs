@@ -1411,11 +1411,12 @@ fn nested_work_guards_keep_retirement_visible_until_the_outer_operation_finishes
     assert!(!gate.measurement_ready(1));
     drop(outer);
     assert!(gate.measurement_ready(1));
-    let error: Result<(), &str> = (|| {
+    fn fail_operation(gate: &Arc<Gate>) -> Result<(), &'static str> {
         let _operation = gate.work(1);
         assert!(!gate.measurement_ready(1));
         Err("operation failed")
-    })();
+    }
+    let error = fail_operation(&gate);
     assert!(error.is_err());
     assert!(gate.measurement_ready(1), "error return releases its guard");
 }
