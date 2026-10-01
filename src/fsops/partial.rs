@@ -1414,12 +1414,20 @@ impl FsOps {
             if target.guard.is_some() {
                 bail!("guarded small-file updates require atomic publication");
             }
+            // Read a created file's metadata at once: the create has just
+            // primed an NFS client's attribute cache, so it costs nothing,
+            // and it serves the metadata step and the identity afterwards.
+            let mut created = None;
             let file = match condition {
                 // The whole file is written here and never read back.
-                TargetCondition::Absent => rooted
-                    .root
-                    .create_write_only_file(&rooted.relative, meta.mode)
-                    .with_context(|| format!("create {}", rooted.label.display()))?,
+                TargetCondition::Absent => {
+                    let file = rooted
+                        .root
+                        .create_write_only_file(&rooted.relative, meta.mode)
+                        .with_context(|| format!("create {}", rooted.label.display()))?;
+                    created = Some(file.metadata()?);
+                    file
+                }
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
                     let file = rooted.root.open_regular_write(&rooted.relative, false)?;
                     require_open_target(&file, &rooted.label, condition)?;
@@ -1447,6 +1455,7 @@ impl FsOps {
                                 .create_write_only_file(&rooted.relative, meta.mode)
                             {
                                 Ok(file) => {
+                                    created = Some(file.metadata()?);
                                     opened = Some(file);
                                     break;
                                 }
@@ -1466,8 +1475,11 @@ impl FsOps {
             };
             observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
-            set_meta_file(&file, meta, flags)
-                .with_context(|| format!("set metadata {}", rooted.label.display()))?;
+            match &created {
+                Some(created) => set_meta_written_file(&file, meta, flags, created),
+                None => set_meta_file(&file, meta, flags),
+            }
+            .with_context(|| format!("set metadata {}", rooted.label.display()))?;
             if matches!(
                 condition,
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
@@ -1480,7 +1492,10 @@ impl FsOps {
                     condition,
                 )?;
             }
-            return published_identity(&file, flags);
+            return match &created {
+                Some(created) => Ok(known_identity(created, flags)),
+                None => published_identity(&file, flags),
+            };
         }
         if target.guard.is_none()
             && matches!(
@@ -3123,11 +3138,34 @@ pub(super) fn set_meta_file_known(
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, current, false)
+    set_meta_file_inner(f, meta, flags, current, false, true)
+}
+
+/// Set a written file's metadata from the metadata read when it was created.
+/// On NFS that read costs nothing, because the create's reply has just
+/// primed the attribute cache, where one taken after the write is a request.
+/// The write since then has changed the times, so those are always set.
+pub(super) fn set_meta_written_file(
+    f: &File,
+    meta: &Meta,
+    flags: u8,
+    created: &fs::Metadata,
+) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, created, false, false)
 }
 
 pub(super) fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, &f.metadata()?, true)
+    set_meta_file_inner(f, meta, flags, &f.metadata()?, true, true)
+}
+
+/// The same for a staged file about to be published.
+pub(super) fn set_meta_written_file_for_publication(
+    f: &File,
+    meta: &Meta,
+    flags: u8,
+    created: &fs::Metadata,
+) -> Result<()> {
+    set_meta_file_inner(f, meta, flags, created, true, false)
 }
 
 fn set_meta_file_inner(
@@ -3136,6 +3174,7 @@ fn set_meta_file_inner(
     flags: u8,
     current: &fs::Metadata,
     before_publication: bool,
+    times_current: bool,
 ) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     // macOS mode and ACL must change together. Keep private staging
@@ -3178,7 +3217,9 @@ fn set_meta_file_inner(
         }
     }
     if flags & flags::TIMES != 0
-        && (current.mtime() != meta.mtime || current.mtime_nsec() as u32 != meta.mtime_nsec)
+        && (!times_current
+            || current.mtime() != meta.mtime
+            || current.mtime_nsec() as u32 != meta.mtime_nsec)
     {
         let ts = [
             timespec(0, libc::UTIME_OMIT as u32),
@@ -3244,8 +3285,17 @@ pub(super) fn published_identity(file: &File, flags: u8) -> Result<Option<(u64, 
     if flags & flags::REPORT_IDENTITY == 0 {
         return Ok(None);
     }
-    let metadata = file.metadata()?;
-    Ok(Some((metadata.dev(), metadata.ino())))
+    Ok(Some(identity_of(&file.metadata()?)))
+}
+
+/// The identity of a file from metadata read at any time since it was
+/// opened: a rename does not change it.
+pub(super) fn known_identity(metadata: &fs::Metadata, flags: u8) -> Option<(u64, u64)> {
+    (flags & flags::REPORT_IDENTITY != 0).then(|| identity_of(metadata))
+}
+
+fn identity_of(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
 }
 
 fn publication_response(identity: Option<(u64, u64)>) -> Response {

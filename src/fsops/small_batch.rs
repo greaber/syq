@@ -19,6 +19,10 @@ pub(super) struct SmallStage {
     label: PathBuf,
     file: File,
     reused: bool,
+    /// Read right after the sidecar was opened, when an NFS client answers
+    /// from the create's reply; it decides the metadata step and gives the
+    /// published identity, which a rename does not change.
+    created: fs::Metadata,
 }
 
 /// Whether a put publishes through a sidecar. In-place writes and ordinary
@@ -213,12 +217,14 @@ impl FsOps {
                 }
             })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
+        let created = file.metadata()?;
         Ok(SmallStage {
             target,
             partial,
             label,
             file,
             reused: basis_size.is_some(),
+            created,
         })
     }
 
@@ -234,7 +240,7 @@ impl FsOps {
         }
         observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
             .with_context(|| format!("write {}", stage.label.display()))?;
-        set_meta_file_for_publication(&stage.file, &put.meta, put.flags)
+        set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&stage.target.label)?;
@@ -263,7 +269,7 @@ impl FsOps {
             put.meta.inode_metadata.as_deref(),
             put.meta.mode,
         )?;
-        published_identity(&stage.file, put.flags)
+        Ok(known_identity(&stage.created, put.flags))
     }
 }
 
@@ -454,6 +460,74 @@ mod tests {
             b"contents"
         );
         assert_eq!(entries(temporary.path()), 1);
+    }
+
+    #[test]
+    fn metadata_and_identity_come_from_the_stage_read_at_creation() {
+        // The sidecar's metadata is read once, right after it is created;
+        // the mode and times set before publication, and the identity
+        // reported after it, follow from that read. A private staging mode
+        // (taken when the group is preserved) must still become the wanted
+        // mode, and the times must be set even when that read showed the
+        // wanted mtime already, because the write since then changed it: the
+        // leftover reused from an earlier attempt is given the wanted mtime
+        // before the batch finds it.
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = receiver(temporary.path());
+        let mut wanted = put("file", b"contents");
+        wanted.meta.mode = 0o640;
+        wanted.meta.gid = unsafe { libc::getegid() };
+        wanted.meta.mtime = 1_000_000_000;
+        wanted.meta.mtime_nsec = 123_456_789;
+        wanted.flags = flags::MODE | flags::GROUP | flags::TIMES | flags::REPORT_IDENTITY;
+        for leftover in [false, true] {
+            if leftover {
+                let target = ops.small_target(&wanted).unwrap();
+                let stage = ops.create_small_stage(&wanted, target).unwrap();
+                assert_eq!(stage.created.mode() & 0o777, PRIVATE_PARTIAL_MODE);
+                let times = [
+                    timespec(0, libc::UTIME_OMIT as u32),
+                    timespec(wanted.meta.mtime, wanted.meta.mtime_nsec),
+                ];
+                assert_eq!(
+                    unsafe { libc::futimens(stage.file.as_raw_fd(), times.as_ptr()) },
+                    0
+                );
+                drop(stage);
+                fs::remove_file(temporary.path().join("file")).unwrap();
+            }
+            let outcomes = ops.put_small_batch(std::slice::from_ref(&wanted));
+            let published = fs::metadata(temporary.path().join("file")).unwrap();
+            assert_eq!(
+                outcomes[0].as_ref().unwrap(),
+                &Some((published.dev(), published.ino())),
+                "leftover={leftover}"
+            );
+            assert_eq!(published.mode() & 0o7777, 0o640, "leftover={leftover}");
+            assert_eq!(
+                (published.mtime(), published.mtime_nsec()),
+                (1_000_000_000, 123_456_789),
+                "leftover={leftover}"
+            );
+            assert_eq!(
+                fs::read(temporary.path().join("file")).unwrap(),
+                b"contents"
+            );
+            assert_eq!(entries(temporary.path()), 1);
+        }
+        // The in-place path reads its new file the same way.
+        let mut inplace = wanted.clone();
+        inplace.path = b"inplace".to_vec();
+        inplace.inplace = true;
+        inplace.condition = TargetCondition::Absent;
+        let identity = ops.put_small(&inplace).unwrap();
+        let published = fs::metadata(temporary.path().join("inplace")).unwrap();
+        assert_eq!(identity, Some((published.dev(), published.ino())));
+        assert_eq!(published.mode() & 0o7777, 0o640);
+        assert_eq!(
+            (published.mtime(), published.mtime_nsec()),
+            (1_000_000_000, 123_456_789)
+        );
     }
 
     #[test]

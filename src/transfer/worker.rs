@@ -546,24 +546,18 @@ impl Worker {
             .max_batch_bytes
             .max(jobs.iter().map(|j| j.entry.size).sum());
         // Each group keeps whole files, so publication and per-file hashes
-        // are unchanged. Larger batches feed bounded read/write windows rather
-        // than reading their entire payload before the first write. Idle
-        // workers take a batch's later groups, so a batch is one group only
-        // where nothing would be gained by splitting it.
-        let pipelined =
-            self.src.supports_request_pipelining() || self.dst.supports_request_pipelining();
-        let group_bytes = if pipelined {
-            // Return the first group before collecting a full read window.
-            FAST_BATCH_READ_BYTES / crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64
-        } else {
-            // Both calls run synchronously: splitting cannot overlap work.
-            u64::MAX
-        };
-        // A same-machine copy sends to a receiver process on this machine,
-        // over a pipelined data connection whose requests cost no network
-        // round trip, so its groups stay small enough in files to share out
-        // when every file is queued at once. Groups bound for another machine
-        // keep only their byte limit: each costs a round trip.
+        // are unchanged. Every destination is a receiver process whose data
+        // connection pipelines requests, so a batch's groups feed bounded
+        // read and write windows rather than moving its whole payload before
+        // the first write, and idle workers take the later groups. Return
+        // the first group before collecting a full read window.
+        let group_bytes =
+            FAST_BATCH_READ_BYTES / crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64;
+        // A same-machine copy's receiver runs on this machine, so its
+        // requests cost no network round trip and its groups stay small
+        // enough in files to share out when every file is queued at once.
+        // Groups bound for another machine keep only their byte limit: each
+        // costs a round trip.
         let group_files = if self.opts.same_host {
             LOCAL_GROUP_FILES
         } else {
