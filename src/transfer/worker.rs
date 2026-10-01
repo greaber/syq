@@ -533,10 +533,6 @@ impl Worker {
     }
 
     pub(super) fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
-        // Issued reads/writes and the final source recheck can outlive a count
-        // reduction. Keep a work guard until all of their
-        // progress is recorded, so a lower-count sample cannot include this slot.
-        let _draining = self.gate.work(self.id);
         #[cfg(debug_assertions)]
         crate::fsops::record_test_event(
             "SYQ_TEST_WORKER_EVENTS",
@@ -1278,7 +1274,6 @@ impl Worker {
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
         let allow_sequential_local_fallback = self.sched.jobs.lock().unwrap().len() > 1;
-        let _work = self.gate.work(self.id);
         let mut credited = 0;
         let resp = self.dst.copy_local(
             Request::CopyLocal {
