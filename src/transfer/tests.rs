@@ -155,6 +155,7 @@ impl Conn for PipelineConn {
                             Ok(SmallBlock {
                                 hash: content_digest(&data),
                                 data,
+                                source: Some(pipeline_job(&read.path, read.len.into()).data.entry),
                             })
                         })
                         .collect(),
