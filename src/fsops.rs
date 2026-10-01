@@ -186,6 +186,7 @@ enum FileSystemKey {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy<'a> {
     inplace: bool,
+    replace_partial: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
     progress: &'a mut dyn FnMut(u64) -> Result<()>,
@@ -198,7 +199,7 @@ pub(crate) enum CopyLocalOutcome {
     Unsupported,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn discard_rooted_copy_partial(
     root: &Root,
     relative: &RelativePath,

@@ -708,7 +708,6 @@ fn attempt_small_copy(
     dst: &Location,
     src_ep: &Endpoint,
     dst_ep: &Endpoint,
-    src_ctl: &mut dyn Conn,
     dst_ctl: &mut dyn Conn,
     roots: &[RegisteredSourceRoot],
     source_entries: Option<Vec<Entry>>,
@@ -890,7 +889,7 @@ fn attempt_small_copy(
                 .zip(roots)
                 .zip(&entries)
                 .enumerate()
-                .filter(|(i, (_, entry))| needed[*i] && entry.size > 0)
+                .filter(|(i, _)| needed[*i])
                 .map(|(_, ((source, root), entry))| SmallRead {
                     path: source.path.clone(),
                     source: Some(root.selection.clone()),
@@ -928,17 +927,16 @@ fn attempt_small_copy(
             .into_iter();
             let mut payloads = Vec::new();
             for (i, entry) in entries.iter().enumerate().filter(|(i, _)| needed[*i]) {
-                let (data, hash) = if entry.size == 0 {
-                    (Vec::new(), opts.hash_policy.payload_algorithm().hash(&[]))
-                } else {
-                    match blocks.next() {
-                        Some(Ok(block)) if block.data.len() as u64 == entry.size => {
-                            (block.data, block.hash)
-                        }
-                        // The receiver retains the offer's directory. Fall back on a
-                        // new session if a selected source could not be read.
-                        _ => return Ok(SmallCopy::Reconnect),
+                let (data, hash) = match blocks.next() {
+                    Some(Ok(block))
+                        if block.data.len() as u64 == entry.size
+                            && !source_changed(entry, block.source.as_ref()) =>
+                    {
+                        (block.data, block.hash)
                     }
+                    // Reconnect before falling back to the engine: preparation
+                    // retained the receiver directory, but no payload was sent.
+                    _ => return Ok(SmallCopy::Reconnect),
                 };
                 payloads.push(SmallCopyPayload {
                     index: i as u32,
@@ -1051,36 +1049,8 @@ fn attempt_small_copy(
     announce_detached_ready()?;
     print_small_copy_diagnostics(args, dst_ep);
 
-    // The engine's quick check is a planning-time decision, including
-    // metadata-only repairs. Recheck only files whose content was copied or
-    // compared, not those already skipped on size/mtime.
-    let check_source: Vec<usize> = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, result)| {
-            matches!(
-                result.disposition,
-                SmallCopyDisposition::Copied | SmallCopyDisposition::ContentMatched
-            )
-            .then_some(i)
-        })
-        .collect();
-    let mut now = if check_source.is_empty() {
-        Vec::new()
-    } else {
-        stat_many_registered(
-            src_ctl,
-            check_source.iter().map(|&i| srcs[i].path.clone()).collect(),
-            Some(
-                check_source
-                    .iter()
-                    .map(|&i| roots[i].selection.clone())
-                    .collect(),
-            ),
-            false,
-        )?
-    }
-    .into_iter();
+    // Payload sources were rechecked before sending. Quick checks keep the
+    // planning-time snapshot, including metadata-only repairs.
     for ((entry, (_, rel_bytes, rel)), result) in entries.iter().zip(&targets).zip(results) {
         if result.disposition == SmallCopyDisposition::Excluded {
             progress.files_excluded.fetch_add(1, Relaxed);
@@ -1094,14 +1064,7 @@ fn attempt_small_copy(
             }
             continue;
         }
-        let now = now.next().expect("one stat per checked source");
-        let source_changed = now.as_ref().is_none_or(|e| {
-            e.kind != Kind::File
-                || e.size != entry.size
-                || e.mtime != entry.mtime
-                || e.mtime_nsec != entry.mtime_nsec
-        });
-        if result.disposition == SmallCopyDisposition::ContentMatched && !source_changed {
+        if result.disposition == SmallCopyDisposition::ContentMatched {
             progress.files_unchanged.fetch_add(1, Relaxed);
             progress.bytes_unchanged.fetch_add(entry.size, Relaxed);
             if let Some(error) = result.error {
@@ -1116,13 +1079,7 @@ fn attempt_small_copy(
                 let error = endpoint_error(error).context("put");
                 Some(("unknown", os_kind_of(&error), format!("{error:#}")))
             }
-            None => source_changed.then(|| {
-                (
-                    "yes",
-                    None,
-                    "source changed during transfer (or vanished)".to_string(),
-                )
-            }),
+            None => None,
         };
         if let Some((retryable, os_kind, message)) = failure {
             progress.error_classified(&format!("syq: {rel}: {message}"), Some("io"), os_kind);
@@ -2436,7 +2393,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             dst,
             &src_ep,
             &dst_ep,
-            &mut *src_ctl,
             &mut *dst_ctl,
             source_roots.get().expect("source roots registered"),
             small_entries,
@@ -4191,6 +4147,18 @@ fn clean_root(p: &[u8]) -> PathBytes {
         out.extend_from_slice(if absolute { b"/" } else { b"." });
     }
     out
+}
+
+fn source_changed(before: &Entry, now: Option<&Entry>) -> bool {
+    now.is_none_or(|entry| {
+        entry.kind != Kind::File
+            || entry.size != before.size
+            || entry.mtime != before.mtime
+            || entry.mtime_nsec != before.mtime_nsec
+            || (before.inode_metadata.is_some()
+                && (entry.dev, entry.ino, entry.ctime, entry.ctime_nsec)
+                    != (before.dev, before.ino, before.ctime, before.ctime_nsec))
+    })
 }
 
 fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Entry>> {

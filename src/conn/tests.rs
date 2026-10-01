@@ -146,6 +146,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
     let data = vec![42; 1 << 20];
     writer
         .write_msg(&Response::SmallBlocks(vec![Ok(SmallBlock {
+            source: None,
             hash: crate::fsops::content_digest(&data),
             data,
         })]))

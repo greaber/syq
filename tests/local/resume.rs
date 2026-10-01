@@ -1441,7 +1441,97 @@ fn impossible_sidecar_name_fails_one_file_and_continues() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn changed_source_retry_uses_published_file_as_block_basis() {
+fn vanished_source_is_not_published_on_any_filesystem_route() {
+    for route in [
+        "local", "push-tcp", "push-ssh", "pull-tcp", "pull-ssh", "relay",
+    ] {
+        for size in [0, 1024, 8 << 20] {
+            for existing in [false, true] {
+                let t = Tmp::new();
+                write(&t.path("src/file"), &vec![b'a'; size]);
+                set_mtime(&t.path("src/file"), 1_600_000_000);
+                fs::create_dir_all(t.path("dst")).unwrap();
+                if existing {
+                    write(&t.path("dst/file"), b"previous good copy");
+                    set_mtime(&t.path("dst/file"), 1_500_000_000);
+                }
+                let before = fs::metadata(t.path("dst/file")).ok();
+                let ready = t.path("source-recheck-ready");
+                let continuation = t.path("source-recheck-continue");
+                let rsh = fake_rsh(&t);
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--no-progress",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                ]);
+                if route.ends_with("ssh") {
+                    command.arg("--no-tcp");
+                }
+                if route.starts_with("pull") || route == "relay" {
+                    command.args(["--from", "source"]);
+                }
+                command.args(["--srcs-in", &t.s("src")]);
+                if route.starts_with("push") || route == "relay" {
+                    command.args(["--to", "destination"]);
+                }
+                if route == "relay" {
+                    command.args(["--coordinate-at", "local"]);
+                }
+                command
+                    .args(["--into", &t.s("dst"), "--results", &t.s("results.ndjson")])
+                    .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+                    .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = command.start().unwrap();
+                wait_for_confinement_marker(
+                    &mut child,
+                    &ready,
+                    "source recheck before publication",
+                );
+                fs::remove_file(t.path("src/file")).unwrap();
+                release_confinement_barrier(&continuation);
+                let output = child.wait_with_output().unwrap();
+                assert!(!output.status.success(), "{route}: {output:?}");
+                if let Some(before) = before {
+                    let after = fs::metadata(t.path("dst/file")).unwrap();
+                    assert_eq!(read(&t.path("dst/file")), b"previous good copy", "{route}");
+                    assert_eq!(
+                        (after.ino(), after.mtime(), after.mode()),
+                        (before.ino(), before.mtime(), before.mode()),
+                        "{route}"
+                    );
+                } else {
+                    assert!(!t.path("dst/file").exists(), "{route}");
+                }
+                let partials = partial_files(&t.path("dst"));
+                if size == 8 << 20 {
+                    assert_eq!(partials.len(), 1, "{route}: {partials:?}");
+                    assert_eq!(read(&partials[0]), vec![b'a'; size], "{route}");
+                } else {
+                    assert!(
+                        partials.is_empty(),
+                        "changed small files must not be sent: {route}"
+                    );
+                }
+                let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+                let summary: serde_json::Value =
+                    serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                assert_eq!(summary["files_transferred"], 0, "{route}: {summary}");
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn changed_source_retry_uses_unpublished_partial_as_block_basis() {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let mut changed = original.clone();
@@ -1451,8 +1541,10 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
 
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
-    let ready = t.path("finalize-ready");
-    let continuation = t.path("finalize-continue");
+    write(&t.path("dst/file"), b"previous good copy");
+    set_mtime(&t.path("dst/file"), 1_500_000_000);
+    let ready = t.path("source-recheck-ready");
+    let continuation = t.path("source-recheck-continue");
     let mut child = compat_command()
         .args([
             "-a",
@@ -1464,17 +1556,16 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
             &t.s("src/"),
             &t.s("dst/"),
         ])
-        .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
-        .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
-    // Wait for an acknowledged publication, then release it after replacing
-    // the source. The test must not race a fixed one-second sleep.
+    // Change the source after all data is written, before it can be published.
     let mut progress = std::time::Instant::now();
     wait_for(
-        "first attempt to acknowledge finalization",
+        "first attempt to reach the source recheck",
         std::time::Duration::from_secs(60),
         || {
             if ready.exists() {
@@ -1482,11 +1573,11 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "copy exited before finalization"
+                "copy exited before the source recheck"
             );
             if progress.elapsed() >= std::time::Duration::from_secs(5) {
                 eprintln!(
-                    "waiting for copy {} to acknowledge finalization: no ready signal",
+                    "waiting for copy {} to reach the source recheck: no ready signal",
                     child.id()
                 );
                 progress = std::time::Instant::now();
@@ -1494,7 +1585,7 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
             false
         },
     );
-    assert!(t.path("dst/file").exists());
+    assert_eq!(read(&t.path("dst/file")), b"previous good copy");
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
     release_confinement_barrier(&continuation);
 
@@ -1513,31 +1604,33 @@ fn changed_source_retry_uses_published_file_as_block_basis() {
     );
 }
 
-#[cfg(all(debug_assertions, target_os = "linux"))]
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
-fn changed_source_retry_still_uses_copy_file_range() {
+fn changed_source_retry_keeps_local_whole_file_copy() {
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
-    let changed = vec![b'b'; 8 * 1024 * 1024];
+    let changed = vec![b'b'; 1024];
     write(&t.path("src/file"), &original);
     set_mtime(&t.path("src/file"), 1_600_000_000);
 
     write(&t.path("replacement"), &changed);
     set_mtime(&t.path("replacement"), 1_600_000_001);
-    let ready = t.path("finalize-ready");
-    let continuation = t.path("finalize-continue");
+    write(&t.path("dst/file"), b"previous good copy");
+    set_mtime(&t.path("dst/file"), 1_500_000_000);
+    let ready = t.path("source-recheck-ready");
+    let continuation = t.path("source-recheck-continue");
     let mut child = compat_command()
         .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
-        .env("SYQ_TEST_FINALIZE_READY_FILE", &ready)
-        .env("SYQ_TEST_FINALIZE_CONTINUE_FILE", &continuation)
-        .env("SYQ_TEST_FAIL_HASH_BASIS", "1")
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+        .env("SYQ_DEBUG", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .start()
         .unwrap();
     let mut progress = std::time::Instant::now();
     wait_for(
-        "first attempt to acknowledge finalization",
+        "first attempt to reach the source recheck",
         std::time::Duration::from_secs(60),
         || {
             if ready.exists() {
@@ -1545,11 +1638,11 @@ fn changed_source_retry_still_uses_copy_file_range() {
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "copy exited before finalization"
+                "copy exited before the source recheck"
             );
             if progress.elapsed() >= std::time::Duration::from_secs(5) {
                 eprintln!(
-                    "waiting for copy {} to acknowledge finalization: no ready signal",
+                    "waiting for copy {} to reach the source recheck: no ready signal",
                     child.id()
                 );
                 progress = std::time::Instant::now();
@@ -1557,7 +1650,7 @@ fn changed_source_retry_still_uses_copy_file_range() {
             false
         },
     );
-    assert!(t.path("dst/file").exists());
+    assert_eq!(read(&t.path("dst/file")), b"previous good copy");
     fs::rename(t.path("replacement"), t.path("src/file")).unwrap();
     release_confinement_barrier(&continuation);
 
@@ -1569,6 +1662,9 @@ fn changed_source_retry_still_uses_copy_file_range() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(read(&t.path("dst/file")), changed);
+    let observed = tuning_observed(&output);
+    assert_eq!(observed["local_whole_files"], 2);
+    assert_eq!(observed["range_requests"], 0);
 }
 
 #[cfg(debug_assertions)]
