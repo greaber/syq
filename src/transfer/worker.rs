@@ -118,118 +118,143 @@ impl Worker {
                     .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
                 self.sched.next()
             };
-            match item {
-                Item::Exit => {
-                    return Ok(());
-                }
-                Item::File(idx) => {
-                    let progress = self.progress.clone();
-                    let _copying = progress.copying_interval();
-                    if self.fast_eligible(idx) {
-                        let first_bytes = self.job(idx).entry.size;
-                        let target = self
-                            .sched
-                            .begin_fast_batch(self.gate.active(), self.fast_batch_files);
-                        let mut batch = vec![idx];
-                        // Keep rate-limited batches to one file so a push can't
-                        // accumulate locally and then hit the network in a burst.
-                        if self.bwlimit.is_none() {
-                            batch.extend(self.sched.take_small_near(
-                                idx,
-                                fast_file_size_limit(&self.opts, self.bwlimit.as_deref()),
-                                target - batch.len(),
-                                self.opts.tuning.batch_bytes().saturating_sub(first_bytes),
-                            ));
-                        }
-                        let (mut fast, slow): (Vec<usize>, Vec<usize>) =
-                            batch.into_iter().partition(|&i| self.fast_eligible(i));
-                        self.sched.mark_fast(fast.len() - 1);
-                        let fast_result = self.fast_batch(&mut fast);
-                        self.sched.complete_fast_batch(fast.len());
-                        if let Err(e) = fast_result {
-                            if self.transport_dead() {
-                                for &i in &slow {
-                                    self.sched.ranges_ready(i, vec![]);
-                                }
-                                for &i in fast.iter().chain(&slow) {
-                                    self.sched.requeue(i);
-                                }
-                                return Err(e);
-                            }
-                            let message = format!("{e:#}");
-                            for &i in &fast {
-                                self.file_error(i, anyhow::anyhow!(message.clone()))?;
-                            }
-                        }
-                        for (position, &i) in slow.iter().enumerate() {
-                            if let Err(e) = self.handle_file(i) {
-                                if self.transport_dead() {
-                                    for &pending in &slow[position + 1..] {
-                                        self.sched.ranges_ready(pending, vec![]);
-                                        self.sched.requeue(pending);
-                                    }
-                                }
-                                self.file_error(i, e)?;
-                            }
-                        }
-                    } else {
-                        let res = if self.opts.dry_run {
-                            self.preview_file(idx)
-                        } else {
-                            self.handle_file(idx)
-                        };
-                        if let Err(e) = res {
-                            self.file_error(idx, e)?;
-                        }
+            if matches!(item, Item::Exit) {
+                return Ok(());
+            }
+            self.process_item(item)?;
+        }
+    }
+
+    /// A scheduled operation can keep contributing progress after the tuner
+    /// lowers the active count. Cover every path, including protocol drains,
+    /// publication and retry bookkeeping, until control returns to the queue.
+    pub(super) fn process_item(&mut self, item: Item) -> Result<()> {
+        let _work = self.gate.work(self.id);
+        // The count may have fallen while next() waited for work. Register
+        // before checking the gate so any later reduction sees this operation.
+        if !self.gate.allowed(self.id) {
+            self.sched.return_unstarted(item);
+            return Ok(());
+        }
+        match item {
+            Item::Exit => {
+                return Ok(());
+            }
+            Item::File(idx) => {
+                let progress = self.progress.clone();
+                let _copying = progress.copying_interval();
+                if self.fast_eligible(idx) {
+                    let first_bytes = self.job(idx).entry.size;
+                    let target = self
+                        .sched
+                        .begin_fast_batch(self.gate.active(), self.fast_batch_files);
+                    let mut batch = vec![idx];
+                    // Keep rate-limited batches to one file so a push can't
+                    // accumulate locally and then hit the network in a burst.
+                    if self.bwlimit.is_none() {
+                        batch.extend(self.sched.take_small_near(
+                            idx,
+                            fast_file_size_limit(&self.opts, self.bwlimit.as_deref()),
+                            target - batch.len(),
+                            self.opts.tuning.batch_bytes().saturating_sub(first_bytes),
+                        ));
                     }
-                }
-                Item::Range(h) => {
-                    let progress = self.progress.clone();
-                    let _copying = progress.copying_interval();
-                    let (idx, start) = {
-                        let range = h.lock().unwrap();
-                        (range.idx, range.pos)
-                    };
-                    let mut credited = 0;
-                    let res = self.transfer_range(&h, &mut credited);
-                    if let Err(e) = res {
+                    let (mut fast, slow): (Vec<usize>, Vec<usize>) =
+                        batch.into_iter().partition(|&i| self.fast_eligible(i));
+                    self.sched.mark_fast(fast.len() - 1);
+                    let fast_result = self.fast_batch(&mut fast);
+                    self.sched.complete_fast_batch(fast.len());
+                    if let Err(e) = fast_result {
                         if self.transport_dead() {
-                            self.retry_credited_range(&h, start, credited);
+                            for &i in &slow {
+                                self.sched.ranges_ready(i, vec![]);
+                            }
+                            for &i in fast.iter().chain(&slow) {
+                                self.sched.requeue(i);
+                            }
                             return Err(e);
                         }
-                        // Keep this range outstanding until failure is visible:
-                        // another worker must not elect itself to publish it.
-                        self.file_error(idx, e)?;
-                        self.sched.range_done(&h);
-                        continue;
-                    }
-                    let done = self.sched.range_done(&h);
-                    if done {
-                        if let Err(e) = self.finish_file(idx) {
-                            if self.transport_dead() {
-                                self.sched.requeue_finish(idx, false);
-                            }
-                            self.file_error(idx, e)?;
+                        let message = format!("{e:#}");
+                        for &i in &fast {
+                            self.file_error(i, anyhow::anyhow!(message.clone()))?;
                         }
                     }
-                }
-                Item::Finish { idx, matched } => {
-                    let progress = self.progress.clone();
-                    let _copying = progress.copying_interval();
-                    let result = if matched {
-                        self.finish_matched_file(idx)
+                    for (position, &i) in slow.iter().enumerate() {
+                        if let Err(e) = self.handle_file(i) {
+                            if self.transport_dead() {
+                                for &pending in &slow[position + 1..] {
+                                    self.sched.ranges_ready(pending, vec![]);
+                                    self.sched.requeue(pending);
+                                }
+                            }
+                            self.file_error(i, e)?;
+                        }
+                    }
+                } else {
+                    let res = if self.opts.dry_run {
+                        self.preview_file(idx)
                     } else {
-                        self.finish_file(idx)
+                        self.handle_file(idx)
                     };
-                    if let Err(e) = result {
+                    if let Err(e) = res {
+                        self.file_error(idx, e)?;
+                    }
+                }
+            }
+            Item::Range(h) => {
+                let progress = self.progress.clone();
+                let _copying = progress.copying_interval();
+                let (idx, start) = {
+                    let range = h.lock().unwrap();
+                    (range.idx, range.pos)
+                };
+                let mut credited = 0;
+                let res = self.transfer_range(&h, &mut credited);
+                if let Err(e) = res {
+                    if self.transport_dead() {
+                        self.retry_credited_range(&h, start, credited);
+                        return Err(e);
+                    }
+                    // Keep this range outstanding until failure is visible:
+                    // another worker must not elect itself to publish it.
+                    self.file_error(idx, e)?;
+                    self.sched.range_done(&h);
+                    return Ok(());
+                }
+                let done = self.sched.range_done(&h);
+                if done {
+                    if let Err(e) = self.finish_file(idx) {
                         if self.transport_dead() {
-                            self.sched.requeue_finish(idx, matched);
+                            self.sched.requeue_finish(idx, false);
                         }
                         self.file_error(idx, e)?;
                     }
                 }
             }
+            Item::Finish { idx, matched } => {
+                let progress = self.progress.clone();
+                let _copying = progress.copying_interval();
+                let result = if matched {
+                    self.finish_matched_file(idx)
+                } else {
+                    self.finish_file(idx)
+                };
+                let result = match result {
+                    Err(e) => {
+                        if self.transport_dead() {
+                            self.sched.requeue_finish(idx, matched);
+                        }
+                        self.file_error(idx, e)
+                    }
+                    Ok(()) => Ok(()),
+                };
+                // Include error handling and retry publication in the claim's
+                // lifetime; even an early error return must release it.
+                self.sched.finish_done();
+                result?;
+            }
         }
+        Ok(())
     }
 
     /// Small files are sent without a per-file protocol round trip. The
@@ -508,10 +533,6 @@ impl Worker {
     }
 
     pub(super) fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
-        // Issued reads/writes and the final source recheck can outlive a count
-        // reduction. Use the existing whole-file drain guard until all of their
-        // progress is recorded, so a lower-count sample cannot include this slot.
-        let _draining = self.gate.whole_file(self.id);
         #[cfg(debug_assertions)]
         crate::fsops::record_test_event(
             "SYQ_TEST_WORKER_EVENTS",
@@ -1253,7 +1274,6 @@ impl Worker {
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
         let allow_sequential_local_fallback = self.sched.jobs.lock().unwrap().len() > 1;
-        let _whole_file = self.gate.whole_file(self.id);
         let mut credited = 0;
         let resp = self.dst.copy_local(
             Request::CopyLocal {

@@ -83,6 +83,7 @@ struct PipelineState {
     abort_on_receive: Option<Arc<Sched>>,
     tuning_check: Option<(Arc<Sched>, Arc<Gate>, usize)>,
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
+    auto_ranges: bool,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -106,8 +107,54 @@ impl Conn for PipelineConn {
     fn check_streaming_writes(&mut self) -> Result<()> {
         Ok(())
     }
+    fn fence_streaming_writes(&mut self) -> Result<()> {
+        assert!(self.0.lock().unwrap().auto_ranges);
+        Ok(())
+    }
+    fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
+        fence?;
+        for _ in 0..sent {
+            assert!(matches!(self.recv()?, Response::Ok));
+        }
+        Ok(())
+    }
     fn send(&mut self, request: Request) -> Result<()> {
         let mut state = self.0.lock().unwrap();
+        if state.auto_ranges {
+            match &request {
+                Request::ReadRange { off, len, .. }
+                | Request::ReadComparedRange { off, len, .. } => {
+                    let data = vec![42; *len as usize];
+                    state.replies.push_back(Response::Block {
+                        off: *off,
+                        hash: content_digest(&data),
+                        data,
+                    });
+                }
+                Request::HashWindow { len, block, .. } => {
+                    state.replies.push_back(Response::Hashes(vec![
+                        [0; 32];
+                        (*len as u64).div_ceil(*block)
+                            as usize
+                    ]))
+                }
+                Request::WriteRange { .. } => state.replies.push_back(Response::Ok),
+                Request::ReadStream(stream) => {
+                    state.replies.push_back(Response::Ok);
+                    for off in (stream.off..stream.end).step_by(stream.block as usize) {
+                        let data = vec![42; (stream.end - off).min(stream.block as u64) as usize];
+                        state.replies.push_back(Response::Block {
+                            off,
+                            hash: content_digest(&data),
+                            data,
+                        });
+                    }
+                }
+                Request::StopReadStream => state.replies.push_back(Response::ReadStreamDone),
+                Request::ShrinkReadStream { .. } => {}
+                other => panic!("unexpected automatic range request {other:?}"),
+            }
+        }
         state.requests.push(request);
         state.sent_at.push(std::time::Instant::now());
         if let Some(latency) = state.latency {
@@ -2371,11 +2418,17 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
         }
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));
-        assert_eq!(sched.begin_fast_batch(1, jobs.len()), jobs.len());
-        let mut batch = vec![0];
-        batch.extend(sched.take_small(32 << 10, jobs.len() - 1, u64::MAX));
-        sched.mark_fast(batch.len() - 1);
-        let original = batch.clone();
+        // Worker 0 already owns its half. Dispatch worker 1 through the
+        // production entry point so it claims the rest and owns the sole guard.
+        let peer_count = sched.begin_fast_batch(2, jobs.len());
+        let mut peer_batch = vec![0];
+        peer_batch.extend(sched.take_small(32 << 10, peer_count - 1, u64::MAX));
+        sched.mark_fast(peer_batch.len() - 1);
+        let item = sched.next();
+        assert!(matches!(item, Item::File(idx) if !peer_batch.contains(&idx)));
+        let original: Vec<_> = (0..jobs.len())
+            .filter(|idx| !peer_batch.contains(idx))
+            .collect();
         let gate = Gate::new(2);
         gate.mark_ready(0);
         gate.mark_ready(1);
@@ -2438,7 +2491,11 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         worker.id = 1;
         worker.gate = gate.clone();
-        worker.fast_batch(&mut batch).unwrap();
+        worker.fast_batch_files = jobs.len();
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.tuning.copy_path = None;
+        opts.tuning.request_size = Some(4 << 20);
+        worker.process_item(item).unwrap();
         assert_eq!(
             worker.progress.files_done.load(Relaxed),
             issued_files as u64
@@ -2448,6 +2505,16 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
             (issued_files as u64) << 15
         );
         let source = src.lock().unwrap();
+        let mut pending: std::collections::BTreeSet<_> = original.iter().copied().collect();
+        for request in &source.requests {
+            if let Request::ReadSmallBatch(reads) = request {
+                for read in reads {
+                    let idx = jobs.iter().position(|job| job.src == read.path).unwrap();
+                    assert!(pending.remove(&idx), "read an unowned or duplicate file");
+                }
+            }
+        }
+        assert_eq!(pending.len(), original.len() - issued_files);
         assert_eq!(
             source.requests.len(),
             issued_groups + usize::from(issued_files > 0),
@@ -2474,7 +2541,7 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
             let state = endpoint.lock().unwrap();
             let (work, ready) = &state.tuning_snapshots[0];
             assert_eq!(work.queued_files, 0);
-            assert_eq!(work.unread_batch_files, jobs.len() - issued_files);
+            assert_eq!(work.unread_batch_files, original.len() - issued_files);
             assert!(work.parallel, "another worker can use the unread groups");
             assert!(!ready, "the retiring worker still contributes traffic");
         }
@@ -2482,9 +2549,7 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
             gate.measurement_ready(1),
             "lower-count observations may begin after drain"
         );
-        sched.complete_fast_batch(batch.len());
-        let mut pending: std::collections::BTreeSet<_> =
-            original[issued_files..].iter().copied().collect();
+        sched.complete_fast_batch(peer_batch.len());
         while !pending.is_empty() {
             let Item::File(idx) = sched.next() else {
                 panic!("unissued work must remain available")
@@ -2496,5 +2561,381 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
             assert!(sched.ranges_ready(idx, vec![]).is_none());
         }
         assert!(sched.finished());
+    }
+}
+
+#[test]
+fn range_dispatch_excludes_retiring_workers_through_both_endpoint_drains() {
+    for path in ["ranges", "comparison", "streaming"] {
+        for retire_at_source in [true, false] {
+            let (sched, handle, job) = pipeline_ranges(&[(0, 16384), (32768, 33792)]);
+            if path == "comparison" {
+                sched.jobs.lock().unwrap()[0].compare_ranges = true;
+            }
+            let gate = Gate::new(2);
+            gate.mark_ready(0);
+            gate.mark_ready(1);
+            let src = Arc::new(Mutex::new(PipelineState {
+                auto_ranges: true,
+                gate_changes: if retire_at_source {
+                    vec![(if path == "streaming" { 2 } else { 1 }, gate.clone(), 1)]
+                } else {
+                    vec![]
+                },
+                tuning_check: Some((sched.clone(), gate.clone(), 1)),
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState {
+                auto_ranges: true,
+                gate_changes: if retire_at_source {
+                    vec![]
+                } else {
+                    vec![(1, gate.clone(), 1)]
+                },
+                tuning_check: Some((sched.clone(), gate.clone(), 1)),
+                ..Default::default()
+            }));
+            let mut worker = pipeline_worker(&sched, &src, &dst, path == "streaming");
+            worker.id = 1;
+            worker.gate = gate.clone();
+            assert!(gate.measurement_ready(1));
+            worker.process_item(Item::Range(handle)).unwrap();
+            assert!(!gate.allowed(1));
+            assert!(job.done.load(Relaxed) > 0, "path={path}");
+            for endpoint in [&src, &dst] {
+                let state = endpoint.lock().unwrap();
+                assert!(!state.tuning_snapshots.is_empty(), "path={path}");
+                assert!(
+                    state.tuning_snapshots.iter().all(|(_, ready)| !ready),
+                    "path={path}: retiring worker contributed traffic to the smaller count"
+                );
+                assert!(
+                    state.replies.is_empty(),
+                    "path={path}: replies left undrained"
+                );
+            }
+            assert!(
+                gate.measurement_ready(1),
+                "path={path}: draining flag leaked"
+            );
+            assert!(!sched.finished(), "unread work remains for the kept worker");
+        }
+    }
+}
+
+#[test]
+fn retired_dispatch_returns_unstarted_work_without_endpoint_requests() {
+    for kind in ["file", "range", "finish", "matched-finish"] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(pipeline_job(b"source", 4096));
+        sched.scan_done();
+        let file = sched.next();
+        assert!(matches!(file, Item::File(0)));
+        let item = match kind {
+            "file" => file,
+            "range" => Item::Range(sched.ranges_ready(0, vec![(0, 4096)]).unwrap()),
+            _ => {
+                sched.ranges_ready(0, vec![]);
+                sched.requeue_finish(0, kind == "matched-finish");
+                sched.next()
+            }
+        };
+        let gate = Gate::new(2);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        // Model a reduction after next() returns but before requests start.
+        gate.set_active(1);
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.id = 1;
+        worker.gate = gate.clone();
+        assert!(
+            !sched.finished(),
+            "the tuner must see the claimed {kind} before the worker returns it"
+        );
+        worker.process_item(item).unwrap();
+        assert!(!sched.finished(), "returned {kind} work remains runnable");
+        assert!(src.lock().unwrap().requests.is_empty());
+        assert!(dst.lock().unwrap().requests.is_empty());
+        assert!(gate.measurement_ready(1));
+        match sched.next() {
+            Item::File(0) if kind == "file" => {
+                sched.ranges_ready(0, vec![]);
+            }
+            Item::Range(handle) if kind == "range" => {
+                let r = handle.lock().unwrap();
+                assert_eq!((r.idx, r.pos, r.end), (0, 0, 4096));
+                drop(r);
+                assert!(sched.range_done(&handle));
+            }
+            Item::Finish { idx: 0, matched } if kind.ends_with("finish") => {
+                assert_eq!(matched, kind == "matched-finish");
+                assert!(!sched.finished(), "claimed publication is still live");
+                sched.finish_done();
+            }
+            _ => panic!("lost or changed returned {kind} assignment"),
+        }
+        assert!(matches!(sched.next(), Item::Exit), "kind={kind}");
+        assert!(sched.finished(), "kind={kind}");
+    }
+}
+
+#[test]
+fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
+    for matched in [false, true] {
+        for source_fails in [false, true] {
+            let sched = Arc::new(Sched::new(512, 8192));
+            let job = pipeline_job(b"source", 4096);
+            job.done.store(4096, Relaxed);
+            sched.push_file(job.clone());
+            sched.scan_done();
+            assert!(matches!(sched.next(), Item::File(0)));
+            sched.ranges_ready(0, vec![]);
+            let gate = Gate::new(2);
+            gate.mark_ready(0);
+            gate.mark_ready(1);
+            let src = Arc::new(Mutex::new(PipelineState {
+                replies: [if source_fails {
+                    Response::Err("injected recheck failure".into())
+                } else {
+                    Response::Stats(vec![Some(job.entry.clone())])
+                }]
+                .into(),
+                gate_changes: vec![(1, gate.clone(), 1)],
+                tuning_check: Some((sched.clone(), gate.clone(), 1)),
+                ..Default::default()
+            }));
+            let dst = Arc::new(Mutex::new(PipelineState {
+                replies: if matched {
+                    Default::default()
+                } else {
+                    [Response::Ok].into()
+                },
+                gate_changes: vec![(1, gate.clone(), 1)],
+                tuning_check: Some((sched.clone(), gate.clone(), 1)),
+                ..Default::default()
+            }));
+            let mut worker = pipeline_worker(&sched, &src, &dst, false);
+            worker.id = 1;
+            worker.gate = gate.clone();
+            worker.progress.files_total.store(1, Relaxed);
+            sched.requeue_finish(0, matched);
+            let item = sched.next();
+            assert!(!sched.finished());
+            worker.process_item(item).unwrap();
+            assert!(
+                sched.finished(),
+                "publication claim leaked on success or failure"
+            );
+            assert!(!gate.allowed(1));
+            assert!(gate.measurement_ready(1));
+            assert_eq!(
+                worker.progress.files_done.load(Relaxed),
+                u64::from(!source_fails && !matched)
+            );
+            assert_eq!(
+                worker.progress.files_unchanged.load(Relaxed),
+                u64::from(!source_fails && matched)
+            );
+            assert_eq!(
+                worker.progress.errors.load(Relaxed),
+                u64::from(source_fails)
+            );
+            for endpoint in [&src, &dst] {
+                let state = endpoint.lock().unwrap();
+                assert!(state.tuning_snapshots.iter().all(|(_, ready)| !ready));
+                assert!(state.replies.is_empty());
+            }
+            assert_eq!(src.lock().unwrap().received, 1, "source recheck ran");
+            assert_eq!(dst.lock().unwrap().received, usize::from(!matched));
+        }
+    }
+}
+
+#[test]
+fn returned_last_publication_is_completed_by_the_remaining_worker() {
+    for matched in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let job = pipeline_job(b"source", 4096);
+        job.done.store(4096, Relaxed);
+        sched.push_file(job.clone());
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        sched.ranges_ready(0, vec![]);
+        sched.requeue_finish(0, matched);
+        let item = sched.next();
+        let gate = Gate::new(2);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        gate.set_active(1);
+        // This is the reviewer's race: worker 1 has the last publication,
+        // but is retired before dispatch. The tuner must not observe completion.
+        assert!(!sched.finished());
+        let src = Arc::new(Mutex::new(PipelineState {
+            replies: [Response::Stats(vec![Some(job.entry.clone())])].into(),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            replies: if matched {
+                Default::default()
+            } else {
+                [Response::Ok].into()
+            },
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.id = 1;
+        worker.gate = gate;
+        worker.progress.files_total.store(1, Relaxed);
+        worker.process_item(item).unwrap();
+        assert!(!sched.finished());
+        assert!(src.lock().unwrap().requests.is_empty());
+        assert!(dst.lock().unwrap().requests.is_empty());
+        worker.id = 0;
+        worker.process_item(sched.next()).unwrap();
+        assert!(sched.finished());
+        assert!(matches!(sched.next(), Item::Exit));
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            u64::from(!matched)
+        );
+        assert_eq!(
+            worker.progress.files_unchanged.load(Relaxed),
+            u64::from(matched)
+        );
+    }
+}
+
+#[test]
+fn publication_connection_failure_releases_claim_after_queuing_retry() {
+    for matched in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        let job = pipeline_job(b"source", 4096);
+        job.done.store(4096, Relaxed);
+        sched.push_file(job.clone());
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(0)));
+        sched.ranges_ready(0, vec![]);
+        sched.requeue_finish(0, matched);
+        let src = Arc::new(Mutex::new(PipelineState {
+            fail_receive: Some(1),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            replies: if matched {
+                Default::default()
+            } else {
+                [Response::Ok].into()
+            },
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let error = worker.process_item(sched.next()).unwrap_err();
+        assert!(error.to_string().contains("injected connection loss"));
+        assert!(!sched.finished(), "retry is still runnable");
+        // Replace the failed source connection, then consume the same publication.
+        *src.lock().unwrap() = PipelineState {
+            replies: [Response::Stats(vec![Some(job.entry.clone())])].into(),
+            ..Default::default()
+        };
+        if !matched {
+            dst.lock().unwrap().replies.push_back(Response::Ok);
+        }
+        worker.progress.files_total.store(1, Relaxed);
+        worker.process_item(sched.next()).unwrap();
+        assert!(
+            sched.finished(),
+            "failed claim must not leak into the retry"
+        );
+    }
+}
+
+#[test]
+fn local_copy_dispatch_keeps_retirement_guard_through_progress_and_failures() {
+    for failure in [
+        "none",
+        "copy-disconnect",
+        "finalize-disconnect",
+        "source-error",
+    ] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        // Above the local small-file threshold, so dispatch selects CopyLocal.
+        let job = pipeline_job(b"source", 128 << 10);
+        sched.push_file(job.clone());
+        sched.scan_done();
+        let item = sched.next();
+        let gate = Gate::new(2);
+        gate.mark_ready(0);
+        gate.mark_ready(1);
+        let src = Arc::new(Mutex::new(PipelineState {
+            replies: [if failure == "source-error" {
+                Response::Err("injected recheck failure".into())
+            } else {
+                Response::Stats(vec![Some(job.entry.clone())])
+            }]
+            .into(),
+            tuning_check: Some((sched.clone(), gate.clone(), 1)),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            replies: [
+                Response::CopyLocalProgress(64 << 10),
+                Response::Ok,
+                Response::Ok,
+            ]
+            .into(),
+            fail_receive: match failure {
+                "copy-disconnect" => Some(2),
+                "finalize-disconnect" => Some(3),
+                _ => None,
+            },
+            gate_changes: vec![(1, gate.clone(), 1)],
+            tuning_check: Some((sched.clone(), gate.clone(), 1)),
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        worker.id = 1;
+        worker.gate = gate.clone();
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.same_host = true;
+        opts.dst_remote = false;
+        opts.tuning.copy_path = None;
+        let result = worker.process_item(item);
+        assert_eq!(
+            result.is_err(),
+            failure.ends_with("disconnect"),
+            "{failure}"
+        );
+        assert!(!gate.allowed(1));
+        assert!(gate.measurement_ready(1), "guard leaked on {failure}");
+        assert!(matches!(
+            dst.lock().unwrap().requests[0],
+            Request::CopyLocal { .. }
+        ));
+        for endpoint in [&src, &dst] {
+            let state = endpoint.lock().unwrap();
+            assert!(
+                state.tuning_snapshots.iter().all(|(_, ready)| !ready),
+                "{failure}: retired local-copy work leaked into a lower-count sample"
+            );
+        }
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            if failure == "copy-disconnect" {
+                0
+            } else {
+                job.entry.size
+            }
+        );
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            u64::from(failure == "none")
+        );
+        assert_eq!(
+            worker.progress.errors.load(Relaxed),
+            u64::from(failure == "source-error")
+        );
+        assert_eq!(sched.finished(), !failure.ends_with("disconnect"));
     }
 }

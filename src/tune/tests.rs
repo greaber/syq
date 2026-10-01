@@ -1206,22 +1206,22 @@ fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
 }
 
 #[test]
-fn whole_file_reductions_wait_for_excess_writers_to_finish() {
+fn reductions_wait_for_excess_workers_to_finish() {
     let gate = Gate::new(4);
     for id in 0..4 {
         gate.mark_ready(id);
     }
-    let kept = gate.whole_file(0);
-    let excess = gate.whole_file(3);
-    assert!(!gate.whole_files_draining(4));
+    let kept = gate.work(0);
+    let excess = gate.work(3);
+    assert!(!gate.workers_draining(4));
     gate.set_active(2);
     assert!(gate.ready_through(2));
-    assert!(gate.whole_files_draining(2));
+    assert!(gate.workers_draining(2));
     drop(excess);
-    assert!(!gate.whole_files_draining(2));
+    assert!(!gate.workers_draining(2));
     // Work in the retained configuration does not delay its own measurement.
     drop(kept);
-    assert!(!gate.whole_files_draining(2));
+    assert!(!gate.workers_draining(2));
 }
 
 #[test]
@@ -1396,4 +1396,27 @@ fn driver_explores_while_all_queued_files_belong_to_shareable_batches() {
     );
     sched.finish_fast_groups(&handle);
     sched.complete_fast_batch(32);
+}
+
+#[test]
+fn nested_work_guards_keep_retirement_visible_until_the_outer_operation_finishes() {
+    let gate = Gate::new(2);
+    gate.mark_ready(0);
+    gate.mark_ready(1);
+    let outer = gate.work(1);
+    let inner = gate.work(1);
+    gate.set_active(1);
+    assert!(!gate.measurement_ready(1));
+    drop(inner);
+    assert!(!gate.measurement_ready(1));
+    drop(outer);
+    assert!(gate.measurement_ready(1));
+    fn fail_operation(gate: &Arc<Gate>) -> Result<(), &'static str> {
+        let _operation = gate.work(1);
+        assert!(!gate.measurement_ready(1));
+        Err("operation failed")
+    }
+    let error = fail_operation(&gate);
+    assert!(error.is_err());
+    assert!(gate.measurement_ready(1), "error return releases its guard");
 }

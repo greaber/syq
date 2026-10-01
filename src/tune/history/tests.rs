@@ -694,13 +694,13 @@ fn trace_clock_units_match_the_driver() {
 
 #[test]
 fn driver_excludes_draining_writers_and_the_first_interval_after_drain() {
-    use crate::tune::{Gate, Meter, Policy, State, WholeFile};
+    use crate::tune::{Gate, Meter, Policy, State, WorkGuard};
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     struct Progress {
         history: Recorder,
         sched: Arc<crate::sched::Sched>,
         start: Instant,
-        excess: Mutex<Option<WholeFile>>,
+        excess: Mutex<Option<WorkGuard>>,
         drained: AtomicBool,
     }
     impl Meter for Progress {
@@ -732,7 +732,7 @@ fn driver_excludes_draining_writers_and_the_first_interval_after_drain() {
     for id in 0..4 {
         gate.mark_ready(id);
     }
-    let excess = gate.whole_file(3);
+    let excess = gate.work(3);
     gate.set_active(2);
     let mut policy = Policy::new(2, 1, 4);
     policy.state = State::Explore {
