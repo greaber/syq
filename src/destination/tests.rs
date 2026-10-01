@@ -286,6 +286,7 @@ fn approve(registration: &Registration, command: Vec<Vec<u8>>, request: CopyRequ
     let (_, reply) = exchange(
         registration,
         Message::Request {
+            cwd: String::new(),
             command,
             request: Box::new(request),
         },
@@ -391,6 +392,7 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
         exchange(
             &registration,
             Message::Request {
+                cwd: String::new(),
                 command,
                 request: Box::new(request),
             },
@@ -769,6 +771,7 @@ fn named_limits_and_scope_validation_precede_approval() {
     assert!(exchange(
         &registration,
         Message::Request {
+            cwd: String::new(),
             command,
             request: Box::new(request),
         },

@@ -144,13 +144,19 @@ enum Message {
         command: Vec<Vec<u8>>,
         request: crate::s3::authorization::Request,
     },
+    // `cwd` is the requesting process's working directory, shown with the
+    // command; it is not enforced.
     Request {
         command: Vec<Vec<u8>>,
+        #[serde(default)]
+        cwd: String,
         request: Box<CopyRequest>,
     },
     Forward {
         target: String,
         command: Vec<Vec<u8>>,
+        #[serde(default)]
+        cwd: String,
         request: Box<CopyRequest>,
     },
     Open {
@@ -802,6 +808,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         &registration,
         Message::Request {
             command: crate::approval_command::current()?,
+            cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },
         REQUEST_TIMEOUT + Duration::from_secs(10),
@@ -946,6 +953,7 @@ impl Receiver {
     fn authorize_request(
         &self,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &CopyRequest,
         socket: &UnixStream,
         generation: u64,
@@ -974,6 +982,7 @@ impl Receiver {
             self.approvals.request(
                 &self.requester,
                 command,
+                cwd,
                 request,
                 self.notifications,
                 cancelled,
@@ -1024,9 +1033,14 @@ impl Receiver {
             Message::Forward {
                 target,
                 command,
+                cwd,
                 request,
-            } => self.forward(target, command, *request, stream),
-            Message::Request { command, request } => {
+            } => self.forward(target, command, cwd, *request, stream),
+            Message::Request {
+                command,
+                cwd,
+                request,
+            } => {
                 let _request = self.request_lock.try_lock().map_err(|_| {
                     anyhow::anyhow!(
                         "another transfer is awaiting approval; retry after it is decided"
@@ -1077,6 +1091,7 @@ impl Receiver {
                     crate::restricted::named_authority(&container, request.clone())?;
                 self.authorize_request(
                     &command,
+                    &cwd,
                     &request,
                     &stream.try_clone()?,
                     generation,

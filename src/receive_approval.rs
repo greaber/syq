@@ -14,9 +14,12 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(300);
-/// Desktop prompts show about this much of a requesting command; Details and
-/// `persist receive pending` show all of it.
+/// Desktop prompts show about this much of a requesting command;
+/// `persist receive pending` shows all of it.
 const DESKTOP_COMMAND_CHARS: usize = 400;
+/// Longer titles are truncated by the macOS dialog; the directory then moves
+/// into the body.
+const TITLE_CHARS: usize = 40;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -53,13 +56,6 @@ impl Kind {
     pub(crate) fn is_copy(&self) -> bool {
         *self == Self::Copy
     }
-    fn question(self) -> &'static str {
-        match self {
-            Self::Copy => "Allow this copy?",
-            Self::Command => "Run this command?",
-            Self::Storage => "Authorize storage access?",
-        }
-    }
 }
 
 /// Who is asking: the server as this machine names it, and the receiving
@@ -88,10 +84,14 @@ pub(crate) struct Summary {
     // Local desktop presentation only: preserve the released pending JSON shape.
     #[serde(skip)]
     server: String,
+    /// The requesting process's working directory, as the server showed it.
     #[serde(skip)]
-    profile: String,
+    server_cwd: String,
+    /// Copy sources as the command named them, and the resolved destination.
     #[serde(skip)]
-    desktop_copy_notice: String,
+    sources: String,
+    #[serde(skip)]
+    target: String,
     #[serde(skip)]
     desktop_storage: Option<String>,
     #[serde(flatten)]
@@ -135,6 +135,7 @@ impl Summary {
     fn new(
         from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &crate::destination::CopyRequest,
         lifetime: Duration,
         remote: Option<&str>,
@@ -166,11 +167,35 @@ impl Summary {
                 format!("{permission}. Uses this machine's SSH access to {target:?} and installs the syq helper there if needed"),
             ),
         };
+        // Sources stay as the command wrote them, relative to `cwd` on the
+        // server; only the destination is resolved, by this machine.
+        let sources = crate::approval_command::parse(command)
+            .map(|args| {
+                let count = args.locations.len().saturating_sub(1);
+                args.locations
+                    .iter()
+                    .take(count)
+                    .map(|location| crate::approval_command::display_arg(&location.path))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let target = match remote {
+            None => crate::approval_command::abbreviate_home(
+                &request.copy.destination,
+                std::env::var_os("HOME").as_deref(),
+            ),
+            Some(target) => crate::approval_command::display_arg(
+                &[target.as_bytes(), b":", request.destination.as_slice()].concat(),
+            ),
+        };
         Ok(Self {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
             from: format!("{:?}", from.to_string()),
             server: from.server.clone(),
-            profile: from.profile.clone(),
+            server_cwd: cwd.to_owned(),
+            sources,
+            target,
             details: Details::Copy {
                 destination,
                 permission,
@@ -183,12 +208,25 @@ impl Summary {
                 + lifetime.as_secs(),
             notification: "starting".into(),
             command: crate::approval_command::display(command),
-            desktop_copy_notice: copy_notice(request, remote),
             desktop_storage: None,
         })
     }
+    /// The server and, when it fits the title bar, its working directory;
+    /// otherwise the directory prefixes the command line like a shell prompt.
+    fn title_and_prefix(&self) -> (String, String) {
+        let short = format!("syq on {}", self.server);
+        if self.server_cwd.is_empty() {
+            return (short, String::new());
+        }
+        let long = format!("{short} in {}", self.server_cwd);
+        if long.chars().count() <= TITLE_CHARS {
+            (long, String::new())
+        } else {
+            (short, format!("{} $ ", self.server_cwd))
+        }
+    }
     fn title(&self) -> String {
-        format!("syq @{}: {}", self.profile, self.kind().question())
+        self.title_and_prefix().0
     }
     pub(crate) fn kind(&self) -> Kind {
         match self.details {
@@ -208,9 +246,8 @@ impl Summary {
         crate::approval_command::render(&self.command, limit, plain, server_input)
     }
     /// Keep the decision visible; the full description remains available in
-    /// the macOS Details view and in `persist receive pending` on both platforms.
-    /// With `markup`, the text is escaped for notify-send and server inputs are
-    /// italic.
+    /// `persist receive pending` on both platforms. With `markup`, the text is
+    /// escaped for notify-send and server inputs are italic.
     fn desktop_description(&self, markup: bool) -> String {
         let text = |text: &str| {
             if markup {
@@ -219,37 +256,41 @@ impl Summary {
                 text.to_owned()
             }
         };
-        // Who, then what they ran, then what allowing it does. The command
-        // already names the destination, so nothing is repeated.
-        let (lead, command, body) = match &self.details {
-            Details::Command { argv, cwd, .. } => (
-                format!("{} asks to run in {cwd}:", self.server),
-                text(&argv.join(" ")),
-                "Runs with your permissions; the copy root and limits do not apply.".to_owned(),
-            ),
-            Details::Storage { description, .. } => (
-                format!("{} is running:", self.server),
-                self.desktop_command(markup),
-                self.desktop_storage
-                    .clone()
-                    .unwrap_or_else(|| description.clone()),
-            ),
-            Details::Copy { max_delete, .. } => {
-                let mut body = self.desktop_copy_notice.clone();
-                if *max_delete > 0 {
-                    body.push_str(&format!(" May delete up to {max_delete} files or folders."));
+        match &self.details {
+            // What moves where, then the command that does it. The title names
+            // the server and its directory, so nothing here repeats them.
+            Details::Copy { .. } => {
+                let arrow = if self.sources.is_empty() {
+                    self.target.clone()
+                } else {
+                    format!("{} -> {}", self.sources, self.target)
+                };
+                let command = self.desktop_command(markup);
+                if command.is_empty() {
+                    return text(&arrow);
                 }
-                (
-                    format!("{} is running:", self.server),
-                    self.desktop_command(markup),
-                    body,
+                let (_, prefix) = self.title_and_prefix();
+                format!("{}\n{}{command}", text(&arrow), text(&prefix))
+            }
+            Details::Command { argv, cwd, .. } => format!(
+                "{}\n{}\n\n{}",
+                text(&format!("{} asks to run in {cwd}:", self.server)),
+                text(&argv.join(" ")),
+                text("Runs with your permissions; the copy root and limits do not apply.")
+            ),
+            Details::Storage { description, .. } => {
+                let body = self.desktop_storage.as_deref().unwrap_or(description);
+                let command = self.desktop_command(markup);
+                if command.is_empty() {
+                    return text(body);
+                }
+                format!(
+                    "{}\n{command}\n\n{}",
+                    text(&format!("{} is running:", self.server)),
+                    text(body)
                 )
             }
-        };
-        if command.is_empty() {
-            return text(&body);
         }
-        format!("{}\n{command}\n\n{}", text(&lead), text(&body))
     }
     fn desktop_command(&self, markup: bool) -> String {
         let text = |text: &str| {
@@ -299,88 +340,6 @@ impl Summary {
         )
     }
 }
-/// One sentence on what allowing the copy does. For a local destination, the
-/// named mutation roots are inspected (never their children or contents) to
-/// tell creating from overwriting. This is a local hint, not a restriction on
-/// the approved policy or a promise that names cannot change before
-/// execution. A `remote` destination is not contacted using the receiving
-/// machine's credentials before approval.
-fn copy_notice(request: &crate::destination::CopyRequest, remote: Option<&str>) -> String {
-    use crate::delegation::{ExistingDestinationPolicy, RootExistence};
-    let options = &request.copy.options;
-    let existing = request.copy.policy.existing;
-    let new_root = request.constraints.root_existence == RootExistence::New;
-    if let Some(target) = remote {
-        let effect = if options.dry_run {
-            "writes nothing (preview only)"
-        } else if options.verify_only {
-            "writes nothing (compares contents only)"
-        } else if existing == ExistingDestinationPolicy::Skip {
-            "adds files there, keeping existing ones"
-        } else if existing == ExistingDestinationPolicy::MustExist {
-            "changes existing files there only"
-        } else if new_root {
-            "creates new files there"
-        } else {
-            "may overwrite files there"
-        };
-        return format!("Uses your SSH access to {target:?} and {effect}.");
-    }
-    let path = format!(
-        "{:?}",
-        std::ffi::OsStr::from_bytes(&request.copy.destination)
-    );
-    if options.dry_run {
-        return format!("Preview only; nothing is written to {path}.");
-    }
-    if options.verify_only {
-        return format!("Compares contents only; nothing is written to {path}.");
-    }
-    if existing == ExistingDestinationPolicy::Skip {
-        return format!("Adds to {path}; existing files are kept.");
-    }
-    if existing == ExistingDestinationPolicy::MustExist {
-        return format!("Changes existing files in {path} only.");
-    }
-    let creates = format!("Creates {path}.");
-    if new_root {
-        return creates;
-    }
-    // Unknown counts as possibly existing. Keep work small even for a request
-    // containing many source names or very deep paths. Existing directory
-    // scopes need no recursive inspection: merging into them can overwrite
-    // children whose names are not yet known.
-    let overwrite = || format!("May overwrite {path}.");
-    if request.copy.mutation_scopes.is_empty() || request.copy.mutation_scopes.len() > 32 {
-        return overwrite();
-    }
-    let Ok(root) = crate::rooted::Root::open(std::path::Path::new("/")) else {
-        return overwrite();
-    };
-    for scope in &request.copy.mutation_scopes {
-        let Some(relative) = scope.path.strip_prefix(b"/") else {
-            return overwrite();
-        };
-        if relative.split(|byte| *byte == b'/').count() > 32 {
-            return overwrite();
-        }
-        let Ok(relative) = crate::rooted::RelativePath::new(relative) else {
-            return overwrite();
-        };
-        match root.metadata(&relative) {
-            Ok(_) => return overwrite(),
-            Err(error)
-                if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                }) => {}
-            Err(_) => return overwrite(),
-        }
-    }
-    creates
-}
-
 /// A short storage prompt: what the approval lets the server do, beyond the
 /// command shown above it. The full description stays in Details.
 fn storage_access(command: &[Vec<u8>], request: &crate::s3::authorization::Request) -> String {
@@ -482,28 +441,31 @@ impl Queue {
         &self,
         from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, command, request, TIMEOUT, None)?,
+            Summary::new(from, command, cwd, request, TIMEOUT, None)?,
             notifications,
             TIMEOUT,
             cancelled,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_remote(
         &self,
         from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         target: &str,
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, command, request, TIMEOUT, Some(target))?,
+            Summary::new(from, command, cwd, request, TIMEOUT, Some(target))?,
             notifications,
             TIMEOUT,
             cancelled,
@@ -523,11 +485,12 @@ impl Queue {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
             from: format!("{:?}", from.to_string()),
             server: from.server.clone(),
-            profile: from.profile.clone(),
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
             notification: "starting".into(),
             command: Vec::new(),
-            desktop_copy_notice: String::new(),
+            server_cwd: String::new(),
+            sources: String::new(),
+            target: String::new(),
             desktop_storage: None,
             details: Details::Command {
                 kind: CommandKind::Command,
@@ -619,12 +582,13 @@ impl Queue {
                 id: id.iter().map(|b| format!("{b:02x}")).collect(),
                 from: format!("{:?}", from.to_string()),
                 server: from.server.clone(),
-                profile: from.profile.clone(),
                 expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                     + TIMEOUT.as_secs(),
                 notification: "starting".into(),
                 command: crate::approval_command::display(command),
-                desktop_copy_notice: String::new(),
+                server_cwd: String::new(),
+                sources: String::new(),
+                target: String::new(),
                 desktop_storage: Some(storage_access(command, request)),
                 details: Details::Storage {
                     kind: StorageKind::Storage,
@@ -768,27 +732,11 @@ fn escape_markup(text: &str) -> String {
 #[cfg(target_os = "macos")]
 const APPLESCRIPT: &str = r#"on run argv
     try
-        set expiresAt to (current date) + (item 2 of argv as integer)
-        set body to item 1 of argv
-        set choices to {"Allow once", "Details", "Deny"}
-        repeat
-            set remainingSeconds to (expiresAt - (current date)) as integer
-            if remainingSeconds <= 0 then return "expired"
-            set answer to display dialog body with title (item 3 of argv) buttons choices default button "Deny" cancel button "Deny" giving up after remainingSeconds
-            if gave up of answer then return "expired"
-            set choice to button returned of answer
-            if choice is "Details" then
-                set body to item 4 of argv
-                set choices to {"Allow once", "Back", "Deny"}
-            else if choice is "Back" then
-                set body to item 1 of argv
-                set choices to {"Allow once", "Details", "Deny"}
-            else if choice is "Allow once" then
-                return "allow"
-            else
-                return "deny"
-            end if
-        end repeat
+        set remainingSeconds to item 2 of argv as integer
+        set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Allow once", "Deny"} default button "Deny" cancel button "Deny" giving up after remainingSeconds
+        if gave up of answer then return "expired"
+        if button returned of answer is "Allow once" then return "allow"
+        return "deny"
     on error number -128
         return "deny"
     end try
@@ -806,7 +754,6 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
             &description,
             &lifetime.as_secs().max(1).to_string(),
             &title,
-            &summary.details_description(str::to_owned),
         ]);
         cmd
     }
@@ -822,10 +769,7 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
         .arg(format!("--expire-time={}", lifetime.as_millis()))
         .arg("--")
         .arg(&title)
-        .arg(format!(
-            "{description}\n\n{}",
-            escape_markup("Details: syq persist receive pending")
-        ));
+        .arg(description);
         cmd
     }
 }
@@ -924,7 +868,6 @@ mod tests {
             id: "request".into(),
             from: "\"server (receiving profile @laptop)\"".into(),
             server: "server".into(),
-            profile: "laptop".into(),
             details: Details::Copy {
                 destination: "/tmp/receiving".into(),
                 permission: "May create and overwrite".into(),
@@ -936,7 +879,9 @@ mod tests {
             expires_at: 0,
             notification: String::new(),
             command: Vec::new(),
-            desktop_copy_notice: "May overwrite \"/tmp/receiving\".".into(),
+            server_cwd: "~/rt-bench".into(),
+            sources: "dbg".into(),
+            target: "~/Downloads/server/dbg".into(),
             desktop_storage: None,
         }
     }
@@ -1016,26 +961,35 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_checks_names_without_scanning_or_following_links() {
-        use std::os::unix::fs::symlink;
+    fn prompts_show_command_sources_and_the_resolved_destination() {
         let temp = crate::test_support::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let missing = root.join("missing");
-        let request = copy_request(&missing);
-        let creates = format!("Creates {:?}.", missing);
-        assert_eq!(copy_notice(&request, None), creates);
+        let path = temp.path().canonicalize().unwrap().join("dbg");
+        let request = copy_request(&path);
+        let command: Vec<Vec<u8>> = ["cp", "rt-bench/dbg", "--to", "@laptop", "--as", "dbg"]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let summary = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &request,
+            TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         assert_eq!(
-            copy_notice(&copy_request(&missing.join("child")), None),
-            format!("Creates {:?}.", missing.join("child"))
+            summary.desktop_description(false),
+            format!(
+                "rt-bench/dbg -> {}\nsyq cp rt-bench/dbg --to @laptop --as dbg",
+                path.display()
+            )
         );
-        let mut summary = Summary::new(&requester(), &[], &request, TIMEOUT, None).unwrap();
-        assert_eq!(summary.desktop_description(false), creates);
-        assert!(summary
-            .details_description(str::to_owned)
-            .contains("May create and overwrite matching entries"));
-        // No presentation-only field enters the released pending JSON contract.
+        // No presentation-only field enters the released pending JSON contract:
+        // the released copy fields plus the command.
         let json = serde_json::to_value(&summary).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 10);
+        assert_eq!(json.as_object().unwrap().len(), 11);
         assert_eq!(json["from"], "\"server (receiving profile @laptop)\"");
         assert_eq!(
             json["permission"],
@@ -1043,80 +997,34 @@ mod tests {
         );
         let old_shape: Summary = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(old_shape).unwrap(), json);
-        summary.desktop_copy_notice = "local hint".into();
-        assert_eq!(serde_json::to_value(summary).unwrap(), json);
 
-        let file = root.join("file");
-        std::fs::write(&file, b"keep").unwrap();
-        let directory = root.join("directory");
-        std::fs::create_dir(&directory).unwrap();
-        let link = root.join("link");
-        symlink(&missing, &link).unwrap();
-        for path in [&file, &directory, &link] {
-            assert_eq!(
-                copy_notice(&copy_request(path), None),
-                format!("May overwrite {path:?}.")
-            );
-        }
-        // A parent symlink is not followed, even when its target is missing;
-        // unknown existence warns about overwriting.
-        assert!(copy_notice(&copy_request(&link.join("child")), None).starts_with("May overwrite"));
-        assert!(copy_notice(&copy_request(&file.join("child")), None).starts_with("May overwrite"));
-        assert_eq!(std::fs::read(file).unwrap(), b"keep");
-        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
-
-        let mut mixed = request.clone();
-        mixed
-            .copy
-            .mutation_scopes
-            .push(copy_request(&link).copy.mutation_scopes.remove(0));
-        assert!(copy_notice(&mixed, None).starts_with("May overwrite"));
-        let mut many = request.clone();
-        many.copy.mutation_scopes = vec![request.copy.mutation_scopes[0].clone(); 33];
-        assert!(copy_notice(&many, None).starts_with("May overwrite"));
-
-        // Another host is never inspected; the prompt names the credential use.
-        assert_eq!(
-            copy_notice(&request, Some("backup")),
-            "Uses your SSH access to \"backup\" and may overwrite files there."
-        );
-        let remote = Summary::new(&requester(), &[], &request, TIMEOUT, Some("backup")).unwrap();
-        let desktop = remote.desktop_description(false);
-        assert!(!desktop.contains("helper"), "{desktop}");
+        // Another host is never inspected; the destination keeps its host.
+        let remote = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &request,
+            TIMEOUT,
+            Some("backup"),
+        )
+        .unwrap();
+        assert!(remote
+            .desktop_description(false)
+            .starts_with(&format!("rt-bench/dbg -> backup:{}\n", path.display())));
         assert!(remote
             .details_description(str::to_owned)
             .contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
-    }
 
-    #[test]
-    fn non_overwriting_policies_do_not_warn_about_existing_entries() {
-        use crate::delegation::{ExistingDestinationPolicy, RootExistence};
-        let temp = crate::test_support::tempdir().unwrap();
-        let path = temp.path().canonicalize().unwrap().join("file");
-        std::fs::write(&path, b"keep").unwrap();
-        let mut request = copy_request(&path);
-        request.copy.options.dry_run = true;
-        assert!(copy_notice(&request, None).starts_with("Preview only"));
-        assert!(copy_notice(&request, Some("backup")).ends_with("writes nothing (preview only)."));
-        request.copy.options.dry_run = false;
-        request.copy.options.verify_only = true;
-        assert!(copy_notice(&request, None).starts_with("Compares contents only"));
-        request.copy.options.verify_only = false;
-        request.copy.policy.existing = ExistingDestinationPolicy::Skip;
-        assert_eq!(
-            copy_notice(&request, None),
-            format!("Adds to {path:?}; existing files are kept.")
-        );
-        assert!(copy_notice(&request, Some("backup")).ends_with("keeping existing ones."));
-        request.copy.policy.existing = ExistingDestinationPolicy::Replace;
-        request.constraints.root_existence = RootExistence::New;
-        assert_eq!(copy_notice(&request, None), format!("Creates {path:?}."));
-        assert!(copy_notice(&request, Some("backup")).ends_with("creates new files there."));
-        request.constraints.root_existence = RootExistence::Any;
-        request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
-        assert_eq!(
-            copy_notice(&request, None),
-            format!("Changes existing files in {path:?} only.")
+        // A mapping copy's entries are relative to the server's directory.
+        let mapping: Vec<Vec<u8>> = ["cp", "--mapping", "map", "--to", "@laptop"]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let summary = Summary::new(&requester(), &mapping, "~", &request, TIMEOUT, None).unwrap();
+        let desktop = summary.desktop_description(false);
+        assert!(
+            desktop.starts_with(&format!(". -> {}\nsyq cp --mapping", path.display())),
+            "{desktop}"
         );
     }
 
@@ -1140,13 +1048,14 @@ mod tests {
         let plain = summary.desktop_description(false);
         assert_eq!(
             plain,
-            "server is running:\nsyq cp --mapping \"<map>\" --to @laptop\n\nMay overwrite \"/tmp/receiving\"."
+            "dbg -> ~/Downloads/server/dbg\nsyq cp --mapping \"<map>\" --to @laptop"
         );
-        assert_eq!(summary.title(), "syq @laptop: Allow this copy?");
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         let markup = summary.desktop_description(true);
-        assert!(markup.starts_with(
-            "server is running:\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop\n"
-        ));
+        assert_eq!(
+            markup,
+            "dbg -&gt; ~/Downloads/server/dbg\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop"
+        );
         assert!(!markup.contains("<map>"));
         let details = summary.details_description(|word| format!("[{word}]"));
         assert!(details.contains("Server command: syq cp --mapping [\"<map>\"] --to @laptop"));
@@ -1207,24 +1116,31 @@ mod tests {
         assert!(access.contains("Deleting versions is permanent."));
     }
     #[test]
-    fn compact_copy_prompt_keeps_deletion_limits_visible() {
+    fn long_directories_move_from_the_title_to_the_command_line() {
         let mut summary = summary();
-        for limit in [1, 2] {
-            if let Details::Copy { max_delete, .. } = &mut summary.details {
-                *max_delete = limit;
-            }
-            let compact = summary.desktop_description(false);
-            assert_eq!(
-                compact,
-                format!(
-                    "May overwrite \"/tmp/receiving\". May delete up to {limit} files or folders."
-                )
-            );
+        summary.command = crate::approval_command::display(&[b"cp".to_vec(), b"dbg".to_vec()]);
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
+        assert_eq!(
+            summary.desktop_description(false),
+            "dbg -> ~/Downloads/server/dbg\nsyq cp dbg"
+        );
+        summary.server_cwd = "~/projects/very-long-directory-name".into();
+        assert_eq!(summary.title(), "syq on server");
+        assert_eq!(
+            summary.desktop_description(false),
+            "dbg -> ~/Downloads/server/dbg\n~/projects/very-long-directory-name $ syq cp dbg"
+        );
+        summary.server_cwd = String::new();
+        assert_eq!(summary.title(), "syq on server");
+        assert_eq!(
+            summary.desktop_description(false),
+            "dbg -> ~/Downloads/server/dbg\nsyq cp dbg"
+        );
+        // Limits stay in the full description only.
+        if let Details::Copy { max_delete, .. } = &mut summary.details {
+            *max_delete = 2;
         }
-        let desktop_details = summary.details_description(str::to_owned);
-        assert!(desktop_details.contains("not been inspected"));
-        assert!(!desktop_details.contains("Allow this copy once?"));
-        assert!(!desktop_details.contains("Local command:"));
+        assert!(!summary.desktop_description(false).contains("deletions"));
         let details = summary.description(str::to_owned);
         assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
         assert!(details.contains("not been inspected"));
@@ -1328,15 +1244,18 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         #[cfg(not(target_os = "macos"))]
-        assert!(args.last().unwrap().contains(&escape_markup(text)));
+        {
+            assert_eq!(args[args.len() - 2], summary.title());
+            assert!(args[args.len() - 2].contains(text));
+            assert_eq!(*args.last().unwrap(), summary.desktop_description(true));
+        }
         #[cfg(target_os = "macos")]
         {
             assert_eq!(args[0], "-e");
             assert_eq!(args[1], APPLESCRIPT);
             assert_eq!(args[3], summary.desktop_description(false));
-            assert_eq!(args[6], summary.details_description(str::to_owned));
-            assert!(args[3].contains(text));
-            assert!(args[6].contains(text));
+            assert_eq!(args[5], summary.title());
+            assert!(args[5].contains(text));
             assert!(!APPLESCRIPT.contains(text));
         }
     }

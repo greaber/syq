@@ -111,17 +111,15 @@ def tests():
                 if choice == "allow":
                     assert destination.read_bytes() == b"return\n"
                 app, summary, body, actions, expiry = observed[-1]
-                assert app == "syq" and summary == "syq @laptop: Allow this copy?", summary
+                assert app == "syq" and summary.startswith("syq on "), summary
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
-                assert "source" in body and "overwrite" not in body and "May create" not in body, body
-                # Who asks, then the server's command, then what allowing it creates.
-                lead, command, rest = body.split("\n", 2)
-                assert lead.endswith(" is running:") and "From" not in lead, lead
-                assert command.startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), command
-                assert rest.startswith('\nCreates "/tmp/syq-real-ssh-receive/desktop-'), rest
-                assert "Details: syq persist receive pending" in body, body
-                assert "Limits:" not in body and "not been inspected" not in body, body
+                assert "May create" not in body and "From" not in body, body
+                # What moves where, then the server's command.
+                arrow, command = body.split("\n", 1)
+                assert arrow.startswith('/tmp/syq-real-ssh/return-source/message.txt -&gt; "/tmp/syq-real-ssh-receive/desktop-'), arrow
+                assert "syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as " in command, command
+                assert "Details" not in body and "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
                 assert expiry == 300000
                 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
@@ -144,7 +142,7 @@ def tests():
         result = subprocess.run(["ssh", "source", command], timeout=20)
         assert result.returncode != 0
         assert destination.read_bytes() == b"keep this"
-        assert 'May overwrite "/tmp/syq-real-ssh-receive/desktop-existing".' in observed[-1][2], observed[-1]
+        assert '-&gt; /tmp/syq-real-ssh-receive/desktop-existing\n' in observed[-1][2], observed[-1]
         for choice in ["allow", "deny"]:
             marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
             command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])
@@ -153,12 +151,12 @@ def tests():
                 assert (process.wait(timeout=20) == 0) == (choice == "allow")
                 assert marker.exists() == (choice == "allow")
                 _, title, body, _, _ = observed[-1]
-                assert title == "syq @laptop: Run this command?", title
+                assert title.startswith("syq on "), title
                 lead, command, rest = body.split("\n", 2)
                 assert lead.endswith(':') and " asks to run in " in lead, lead
                 assert command.startswith('"touch" '), command
                 assert rest.startswith("\nRuns with your permissions; the copy root and limits do not apply."), rest
-                assert "Details: syq persist receive pending" in body and "Limits:" not in body, body
+                assert "Details" not in body and "Limits:" not in body, body
                 print(f"Command notification {choice}: passed", flush=True)
             finally:
                 if process.poll() is None:

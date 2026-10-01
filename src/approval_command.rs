@@ -139,7 +139,30 @@ fn check_storage_as(
 
 /// Display text for one argument. Plain words stay as typed; anything else is
 /// quoted with control, formatting, and invalid bytes escaped.
-fn display_arg(arg: &[u8]) -> String {
+/// The requesting process's working directory for display, with its home
+/// directory shortened to `~`. It travels with the command so the receiving
+/// machine can show where relative source names resolve.
+pub(crate) fn current_directory() -> String {
+    let cwd = std::env::current_dir()
+        .map(|path| path.into_os_string().into_vec())
+        .unwrap_or_default();
+    abbreviate_home(&cwd, std::env::var_os("HOME").as_deref())
+}
+
+/// `path` for display, with `home` and paths under it shortened to `~`.
+pub(crate) fn abbreviate_home(path: &[u8], home: Option<&OsStr>) -> String {
+    let home = home.map(OsStr::as_bytes).filter(|home| !home.is_empty());
+    let shown = match home {
+        Some(home) if path == home => b"~".to_vec(),
+        Some(home) if path.starts_with(home) && path[home.len()..].starts_with(b"/") => {
+            [b"~", &path[home.len()..]].concat()
+        }
+        _ => path.to_vec(),
+    };
+    display_arg(&shown)
+}
+
+pub(crate) fn display_arg(arg: &[u8]) -> String {
     if !arg.is_empty()
         && arg
             .iter()
