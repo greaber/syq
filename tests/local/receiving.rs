@@ -1117,12 +1117,13 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
     let script = t.path("bin/ssh");
-    executable(&script, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nsleep 0.2\nexec \"$SYQ_TEST_REMOTE_BINARY\" --server\n");
+    executable(&script, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nif [ -n \"$SYQ_TEST_SSH_READY\" ]; then\n  : > \"$SYQ_TEST_SSH_READY\"\n  n=0\n  while [ ! -e \"$SYQ_TEST_SSH_CONTINUE\" ]; do\n    n=$((n + 1))\n    if [ \"$n\" -ge 50 ]; then echo \"SSH fixture timed out waiting for release\" >&2; exit 1; fi\n    if [ \"$((n % 10))\" -eq 0 ]; then echo \"SSH fixture waiting for release\" >&2; fi\n    sleep 0.1\n  done\nfi\nsleep 0.2\nexec \"$SYQ_TEST_REMOTE_BINARY\" --server\n");
     let mut paths = vec![t.path("bin")];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let paths = std::env::join_paths(paths).unwrap();
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
@@ -1130,10 +1131,10 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
             .env("PATH", &paths)
             .env("SYQ_TEST_REMOTE_BINARY", env!("CARGO_BIN_EXE_syq"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .current_dir(t.path(""))
-            .capture_output()
-            .unwrap()
+            .current_dir(t.path(""));
+        command
     };
+    let run = |args: &[&str]| command(args).capture_output().unwrap();
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
     let registry = t.path(".syq-destinations-v3");
     fs::create_dir(&registry).unwrap();
@@ -1189,6 +1190,53 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
         fs::remove_file(t.path("destination")).unwrap();
         fs::remove_file(t.path("ssh-used")).unwrap();
         fs::remove_file(t.path("result.ndjson")).unwrap();
+    }
+    // Both starts must reach their barriers before either is released. Keep
+    // the registered directory when its display path is replaced while SSH
+    // connects; repeat operands must not register a second root.
+    #[cfg(debug_assertions)]
+    {
+        write(&t.path("tree/original"), b"pinned source");
+        write(&t.path("outside/replacement"), b"outside");
+        let ready = t.path("source-ready");
+        let continuation = t.path("source-continue");
+        let ssh_ready = t.path("ssh-ready");
+        let ssh_continue = t.path("ssh-continue");
+        let mut child = command(&[
+            "cp",
+            "tree",
+            "tree",
+            "--to",
+            "127.0.0.1",
+            "--into",
+            &t.s("overlap"),
+            "--performance-tuning=workers=1",
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+        ])
+        .env("SYQ_TEST_SOURCE_ROOTS_REGISTERED_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_ROOTS_CONTINUE_FILE", &continuation)
+        .env("SYQ_TEST_SSH_READY", &ssh_ready)
+        .env("SYQ_TEST_SSH_CONTINUE", &ssh_continue)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+        wait_for_confinement_marker(&mut child, &ssh_ready, "destination SSH start");
+        wait_for_confinement_marker(&mut child, &ready, "source registration during SSH setup");
+        fs::rename(t.path("tree"), t.path("selected-tree")).unwrap();
+        std::os::unix::fs::symlink(t.path("outside"), t.path("tree")).unwrap();
+        release_confinement_barrier(&continuation);
+        release_confinement_barrier(&ssh_continue);
+        let output = wait_for_child_output(child, std::time::Duration::from_secs(10));
+        assert_output_ok(&output);
+        assert_eq!(
+            fs::read(t.path("overlap/tree/original")).unwrap(),
+            b"pinned source"
+        );
+        assert!(!t.path("overlap/tree/replacement").exists());
+        assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+        fs::remove_file(t.path("ssh-used")).unwrap();
     }
     // Successful authentication does not permit switching authority after a
     // destination filesystem error.

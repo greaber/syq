@@ -460,6 +460,7 @@ dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
 
 printf 'case: return copies hand off between server PATH builds\n'
 python3 /usr/local/libexec/syq-test-return-handoff.py
+ssh source 'python3 /usr/local/libexec/syq-test-handoff-timing.py syq-other-build syq'
 
 printf 'case: forward copies authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-forward-copy.py

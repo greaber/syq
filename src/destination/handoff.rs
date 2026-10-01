@@ -4,6 +4,36 @@ use std::sync::OnceLock;
 
 const HANDOFF: &str = "--return-handoff-v1";
 static ACCEPTED: OnceLock<Guard> = OnceLock::new();
+// Process-local timing only: keep the released argv guard and registration
+// formats unchanged. CLOCK_MONOTONIC has the same origin across a local exec.
+const COPY_START_ENV: &str = "SYQ_RETURN_COPY_START_NS";
+pub(crate) const TIMING_CAPABILITY: &str = "--return-handoff-timing-v1";
+static COPY_START: OnceLock<u64> = OnceLock::new();
+
+fn monotonic_ns() -> Option<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: clock_gettime initializes the timespec on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let time = unsafe { time.assume_init() };
+    u64::try_from(time.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(time.tv_nsec).ok()?)
+}
+
+pub(crate) fn copy_start() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let Some(ticks) = monotonic_ns() else {
+        return now;
+    };
+    let start = *COPY_START.get_or_init(|| ticks);
+    ticks
+        .checked_sub(start)
+        .and_then(|elapsed| now.checked_sub(Duration::from_nanos(elapsed)))
+        .unwrap_or(now)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Kind {
@@ -89,6 +119,10 @@ impl Guard {
 /// Strip the private prefix before public CLI parsing. Validate the guard in
 /// preflight so copy failures can settle the requested automation stream.
 pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
+    let inherited_start = std::env::var(COPY_START_ENV).ok();
+    // SAFETY: main calls enter before starting any threads. Do not let this
+    // private value reach remote helpers or unrelated child commands.
+    unsafe { std::env::remove_var(COPY_START_ENV) };
     if argv.get(1).is_none_or(|arg| arg != HANDOFF) {
         return Ok(argv);
     }
@@ -103,6 +137,11 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
         (Kind::Copy | Kind::Forward, Some("cp")) | (Kind::Command, Some("exec"))
     ) {
         bail!("invalid return handoff command");
+    }
+    if matches!(guard.kind, Kind::Copy | Kind::Forward) {
+        if let Some(start) = inherited_start.and_then(|value| value.parse().ok()) {
+            let _ = COPY_START.set(start);
+        }
     }
     ACCEPTED
         .set(guard)
@@ -153,7 +192,21 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     let program = std::ffi::OsStr::from_bytes(&selection.registration.program);
     let guard = serde_json::to_string(&selection.guard()?)?;
     let argv = command_line()?;
-    let error = Command::new(program)
+    let mut command = Command::new(program);
+    if let Some(start) = COPY_START.get() {
+        let supported = Command::new(program)
+            .arg(TIMING_CAPABILITY)
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"1\n");
+        if !supported {
+            crate::output::diagnostic!(
+                "syq: registered helper predates handoff timing; elapsed time and throughput exclude setup before handoff; update syq on the receiving machine and reconnect to include it"
+            );
+        }
+        command.env(COPY_START_ENV, start.to_string());
+    }
+    let error = command
         .arg(HANDOFF)
         .arg(guard)
         .args(argv.iter().skip(1))

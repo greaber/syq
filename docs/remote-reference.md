@@ -132,7 +132,9 @@ reply. Offline or unsupported connections are skipped. With none available,
 the SSH error is reported. Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
 authorization attempt. Once approval is requested, refusal or failure ends
-the attempt.
+the attempt. Elapsed time includes authorization setup. If a receiving machine
+uses an older helper that cannot include time spent before switching builds,
+syq prints a notice; update syq on that machine and reconnect to include it.
 
 For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).

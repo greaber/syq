@@ -122,7 +122,9 @@ def destination_connections():
 
 before = destination_connections()
 copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",))
-assert destination_connections() - before == 1, "a cached helper must need only the copy's SSH connection"
+assert destination_connections() - before == 2, (
+    "automatic fallback needs one failed source SSH attempt and one approved SSH connection"
+)
 expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expected
 

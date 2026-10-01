@@ -118,6 +118,15 @@ impl Drop for ProgressTicker {
 
 impl Progress {
     pub fn new(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
+        Self::starting_at(enabled, force, width, Instant::now())
+    }
+
+    pub fn starting_at(
+        enabled: bool,
+        force: bool,
+        width: Option<usize>,
+        start: Instant,
+    ) -> Arc<Self> {
         Arc::new(Progress {
             tuning_destination_devices: Default::default(),
             tuning_history: std::sync::OnceLock::new(),
@@ -149,7 +158,7 @@ impl Progress {
             symlinks_created: AtomicU64::new(0),
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
-            start: Instant::now(),
+            start,
             copy_first_ns: AtomicU64::new(u64::MAX),
             copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {

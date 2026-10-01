@@ -187,6 +187,10 @@ fn main() {
         remote_user_install::install();
         return;
     }
+    if argv.len() == 2 && argv[1] == destination::handoff::TIMING_CAPABILITY {
+        println!("1");
+        return;
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("--build-identity") {
         println!("{}", identity::build());
         return;

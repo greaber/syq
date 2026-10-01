@@ -610,6 +610,128 @@ struct SmallCopySources {
     claim_workers: usize,
 }
 
+type SourceControl = (Box<dyn Conn>, Option<SmallCopySources>);
+
+pub(crate) struct PreparedSource {
+    endpoint: Endpoint,
+    control: Mutex<Option<Result<SourceControl>>>,
+}
+
+impl std::fmt::Debug for PreparedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedSource").finish_non_exhaustive()
+    }
+}
+
+fn connect_source(
+    endpoint: &Endpoint,
+    args: &Args,
+    sources: Option<&[Location]>,
+    source_shared_workers: usize,
+    copy_local_claim_workers: usize,
+    remote_source_handoff_workers: usize,
+) -> Result<SourceControl> {
+    let mut connection = connect_ctl(endpoint, args)?;
+    let sources = if let Some(sources) = sources {
+        let claim_workers = admitted_clone_claim_workers(
+            sources.len(),
+            source_shared_workers,
+            copy_local_claim_workers,
+        );
+        let roots = register_source_roots(
+            &mut *connection,
+            sources,
+            args,
+            source_shared_workers,
+            claim_workers
+                .checked_add(remote_source_handoff_workers)
+                .context("source worker count overflow")?,
+        )?;
+        let entries = sources
+            .iter()
+            .zip(&roots)
+            .map(|(source, root)| {
+                stat_one_registered(
+                    &mut *connection,
+                    &source.path,
+                    &root.selection,
+                    source.follows_root(args.follows_native_source_paths()),
+                )
+                .ok()
+                .flatten()
+            })
+            .collect();
+        Some(SmallCopySources {
+            roots,
+            entries,
+            claim_workers,
+        })
+    } else {
+        None
+    };
+    Ok((connection, sources))
+}
+
+/// Reuse the normal small-copy source work while authorization opens SSH.
+/// Nothing consumes stdin or creates results before a possible exec handoff.
+pub(crate) fn connect_for_authorization(
+    args: &mut Args,
+    spec: &RemoteSpec,
+) -> Result<crate::conn::RemoteConn> {
+    let (dst, sources) = args
+        .locations
+        .split_last()
+        .context("copy endpoints missing")?;
+    let sources = distinct_native_sources(sources);
+    let source_endpoint = endpoint(&sources[0], args)?;
+    if args.has_pending_ignore_inputs()
+        || !small_copy_eligible(
+            args,
+            &sources,
+            dst,
+            &source_endpoint,
+            &Endpoint::Remote(spec.clone()),
+        )
+    {
+        return spec.connect_with(args.compress, false);
+    }
+    let shared_workers = if args.connections_default {
+        0
+    } else {
+        args.connections
+    };
+    let (connection, source) = std::thread::scope(|scope| {
+        let source = scope.spawn(|| {
+            // A local-to-remote copy needs neither foreign clone claims nor
+            // source descriptors handed to remote worker processes.
+            connect_source(&source_endpoint, args, Some(&sources), shared_workers, 0, 0)
+        });
+        let connection = spec.connect_with(args.compress, false);
+        let source = source
+            .join()
+            .map_err(|_| anyhow::anyhow!("connect thread panicked"))
+            .and_then(|source| source);
+        (connection, source)
+    });
+    let connection = connection?;
+    // Keep source errors for normal transfer preflight. A failed SSH attempt
+    // discards this work before selecting or execing a receiving helper.
+    args.prepared_source = Some(Arc::new(PreparedSource {
+        endpoint: source_endpoint,
+        control: Mutex::new(Some(source)),
+    }));
+    Ok(connection)
+}
+
+fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
+    let mut seen = std::collections::HashSet::new();
+    sources
+        .iter()
+        .filter(|source| seen.insert((source.path.clone(), source.selection)))
+        .cloned()
+        .collect()
+}
+
 /// Foreign source claims that macOS cloning may reserve. Cloning is optional:
 /// when its claims do not fit, return 0 so the copy keeps its normal worker
 /// budget and byte-copies on every filesystem, including APFS. Registration
@@ -1392,7 +1514,12 @@ pub fn run(mut args: Args) -> Result<i32> {
     // Authorization selection may open the destination SSH connection. Count
     // that setup in elapsed time and end-to-end throughput.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(show_progress, args.progress, args.width);
+    let progress = Progress::starting_at(
+        show_progress,
+        args.progress,
+        args.width,
+        crate::destination::handoff::copy_start(),
+    );
     // Re-exec before consuming stdin or opening results. A failed handoff still
     // settles the normal automation stream below.
     let handoff = crate::destination::handoff::copy(&mut args);
@@ -1656,12 +1783,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // commands.
     let multiple_source_operands = source_operand_count > 1;
     let srcs: Vec<Location> = if native_locations {
-        let mut seen_sources = std::collections::HashSet::new();
-        original_srcs
-            .iter()
-            .filter(|source| seen_sources.insert((source.path.clone(), source.selection)))
-            .cloned()
-            .collect()
+        distinct_native_sources(original_srcs)
     } else {
         let mut seen_sources = std::collections::HashSet::new();
         raw_source_operands
@@ -1738,7 +1860,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else if args.interface != Interface::Rsync && args.coordinate_at != CoordinateAt::Auto {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
-    let src_ep = endpoint(&srcs[0], &args)?;
+    let prepared_source = args.prepared_source.take();
+    let src_ep = match &prepared_source {
+        Some(source) => source.endpoint.clone(),
+        None => endpoint(&srcs[0], &args)?,
+    };
     let mut dst_ep = match args.direct_destination.take() {
         Some(spec) => Endpoint::Remote(*spec),
         None => endpoint(dst, &args)?,
@@ -1934,45 +2060,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let candidates = small_copy_candidate.then(|| srcs.to_vec());
         // Local metadata is usually ready before the SSH handshake completes.
         let t = std::thread::spawn(move || -> Result<_> {
-            let mut connection = connect_ctl(&a, &b)?;
-            let sources = if let Some(sources) = candidates {
-                let claim_workers = admitted_clone_claim_workers(
-                    sources.len(),
-                    source_shared_workers,
-                    copy_local_claim_workers,
-                );
-                let roots = register_source_roots(
-                    &mut *connection,
-                    &sources,
-                    &b,
-                    source_shared_workers,
-                    claim_workers
-                        .checked_add(remote_source_handoff_workers)
-                        .context("source worker count overflow")?,
-                )?;
-                let entries = sources
-                    .iter()
-                    .zip(&roots)
-                    .map(|(source, root)| {
-                        stat_one_registered(
-                            &mut *connection,
-                            &source.path,
-                            &root.selection,
-                            source.follows_root(b.follows_native_source_paths()),
-                        )
-                        .ok()
-                        .flatten()
-                    })
-                    .collect();
-                Some(SmallCopySources {
-                    roots,
-                    entries,
-                    claim_workers,
-                })
-            } else {
-                None
-            };
-            Ok((connection, sources))
+            if let Some(source) = prepared_source {
+                return source
+                    .control
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .context("prepared source already consumed")?;
+            }
+            connect_source(
+                &a,
+                &b,
+                candidates.as_deref(),
+                source_shared_workers,
+                copy_local_claim_workers,
+                remote_source_handoff_workers,
+            )
         });
         // The small-copy offer configures hashing and selects entries in the
         // same turn. General copies keep the usual control initialization.

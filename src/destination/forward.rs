@@ -107,7 +107,7 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
         else {
             unreachable!("eligible forwarding destination is remote");
         };
-        let error = match spec.connect_with(args.compress, false) {
+        let error = match crate::transfer::connect_for_authorization(args, &spec) {
             Ok(connection) => {
                 *spec.primed_control.lock().unwrap() =
                     crate::conn::PrimedControl::Checked(Some(Box::new(connection)));
