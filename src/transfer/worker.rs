@@ -918,8 +918,7 @@ impl Worker {
         // Reuse needs comparison only when there is a final file to compare.
         // Fresh files can still use the whole-file shortcut with reuse enabled.
         let compare_existing = final_file.is_some() && reuse_blocks;
-        if !compare_existing
-            && !(job.attempt > 0 && reuse_blocks)
+        if !(compare_existing || job.attempt > 0 && reuse_blocks)
             && self
                 .opts
                 .copy_policy(self.bwlimit.is_some())
