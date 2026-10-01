@@ -40,17 +40,22 @@ impl FsOps {
         root.create_file(relative, mode)
     }
 
-    pub(super) fn create_write_only_partial(
+    /// Open or create a small file's sidecar for writing only, with the
+    /// metadata read when it was opened. The caller checks that metadata:
+    /// the name may have held something other than a new file.
+    pub(super) fn open_or_create_write_only_partial(
         &self,
         root: &Root,
         relative: &RelativePath,
         mode: u32,
-    ) -> Result<File> {
+    ) -> Result<(File, fs::Metadata)> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
-            return root.create_private_file(relative);
+            let file = root.create_private_file(relative)?;
+            let metadata = file.metadata()?;
+            return Ok((file, metadata));
         }
-        root.create_write_only_file(relative, mode)
+        root.open_or_create_write_only_file(relative, mode)
     }
 
     fn create_inplace_file(root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
@@ -2993,6 +2998,35 @@ pub(super) fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
 
 pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file() && metadata.nlink() == 1
+}
+
+/// Whether a sidecar opened without exclusive creation is a new empty file
+/// of ours, which is what an exclusive create would have made. Anything else
+/// at the name, including an older sidecar with data, takes the checked path.
+pub(super) fn is_fresh_partial(metadata: &fs::Metadata) -> bool {
+    is_owned_partial(metadata) && metadata.len() == 0 && metadata.mode() & 0o7000 == 0
+}
+
+/// Whether the kernel refused to open or create the sidecar because of what
+/// the name already held: a symlink, a directory, a FIFO without a reader,
+/// or a file this account may not write. The checked path then examines the
+/// name, and repeats the creation for an error that was not about it.
+pub(super) fn existing_leaf_refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .and_then(io::Error::raw_os_error)
+        .is_some_and(|code| {
+            matches!(
+                code,
+                libc::ELOOP
+                    | libc::EISDIR
+                    | libc::ENXIO
+                    | libc::EEXIST
+                    | libc::EACCES
+                    | libc::EPERM
+                    | libc::ETXTBSY
+            )
+        })
 }
 
 pub(super) fn is_safe_rooted_partial(metadata: RootMetadata) -> bool {

@@ -204,20 +204,25 @@ impl FsOps {
         let mode = staged_file_mode(&put.meta, put.flags);
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
-                // Nothing reads a small file's sidecar, so a new one is
-                // opened for writing only. One left by an earlier attempt
-                // takes the checked reuse that ranged writes apply.
+                // Nothing reads a small file's sidecar, so it is opened for
+                // writing only, and without exclusive creation, which costs
+                // an NFS client a further request. Whatever the name held is
+                // opened too: a new empty file of ours is used as created,
+                // and anything else, or an open the kernel refused, takes
+                // the checked reuse that ranged writes apply.
                 self.uncache_rooted(&target.root, relative);
-                match self.create_write_only_partial(&target.root, relative, mode) {
-                    Ok(file) => Ok(Some((file, None))),
-                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
-                        self.open_private_partial_rooted(&target.root, relative, label, true, mode)
+                match self.open_or_create_write_only_partial(&target.root, relative, mode) {
+                    Ok((file, created)) if is_fresh_partial(&created) => {
+                        Ok(Some((file, created, None)))
+                    }
+                    Ok(_) => self.checked_small_stage(&target.root, relative, label, mode),
+                    Err(error) if existing_leaf_refused(&error) => {
+                        self.checked_small_stage(&target.root, relative, label, mode)
                     }
                     Err(error) => Err(error),
                 }
             })?;
-        let (file, basis_size) = opened.context("sidecar creation was requested")?;
-        let created = file.metadata()?;
+        let (file, created, basis_size) = opened.context("sidecar creation was requested")?;
         Ok(SmallStage {
             target,
             partial,
@@ -226,6 +231,24 @@ impl FsOps {
             reused: basis_size.is_some(),
             created,
         })
+    }
+
+    /// The checked reuse of whatever the sidecar name holds, with the
+    /// metadata of the file it settles on.
+    fn checked_small_stage(
+        &mut self,
+        root: &Root,
+        relative: &RelativePath,
+        label: &Path,
+        mode: u32,
+    ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
+        let Some((file, basis_size)) =
+            self.open_private_partial_rooted(root, relative, label, true, mode)?
+        else {
+            return Ok(None);
+        };
+        let metadata = file.metadata()?;
+        Ok(Some((file, metadata, basis_size)))
     }
 
     pub(super) fn write_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
@@ -447,7 +470,14 @@ mod tests {
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert_eq!(access(&stage), libc::O_WRONLY);
         assert!(!stage.reused);
-        // The same copy finds its sidecar again after an interrupted attempt.
+        // An attempt interrupted before it wrote anything leaves an empty
+        // sidecar, which is what a new one would be; the copy uses it as
+        // created. One interrupted after writing takes the checked reuse.
+        drop(stage);
+        let target = ops.small_target(&file).unwrap();
+        let stage = ops.create_small_stage(&file, target).unwrap();
+        assert!(!stage.reused);
+        ops.write_small_stage(&file, &stage).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
@@ -459,6 +489,57 @@ mod tests {
             fs::read(temporary.path().join("file")).unwrap(),
             b"contents"
         );
+        assert_eq!(entries(temporary.path()), 1);
+    }
+
+    #[test]
+    fn whatever_else_the_sidecar_name_holds_takes_the_checked_path() {
+        // The sidecar is created without O_EXCL, so the open can land on
+        // something already at its name. Only a new empty file of ours is
+        // used as opened; a symlink, a FIFO, a second link to a file of ours,
+        // and a file holding data are left to the checked path, which
+        // replaces what is not a safe sidecar and reuses what is. Nothing
+        // planted at the name receives the copy's data.
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = receiver(temporary.path());
+        let wanted = put("file", b"contents");
+        let target = ops.small_target(&wanted).unwrap();
+        let (relative, _) = rooted_partial_target(&target, &wanted.copy_id).unwrap();
+        let sidecar = temporary.path().join(relative.to_path_buf());
+        fs::write(temporary.path().join("victim"), b"victim").unwrap();
+        for planted in ["symlink", "fifo", "hardlink", "data"] {
+            match planted {
+                "symlink" => {
+                    std::os::unix::fs::symlink(temporary.path().join("victim"), &sidecar).unwrap()
+                }
+                "fifo" => {
+                    let path = std::ffi::CString::new(sidecar.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                "hardlink" => fs::hard_link(temporary.path().join("victim"), &sidecar).unwrap(),
+                "data" => fs::write(&sidecar, b"an earlier attempt").unwrap(),
+                _ => unreachable!(),
+            }
+            let outcomes = ops.put_small_batch(std::slice::from_ref(&wanted));
+            outcomes[0]
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{planted}: {error}"));
+            assert_eq!(
+                fs::read(temporary.path().join("file")).unwrap(),
+                b"contents",
+                "{planted}"
+            );
+            assert_eq!(
+                fs::read(temporary.path().join("victim")).unwrap(),
+                b"victim",
+                "{planted}"
+            );
+            assert!(
+                fs::symlink_metadata(&sidecar).is_err(),
+                "{planted}: the name is free again"
+            );
+            fs::remove_file(temporary.path().join("file")).unwrap();
+        }
         assert_eq!(entries(temporary.path()), 1);
     }
 
