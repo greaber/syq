@@ -504,7 +504,15 @@ impl Worker {
                         }
                     }
                 };
-                if read_window > 1 && waited > read_stall_budget && self.gate.active() > 1 {
+                // Adaptive groups already respond to slow service by sizing
+                // future work and pausing refill for overdue requests. Also
+                // pinning their depth to one mistakes shared-link queuing for
+                // a stalled source and prevents recovery within this batch.
+                if !adaptive
+                    && read_window > 1
+                    && waited > read_stall_budget
+                    && self.gate.active() > 1
+                {
                     if debug() {
                         crate::output::diagnostic!(
                             "syq: worker {}: source reply wait {:.3}s exceeded {:.3}s allowance (RTT {}us, setup {:.3}s); draining read-ahead",

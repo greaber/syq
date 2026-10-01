@@ -1300,15 +1300,18 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
 }
 
 #[test]
-fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
+fn source_wait_reduces_fixed_groups_but_preserves_adaptive_pipelining() {
     // Inject reply-start waits so scheduling delays cannot change which
     // side of the stall allowance a case exercises.
-    for (rtt_us, setup_ms, reply_wait_ms, expected) in [
-        (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
-        (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-        (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+    for (adaptive, rtt_us, setup_ms, reply_wait_ms, expected) in [
+        (false, None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
+        (false, Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (false, None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+        // Adaptive sizing and request ages already bound unread work. A
+        // delayed reply must not pin its read depth to one for this batch.
+        (true, None, 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         // Payload time does not contribute to the reported reply-start wait.
-        (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (false, None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
     ] {
         let jobs: Vec<_> = (0..8)
             .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
@@ -1334,6 +1337,9 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
                 .push_back(Response::Applied(vec![None]));
         }
         let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+        if adaptive {
+            Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        }
         worker.gate.set_active(2);
         worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
         let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
