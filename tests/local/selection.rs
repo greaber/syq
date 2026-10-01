@@ -941,7 +941,7 @@ fn rsync_ignore_named_sources_use_source_basename() {
         for rule in &rules {
             args.extend(["--syq-ignore", rule]);
         }
-        args.extend([&source, &destination]);
+        args.extend([source.as_str(), destination.as_str()]);
         run_ok(&args);
         assert_eq!(Path::new(&destination).exists(), !excluded, "{case}");
     }

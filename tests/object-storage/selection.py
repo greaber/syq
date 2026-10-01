@@ -123,11 +123,13 @@ def check_source_roots():
                     args += ['--to', remote, '--into', key] if to_s3 else ['--into', destination]
                     args += ['--ignore', rule, '--prune']
                     for dry_run in [True, False]:
-                        results = root / 'overlap-results.jsonl'
+                        results = root / f'{case}-{dry_run}.jsonl'
                         command = [*args, '--results', results, *(['--dry-run'] if dry_run else [])]
                         if route == 'local':
-                            subprocess.run([checks.SYQ, 'cp', '--no-progress', *map(str, command)],
-                                           check=True, timeout=180, capture_output=True)
+                            completed = subprocess.run(
+                                [checks.SYQ, 'cp', '--no-progress', *map(str, command)],
+                                timeout=180, capture_output=True)
+                            assert completed.returncode == 0, (case, dry_run, completed)
                         else:
                             checks.run(command)
                         terminal = json.loads(results.read_text().splitlines()[-1])
@@ -165,7 +167,7 @@ def check_source_roots():
                 else:
                     args = [source / 'project-a/build/secret']
                 args += ['--to', remote, '--as', key] if to_s3 else ['--as', destination]
-                results = root / 'named-results.jsonl'
+                results = root / f'named-{case}-{route}.jsonl'
                 args += [*options, '--results', results]
                 if route == 'local':
                     subprocess.run([checks.SYQ, 'cp', '--no-progress', *map(str, args)],
