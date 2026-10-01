@@ -173,8 +173,8 @@ pub trait Conn: Send {
         None
     }
     /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
-    /// Returns the number of ignored entries/subtrees.
     /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
+    /// Returns the number of ignored entries/subtrees.
     #[allow(clippy::too_many_arguments)]
     fn scan(
         &mut self,

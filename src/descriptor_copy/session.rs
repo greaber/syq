@@ -386,7 +386,7 @@ mod tests {
             _: bool,
             _: &[String],
             _: bool,
-            _: &mut dyn FnMut(Vec<crate::proto::Entry>) -> Result<u64>,
+            _: &mut dyn FnMut(Vec<crate::proto::Entry>) -> Result<()>,
             _: &mut dyn FnMut(Vec<crate::proto::PathBytes>) -> Result<()>,
             _: &mut dyn FnMut(String),
         ) -> Result<u64> {

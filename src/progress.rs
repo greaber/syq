@@ -37,11 +37,11 @@ pub struct Progress {
     tuning_files_high_water: AtomicU64,
     pub files_unchanged: AtomicU64,
     /// Source files deliberately not transferred (-u, size limits, --existing,
-    /// symlinks without -l, ...), excluding ignore rules; neither "transferred" nor "unchanged".
+    /// symlinks without -l, ...), excluding ignore rules; neither "transferred"
+    /// nor "unchanged".
     pub files_excluded: AtomicU64,
-    /// Source paths matched by ignore rules. An ignored
-    /// directory is one path here even though its unscanned subtree may
-    /// contain many entries.
+    /// Source paths matched by ignore rules. An ignored directory is one path
+    /// here even though its unscanned subtree may contain many entries.
     pub paths_ignored: AtomicU64,
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
