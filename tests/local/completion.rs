@@ -1559,7 +1559,7 @@ fn return_via_completes_only_explicit_names_without_contacting_hosts() {
 }
 
 #[test]
-fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
+fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
     let t = Tmp::new();
     write(&t.path("local-folder/file"), b"payload");
     for name in ["laptop", "ssh"] {
@@ -1596,6 +1596,7 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
         vec!["--auth-from", "@laptop"],
         vec!["--auth-from", "auto"],
     ] {
+        let uses_ssh = !selector.contains(&"@laptop");
         let mut words = vec!["syq", "cp", "source", "--to", "backup"];
         words.extend(selector);
         words.extend(["--into", "anything"]);
@@ -1609,7 +1610,10 @@ fn automatic_authorization_completion_keeps_local_paths_and_never_prompts() {
             .unwrap();
         assert_output_ok(&output);
         assert!(output.stdout.is_empty(), "{output:?}");
-        assert!(!t.path("home/ssh-used").exists());
+        assert_eq!(t.path("home/ssh-used").exists(), uses_ssh);
+        if uses_ssh {
+            fs::remove_file(t.path("home/ssh-used")).unwrap();
+        }
     }
 }
 

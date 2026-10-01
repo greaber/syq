@@ -423,15 +423,6 @@ fn private_directory(name: &str) -> Result<PathBuf> {
 /// Completion only lists local names; it never creates state or asks a laptop
 /// for file listings without a transfer approval.
 pub(crate) fn registered_names() -> Vec<String> {
-    local_names(true)
-}
-
-/// Connection records only, for completion routing without network probes.
-pub(crate) fn connection_names() -> Vec<String> {
-    local_names(false)
-}
-
-fn local_names(include_offline: bool) -> Vec<String> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
@@ -454,11 +445,7 @@ fn local_names(include_offline: bool) -> Vec<String> {
             let file = file.to_str()?;
             let name = file
                 .strip_suffix(".json")
-                .or_else(|| {
-                    include_offline
-                        .then(|| file.strip_suffix(".owner"))
-                        .flatten()
-                })?
+                .or_else(|| file.strip_suffix(".owner"))?
                 .to_owned();
             validate_name(&name).ok()?;
             Some(name)
@@ -716,7 +703,7 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
     grant.as_deref().is_some_and(|s| s.starts_with(PREFIX))
 }
 
-fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
+fn select_copy(args: &mut crate::cli::Args) -> Result<Option<handoff::Selection>> {
     match &args.auth_from {
         crate::cli::AuthFrom::Return(_) => return forward::select(args),
         crate::cli::AuthFrom::Ssh => {

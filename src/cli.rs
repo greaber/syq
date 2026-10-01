@@ -128,6 +128,12 @@ pub struct Args {
     pub(crate) s3_remove: crate::s3::RemoveFlags,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
+    /// Destination SSH connection opened while choosing automatic authorization.
+    #[arg(skip)]
+    pub(crate) direct_destination: Option<Box<crate::conn::RemoteSpec>>,
+    /// Local source work overlapped with the automatic authorization SSH attempt.
+    #[arg(skip)]
+    pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]
@@ -676,6 +682,10 @@ impl Args {
         let args = Args::from_arg_matches(&matches)?;
         reject_remote_to_remote(&args)?;
         finish_parse(args, &matches)
+    }
+
+    pub(crate) fn has_pending_ignore_inputs(&self) -> bool {
+        !self.pending_ignore_inputs.is_empty()
     }
 
     pub(crate) fn read_copy_inputs(&mut self) -> Result<()> {
@@ -1299,7 +1309,7 @@ fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Authorize through @NAME (also S3 copies), or use local SSH access (default: auto)
+    /// Use local SSH first, then an available receiving machine if authentication fails (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
