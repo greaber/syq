@@ -111,7 +111,7 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
             Ok(connection) => {
                 *spec.primed_control.lock().unwrap() =
                     crate::conn::PrimedControl::Checked(Some(Box::new(connection)));
-                args.direct_destination = Some(spec);
+                args.direct_destination = Some(Box::new(spec));
                 return Ok(None);
             }
             Err(error) if crate::conn::is_ssh_connect_error(&error) => error,

@@ -1738,7 +1738,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let src_ep = endpoint(&srcs[0], &args)?;
     let mut dst_ep = match args.direct_destination.take() {
-        Some(spec) => Endpoint::Remote(spec),
+        Some(spec) => Endpoint::Remote(*spec),
         None => endpoint(dst, &args)?,
     };
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {

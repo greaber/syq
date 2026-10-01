@@ -130,7 +130,7 @@ pub struct Args {
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
     /// Destination SSH connection opened while choosing automatic authorization.
     #[arg(skip)]
-    pub(crate) direct_destination: Option<crate::conn::RemoteSpec>,
+    pub(crate) direct_destination: Option<Box<crate::conn::RemoteSpec>>,
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]

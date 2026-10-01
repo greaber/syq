@@ -94,6 +94,13 @@ print("case: automatic authorization falls back after source SSH fails and requi
 run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")
+print("case: automatic authorization uses working source SSH without requesting approval", flush=True)
+run("ssh", "-A", "source", "timeout 20 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
+    "--to destination --as /tmp/syq-real-ssh/forward/source-ssh")
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+assert remote("sha256sum /tmp/syq-real-ssh/forward/source-ssh").split()[0] == run(
+    "ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
+
 print("case: explicit SSH fails without source credentials and never requests approval", flush=True)
 run("ssh", "source", "timeout 15 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
     "--to destination --as /tmp/syq-real-ssh/forward/direct-ssh --auth-from ssh", success=False)
