@@ -2333,7 +2333,7 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
 fn s3_late_close_preserves_download_destination() {
     for multipart in [false, true] {
         for existing in [false, true] {
-            let server = Server::start("prefix-multipart");
+            let server = Server::start("ok");
             let temp = crate::test_support::tempdir().unwrap();
             let destination = temp.path().join("download");
             if existing {
