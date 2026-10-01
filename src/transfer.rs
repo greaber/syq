@@ -66,7 +66,10 @@ const CONNECTION_RECOVERY_ATTEMPTS: u32 = 3;
 const FAST_BATCH_READ_BYTES: u64 = 4 << 20;
 /// Files per group of a same-machine small-file batch. A worker that took a
 /// large batch while others were still connecting hands its later groups to
-/// them; with one group per batch it kept them all.
+/// them; with one group per batch it kept them all. Measured against 16, 256
+/// and 1,024 on an NFS destination, 64 was fastest or tied in every shape,
+/// and 256 cost 1.7 times the time on 128 files per directory; local
+/// filesystems could not tell the sizes apart.
 const LOCAL_GROUP_FILES: usize = 64;
 
 /// Upper bound: each file needs one worker, and each simultaneous range must
