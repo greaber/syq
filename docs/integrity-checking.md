@@ -115,7 +115,6 @@ change can trigger a retry; a failed check leaves the previous destination in
 place. These checks do not detect every concurrent change. `--inplace` lets
 destination readers see partial updates, including after an interrupted copy.
 
-
 Successful completion does not guarantee that the copy will survive an
 immediate power loss. Normal file copies do not force transferred data onto
 durable storage with `fsync`.

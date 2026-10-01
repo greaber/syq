@@ -356,8 +356,8 @@ impl Worker {
         }
         let valid = Self::record_small_batch_reply(&sent, response, results);
         // Remote readers already credited these acknowledgments on arrival.
-        // Synchronous connections account here. Confirmed file completion
-        // still belongs to the final source check in either case.
+        // Synchronous connections account here. Successful-file bookkeeping
+        // happens after the batch drains in either case.
         if early.is_none() {
             let (bytes, files) = sent
                 .iter()
