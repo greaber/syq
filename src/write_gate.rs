@@ -46,6 +46,10 @@ impl Registry {
 
 pub(crate) struct CachedFile {
     file: File,
+    /// Metadata read when this descriptor created its file, kept for the
+    /// publication of a fresh sidecar: an NFS client answers that read from
+    /// the create's reply, where one after the data is written is a request.
+    created: Option<std::fs::Metadata>,
     #[cfg(any(target_os = "linux", test))]
     gate: OnceLock<Arc<Mutex<()>>>,
 }
@@ -54,8 +58,16 @@ impl CachedFile {
     pub(crate) fn new(file: File) -> Self {
         Self {
             file,
+            created: None,
             #[cfg(any(target_os = "linux", test))]
             gate: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn created(file: File, metadata: std::fs::Metadata) -> Self {
+        Self {
+            created: Some(metadata),
+            ..Self::new(file)
         }
     }
 
@@ -65,6 +77,10 @@ impl CachedFile {
 
     pub(crate) fn into_file(self) -> File {
         self.file
+    }
+
+    pub(crate) fn into_parts(self) -> (File, Option<std::fs::Metadata>) {
+        (self.file, self.created)
     }
 
     #[cfg(any(target_os = "linux", test))]

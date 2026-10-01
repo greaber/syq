@@ -1520,13 +1520,27 @@ impl Worker {
         job: &WorkerJob,
         create_if_missing: bool,
     ) -> Result<crate::proto::Preparation> {
+        // An in-place file is created in its final mode; a sidecar in its
+        // staged mode: the final bits, unless group preservation or an ACL
+        // keeps it private until publication. The receiver adds owner access
+        // for its other workers, so publication chmods only files whose
+        // final mode lacks that, or that stayed private.
+        let mode = if job.inplace {
+            self.create_mode(job)
+        } else {
+            crate::fsops::staged_mode(
+                self.create_mode(job),
+                self.publication_flags(job),
+                crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
+            )
+        };
         match ok(
             self.dst.call(Request::Prepare {
                 path: job.dst.clone(),
                 size: job.entry.size,
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
-                mode: self.create_mode(job),
+                mode,
                 attempt: job.attempt,
                 create_if_missing,
                 guard: job.container_guard.clone(),
