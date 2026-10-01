@@ -340,9 +340,10 @@ impl Worker {
         early: Option<&crate::conn::BatchProgress>,
     ) -> Result<bool> {
         let response = self.dst.recv()?;
-        if let Some(early) = early {
-            early.consume()?;
-        }
+        let completed = match early {
+            Some(early) => early.consume()?,
+            None => std::time::Instant::now(),
+        };
         let valid = Self::record_small_batch_reply(&sent, response, results);
         if self.adaptive_batches()
             && valid
@@ -353,7 +354,7 @@ impl Worker {
                     bytes: sent.iter().map(|&i| jobs[i].entry.size).sum(),
                     files: sent.len(),
                 },
-                started.elapsed(),
+                completed.saturating_duration_since(started),
             );
         }
         // Remote readers already credited these acknowledgments on arrival.
