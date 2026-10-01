@@ -334,20 +334,27 @@ impl Worker {
         sent: Vec<usize>,
         jobs: &[WorkerJob],
         results: &mut [Option<SmallPutOutcome>],
+        early: Option<&crate::conn::BatchProgress>,
     ) -> Result<bool> {
         let response = self.dst.recv()?;
+        if let Some(early) = early {
+            early.consume()?;
+        }
         let valid = Self::record_small_batch_reply(&sent, response, results);
-        // Acknowledgments advance both byte and file activity for the tuner.
-        // Confirmed file completion still belongs to the final source check.
-        let (bytes, files) = sent
-            .iter()
-            .filter(|&&idx| matches!(results[idx], Some(Ok(_))))
-            .fold((0, 0), |(bytes, files), &idx| {
-                (bytes + jobs[idx].entry.size, files + 1)
-            });
-        if files > 0 {
-            self.progress.add_bytes(bytes);
-            self.progress.add_tuning_files(files);
+        // Remote readers already credited these acknowledgments on arrival.
+        // Synchronous connections account here. Confirmed file completion
+        // still belongs to the final source check in either case.
+        if early.is_none() {
+            let (bytes, files) = sent
+                .iter()
+                .filter(|&&idx| matches!(results[idx], Some(Ok(_))))
+                .fold((0, 0), |(bytes, files), &idx| {
+                    (bytes + jobs[idx].entry.size, files + 1)
+                });
+            if files > 0 {
+                self.progress.add_bytes(bytes);
+                self.progress.add_tuning_files(files);
+            }
         }
         Ok(valid)
     }
@@ -358,6 +365,7 @@ impl Worker {
         mut groups: impl Iterator<Item = std::ops::Range<usize>>,
         results: &mut [Option<SmallPutOutcome>],
     ) -> Result<()> {
+        let early = self.dst.track_small_batches(self.progress.clone())?;
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let mut read_window = if self.src.supports_request_pipelining() {
             window
@@ -500,6 +508,7 @@ impl Worker {
                         writes.pop_front().expect("pending batch"),
                         jobs,
                         results,
+                        early.as_ref(),
                     )?
                 {
                     break;
@@ -525,7 +534,7 @@ impl Worker {
                 // A receive error ends draining even if the connection cannot
                 // report a dead flag. Endpoint errors consume their reply and
                 // belong only to that group; keep later acknowledgments too.
-                self.receive_small_batch(sent, jobs, results)?;
+                self.receive_small_batch(sent, jobs, results, early.as_ref())?;
             }
             Ok(())
         })();

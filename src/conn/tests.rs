@@ -167,6 +167,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
     assert!(matches!(reply.value, Response::SmallBlocks(_)));
     reader.join().unwrap(); // The following reply and EOF are already queued.
     let mut conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -218,7 +219,7 @@ fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
         drop(writer);
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, thread) =
+        let (rx, thread, _) =
             spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone());
         assert!(matches!(
             rx.recv().unwrap().unwrap().value,
@@ -692,6 +693,7 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let writes = Arc::new(AtomicUsize::new(0));
     let mut conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -965,6 +967,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     );
     let conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -1019,6 +1022,7 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
         crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     );
     let conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -1065,6 +1069,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         .spawn_guarded()
         .unwrap();
     let mut conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
@@ -1106,6 +1111,7 @@ fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
         .unwrap();
     let stdin = child.stdin.take().unwrap();
     let conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
@@ -1235,6 +1241,7 @@ fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         );
         let mut connection = RemoteConn {
+            batch_receipts: Default::default(),
             transport_stop: None,
             observation: Default::default(),
             child: None,
@@ -1311,6 +1318,7 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
         drop(writer);
         let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
         let mut remote = RemoteConn {
+            batch_receipts: Default::default(),
             transport_stop: None,
             observation: Default::default(),
             child: None,
@@ -2037,6 +2045,7 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
     drop(writer);
     let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
     let conn = RemoteConn {
+        batch_receipts: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -2287,4 +2296,80 @@ fn persistent_ssh_options_resolve_relative_file_paths() {
             "{command}"
         );
     }
+}
+
+#[test]
+fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
+    use crate::tune::Meter;
+    use std::sync::atomic::Ordering::Relaxed;
+    let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let (rx, reader, batch_receipts) =
+        spawn_observed_reader(Box::new(client.try_clone().unwrap()), 4, Default::default());
+    let mut replies = FrameWriter::new(peer.try_clone().unwrap(), false);
+    replies.write_msg(&hello_ok()).unwrap();
+    let mut requests = FrameReader::new(peer);
+    let mut conn = RemoteConn {
+        batch_receipts,
+        transport_stop: None,
+        rpc_observation: None,
+        observation: Default::default(),
+        child: None,
+        w: FrameWriter::new(Box::new(client.try_clone().unwrap()), false),
+        rx: Some(rx),
+        reader: Some(reader),
+        label: "batch progress test".into(),
+        dead: false,
+        peer: None,
+        tcp_socket: None,
+        named_socket: Some(client),
+        multiplexed_ssh: false,
+        detached: false,
+        write_stream: None,
+    };
+    assert!(matches!(conn.recv().unwrap(), Response::HelloOk { .. }));
+    let progress = crate::progress::Progress::new(false, false, None);
+    let scope = conn.track_small_batches(progress.clone()).unwrap().unwrap();
+    for size in [16, 32] {
+        conn.send(batch_progress::test_request(&[size])).unwrap();
+        assert!(matches!(
+            requests.read_msg::<Request>().unwrap(),
+            Request::PutSmallBatch(_)
+        ));
+    }
+    assert_eq!(Meter::bytes(&*progress), 0);
+    // An unsolicited telemetry reply must not consume a batch's receipt slot.
+    replies
+        .write_msg(&Response::TransportStats(Box::new(TransportStatsReply {
+            tcp: None,
+            observation: None,
+            solicited: false,
+        })))
+        .unwrap();
+    for _ in 0..2 {
+        replies
+            .write_msg(&Response::PublishedBatch(vec![Ok(None)]))
+            .unwrap();
+        // Wait for the real reader, holding the result without running the
+        // worker's receive/accounting function. No timing sleeps are needed.
+        let response = conn
+            .rx
+            .as_ref()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(response.value, Response::PublishedBatch(_)));
+    }
+    assert_eq!(progress.bytes_done.load(Relaxed), 48);
+    assert_eq!(Meter::bytes(&*progress), 48);
+    assert_eq!(Meter::files(&*progress), 2);
+    assert_eq!(progress.files_done.load(Relaxed), 0);
+    scope.consume().unwrap(); // The worker accepts only the first result before interruption.
+    drop(scope);
+    assert_eq!(progress.bytes_done.load(Relaxed), 16);
+    drop(replies);
+    drop(requests);
+    drop(conn);
 }

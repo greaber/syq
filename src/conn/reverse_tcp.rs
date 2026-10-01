@@ -62,7 +62,7 @@ impl RemoteSpec {
         let (stream, channel, key) = reverse.accept()?;
         stream.set_nodelay(true)?;
         let observation = Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, reader) = spawn_observed_reader(
+        let (rx, reader, batch_receipts) = spawn_observed_reader(
             Box::new(RecordReader::new(
                 stream.try_clone()?,
                 Some(Cipher::new(&key, 0, 2)),
@@ -71,6 +71,7 @@ impl RemoteSpec {
             observation.clone(),
         );
         let conn = RemoteConn {
+            batch_receipts,
             transport_stop: None,
             observation,
             child: None,
