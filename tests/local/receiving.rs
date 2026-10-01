@@ -1188,6 +1188,7 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
         );
         fs::remove_file(t.path("destination")).unwrap();
         fs::remove_file(t.path("ssh-used")).unwrap();
+        fs::remove_file(t.path("result.ndjson")).unwrap();
     }
     // Successful authentication does not permit switching authority after a
     // destination filesystem error.
