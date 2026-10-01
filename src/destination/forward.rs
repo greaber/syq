@@ -114,7 +114,7 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
                 args.direct_destination = Some(Box::new(spec));
                 return Ok(None);
             }
-            Err(error) if crate::conn::is_ssh_connect_error(&error) => error,
+            Err(error) if crate::conn::is_ssh_authentication_error(&error) => error,
             Err(error) => return Err(error),
         };
         let Some(found) = names.into_iter().find_map(|name| {

@@ -107,6 +107,32 @@ assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 assert remote("sha256sum /tmp/syq-real-ssh/forward/source-ssh").split()[0] == run(
     "ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 
+print("case: a configured SSH handshake timeout never requests laptop approval", flush=True)
+run("ssh", "source", "python3 -", stdin="""
+from pathlib import Path
+import subprocess
+import time
+
+config = Path.home() / ".ssh/config"
+original = config.read_bytes()
+try:
+    config.write_bytes(b"Host syq-timeout-fixture\\n  HostName destination\\n  ProxyCommand sleep 10\\n  ConnectTimeout 1\\nHost *\\n" + original)
+    started = time.monotonic()
+    result = subprocess.run([
+        "syq", "cp", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin",
+        "--to", "syq-timeout-fixture", "--as", "/tmp/syq-real-ssh/forward/timed-out",
+    ], capture_output=True, text=True, timeout=8)
+    print(result.stderr, end="", flush=True)
+    assert result.returncode != 0, result
+    assert "timed out" in result.stderr.lower(), result
+    assert "requesting permission" not in result.stderr, result
+    print("SSH timeout returned after", round(time.monotonic() - started, 2), "seconds", flush=True)
+finally:
+    config.write_bytes(original)
+""")
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+remote("test ! -e /tmp/syq-real-ssh/forward/timed-out")
+
 print("case: explicit SSH fails without source credentials and never requests approval", flush=True)
 run("ssh", "source", "timeout 15 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
     "--to destination --as /tmp/syq-real-ssh/forward/direct-ssh --auth-from ssh", success=False)

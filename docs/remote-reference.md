@@ -126,15 +126,16 @@ still be running. The coordinating server needs `/bin/kill` and either
 
 For `syq cp` with local sources and an SSH destination, `--auth-from auto`
 (the default) first uses the source machine's SSH access, including existing
-connections. If SSH cannot establish the destination session, syq tries live
-receiving machines in alphabetical order, allowing up to two seconds for each
-reply. Offline or unsupported connections are skipped. With none available,
+connections. SSH keeps its normal prompts and configured timeouts. If SSH
+reports rejected credentials, syq tries live receiving machines in alphabetical
+order, allowing up to two seconds for each reply. Connection timeouts, host-key
+failures, and other SSH errors end the attempt without trying a receiving machine.
+Offline or unsupported receiving connections are skipped. With none available,
 the SSH error is reported. Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
 authorization attempt. Once approval is requested, refusal or failure ends
-the attempt. Elapsed time includes authorization setup. If a receiving machine
-uses an older helper that cannot include time spent before switching builds,
-syq prints a notice; update syq on that machine and reconnect to include it.
+the attempt. Elapsed time includes authorization setup; handoffs to older helpers
+may omit time spent before the handoff.
 
 For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).

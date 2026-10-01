@@ -1255,6 +1255,44 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
         std::io::ErrorKind::WouldBlock
     );
 
+    for diagnostic in [
+        "ssh: connect to host backup port 22: Connection timed out",
+        "Connection timed out during banner exchange",
+        "ssh: connect to host backup port 22: Connection refused",
+        "ssh: connect to host backup port 22: Permission denied",
+        "Host key verification failed.",
+        "user@backup: Permission denied (publickey).\nConnection to backup timed out",
+        "",
+    ] {
+        executable(
+            &script,
+            br#"#!/bin/sh
+if [ "$1" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi
+printf '%s\n' "$@" > "$HOME/ssh-arguments"
+printf '%s\n' "$SYQ_TEST_SSH_FAILURE" >&2
+exit 255
+"#,
+        );
+        let failed = command(&["cp", "source", "--to", "backup"])
+            .env("SYQ_TEST_SSH_FAILURE", diagnostic)
+            .capture_output()
+            .unwrap();
+        assert!(!failed.status.success());
+        assert!(
+            stderr_of(&failed).contains(diagnostic),
+            "{}",
+            stderr_of(&failed)
+        );
+        assert!(!stderr_of(&failed).contains("requesting permission"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let arguments = fs::read_to_string(t.path("ssh-arguments")).unwrap();
+        assert!(!arguments.contains("BatchMode"), "{arguments}");
+        assert!(!arguments.contains("ConnectTimeout"), "{arguments}");
+    }
+
     // A helper that exits unsuccessfully is not an SSH authentication failure.
     executable(&script, b"#!/bin/sh\nsleep 0.2\nexit 42\n");
     let failed = run(&[
@@ -1292,7 +1330,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nexit 255\n",
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\necho 'user@backup: Permission denied (publickey).' >&2\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];

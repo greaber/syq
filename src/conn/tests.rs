@@ -1674,6 +1674,7 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
             send_budget: None,
         },
         true,
+        false,
     );
     assert!(result.is_err()); // The independent attempt reports a missing helper.
     assert_eq!(

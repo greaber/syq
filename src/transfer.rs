@@ -693,7 +693,7 @@ pub(crate) fn connect_for_authorization(
             &Endpoint::Remote(spec.clone()),
         )
     {
-        return spec.connect_with(args.compress, false);
+        return spec.connect_for_authorization(args.compress);
     }
     let shared_workers = if args.connections_default {
         0
@@ -706,7 +706,7 @@ pub(crate) fn connect_for_authorization(
             // source descriptors handed to remote worker processes.
             connect_source(&source_endpoint, args, Some(&sources), shared_workers, 0, 0)
         });
-        let connection = spec.connect_with(args.compress, false);
+        let connection = spec.connect_for_authorization(args.compress);
         let source = source
             .join()
             .map_err(|_| anyhow::anyhow!("connect thread panicked"))

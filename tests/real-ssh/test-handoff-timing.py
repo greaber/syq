@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import socket
 import struct
 import subprocess
@@ -18,7 +19,7 @@ def check(current, helper, *, legacy=False):
         (root / "bin").mkdir()
         (root / "source").write_bytes(b"payload")
         ssh = root / "bin/ssh"
-        ssh.write_text('#!/bin/sh\nif [ "$1" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\nsleep 0.2\nexit 255\n')
+        ssh.write_text('#!/bin/sh\nif [ "$1" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\nsleep 0.2\necho "user@backup: Permission denied (publickey)." >&2\nexit 255\n')
         ssh.chmod(0o700)
         env = {key: value for key, value in os.environ.items() if not key.startswith("SYQ_")}
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
@@ -30,9 +31,14 @@ def check(current, helper, *, legacy=False):
         registry = root / ".syq-destinations-v3"
         registry.mkdir(mode=0o700)
         registration = registry / "laptop.json"
+        calls = root / "helper-calls"
+        wrapper = root / "helper"
+        wrapper.write_text("#!/bin/sh\necho called >> " + shlex.quote(str(calls)) +
+                           "\nexec " + shlex.quote(helper) + ' "$@"\n')
+        wrapper.chmod(0o700)
         registration.write_text(json.dumps(dict(
             version=3, identity=identity, socket=str(root / "receiver.sock"),
-            secret="fixture", program=list(os.fsencode(helper)))))
+            secret="fixture", program=list(os.fsencode(wrapper)))))
         registration.chmod(0o600)
         errors, messages = [], []
         with socket.socket(socket.AF_UNIX) as listener:
@@ -74,8 +80,9 @@ def check(current, helper, *, legacy=False):
         terminal = records[-1]
         assert terminal["status"] == "failed", records
         assert sum(record.get("type") == "result" for record in records) == 1, records
-        notice = "registered helper predates handoff timing" in result.stderr
-        assert notice == legacy, result.stderr
+        assert "registered helper predates handoff timing" not in result.stderr, result.stderr
+        invocations = calls.read_text().splitlines() if calls.exists() else []
+        assert invocations == ([] if current == helper else ["called"]), invocations
         assert terminal["elapsed_ms"] <= wall_ms + 50, (terminal, wall_ms)
         if not legacy:
             assert terminal["elapsed_ms"] >= 175, (terminal, wall_ms, result.stderr)

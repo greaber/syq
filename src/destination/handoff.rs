@@ -7,7 +7,6 @@ static ACCEPTED: OnceLock<Guard> = OnceLock::new();
 // Process-local timing only: keep the released argv guard and registration
 // formats unchanged. CLOCK_MONOTONIC has the same origin across a local exec.
 const COPY_START_ENV: &str = "SYQ_RETURN_COPY_START_NS";
-pub(crate) const TIMING_CAPABILITY: &str = "--return-handoff-timing-v1";
 static COPY_START: OnceLock<u64> = OnceLock::new();
 
 fn monotonic_ns() -> Option<u64> {
@@ -194,16 +193,6 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     let argv = command_line()?;
     let mut command = Command::new(program);
     if let Some(start) = COPY_START.get() {
-        let supported = Command::new(program)
-            .arg(TIMING_CAPABILITY)
-            .stdin(Stdio::null())
-            .output()
-            .is_ok_and(|output| output.status.success() && output.stdout == b"1\n");
-        if !supported {
-            crate::output::diagnostic!(
-                "syq: registered helper predates handoff timing; elapsed time and throughput exclude setup before handoff; update syq on the receiving machine and reconnect to include it"
-            );
-        }
         command.env(COPY_START_ENV, start.to_string());
     }
     let error = command
