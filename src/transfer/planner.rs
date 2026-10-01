@@ -603,9 +603,11 @@ impl Planner<'_> {
                         });
                         if root.kind != Kind::Dir && pl.selected_file_is_ignored(src_root)? {
                             pl.progress.paths_ignored.fetch_add(1, Relaxed);
-                            pl.dst_seen
-                                .entry(join(dst_root, &sub))
-                                .or_insert(Claim::Weak);
+                            if !pl.opts.delete_excluded {
+                                pl.dst_seen
+                                    .entry(join(dst_root, &sub))
+                                    .or_insert(Claim::Weak);
+                            }
                             skip_all = true;
                             return Ok(());
                         }

@@ -165,11 +165,8 @@ An outcome for a completed copy change or a failed mapping entry.
 In attested records, `dst` is relative to the destination area identified by
 `scope`. An attested `set_metadata` omits `kind`.
 
-Unchanged and excluded entries have totals only. `files_excluded` includes
-ignore-rule skips on every route, in both live copies and dry runs. An ignored
-directory counts once; its unscanned descendants are not counted.
-
-Ordinary live streams do not emit per-operation records for metadata-only updates, though dry runs emit
+Unchanged and excluded entries have totals only. Ordinary live streams do not
+emit per-operation records for metadata-only updates, though dry runs emit
 `metadata_differs` traces. Failed implicit parent creation can lack `src` and
 is non-retryable. Do not construct a retry source from its destination name.
 
@@ -275,11 +272,15 @@ times or pure network time. The field is absent when no bytes moved or the
 coordinator does not supply it, including older releases and attested terminals.
 Use `elapsed_ms` for end-to-end throughput comparisons.
 
-Copy totals include transferred/unchanged/excluded files, created directories,
+Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
 `deletions_planned`, `deletions_completed`, and `deletions_blocked`. A fatal
 failure reports what finished before it stopped. Dry-run totals describe
 planned work, not committed changes.
+
+For results without destination attestations, `files_excluded` includes
+ignore-rule skips on filesystem and S3 routes, in both live copies and dry runs.
+An ignored directory counts once; its unscanned descendants are not counted.
 
 Attested terminals add `receipt_status` (`clean`, `failed`, or `incomplete`),
 provenance, and receipt counts. They can attest only what the receiver saw:

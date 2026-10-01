@@ -958,6 +958,50 @@ fn rsync_ignore_named_sources_use_source_basename() {
 }
 
 #[test]
+fn rsync_delete_excluded_removes_ignored_named_sources() {
+    let t = Tmp::new();
+    write(&t.path("source/report.txt"), b"new");
+    std::os::unix::fs::symlink("report.txt", t.path("source/link.txt")).unwrap();
+    fs::create_dir(t.path("dir")).unwrap();
+    for delete_excluded in [false, true] {
+        for dry_run in [false, true] {
+            for reverse in [false, true] {
+                let destination = format!("dst-{delete_excluded}-{dry_run}-{reverse}");
+                for name in ["report.txt", "link.txt", "other.txt"] {
+                    write(&t.path(&format!("{destination}/{name}")), b"old");
+                }
+                let source = t.s("source/report.txt");
+                let link = t.s("source/link.txt");
+                let directory = t.s("dir/");
+                let destination = t.s(&format!("{destination}/"));
+                let mut args = vec!["-a", "--delete", "--syq-ignore", "*.txt"];
+                if delete_excluded {
+                    args.push("--delete-excluded");
+                }
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                if reverse {
+                    args.extend([directory.as_str(), source.as_str(), link.as_str()]);
+                } else {
+                    args.extend([source.as_str(), link.as_str(), directory.as_str()]);
+                }
+                args.push(&destination);
+                run_ok(&args);
+                for name in ["report.txt", "link.txt", "other.txt"] {
+                    let path = Path::new(&destination).join(name);
+                    if dry_run || !delete_excluded {
+                        assert_eq!(read(&path), b"old", "{}", path.display());
+                    } else {
+                        assert!(!path.exists(), "{}", path.display());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn ignore_from_strips_bom_and_hyphen_patterns_work() {
     let t = Tmp::new();
     make_ignore_tree(&t.path("src"));
