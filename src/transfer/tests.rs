@@ -3136,11 +3136,44 @@ fn explicit_batch_request_and_pipeline_settings_keep_fixed_grouping() {
         "request-size=1M",
         "pipeline-depth=8",
     ] {
-        let src = Arc::new(Mutex::new(PipelineState::default()));
-        let dst = Arc::new(Mutex::new(PipelineState::default()));
-        let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
-        let tuning = option.parse().unwrap();
-        Arc::get_mut(&mut worker.opts).unwrap().tuning = tuning;
-        assert!(!worker.adaptive_batches(), "{option}");
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        for i in 0..512 {
+            sched.push_file(pipeline_job(format!("file{i}").as_bytes(), 32 << 10));
+        }
+        sched.scan_done();
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(32 << 10),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(32 << 10),
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.tuning = option.parse().unwrap();
+        opts.block = 4 << 20;
+        worker.fast_batch_files = opts.tuning.batch_files.unwrap_or(2048);
+        worker.process_item(sched.next()).unwrap();
+        let source = src.lock().unwrap();
+        let reads: Vec<_> = source
+            .requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::ReadSmallBatch(reads) => Some(reads),
+                _ => None,
+            })
+            .collect();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.iter().all(|reads| reads.len() == 32),
+            "{option}: fixed 1 MiB groups, not adaptive 64 KiB startup groups"
+        );
+        assert_eq!(
+            worker.progress.files_done.load(Relaxed),
+            (32 * reads.len()) as u64
+        );
+        assert!(source.replies.is_empty());
+        assert!(dst.lock().unwrap().replies.is_empty());
     }
 }
