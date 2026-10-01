@@ -85,6 +85,7 @@ struct PipelineState {
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
     auto_small_size: Option<u64>,
+    reject_small_puts: bool,
     immediate_batch_receipts: Option<Arc<crate::conn::BatchReceipts>>,
 }
 
@@ -148,6 +149,9 @@ impl Conn for PipelineConn {
                         })
                         .collect(),
                 ),
+                Request::PutSmallBatch(_) if state.reject_small_puts => {
+                    Response::Err("denied".into())
+                }
                 Request::PutSmallBatch(puts) => Response::Applied(vec![None; puts.len()]),
                 Request::StatMany { paths, .. } => Response::Stats(
                     paths
@@ -3081,7 +3085,7 @@ fn adaptive_batches_leave_work_for_peers_including_empty_files() {
 fn aged_batch_requests_drain_before_refill_at_either_endpoint() {
     for slow_source in [true, false] {
         let size = 1024;
-        let delay = std::time::Duration::from_millis(300);
+        let delay = std::time::Duration::from_millis(600);
         let src = Arc::new(Mutex::new(PipelineState {
             auto_small_size: Some(size),
             latency: slow_source.then_some(delay),
@@ -3150,7 +3154,7 @@ fn acknowledged_batch_writes_do_not_stall_source_refill() {
     let size = 32 << 10;
     let src = Arc::new(Mutex::new(PipelineState {
         auto_small_size: Some(size),
-        latency: Some(std::time::Duration::from_millis(150)),
+        latency: Some(std::time::Duration::from_millis(300)),
         ..Default::default()
     }));
     let dst = Arc::new(Mutex::new(PipelineState {
@@ -3194,6 +3198,73 @@ fn acknowledged_batch_writes_do_not_stall_source_refill() {
     );
     assert!(source.replies.is_empty());
     assert!(dst.lock().unwrap().replies.is_empty());
+}
+
+#[test]
+fn received_batch_feedback_sizes_the_next_source_request() {
+    for rejected in [false, true] {
+        let size = 32 << 10;
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
+            reject_small_puts: rejected,
+            ..Default::default()
+        }));
+        let mut worker =
+            pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
+        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        let jobs: Vec<_> = (0..12)
+            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
+            .collect();
+        let mut next = 0;
+        let mut limits = Vec::new();
+        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+        worker
+            .transfer_small_batches(
+                &jobs,
+                |limit| {
+                    if next == jobs.len() {
+                        return None;
+                    }
+                    limits.push(limit);
+                    let group = next..next + 1;
+                    next += 1;
+                    Some(group)
+                },
+                &mut results,
+            )
+            .unwrap();
+        if rejected {
+            assert_eq!(next, 4, "reject before claiming more source work");
+            assert!(matches!(results[0], Some(Err(_))));
+            assert!(results[1..].iter().all(Option::is_none));
+            assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
+            assert_eq!(dst.lock().unwrap().requests.len(), 1);
+        } else {
+            assert_eq!(
+                limits[4].bytes,
+                256 << 10,
+                "first receipt updates the next claim"
+            );
+            assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
+            assert_eq!(
+                worker.progress.bytes_done.load(Relaxed),
+                size * jobs.len() as u64
+            );
+        }
+        assert!(
+            src.lock().unwrap().replies.is_empty(),
+            "issued reads drained"
+        );
+        assert!(
+            dst.lock().unwrap().replies.is_empty(),
+            "issued writes drained"
+        );
+    }
 }
 
 #[test]

@@ -44,8 +44,12 @@ impl WorkBudget {
         self.limit
     }
 
+    // A completion target is not a stall deadline. Leave room for ordinary
+    // queuing variation instead of draining a healthy pipe at its operating point.
     pub fn overdue(&self, now: Instant, oldest: Option<Instant>) -> bool {
-        oldest.is_some_and(|start| now.saturating_duration_since(start) > self.target)
+        oldest.is_some_and(|start| {
+            now.saturating_duration_since(start) > self.target.saturating_mul(2)
+        })
     }
 
     /// End-to-end completion includes reads, writes and time behind earlier
@@ -58,8 +62,17 @@ impl WorkBudget {
             if amount == 0 {
                 return current;
             }
-            (u128::from(amount).saturating_mul(target) / elapsed)
-                .clamp(1, u128::from(current.saturating_mul(4))) as u64
+            let estimate = (u128::from(amount).saturating_mul(target) / elapsed)
+                .clamp(1, u128::from(current.saturating_mul(4))) as u64;
+            // Groups can be smaller than the budget at a boundary or because
+            // they were issued before it grew. An on-time remainder does not
+            // show that the current budget is too large. Likewise, a late
+            // reply from an older, larger group cannot justify growing it.
+            if elapsed <= target {
+                estimate.max(current)
+            } else {
+                estimate.min(current)
+            }
         }
         self.limit.bytes = resized(self.limit.bytes, work.bytes, elapsed, target).min(1 << 20);
         self.limit.files =
@@ -114,6 +127,45 @@ mod tests {
     }
 
     #[test]
+    fn on_time_remainders_keep_capacity_and_late_old_groups_cannot_grow_it() {
+        let mut budget = WorkBudget::default();
+        for _ in 0..4 {
+            budget.observe(budget.limit(), Duration::from_millis(50));
+        }
+        let large = budget.limit();
+        assert_eq!(large.bytes, 1 << 20);
+        assert_eq!(large.files, 2048);
+        for work in [
+            WorkSize {
+                bytes: 16 << 10,
+                files: 1,
+            },
+            WorkSize { bytes: 0, files: 1 },
+        ] {
+            budget.observe(work, Duration::from_millis(200));
+            assert_eq!(
+                budget.limit(),
+                large,
+                "fast tail is not a slower connection"
+            );
+        }
+        budget.observe(large, Duration::from_secs(1));
+        let reduced = budget.limit();
+        assert!(reduced.bytes < large.bytes && reduced.files < large.files);
+        budget.observe(large, Duration::from_millis(300));
+        assert_eq!(
+            budget.limit(),
+            reduced,
+            "late sample cannot undo a reduction"
+        );
+        budget.observe(reduced, Duration::from_millis(50));
+        assert!(
+            budget.limit().bytes > reduced.bytes,
+            "growth resumes with fast service"
+        );
+    }
+
+    #[test]
     fn empty_files_and_very_fast_or_slow_samples_stay_bounded() {
         let mut budget = WorkBudget::default();
         budget.observe(
@@ -157,7 +209,8 @@ mod tests {
         let start = Instant::now();
         assert!(!budget.overdue(start + Duration::from_millis(700), Some(start)));
         assert!(!budget.overdue(start + Duration::from_secs(1), Some(start)));
-        assert!(budget.overdue(start + Duration::from_secs(2), Some(start)));
+        assert!(!budget.overdue(start + Duration::from_secs(2), Some(start)));
+        assert!(budget.overdue(start + Duration::from_secs(4), Some(start)));
         assert!(!budget.overdue(start + Duration::from_secs(20), None));
         budget.observe(budget.limit(), Duration::from_millis(400));
         assert_eq!(

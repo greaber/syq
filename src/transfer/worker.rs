@@ -420,15 +420,25 @@ impl Worker {
                 {
                     let started = std::time::Instant::now();
                     if adaptive {
-                        // Replies may already be queued while we receive source
-                        // data. Only unacknowledged writes can stall refill;
-                        // arrived replies still get validated when consumed.
+                        // Apply acknowledgments already queued by the reader
+                        // before sizing more work. Waiting for a full write
+                        // window delays feedback even with a fast destination.
                         let received = early.as_ref().map_or(0, |scope| scope.received_count());
+                        for _ in 0..received {
+                            if !self.receive_small_batch(
+                                writes.pop_front().expect("acknowledged batch"),
+                                jobs,
+                                results,
+                                early.as_ref(),
+                            )? {
+                                break 'issuing;
+                            }
+                        }
                         let oldest = reads
                             .front()
                             .map(|r| r.2)
                             .into_iter()
-                            .chain(writes.get(received).map(|w| w.1))
+                            .chain(writes.front().map(|w| w.1))
                             .min();
                         if self.batch_budget.overdue(started, oldest) {
                             break;
