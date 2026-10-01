@@ -17,6 +17,10 @@ impl WorkSize {
 pub(super) struct WorkBudget {
     limit: WorkSize,
     target: Duration,
+    recheck_latency: bool,
+    next_latency_check: Instant,
+    earliest_latency_check: Instant,
+    limit_at_check: WorkSize,
 }
 impl Default for WorkBudget {
     fn default() -> Self {
@@ -26,6 +30,13 @@ impl Default for WorkBudget {
                 files: 64,
             },
             target: Duration::from_millis(250),
+            recheck_latency: false,
+            next_latency_check: Instant::now() + Duration::from_secs(2),
+            earliest_latency_check: Instant::now() + Duration::from_secs(2),
+            limit_at_check: WorkSize {
+                bytes: 64 << 10,
+                files: 64,
+            },
         }
     }
 }
@@ -38,6 +49,42 @@ impl WorkBudget {
         // shrinking; a single-RPC allowance stalls fast delayed connections.
         self.target = Duration::from_millis(250)
             .max(round_trip.saturating_mul(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32));
+    }
+
+    pub fn latency_target(&self) -> Duration {
+        self.target
+    }
+
+    pub fn latency_check_due(&self, now: Instant) -> bool {
+        let shrunk = self.limit.bytes.saturating_mul(2) < self.limit_at_check.bytes
+            || self.limit.files.saturating_mul(2) < self.limit_at_check.files;
+        (now >= self.next_latency_check
+            && (self.recheck_latency || self.target > Duration::from_millis(250)))
+            || (now >= self.earliest_latency_check && self.recheck_latency && shrunk)
+    }
+
+    pub fn refreshed_latency(&mut self, round_trip: Duration, now: Instant) {
+        let previous = self.target;
+        let periodic = now >= self.next_latency_check;
+        self.set_latency(round_trip);
+        if !periodic {
+            // An urgent check responds to a slowdown. A transiently empty
+            // queue during its drain is not evidence for a lower allowance;
+            // periodic checks can lower it again when conditions improve.
+            self.target = self.target.max(previous);
+        }
+        self.recheck_latency = false;
+        self.limit_at_check = self.limit;
+        self.earliest_latency_check = now
+            + Duration::from_secs(2)
+                .max(round_trip.saturating_mul(8))
+                .min(Duration::from_secs(300));
+        // Draining for a check costs a round trip. Keep checks infrequent even
+        // when a slow data path remains above the target after a cheap RPC.
+        let interval = Duration::from_secs(30)
+            .max(round_trip.saturating_mul(32))
+            .min(Duration::from_secs(300));
+        self.next_latency_check = now + interval;
     }
 
     pub fn limit(&self) -> WorkSize {
@@ -56,6 +103,7 @@ impl WorkBudget {
     /// requests. Reduce immediately when service slows; grow at most fourfold
     /// per observation so a briefly cached operation cannot reserve a huge tail.
     pub fn observe(&mut self, work: WorkSize, elapsed: Duration) {
+        self.recheck_latency |= elapsed > self.target;
         let elapsed = elapsed.max(Duration::from_micros(1)).as_nanos();
         let target = self.target.as_nanos();
         fn resized(current: u64, amount: u64, elapsed: u128, target: u128) -> u64 {
@@ -267,5 +315,45 @@ mod tests {
                 files: 256
             }
         );
+    }
+
+    #[test]
+    fn latency_checks_are_bounded_and_allow_recovery_when_queueing_disappears() {
+        let mut budget = WorkBudget::default();
+        let now = Instant::now() + Duration::from_secs(3);
+        assert!(!budget.latency_check_due(now));
+        budget.observe(budget.limit(), Duration::from_millis(400));
+        assert!(budget.latency_check_due(now));
+        budget.refreshed_latency(Duration::from_millis(300), now);
+        assert_eq!(budget.latency_target(), Duration::from_millis(1200));
+        budget.observe(budget.limit(), Duration::from_millis(1300));
+        assert!(!budget.latency_check_due(now + Duration::from_secs(29)));
+        assert!(budget.latency_check_due(now + Duration::from_secs(30)));
+        budget.refreshed_latency(Duration::from_millis(10), now + Duration::from_secs(30));
+        assert_eq!(budget.latency_target(), Duration::from_millis(250));
+        assert!(!budget.latency_check_due(now + Duration::from_secs(61)));
+        budget.observe(budget.limit(), Duration::from_secs(4));
+        assert!(!budget.latency_check_due(now + Duration::from_secs(31)));
+        assert!(
+            budget.latency_check_due(now + Duration::from_secs(33)),
+            "a new severe drop need not wait thirty seconds"
+        );
+        budget.refreshed_latency(Duration::from_secs(4), now + Duration::from_secs(33));
+        assert_eq!(budget.latency_target(), Duration::from_secs(16));
+        budget.observe(budget.limit(), Duration::from_secs(64));
+        assert!(budget.latency_check_due(now + Duration::from_secs(66)));
+        budget.refreshed_latency(Duration::from_millis(10), now + Duration::from_secs(66));
+        assert_eq!(
+            budget.latency_target(),
+            Duration::from_secs(16),
+            "an urgent check must not mistake a transiently empty queue for recovery"
+        );
+        assert!(!budget.latency_check_due(now + Duration::from_secs(95)));
+        assert!(budget.latency_check_due(now + Duration::from_secs(96)));
+        budget.refreshed_latency(Duration::from_millis(10), now + Duration::from_secs(96));
+        assert_eq!(budget.latency_target(), Duration::from_millis(250));
+        budget.refreshed_latency(Duration::MAX, now + Duration::from_secs(97));
+        assert!(!budget.latency_check_due(now + Duration::from_secs(396)));
+        assert!(budget.latency_check_due(now + Duration::from_secs(397)));
     }
 }

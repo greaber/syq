@@ -285,7 +285,10 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
 
 By default, workers adjust the size of small-file request groups to their own
 observed completion times. Slow workers issue smaller groups, leaving unread
-files available to others. A group still contains whole files: one slow file
+files available to others. Workers occasionally recheck connection delay when
+replies slow down, so competing traffic does not permanently reduce their groups
+to single files. These checks briefly pause new requests on that worker.
+A group still contains whole files: one slow file
 can exceed the estimate, and requests already sent must finish or fail.
 Explicit `batch-files`, `batch-bytes`, `request-size`, or `pipeline-depth` settings
 disable this adjustment for controlled comparisons.
