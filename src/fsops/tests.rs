@@ -5224,6 +5224,70 @@ fn partial_seeding_does_not_fall_back_to_final_when_disallowed() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn shorter_staged_basis_truncates_rounded_clone_before_comparison() {
+    use std::os::unix::fs::MetadataExt;
+
+    for final_donor in [false, true] {
+        let tree = crate::test_support::tempdir().unwrap();
+        let path = tree.path().join("file");
+        let donor_path = if final_donor {
+            path.clone()
+        } else {
+            tree.path().join(".file.syq-tmp.abcdefghijklmnop")
+        };
+        let original = vec![17; (4 << 20) + 123];
+        let wanted = (2 << 20) + 17;
+        fs::write(&donor_path, &original).unwrap();
+        let donor = File::open(&donor_path).unwrap();
+        donor.sync_all().unwrap();
+        let rounded = (wanted as u64)
+            .next_multiple_of(donor.metadata().unwrap().blksize().max(1))
+            .min(original.len() as u64);
+        let probe = File::create(tree.path().join("probe")).unwrap();
+        let clones_supported = crate::local_copy::try_clone(&donor, &probe, rounded);
+        drop(probe);
+        let mut ops = destination_ops(tree.path());
+        let id = [106; 16];
+        let reply = ops.handle(&Request::StageBasis {
+            path: path_bytes(&path),
+            copy_id: id,
+            len: wanted as u64,
+            block: MIN_HASH_BLOCK_BYTES,
+            allow_final: final_donor,
+            attempt: 0,
+            guard: None,
+        });
+        let Response::BasisStaged { compare_final } = reply else {
+            panic!("{reply:?}");
+        };
+        if clones_supported || !final_donor {
+            assert!(!compare_final);
+        }
+        let partial = tree
+            .path()
+            .join(ops.partial_path(Path::new("file"), &id).unwrap());
+        assert_eq!(fs::metadata(&partial).unwrap().len(), wanted as u64);
+        fs::write(&donor_path, vec![91; original.len()]).unwrap();
+        if !compare_final {
+            assert_eq!(fs::read(&partial).unwrap(), original[..wanted]);
+            let reply = ops.handle(&Request::HashWindow {
+                final_basis: false,
+                path: path_bytes(&path),
+                copy_id: id,
+                off: (wanted - 17) as u64,
+                len: 17,
+                block: MIN_HASH_BLOCK_BYTES,
+                attempt: 0,
+                guard: None,
+            });
+            assert!(matches!(reply, Response::Hashes(h)
+                if h == vec![ops.hash_policy.algorithm.hash(&[17; 17])]));
+        }
+    }
+}
+
 #[test]
 fn comparison_window_reads_staged_bytes_after_donor_changes() {
     let tree = crate::test_support::tempdir().unwrap();

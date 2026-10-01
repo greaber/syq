@@ -190,10 +190,15 @@ mod tests {
             input.set_len(length as u64).unwrap();
             crate::sparse::write_at(&input, &original, 0, false).unwrap();
             input.sync_all().unwrap();
-            let probe = File::create(tree.path().join("probe")).unwrap();
-            let clones_supported = crate::local_copy::try_clone(&input, &probe, length as u64);
-            drop(probe);
             for wanted in [(4 << 20), (4 << 20) + 17, length - 1, length] {
+                // Full-file cloning alone does not establish which range
+                // alignment this filesystem accepts.
+                let probe = File::create(tree.path().join("probe")).unwrap();
+                let rounded = (wanted as u64)
+                    .next_multiple_of(input.metadata().unwrap().blksize().max(1))
+                    .min(length as u64);
+                let clones_supported = crate::local_copy::try_clone(&input, &probe, rounded);
+                drop(probe);
                 let output = File::options()
                     .read(true)
                     .write(true)
@@ -203,6 +208,8 @@ mod tests {
                 let cloned = try_clone(&input, &output, wanted as u64);
                 if clones_supported {
                     assert!(cloned, "cloneable filesystem rejected prefix {wanted}");
+                }
+                if cloned {
                     let actual = output.metadata().unwrap().len();
                     assert!(actual >= wanted as u64 && actual <= length as u64);
                     assert!(actual - wanted as u64 < input.metadata().unwrap().blksize());
