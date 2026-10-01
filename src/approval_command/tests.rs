@@ -1,5 +1,20 @@
 use super::*;
 
+#[test]
+fn home_is_shortened_only_as_a_path_prefix() {
+    let home = Some(OsStr::new("/home/me"));
+    assert_eq!(abbreviate_home(b"/home/me", home), b"~");
+    assert_eq!(abbreviate_home(b"/home/me/rt-bench", home), b"~/rt-bench");
+    assert_eq!(abbreviate_home(b"/home/meow/x", home), b"/home/meow/x");
+    assert_eq!(abbreviate_home(b"/tmp/x", home), b"/tmp/x");
+    assert_eq!(abbreviate_home(b"/home/me/a b", home), b"~/a b");
+    assert_eq!(abbreviate_home(b"/home/me/x", None), b"/home/me/x");
+    assert_eq!(
+        abbreviate_home(b"/home/me/x", Some(OsStr::new(""))),
+        b"/home/me/x"
+    );
+}
+
 fn command(args: &[&str]) -> Vec<Vec<u8>> {
     args.iter().map(|arg| arg.as_bytes().to_vec()).collect()
 }
@@ -497,6 +512,6 @@ fn long_commands_are_shortened_in_desktop_prompts() {
     ));
     let short = render(&shown, Some(400), str::to_owned, str::to_owned);
     assert!(short.chars().count() < 450, "{}", short.len());
-    assert!(short.ends_with("… (full command in Details)"));
+    assert!(short.ends_with("… (full command in syq persist receive pending)"));
     assert!(render(&shown, None, str::to_owned, str::to_owned).ends_with("--to @laptop"));
 }

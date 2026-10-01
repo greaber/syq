@@ -111,15 +111,15 @@ def tests():
                 if choice == "allow":
                     assert destination.read_bytes() == b"return\n"
                 app, summary, body, actions, expiry = observed[-1]
-                assert app == "syq" and summary == "syq: Allow this copy?"
+                assert app == "syq" and summary.startswith("syq on "), summary
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
-                assert "source" in body and "overwritten" not in body and "May create" not in body, body
-                # The server's command comes first, then where it writes.
-                assert body.startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), body
-                assert "\nWrites to: " in body, body
-                assert "Details: syq persist receive pending" in body, body
-                assert "Limits:" not in body and "not been inspected" not in body, body
+                assert "May create" not in body and "\nFrom: " not in body and "existing" not in body, body
+                # What is copied where, then the server's command; the server's
+                # directory comes first only when it does not fit the title.
+                assert 'wants to download\n\n    /tmp/syq-real-ssh/return-source/message.txt\n\nto\n\n    "/tmp/syq-real-ssh-receive/desktop-' in body, body
+                assert body.split("\n\n")[-1].startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), body
+                assert "Details" not in body and "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
                 assert expiry == 300000
                 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
@@ -142,7 +142,7 @@ def tests():
         result = subprocess.run(["ssh", "source", command], timeout=20)
         assert result.returncode != 0
         assert destination.read_bytes() == b"keep this"
-        assert "Existing destination entries may be overwritten" in observed[-1][2], observed[-1]
+        assert '\n\nto\n\n    /tmp/syq-real-ssh-receive/desktop-existing\n\nreplaces existing files\n\n' in observed[-1][2], observed[-1]
         for choice in ["allow", "deny"]:
             marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
             command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])
@@ -151,11 +151,11 @@ def tests():
                 assert (process.wait(timeout=20) == 0) == (choice == "allow")
                 assert marker.exists() == (choice == "allow")
                 _, title, body, _, _ = observed[-1]
-                assert title == "syq: Run this command?", title
-                assert body.startswith('"touch" '), body
-                assert "From:" in body and "In:" in body and "Runs with your permissions" in body, body
-                assert "Copy root and limits do not apply" in body, body
-                assert "Details: syq persist receive pending" in body and "Limits:" not in body, body
+                assert title.startswith("syq on "), title
+                assert "wants to run\n\n    touch /tmp/syq-real-ssh-receive/exec-desktop-" in body, body
+                assert "\n\nin\n\n    " in body, body
+                assert body.split("\n\n")[-1].startswith("syq exec --on @laptop -- touch "), body
+                assert "Details" not in body and "Limits:" not in body and "Runs with" not in body, body
                 print(f"Command notification {choice}: passed", flush=True)
             finally:
                 if process.poll() is None:

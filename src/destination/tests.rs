@@ -15,7 +15,7 @@ fn full_listen_queue_reports_busy_without_reconnect_advice() {
     let mut queued = Vec::new();
     let mut full = false;
     for _ in 0..16 {
-        match connect_socket(&path, Instant::now() + Duration::from_secs(1)) {
+        match connect_socket(&path, Instant::now() + Duration::from_secs(1), None) {
             Ok(socket) => queued.push(socket),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 full = true;
@@ -32,9 +32,14 @@ fn full_listen_queue_reports_busy_without_reconnect_advice() {
         secret: "test".into(),
         program: b"/test/syq".to_vec(),
     };
-    let error = exchange(&registration, Message::Ping, Duration::from_millis(100))
-        .err()
-        .unwrap();
+    let error = exchange(
+        &registration,
+        Message::Ping,
+        Duration::from_millis(100),
+        Some(Duration::from_millis(100)),
+    )
+    .err()
+    .unwrap();
     assert!(error.to_string().contains("busy"), "{error:#}");
     assert!(!error.to_string().contains("reconnect"), "{error:#}");
     assert_eq!(
@@ -65,13 +70,13 @@ fn registration_retries_socket_timeout_but_not_peer_rejection() {
                 )
                 .unwrap();
             } else {
-                // Leave the connection open without a reply: read_exact
-                // must hit the real Unix socket timeout (EAGAIN/EWOULDBLOCK).
+                // Leave the connection open without a reply so the absolute
+                // exchange deadline expires even with no socket read timeout.
                 let _ = stopped.recv_timeout(Duration::from_secs(15));
             }
         });
         // Only the unanswered handshake needs a short timeout to fail quickly
-        // through the same real Unix socket timeout. The rejection keeps the
+        // through the exchange deadline. The rejection keeps the
         // production timeout so a slow peer thread cannot turn it into a retry.
         let timeout = if reject {
             REGISTRATION_HANDSHAKE_TIMEOUT
@@ -226,7 +231,10 @@ pub(super) fn broker(
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
         name: "laptop".into(),
         identity_key: identity::generate_key().unwrap(),
-        requester: "test-server".into(),
+        requester: crate::receive_approval::Requester {
+            server: "test-server".into(),
+            profile: "test".into(),
+        },
         auto_approve_root: Some(root.into()),
         notifications: crate::receive_approval::Notifications::Off,
         approvals: Arc::new(crate::receive_approval::Queue::default()),
@@ -283,10 +291,12 @@ fn approve(registration: &Registration, command: Vec<Vec<u8>>, request: CopyRequ
     let (_, reply) = exchange(
         registration,
         Message::Request {
+            cwd: String::new(),
             command,
             request: Box::new(request),
         },
         Duration::from_secs(10),
+        Some(Duration::from_secs(10)),
     )
     .unwrap();
     match reply {
@@ -359,7 +369,13 @@ fn named_parser_rejects_oversize_truncated_and_wrong_generation() {
     let root = crate::test_support::tempdir().unwrap();
     let (_broker, _receiver, mut registration, _) = broker(root.path(), Approval::Always);
     registration.secret = "wrong".into();
-    assert!(exchange(&registration, Message::Ping, Duration::from_secs(2)).is_err());
+    assert!(exchange(
+        &registration,
+        Message::Ping,
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
+    )
+    .is_err());
     let mut stream = UnixStream::connect(&registration.socket).unwrap();
     write_message(
         &mut stream,
@@ -388,10 +404,12 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
         exchange(
             &registration,
             Message::Request {
+                cwd: String::new(),
                 command,
                 request: Box::new(request),
             },
             Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
         )
         .is_err()
     });
@@ -418,7 +436,8 @@ fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
             token: approved.token.clone(),
             control: true
         },
-        Duration::from_secs(2)
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
     )
     .is_err());
     conn.send(Request::TcpListen {
@@ -443,7 +462,8 @@ fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
             token: approved.token,
             control: false
         },
-        Duration::from_secs(2)
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
     )
     .is_err());
 }
@@ -456,6 +476,7 @@ fn worker_stream(registration: &Registration, approved: &Approved) -> UnixStream
             control: false,
         },
         Duration::from_secs(2),
+        Some(Duration::from_secs(2)),
     )
     .unwrap();
     assert!(matches!(reply, Reply::Ready));
@@ -489,11 +510,7 @@ fn named_control_closure_revokes_connected_workers() {
     let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
     let approved = approve(&registration, command, request);
     let conn = control(registration.clone(), &approved);
-    let mut worker = worker_stream(&registration, &approved);
-    // macOS may reject SO_RCVTIMEO after the peer has shut down.
-    worker
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
+    let worker = worker_stream(&registration, &approved);
     let authority = receiver
         .sessions
         .lock()
@@ -509,8 +526,8 @@ fn named_control_closure_revokes_connected_workers() {
     }
     assert!(receiver.sessions.lock().unwrap().is_empty());
     assert_eq!(
-        worker.read(&mut [0u8; 1]).unwrap(),
-        0,
+        crate::test_support::read_until_closed(&worker, Duration::from_secs(1)).unwrap(),
+        Vec::<u8>::new(),
         "connected worker was not closed"
     );
     let mut request = Request::Apply {
@@ -562,9 +579,8 @@ fn pending_hellos(
                 token: approved.token.clone(),
                 control: false,
             },
-            // exchange sets the read timeout before sending Open, while the
-            // peer is still live. Keep that timeout for waiting on expiry.
-            Duration::from_secs(5),
+            Duration::from_secs(2),
+            None,
         )
         .unwrap();
         assert!(matches!(reply, Reply::Ready));
@@ -591,13 +607,19 @@ fn named_pending_hello_is_bounded_and_does_not_block_readiness() {
             token: approved.token.clone(),
             control: false,
         },
-        Duration::from_secs(2)
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
     )
     .is_err());
     assert!(matches!(
-        exchange(&registration, Message::Ping, Duration::from_secs(1))
-            .unwrap()
-            .1,
+        exchange(
+            &registration,
+            Message::Ping,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1))
+        )
+        .unwrap()
+        .1,
         Reply::Ready
     ));
 }
@@ -607,10 +629,10 @@ fn named_expired_pending_hellos_release_their_worker_allowance() {
     let (_fixture, registration, approved, _control, pending) =
         pending_hellos(Duration::from_millis(200));
     // The receiver closes each channel when its hello times out; waiting for
-    // that close is waiting for the expiry itself, not a fixed delay. Use
-    // the timeout set by exchange: macOS can reject changes after peer close.
-    for mut stream in pending {
-        stream.read_to_end(&mut Vec::new()).unwrap();
+    // that close is waiting for the expiry itself, not a fixed delay. Neither
+    // socket options nor shared flags change while waiting for an expired peer.
+    for stream in pending {
+        crate::test_support::read_until_closed(&stream, Duration::from_secs(5)).unwrap();
     }
     // Expired handshakes release their worker allowance while control stays live.
     let _worker = worker_stream(&registration, &approved);
@@ -631,6 +653,7 @@ fn named_abandoned_open_releases_its_session() {
             control: true,
         },
         Duration::from_secs(2),
+        Some(Duration::from_secs(2)),
     )
     .unwrap();
     assert!(matches!(reply, Reply::Ready));
@@ -749,7 +772,8 @@ fn named_authorization_expires_before_control_opens() {
             token: approved.token,
             control: true
         },
-        Duration::from_secs(2)
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
     )
     .is_err());
     assert_eq!(fs::read_dir(root).unwrap().count(), 0);
@@ -766,10 +790,12 @@ fn named_limits_and_scope_validation_precede_approval() {
     assert!(exchange(
         &registration,
         Message::Request {
+            cwd: String::new(),
             command,
             request: Box::new(request),
         },
-        Duration::from_secs(2)
+        Duration::from_secs(2),
+        Some(Duration::from_secs(2))
     )
     .is_err());
     assert_eq!(fs::read_dir(root).unwrap().count(), 0);

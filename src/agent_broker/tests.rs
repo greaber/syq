@@ -118,9 +118,8 @@ fn read_response(stream: &mut UnixStream) -> Response {
 }
 
 fn assert_closed(stream: &mut UnixStream) {
-    let mut byte = [0];
-    match stream.read(&mut byte) {
-        Ok(0) => {}
+    match crate::test_support::read_until_closed(stream, Duration::from_secs(1)) {
+        Ok(bytes) if bytes.is_empty() => {}
         Err(error)
             if matches!(
                 error.kind(),
@@ -835,18 +834,10 @@ fn broker_bounds_idle_clients_and_drop_closes_them() {
     }
     assert_eq!(broker.broker.active_connections(), TEST_BROKER_CONNECTIONS);
     let mut excess = UnixStream::connect(&path).unwrap();
-    excess
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
     // The broker rejects excess clients without reading a request. Writing
     // here would race that close and could fail with BrokenPipe.
     assert_closed(&mut excess);
 
-    for client in &clients {
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-    }
     drop(broker);
     assert!(!path.exists());
     for mut client in clients {

@@ -1,6 +1,12 @@
 use super::*;
 
-type SmallPutOutcome = Result<Option<(u64, u64)>>;
+#[derive(Debug)]
+pub(super) enum SmallPutResult {
+    Published(Option<(u64, u64)>),
+    SourceChanged(Box<Option<Entry>>),
+}
+
+type SmallPutOutcome = Result<SmallPutResult>;
 
 pub(super) struct RangeFlight {
     pub(super) handle: RangeHandle,
@@ -267,6 +273,9 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !self.opts.dry_run
+            // A source-change retry may have a completed partial to reuse,
+            // even when the new source is small enough for a batch.
+            && j.attempt == 0
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
@@ -327,7 +336,12 @@ impl Worker {
             }
         };
         for (&idx, error) in sent.iter().zip(applied) {
-            results[idx] = Some(error.map_err(endpoint_error).context("put"));
+            results[idx] = Some(
+                error
+                    .map(SmallPutResult::Published)
+                    .map_err(endpoint_error)
+                    .context("put"),
+            );
         }
         true
     }
@@ -358,12 +372,12 @@ impl Worker {
             );
         }
         // Remote readers already credited these acknowledgments on arrival.
-        // Synchronous connections account here. Confirmed file completion
-        // still belongs to the final source check in either case.
+        // Synchronous connections account here. Successful-file bookkeeping
+        // happens after the batch drains in either case.
         if early.is_none() {
             let (bytes, files) = sent
                 .iter()
-                .filter(|&&idx| matches!(results[idx], Some(Ok(_))))
+                .filter(|&&idx| matches!(results[idx], Some(Ok(SmallPutResult::Published(_)))))
                 .fold((0, 0), |(bytes, files), &idx| {
                     (bytes + jobs[idx].entry.size, files + 1)
                 });
@@ -456,16 +470,13 @@ impl Worker {
                     };
                     let mut requests = Vec::new();
                     for job in &jobs[group.clone()] {
-                        // Empty files need no source access, including mode 000.
-                        if job.entry.size > 0 {
-                            self.limit(job.entry.size);
-                            requests.push(SmallRead {
-                                path: job.src.clone(),
-                                source: self.source_reference(job),
-                                attempt: job.attempt,
-                                len: job.entry.size as u32,
-                            });
-                        }
+                        self.limit(job.entry.size);
+                        requests.push(SmallRead {
+                            path: job.src.clone(),
+                            source: self.source_reference(job),
+                            attempt: job.attempt,
+                            len: job.entry.size as u32,
+                        });
                     }
                     let count = requests.len();
                     if count > 0 {
@@ -523,28 +534,23 @@ impl Worker {
                 let mut sent = Vec::new();
                 for idx in group {
                     let job = &jobs[idx];
-                    let block = if job.entry.size == 0 {
-                        Ok(SmallBlock {
-                            data: Vec::new(),
-                            hash: self.opts.hash_policy.payload_algorithm().hash(&[]),
-                        })
-                    } else {
-                        match blocks.next() {
-                            Some(Ok(block)) if block.data.len() as u64 == job.entry.size => {
-                                Ok(block)
-                            }
-                            Some(Ok(_)) => Err(anyhow::anyhow!("block size mismatch on read")),
-                            Some(Err(error)) => Err(anyhow::anyhow!("read: {error}")),
-                            None => Err(anyhow::anyhow!("missing block in read small batch")),
-                        }
+                    let block = match blocks.next() {
+                        Some(Ok(block)) if block.data.len() as u64 == job.entry.size => Ok(block),
+                        Some(Ok(_)) => Err(anyhow::anyhow!("block size mismatch on read")),
+                        Some(Err(error)) => Err(anyhow::anyhow!("read: {error}")),
+                        None => Err(anyhow::anyhow!("missing block in read small batch")),
                     };
-                    let SmallBlock { data, hash } = match block {
+                    let SmallBlock { data, hash, source } = match block {
                         Ok(block) => block,
                         Err(error) => {
                             results[idx] = Some(Err(error));
                             continue;
                         }
                     };
+                    if source_changed(&job.entry, source.as_ref()) {
+                        results[idx] = Some(Ok(SmallPutResult::SourceChanged(Box::new(source))));
+                        continue;
+                    }
                     let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
                     meta.mode = self.create_mode(job);
                     puts.push(SmallPut {
@@ -719,7 +725,7 @@ impl Worker {
         let (credited, credited_files) = jobs
             .iter()
             .zip(&results)
-            .filter(|(_, result)| matches!(result, Some(Ok(_))))
+            .filter(|(_, result)| matches!(result, Some(Ok(SmallPutResult::Published(_)))))
             .fold((0, 0), |(bytes, files), (job, _)| {
                 (bytes + job.entry.size, files + 1)
             });
@@ -728,30 +734,6 @@ impl Worker {
             self.progress.undo_tuning_files(credited_files);
             return Err(error);
         }
-        // Recheck only acknowledged successes. Later errors must not discard
-        // them or make us inspect groups this worker never published.
-        let successful = jobs
-            .iter()
-            .zip(&results)
-            .filter_map(|(job, result)| matches!(result, Some(Ok(_))).then_some(job));
-        let paths = successful
-            .clone()
-            .map(|job| job.src.clone())
-            .collect::<Vec<_>>();
-        let registered = successful.map(|job| job.source.clone()).collect();
-        let now = if paths.is_empty() {
-            Vec::new()
-        } else {
-            match stat_many_registered(&mut *self.src, paths, Some(registered), false) {
-                Ok(now) => now,
-                Err(error) => {
-                    self.progress.bytes_done.fetch_sub(credited, Relaxed);
-                    self.progress.undo_tuning_files(credited_files);
-                    return Err(error);
-                }
-            }
-        };
-        let mut now = now.into_iter();
         for ((idx, j), res) in batch.iter().zip(jobs.iter()).zip(results) {
             let Some(res) = res else {
                 self.sched.requeue(*idx);
@@ -772,61 +754,48 @@ impl Worker {
                 }
                 continue;
             }
-            let published = res.expect("successful publication checked above");
-            let now = now.next().expect("rechecked acknowledged file");
-            let changed = match &now {
-                Some(e) => {
-                    e.kind != Kind::File
-                        || e.size != j.entry.size
-                        || e.mtime != j.entry.mtime
-                        || e.mtime_nsec != j.entry.mtime_nsec
-                        || (j.entry.inode_metadata.is_some()
-                            && (e.dev, e.ino, e.ctime, e.ctime_nsec)
-                                != (j.entry.dev, j.entry.ino, j.entry.ctime, j.entry.ctime_nsec))
-                }
-                None => true,
-            };
-            if changed {
-                self.progress.bytes_done.fetch_sub(j.entry.size, Relaxed);
-                self.progress.undo_tuning_files(1);
-                if let (Some(e), true, true) = (
-                    now,
-                    j.attempt + 1 < MAX_ATTEMPTS,
-                    j.target_condition == TargetCondition::Any,
-                ) {
-                    if !self.opts.quiet {
-                        self.progress.eprintln(&format!(
-                            "syq: {}: changed during transfer, retrying",
+            let result = res.expect("successful read/publication checked above");
+            let published = match result {
+                SmallPutResult::Published(identity) => identity,
+                SmallPutResult::SourceChanged(now) => {
+                    if let (Some(e), true, true) = (
+                        *now,
+                        j.attempt + 1 < MAX_ATTEMPTS,
+                        j.target_condition == TargetCondition::Any,
+                    ) {
+                        if !self.opts.quiet {
+                            self.progress.eprintln(&format!(
+                                "syq: {}: changed during transfer, retrying",
+                                j.rel
+                            ));
+                        }
+                        let mut all = self.sched.jobs.lock().unwrap();
+                        let job = &mut all[*idx];
+                        self.progress.bytes_total.fetch_sub(j.entry.size, Relaxed);
+                        self.progress.bytes_total.fetch_add(e.size, Relaxed);
+                        job.entry = Entry {
+                            path: job.entry.path.clone(),
+                            ..e
+                        };
+                        job.attempt += 1;
+                        drop(all);
+                        self.sched.requeue(*idx);
+                    } else {
+                        self.progress.error(&format!(
+                            "syq: {}: source changed during transfer (or vanished)",
                             j.rel
                         ));
+                        self.emit_file_result_failed(
+                            j,
+                            "yes",
+                            None,
+                            "source changed during transfer (or vanished)",
+                        );
+                        self.sched.fail_file(*idx);
                     }
-                    let published = self.published_entry(j);
-                    let mut all = self.sched.jobs.lock().unwrap();
-                    let job = &mut all[*idx];
-                    self.progress.bytes_total.fetch_add(e.size, Relaxed);
-                    job.entry = Entry {
-                        path: job.entry.path.clone(),
-                        ..e
-                    };
-                    job.attempt += 1;
-                    all.set_destination(*idx, published);
-                    drop(all);
-                    self.sched.requeue(*idx);
-                } else {
-                    self.progress.error(&format!(
-                        "syq: {}: source changed during transfer (or vanished)",
-                        j.rel
-                    ));
-                    self.emit_file_result_failed(
-                        j,
-                        "yes",
-                        None,
-                        "source changed during transfer (or vanished)",
-                    );
-                    self.sched.fail_file(*idx);
+                    continue;
                 }
-                continue;
-            }
+            };
             if let Err(error) = self.record_hardlink_identity(*idx, j, published) {
                 self.file_error(*idx, error)?;
                 continue;
@@ -1036,7 +1005,7 @@ impl Worker {
         // Reuse needs comparison only when there is a final file to compare.
         // Fresh files can still use the whole-file shortcut with reuse enabled.
         let compare_existing = final_file.is_some() && reuse_blocks;
-        if !compare_existing
+        if !(compare_existing || job.attempt > 0 && reuse_blocks)
             && self
                 .opts
                 .copy_policy(self.bwlimit.is_some())
@@ -1374,6 +1343,7 @@ impl Worker {
         let resp = self.dst.copy_local(
             Request::CopyLocal {
                 source: job.source.clone(),
+                replace_partial: job.attempt > 0,
                 dst: job.dst.clone(),
                 inplace,
                 allow_sequential_nfs_fallback: self.opts.allow_sequential_nfs_fallback,
@@ -1520,13 +1490,27 @@ impl Worker {
         job: &WorkerJob,
         create_if_missing: bool,
     ) -> Result<crate::proto::Preparation> {
+        // An in-place file is created in its final mode; a sidecar in its
+        // staged mode: the final bits, unless group preservation or an ACL
+        // keeps it private until publication. The receiver adds owner access
+        // for its other workers, so publication chmods only files whose
+        // final mode lacks that, or that stayed private.
+        let mode = if job.inplace {
+            self.create_mode(job)
+        } else {
+            crate::fsops::staged_mode(
+                self.create_mode(job),
+                self.publication_flags(job),
+                crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
+            )
+        };
         match ok(
             self.dst.call(Request::Prepare {
                 path: job.dst.clone(),
                 size: job.entry.size,
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
-                mode: self.create_mode(job),
+                mode,
                 attempt: job.attempt,
                 create_if_missing,
                 guard: job.container_guard.clone(),
@@ -2349,6 +2333,15 @@ impl Worker {
         if job.done.load(Relaxed) != job.entry.size {
             bail!("refusing to publish an incomplete file");
         }
+        #[cfg(debug_assertions)]
+        crate::fsops::test_race_barrier(
+            "SYQ_TEST_SOURCE_RECHECK_READY_FILE",
+            "SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE",
+            "source recheck before publication",
+        )?;
+        if !self.recheck_source(idx, &job, job.inplace)? {
+            return Ok(());
+        }
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(&job);
         let finalized = ok(
@@ -2410,7 +2403,7 @@ impl Worker {
             "SYQ_TEST_FINALIZE_CONTINUE_FILE",
             "finalize-ready",
         )?;
-        self.complete_file(idx, job, false)
+        self.complete_file(job, false)
     }
 
     pub(super) fn contents_match(&mut self, job: &WorkerJob) -> Result<bool> {
@@ -2453,37 +2446,26 @@ impl Worker {
         if self.sched.is_failed(idx) {
             return Ok(());
         }
-        self.complete_file(idx, self.job(idx), true)
+        let job = self.job(idx);
+        if !self.recheck_source(idx, &job, true)? {
+            return Ok(());
+        }
+        self.complete_file(job, true)
     }
 
-    /// Recheck the source after either an atomic publication or a verified
-    /// metadata-only completion, and retry from the completed destination when
-    /// the source changed during that work.
-    pub(super) fn complete_file(
+    /// Recheck before publishing staged data. A retry leaves both the old
+    /// destination and the completed partial in place; normal resume planning
+    /// can reuse the partial's matching blocks. In-place writes and verified
+    /// matches already have their completed contents at the destination.
+    fn recheck_source(
         &mut self,
         idx: usize,
-        job: WorkerJob,
-        matched: bool,
-    ) -> Result<()> {
+        job: &WorkerJob,
+        destination_completed: bool,
+    ) -> Result<bool> {
         // Did the source change under us?
         let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
-        let changed = match &now {
-            Some(e) => {
-                e.kind != Kind::File
-                    || e.size != job.entry.size
-                    || e.mtime != job.entry.mtime
-                    || e.mtime_nsec != job.entry.mtime_nsec
-                    || (job.entry.inode_metadata.is_some()
-                        && (e.dev, e.ino, e.ctime, e.ctime_nsec)
-                            != (
-                                job.entry.dev,
-                                job.entry.ino,
-                                job.entry.ctime,
-                                job.entry.ctime_nsec,
-                            ))
-            }
-            None => true,
-        };
+        let changed = source_changed(&job.entry, now.as_ref());
         if changed {
             if job.attempt + 1 < MAX_ATTEMPTS && job.target_condition == TargetCondition::Any {
                 if let Some(e) = now {
@@ -2493,7 +2475,7 @@ impl Worker {
                             job.rel
                         ));
                     }
-                    let published = self.published_entry(&job);
+                    let published = destination_completed.then(|| self.published_entry(job));
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let j = &mut jobs[idx];
                     self.progress.bytes_total.fetch_add(e.size, Relaxed);
@@ -2503,14 +2485,20 @@ impl Worker {
                     };
                     j.attempt += 1;
                     j.done.store(0, Relaxed);
-                    jobs.set_destination(idx, published);
+                    if let Some(published) = published {
+                        jobs.set_destination(idx, published);
+                    }
                     drop(jobs);
                     self.sched.requeue(idx);
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             bail!("source changed during transfer (or vanished)");
         }
+        Ok(true)
+    }
+
+    fn complete_file(&self, job: WorkerJob, matched: bool) -> Result<()> {
         if matched {
             self.progress.files_total.fetch_sub(1, Relaxed);
             self.progress.files_unchanged.fetch_add(1, Relaxed);
