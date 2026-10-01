@@ -1188,7 +1188,7 @@ fn tuning_pipeline_drains_responses_while_sending_large_requests() {
                 .unwrap()
                 .into_inner();
             assert!(matches!(response, Response::Block { off, data, .. }
-                if off == i as u64 * (64 << 10) && &*data == vec![7; 64 << 10]));
+                if off == i as u64 * (64 << 10) && *data == vec![7; 64 << 10]));
         }
         drop(responses);
         drop(requests);
