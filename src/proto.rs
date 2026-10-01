@@ -1594,9 +1594,6 @@ impl SizeHint for Request {
 }
 
 impl SizeHint for Response {
-    fn recycle_frames() -> bool {
-        true
-    }
     fn decode_frame(frame: FrameBuffer) -> io::Result<crate::wire_budget::Budgeted<Self>> {
         payload::decode_response(frame)
     }

@@ -439,48 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_replies_recycle_without_compacting_the_forwarded_payload() {
-        let mut wire = Vec::new();
-        let mut writer = FrameWriter::new(&mut wire, false);
-        for i in 0..3 {
-            writer
-                .write_msg(&Response::Block {
-                    off: i,
-                    hash: [0; 32],
-                    data: vec![i as u8; 256 << 10].into(),
-                })
-                .unwrap();
-        }
-        drop(writer);
-        let mut reader = FrameReader::new(wire.as_slice());
-        let mut original = None;
-        for i in 0..3 {
-            let Response::Block { data, .. } = reader.read_msg::<Response>().unwrap() else {
-                panic!("not a block")
-            };
-            let ptr = data.storage.as_ptr() as usize;
-            if let Some(original) = original {
-                assert_eq!(ptr, original);
-            } else {
-                original = Some(ptr);
-            }
-            assert_eq!(&*data, vec![i; 256 << 10]);
-            std::thread::spawn(move || assert!(data.recycle().is_none()))
-                .join()
-                .unwrap();
-            assert!(reader
-                .pool
-                .returned
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .is_some());
-        }
-        assert_eq!(Payload::from(vec![1, 2, 3]).recycle(), Some(vec![1, 2, 3]));
-    }
-
-    #[test]
     fn outgoing_buffer_recycling_preserves_the_allocation() {
         let mut bytes = Vec::with_capacity(4096);
         bytes.extend_from_slice(b"outgoing");
