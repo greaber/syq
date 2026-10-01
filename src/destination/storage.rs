@@ -30,16 +30,16 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
         &registration,
         Message::Storage {
             command: crate::approval_command::current()?,
-            request,
+            cwd: crate::approval_command::current_directory(),
+            request: Box::new(request),
         },
         REQUEST_TIMEOUT + Duration::from_secs(10),
+        Some(Duration::from_secs(60)),
     )?;
     anyhow::ensure!(
         matches!(reply, Reply::Ready),
         "unexpected storage approval response"
     );
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let configuration = match read_message(&mut stream)? {
         SigningReply::Configuration(configuration) => configuration,
         SigningReply::Error(error) => bail!("authorizing machine: {error}"),
@@ -135,6 +135,7 @@ impl Receiver {
     pub(super) fn storage(
         &self,
         command: Vec<Vec<u8>>,
+        cwd: String,
         request: Request,
         mut stream: TrackedStream,
     ) -> Result<()> {
@@ -159,6 +160,7 @@ impl Receiver {
         self.approvals.request_storage(
             &self.requester,
             &command,
+            &cwd,
             &request,
             self.notifications,
             cancelled,
@@ -168,6 +170,9 @@ impl Receiver {
             !cancelled(),
             "storage authorization cancelled before preparation"
         );
+        // A hashing/preparation phase can take longer than a network request.
+        // The owned receiver registry closes this stream on cancellation.
+        socket.set_read_timeout(None)?;
         write_message(&mut stream, &Reply::Ready)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -177,9 +182,6 @@ impl Receiver {
             &mut stream,
             &SigningReply::Configuration(signer.configuration.clone()),
         )?;
-        // A hashing/preparation phase can take longer than a network request.
-        // The owned receiver registry closes this stream on cancellation.
-        socket.set_read_timeout(None)?;
         loop {
             // Once approved, queued bytes are valid pipelined requests. The
             // approval-phase probe treats those bytes as cancellation; rely on

@@ -14,9 +14,12 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(300);
-/// Desktop prompts show about this much of a requesting command; Details and
-/// `persist receive pending` show all of it.
+/// Desktop prompts show about this much of a requesting command;
+/// `persist receive pending` shows all of it.
 const DESKTOP_COMMAND_CHARS: usize = 400;
+/// Longer titles are truncated by the macOS dialog; the directory then moves
+/// into the body.
+const TITLE_CHARS: usize = 40;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -53,12 +56,18 @@ impl Kind {
     pub(crate) fn is_copy(&self) -> bool {
         *self == Self::Copy
     }
-    fn title(self) -> &'static str {
-        match self {
-            Self::Copy => "syq: Allow this copy?",
-            Self::Command => "syq: Run this command?",
-            Self::Storage => "syq: Authorize storage access?",
-        }
+}
+
+/// Who is asking: the server as this machine names it, and the receiving
+/// profile the request arrived on. Both come from local configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct Requester {
+    pub server: String,
+    pub profile: String,
+}
+impl std::fmt::Display for Requester {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (receiving profile @{})", self.server, self.profile)
     }
 }
 
@@ -74,9 +83,24 @@ pub(crate) struct Summary {
     pub command: Vec<String>,
     // Local desktop presentation only: preserve the released pending JSON shape.
     #[serde(skip)]
-    desktop_copy_notice: Option<String>,
+    server: String,
+    /// The requesting process's working directory, as the server showed it.
     #[serde(skip)]
-    desktop_storage: Option<String>,
+    server_cwd: String,
+    /// The prompt's request: "wants to download", what, "to" where. Copy
+    /// sources stay as the command named them; the destination is resolved.
+    #[serde(skip)]
+    verb: &'static str,
+    #[serde(skip)]
+    sources: Vec<String>,
+    #[serde(skip)]
+    preposition: &'static str,
+    #[serde(skip)]
+    target: String,
+    /// Facts the command does not show, such as how long storage requests
+    /// stay valid.
+    #[serde(skip)]
+    notes: Vec<String>,
     #[serde(flatten)]
     pub details: Details,
 }
@@ -116,11 +140,12 @@ pub(crate) enum StorageKind {
 }
 impl Summary {
     fn new(
-        from: &str,
+        from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &crate::destination::CopyRequest,
         lifetime: Duration,
-        inspect_local_destination: bool,
+        remote: Option<&str>,
     ) -> Result<Self> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
@@ -137,17 +162,65 @@ impl Summary {
                 UpdateIfOlder => bail!("unsupported receiving overwrite policy"),
             }
         };
+        // Debug formatting preserves unusual bytes and escapes terminal
+        // control characters. Do not interpret remote text as UI markup.
+        // A copy to another server keeps its requested path; the operation's
+        // own destination is a placeholder until that server resolves it.
+        let (destination, permission) = match remote {
+            None => (
+                format!("{:?}", std::ffi::OsStr::from_bytes(&request.copy.destination)),
+                permission.to_owned(),
+            ),
+            // Automatic approval of writes to this machine does not authorize
+            // use of its SSH credentials on another host; say what that use is.
+            Some(target) => (
+                format!(
+                    "{:?} on {target:?} using your SSH access",
+                    std::ffi::OsStr::from_bytes(&request.destination)
+                ),
+                format!("{permission}. Uses this machine's SSH access to {target:?} and installs the syq helper there if needed"),
+            ),
+        };
+        // Sources stay as the command wrote them, relative to `cwd` on the
+        // server; only the destination is resolved, by this machine.
+        let parsed = crate::approval_command::parse(command).ok();
+        let sources = parsed
+            .as_ref()
+            .map(|args| {
+                let count = args.locations.len().saturating_sub(1);
+                args.locations
+                    .iter()
+                    .take(count)
+                    .map(|location| crate::approval_command::display_arg(&location.path))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let prunes = parsed.as_ref().is_some_and(|args| args.delete);
+        let target = match remote {
+            None => local_path(&request.copy.destination),
+            Some(target) => crate::approval_command::display_arg(
+                &[target.as_bytes(), b":", request.destination.as_slice()].concat(),
+            ),
+        };
         Ok(Self {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
-            // Debug formatting preserves unusual bytes and escapes terminal
-            // control characters. Do not interpret remote text as UI markup.
-            from: format!("{from:?}"),
+            from: format!("{:?}", from.to_string()),
+            server: from.server.clone(),
+            server_cwd: shown_directory(cwd),
+            verb: if prunes {
+                "wants to sync"
+            } else if remote.is_some() {
+                "wants to copy"
+            } else {
+                "wants to download"
+            },
+            sources,
+            preposition: "to",
+            target,
+            notes: copy_notes(request, remote.is_some()),
             details: Details::Copy {
-                destination: format!(
-                    "{:?}",
-                    std::ffi::OsStr::from_bytes(&request.copy.destination)
-                ),
-                permission: permission.into(),
+                destination,
+                permission,
                 max_bytes: request.copy.limits.max_total_bytes,
                 max_entries: request.copy.limits.max_entries,
                 max_delete: request.copy.limits.max_deletions,
@@ -157,9 +230,25 @@ impl Summary {
                 + lifetime.as_secs(),
             notification: "starting".into(),
             command: crate::approval_command::display(command),
-            desktop_copy_notice: copy_notice(request, inspect_local_destination),
-            desktop_storage: None,
         })
+    }
+    /// The server and, when it fits the title bar, its working directory;
+    /// otherwise the directory becomes the first line of the body. A
+    /// directory that needed quoting stays in the body, where it is escaped.
+    fn title_and_directory(&self) -> (String, Option<&str>) {
+        let short = format!("syq on {}", self.server);
+        if self.server_cwd.is_empty() {
+            return (short, None);
+        }
+        let long = format!("{short} in {}", self.server_cwd);
+        if long.chars().count() <= TITLE_CHARS && !self.server_cwd.starts_with('"') {
+            (long, None)
+        } else {
+            (short, Some(&self.server_cwd))
+        }
+    }
+    fn title(&self) -> String {
+        self.title_and_directory().0
     }
     pub(crate) fn kind(&self) -> Kind {
         match self.details {
@@ -179,9 +268,12 @@ impl Summary {
         crate::approval_command::render(&self.command, limit, plain, server_input)
     }
     /// Keep the decision visible; the full description remains available in
-    /// the macOS Details view and in `persist receive pending` on both platforms.
-    /// With `markup`, the text is escaped for notify-send and server inputs are
-    /// italic.
+    /// `persist receive pending` on both platforms. With `markup`, the text is
+    /// escaped for notify-send and server inputs are italic.
+    ///
+    /// The title is the subject, "syq on hetz ... wants to download", unless
+    /// a directory line comes between. What moves and where sit indented on
+    /// their own lines; the server's command comes last.
     fn desktop_description(&self, markup: bool) -> String {
         let text = |text: &str| {
             if markup {
@@ -190,41 +282,45 @@ impl Summary {
                 text.to_owned()
             }
         };
-        let body = self.desktop_body();
-        if self.command.is_empty() {
-            return text(&body);
+        let (_, directory) = self.title_and_directory();
+        let mut request = if directory.is_some() {
+            format!("syq {}", self.verb)
+        } else {
+            self.verb.to_owned()
+        };
+        for source in &self.sources {
+            request.push_str(&format!("\n\n    {source}"));
         }
-        let command = self.command_text(Some(DESKTOP_COMMAND_CHARS), text, |word| {
+        if !self.target.is_empty() {
+            request.push_str(&format!("\n\n{}\n\n    {}", self.preposition, self.target));
+        }
+        for note in &self.notes {
+            request.push_str(&format!("\n\n{note}"));
+        }
+        let command = self.desktop_command(markup);
+        directory
+            .map(|directory| text(&format!("in {directory}")))
+            .into_iter()
+            .chain([text(&request)])
+            .chain((!command.is_empty()).then_some(command))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+    fn desktop_command(&self, markup: bool) -> String {
+        let text = |text: &str| {
+            if markup {
+                escape_markup(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        self.command_text(Some(DESKTOP_COMMAND_CHARS), text, |word| {
             if markup {
                 format!("<i>{}</i>", escape_markup(word))
             } else {
                 word.to_owned()
             }
-        });
-        format!("{command}\n\n{}", text(&body))
-    }
-    fn desktop_body(&self) -> String {
-        match &self.details {
-            Details::Storage { description, .. } => format!(
-                "From: {}\n{}",
-                self.from,
-                self.desktop_storage.as_deref().unwrap_or(description)
-            ),
-            Details::Copy { destination, max_delete, .. } => {
-                let mut body = format!("From: {}\nWrites to: {destination}", self.from);
-                if let Some(notice) = &self.desktop_copy_notice {
-                    body.push_str(&format!("\n\n{notice}"));
-                }
-                if *max_delete > 0 {
-                    body.push_str(&format!("\nDeletion limit (files or folders): {max_delete}."));
-                }
-                body
-            }
-            Details::Command { argv, cwd, .. } => format!(
-                "{}\n\nFrom: {}\nIn: {cwd}\n\nRuns with your permissions. Copy root and limits do not apply.",
-                argv.join(" "), self.from
-            ),
-        }
+        })
     }
     fn details_description(&self, server_input: impl Fn(&str) -> String) -> String {
         let command = if self.command.is_empty() {
@@ -258,106 +354,172 @@ impl Summary {
         )
     }
 }
-/// Inspect only the named mutation roots, never their children or contents.
-/// This is a local hint, not a restriction on the approved policy or a promise
-/// that names cannot change before execution. Remote destinations are not
-/// contacted using the receiving machine's credentials before approval.
-fn copy_notice(
-    request: &crate::destination::CopyRequest,
-    inspect_local_destination: bool,
-) -> Option<String> {
+/// A server's working directory as sent, escaped here like any other remote
+/// text: quoted with control characters escaped when it is not plain.
+fn shown_directory(cwd: &str) -> String {
+    if cwd.is_empty() {
+        String::new()
+    } else {
+        crate::approval_command::display_arg(cwd.as_bytes())
+    }
+}
+/// A path on this machine, with its home shortened to `~`.
+fn local_path(path: &[u8]) -> String {
+    crate::approval_command::display_arg(&crate::approval_command::abbreviate_home(
+        path,
+        std::env::var_os("HOME").as_deref(),
+    ))
+}
+
+/// What this copy does beyond moving files: only facts that differ between
+/// requests, such as a preview, a non-default overwrite policy, deletions, or
+/// an existing destination. For a local destination, the named mutation
+/// roots are inspected (never their children or contents). This is a local
+/// hint, not a restriction on the approved policy or a promise that names
+/// cannot change before execution. Another server is not contacted using the
+/// receiving machine's credentials before approval.
+fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<String> {
     use crate::delegation::{ExistingDestinationPolicy, RootExistence};
-    if request.copy.options.dry_run {
-        return Some("Preview only; no filesystem changes".into());
+    let options = &request.copy.options;
+    let mut notes = Vec::new();
+    if options.dry_run {
+        notes.push("preview only".to_owned());
+    } else if options.verify_only {
+        notes.push("compares only, writes nothing".to_owned());
+    } else {
+        match request.copy.policy.existing {
+            ExistingDestinationPolicy::Skip => notes.push("keeps existing files".to_owned()),
+            ExistingDestinationPolicy::MustExist => {
+                notes.push("changes existing files only".to_owned())
+            }
+            _ if remote || request.constraints.root_existence == RootExistence::New => {}
+            _ => match destination_exists(request) {
+                Some(true) => notes.push("replaces existing files".to_owned()),
+                Some(false) => {}
+                None => notes.push("may replace existing files".to_owned()),
+            },
+        }
     }
-    if request.copy.options.verify_only {
-        return Some("Compare contents only; no filesystem changes".into());
+    let deletions = request.copy.limits.max_deletions;
+    if deletions > 0 && !options.dry_run && !options.verify_only {
+        notes.push(format!("deletes up to {deletions} files or folders"));
     }
-    if request.copy.policy.existing == ExistingDestinationPolicy::Skip
-        || request.constraints.root_existence == RootExistence::New
-    {
+    notes
+}
+/// Whether any named mutation root exists on this machine, or `None` when
+/// that cannot be told cheaply. Existing directory scopes need no recursive
+/// inspection: merging into them can overwrite children whose names are not
+/// yet known.
+fn destination_exists(request: &crate::destination::CopyRequest) -> Option<bool> {
+    let scopes = &request.copy.mutation_scopes;
+    if scopes.is_empty() || scopes.len() > 32 {
         return None;
     }
-    let unchecked = || {
-        Some("Destination entries were not checked; existing entries may be overwritten.".into())
-    };
-    // Keep work small even for a request containing many source names or very
-    // deep paths. Existing directory scopes need no recursive inspection:
-    // merging into them can overwrite children whose names are not yet known.
-    if !inspect_local_destination
-        || request.copy.mutation_scopes.is_empty()
-        || request.copy.mutation_scopes.len() > 32
-    {
-        return unchecked();
-    }
-    let Ok(root) = crate::rooted::Root::open(std::path::Path::new("/")) else {
-        return unchecked();
-    };
-    for scope in &request.copy.mutation_scopes {
-        let Some(relative) = scope.path.strip_prefix(b"/") else {
-            return unchecked();
-        };
+    let root = crate::rooted::Root::open(std::path::Path::new("/")).ok()?;
+    for scope in scopes {
+        let relative = scope.path.strip_prefix(b"/")?;
         if relative.split(|byte| *byte == b'/').count() > 32 {
-            return unchecked();
+            return None;
         }
-        let Ok(relative) = crate::rooted::RelativePath::new(relative) else {
-            return unchecked();
-        };
+        let relative = crate::rooted::RelativePath::new(relative).ok()?;
         match root.metadata(&relative) {
-            Ok(_) => return Some("Existing destination entries may be overwritten.".into()),
+            Ok(_) => return Some(true),
             Err(error)
                 if error.chain().any(|cause| {
                     cause
                         .downcast_ref::<std::io::Error>()
                         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
                 }) => {}
-            Err(_) => return unchecked(),
+            Err(_) => return None,
         }
     }
-    None
+    Some(false)
 }
 
-/// A short storage prompt: what the approval lets the server do, beyond the
-/// command shown above it. The full description stays in Details.
-fn storage_access(command: &[Vec<u8>], request: &crate::s3::authorization::Request) -> String {
+/// What a storage authorization lets the server do, in the prompt's shape:
+/// the verb, what, where, and the facts that differ between requests.
+fn storage_request(
+    command: &[Vec<u8>],
+    request: &crate::s3::authorization::Request,
+) -> (&'static str, Vec<String>, &'static str, String, Vec<String>) {
     use crate::s3::authorization::{Removal, Scope};
-    fn locations(bucket: &str, scopes: &[Scope]) -> String {
+    fn locations(bucket: &str, scopes: &[Scope]) -> Vec<String> {
         let mut shown: Vec<_> = scopes
             .iter()
             .take(3)
-            .map(|scope| format!("s3://{bucket}/{}", scope.key))
-            .map(|location| format!("{:?}", location))
+            .map(|scope| {
+                crate::approval_command::display_arg(
+                    format!("s3://{bucket}/{}", scope.key).as_bytes(),
+                )
+            })
             .collect();
         if scopes.len() > 3 {
             shown.push(format!("and {} more", scopes.len() - 3));
         }
-        shown.join(", ")
+        shown
     }
-    let verb = if request.upload {
-        if request.create_only {
-            "Creates in"
-        } else {
-            "Writes to"
-        }
-    } else if request.delete {
-        "Deletes in"
-    } else {
-        "Reads"
+    // The command names the operation and its local operands; a dry run
+    // clears the request's write flags, so they cannot say the direction.
+    let parsed = crate::approval_command::parse(command).ok();
+    let local = parsed
+        .as_ref()
+        .map(|args| {
+            args.locations
+                .iter()
+                .filter(|location| location.host.is_none())
+                .map(|location| crate::approval_command::display_arg(&location.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (removes, uploads, prunes, dry_run) = match &parsed {
+        Some(args) => (
+            args.rm,
+            matches!(
+                args.s3.as_ref().map(|options| &options.route),
+                Some(crate::s3::Route::Upload | crate::s3::Route::ServerCopy { .. })
+            ),
+            args.delete,
+            args.dry_run,
+        ),
+        None => (
+            request.delete && !request.upload,
+            request.upload,
+            false,
+            false,
+        ),
     };
-    let mut lines = vec![format!(
-        "{verb}: {}",
-        locations(&request.bucket, &request.scopes)
-    )];
-    if let Some(source) = &request.source {
-        lines.push(format!(
-            "Reads: {}",
-            locations(&source.bucket, &source.scopes)
-        ));
-    }
-    if let Some(endpoint) = &request.endpoint {
-        if !command.iter().any(|arg| arg.starts_with(b"--s3-endpoint")) {
-            lines.push(format!("Endpoint (set on the server): {endpoint:?}"));
-        }
+    let storage = locations(&request.bucket, &request.scopes);
+    let (verb, sources, preposition, target) = if removes {
+        ("wants to delete", storage, "", String::new())
+    } else if let Some(source) = &request.source {
+        (
+            if prunes {
+                "wants to sync"
+            } else {
+                "wants to copy"
+            },
+            locations(&source.bucket, &source.scopes),
+            "to",
+            storage.join("\n    "),
+        )
+    } else if uploads {
+        (
+            if prunes {
+                "wants to sync"
+            } else {
+                "wants to upload"
+            },
+            local,
+            "to",
+            storage.join("\n    "),
+        )
+    } else {
+        let destination = local.last().cloned().unwrap_or_default();
+        ("wants to download", storage, "to", destination)
+    };
+    let mut notes = Vec::new();
+    if dry_run {
+        notes.push("preview only".to_owned());
     }
     if request.delete
         && matches!(
@@ -365,13 +527,18 @@ fn storage_access(command: &[Vec<u8>], request: &crate::s3::authorization::Reque
             Some(Removal::Version(_) | Removal::AllVersions)
         )
     {
-        lines.push("Deleting versions is permanent.".into());
+        notes.push("deleting versions is permanent".to_owned());
     }
-    lines.push(format!(
-        "Signed requests stay usable for up to {} days, even after you disconnect.",
-        request.lifetime.div_ceil(24 * 60 * 60)
-    ));
-    lines.join("\n")
+    // An endpoint from the server's environment is invisible in the command.
+    if let Some(endpoint) = &request.endpoint {
+        if !command.iter().any(|arg| arg.starts_with(b"--s3-endpoint")) {
+            notes.push(format!(
+                "endpoint {}",
+                crate::approval_command::display_arg(endpoint.as_bytes())
+            ));
+        }
+    }
+    (verb, sources, preposition, target, notes)
 }
 
 struct Pending {
@@ -416,53 +583,46 @@ impl Queue {
     }
     pub(crate) fn request(
         &self,
-        from: &str,
+        from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, command, request, TIMEOUT, true)?,
+            Summary::new(from, command, cwd, request, TIMEOUT, None)?,
             notifications,
             TIMEOUT,
             cancelled,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_remote(
         &self,
-        from: &str,
+        from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         target: &str,
         request: &crate::destination::CopyRequest,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
-        let mut summary = Summary::new(from, command, request, TIMEOUT, false)?;
-        if let Details::Copy {
-            destination,
-            permission,
-            ..
-        } = &mut summary.details
-        {
-            *destination = format!(
-                "SSH {target:?}, path {:?} (relative paths and ~ refer to the destination login home)",
-                std::ffi::OsStr::from_bytes(&request.destination)
-            );
-            permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");
-        }
-        let notice = summary.desktop_copy_notice.get_or_insert_with(String::new);
-        if !notice.is_empty() {
-            notice.push(' ');
-        }
-        notice.push_str("Connect using this machine's SSH access and install the matching syq helper if needed.");
-        self.wait(summary, notifications, TIMEOUT, cancelled)
+        self.wait(
+            Summary::new(from, command, cwd, request, TIMEOUT, Some(target))?,
+            notifications,
+            TIMEOUT,
+            cancelled,
+        )
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_command(
         &self,
-        from: &str,
+        from: &Requester,
         argv: &[Vec<u8>],
         cwd: &std::path::Path,
+        command: &[Vec<u8>],
+        server_cwd: &str,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
@@ -470,12 +630,21 @@ impl Queue {
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
         self.wait(Summary {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
-            from: format!("{from:?}"),
+            from: format!("{:?}", from.to_string()),
+            server: from.server.clone(),
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
             notification: "starting".into(),
-            command: Vec::new(),
-            desktop_copy_notice: None,
-            desktop_storage: None,
+            command: crate::approval_command::display(command),
+            server_cwd: shown_directory(server_cwd),
+            verb: "wants to run",
+            sources: vec![argv
+                .iter()
+                .map(|arg| crate::approval_command::display_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ")],
+            preposition: "in",
+            target: local_path(cwd.as_os_str().as_bytes()),
+            notes: Vec::new(),
             details: Details::Command {
                 kind: CommandKind::Command,
                 argv: argv.iter().map(|arg| format!("{:?}", std::ffi::OsStr::from_bytes(arg))).collect(),
@@ -486,8 +655,9 @@ impl Queue {
     }
     pub(crate) fn request_storage(
         &self,
-        from: &str,
+        from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &crate::s3::authorization::Request,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
@@ -561,16 +731,22 @@ impl Queue {
             if request.upload { "read and upload" } else { "read" },
             if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },
             if request.delete { ", may delete" } else { ", no object deletion" }, request.lifetime);
+        let (verb, sources, preposition, target, notes) = storage_request(command, request);
         self.wait(
             Summary {
                 id: id.iter().map(|b| format!("{b:02x}")).collect(),
-                from: format!("{from:?}"),
+                from: format!("{:?}", from.to_string()),
+                server: from.server.clone(),
                 expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                     + TIMEOUT.as_secs(),
                 notification: "starting".into(),
                 command: crate::approval_command::display(command),
-                desktop_copy_notice: None,
-                desktop_storage: Some(storage_access(command, request)),
+                server_cwd: shown_directory(cwd),
+                verb,
+                sources,
+                preposition,
+                target,
+                notes,
                 details: Details::Storage {
                     kind: StorageKind::Storage,
                     description,
@@ -713,34 +889,18 @@ fn escape_markup(text: &str) -> String {
 #[cfg(target_os = "macos")]
 const APPLESCRIPT: &str = r#"on run argv
     try
-        set expiresAt to (current date) + (item 2 of argv as integer)
-        set body to item 1 of argv
-        set choices to {"Allow once", "Details", "Deny"}
-        repeat
-            set remainingSeconds to (expiresAt - (current date)) as integer
-            if remainingSeconds <= 0 then return "expired"
-            set answer to display dialog body with title (item 3 of argv) buttons choices default button "Deny" cancel button "Deny" giving up after remainingSeconds
-            if gave up of answer then return "expired"
-            set choice to button returned of answer
-            if choice is "Details" then
-                set body to item 4 of argv
-                set choices to {"Allow once", "Back", "Deny"}
-            else if choice is "Back" then
-                set body to item 1 of argv
-                set choices to {"Allow once", "Details", "Deny"}
-            else if choice is "Allow once" then
-                return "allow"
-            else
-                return "deny"
-            end if
-        end repeat
+        set remainingSeconds to item 2 of argv as integer
+        set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Allow once", "Deny"} default button "Deny" cancel button "Deny" giving up after remainingSeconds
+        if gave up of answer then return "expired"
+        if button returned of answer is "Allow once" then return "allow"
+        return "deny"
     on error number -128
         return "deny"
     end try
 end run"#;
 fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
     let description = summary.desktop_description(cfg!(not(target_os = "macos")));
-    let title = summary.kind().title();
+    let title = summary.title();
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("/usr/bin/osascript");
@@ -750,8 +910,7 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
             "--",
             &description,
             &lifetime.as_secs().max(1).to_string(),
-            title,
-            &summary.details_description(str::to_owned),
+            &title,
         ]);
         cmd
     }
@@ -766,11 +925,8 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
         ])
         .arg(format!("--expire-time={}", lifetime.as_millis()))
         .arg("--")
-        .arg(title)
-        .arg(format!(
-            "{description}\n\n{}",
-            escape_markup("Details: syq persist receive pending")
-        ));
+        .arg(&title)
+        .arg(description);
         cmd
     }
 }
@@ -867,7 +1023,8 @@ mod tests {
     fn summary() -> Summary {
         Summary {
             id: "request".into(),
-            from: "server".into(),
+            from: "\"server (receiving profile @laptop)\"".into(),
+            server: "server".into(),
             details: Details::Copy {
                 destination: "/tmp/receiving".into(),
                 permission: "May create and overwrite".into(),
@@ -879,8 +1036,18 @@ mod tests {
             expires_at: 0,
             notification: String::new(),
             command: Vec::new(),
-            desktop_copy_notice: Some("Existing destination entries may be overwritten.".into()),
-            desktop_storage: None,
+            server_cwd: "~/rt-bench".into(),
+            verb: "wants to download",
+            sources: vec!["dbg".into()],
+            preposition: "to",
+            target: "~/Downloads/server/dbg".into(),
+            notes: Vec::new(),
+        }
+    }
+    fn requester() -> Requester {
+        Requester {
+            server: "server".into(),
+            profile: "laptop".into(),
         }
     }
     fn copy_request(path: &std::path::Path) -> crate::destination::CopyRequest {
@@ -953,98 +1120,105 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_checks_names_without_scanning_or_following_links() {
-        use std::os::unix::fs::symlink;
+    fn prompts_show_command_sources_and_the_resolved_destination() {
         let temp = crate::test_support::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let missing = root.join("missing");
-        let request = copy_request(&missing);
-        assert_eq!(copy_notice(&request, true), None);
+        let path = temp.path().canonicalize().unwrap().join("dbg");
+        let request = copy_request(&path);
+        let command: Vec<Vec<u8>> = ["cp", "rt-bench/dbg", "--to", "@laptop", "--as", "dbg"]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let summary = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &request,
+            TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         assert_eq!(
-            copy_notice(&copy_request(&missing.join("child")), true),
-            None
+            summary.desktop_description(false),
+            format!(
+                "wants to download\n\n    rt-bench/dbg\n\nto\n\n    {}\n\nsyq cp rt-bench/dbg --to @laptop --as dbg",
+                path.display()
+            )
         );
-        let mut summary = Summary::new("server", &[], &request, TIMEOUT, true).unwrap();
-        assert!(!summary.desktop_description(false).contains("overwrite"));
-        assert!(summary
-            .details_description(str::to_owned)
-            .contains("May create and overwrite matching entries"));
-        // No presentation-only field enters the released pending JSON contract.
+        // No presentation-only field enters the released pending JSON contract:
+        // the released copy fields plus the command.
         let json = serde_json::to_value(&summary).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 10);
+        assert_eq!(json.as_object().unwrap().len(), 11);
+        assert_eq!(json["from"], "\"server (receiving profile @laptop)\"");
         assert_eq!(
             json["permission"],
             "May create and overwrite matching entries"
         );
         let old_shape: Summary = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(old_shape).unwrap(), json);
-        summary.desktop_copy_notice = Some("local hint".into());
-        assert_eq!(serde_json::to_value(summary).unwrap(), json);
 
-        let file = root.join("file");
-        std::fs::write(&file, b"keep").unwrap();
-        let directory = root.join("directory");
-        std::fs::create_dir(&directory).unwrap();
-        let link = root.join("link");
-        symlink(&missing, &link).unwrap();
-        for path in [&file, &directory, &link] {
-            assert!(copy_notice(&copy_request(path), true)
-                .unwrap()
-                .contains("Existing destination"));
-        }
-        // A parent symlink is not followed, even when its target is missing.
-        assert!(copy_notice(&copy_request(&link.join("child")), true)
-            .unwrap()
-            .contains("not checked"));
-        assert!(copy_notice(&copy_request(&file.join("child")), true)
-            .unwrap()
-            .contains("not checked"));
-        assert_eq!(std::fs::read(file).unwrap(), b"keep");
-        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+        // Another host is never inspected; the destination keeps its host and
+        // the requested path, not the placeholder that host later resolves.
+        let mut forwarded = request.clone();
+        forwarded.copy.destination = b"/SYQ-RECEIVE".to_vec();
+        let remote = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &forwarded,
+            TIMEOUT,
+            Some("backup"),
+        )
+        .unwrap();
+        assert!(remote.desktop_description(false).starts_with(&format!(
+            "wants to copy\n\n    rt-bench/dbg\n\nto\n\n    backup:{}\n\n",
+            path.display()
+        )));
+        let details = remote.details_description(str::to_owned);
+        assert!(
+            details.contains(&format!("Destination: {:?} on \"backup\"", path)),
+            "{details}"
+        );
+        assert!(!details.contains("SYQ-RECEIVE"), "{details}");
+        assert!(details.contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
 
-        let mut mixed = request.clone();
-        mixed
-            .copy
-            .mutation_scopes
-            .push(copy_request(&link).copy.mutation_scopes.remove(0));
-        assert!(copy_notice(&mixed, true)
-            .unwrap()
-            .contains("Existing destination"));
-        assert!(copy_notice(&request, false)
-            .unwrap()
-            .contains("not checked"));
-        let mut many = request.clone();
-        many.copy.mutation_scopes = vec![request.copy.mutation_scopes[0].clone(); 33];
-        assert!(copy_notice(&many, true).unwrap().contains("not checked"));
-    }
+        // The server's directory is remote text: no line breaks or markup of
+        // its own reach the prompt, and it never enters the title.
+        let hostile = Summary::new(
+            &requester(),
+            &command,
+            "x\n\nwants to run\n\n    rm -rf <b>",
+            &request,
+            TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hostile.title(), "syq on server");
+        let desktop = hostile.desktop_description(false);
+        assert!(
+            desktop.starts_with(
+                "in \"x\\n\\nwants to run\\n\\n    rm -rf <b>\"\n\nsyq wants to download"
+            ),
+            "{desktop}"
+        );
+        assert!(hostile
+            .desktop_description(true)
+            .starts_with("in \"x\\\\n\\\\nwants to run\\\\n\\\\n    rm -rf &lt;b&gt;\""));
 
-    #[test]
-    fn non_overwriting_policies_do_not_warn_about_existing_entries() {
-        use crate::delegation::{ExistingDestinationPolicy, RootExistence};
-        let temp = crate::test_support::tempdir().unwrap();
-        let path = temp.path().canonicalize().unwrap().join("file");
-        std::fs::write(&path, b"keep").unwrap();
-        let mut request = copy_request(&path);
-        request.copy.options.dry_run = true;
-        assert!(copy_notice(&request, true)
-            .unwrap()
-            .starts_with("Preview only"));
-        request.copy.options.dry_run = false;
-        request.copy.options.verify_only = true;
-        assert!(copy_notice(&request, true)
-            .unwrap()
-            .starts_with("Compare contents only"));
-        request.copy.options.verify_only = false;
-        request.copy.policy.existing = ExistingDestinationPolicy::Skip;
-        assert_eq!(copy_notice(&request, true), None);
-        request.copy.policy.existing = ExistingDestinationPolicy::Replace;
-        request.constraints.root_existence = RootExistence::New;
-        assert_eq!(copy_notice(&request, true), None);
-        request.constraints.root_existence = RootExistence::Any;
-        request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
-        assert!(copy_notice(&request, true)
-            .unwrap()
-            .contains("Existing destination"));
+        // A mapping copy's entries are relative to the server's directory.
+        let mapping: Vec<Vec<u8>> = ["cp", "--mapping", "map", "--to", "@laptop"]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let summary = Summary::new(&requester(), &mapping, "~", &request, TIMEOUT, None).unwrap();
+        let desktop = summary.desktop_description(false);
+        assert!(
+            desktop.starts_with(&format!(
+                "wants to download\n\n    .\n\nto\n\n    {}\n\nsyq cp --mapping",
+                path.display()
+            )),
+            "{desktop}"
+        );
     }
 
     fn wait_pending(queue: &Queue) {
@@ -1065,10 +1239,16 @@ mod tests {
             b"@laptop".to_vec(),
         ]);
         let plain = summary.desktop_description(false);
-        assert!(plain.starts_with("syq cp --mapping \"<map>\" --to @laptop\n\nFrom: server\n"));
-        assert!(plain.contains("Writes to: /tmp/receiving"));
+        assert_eq!(
+            plain,
+            "wants to download\n\n    dbg\n\nto\n\n    ~/Downloads/server/dbg\n\nsyq cp --mapping \"<map>\" --to @laptop"
+        );
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         let markup = summary.desktop_description(true);
-        assert!(markup.starts_with("syq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop\n"));
+        assert_eq!(
+            markup,
+            "wants to download\n\n    dbg\n\nto\n\n    ~/Downloads/server/dbg\n\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop"
+        );
         assert!(!markup.contains("<map>"));
         let details = summary.details_description(|word| format!("[{word}]"));
         assert!(details.contains("Server command: syq cp --mapping [\"<map>\"] --to @laptop"));
@@ -1077,7 +1257,7 @@ mod tests {
         assert_eq!(json["command"][0], "syq");
     }
     #[test]
-    fn storage_prompts_summarize_access_beyond_the_command() {
+    fn storage_prompts_name_the_operation_and_its_validity() {
         use crate::s3::authorization::{Removal, Request, Scope};
         let scope = |key: &str| Scope {
             key: key.into(),
@@ -1098,55 +1278,294 @@ mod tests {
             lifetime: crate::s3::authorization::DEFAULT_LIFETIME,
             headers: Default::default(),
         };
-        let command = [b"cp".to_vec()];
-        let access = storage_access(&command, &request);
-        assert!(
-            access.starts_with("Writes to: \"s3://bucket/runs\"\n"),
-            "{access}"
-        );
-        assert!(access.contains("Endpoint (set on the server): \"https://storage.example\""));
-        assert!(
-            access.ends_with("up to 7 days, even after you disconnect."),
-            "{access}"
-        );
-        let named = [
-            b"cp".to_vec(),
-            b"--s3-endpoint=https://storage.example".to_vec(),
-        ];
-        assert!(!storage_access(&named, &request).contains("Endpoint"));
+        let command = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|part| part.as_bytes().to_vec()).collect()
+        };
+        let upload = command(&["cp", "results", "--to", "s3://bucket", "--into", "runs"]);
+        let (verb, sources, preposition, target, notes) = storage_request(&upload, &request);
+        assert_eq!(verb, "wants to upload");
+        assert_eq!(sources, ["results"]);
+        assert_eq!((preposition, target.as_str()), ("to", "s3://bucket/runs"));
+        assert_eq!(notes, ["endpoint https://storage.example"]);
+        let named = command(&[
+            "cp",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--s3-endpoint=https://storage.example",
+        ]);
+        assert!(storage_request(&named, &request).4.is_empty());
+        let pruning = command(&[
+            "cp",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--prune",
+        ]);
+        let (verb, _, _, _, notes) = storage_request(&pruning, &request);
+        assert_eq!(verb, "wants to sync");
+        assert_eq!(notes, ["endpoint https://storage.example"]);
+        // A copy between buckets prunes too.
+        let mut between = request.clone();
+        between.source = Some(crate::s3::authorization::ReadAccess {
+            bucket: "source".into(),
+            scopes: vec![scope("tree")],
+        });
+        let mirror = command(&[
+            "cp",
+            "--srcs-in",
+            "tree",
+            "--from",
+            "s3://source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--prune",
+        ]);
+        let (verb, sources, _, target, _) = storage_request(&mirror, &between);
+        assert_eq!(verb, "wants to sync");
+        assert_eq!(sources, ["s3://source/tree"]);
+        assert_eq!(target, "s3://bucket/runs");
+        let plain = command(&[
+            "cp",
+            "--srcs-in",
+            "tree",
+            "--from",
+            "s3://source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+        ]);
+        assert_eq!(storage_request(&plain, &between).0, "wants to copy");
+        request.endpoint = None;
 
+        // A dry run clears the request's write flags; the command still says
+        // which way the data goes.
         request.upload = false;
+        let preview = command(&[
+            "cp",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--dry-run",
+        ]);
+        let (verb, sources, _, target, notes) = storage_request(&preview, &request);
+        assert_eq!(verb, "wants to upload");
+        assert_eq!(sources, ["results"]);
+        assert_eq!(target, "s3://bucket/runs");
+        assert_eq!(notes, ["preview only"]);
+
+        let download = command(&["cp", "runs", "--from", "s3://bucket", "--into", "archive"]);
+        let (verb, sources, _, target, notes) = storage_request(&download, &request);
+        assert_eq!(verb, "wants to download");
+        assert_eq!(sources, ["s3://bucket/runs"]);
+        assert_eq!(target, "archive");
+        assert!(notes.is_empty());
+
         request.delete = true;
         request.removal = Some(Removal::AllVersions);
         request.scopes = ["a", "b", "c", "d", "e"].map(scope).to_vec();
-        let access = storage_access(&command, &request);
-        assert!(
-            access.starts_with(
-                "Deletes in: \"s3://bucket/a\", \"s3://bucket/b\", \"s3://bucket/c\", and 2 more\n"
-            ),
-            "{access}"
+        request.lifetime = 60;
+        let (verb, sources, _, target, notes) =
+            storage_request(&command(&["rm", "--on", "s3://bucket"]), &request);
+        assert_eq!(verb, "wants to delete");
+        assert_eq!(
+            sources,
+            [
+                "s3://bucket/a",
+                "s3://bucket/b",
+                "s3://bucket/c",
+                "and 2 more"
+            ]
         );
-        assert!(access.contains("Deleting versions is permanent."));
+        assert!(target.is_empty());
+        assert_eq!(notes, ["deleting versions is permanent"]);
+
+        let mut summary = summary();
+        summary.command = crate::approval_command::display(&upload);
+        summary.verb = "wants to delete";
+        summary.sources = vec!["s3://bucket/a".into(), "s3://bucket/b".into()];
+        summary.target = String::new();
+        summary.notes = vec!["deleting versions is permanent".into()];
+        assert_eq!(
+            summary.desktop_description(false),
+            "wants to delete\n\n    s3://bucket/a\n\n    s3://bucket/b\n\ndeleting versions is permanent\n\nsyq cp results --to s3://bucket --into runs"
+        );
     }
     #[test]
-    fn compact_copy_prompt_keeps_deletion_limits_visible() {
-        let mut summary = summary();
-        for limit in [1, 2] {
-            if let Details::Copy { max_delete, .. } = &mut summary.details {
-                *max_delete = limit;
-            }
-            let compact = summary.desktop_description(false);
-            assert!(compact.contains("Existing destination entries may be overwritten."));
-            assert!(compact.contains(&format!("Deletion limit (files or folders): {limit}.")));
-            assert!(!compact.contains("100 bytes"));
+    fn copy_notes_say_only_what_differs_between_requests() {
+        use crate::delegation::{ExistingDestinationPolicy, RootExistence};
+        use std::os::unix::fs::symlink;
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let missing = root.join("missing");
+        let none: [&str; 0] = [];
+        assert_eq!(copy_notes(&copy_request(&missing), false), none);
+        assert_eq!(
+            copy_notes(&copy_request(&missing.join("child")), false),
+            none
+        );
+
+        let file = root.join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let link = root.join("link");
+        symlink(&missing, &link).unwrap();
+        for path in [&file, &directory, &link] {
+            assert_eq!(
+                copy_notes(&copy_request(path), false),
+                ["replaces existing files"]
+            );
         }
-        let desktop_details = summary.details_description(str::to_owned);
-        assert!(desktop_details.contains("not been inspected"));
-        assert!(!desktop_details.contains("Allow this copy once?"));
-        assert!(!desktop_details.contains("Local command:"));
+        // A parent symlink is not followed, even when its target is missing;
+        // unknown existence is said as such.
+        assert_eq!(
+            copy_notes(&copy_request(&link.join("child")), false),
+            ["may replace existing files"]
+        );
+        assert_eq!(
+            copy_notes(&copy_request(&file.join("child")), false),
+            ["may replace existing files"]
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        let mut many = copy_request(&missing);
+        many.copy.mutation_scopes = vec![many.copy.mutation_scopes[0].clone(); 33];
+        assert_eq!(copy_notes(&many, false), ["may replace existing files"]);
+        // Another server is never inspected, so nothing is claimed about it.
+        assert_eq!(copy_notes(&copy_request(&file), true), none);
+
+        let mut request = copy_request(&file);
+        request.copy.options.dry_run = true;
+        assert_eq!(copy_notes(&request, false), ["preview only"]);
+        request.copy.options.dry_run = false;
+        request.copy.options.verify_only = true;
+        assert_eq!(
+            copy_notes(&request, false),
+            ["compares only, writes nothing"]
+        );
+        request.copy.options.verify_only = false;
+        request.copy.policy.existing = ExistingDestinationPolicy::Skip;
+        assert_eq!(copy_notes(&request, false), ["keeps existing files"]);
+        assert_eq!(copy_notes(&request, true), ["keeps existing files"]);
+        request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
+        assert_eq!(copy_notes(&request, false), ["changes existing files only"]);
+        request.copy.policy.existing = ExistingDestinationPolicy::Replace;
+        request.constraints.root_existence = RootExistence::New;
+        assert_eq!(copy_notes(&request, false), none);
+        request.constraints.root_existence = RootExistence::Any;
+        request.copy.limits.max_deletions = 3;
+        assert_eq!(
+            copy_notes(&request, false),
+            [
+                "replaces existing files",
+                "deletes up to 3 files or folders"
+            ]
+        );
+        assert_eq!(
+            copy_notes(&request, true),
+            ["deletes up to 3 files or folders"]
+        );
+
+        let summary = Summary::new(
+            &requester(),
+            &[b"cp".to_vec(), b"file".to_vec()],
+            "~",
+            &request,
+            TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert!(summary.desktop_description(false).ends_with(&format!(
+            "to\n\n    {}\n\nreplaces existing files\n\ndeletes up to 3 files or folders\n\nsyq cp file",
+            file.display()
+        )));
+        // Pruning is a sync, whichever way it goes.
+        let pruning: Vec<Vec<u8>> = ["cp", "file", "--to", "@laptop", "--as", "file", "--prune"]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let sync = Summary::new(&requester(), &pruning, "~", &request, TIMEOUT, None).unwrap();
+        assert!(sync
+            .desktop_description(false)
+            .starts_with("wants to sync\n\n    file\n\n"));
+        let sync = Summary::new(
+            &requester(),
+            &pruning,
+            "~",
+            &request,
+            TIMEOUT,
+            Some("backup"),
+        )
+        .unwrap();
+        assert!(sync
+            .desktop_description(false)
+            .starts_with("wants to sync\n\n"));
+    }
+    #[test]
+    fn long_directories_move_from_the_title_to_the_body() {
+        let mut summary = summary();
+        summary.command = crate::approval_command::display(&[b"cp".to_vec(), b"dbg".to_vec()]);
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
+        let body = "wants to download\n\n    dbg\n\nto\n\n    ~/Downloads/server/dbg\n\nsyq cp dbg";
+        assert_eq!(summary.desktop_description(false), body);
+        summary.server_cwd = "~/projects/very-long-directory-name".into();
+        assert_eq!(summary.title(), "syq on server");
+        assert_eq!(
+            summary.desktop_description(false),
+            format!("in ~/projects/very-long-directory-name\n\nsyq {body}")
+        );
+        summary.server_cwd = String::new();
+        assert_eq!(summary.title(), "syq on server");
+        assert_eq!(summary.desktop_description(false), body);
+        // Limits stay in the full description only.
+        if let Details::Copy { max_delete, .. } = &mut summary.details {
+            *max_delete = 2;
+        }
+        assert!(!summary.desktop_description(false).contains("deletions"));
         let details = summary.description(str::to_owned);
         assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
         assert!(details.contains("not been inspected"));
+    }
+    #[test]
+    fn command_prompts_show_the_program_and_its_directory() {
+        let mut summary = summary();
+        summary.command = crate::approval_command::display(&[
+            b"exec".to_vec(),
+            b"--on".to_vec(),
+            b"@laptop".to_vec(),
+            b"--".to_vec(),
+            b"make".to_vec(),
+            b"-j8".to_vec(),
+        ]);
+        summary.verb = "wants to run";
+        summary.sources = vec!["make -j8".into()];
+        summary.preposition = "in";
+        summary.target = "~/project".into();
+        summary.details = Details::Command {
+            kind: CommandKind::Command,
+            argv: vec!["\"make\"".into(), "\"-j8\"".into()],
+            cwd: "\"/home/me/project\"".into(),
+            permission: String::new(),
+        };
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
+        assert_eq!(
+            summary.desktop_description(false),
+            "wants to run\n\n    make -j8\n\nin\n\n    ~/project\n\nsyq exec --on @laptop -- make -j8"
+        );
+        summary.server_cwd = "~/projects/very-long-directory-name".into();
+        assert!(summary
+            .desktop_description(false)
+            .starts_with("in ~/projects/very-long-directory-name\n\nsyq wants to run\n\n"));
     }
     #[test]
     fn exited_prompt_closes_descendant_output_before_reaping() {
@@ -1239,21 +1658,26 @@ mod tests {
         let text = "<a>&\"; do shell script \"touch /tmp/not-code\"";
         let mut summary = summary();
         summary.from = text.into();
+        summary.server = text.into();
+        summary.command = crate::approval_command::display(&[b"cp".to_vec()]);
         let command = notification_command(&summary, TIMEOUT);
         let args: Vec<_> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         #[cfg(not(target_os = "macos"))]
-        assert!(args.last().unwrap().contains(&escape_markup(text)));
+        {
+            assert_eq!(args[args.len() - 2], summary.title());
+            assert!(args[args.len() - 2].contains(text));
+            assert_eq!(*args.last().unwrap(), summary.desktop_description(true));
+        }
         #[cfg(target_os = "macos")]
         {
             assert_eq!(args[0], "-e");
             assert_eq!(args[1], APPLESCRIPT);
             assert_eq!(args[3], summary.desktop_description(false));
-            assert_eq!(args[6], summary.details_description(str::to_owned));
-            assert!(args[3].contains(text));
-            assert!(args[6].contains(text));
+            assert_eq!(args[5], summary.title());
+            assert!(args[5].contains(text));
             assert!(!APPLESCRIPT.contains(text));
         }
     }

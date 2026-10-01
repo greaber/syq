@@ -115,6 +115,7 @@ pub(super) fn verify_receiver_with_timeout(
             challenge: challenge.clone(),
         },
         timeout,
+        None,
     )
     .context(
         "cannot verify receiver identity; reconnect with an updated syq on the receiving machine",

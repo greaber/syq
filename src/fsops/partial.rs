@@ -437,6 +437,32 @@ impl FsOps {
         }
         let (relative, _label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
+                if create_if_missing {
+                    // A new sidecar is created as the small-file batch
+                    // creates its own: for writing only, in its staged mode,
+                    // without exclusive creation, and used as created only
+                    // when the open landed on a new empty file of ours. Its
+                    // metadata, read at once, serves publication. Anything
+                    // else at the name takes the checked reuse below. Other
+                    // range workers reopen the sidecar by name for writing,
+                    // and verification reopens it for reading, so it keeps
+                    // owner access until publication sets the final mode, as
+                    // an in-place file does; that chmod is paid only by files
+                    // whose final mode lacks it.
+                    let staged = mode | 0o600;
+                    self.uncache_rooted(&target.root, relative);
+                    match self.open_or_create_write_only_partial(&target.root, relative, staged) {
+                        Ok((file, created))
+                            if is_fresh_partial(&created, staged)
+                                && created.mode() & 0o600 == 0o600 =>
+                        {
+                            return Ok(Some((file, None, Some(created))));
+                        }
+                        Ok(_) => {}
+                        Err(error) if existing_leaf_refused(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 self.open_private_partial_rooted(
                     &target.root,
                     relative,
@@ -444,8 +470,9 @@ impl FsOps {
                     create_if_missing,
                     PRIVATE_PARTIAL_MODE,
                 )
+                .map(|opened| opened.map(|(file, basis_size)| (file, basis_size, None)))
             })?;
-        let Some((file, basis_size)) = opened else {
+        let Some((file, basis_size, created)) = opened else {
             return Ok(Preparation {
                 partial_size: None,
                 has_candidates: !self.candidate_partials(&target).is_empty(),
@@ -464,15 +491,14 @@ impl FsOps {
             "SYQ_TEST_PARTIAL_CONTINUE_FILE",
             "partial-ready",
         )?;
-        self.cache_file(
-            FileLocation::Rooted {
-                root: target.root.identity(),
-                relative,
-            },
-            attempt,
-            true,
-            file,
-        );
+        let location = FileLocation::Rooted {
+            root: target.root.identity(),
+            relative,
+        };
+        match created {
+            Some(created) => self.cache_created_file(location, attempt, true, file, created),
+            None => self.cache_file(location, attempt, true, file),
+        }
         Ok(Preparation {
             partial_size: basis_size,
             has_candidates: false,
@@ -938,28 +964,7 @@ impl FsOps {
         #[cfg(debug_assertions)]
         hold_copy_local_before_destination_open_for_test()?;
         let source_metadata = s.metadata()?;
-        // A staged copy could safely replace a hard-linked destination, but a
-        // command that names the same file is still a self-copy and should not
-        // silently replace its own selected source. The in-place open repeats
-        // this check against the exact descriptor before truncation.
         let parent = destination_root.resolve_parent(&destination_relative)?;
-        let existing = match parent.metadata() {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error).with_context(|| format!("stat {}", destination_label.display()));
-            }
-        };
-        if existing.is_some_and(|metadata| {
-            metadata.is_file()
-                && metadata.dev == source_metadata.dev()
-                && metadata.ino == source_metadata.ino()
-        }) {
-            bail!(
-                "source and destination are the same file: {}",
-                destination_label.display()
-            );
-        }
         let inspected = inspect_parent(parent.directory());
         drop(parent);
         Ok((
@@ -974,6 +979,34 @@ impl FsOps {
             },
             inspected,
         ))
+    }
+
+    /// A staged copy could safely replace a hard-linked destination, but a
+    /// command that names the same file is still a self-copy and should not
+    /// silently replace its own selected source. The in-place open repeats
+    /// this check against the exact descriptor before truncation. It is made
+    /// right before the destination is touched: looking the name up costs an
+    /// NFS client a request, which a pair known to need the range path spares.
+    pub(super) fn require_not_self_copy(
+        target: &RootedTarget,
+        source_metadata: &fs::Metadata,
+    ) -> Result<()> {
+        let parent = target.root.resolve_parent(&target.relative)?;
+        match parent.metadata() {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.dev == source_metadata.dev()
+                    && metadata.ino == source_metadata.ino() =>
+            {
+                bail!(
+                    "source and destination are the same file: {}",
+                    target.label.display()
+                )
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("stat {}", target.label.display())),
+        }
     }
 
     /// Copy a whole same-machine file without routing its bytes through the
@@ -1077,6 +1110,7 @@ impl FsOps {
             // costs two directory changes for every file.
             return Ok(CopyLocalOutcome::Unsupported);
         }
+        Self::require_not_self_copy(&target, &source_metadata)?;
         // Advisory sequential readahead for the kernel copy on Linux.
         unsafe {
             libc::posix_fadvise(s.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
@@ -1369,6 +1403,7 @@ impl FsOps {
             return Ok(CopyLocalOutcome::Unsupported);
         }
         let (source, source_metadata, target, ()) = self.prepare_local_copy(source, dst, |_| ())?;
+        Self::require_not_self_copy(&target, &source_metadata)?;
         let root = target.root.clone();
         let (partial, _) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
@@ -2112,13 +2147,36 @@ impl FsOps {
             }
             return published_identity(&file, flags);
         }
-        let (src_relative, src, file) = with_rooted_partial(target, copy_id, |relative, _| {
-            self.uncache_rooted(&target.root, relative)
-                .map(Ok)
-                .unwrap_or_else(|| target.root.open_regular_write(relative, false))
-        })?;
-        require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+        // The descriptor that created the sidecar carries the metadata read
+        // then, which the metadata step and the identity use instead of a
+        // read after the data: on NFS that read is a request. A reopened
+        // sidecar has no such read and takes the reads it always did.
+        let (src_relative, src, (file, created)) =
+            with_rooted_partial(target, copy_id, |relative, _| {
+                match self.uncache_rooted_created(&target.root, relative) {
+                    Some(opened) => Ok(opened),
+                    None => target
+                        .root
+                        .open_regular_write(relative, false)
+                        .map(|file| (file, None)),
+                }
+            })?;
+        // The name is checked against the held inode before anything reads
+        // the sidecar or changes its metadata, and again before publication.
+        // A reopened descriptor may be whatever the name now holds, so it is
+        // checked at once. The descriptor that created the sidecar is that
+        // inode by construction, so its check waits for the metadata step,
+        // whose SETATTR lets an NFS client answer the check's reads of the
+        // written file from its cache, where before the step they are a
+        // request.
+        let checked_early = created.is_none();
+        if checked_early {
+            require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+        }
         if let Some(expected) = expected {
+            if !checked_early {
+                require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+            }
             let reader = target.root.open_regular_read(&src_relative)?;
             Self::verify_expected_inode(&file, &reader, expected)?;
         }
@@ -2129,6 +2187,9 @@ impl FsOps {
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
             )
         {
+            if !checked_early {
+                require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+            }
             // Ordinary identity-conditioned staged updates preserve the
             // existing destination inode.
             // Keep the cached writer pinned while independently opening the
@@ -2186,29 +2247,40 @@ impl FsOps {
             return published_identity(&destination, flags);
         }
 
-        set_meta_file_for_publication(&file, meta, flags)
-            .with_context(|| format!("set metadata {}", src.display()))?;
-        require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
-        if target
-            .root
-            .metadata_optional(&target.relative)?
-            .is_some_and(RootMetadata::is_dir)
-        {
-            bail!("destination {} is a directory", target.label.display());
+        match &created {
+            Some(created) => set_meta_written_file_for_publication(&file, meta, flags, created),
+            None => set_meta_file_for_publication(&file, meta, flags),
         }
+        .with_context(|| format!("set metadata {}", src.display()))?;
+        require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+        // A directory at the target name fails the rename; looking the name
+        // up first cost an NFS client a request for every file.
         publish_partial_rooted(
             &target.root,
             &src_relative,
             &target.relative,
             &file,
             condition,
-        )?;
+        )
+        .map_err(|error| {
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::EISDIR))
+            {
+                anyhow::anyhow!("destination {} is a directory", target.label.display())
+            } else {
+                error
+            }
+        })?;
         crate::inode_metadata::finish_publication(
             &file,
             meta.inode_metadata.as_deref(),
             meta.mode,
         )?;
-        published_identity(&file, flags)
+        match &created {
+            Some(created) => Ok(known_identity(created, flags)),
+            None => published_identity(&file, flags),
+        }
     }
 
     pub fn file_hash(
@@ -3006,18 +3078,30 @@ pub(super) const PRIVATE_PARTIAL_MODE: u32 = 0o600;
 /// is a round trip). Special bits are still applied by `set_meta_file` once the
 /// content is written.
 ///
-/// The sidecar stays private when no mode is requested, and when group
-/// preservation is requested: the kernel assigns the receiver's or a setgid
-/// parent's group at creation, and final group bits would let that group read
-/// or write the content until the chown. Without group preservation the group
-/// at creation is the final group, and the owner bits only widen access for
-/// the receiver, which already holds the content.
-pub(super) fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
-    if flags & flags::MODE_MASK != 0 && flags & flags::GROUP == 0 {
-        meta.mode & 0o777
+/// The sidecar stays private when no mode is requested, when group
+/// preservation is requested, and when an ACL will be applied. The kernel
+/// assigns the receiver's or a setgid parent's group at creation, and final
+/// group bits would let that group read or write the content until the
+/// chown. With an ACL the final group bits are the ACL mask, which can be
+/// wider than what the file grants its owning group. Without either, the
+/// group at creation is the final group, and the owner bits only widen
+/// access for the receiver, which already holds the content.
+pub(crate) fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
+    staged_mode(meta.mode, flags, has_acl(meta.inode_metadata.as_deref()))
+}
+
+/// The same from the parts a sender has at hand, without cloning the
+/// file's metadata.
+pub(crate) fn staged_mode(mode: u32, flags: u8, acl: bool) -> u32 {
+    if flags & flags::MODE_MASK != 0 && flags & flags::GROUP == 0 && !acl {
+        mode & 0o777
     } else {
         PRIVATE_PARTIAL_MODE
     }
+}
+
+pub(crate) fn has_acl(metadata: Option<&crate::inode_metadata::InodeMetadata>) -> bool {
+    metadata.is_some_and(|metadata| metadata.acls.is_some() || metadata.macos_acl.is_some())
 }
 
 pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {

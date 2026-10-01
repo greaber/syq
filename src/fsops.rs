@@ -2253,6 +2253,33 @@ impl FsOps {
     }
 
     fn cache_file(&mut self, location: FileLocation, attempt: u32, private: bool, file: File) {
+        self.cache_entry(location, attempt, private, CachedFile::new(file));
+    }
+
+    /// Cache the descriptor that created a file, with the metadata read then.
+    fn cache_created_file(
+        &mut self,
+        location: FileLocation,
+        attempt: u32,
+        private: bool,
+        file: File,
+        metadata: fs::Metadata,
+    ) {
+        self.cache_entry(
+            location,
+            attempt,
+            private,
+            CachedFile::created(file, metadata),
+        );
+    }
+
+    fn cache_entry(
+        &mut self,
+        location: FileLocation,
+        attempt: u32,
+        private: bool,
+        entry: CachedFile,
+    ) {
         self.uncache_location(&location);
         if self.fds.len() >= FD_CACHE_MAX {
             let victim = self.fd_order.remove(0);
@@ -2263,7 +2290,7 @@ impl FsOps {
             attempt,
             private,
         };
-        self.fds.insert(key.clone(), CachedFile::new(file));
+        self.fds.insert(key.clone(), entry);
         self.fd_order.push(key);
     }
 
@@ -2285,21 +2312,37 @@ impl FsOps {
     }
 
     fn uncache_rooted(&mut self, root: &Root, relative: &RelativePath) -> Option<File> {
-        self.uncache_location(&FileLocation::Rooted {
+        self.uncache_rooted_entry(root, relative)
+            .map(CachedFile::into_file)
+    }
+
+    /// The cached descriptor with the metadata read when it created its
+    /// file, if it did.
+    fn uncache_rooted_created(
+        &mut self,
+        root: &Root,
+        relative: &RelativePath,
+    ) -> Option<(File, Option<fs::Metadata>)> {
+        self.uncache_rooted_entry(root, relative)
+            .map(CachedFile::into_parts)
+    }
+
+    fn uncache_rooted_entry(&mut self, root: &Root, relative: &RelativePath) -> Option<CachedFile> {
+        self.uncache_entry(&FileLocation::Rooted {
             root: root.identity(),
             relative: relative.clone(),
         })
     }
 
     fn uncache_location(&mut self, location: &FileLocation) -> Option<File> {
+        self.uncache_entry(location).map(CachedFile::into_file)
+    }
+
+    fn uncache_entry(&mut self, location: &FileLocation) -> Option<CachedFile> {
         let mut removed = None;
         self.fd_order.retain(|key| {
             if &key.location == location {
-                removed = self
-                    .fds
-                    .remove(key)
-                    .map(CachedFile::into_file)
-                    .or(removed.take());
+                removed = self.fds.remove(key).or(removed.take());
                 false
             } else {
                 true

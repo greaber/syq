@@ -139,7 +139,31 @@ fn check_storage_as(
 
 /// Display text for one argument. Plain words stay as typed; anything else is
 /// quoted with control, formatting, and invalid bytes escaped.
-fn display_arg(arg: &[u8]) -> String {
+/// The requesting process's working directory, with its home directory
+/// shortened to `~`. It travels with the command so the receiving machine can
+/// show where relative source names resolve; that machine escapes it for
+/// display like any other remote text.
+pub(crate) fn current_directory() -> String {
+    let cwd = std::env::current_dir()
+        .map(|path| path.into_os_string().into_vec())
+        .unwrap_or_default();
+    String::from_utf8_lossy(&abbreviate_home(&cwd, std::env::var_os("HOME").as_deref()))
+        .into_owned()
+}
+
+/// `path` with `home` and paths under it shortened to `~`.
+pub(crate) fn abbreviate_home(path: &[u8], home: Option<&OsStr>) -> Vec<u8> {
+    let home = home.map(OsStr::as_bytes).filter(|home| !home.is_empty());
+    match home {
+        Some(home) if path == home => b"~".to_vec(),
+        Some(home) if path.starts_with(home) && path[home.len()..].starts_with(b"/") => {
+            [b"~", &path[home.len()..]].concat()
+        }
+        _ => path.to_vec(),
+    }
+}
+
+pub(crate) fn display_arg(arg: &[u8]) -> String {
     if !arg.is_empty()
         && arg
             .iter()
@@ -205,7 +229,7 @@ pub(crate) fn render(
     for word in display {
         length += word.chars().count() + 1;
         if limit.is_some_and(|limit| length > limit) {
-            words.push(plain("… (full command in Details)"));
+            words.push(plain("… (full command in syq persist receive pending)"));
             break;
         }
         // A quoted argument keeps its ASCII option name after the opening quote.

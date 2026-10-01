@@ -97,6 +97,218 @@ fn selected_hash_is_independent_of_payload_integrity() {
 }
 
 #[test]
+fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read() {
+    // A new sidecar is opened for writing only, without exclusive creation,
+    // in the staged mode the sender chose; the metadata read then decides
+    // the publication's chmod, the times are set regardless, set-id bits are
+    // applied, and the identity reported is the inode created. A leftover
+    // holding data still takes the checked reuse, and a directory at the
+    // target is refused as before.
+    use std::os::unix::io::AsRawFd;
+    let directory = crate::test_support::tempdir().unwrap();
+    let copy_id = [5; 16];
+    let mut operations = destination_ops(directory.path());
+    let target = |path: &'static [u8]| PartialTarget {
+        path,
+        id: &copy_id,
+        guard: None,
+    };
+    let prepare = |operations: &mut FsOps, path, mode| {
+        operations
+            .prepare(
+                target(path),
+                PrepareOptions {
+                    size: 8,
+                    inplace: false,
+                    mode,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap()
+    };
+    let write = |operations: &mut FsOps, path| {
+        operations
+            .write_range(
+                target(path),
+                false,
+                0,
+                0,
+                content_digest(b"contents"),
+                b"contents",
+            )
+            .unwrap();
+    };
+    let meta = |mode| Meta {
+        inode_metadata: None,
+        mode,
+        uid: 0,
+        gid: 0,
+        mtime: 1_000_000_000,
+        mtime_nsec: 123_456_789,
+    };
+    let publish = |operations: &mut FsOps, path, mode| {
+        operations.finalize(
+            path,
+            false,
+            &copy_id,
+            &meta(mode),
+            flags::MODE | flags::TIMES | flags::REPORT_IDENTITY,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None,
+            },
+        )
+    };
+
+    // Staged mode 0644: no chmod is needed, and the staged file was opened
+    // write-only. Set-id bits are applied at publication.
+    assert_eq!(prepare(&mut operations, b"plain", 0o644).partial_size, None);
+    let (sidecar, _) = rooted_partial_target(
+        &operations
+            .destination_mutation_target(b"plain", None)
+            .unwrap(),
+        &copy_id,
+    )
+    .unwrap();
+    let sidecar = directory.path().join(sidecar.to_path_buf());
+    assert_eq!(fs::metadata(&sidecar).unwrap().mode() & 0o777, 0o644);
+    {
+        let root = operations.destination_root.clone().unwrap();
+        let relative = RelativePath::new(
+            sidecar
+                .strip_prefix(directory.path())
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
+        let cached = operations
+            .cached_clone(
+                FileLocation::Rooted {
+                    root: root.identity(),
+                    relative,
+                },
+                0,
+                true,
+            )
+            .unwrap()
+            .expect("prepared descriptor is cached");
+        let access = unsafe { libc::fcntl(cached.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE;
+        assert_eq!(access, libc::O_WRONLY);
+    }
+    write(&mut operations, b"plain");
+    let identity = publish(&mut operations, b"plain", 0o4755).unwrap();
+    let published = fs::metadata(directory.path().join("plain")).unwrap();
+    assert_eq!(identity, Some((published.dev(), published.ino())));
+    assert_eq!(published.mode() & 0o7777, 0o4755);
+    assert_eq!(
+        (published.mtime(), published.mtime_nsec()),
+        (1_000_000_000, 123_456_789)
+    );
+    assert_eq!(
+        fs::read(directory.path().join("plain")).unwrap(),
+        b"contents"
+    );
+    assert!(!sidecar.exists());
+
+    // A leftover holding data is reused through the checked path and still
+    // published correctly.
+    let (leftover, _) = rooted_partial_target(
+        &operations
+            .destination_mutation_target(b"left", None)
+            .unwrap(),
+        &copy_id,
+    )
+    .unwrap();
+    let leftover = directory.path().join(leftover.to_path_buf());
+    fs::write(&leftover, b"earlier attempt wrote this").unwrap();
+    assert_eq!(
+        prepare(&mut operations, b"left", 0o644).partial_size,
+        Some(26)
+    );
+    write(&mut operations, b"left");
+    publish(&mut operations, b"left", 0o644).unwrap();
+    assert_eq!(
+        fs::read(directory.path().join("left")).unwrap(),
+        b"contents"
+    );
+
+    // A read-only final mode: the sidecar keeps owner access, so another
+    // worker, which reopens it by name, can still write it and publish it,
+    // and publication sets the final mode. Root is never refused, so the
+    // case proves nothing there.
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            prepare(&mut operations, b"readonly", 0o444).partial_size,
+            None
+        );
+        let (partial, _) = rooted_partial_target(
+            &operations
+                .destination_mutation_target(b"readonly", None)
+                .unwrap(),
+            &copy_id,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(directory.path().join(partial.to_path_buf()))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        let mut other = destination_ops(directory.path());
+        write(&mut other, b"readonly");
+        publish(&mut other, b"readonly", 0o444).unwrap();
+        let published = fs::metadata(directory.path().join("readonly")).unwrap();
+        assert_eq!(published.mode() & 0o7777, 0o444);
+        assert_eq!(
+            fs::read(directory.path().join("readonly")).unwrap(),
+            b"contents"
+        );
+    }
+
+    // A worker without the creating descriptor reopens the sidecar by name
+    // and must check what it got before touching its metadata: a hard link
+    // planted at the name is refused, and the file it leads to keeps its
+    // mode and times.
+    prepare(&mut operations, b"swapped", 0o644);
+    write(&mut operations, b"swapped");
+    let (partial, _) = rooted_partial_target(
+        &operations
+            .destination_mutation_target(b"swapped", None)
+            .unwrap(),
+        &copy_id,
+    )
+    .unwrap();
+    let partial = directory.path().join(partial.to_path_buf());
+    let unrelated = directory.path().join("unrelated");
+    fs::write(&unrelated, b"unrelated").unwrap();
+    fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(&unrelated).unwrap();
+    fs::remove_file(&partial).unwrap();
+    fs::hard_link(&unrelated, &partial).unwrap();
+    let mut other = destination_ops(directory.path());
+    let error = publish(&mut other, b"swapped", 0o644).unwrap_err();
+    assert!(error.to_string().contains("singly-linked"), "{error}");
+    let after = fs::metadata(&unrelated).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(
+        (after.mtime(), after.mtime_nsec()),
+        (before.mtime(), before.mtime_nsec())
+    );
+    assert!(!directory.path().join("swapped").exists());
+    fs::remove_file(&partial).unwrap();
+
+    // A directory at the target name is refused with the same message.
+    fs::create_dir(directory.path().join("dir")).unwrap();
+    prepare(&mut operations, b"dir", 0o644);
+    write(&mut operations, b"dir");
+    let error = publish(&mut operations, b"dir", 0o644).unwrap_err();
+    assert!(error.to_string().contains("is a directory"), "{error}");
+}
+
+#[test]
 fn payload_integrity_checks_are_explicit() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
     let directory = crate::test_support::tempdir().unwrap();
@@ -1301,6 +1513,24 @@ fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() 
         staged_file_mode(&meta(0o640), flags::TIMES),
         PRIVATE_PARTIAL_MODE
     );
+    // With an ACL the final group bits are the ACL mask, which may grant
+    // the owning group more than the ACL does, so the sidecar stays private.
+    let with_acl = Meta {
+        inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+            acls: Some(crate::inode_metadata::PosixAcls {
+                access: Some(Vec::new()),
+                default: None,
+            }),
+            ..Default::default()
+        })),
+        ..meta(0o660)
+    };
+    assert_eq!(
+        staged_file_mode(&with_acl, flags::MODE),
+        PRIVATE_PARTIAL_MODE
+    );
+    assert_eq!(staged_mode(0o660, flags::MODE, true), PRIVATE_PARTIAL_MODE);
+    assert_eq!(staged_mode(0o660, flags::MODE, false), 0o660);
 }
 
 #[test]
