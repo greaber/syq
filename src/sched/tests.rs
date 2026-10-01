@@ -803,8 +803,14 @@ fn claimed_file_groups_cannot_be_stolen_or_request_spare_workers() {
     );
     assert_eq!(first, 0..2);
     assert!(sched.needs_worker_capacity());
-    assert_eq!(groups.lock().unwrap().claim(), Some(2..4));
-    assert_eq!(groups.lock().unwrap().claim(), Some(4..6));
+    assert_eq!(
+        groups.lock().unwrap().claim(usize::MAX, u64::MAX),
+        Some(2..4)
+    );
+    assert_eq!(
+        groups.lock().unwrap().claim(usize::MAX, u64::MAX),
+        Some(4..6)
+    );
     assert!(!sched.needs_worker_capacity());
     assert_eq!(
         sched.steal_fast_group(&mut sched.inner.lock().unwrap()),
@@ -823,7 +829,7 @@ fn single_file_group_is_not_registered_for_stealing() {
     let (first, handle) = sched.share_fast_groups(vec![(512, 0), (512, 1), (512, 2)], groups);
     assert_eq!(first, 0..3);
     assert!(sched.inner.lock().unwrap().fast_groups.is_empty());
-    assert!(handle.lock().unwrap().claim().is_none());
+    assert!(handle.lock().unwrap().claim(usize::MAX, u64::MAX).is_none());
     assert_eq!(sched.finish_fast_groups(&handle), vec![true; 3]);
 }
 
@@ -1136,7 +1142,10 @@ fn tuning_counts_only_unissued_batch_work_through_claims_and_steals() {
     assert!(work.sufficient);
     assert!(!sched.work_left_for(4, 2449, 100));
 
-    assert_eq!(handle.lock().unwrap().claim(), Some(2..4));
+    assert_eq!(
+        handle.lock().unwrap().claim(usize::MAX, u64::MAX),
+        Some(2..4)
+    );
     let work = sched.tuning_work(2, 1024, 0);
     assert_eq!(work.unread_batch_files, 2);
     assert_eq!(work.remaining_bytes, 1024);
@@ -1258,5 +1267,56 @@ fn claimed_publication_keeps_consumers_alive_until_return_completion_or_abort() 
             }
             assert!(sched.finished(), "{disposition} leaked a publication claim");
         }
+    }
+}
+
+#[test]
+fn split_batch_claims_leave_exact_unread_totals_and_ownership_for_stealers() {
+    let sched = Sched::new(64, 128);
+    for i in 0..6 {
+        sched.push_file(test_job(format!("file{i}").as_bytes(), 512));
+    }
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(_)));
+    sched.begin_fast_batch(1, 6);
+    sched.take_small(512, 5, u64::MAX);
+    sched.mark_fast(5);
+    let (first, handle) =
+        sched.share_fast_groups((0..6).map(|i| (512, i)).collect(), [0..1, 1..6].into());
+    assert_eq!(first, 0..1);
+    assert_eq!(handle.lock().unwrap().claim(2, 512), Some(1..2));
+    let work = sched.tuning_work(4, 2048, 0);
+    assert_eq!(
+        (work.unread_batch_files, work.unread_batch_bytes),
+        (4, 2048)
+    );
+    assert!(work.sufficient);
+    assert_eq!(handle.lock().unwrap().claim(1, u64::MAX), Some(2..3));
+    assert!(matches!(sched.next(), Item::File(3)));
+    assert!(handle.lock().unwrap().claim(2, 1024).is_none());
+    assert_eq!(
+        sched.finish_fast_groups(&handle),
+        [true, true, true, false, false, false]
+    );
+    sched.complete_fast_batch(3);
+    sched.ranges_ready(3, vec![]);
+    for _ in 0..2 {
+        let Item::File(i) = sched.next() else {
+            panic!("returned sibling missing")
+        };
+        sched.ranges_ready(i, vec![]);
+    }
+    assert!(sched.finished());
+}
+
+#[test]
+fn bounded_batch_claim_always_makes_progress_on_an_oversized_or_empty_file() {
+    for size in [0, 1, u32::MAX as u64] {
+        let sched = Sched::new(64, 128);
+        let (_, handle) =
+            sched.share_fast_groups(vec![(size, 0), (size, 1), (size, 2)], [0..1, 1..3].into());
+        assert_eq!(handle.lock().unwrap().claim(0, 0), Some(1..2));
+        assert_eq!(handle.lock().unwrap().claim(1, 1), Some(2..3));
+        assert_eq!(handle.lock().unwrap().claim(1, 1), None);
     }
 }

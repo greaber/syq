@@ -84,6 +84,7 @@ struct PipelineState {
     tuning_check: Option<(Arc<Sched>, Arc<Gate>, usize)>,
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
+    auto_small_size: Option<u64>,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -120,6 +121,31 @@ impl Conn for PipelineConn {
     }
     fn send(&mut self, request: Request) -> Result<()> {
         let mut state = self.0.lock().unwrap();
+        if let Some(size) = state.auto_small_size {
+            let response = match &request {
+                Request::ReadSmallBatch(reads) => Response::SmallBlocks(
+                    reads
+                        .iter()
+                        .map(|read| {
+                            let data = vec![42; read.len as usize];
+                            Ok(SmallBlock {
+                                hash: content_digest(&data),
+                                data,
+                            })
+                        })
+                        .collect(),
+                ),
+                Request::PutSmallBatch(puts) => Response::Applied(vec![None; puts.len()]),
+                Request::StatMany { paths, .. } => Response::Stats(
+                    paths
+                        .iter()
+                        .map(|path| Some(pipeline_job(path, size).data.entry))
+                        .collect(),
+                ),
+                other => panic!("unexpected automatic small-batch request {other:?}"),
+            };
+            state.replies.push_back(response);
+        }
         if state.auto_ranges {
             match &request {
                 Request::ReadRange { off, len, .. }
@@ -190,6 +216,10 @@ impl Conn for PipelineConn {
             state.tuning_at_receive.push(tuning);
         }
         if let Some(sched) = state.steal_on_receive.take() {
+            assert!(
+                sched.tuning_work(1, 0, 0).unread_batch_files > 0,
+                "must leave shareable work before the peer claims it"
+            );
             let Item::File(idx) = sched.next() else {
                 panic!("expected unread file group")
             };
@@ -340,6 +370,7 @@ fn pipeline_worker(
         observation: None,
         benchmark: Default::default(),
         fast_batch_files: 1,
+        batch_budget: WorkBudget::default(),
         setup_elapsed: std::time::Duration::ZERO,
     }
 }
@@ -735,7 +766,14 @@ fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
             }
             let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
             let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-            let result = worker.transfer_small_batches(&jobs, groups.into_iter(), &mut results);
+            let result = worker.transfer_small_batches(
+                &jobs,
+                {
+                    let mut groups = groups.into_iter();
+                    move |_| groups.next()
+                },
+                &mut results,
+            );
             if matches!(failure, "none" | "read-file" | "write-file") {
                 result.unwrap();
                 assert_eq!(results.len(), 8);
@@ -945,7 +983,12 @@ fn small_batch_tuning_counts_empty_files_but_not_failed_publications() {
         ]));
     let mut results = vec![None, None, None];
     assert!(worker
-        .receive_small_batch(vec![0, 1, 2], &jobs, &mut results, None)
+        .receive_small_batch(
+            (vec![0, 1, 2], std::time::Instant::now()),
+            &jobs,
+            &mut results,
+            None
+        )
         .unwrap());
     assert_eq!(Meter::files(&*worker.progress), 2);
     assert_eq!(Meter::bytes(&*worker.progress), 0);
@@ -957,7 +1000,12 @@ fn small_batch_tuning_counts_empty_files_but_not_failed_publications() {
         .replies
         .push_back(Response::Applied(vec![]));
     assert!(!worker
-        .receive_small_batch(vec![1], &jobs, &mut results, None)
+        .receive_small_batch(
+            (vec![1], std::time::Instant::now()),
+            &jobs,
+            &mut results,
+            None
+        )
         .unwrap());
     assert_eq!(
         Meter::files(&*worker.progress),
@@ -1269,7 +1317,14 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
         let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
         worker
-            .transfer_small_batches(&jobs, (0..8).map(|i| i..i + 1), &mut results)
+            .transfer_small_batches(
+                &jobs,
+                {
+                    let mut groups = (0..8).map(|i| i..i + 1);
+                    move |_| groups.next()
+                },
+                &mut results,
+            )
             .unwrap();
         assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
         assert_eq!(src.lock().unwrap().sent_at_receive, expected);
@@ -1293,7 +1348,14 @@ fn empty_file_groups_need_no_source_reads() {
         .algorithm = algorithm;
     let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
     worker
-        .transfer_small_batches(&jobs, std::iter::once(0..2), &mut results)
+        .transfer_small_batches(
+            &jobs,
+            {
+                let mut groups = std::iter::once(0..2);
+                move |_| groups.next()
+            },
+            &mut results,
+        )
         .unwrap();
     assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
     assert!(src.lock().unwrap().requests.is_empty());
@@ -2937,5 +2999,148 @@ fn local_copy_dispatch_keeps_retirement_guard_through_progress_and_failures() {
             u64::from(failure == "source-error")
         );
         assert_eq!(sched.finished(), !failure.ends_with("disconnect"));
+    }
+}
+
+#[test]
+fn adaptive_batches_leave_work_for_peers_including_empty_files() {
+    for size in [0, 1024, 32 << 10] {
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        for i in 0..512 {
+            sched.push_file(pipeline_job(format!("file{i}").as_bytes(), size));
+        }
+        sched.scan_done();
+        let item = sched.next();
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            steal_on_receive: Some(sched.clone()),
+            ..Default::default()
+        }));
+        let mut owner = pipeline_worker(&sched, &src, &dst, false);
+        let opts = Arc::get_mut(&mut owner.opts).unwrap();
+        opts.tuning = Default::default();
+        opts.block = 4 << 20;
+        owner.fast_batch_files = 2048;
+        owner.process_item(item).unwrap();
+        let stolen = dst
+            .lock()
+            .unwrap()
+            .stolen_file
+            .expect("peer claimed unread work");
+        let completed_by_owner = owner.progress.files_done.load(Relaxed);
+        assert!(completed_by_owner > 0 && completed_by_owner < 512);
+        owner.process_item(Item::File(stolen)).unwrap();
+        owner.run_inner().unwrap();
+        assert!(sched.finished());
+        assert_eq!(owner.progress.files_done.load(Relaxed), 512);
+        assert_eq!(owner.progress.bytes_done.load(Relaxed), 512 * size);
+        let state = dst.lock().unwrap();
+        let paths: Vec<_> = state
+            .requests
+            .iter()
+            .filter_map(|r| match r {
+                Request::PutSmallBatch(puts) => Some(puts),
+                _ => None,
+            })
+            .flatten()
+            .map(|put| put.path.clone())
+            .collect();
+        assert_eq!(paths.len(), 512);
+        assert_eq!(
+            paths.iter().collect::<std::collections::HashSet<_>>().len(),
+            512,
+            "every file published exactly once despite stealing"
+        );
+        assert!(state.replies.is_empty());
+        assert!(src.lock().unwrap().replies.is_empty());
+    }
+}
+
+#[test]
+fn aged_batch_requests_drain_before_refill_at_either_endpoint() {
+    for slow_source in [true, false] {
+        let size = 1024;
+        let delay = std::time::Duration::from_millis(300);
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            latency: slow_source.then_some(delay),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            latency: (!slow_source).then_some(delay),
+            ..Default::default()
+        }));
+        let mut worker =
+            pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
+        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        let jobs: Vec<_> = (0..512)
+            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
+            .collect();
+        let mut next = 0;
+        let mut limits = Vec::new();
+        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+        worker
+            .transfer_small_batches(
+                &jobs,
+                |limit| {
+                    if next == jobs.len() {
+                        return None;
+                    }
+                    limits.push(limit);
+                    let end = (next + limit.files.min((limit.bytes / size).max(1) as usize))
+                        .min(jobs.len());
+                    let group = next..end;
+                    next = end;
+                    Some(group)
+                },
+                &mut results,
+            )
+            .unwrap();
+        assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
+        let source = src.lock().unwrap();
+        if slow_source {
+            assert_eq!(
+                &source.sent_at_receive[..4],
+                &[4, 4, 4, 4],
+                "old reads stop refill before any acknowledgment"
+            );
+        } else {
+            assert_eq!(
+                &source.sent_at_receive[4..7],
+                &[7, 7, 7],
+                "old writes also stop source refill"
+            );
+        }
+        assert!(
+            limits
+                .iter()
+                .skip(4)
+                .any(|limit| limit.bytes < (64 << 10) && limit.files < 64),
+            "slow service shrinks both budgets: {limits:?}"
+        );
+        assert!(source.replies.is_empty());
+        assert!(dst.lock().unwrap().replies.is_empty());
+    }
+}
+
+#[test]
+fn explicit_batch_request_and_pipeline_settings_keep_fixed_grouping() {
+    for option in [
+        "batch-files=128",
+        "batch-bytes=2M",
+        "request-size=1M",
+        "pipeline-depth=8",
+    ] {
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+        let tuning = option.parse().unwrap();
+        Arc::get_mut(&mut worker.opts).unwrap().tuning = tuning;
+        assert!(!worker.adaptive_batches(), "{option}");
     }
 }

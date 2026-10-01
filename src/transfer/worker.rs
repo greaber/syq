@@ -33,6 +33,7 @@ pub(super) struct Worker {
     pub(super) observation: Option<Arc<crate::transfer_observations::Actor>>,
     pub(super) benchmark: crate::transfer_tuning::BenchmarkStats,
     pub(super) fast_batch_files: usize,
+    pub(super) batch_budget: WorkBudget,
     pub(super) setup_elapsed: std::time::Duration,
 }
 
@@ -51,8 +52,10 @@ impl Worker {
 
     pub(super) fn run(&mut self) -> Result<()> {
         let r = (|| {
+            let configure_start = std::time::Instant::now();
             configure_hashing(&mut *self.src, self.opts.hash_policy)?;
             configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
+            self.batch_budget.set_latency(configure_start.elapsed());
             if self.progress.observations.enabled.load(Relaxed) {
                 let actor = self.progress.observations.workers.actor("worker");
                 self.src
@@ -331,7 +334,7 @@ impl Worker {
 
     pub(super) fn receive_small_batch(
         &mut self,
-        sent: Vec<usize>,
+        (sent, started): (Vec<usize>, std::time::Instant),
         jobs: &[WorkerJob],
         results: &mut [Option<SmallPutOutcome>],
         early: Option<&crate::conn::BatchProgress>,
@@ -341,6 +344,18 @@ impl Worker {
             early.consume()?;
         }
         let valid = Self::record_small_batch_reply(&sent, response, results);
+        if self.adaptive_batches()
+            && valid
+            && sent.iter().all(|&i| matches!(results[i], Some(Ok(_))))
+        {
+            self.batch_budget.observe(
+                WorkSize {
+                    bytes: sent.iter().map(|&i| jobs[i].entry.size).sum(),
+                    files: sent.len(),
+                },
+                started.elapsed(),
+            );
+        }
         // Remote readers already credited these acknowledgments on arrival.
         // Synchronous connections account here. Confirmed file completion
         // still belongs to the final source check in either case.
@@ -362,7 +377,7 @@ impl Worker {
     pub(super) fn transfer_small_batches(
         &mut self,
         jobs: &[WorkerJob],
-        mut groups: impl Iterator<Item = std::ops::Range<usize>>,
+        mut next_group: impl FnMut(WorkSize) -> Option<std::ops::Range<usize>>,
         results: &mut [Option<SmallPutOutcome>],
     ) -> Result<()> {
         let early = self.dst.track_small_batches(self.progress.clone())?;
@@ -389,14 +404,37 @@ impl Worker {
             .max(std::time::Duration::from_micros(
                 source_rtt_us.saturating_mul(16),
             ));
-        let mut reads = std::collections::VecDeque::new();
-        let mut writes = std::collections::VecDeque::new();
+        let adaptive = self.adaptive_batches();
+        let mut reads =
+            std::collections::VecDeque::<(std::ops::Range<usize>, usize, std::time::Instant)>::new(
+            );
+        let mut writes = std::collections::VecDeque::<(Vec<usize>, std::time::Instant)>::new();
         let result = (|| -> Result<()> {
             'issuing: loop {
                 // A retired worker finishes its issued groups, but leaves the
                 // unread suffix available to peers instead of refilling the pipe.
-                while self.gate.allowed(self.id) && reads.len() < read_window {
-                    let Some(group) = groups.next() else { break };
+                while self.gate.allowed(self.id)
+                    && !self.sched.is_aborted()
+                    && reads.len() < read_window
+                {
+                    let started = std::time::Instant::now();
+                    let oldest = reads
+                        .front()
+                        .map(|r| r.2)
+                        .into_iter()
+                        .chain(writes.front().map(|w| w.1))
+                        .min();
+                    if adaptive && self.batch_budget.overdue(started, oldest) {
+                        break;
+                    }
+                    let limit = if adaptive {
+                        self.batch_budget.limit()
+                    } else {
+                        WorkSize::UNLIMITED
+                    };
+                    let Some(group) = next_group(limit) else {
+                        break;
+                    };
                     let mut requests = Vec::new();
                     for job in &jobs[group.clone()] {
                         // Empty files need no source access, including mode 000.
@@ -417,9 +455,17 @@ impl Worker {
                             return Err(error);
                         }
                     }
-                    reads.push_back((group.clone(), count));
+                    reads.push_back((group.clone(), count, started));
                 }
-                let Some((group, count)) = reads.pop_front() else {
+                let Some((group, count, started)) = reads.pop_front() else {
+                    // Old writes can prevent refill before this window is full.
+                    // Retire their replies and retry with the updated estimate.
+                    if let Some(write) = writes.pop_front() {
+                        if !self.receive_small_batch(write, jobs, results, early.as_ref())? {
+                            break;
+                        }
+                        continue;
+                    }
                     break;
                 };
                 let (blocks, waited) = if count == 0 {
@@ -501,7 +547,7 @@ impl Worker {
                         Self::fail_small_batch(results, sent, &error);
                         return Err(error);
                     }
-                    writes.push_back(sent);
+                    writes.push_back((sent, started));
                 }
                 if writes.len() >= write_window
                     && !self.receive_small_batch(
@@ -519,7 +565,7 @@ impl Worker {
         // A normal endpoint error consumes its reply. Drain only requests still
         // outstanding; a receive/transport error stops that drain immediately.
         let source_end = (|| {
-            while let Some((group, count)) = reads.pop_front() {
+            while let Some((group, count, _)) = reads.pop_front() {
                 if count > 0 {
                     let response = self.src.recv()?;
                     if let Err(error) = ok(response, "read small batch") {
@@ -539,6 +585,12 @@ impl Worker {
             Ok(())
         })();
         result.and(source_end).and(destination_end)
+    }
+
+    pub(super) fn adaptive_batches(&self) -> bool {
+        !self.opts.tuning.batch_override()
+            && self.opts.tuning.request_size.is_none()
+            && self.opts.tuning.pipeline_depth.is_none()
     }
 
     pub(super) fn fast_batch(&mut self, batch: &mut Vec<usize>) -> Result<()> {
@@ -575,6 +627,11 @@ impl Worker {
         } else {
             usize::MAX
         };
+        let initial = if self.adaptive_batches() {
+            self.batch_budget.limit()
+        } else {
+            WorkSize::UNLIMITED
+        };
         let mut groups = Vec::new();
         let mut start = 0;
         let mut bytes = 0u64;
@@ -587,11 +644,18 @@ impl Worker {
                     .as_ref()
                     .map_or(0, |m| m.size_hint()) as u64,
             );
+            let first_limit = if start == 0 {
+                initial
+            } else {
+                WorkSize::UNLIMITED
+            };
             if i > start
                 && (bytes.saturating_add(file_bytes)
-                    > group_bytes.min(crate::proto::MAX_READ_BYTES)
+                    > group_bytes
+                        .min(crate::proto::MAX_READ_BYTES)
+                        .min(first_limit.bytes)
                     || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES
-                    || i - start >= group_files)
+                    || i - start >= group_files.min(first_limit.files))
             {
                 groups.push(start..i);
                 start = i;
@@ -611,8 +675,12 @@ impl Worker {
                 .collect(),
             groups.into(),
         );
-        let groups =
-            std::iter::once(first).chain(std::iter::from_fn(|| shared.lock().unwrap().claim()));
+        let mut first = Some(first);
+        let groups = |limit: WorkSize| {
+            first
+                .take()
+                .or_else(|| shared.lock().unwrap().claim(limit.files, limit.bytes))
+        };
         // None means no destination result: an unissued group or a read
         // drained after another group's error is still safe to requeue.
         let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();

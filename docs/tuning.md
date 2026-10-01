@@ -283,6 +283,13 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
   --performance-tuning workers=1,batch-files=256,batch-bytes=8M -v
 ```
 
+By default, workers adjust the size of small-file request groups to their own
+observed completion times. Slow workers issue smaller groups, leaving unread
+files available to others. A group still contains whole files: one slow file
+can exceed the estimate, and requests already sent must finish or fail.
+Explicit `batch-files`, `batch-bytes`, `request-size`, or `pipeline-depth` settings
+disable this adjustment for controlled comparisons.
+
 Explicit batch settings replace the small-copy shortcut with worker batches.
 With logical-byte bandwidth pacing, each batch contains at most one file.
 Ordinary SSH and TCP copies keep multi-file batches while pacing compressed
