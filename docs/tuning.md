@@ -285,11 +285,15 @@ syq cp --srcs-in small-files --to server --into /scratch/benchmark-small \
 
 By default, workers adjust the size of small-file request groups to their own
 observed completion times. Slow workers issue smaller groups, leaving unread
-files available to others. Workers occasionally recheck connection delay when
-replies slow down, so competing traffic does not permanently reduce their groups
-to single files. These checks briefly pause new requests on that worker.
-A group still contains whole files: one slow file
-can exceed the estimate, and requests already sent must finish or fail.
+files available to others. Workers occasionally recheck connection delay after
+slow replies and on connections whose latency allowance exceeds 250 ms. The
+first periodic check waits 30 seconds; a large drop in the group budget can
+trigger an earlier check. These checks briefly pause new requests on that worker
+and help it recover when competing traffic changes the delay. Default source
+read-ahead also allows for the group's expected completion time, at least
+250 ms, before treating a source reply as stalled. A group still contains whole
+files: one slow file can exceed the estimate, and requests already sent must
+finish or fail.
 Explicit `batch-files`, `batch-bytes`, `request-size`, or `pipeline-depth` settings
 disable this adjustment for controlled comparisons.
 

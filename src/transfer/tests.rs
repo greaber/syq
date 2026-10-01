@@ -1374,12 +1374,18 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
 fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
     // Inject reply-start waits so scheduling delays cannot change which
     // side of the stall allowance a case exercises.
-    for (rtt_us, setup_ms, reply_wait_ms, expected) in [
-        (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
-        (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-        (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+    for (adaptive, refreshed_ms, rtt_us, setup_ms, reply_wait_ms, expected) in [
+        (false, 0, None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
+        (false, 0, Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (false, 0, None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         // Payload time does not contribute to the reported reply-start wait.
-        (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (false, 0, None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+        // The default adaptive group budget allows 250 ms of service.
+        (true, 0, None, 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (true, 0, None, 0, 300, [4, 4, 4, 4, 5, 6, 7, 8]),
+        // A latency recheck also updates the source's stall allowance.
+        (true, 300, None, 0, 500, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (true, 300, None, 0, 1300, [4, 4, 4, 4, 5, 6, 7, 8]),
     ] {
         let jobs: Vec<_> = (0..8)
             .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
@@ -1406,6 +1412,15 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
                 .push_back(Response::Applied(vec![None]));
         }
         let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+        if adaptive {
+            Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        }
+        if refreshed_ms > 0 {
+            worker.batch_budget.refreshed_latency(
+                std::time::Duration::from_millis(refreshed_ms),
+                std::time::Instant::now(),
+            );
+        }
         worker.gate.set_active(2);
         worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
         let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();

@@ -31,7 +31,7 @@ impl Default for WorkBudget {
             },
             target: Duration::from_millis(250),
             recheck_latency: false,
-            next_latency_check: Instant::now() + Duration::from_secs(2),
+            next_latency_check: Instant::now() + Duration::from_secs(30),
             earliest_latency_check: Instant::now() + Duration::from_secs(2),
             limit_at_check: WorkSize {
                 bytes: 64 << 10,
@@ -318,9 +318,25 @@ mod tests {
     }
 
     #[test]
+    fn initial_periodic_check_waits_but_budget_collapse_can_check_early() {
+        let mut budget = WorkBudget::default();
+        let now = Instant::now();
+        budget.set_latency(Duration::from_millis(150));
+        budget.observe(budget.limit(), Duration::from_millis(100));
+        assert!(!budget.latency_check_due(now + Duration::from_secs(3)));
+        assert!(!budget.latency_check_due(now + Duration::from_secs(29)));
+        assert!(budget.latency_check_due(now + Duration::from_secs(31)));
+
+        let mut collapsed = WorkBudget::default();
+        collapsed.observe(collapsed.limit(), Duration::from_secs(2));
+        assert!(!collapsed.latency_check_due(now + Duration::from_secs(1)));
+        assert!(collapsed.latency_check_due(now + Duration::from_secs(3)));
+    }
+
+    #[test]
     fn latency_checks_are_bounded_and_allow_recovery_when_queueing_disappears() {
         let mut budget = WorkBudget::default();
-        let now = Instant::now() + Duration::from_secs(3);
+        let now = Instant::now() + Duration::from_secs(31);
         assert!(!budget.latency_check_due(now));
         budget.observe(budget.limit(), Duration::from_millis(400));
         assert!(budget.latency_check_due(now));
