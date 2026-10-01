@@ -20,10 +20,12 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), cancel=False,
-         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None):
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None, ssh_trace=None):
 
     argv = [binary, "cp", "-vv", source, "--to", "destination",
             *auth, "--as", path, "--performance-tuning", "workers=2", *extra]
+    if ssh_trace is not None:
+        argv = ["env", "SYQ_REAL_SSH_TRACE_FILE=" + ssh_trace, *argv]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(["ssh", "source", command], stdout=output, stderr=output,
@@ -115,16 +117,38 @@ remote("test ! -e /tmp/syq-real-ssh/forward/denied")
 
 print("case: approved copy uses direct encrypted TCP without source SSH credentials", flush=True)
 trace = Path("/tmp/syq-real-ssh-ssh.trace")
-def destination_connections():
-    events = [dict(field.split("=", 1) for field in line.split("\t"))
-              for line in trace.read_text().splitlines()]
-    return sum(event["phase"] == "start" and event["host"] == "destination" for event in events)
 
-before = destination_connections()
-copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",))
-assert destination_connections() - before == 2, (
-    "automatic fallback needs one failed source SSH attempt and one approved SSH connection"
-)
+
+def trace_events(text):
+    return [dict(field.split("=", 1) for field in line.split("\t"))
+            for line in text.splitlines()]
+
+
+def forwarding_connections():
+    # Pool warming also connects to destination in the background. Only the
+    # approved copy launches --return-receiver in this container.
+    return [event for event in trace_events(trace.read_text())
+            if event["phase"] == "start" and event["host"] == "destination"
+            and event["return_receiver"] == "yes"]
+
+
+before = len(forwarding_connections())
+# The source has its own trace filesystem. Give this copy a separate file so
+# an older source session's background activity cannot enter the assertion.
+source_trace = run("ssh", "source", "mktemp /tmp/syq-real-ssh/forward-ssh.XXXXXX").strip()
+try:
+    copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",), ssh_trace=source_trace)
+    approved = forwarding_connections()[before:]
+    assert len(approved) == 1, ("expected one approved SSH connection on the runner", approved)
+    events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
+    attempts = [event for event in events
+                if event["phase"] == "start" and event["host"] == "destination"]
+    assert len(attempts) == 1, ("expected one source SSH attempt", events)
+    exits = [event for event in events
+             if event["phase"] == "end" and event["pid"] == attempts[0]["pid"]]
+    assert len(exits) == 1 and exits[0]["status"] == "255", events
+finally:
+    run("ssh", "source", "rm -f " + shlex.quote(source_trace))
 expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expected
 
