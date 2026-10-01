@@ -1423,7 +1423,8 @@ impl FsOps {
             .map(|read| {
                 // Metadata is enough for an empty file, even with mode 000.
                 let result = if read.len == 0 {
-                    Ok((Vec::new(), self.observed_payload_hash(&[])))
+                    self.source_content_target(read.source.as_ref())
+                        .map(|_| (Vec::new(), self.observed_payload_hash(&[])))
                 } else {
                     self.read_range(&read.path, read.source.as_ref(), read.attempt, 0, read.len)
                         .and_then(|response| match response {

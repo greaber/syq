@@ -4636,15 +4636,17 @@ fn destination_worker_rejects_source_only_content_requests() {
     assert!(
         matches!(response, Response::EndpointError(error) if error.message.contains("destination worker"))
     );
-    let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
-        path: b"marker".to_vec(),
-        source: None,
-        attempt: 0,
-        len: 6,
-    }]));
-    assert!(
-        matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("destination worker")))
-    );
+    for len in [0, 6] {
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: b"marker".to_vec(),
+            source: None,
+            attempt: 0,
+            len,
+        }]));
+        assert!(
+            matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("destination worker")))
+        );
+    }
 }
 
 #[test]

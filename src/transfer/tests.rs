@@ -946,7 +946,14 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
                 _ => None,
             })
             .sum::<usize>();
-        assert_eq!(writes, if failure.starts_with("changed") { 5 } else { 6 });
+        assert_eq!(
+            writes,
+            if failure.starts_with("changed") || failure == "source-drop" {
+                5
+            } else {
+                6
+            }
+        );
         let snapshots = &dst.lock().unwrap().progress_at_receive;
         for (i, &(bytes, files)) in snapshots.iter().enumerate() {
             assert_eq!(bytes, 123 + ((i as u64) << 20), "{failure}: ack {i}");

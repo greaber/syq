@@ -1511,19 +1511,86 @@ fn vanished_source_is_not_published_on_any_filesystem_route() {
                     assert!(!t.path("dst/file").exists(), "{route}");
                 }
                 let partials = partial_files(&t.path("dst"));
+                assert!(partials.len() <= 1, "{route}: {partials:?}");
                 if size == 8 << 20 {
-                    assert_eq!(partials.len(), 1, "{route}: {partials:?}");
-                    assert_eq!(read(&partials[0]), vec![b'a'; size], "{route}");
-                } else {
-                    assert!(
-                        partials.is_empty(),
-                        "changed small files must not be sent: {route}"
-                    );
+                    assert_eq!(partials.len(), 1, "{route}");
+                }
+                for partial in partials {
+                    assert_eq!(read(&partial), vec![b'a'; size], "{route}");
                 }
                 let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
                 let summary: serde_json::Value =
                     serde_json::from_str(records.lines().last().unwrap()).unwrap();
                 assert_eq!(summary["files_transferred"], 0, "{route}: {summary}");
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn changed_small_source_retries_before_replacement() {
+    for startup_shortcut in [false, true] {
+        for original_size in [0, 1024] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), &vec![b'a'; original_size]);
+            set_mtime(&t.path("src/file"), 1_600_000_000);
+            write(&t.path("dst/file"), b"previous good copy");
+            set_mtime(&t.path("dst/file"), 1_500_000_000);
+            let ready = t.path("source-recheck-ready");
+            let continuation = t.path("source-recheck-continue");
+            let mut command = if startup_shortcut {
+                let rsh = fake_rsh(&t);
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--no-tcp",
+                    &t.s("src/file"),
+                    "--to",
+                    "fake",
+                    "--into",
+                    &t.s("dst"),
+                ]);
+                command
+            } else {
+                let mut command = compat_command();
+                command.args(["-a", &t.s("src/"), &t.s("dst/")]);
+                command
+            };
+            let mut child = command
+                .arg("--no-progress")
+                .env("SYQ_DEBUG", "1")
+                .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+                .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .start()
+                .unwrap();
+            wait_for_confinement_marker(&mut child, &ready, "small source recheck");
+            assert_eq!(read(&t.path("dst/file")), b"previous good copy");
+            let changed = vec![b'b'; 2048];
+            write(&t.path("src/file"), &changed);
+            set_mtime(&t.path("src/file"), 1_600_000_001);
+            release_confinement_barrier(&continuation);
+            let output = child.wait_with_output().unwrap();
+            assert_output_ok(&output);
+            assert_eq!(read(&t.path("dst/file")), changed);
+            assert!(partial_files(&t.path("dst")).is_empty());
+            if startup_shortcut {
+                assert!(
+                    stderr_of(&output).contains("small copy: offering 1 files"),
+                    "{output:?}"
+                );
+                assert!(
+                    !stderr_of(&output).contains("small copy: sending"),
+                    "changed payload must not reach the startup receiver: {output:?}"
+                );
+            } else {
+                assert!(tuning_observed(&output)["small_batches"].as_u64().unwrap() >= 1);
             }
         }
     }
@@ -1607,6 +1674,10 @@ fn changed_source_retry_uses_unpublished_partial_as_block_basis() {
 #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn changed_source_retry_keeps_local_whole_file_copy() {
+    #[cfg(target_os = "macos")]
+    if !macos_clone_support::available() {
+        return;
+    }
     let t = Tmp::new();
     let original = vec![b'a'; 8 * 1024 * 1024];
     let changed = vec![b'b'; 1024];
