@@ -814,7 +814,7 @@ impl Conn for RemoteConn {
         );
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
         Ok(match req {
-            Request::WriteRange { data, .. } => Some(data.into_vec()),
+            Request::WriteRange { data, .. } => data.recycle(),
             _ => None,
         })
     }

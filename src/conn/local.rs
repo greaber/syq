@@ -168,7 +168,7 @@ impl Conn for LocalConn {
             self.pending.push_back(resp);
         }
         Ok(match req {
-            Request::WriteRange { data, .. } => Some(data.into_vec()),
+            Request::WriteRange { data, .. } => data.recycle(),
             _ => None,
         })
     }

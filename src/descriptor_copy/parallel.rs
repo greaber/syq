@@ -341,7 +341,7 @@ impl Workers {
                         && data.len() == job.len
                         && self.controls.settings.matches(&data, hash) =>
                 {
-                    job.data = data
+                    job.data = data.into_vec()
                 }
                 _ => bail!("invalid stream range response"),
             }

@@ -337,7 +337,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
         .unwrap();
     assert!(matches!(
         reader.read_msg::<Response>().unwrap(),
-        Response::Block { data, .. } if data == b"marker"
+        Response::Block { data, .. } if &*data == b"marker"
     ));
     writer
         .write_msg(&Request::ReadRange {
@@ -385,7 +385,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 "{response:?}"
             );
         } else {
-            assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+            assert!(matches!(response, Response::Block { data, .. } if &*data == b"marker"));
         }
         // Completion arrives before Stop, including after a read error.
         // The socket's read deadline makes waiting for Stop fail this test.
@@ -1026,7 +1026,7 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
     };
     writer.write_msg(&range).unwrap();
     assert!(
-        matches!(reader.read_msg::<Response>().unwrap(), Response::Block { data, .. } if data == b"source")
+        matches!(reader.read_msg::<Response>().unwrap(), Response::Block { data, .. } if &*data == b"source")
     );
     // Pipelined release/rebind must have exactly two checked replies.
     writer.write_msg(&Request::BindStream(None)).unwrap();

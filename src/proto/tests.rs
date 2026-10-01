@@ -45,7 +45,7 @@ fn block_message(data: Vec<u8>) -> Response {
     Response::Block {
         off: 7,
         hash: [11; 32],
-        data,
+        data: data.into(),
     }
 }
 
@@ -133,7 +133,7 @@ fn direct_frames_preserve_buffered_encoding_and_released_payloads() {
             let response = Response::Block {
                 off: 1234567,
                 hash: [11; 32],
-                data: vec![0xab; size],
+                data: vec![0xab; size].into(),
             };
             let payload = postcard::to_stdvec(&response).unwrap();
             expected.extend_from_slice(&raw_frame(&payload, 0)[local_preamble_len()..]);
@@ -181,7 +181,7 @@ fn direct_frame_passes_large_payload_to_transport_without_copying() {
         .write_msg(&Response::Block {
             off: 0,
             hash: [0; 32],
-            data,
+            data: data.into(),
         })
         .unwrap();
     assert!(
@@ -278,7 +278,7 @@ fn direct_frame_preserves_payload_io_error() {
         .write_msg(&Response::Block {
             off: 0,
             hash: [0; 32],
-            data: vec![0; 2 << 20],
+            data: vec![0; 2 << 20].into(),
         })
         .unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
@@ -429,7 +429,7 @@ fn compression_is_per_frame_and_never_expands_the_wire_payload() {
             data: decoded,
         } => {
             assert_eq!((off, hash), (7, [11; 32]));
-            assert_eq!(decoded, data);
+            assert_eq!(&*decoded, data);
         }
         other => panic!("unexpected response {other:?}"),
     }
@@ -659,7 +659,7 @@ fn frames_mix_lz4_zstd_and_raw_without_losing_boundaries() {
         let Response::Block { data, .. } = reader.read_msg().unwrap() else {
             panic!("expected block")
         };
-        assert_eq!(data, expected);
+        assert_eq!(&*data, expected);
     }
     let mut offset = local_preamble_len();
     let mut codecs = Vec::new();

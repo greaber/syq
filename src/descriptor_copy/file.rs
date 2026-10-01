@@ -554,7 +554,7 @@ impl FileWorker {
                 Ok(Response::Block {
                     off: *off,
                     hash: self.settings.hash(&data),
-                    data,
+                    data: data.into(),
                 })
             }
             Request::WriteRange {

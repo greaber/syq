@@ -422,7 +422,7 @@ fn oversized_reads_are_rejected_before_allocation() {
         off: 0,
         len: 8,
     });
-    assert!(matches!(response, Response::Block { data, .. } if data == b"original"));
+    assert!(matches!(response, Response::Block { data, .. } if &*data == b"original"));
 }
 
 #[test]
@@ -4313,7 +4313,7 @@ fn source_content_uses_registered_directory_after_name_replacement() {
         off: 0,
         len: 8,
     });
-    assert!(matches!(response, Response::Block { data, .. } if data == b"original"));
+    assert!(matches!(response, Response::Block { data, .. } if &*data == b"original"));
 
     let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
         path: parallel_marker.clone(),
@@ -4358,7 +4358,7 @@ fn source_content_uses_registered_directory_after_name_replacement() {
         off: 0,
         len: 12,
     });
-    assert!(matches!(response, Response::Block { data, .. } if data == b"raw-original"));
+    assert!(matches!(response, Response::Block { data, .. } if &*data == b"raw-original"));
 }
 
 #[test]
@@ -4484,7 +4484,7 @@ fn source_read_cache_keys_root_and_attempt() {
             off: 0,
             len: 5,
         });
-        assert!(matches!(response, Response::Block { data, .. } if data == expected));
+        assert!(matches!(response, Response::Block { data, .. } if &*data == expected));
     }
 
     fs::rename(first.join("same"), first.join("old")).unwrap();
@@ -4496,7 +4496,7 @@ fn source_read_cache_keys_root_and_attempt() {
         off: 0,
         len: 5,
     });
-    assert!(matches!(same_attempt, Response::Block { data, .. } if data == b"first"));
+    assert!(matches!(same_attempt, Response::Block { data, .. } if &*data == b"first"));
     let retry = worker.handle(&Request::ReadRange {
         path: Vec::new(),
         source: Some(first_source),
@@ -4504,7 +4504,7 @@ fn source_read_cache_keys_root_and_attempt() {
         off: 0,
         len: 5,
     });
-    assert!(matches!(retry, Response::Block { data, .. } if data == b"newer"));
+    assert!(matches!(retry, Response::Block { data, .. } if &*data == b"newer"));
 }
 
 #[test]
@@ -4590,7 +4590,7 @@ fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
         off: 0,
         len: 8,
     });
-    assert!(matches!(response, Response::Block { data, .. } if data == b"legacy!!"));
+    assert!(matches!(response, Response::Block { data, .. } if &*data == b"legacy!!"));
 
     let response = worker.handle(&Request::HashBlocks {
         off: 0,
@@ -5344,7 +5344,7 @@ fn compared_reads_preserve_independent_payload_integrity() {
                         panic!("{reply:?}");
                     };
                     assert_eq!(off, 5);
-                    assert_eq!(data, b"contents");
+                    assert_eq!(&*data, b"contents");
                     assert_eq!(
                         hash,
                         if integrity {

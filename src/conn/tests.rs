@@ -291,7 +291,7 @@ fn client_reader_requires_accepted_hello_before_large_data() {
             .write_msg(&Response::Block {
                 off: 0,
                 hash: [0; 32],
-                data: vec![7; 2 << 20],
+                data: vec![7; 2 << 20].into(),
             })
             .unwrap();
         drop(writer);
@@ -452,7 +452,7 @@ fn local_source_worker_rejects_destination_mutation_requests() {
             len: 6,
         })
         .unwrap();
-    assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+    assert!(matches!(response, Response::Block { data, .. } if &*data == b"marker"));
 
     for reference in [Some(source_marker.clone()), None] {
         source
@@ -468,7 +468,7 @@ fn local_source_worker_rejects_destination_mutation_requests() {
         assert!(matches!(source.recv().unwrap(), Response::Ok));
         let response = source.recv().unwrap();
         if reference.is_some() {
-            assert!(matches!(response, Response::Block { data, .. } if data == b"marker"));
+            assert!(matches!(response, Response::Block { data, .. } if &*data == b"marker"));
         } else {
             assert!(matches!(response, Response::EndpointError(_)));
         }
@@ -509,7 +509,7 @@ fn local_source_worker_rejects_destination_mutation_requests() {
         );
         if end > 0 {
             assert!(
-                matches!(source.recv().unwrap(), Response::Block { data, .. } if data == b"marker")
+                matches!(source.recv().unwrap(), Response::Block { data, .. } if &*data == b"marker")
             );
         }
         assert!(matches!(source.recv().unwrap(), Response::ReadStreamDone));
@@ -1155,7 +1155,7 @@ fn tuning_pipeline_drains_responses_while_sending_large_requests() {
                     .write_msg(&Response::Block {
                         off,
                         hash: [0; 32],
-                        data: vec![7; len as usize],
+                        data: vec![7; len as usize].into(),
                     })
                     .unwrap();
             }
@@ -1188,7 +1188,7 @@ fn tuning_pipeline_drains_responses_while_sending_large_requests() {
                 .unwrap()
                 .into_inner();
             assert!(matches!(response, Response::Block { off, data, .. }
-                if off == i as u64 * (64 << 10) && data == vec![7; 64 << 10]));
+                if off == i as u64 * (64 << 10) && &*data == vec![7; 64 << 10]));
         }
         drop(responses);
         drop(requests);

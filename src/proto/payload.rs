@@ -1,7 +1,7 @@
-//! An incoming write owns its encoded frame, exposing only its file bytes.
-//! This keeps queued writes independent without copying the payload out of
-//! the frame. Locally produced writes own their original Vec directly.
-use super::{Request, WireRequest};
+//! Incoming file payloads own their frames, exposing only the file bytes.
+//! Queued reads and writes stay independent without copying payloads out of
+//! frames. Locally produced payloads own their original Vec directly.
+use super::{Request, Response, WireRequest, WireResponse};
 use crate::wire_budget::{self, Budgeted};
 use serde::{Deserializer, Serializer};
 use std::io;
@@ -129,6 +129,20 @@ impl DerefMut for Payload {
     }
 }
 impl Payload {
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.range.end = self.range.start + self.len().min(len);
+    }
+
+    /// Return locally produced storage to its producer. Received frames instead
+    /// return to their reader on drop, without moving the payload within them.
+    pub(crate) fn recycle(self) -> Option<Vec<u8>> {
+        if self.range.start == 0 {
+            Some(self.into_vec())
+        } else {
+            None
+        }
+    }
+
     /// Outgoing buffers have offset zero, so returning them to the producer
     /// preserves their allocation. A forwarded received frame is compacted.
     pub(crate) fn into_vec(mut self) -> Vec<u8> {
@@ -229,6 +243,57 @@ pub(super) fn decode_request(mut frame: FrameBuffer) -> io::Result<Budgeted<Requ
     })
 }
 
+fn block_tag() -> u32 {
+    static TAG: OnceLock<u32> = OnceLock::new();
+    *TAG.get_or_init(|| {
+        let response = WireResponse::Block {
+            off: 0,
+            hash: [0; 32],
+            data: &[] as &[u8],
+        };
+        let encoded = postcard::to_stdvec(&response).expect("serialize block tag");
+        postcard::take_from_bytes::<u32>(&encoded)
+            .expect("decode block tag")
+            .0
+    })
+}
+
+pub(super) fn decode_response(mut frame: FrameBuffer) -> io::Result<Budgeted<Response>> {
+    if postcard::take_from_bytes::<u32>(&frame).map(|(tag, _)| tag) != Ok(block_tag()) {
+        frame.returned = Weak::new();
+        return wire_budget::decode(&frame);
+    }
+    let decoded = wire_budget::decode::<WireResponse<&[u8]>>(&frame)?;
+    let (response, mut hold) = decoded.into_parts();
+    hold.grow(
+        std::mem::size_of::<Response>().saturating_sub(std::mem::size_of::<WireResponse<&[u8]>>()),
+    )?;
+    let WireResponse::Block { off, hash, data } = response else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected block reply",
+        ));
+    };
+    let start = (data.as_ptr() as usize)
+        .checked_sub(frame.as_ptr() as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload outside frame"))?;
+    let end = start
+        .checked_add(data.len())
+        .filter(|end| *end <= frame.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload outside frame"))?;
+    Ok(Budgeted {
+        value: Response::Block {
+            off,
+            hash,
+            data: Payload {
+                storage: frame,
+                range: start..end,
+            },
+        },
+        hold,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +339,145 @@ mod tests {
         // frame to transfer, and re-encoding has the same representation.
         let standalone: Request = postcard::from_bytes(old).unwrap();
         assert_eq!(postcard::to_stdvec(&standalone).unwrap(), old);
+    }
+
+    #[test]
+    fn unchanged_reply_fixture_keeps_wire_bytes_and_frame_allocation() {
+        // Captured with the unchanged master writer at eadb624d.
+        let old = include_bytes!("../../tests/fixtures/protocol/read-block-eadb624d.bin");
+        let response = Response::Block {
+            off: (1 << 40) + 17,
+            hash: [231; 32],
+            data: vec![0, 1, 127, 128, 255, 9].into(),
+        };
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), old);
+        let frame = old.to_vec();
+        let ptr = frame.as_ptr();
+        let decoded = decode_response(frame.into()).unwrap();
+        assert_eq!(postcard::to_stdvec(&decoded.value).unwrap(), old);
+        let Response::Block { mut data, .. } = decoded.value else {
+            panic!("not a block")
+        };
+        assert_eq!(data.storage.as_ptr(), ptr);
+        assert_eq!(&*data, &[0, 1, 127, 128, 255, 9]);
+        data.truncate(3);
+        assert_eq!(&*data, &[0, 1, 127]);
+        assert_eq!(data.storage.as_ptr(), ptr);
+        assert!(data.recycle().is_none());
+        let standalone: Response = postcard::from_bytes(old).unwrap();
+        assert_eq!(postcard::to_stdvec(&standalone).unwrap(), old);
+        for end in 0..old.len() {
+            assert!(decode_response(old[..end].to_vec().into()).is_err());
+        }
+    }
+
+    #[test]
+    fn replies_own_frames_across_queues_codecs_and_forwarding() {
+        for codec in [0, crate::compression::ZSTD, crate::compression::LZ4] {
+            let mut wire = Vec::new();
+            FrameWriter::new(&mut wire, false).write_preamble().unwrap();
+            let sizes = [0, 1, 128, 256 << 10, 2 << 20, 7, 0];
+            for (index, size) in sizes.into_iter().enumerate() {
+                let reply = Response::Block {
+                    off: index as u64,
+                    hash: [index as u8; 32],
+                    data: vec![index as u8; size].into(),
+                };
+                let encoded = postcard::to_stdvec(&reply).unwrap();
+                let body = match codec {
+                    0 => encoded,
+                    crate::compression::ZSTD => zstd::bulk::compress(&encoded, 1).unwrap(),
+                    crate::compression::LZ4 => lz4::block::compress(&encoded, None, true).unwrap(),
+                    _ => unreachable!(),
+                };
+                wire.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+                wire.push(codec);
+                wire.extend_from_slice(&body);
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel(4);
+            let reader = std::thread::spawn(move || {
+                let mut reader = FrameReader::new(wire.as_slice());
+                for _ in sizes {
+                    tx.send(reader.read_budgeted::<Response>().unwrap())
+                        .unwrap();
+                }
+            });
+            let messages: Vec<_> = rx.into_iter().collect();
+            reader.join().unwrap();
+            for (index, message) in messages.into_iter().enumerate() {
+                let Response::Block { off, hash, data } = message.value else {
+                    panic!("not a block")
+                };
+                let ptr = data.storage.as_ptr();
+                assert_eq!(&*data, vec![index as u8; sizes[index]]);
+                let write = Request::WriteRange {
+                    path: b"output".to_vec(),
+                    inplace: false,
+                    copy_id: [0; 16],
+                    attempt: 0,
+                    off,
+                    hash,
+                    data,
+                    guard: None,
+                };
+                let Request::WriteRange { data, .. } = &write else {
+                    unreachable!()
+                };
+                assert_eq!(data.storage.as_ptr(), ptr);
+                let mut forwarded = Vec::new();
+                FrameWriter::new(&mut forwarded, false)
+                    .write_msg(&write)
+                    .unwrap();
+                let Request::WriteRange { data, .. } =
+                    FrameReader::new(forwarded.as_slice()).read_msg().unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(&*data, vec![index as u8; sizes[index]]);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_replies_recycle_without_compacting_the_forwarded_payload() {
+        let mut wire = Vec::new();
+        let mut writer = FrameWriter::new(&mut wire, false);
+        for i in 0..3 {
+            writer
+                .write_msg(&Response::Block {
+                    off: i,
+                    hash: [0; 32],
+                    data: vec![i as u8; 256 << 10].into(),
+                })
+                .unwrap();
+        }
+        drop(writer);
+        let mut reader = FrameReader::new(wire.as_slice());
+        let mut original = None;
+        for i in 0..3 {
+            let Response::Block { data, .. } = reader.read_msg::<Response>().unwrap() else {
+                panic!("not a block")
+            };
+            let ptr = data.storage.as_ptr() as usize;
+            if let Some(original) = original {
+                assert_eq!(ptr, original);
+            } else {
+                original = Some(ptr);
+            }
+            assert_eq!(&*data, vec![i; 256 << 10]);
+            std::thread::spawn(move || assert!(data.recycle().is_none()))
+                .join()
+                .unwrap();
+            assert!(reader
+                .pool
+                .returned
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(Payload::from(vec![1, 2, 3]).recycle(), Some(vec![1, 2, 3]));
     }
 
     #[test]

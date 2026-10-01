@@ -1245,8 +1245,14 @@ impl Request {
     }
 }
 
+pub type Response = WireResponse<Payload>;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum Response {
+#[serde(bound(
+    serialize = "Data: serde_bytes::Serialize",
+    deserialize = "Data: serde_bytes::Deserialize<'de>"
+))]
+pub enum WireResponse<Data> {
     HelloOk {
         identity: String,
         platform: String,
@@ -1305,7 +1311,7 @@ pub enum Response {
         off: u64,
         hash: ContentDigest,
         #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
+        data: Data,
     },
     SmallBlocks(Vec<std::result::Result<SmallBlock, String>>),
     FileHash {
@@ -1588,6 +1594,12 @@ impl SizeHint for Request {
 }
 
 impl SizeHint for Response {
+    fn recycle_frames() -> bool {
+        true
+    }
+    fn decode_frame(frame: FrameBuffer) -> io::Result<crate::wire_budget::Budgeted<Self>> {
+        payload::decode_response(frame)
+    }
     fn direct_payload(&self) -> bool {
         matches!(self, Response::Block { .. })
     }

@@ -123,12 +123,12 @@ fn draining_counts_discarded_payload_and_preserves_the_next_response() {
         Response::Block {
             off: 0,
             hash: [0; 32],
-            data: vec![0; 7],
+            data: vec![0; 7].into(),
         },
         Response::Block {
             off: 7,
             hash: [0; 32],
-            data: vec![0; 11],
+            data: vec![0; 11].into(),
         },
         Response::ReadStreamDone,
         Response::Ok,
@@ -153,15 +153,15 @@ fn streaming_claim_preserves_a_stolen_suffix_and_checks_its_hash() {
         pos: 0,
         end: 5,
     }));
-    let mut data = b"abcdefgh".to_vec();
+    let mut data: Payload = b"abcdefgh".to_vec().into();
     let mut bad_hash = [0; 32];
     assert!(claim_block(&range, 0, &mut bad_hash, &mut data).is_err());
     assert_eq!(range.lock().unwrap().pos, 0);
-    assert_eq!(data, b"abcdefgh");
+    assert_eq!(&*data, b"abcdefgh");
     assert_eq!(bad_hash, [0; 32]);
     let mut hash = crate::fsops::content_digest(&data);
     assert_eq!(claim_block(&range, 0, &mut hash, &mut data).unwrap(), 5);
-    assert_eq!(data, b"abcde");
+    assert_eq!(&*data, b"abcde");
     assert_eq!(hash, crate::fsops::content_digest(b"abcde"));
     assert_eq!(range.lock().unwrap().pos, 5);
     assert_eq!(claim_block(&range, 5, &mut hash, &mut data).unwrap(), 0);
@@ -175,7 +175,7 @@ fn split_hashing_unlocks_the_range_and_revalidates_a_further_steal() {
         pos: 0,
         end: 5,
     }));
-    let mut data = b"abcdefgh".to_vec();
+    let mut data: Payload = b"abcdefgh".to_vec().into();
     let mut hash = crate::fsops::content_digest(&data);
     let mut hashed_lengths = Vec::new();
     let claimed = claim_block_with_digest(&range, 0, &mut hash, &mut data, |bytes| {
@@ -189,7 +189,7 @@ fn split_hashing_unlocks_the_range_and_revalidates_a_further_steal() {
     assert_eq!(hashed_lengths, [8, 5, 3]);
     assert_eq!(claimed, 3);
     assert_eq!(range.lock().unwrap().pos, 3);
-    assert_eq!(data, b"abc");
+    assert_eq!(&*data, b"abc");
     assert_eq!(hash, crate::fsops::content_digest(b"abc"));
 }
 
@@ -201,7 +201,7 @@ fn split_hashing_preserves_payload_when_cancelled_or_position_changes() {
             pos: 0,
             end: 5,
         }));
-        let mut data = b"abcdefgh".to_vec();
+        let mut data: Payload = b"abcdefgh".to_vec().into();
         let original_hash = crate::fsops::content_digest(&data);
         let mut hash = original_hash;
         let claimed = claim_block_with_digest(&range, 0, &mut hash, &mut data, |bytes| {
@@ -222,7 +222,7 @@ fn split_hashing_preserves_payload_when_cancelled_or_position_changes() {
             assert_eq!(claimed.unwrap(), 0);
             assert_eq!(range.lock().unwrap().pos, 0);
         }
-        assert_eq!(data, b"abcdefgh");
+        assert_eq!(&*data, b"abcdefgh");
         assert_eq!(hash, original_hash);
     }
 }
@@ -235,7 +235,7 @@ fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
             pos: 0,
             end,
         }));
-        let mut data = b"abcdefgh".to_vec();
+        let mut data: Payload = b"abcdefgh".to_vec().into();
         let mut hash = crate::fsops::content_digest(&data);
         let claimed = claim_block_with_digest(&range, 0, &mut hash, &mut data, |_| {
             panic!("only split frames need a coordinator-side hash")
@@ -243,7 +243,7 @@ fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
         .unwrap();
         assert_eq!(claimed, end.min(8));
         assert_eq!(range.lock().unwrap().pos, claimed);
-        assert_eq!(data, b"abcdefgh");
+        assert_eq!(&*data, b"abcdefgh");
     }
 }
 

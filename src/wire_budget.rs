@@ -511,7 +511,7 @@ mod tests {
         let response = crate::proto::Response::Block {
             off: 0,
             hash: [0; 32],
-            data: vec![7; 8 << 20],
+            data: vec![7; 8 << 20].into(),
         };
         let bytes = postcard::to_stdvec(&response).unwrap();
         let decoded = decode_with_hold::<crate::proto::Response>(&bytes, hold(&shared)).unwrap();

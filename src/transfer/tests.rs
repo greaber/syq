@@ -503,7 +503,7 @@ fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
         src.lock().unwrap().replies.push_back(Response::Block {
             off: i * 512,
             hash: content_digest(&data),
-            data,
+            data: data.into(),
         });
     }
     let dst = Arc::new(Mutex::new(PipelineState::default()));
@@ -557,7 +557,7 @@ fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
                             i * 512
                         },
                         hash: content_digest(&data),
-                        data,
+                        data: data.into(),
                     });
                 }
                 let dst = Arc::new(Mutex::new(PipelineState::default()));
@@ -1309,7 +1309,7 @@ fn scattered_ranges_pipeline_and_recover_with_bounded_ownership() {
                                 off
                             },
                             hash: content_digest(&data),
-                            data,
+                            data: data.into(),
                         }
                     });
                 dst.lock().unwrap().replies.push_back(
@@ -1405,7 +1405,7 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
                     src.lock().unwrap().replies.push_back(Response::Block {
                         off: off + block * 512,
                         hash: content_digest(&data),
-                        data,
+                        data: data.into(),
                     });
                     dst.lock().unwrap().replies.push_back(Response::Ok);
                 }
@@ -1474,7 +1474,7 @@ fn long_extras_follow_range_selection_and_only_reserve_for_ready_peers() {
                 src.lock().unwrap().replies.push_back(Response::Block {
                     off,
                     hash: content_digest(&data),
-                    data,
+                    data: data.into(),
                 });
                 dst.lock().unwrap().replies.push_back(Response::Ok);
             }
@@ -1510,7 +1510,7 @@ fn released_pipeline_does_not_reclaim_work_when_reenabled_during_drain() {
         src.lock().unwrap().replies.push_back(Response::Block {
             off,
             hash: content_digest(&data),
-            data,
+            data: data.into(),
         });
         dst.lock().unwrap().replies.push_back(Response::Ok);
     }
@@ -2207,7 +2207,7 @@ fn comparing_pull_pipelines_remote_reads_with_a_synchronous_destination() {
                     src.lock().unwrap().replies.push_back(Response::Block {
                         off,
                         hash: content_digest(&data),
-                        data,
+                        data: data.into(),
                     });
                     dst.lock().unwrap().replies.push_back(Response::Ok);
                 }
@@ -2263,7 +2263,7 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
                 Response::Block {
                     off: 1024,
                     hash: content_digest(&data),
-                    data,
+                    data: data.into(),
                 },
                 Response::Stats(vec![Some(job.entry.clone())]),
             ]);

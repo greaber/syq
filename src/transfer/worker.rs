@@ -1722,7 +1722,7 @@ impl Worker {
                                 attempt: job.attempt,
                                 off,
                                 hash,
-                                data: data.into(),
+                                data,
                                 guard: job.container_guard.clone(),
                             })?;
                             writes.push_back((expected_len, false));
@@ -1992,7 +1992,7 @@ impl Worker {
                     attempt: job.attempt,
                     off,
                     hash,
-                    data: data.into(),
+                    data,
                     guard: job.container_guard.clone(),
                 })?;
                 pending_writes.push_back((slot, n));
@@ -2155,7 +2155,7 @@ impl Worker {
                     attempt: job.attempt,
                     off,
                     hash,
-                    data: data.into(),
+                    data,
                     guard: job.container_guard.clone(),
                 })?;
                 sent += 1;

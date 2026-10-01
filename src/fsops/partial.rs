@@ -1879,7 +1879,11 @@ impl FsOps {
                     [0; 32]
                 }
             };
-            Ok(Response::Block { off, hash, data })
+            Ok(Response::Block {
+                off,
+                hash,
+                data: data.into(),
+            })
         })();
         #[cfg(target_os = "linux")]
         {
@@ -2788,9 +2792,10 @@ impl FsOps {
                                     0,
                                     read.len,
                                 ) {
-                                    Ok(Response::Block { data, hash, .. }) => {
-                                        Ok(SmallBlock { data, hash })
-                                    }
+                                    Ok(Response::Block { data, hash, .. }) => Ok(SmallBlock {
+                                        data: data.into_vec(),
+                                        hash,
+                                    }),
                                     Ok(other) => Err(format!("unexpected response {other:?}")),
                                     Err(error) => Err(errstr(&error)),
                                 }

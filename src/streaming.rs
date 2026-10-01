@@ -80,7 +80,7 @@ pub(crate) fn claim_block(
     range: &crate::sched::RangeHandle,
     off: u64,
     hash: &mut crate::proto::ContentDigest,
-    data: &mut Vec<u8>,
+    data: &mut crate::proto::Payload,
 ) -> anyhow::Result<u64> {
     claim_block_with_digest(range, off, hash, data, crate::fsops::content_digest)
 }
@@ -89,7 +89,7 @@ pub(crate) fn claim_block_with_digest(
     range: &crate::sched::RangeHandle,
     off: u64,
     hash: &mut crate::proto::ContentDigest,
-    data: &mut Vec<u8>,
+    data: &mut crate::proto::Payload,
     mut digest: impl FnMut(&[u8]) -> crate::proto::ContentDigest,
 ) -> anyhow::Result<u64> {
     let mut assigned = range.lock().unwrap();
