@@ -79,8 +79,10 @@ struct PipelineState {
     dead: bool,
     max_pending: usize,
     latency: Option<std::time::Duration>,
+    configuration_latency: Option<std::time::Duration>,
     ready: std::collections::VecDeque<std::time::Instant>,
     abort_on_receive: Option<Arc<Sched>>,
+    abort_receive_number: Option<usize>,
     tuning_check: Option<(Arc<Sched>, Arc<Gate>, usize)>,
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
@@ -137,6 +139,14 @@ impl Conn for PipelineConn {
         let mut state = self.0.lock().unwrap();
         if let Some(size) = state.auto_small_size {
             let response = match &request {
+                Request::ConfigureHashing(_) => {
+                    assert_eq!(
+                        state.requests.len(),
+                        state.received,
+                        "latency check requires drained requests"
+                    );
+                    Response::Ok
+                }
                 Request::ReadSmallBatch(reads) => Response::SmallBlocks(
                     reads
                         .iter()
@@ -203,9 +213,14 @@ impl Conn for PipelineConn {
                 other => panic!("unexpected automatic range request {other:?}"),
             }
         }
+        let latency = if matches!(request, Request::ConfigureHashing(_)) {
+            state.configuration_latency
+        } else {
+            state.latency
+        };
         state.requests.push(request);
         state.sent_at.push(std::time::Instant::now());
-        if let Some(latency) = state.latency {
+        if let Some(latency) = latency {
             state.ready.push_back(std::time::Instant::now() + latency);
         }
         state.max_pending = state
@@ -272,8 +287,13 @@ impl Conn for PipelineConn {
         if let Some(ready) = state.ready.pop_front() {
             std::thread::sleep(ready.saturating_duration_since(std::time::Instant::now()));
         }
-        if let Some(sched) = state.abort_on_receive.take() {
-            sched.abort();
+        if state
+            .abort_receive_number
+            .is_none_or(|at| at == state.received)
+        {
+            if let Some(sched) = state.abort_on_receive.take() {
+                sched.abort();
+            }
         }
         Ok(state.replies.pop_front().expect("unexpected receive"))
     }
@@ -1354,12 +1374,18 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
 fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
     // Inject reply-start waits so scheduling delays cannot change which
     // side of the stall allowance a case exercises.
-    for (rtt_us, setup_ms, reply_wait_ms, expected) in [
-        (None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
-        (Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
-        (None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+    for (adaptive, refreshed_ms, rtt_us, setup_ms, reply_wait_ms, expected) in [
+        (false, 0, None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
+        (false, 0, Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (false, 0, None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         // Payload time does not contribute to the reported reply-start wait.
-        (None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (false, 0, None, 0, 0, [4, 5, 6, 7, 8, 8, 8, 8]),
+        // The default adaptive group budget allows 250 ms of service.
+        (true, 0, None, 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (true, 0, None, 0, 300, [4, 4, 4, 4, 5, 6, 7, 8]),
+        // A latency recheck also updates the source's stall allowance.
+        (true, 300, None, 0, 500, [4, 5, 6, 7, 8, 8, 8, 8]),
+        (true, 300, None, 0, 1300, [4, 4, 4, 4, 5, 6, 7, 8]),
     ] {
         let jobs: Vec<_> = (0..8)
             .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 512)))
@@ -1386,6 +1412,15 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
                 .push_back(Response::Applied(vec![None]));
         }
         let mut worker = pipeline_worker(&Arc::new(Sched::new(512, 8192)), &src, &dst, false);
+        if adaptive {
+            Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        }
+        if refreshed_ms > 0 {
+            worker.batch_budget.refreshed_latency(
+                std::time::Duration::from_millis(refreshed_ms),
+                std::time::Instant::now(),
+            );
+        }
         worker.gate.set_active(2);
         worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
         let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
@@ -3440,5 +3475,185 @@ fn explicit_batch_request_and_pipeline_settings_keep_fixed_grouping() {
         );
         assert!(source.replies.is_empty());
         assert!(dst.lock().unwrap().replies.is_empty());
+    }
+}
+
+#[test]
+fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
+    use std::time::{Duration, Instant};
+    for network_delay in [true, false] {
+        let size = 16 << 10;
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            latency: Some(Duration::from_millis(300)),
+            configuration_latency: network_delay.then_some(Duration::from_millis(300)),
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            synchronous: true,
+            immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
+            ..Default::default()
+        }));
+        let mut worker =
+            pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
+        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        worker.gate = Gate::new(8);
+        worker
+            .batch_budget
+            .refreshed_latency(Duration::ZERO, Instant::now() - Duration::from_secs(60));
+        let count = if network_delay { 128 } else { 24 };
+        let jobs: Vec<_> = (0..count)
+            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
+            .collect();
+        let mut next = 0;
+        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+        worker
+            .transfer_small_batches(
+                &jobs,
+                |limit| {
+                    if next == jobs.len() {
+                        return None;
+                    }
+                    let end = (next + limit.files.min((limit.bytes / size).max(1) as usize))
+                        .min(jobs.len());
+                    let group = next..end;
+                    next = end;
+                    Some(group)
+                },
+                &mut results,
+            )
+            .unwrap();
+        assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
+        let source = src.lock().unwrap();
+        let probe = source
+            .requests
+            .iter()
+            .position(|r| matches!(r, Request::ConfigureHashing(_)))
+            .expect("rechecked latency");
+        assert_eq!(
+            source
+                .requests
+                .iter()
+                .filter(|r| matches!(r, Request::ConfigureHashing(_)))
+                .count(),
+            1,
+            "checks do not repeat for every late group"
+        );
+        assert!(source.max_pending <= 4 && source.replies.is_empty());
+        let groups: Vec<_> = source.requests[probe + 1..]
+            .iter()
+            .filter_map(|r| match r {
+                Request::ReadSmallBatch(reads) => Some(reads.len()),
+                _ => None,
+            })
+            .collect();
+        if network_delay {
+            assert!(worker.batch_budget.latency_target() >= Duration::from_millis(1200));
+            assert!(
+                groups.iter().any(|&n| n > 4),
+                "groups must recover beyond the startup budget: {groups:?}"
+            );
+        } else {
+            assert_eq!(
+                worker.batch_budget.latency_target(),
+                Duration::from_millis(250)
+            );
+            assert!(
+                groups.iter().all(|&n| n <= 4),
+                "slow file work still leaves small groups: {groups:?}"
+            );
+        }
+        let destination = dst.lock().unwrap();
+        assert!(destination.replies.is_empty());
+        assert_eq!(
+            destination
+                .requests
+                .iter()
+                .filter(|r| matches!(r, Request::ConfigureHashing(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            worker.progress.bytes_done.load(Relaxed),
+            size * count as u64
+        );
+    }
+}
+
+#[test]
+fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
+    use std::time::{Duration, Instant};
+    for abort in [true, false] {
+        let size = 16 << 10;
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        let gate = Gate::new(2);
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            latency: Some(Duration::from_millis(300)),
+            abort_on_receive: abort.then(|| sched.clone()),
+            abort_receive_number: Some(5),
+            gate_changes: if abort {
+                Vec::new()
+            } else {
+                vec![(5, gate.clone(), 1)]
+            },
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_small_size: Some(size),
+            synchronous: true,
+            immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+        worker.id = 1;
+        worker.gate = gate;
+        worker
+            .batch_budget
+            .refreshed_latency(Duration::ZERO, Instant::now() - Duration::from_secs(60));
+        let jobs: Vec<_> = (0..64)
+            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
+            .collect();
+        let mut next = 0;
+        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+        worker
+            .transfer_small_batches(
+                &jobs,
+                |limit| {
+                    if next == jobs.len() {
+                        return None;
+                    }
+                    let end = (next + limit.files.min((limit.bytes / size).max(1) as usize))
+                        .min(jobs.len());
+                    let group = next..end;
+                    next = end;
+                    Some(group)
+                },
+                &mut results,
+            )
+            .unwrap();
+        let source = src.lock().unwrap();
+        assert_eq!(
+            source.requests.len(),
+            5,
+            "four data groups, then the latency check"
+        );
+        assert!(matches!(
+            source.requests.last(),
+            Some(Request::ConfigureHashing(_))
+        ));
+        assert!(source.replies.is_empty());
+        let destination = dst.lock().unwrap();
+        assert_eq!(
+            destination.requests.len(),
+            4,
+            "stop even before the other latency RPC"
+        );
+        assert!(destination.replies.is_empty());
+        assert_eq!(next, 16, "no further work admitted");
+        assert!(results[..16].iter().all(|r| matches!(r, Some(Ok(_)))));
+        assert!(results[16..].iter().all(Option::is_none));
     }
 }
