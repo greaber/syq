@@ -543,7 +543,7 @@ unsuccessful copy. Read attributes directly, for example
 |---|---|---|
 | `files_transferred` | `int` | Regular files transferred |
 | `files_unchanged` | `int` | Regular files skipped as unchanged |
-| `files_excluded` | `int` | Files excluded from copying |
+| `files_excluded` | `int` | Source entries excluded from copying, including ignore matches; an ignored directory counts once |
 | `directories_created` | `int` | Directories created |
 | `symlinks_created` | `int` | Symbolic links created |
 | `specials_created` | `int` | Special filesystem objects created |

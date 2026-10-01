@@ -272,8 +272,14 @@ impl Engine {
         if self.options.route == Route::Upload {
             let scanning = super::diagnostics::start();
             let args = self.args.clone();
-            let (plan, prune) =
-                tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
+            let local::UploadPlan {
+                sources: plan,
+                prune,
+                ignored,
+                excluded,
+            } = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
+            self.progress.paths_ignored.fetch_add(ignored, Relaxed);
+            self.progress.files_excluded.fetch_add(excluded, Relaxed);
             super::diagnostics::elapsed(scanning, "source_plan", plan.len() as u64);
             if let Some(results) = self.progress.results_writer() {
                 results.mapping_metadata(
@@ -1878,7 +1884,7 @@ impl Engine {
                         bail!("S3 source prefix {key:?} contains no objects");
                     }
                     self.progress
-                        .files_excluded
+                        .paths_ignored
                         .fetch_add(listed.excluded, Relaxed);
                     if same_bucket {
                         copy_sources.push((prefix.clone(), true));
@@ -1937,11 +1943,14 @@ impl Engine {
             for object in objects {
                 let (key, size, path, kind, directory, service_time, source_object) = object?;
                 if !directory
-                    && ((!from_listing
-                        && crate::scan::selected_file_is_ignored(matcher.as_ref(), key.as_bytes()))
-                        || size < min
-                        || size > max)
+                    && !from_listing
+                    && crate::scan::selected_file_is_ignored(matcher.as_ref(), key.as_bytes())
                 {
+                    self.progress.paths_ignored.fetch_add(1, Relaxed);
+                    prune.protect(path.as_bytes());
+                    continue;
+                }
+                if !directory && (size < min || size > max) {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     prune.protect(path.as_bytes());
                     continue;

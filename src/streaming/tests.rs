@@ -56,7 +56,7 @@ impl Conn for FinishingConn {
         _: &mut dyn FnMut(Vec<Entry>) -> anyhow::Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> anyhow::Result<()>,
         _: &mut dyn FnMut(String),
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         unreachable!()
     }
     fn native_remove(

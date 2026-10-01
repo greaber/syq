@@ -980,7 +980,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     w.write_msg(&Response::ScanWarn(m))?;
                 }
                 match res {
-                    Ok(()) => w.write_msg(&Response::ScanDone)?,
+                    Ok(count) => {
+                        if count > 0 {
+                            w.write_msg(&Response::ScanIgnoredCount(count))?;
+                        }
+                        w.write_msg(&Response::ScanDone)?;
+                    }
                     Err(e) => w.write_msg(&Response::Err(format!("{e:#}")))?,
                 }
             }

@@ -100,7 +100,8 @@ fn produce_scan(
     ignore: Option<Gitignore>,
     report_ignored: bool,
     tx: SyncSender<ScanChunk>,
-) {
+) -> u64 {
+    let mut ignored_count = 0;
     let mut chunk = Vec::with_capacity(FIRST_BATCH);
     let mut entries_sent = 1; // The root entry is already waiting in the consumer.
     let mut entries_in_chunk = 0;
@@ -140,7 +141,7 @@ fn produce_scan(
                 if chunk.len() >= FIRST_BATCH
                     && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
                 {
-                    return;
+                    return ignored_count;
                 }
                 continue;
             }
@@ -159,7 +160,7 @@ fn produce_scan(
             if chunk.len() >= FIRST_BATCH
                 && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
             {
-                return;
+                return ignored_count;
             }
             continue;
         }
@@ -171,8 +172,12 @@ fn produce_scan(
                 entries_in_chunk += 1;
                 ScanEvent::Entry(entry)
             }
-            State::Skipped => continue,
+            State::Skipped => {
+                ignored_count += 1;
+                continue;
+            }
             State::Ignored => {
+                ignored_count += 1;
                 let full = de.path();
                 ScanEvent::Ignored(path_bytes(full.strip_prefix(&root).unwrap_or(&full)))
             }
@@ -188,10 +193,11 @@ fn produce_scan(
         if (first_batch_ready || chunk.len() >= FIRST_BATCH)
             && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
         {
-            return;
+            return ignored_count;
         }
     }
     let _ = send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk);
+    ignored_count
 }
 
 fn inspect_descriptor_children(
@@ -262,6 +268,7 @@ fn hold_descriptor_directory_for_test(_relative: &[u8]) -> Result<()> {
 }
 
 struct DirectoryStep {
+    ignored: u64,
     events: ScanChunk,
     children: Vec<DescriptorDirectory>,
     remainder: Option<DescriptorDirectory>,
@@ -304,6 +311,7 @@ impl DescriptorScan<'_> {
         let mut events = Vec::with_capacity(batch.len());
         let mut children = Vec::new();
         let mut retained = 0;
+        let mut ignored = 0;
         for (name, (relative, result)) in batch.iter().zip(inspect_descriptor_children(
             self.root,
             &opened,
@@ -330,6 +338,7 @@ impl DescriptorScan<'_> {
                     )
                     .is_ignore()
             }) {
+                ignored += 1;
                 if self.report_ignored {
                     events.push(ScanEvent::Ignored(relative));
                 }
@@ -373,6 +382,7 @@ impl DescriptorScan<'_> {
             Some(directory)
         };
         Ok(DirectoryStep {
+            ignored,
             events,
             children,
             remainder,
@@ -388,7 +398,7 @@ fn produce_descriptor_scan(
     ignore: Option<Gitignore>,
     report_ignored: bool,
     tx: SyncSender<ScanChunk>,
-) {
+) -> u64 {
     const DIRECTORY_WORKERS: usize = 8;
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     let pool = POOL.get_or_init(|| {
@@ -405,6 +415,7 @@ fn produce_descriptor_scan(
         ignore: ignore.as_ref(),
         report_ignored,
     };
+    let mut ignored_count = 0;
     let mut chunk = Vec::with_capacity(FIRST_BATCH);
     let mut entries_sent = 1;
     let mut entries_in_chunk = 0;
@@ -435,6 +446,11 @@ fn produce_descriptor_scan(
                         })
                     })
                     .collect();
+                ignored_count += steps
+                    .iter()
+                    .filter_map(|step| step.as_ref().ok())
+                    .map(|step| step.ignored)
+                    .sum::<u64>();
                 let productive = steps.iter().any(|step| match step {
                     Ok(step) => {
                         !step.events.is_empty()
@@ -470,7 +486,7 @@ fn produce_descriptor_scan(
                 if chunk.len() >= FIRST_BATCH
                     && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
                 {
-                    return;
+                    return ignored_count;
                 }
             }
         }
@@ -487,6 +503,7 @@ fn produce_descriptor_scan(
         directories.extend(remainders);
     }
     let _ = send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk);
+    ignored_count
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -555,7 +572,7 @@ pub fn scan(
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(String),
-) -> Result<()> {
+) -> Result<u64> {
     let ignore = build_ignore(ignore)?;
     let md = if follow_root {
         fs::metadata(root)
@@ -569,7 +586,8 @@ pub fn scan(
         root_entry.link = None;
     }
     if !md.is_dir() {
-        return sink(vec![root_entry]);
+        sink(vec![root_entry])?;
+        return Ok(0);
     }
     // Preserve bounded first-byte progress on slow/NFS walks without splitting
     // a small, fast scan into several serialized WAN planning round trips. The
@@ -595,18 +613,16 @@ pub fn scan(
         warn,
     );
     drop(rx);
-    let producer_panicked = producer.join().is_err();
+    let produced = producer.join();
     received?;
-    if producer_panicked {
-        anyhow::bail!("scan producer panicked");
-    }
+    let ignored_count = produced.map_err(|_| anyhow::anyhow!("scan producer panicked"))?;
     if !batch.is_empty() {
         sink(batch)?;
     }
     if !ignored_batch.is_empty() {
         ignored(ignored_batch)?;
     }
-    Ok(())
+    Ok(ignored_count)
 }
 
 /// Walk a subtree beneath an already-adopted endpoint authority root. The
@@ -624,7 +640,7 @@ pub(crate) fn scan_descriptor(
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(String),
-) -> Result<()> {
+) -> Result<u64> {
     if follow_root {
         anyhow::bail!("a descriptor-rooted scan never follows a root symlink");
     }
@@ -644,7 +660,8 @@ pub(crate) fn scan_descriptor(
         require_source_leaf_identity(expected, root.metadata(&scan_relative)?)?;
     }
     if root_entry.kind != crate::proto::Kind::Dir {
-        return sink(vec![root_entry]);
+        sink(vec![root_entry])?;
+        return Ok(0);
     }
 
     let matcher = build_ignore(ignore)?;
@@ -683,18 +700,16 @@ pub(crate) fn scan_descriptor(
         warn,
     );
     drop(rx);
-    let producer_panicked = producer.join().is_err();
+    let produced = producer.join();
     received?;
-    if producer_panicked {
-        anyhow::bail!("descriptor scan producer panicked");
-    }
+    let ignored_count = produced.map_err(|_| anyhow::anyhow!("scan producer panicked"))?;
     if !batch.is_empty() {
         sink(batch)?;
     }
     if !ignored_batch.is_empty() {
         ignored(ignored_batch)?;
     }
-    Ok(())
+    Ok(ignored_count)
 }
 
 /// Walk disjoint selections together, returning paths relative to their common base.
@@ -762,7 +777,7 @@ pub fn scan_rooted(
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(String),
-) -> Result<()> {
+) -> Result<u64> {
     if follow_root {
         anyhow::bail!("a signed receiver never follows a destination root symlink");
     }
@@ -786,10 +801,12 @@ pub fn scan_rooted(
     let metadata = root.metadata(&target_relative)?;
     let root_entry = crate::fsops::rooted_entry(&root, &target_relative, Vec::new(), metadata)?;
     if root_entry.kind != crate::proto::Kind::Dir {
-        return sink(vec![root_entry]);
+        sink(vec![root_entry])?;
+        return Ok(0);
     }
 
     let matcher = build_ignore(ignore)?;
+    let mut ignored_count = 0;
     let mut batch = vec![root_entry];
     let mut ignored_batch = Vec::new();
     let mut directories: Vec<PathBytes> = vec![Vec::new()];
@@ -838,6 +855,7 @@ pub fn scan_rooted(
                     )
                     .is_ignore()
             }) {
+                ignored_count += 1;
                 if report_ignored {
                     ignored_batch.push(relative);
                     if ignored_batch.len() >= BATCH {
@@ -864,7 +882,7 @@ pub fn scan_rooted(
     if !ignored_batch.is_empty() {
         ignored(ignored_batch)?;
     }
-    Ok(())
+    Ok(ignored_count)
 }
 
 fn target_relative_path_bytes(target: &Path, root: &Path) -> Result<PathBytes> {
@@ -1027,6 +1045,83 @@ mod tests {
         );
         assert!(ignored.is_empty());
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn ignored_counts_include_pruned_directories_without_requesting_paths() {
+        let temp = crate::test_support::tempdir().unwrap();
+        // Many rounds with only excluded entries exercise the empty-round
+        // optimization, including when no ignored-path events are requested.
+        for index in 0..80 {
+            let directory = temp.path().join(format!("d{index:02}"));
+            fs::create_dir_all(directory.join("skip/hidden")).unwrap();
+            fs::write(directory.join("skip/hidden/file"), b"hidden").unwrap();
+            fs::write(directory.join("file.tmp"), b"excluded").unwrap();
+        }
+        let root = Arc::new(Root::open(temp.path()).unwrap());
+        let identity = root.identity();
+        let guard = ContainerGuard {
+            root: temp.path().as_os_str().as_bytes().to_vec(),
+            dev: identity.dev,
+            ino: identity.ino,
+        };
+        let rules = ["skip/".into(), "*.tmp".into()];
+        for report_ignored in [false, true] {
+            for route in ["pathname", "descriptor", "rooted"] {
+                let mut paths = Vec::new();
+                let mut ignored_paths = Vec::new();
+                let mut sink = |batch: Vec<Entry>| {
+                    paths.extend(batch.into_iter().map(|entry| entry.path));
+                    Ok(())
+                };
+                let mut ignored = |batch| {
+                    ignored_paths.extend(batch);
+                    Ok(())
+                };
+                let mut warn = |warning| panic!("{route}: {warning}");
+                let count = match route {
+                    "pathname" => scan(
+                        temp.path(),
+                        false,
+                        &rules,
+                        report_ignored,
+                        &mut sink,
+                        &mut ignored,
+                        &mut warn,
+                    ),
+                    "descriptor" => scan_descriptor(
+                        root.clone(),
+                        b"",
+                        None,
+                        false,
+                        false,
+                        &rules,
+                        report_ignored,
+                        &mut sink,
+                        &mut ignored,
+                        &mut warn,
+                    ),
+                    _ => scan_rooted(
+                        &guard.root,
+                        false,
+                        &rules,
+                        report_ignored,
+                        &guard,
+                        &mut sink,
+                        &mut ignored,
+                        &mut warn,
+                    ),
+                }
+                .unwrap();
+                assert_eq!(count, 160, "{route}, paths={report_ignored}");
+                assert_eq!(paths.len(), 81, "{route}");
+                assert_eq!(
+                    ignored_paths.len(),
+                    if report_ignored { 160 } else { 0 },
+                    "{route}"
+                );
+            }
+        }
     }
 
     #[test]

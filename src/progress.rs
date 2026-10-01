@@ -37,11 +37,11 @@ pub struct Progress {
     tuning_files_high_water: AtomicU64,
     pub files_unchanged: AtomicU64,
     /// Source files deliberately not transferred (-u, size limits, --existing,
-    /// symlinks without -l, ...); neither "transferred" nor "unchanged".
+    /// symlinks without -l, ...), excluding ignore rules; neither "transferred"
+    /// nor "unchanged".
     pub files_excluded: AtomicU64,
-    /// Source paths matched by ignore rules during a dry run. An ignored
-    /// directory is one path here even though its unscanned subtree may
-    /// contain many entries.
+    /// Source paths matched by ignore rules. An ignored directory is one path
+    /// here even though its unscanned subtree may contain many entries.
     pub paths_ignored: AtomicU64,
     pub scanned: AtomicU64,
     pub scan_done: AtomicBool,
@@ -117,6 +117,11 @@ impl Drop for ProgressTicker {
 }
 
 impl Progress {
+    /// Public total; keep the components separate for the dry-run explanation.
+    pub fn excluded(&self) -> u64 {
+        self.files_excluded.load(Relaxed) + self.paths_ignored.load(Relaxed)
+    }
+
     pub fn new(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
         Arc::new(Progress {
             tuning_destination_devices: Default::default(),
@@ -322,7 +327,7 @@ impl Progress {
                     files_done: fdone,
                     files_total: ftotal,
                     files_unchanged: self.files_unchanged.load(Relaxed),
-                    files_excluded: self.files_excluded.load(Relaxed),
+                    files_excluded: self.excluded(),
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
                     elapsed_ms: self.start.elapsed().as_millis() as u64,
