@@ -62,7 +62,15 @@ impl WorkBudget {
             if amount == 0 {
                 return current;
             }
-            let estimate = (u128::from(amount).saturating_mul(target) / elapsed)
+            // A short tail can be late because larger groups preceded it.
+            // Reduce the current budget in proportion to that delay instead
+            // of treating the tail's size as the connection's full capacity.
+            let measured = if elapsed > target {
+                amount.max(current)
+            } else {
+                amount
+            };
+            let estimate = (u128::from(measured).saturating_mul(target) / elapsed)
                 .clamp(1, u128::from(current.saturating_mul(4))) as u64;
             // Groups can be smaller than the budget at a boundary or because
             // they were issued before it grew. An on-time remainder does not
@@ -163,6 +171,45 @@ mod tests {
             budget.limit().bytes > reduced.bytes,
             "growth resumes with fast service"
         );
+    }
+
+    #[test]
+    fn slightly_late_remainders_reduce_current_capacity_proportionally() {
+        for remainder in [
+            WorkSize {
+                bytes: 16 << 10,
+                files: 1,
+            },
+            WorkSize { bytes: 0, files: 1 },
+        ] {
+            let mut budget = WorkBudget::default();
+            for _ in 0..4 {
+                budget.observe(budget.limit(), Duration::from_millis(50));
+            }
+            let before = budget.limit();
+            // This tail waited behind earlier groups. Being five percent late
+            // is not evidence that only one file fits in the target interval.
+            budget.observe(remainder, Duration::from_micros(262_500));
+            let reduced = budget.limit();
+            assert_eq!(reduced.files, before.files * 20 / 21);
+            assert_eq!(
+                reduced.bytes,
+                if remainder.bytes == 0 {
+                    before.bytes
+                } else {
+                    before.bytes * 20 / 21
+                }
+            );
+            budget.observe(reduced, Duration::from_millis(50));
+            assert_eq!(
+                budget.limit(),
+                before,
+                "timely full groups restore capacity"
+            );
+            budget.observe(before, Duration::from_secs(4));
+            assert_eq!(budget.limit().files, before.files / 16);
+            assert_eq!(budget.limit().bytes, before.bytes / 16);
+        }
     }
 
     #[test]
