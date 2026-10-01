@@ -3,15 +3,15 @@ use super::*;
 #[test]
 fn home_is_shortened_only_as_a_path_prefix() {
     let home = Some(OsStr::new("/home/me"));
-    assert_eq!(abbreviate_home(b"/home/me", home), "~");
-    assert_eq!(abbreviate_home(b"/home/me/rt-bench", home), "~/rt-bench");
-    assert_eq!(abbreviate_home(b"/home/meow/x", home), "/home/meow/x");
-    assert_eq!(abbreviate_home(b"/tmp/x", home), "/tmp/x");
-    assert_eq!(abbreviate_home(b"/home/me/a b", home), "\"~/a b\"");
-    assert_eq!(abbreviate_home(b"/home/me/x", None), "/home/me/x");
+    assert_eq!(abbreviate_home(b"/home/me", home), b"~");
+    assert_eq!(abbreviate_home(b"/home/me/rt-bench", home), b"~/rt-bench");
+    assert_eq!(abbreviate_home(b"/home/meow/x", home), b"/home/meow/x");
+    assert_eq!(abbreviate_home(b"/tmp/x", home), b"/tmp/x");
+    assert_eq!(abbreviate_home(b"/home/me/a b", home), b"~/a b");
+    assert_eq!(abbreviate_home(b"/home/me/x", None), b"/home/me/x");
     assert_eq!(
         abbreviate_home(b"/home/me/x", Some(OsStr::new(""))),
-        "/home/me/x"
+        b"/home/me/x"
     );
 }
 

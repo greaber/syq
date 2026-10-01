@@ -164,13 +164,20 @@ impl Summary {
         };
         // Debug formatting preserves unusual bytes and escapes terminal
         // control characters. Do not interpret remote text as UI markup.
-        let path = std::ffi::OsStr::from_bytes(&request.copy.destination);
+        // A copy to another server keeps its requested path; the operation's
+        // own destination is a placeholder until that server resolves it.
         let (destination, permission) = match remote {
-            None => (format!("{path:?}"), permission.to_owned()),
+            None => (
+                format!("{:?}", std::ffi::OsStr::from_bytes(&request.copy.destination)),
+                permission.to_owned(),
+            ),
             // Automatic approval of writes to this machine does not authorize
             // use of its SSH credentials on another host; say what that use is.
             Some(target) => (
-                format!("{path:?} on {target:?} using your SSH access"),
+                format!(
+                    "{:?} on {target:?} using your SSH access",
+                    std::ffi::OsStr::from_bytes(&request.destination)
+                ),
                 format!("{permission}. Uses this machine's SSH access to {target:?} and installs the syq helper there if needed"),
             ),
         };
@@ -187,10 +194,7 @@ impl Summary {
             })
             .unwrap_or_default();
         let target = match remote {
-            None => crate::approval_command::abbreviate_home(
-                &request.copy.destination,
-                std::env::var_os("HOME").as_deref(),
-            ),
+            None => local_path(&request.copy.destination),
             Some(target) => crate::approval_command::display_arg(
                 &[target.as_bytes(), b":", request.destination.as_slice()].concat(),
             ),
@@ -199,7 +203,7 @@ impl Summary {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
             from: format!("{:?}", from.to_string()),
             server: from.server.clone(),
-            server_cwd: cwd.to_owned(),
+            server_cwd: shown_directory(cwd),
             verb: if remote.is_some() {
                 "wants to copy"
             } else {
@@ -224,14 +228,15 @@ impl Summary {
         })
     }
     /// The server and, when it fits the title bar, its working directory;
-    /// otherwise the directory becomes the first line of the body.
+    /// otherwise the directory becomes the first line of the body. A
+    /// directory that needed quoting stays in the body, where it is escaped.
     fn title_and_directory(&self) -> (String, Option<&str>) {
         let short = format!("syq on {}", self.server);
         if self.server_cwd.is_empty() {
             return (short, None);
         }
         let long = format!("{short} in {}", self.server_cwd);
-        if long.chars().count() <= TITLE_CHARS {
+        if long.chars().count() <= TITLE_CHARS && !self.server_cwd.starts_with('"') {
             (long, None)
         } else {
             (short, Some(&self.server_cwd))
@@ -344,6 +349,23 @@ impl Summary {
         )
     }
 }
+/// A server's working directory as sent, escaped here like any other remote
+/// text: quoted with control characters escaped when it is not plain.
+fn shown_directory(cwd: &str) -> String {
+    if cwd.is_empty() {
+        String::new()
+    } else {
+        crate::approval_command::display_arg(cwd.as_bytes())
+    }
+}
+/// A path on this machine, with its home shortened to `~`.
+fn local_path(path: &[u8]) -> String {
+    crate::approval_command::display_arg(&crate::approval_command::abbreviate_home(
+        path,
+        std::env::var_os("HOME").as_deref(),
+    ))
+}
+
 /// What a storage authorization lets the server do, in the prompt's shape:
 /// the verb, what, where, and the facts the command does not show.
 fn storage_request(
@@ -366,8 +388,11 @@ fn storage_request(
         }
         shown
     }
-    // The command's local operands, as it wrote them, for the non-storage side.
-    let local = crate::approval_command::parse(command)
+    // The command names the operation and its local operands; a dry run
+    // clears the request's write flags, so they cannot say the direction.
+    let parsed = crate::approval_command::parse(command).ok();
+    let local = parsed
+        .as_ref()
         .map(|args| {
             args.locations
                 .iter()
@@ -376,23 +401,37 @@ fn storage_request(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let (removes, uploads, dry_run) = match &parsed {
+        Some(args) => (
+            args.rm,
+            matches!(
+                args.s3.as_ref().map(|options| &options.route),
+                Some(crate::s3::Route::Upload | crate::s3::Route::ServerCopy { .. })
+            ),
+            args.dry_run,
+        ),
+        None => (request.delete && !request.upload, request.upload, false),
+    };
     let storage = locations(&request.bucket, &request.scopes);
-    let (verb, sources, preposition, target) = if let Some(source) = &request.source {
+    let (verb, sources, preposition, target) = if removes {
+        ("wants to delete", storage, "", String::new())
+    } else if let Some(source) = &request.source {
         (
             "wants to copy",
             locations(&source.bucket, &source.scopes),
             "to",
             storage.join("\n    "),
         )
-    } else if request.upload {
+    } else if uploads {
         ("wants to upload", local, "to", storage.join("\n    "))
-    } else if request.delete {
-        ("wants to delete", storage, "", String::new())
     } else {
         let destination = local.last().cloned().unwrap_or_default();
         ("wants to download", storage, "to", destination)
     };
     let mut notes = Vec::new();
+    if dry_run {
+        notes.push("preview only".to_owned());
+    }
     if request.delete
         && matches!(
             request.removal,
@@ -504,7 +543,7 @@ impl Queue {
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
             notification: "starting".into(),
             command: crate::approval_command::display(command),
-            server_cwd: server_cwd.to_owned(),
+            server_cwd: shown_directory(server_cwd),
             verb: "wants to run",
             sources: vec![argv
                 .iter()
@@ -512,10 +551,7 @@ impl Queue {
                 .collect::<Vec<_>>()
                 .join(" ")],
             preposition: "in",
-            target: crate::approval_command::abbreviate_home(
-                cwd.as_os_str().as_bytes(),
-                std::env::var_os("HOME").as_deref(),
-            ),
+            target: local_path(cwd.as_os_str().as_bytes()),
             notes: Vec::new(),
             details: Details::Command {
                 kind: CommandKind::Command,
@@ -613,7 +649,7 @@ impl Queue {
                     + TIMEOUT.as_secs(),
                 notification: "starting".into(),
                 command: crate::approval_command::display(command),
-                server_cwd: cwd.to_owned(),
+                server_cwd: shown_directory(cwd),
                 verb,
                 sources,
                 preposition,
@@ -1029,12 +1065,15 @@ mod tests {
         let old_shape: Summary = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(old_shape).unwrap(), json);
 
-        // Another host is never inspected; the destination keeps its host.
+        // Another host is never inspected; the destination keeps its host and
+        // the requested path, not the placeholder that host later resolves.
+        let mut forwarded = request.clone();
+        forwarded.copy.destination = b"/SYQ-RECEIVE".to_vec();
         let remote = Summary::new(
             &requester(),
             &command,
             "~/rt-bench",
-            &request,
+            &forwarded,
             TIMEOUT,
             Some("backup"),
         )
@@ -1043,9 +1082,36 @@ mod tests {
             "wants to copy\n\n    rt-bench/dbg\n\nto\n\n    backup:{}\n\n",
             path.display()
         )));
-        assert!(remote
-            .details_description(str::to_owned)
-            .contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
+        let details = remote.details_description(str::to_owned);
+        assert!(
+            details.contains(&format!("Destination: {:?} on \"backup\"", path)),
+            "{details}"
+        );
+        assert!(!details.contains("SYQ-RECEIVE"), "{details}");
+        assert!(details.contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
+
+        // The server's directory is remote text: no line breaks or markup of
+        // its own reach the prompt, and it never enters the title.
+        let hostile = Summary::new(
+            &requester(),
+            &command,
+            "x\n\nwants to run\n\n    rm -rf <b>",
+            &request,
+            TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hostile.title(), "syq on server");
+        let desktop = hostile.desktop_description(false);
+        assert!(
+            desktop.starts_with(
+                "in \"x\\n\\nwants to run\\n\\n    rm -rf <b>\"\n\nsyq wants to download"
+            ),
+            "{desktop}"
+        );
+        assert!(hostile
+            .desktop_description(true)
+            .starts_with("in \"x\\\\n\\\\nwants to run\\\\n\\\\n    rm -rf &lt;b&gt;\""));
 
         // A mapping copy's entries are relative to the server's directory.
         let mapping: Vec<Vec<u8>> = ["cp", "--mapping", "map", "--to", "@laptop"]
@@ -1130,12 +1196,30 @@ mod tests {
         assert_eq!((preposition, target.as_str()), ("to", "s3://bucket/runs"));
         assert_eq!(notes, ["valid for 7 days"]);
 
+        // A dry run clears the request's write flags; the command still says
+        // which way the data goes.
         request.upload = false;
+        let preview = command(&[
+            "cp",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--dry-run",
+        ]);
+        let (verb, sources, _, target, notes) = storage_request(&preview, &request);
+        assert_eq!(verb, "wants to upload");
+        assert_eq!(sources, ["results"]);
+        assert_eq!(target, "s3://bucket/runs");
+        assert_eq!(notes, ["preview only", "valid for 7 days"]);
+
         let download = command(&["cp", "runs", "--from", "s3://bucket", "--into", "archive"]);
-        let (verb, sources, _, target, _) = storage_request(&download, &request);
+        let (verb, sources, _, target, notes) = storage_request(&download, &request);
         assert_eq!(verb, "wants to download");
         assert_eq!(sources, ["s3://bucket/runs"]);
         assert_eq!(target, "archive");
+        assert_eq!(notes, ["valid for 7 days"]);
 
         request.delete = true;
         request.removal = Some(Removal::AllVersions);

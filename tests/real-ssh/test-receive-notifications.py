@@ -114,7 +114,7 @@ def tests():
                 assert app == "syq" and summary.startswith("syq on "), summary
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
-                assert "May create" not in body and "From" not in body, body
+                assert "May create" not in body and "\nFrom: " not in body, body
                 # What is copied where, then the server's command; the server's
                 # directory comes first only when it does not fit the title.
                 assert 'wants to download\n\n    /tmp/syq-real-ssh/return-source/message.txt\n\nto\n\n    "/tmp/syq-real-ssh-receive/desktop-' in body, body
