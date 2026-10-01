@@ -63,12 +63,12 @@ def check(current, helper, *, legacy=False):
                 started = time.monotonic()
                 result = subprocess.run([
                     current, "cp", "source", "--to", "backup", "--results=result.ndjson",
-                    "--ignore-from", "/dev/stdin",
+                    "--follow", "--ignore-from", "/dev/stdin",
                 ], cwd=root, env=env, input="*.tmp\n", capture_output=True, text=True, timeout=12)
                 wall_ms = (time.monotonic() - started) * 1000
             finally:
                 thread.join(11)
-            assert not thread.is_alive() and not errors, (messages, errors)
+            assert not thread.is_alive() and not errors, (messages, errors, result)
         assert result.returncode == 1 and "denied by timing fixture" in result.stderr, result
         records = [json.loads(line) for line in (root / "result.ndjson").read_text().splitlines()]
         terminal = records[-1]
