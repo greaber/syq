@@ -212,7 +212,7 @@ mod tests {
                 if cloned {
                     let actual = output.metadata().unwrap().len();
                     assert!(actual >= wanted as u64 && actual <= length as u64);
-                    assert!(actual - wanted as u64 < input.metadata().unwrap().blksize());
+                    assert!(actual - (wanted as u64) < input.metadata().unwrap().blksize());
                 } else {
                     seed(&input, &output, wanted as u64, || Ok(())).unwrap();
                 }
