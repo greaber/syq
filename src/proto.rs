@@ -344,6 +344,8 @@ pub struct SmallPut {
 /// Contents and integrity hash for one successful `SmallRead`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallBlock {
+    /// Source metadata rechecked after reading, before returning the payload.
+    pub source: Option<Entry>,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub hash: ContentDigest,
@@ -898,6 +900,9 @@ pub enum WireRequest<Data> {
         source: RegisteredPath,
         dst: PathBytes,
         inplace: bool,
+        /// A source-change retry with block reuse disabled may replace its
+        /// completed partial instead of falling back to streamed resumption.
+        replace_partial: bool,
         allow_sequential_nfs_fallback: bool,
         /// The planner has multiple files, so whole-file writers can run in
         /// parallel. A single local file retains adaptive range copying.
@@ -1611,7 +1616,11 @@ impl SizeHint for Response {
                 blocks
                     .iter()
                     .map(|block| match block {
-                        Ok(block) => block.data.len() + 40,
+                        Ok(block) => {
+                            block.data.len()
+                                + block.source.as_ref().map_or(1, Entry::size_hint)
+                                + 40
+                        }
                         Err(error) => error.len() + 8,
                     })
                     .sum::<usize>()

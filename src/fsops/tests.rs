@@ -539,6 +539,7 @@ fn macos_receiver_refuses_inplace_copy_without_touching_files() {
     worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
     for name in [b"existing".as_slice(), b"missing"] {
         let response = worker.handle(&Request::CopyLocal {
+            replace_partial: false,
             source: sources[0].clone(),
             dst: name.to_vec(),
             inplace: true,
@@ -574,6 +575,7 @@ fn direct_copy_rejects_eof_before_the_planned_size() {
         &sources[0],
         b"file",
         CopyLocalPolicy {
+            replace_partial: false,
             inplace: false,
             allow_sequential_nfs_fallback: false,
             allow_sequential_local_fallback: true,
@@ -4864,15 +4866,17 @@ fn destination_worker_rejects_source_only_content_requests() {
     assert!(
         matches!(response, Response::EndpointError(error) if error.message.contains("destination worker"))
     );
-    let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
-        path: b"marker".to_vec(),
-        source: None,
-        attempt: 0,
-        len: 6,
-    }]));
-    assert!(
-        matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("destination worker")))
-    );
+    for len in [0, 6] {
+        let response = worker.handle(&Request::ReadSmallBatch(vec![SmallRead {
+            path: b"marker".to_vec(),
+            source: None,
+            attempt: 0,
+            len,
+        }]));
+        assert!(
+            matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("destination worker")))
+        );
+    }
 }
 
 #[test]

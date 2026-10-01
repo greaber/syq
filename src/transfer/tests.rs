@@ -611,6 +611,48 @@ fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
 }
 
 #[test]
+fn changed_source_exhausts_retries_without_publishing() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut job = pipeline_job(b"source", 4096);
+    let mut destination = job.entry.clone();
+    destination.mtime -= 1;
+    job.dst_entry = Some(destination.clone());
+    sched.push_file(job);
+    sched.scan_done();
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    for attempt in 0..MAX_ATTEMPTS {
+        assert!(matches!(sched.next(), Item::File(0)));
+        let job = worker.job(0);
+        assert_eq!(job.attempt, attempt);
+        job.done.store(job.entry.size, Relaxed);
+        sched.ranges_ready(0, vec![]);
+        let mut changed = job.entry.clone();
+        changed.mtime += 1;
+        src.lock()
+            .unwrap()
+            .replies
+            .push_back(Response::Stats(vec![Some(changed)]));
+        let result = worker.finish_file(0);
+        if attempt + 1 == MAX_ATTEMPTS {
+            assert!(result.unwrap_err().to_string().contains("source changed"));
+        } else {
+            result.unwrap();
+            assert!(
+                !worker.fast_eligible(0),
+                "a smaller retry must keep staged publication"
+            );
+        }
+        let current = worker.job(0);
+        assert_eq!(current.dst_entry.as_ref().unwrap().mtime, destination.mtime);
+        assert!(dst.lock().unwrap().requests.is_empty());
+    }
+    assert_eq!(src.lock().unwrap().requests.len(), MAX_ATTEMPTS as usize);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+}
+
+#[test]
 fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
     let (sched, range, _) = pipeline_ranges(&[(0, 4096)]);
     let src = Arc::new(Mutex::new(PipelineState {
@@ -772,6 +814,7 @@ fn whole_file_groups_overlap_and_drain_both_endpoint_windows() {
                         Err("injected file read error".into())
                     } else {
                         Ok(SmallBlock {
+                            source: Some(pipeline_job(b"source", data.len() as u64).entry.clone()),
                             hash: content_digest(&data),
                             data,
                         })
@@ -871,7 +914,7 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
     for failure in [
         "none",
         "destination-drop",
-        "stat-drop",
+        "source-drop",
         "changed",
         "changed-retry",
     ] {
@@ -895,40 +938,38 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
         batch.extend(sched.take_small(1 << 20, 5, u64::MAX));
         sched.mark_fast(5);
         let src = Arc::new(Mutex::new(PipelineState {
-            fail_receive: (failure == "stat-drop").then_some(7),
+            fail_receive: (failure == "source-drop").then_some(6),
             ..Default::default()
         }));
         let dst = Arc::new(Mutex::new(PipelineState {
             fail_receive: (failure == "destination-drop").then_some(6),
             ..Default::default()
         }));
-        for _ in 0..6 {
+        for i in 0..6 {
             let data = vec![0; 1 << 20];
+            let mut source = jobs[batch[i]].entry.clone();
+            let changed = i == 0 && failure.starts_with("changed");
+            if changed {
+                source.mtime += 1;
+            }
             src.lock()
                 .unwrap()
                 .replies
                 .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                    source: Some(source),
                     hash: content_digest(&data),
                     data,
                 })]));
-            dst.lock()
-                .unwrap()
-                .replies
-                .push_back(Response::Applied(vec![None]));
+            if !changed {
+                dst.lock()
+                    .unwrap()
+                    .replies
+                    .push_back(Response::Applied(vec![None]));
+            }
         }
-        let mut entries: Vec<_> = batch
-            .iter()
-            .map(|&idx| Some(jobs[idx].entry.clone()))
-            .collect();
-        if failure.starts_with("changed") {
-            entries[0].as_mut().unwrap().mtime += 1;
-        }
-        src.lock()
-            .unwrap()
-            .replies
-            .push_back(Response::Stats(entries));
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         // Other workers' progress must survive rollback of this batch.
+        worker.progress.bytes_total.store(6 << 20, Relaxed);
         worker.progress.add_bytes(123);
         worker.progress.add_files(7);
         src.lock().unwrap().progress = Some(worker.progress.clone());
@@ -953,7 +994,7 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
             7 + expected_files,
             "{failure}"
         );
-        let acknowledged = if failure == "destination-drop" { 5 } else { 6 };
+        let acknowledged = if failure == "none" { 6 } else { 5 };
         assert_eq!(
             crate::tune::Meter::files(&*worker.progress),
             7 + acknowledged
@@ -974,16 +1015,28 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
             crate::tune::Meter::files(&*worker.progress),
             8 + acknowledged
         );
+        let writes = dst
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::PutSmallBatch(puts) => Some(puts.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(
+            writes,
+            if failure.starts_with("changed") || failure == "source-drop" {
+                5
+            } else {
+                6
+            }
+        );
         let snapshots = &dst.lock().unwrap().progress_at_receive;
         for (i, &(bytes, files)) in snapshots.iter().enumerate() {
             assert_eq!(bytes, 123 + ((i as u64) << 20), "{failure}: ack {i}");
-            assert_eq!(files, 7, "no file completes before the source recheck");
-        }
-        if !dropped {
-            assert_eq!(
-                src.lock().unwrap().progress_at_receive.last(),
-                Some(&(123 + (6 << 20), 7))
-            );
+            assert_eq!(files, 7, "completion waits for the batch to drain");
         }
         assert_eq!(
             jobs[0].done.load(Relaxed),
@@ -992,6 +1045,8 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
         assert_eq!(sched.is_failed(0), failure == "changed");
         if failure == "changed-retry" {
             assert_eq!(sched.jobs.lock().unwrap()[0].attempt, 1);
+            assert_eq!(worker.progress.bytes_total.load(Relaxed), 6 << 20);
+            assert!(sched.jobs.lock().unwrap().destination(0).is_none());
         }
     }
 }
@@ -1082,6 +1137,7 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
             .unwrap()
             .replies
             .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                source: Some(pipeline_job(b"source", data.len() as u64).entry.clone()),
                 hash: content_digest(&data),
                 data,
             })]));
@@ -1098,12 +1154,7 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
             io_kind: Some(crate::proto::WireIoKind::PermissionDenied),
             raw_os_error: None,
         }));
-    src.lock().unwrap().replies.push_back(Response::Stats(
-        original[..4]
-            .iter()
-            .map(|&idx| Some(jobs[idx].entry.clone()))
-            .collect(),
-    ));
+
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
     worker.fast_batch(&mut batch).unwrap();
     assert_eq!(batch, original);
@@ -1116,16 +1167,12 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     }
     assert!(sched.is_failed(original[4]));
     let source = src.lock().unwrap();
-    let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
-        panic!("source recheck");
-    };
     assert_eq!(
-        paths,
-        &original[..4]
-            .iter()
-            .map(|&idx| jobs[idx].src.clone())
-            .collect::<Vec<_>>()
+        source.requests.len(),
+        5,
+        "rechecks travel with whole-file reads"
     );
+    assert!(source.replies.is_empty());
     drop(source);
     let destination = dst.lock().unwrap();
     assert_eq!(
@@ -1183,6 +1230,7 @@ fn same_machine_batches_reach_the_receiver_in_groups_idle_workers_can_take() {
                     .map(|_| {
                         let data = vec![0; 512];
                         Ok(SmallBlock {
+                            source: Some(pipeline_job(b"source", data.len() as u64).entry.clone()),
                             hash: content_digest(&data),
                             data,
                         })
@@ -1194,9 +1242,7 @@ fn same_machine_batches_reach_the_receiver_in_groups_idle_workers_can_take() {
                 .replies
                 .push_back(Response::Applied(vec![None; files]));
         }
-        src.lock().unwrap().replies.push_back(Response::Stats(
-            jobs.iter().map(|job| Some(job.entry.clone())).collect(),
-        ));
+
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         Arc::get_mut(&mut worker.opts).unwrap().same_host = same_host;
         worker.fast_batch(&mut batch).unwrap();
@@ -1252,6 +1298,7 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
                     .map(|_| {
                         let data = vec![0; 256 << 10];
                         Ok(SmallBlock {
+                            source: Some(pipeline_job(b"source", data.len() as u64).entry.clone()),
                             hash: content_digest(&data),
                             data,
                         })
@@ -1263,12 +1310,7 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
                 .replies
                 .push_back(Response::Applied(vec![None; 4]));
         }
-        src.lock().unwrap().replies.push_back(Response::Stats(
-            owned
-                .iter()
-                .map(|&idx| Some(jobs[idx].entry.clone()))
-                .collect(),
-        ));
+
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         let result = worker.fast_batch(&mut batch);
         assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
@@ -1284,16 +1326,24 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
         );
         if failure == "none" {
             let source = src.lock().unwrap();
-            let Some(Request::StatMany { paths, .. }) = source.requests.last() else {
-                panic!("source recheck")
-            };
+            let paths: Vec<_> = source
+                .requests
+                .iter()
+                .flat_map(|request| match request {
+                    Request::ReadSmallBatch(reads) => {
+                        reads.iter().map(|read| read.path.clone()).collect()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect();
             assert_eq!(
                 paths,
-                &owned
+                owned
                     .iter()
                     .map(|&idx| jobs[idx].src.clone())
                     .collect::<Vec<_>>()
             );
+            assert!(source.replies.is_empty());
         }
         sched.complete_fast_batch(batch.len());
         if result.is_err() {
@@ -1345,6 +1395,7 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
                 .unwrap()
                 .replies
                 .push_back(Response::SmallBlocks(vec![Ok(SmallBlock {
+                    source: Some(pipeline_job(b"source", data.len() as u64).entry.clone()),
                     hash: content_digest(&data),
                     data,
                 })]));
@@ -1373,7 +1424,7 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
 }
 
 #[test]
-fn empty_file_groups_need_no_source_reads() {
+fn empty_file_groups_only_request_metadata() {
     let jobs = [pipeline_job(b"empty1", 0), pipeline_job(b"empty2", 0)].map(pipeline_snapshot);
     let src = Arc::new(Mutex::new(PipelineState::default()));
     let dst = Arc::new(Mutex::new(PipelineState::default()));
@@ -1387,6 +1438,17 @@ fn empty_file_groups_need_no_source_reads() {
         .unwrap()
         .hash_policy
         .algorithm = algorithm;
+    src.lock().unwrap().replies.push_back(Response::SmallBlocks(
+        jobs.iter()
+            .map(|job| {
+                Ok(SmallBlock {
+                    source: Some(job.entry.clone()),
+                    data: Vec::new(),
+                    hash: algorithm.hash(&[]),
+                })
+            })
+            .collect(),
+    ));
     let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
     worker
         .transfer_small_batches(
@@ -1399,7 +1461,11 @@ fn empty_file_groups_need_no_source_reads() {
         )
         .unwrap();
     assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
-    assert!(src.lock().unwrap().requests.is_empty());
+    let source = src.lock().unwrap();
+    assert!(
+        matches!(source.requests.as_slice(), [Request::ReadSmallBatch(reads)] if reads.iter().all(|read| read.len == 0))
+    );
+    assert!(source.replies.is_empty());
     let destination = dst.lock().unwrap();
     let [Request::PutSmallBatch(puts)] = destination.requests.as_slice() else {
         panic!("expected one whole-file write batch")
@@ -2102,6 +2168,7 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
                         .map(|read| {
                             let data = vec![7; read.len as usize];
                             Ok(SmallBlock {
+                                source: self.entries.get(&read.path).cloned(),
                                 hash: content_digest(&data),
                                 data,
                             })
@@ -2215,13 +2282,9 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
             .count()
             > 1
     );
-    assert!(
-        requests
-            .iter()
-            .filter(|request| matches!(request, Request::StatMany { .. }))
-            .count()
-            > 1
-    );
+    assert!(requests
+        .iter()
+        .all(|request| matches!(request, Request::ReadSmallBatch(_))));
 }
 
 #[test]
@@ -2572,6 +2635,7 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
                     .map(|_| {
                         let data = vec![42; 32 << 10];
                         Ok(SmallBlock {
+                            source: Some(pipeline_job(b"source", data.len() as u64).entry.clone()),
                             hash: content_digest(&data),
                             data,
                         })
@@ -2583,14 +2647,7 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
                 .replies
                 .push_back(Response::Applied(vec![None; 32]));
         }
-        if issued_files > 0 {
-            src.lock().unwrap().replies.push_back(Response::Stats(
-                original[..issued_files]
-                    .iter()
-                    .map(|&i| Some(jobs[i].entry.clone()))
-                    .collect(),
-            ));
-        }
+
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
         worker.id = 1;
         worker.gate = gate.clone();
@@ -2620,8 +2677,8 @@ fn retiring_small_batch_stops_issuing_and_excludes_its_draining_traffic() {
         assert_eq!(pending.len(), original.len() - issued_files);
         assert_eq!(
             source.requests.len(),
-            issued_groups + usize::from(issued_files > 0),
-            "only issued reads and the final source recheck"
+            issued_groups,
+            "rechecks travel with issued reads"
         );
         assert_eq!(
             source.received,
@@ -2810,7 +2867,7 @@ fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
                 ..Default::default()
             }));
             let dst = Arc::new(Mutex::new(PipelineState {
-                replies: if matched {
+                replies: if matched || source_fails {
                     Default::default()
                 } else {
                     [Response::Ok].into()
@@ -2851,7 +2908,10 @@ fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
                 assert!(state.replies.is_empty());
             }
             assert_eq!(src.lock().unwrap().received, 1, "source recheck ran");
-            assert_eq!(dst.lock().unwrap().received, usize::from(!matched));
+            assert_eq!(
+                dst.lock().unwrap().received,
+                usize::from(!matched && !source_fails)
+            );
         }
     }
 }
