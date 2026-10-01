@@ -1099,6 +1099,18 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
     assert!(!diagnostic.contains(WIRE_PREAMBLE_PROTOCOL_ERROR));
     assert!(!is_non_retryable_connect_error(&error));
     assert!(!helper_needs_install(&error));
+    assert!(is_ssh_connect_error(&error));
+    conn.peer = Some(PeerInfo {
+        identity: crate::identity::build().into(),
+        platform: crate::identity::platform(),
+        supports_confined_socket_nodes: false,
+        ssh_worker_ticket: None,
+    });
+    let later = conn.io_err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    assert!(
+        !is_ssh_connect_error(&later),
+        "an established copy must not change authority"
+    );
 }
 
 #[test]
@@ -1698,6 +1710,7 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
             send_budget: None,
         },
         true,
+        false,
     );
     assert!(result.is_err()); // The independent attempt reports a missing helper.
     assert_eq!(

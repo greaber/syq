@@ -153,9 +153,9 @@ impl Conn for PipelineConn {
                         .map(|read| {
                             let data = vec![42; read.len as usize];
                             Ok(SmallBlock {
+                                source: Some(pipeline_job(&read.path, size).data.entry),
                                 hash: content_digest(&data),
                                 data,
-                                source: Some(pipeline_job(&read.path, read.len.into()).data.entry),
                             })
                         })
                         .collect(),
