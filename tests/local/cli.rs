@@ -1296,9 +1296,10 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
     assert_output_ok(&out);
     assert_eq!(out.stdout, payload);
     assert!(stderr_of(&out).contains("131072 bytes"));
-    assert_eq!(
-        stderr_of(&out).matches(" ready (local)").count(),
-        2,
+    // This one-request copy can finish before every worker starts. Check the
+    // selected count, not how many threads happened to report readiness.
+    assert!(
+        stderr_of(&out).contains("stream: 2 data workers\n"),
         "explicit worker count was changed: {}",
         stderr_of(&out)
     );
