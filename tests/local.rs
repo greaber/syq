@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 #[path = "../src/process.rs"]
 mod process;
+#[path = "../src/process_group.rs"]
+mod process_group;
 use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;

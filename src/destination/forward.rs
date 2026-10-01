@@ -138,6 +138,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
             request: Box::new(request),
         },
         REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
+        None,
     )?;
     if args.verbose > 0 {
         crate::output::diagnostic!("syq: remote copy approved; opening its control connection");
@@ -145,8 +146,6 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     let Reply::Approved(approved) = reply else {
         bail!("unexpected remote copy approval response");
     };
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.auth_from = crate::cli::AuthFrom::Return(name);
     // The actual authority never leaves the destination helper. This internal
@@ -251,9 +250,9 @@ impl Receiver {
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();
-            write_message(&mut stream, &Reply::Approved(approved))?;
             socket.set_read_timeout(None)?;
             socket.set_write_timeout(None)?;
+            write_message(&mut stream, &Reply::Approved(approved))?;
             relay(socket.try_clone()?, input, output, cancelled, &mut child)
         })();
         result.with_context(|| format!("copy via this machine to {target:?}: {}", child.errors()))
@@ -887,7 +886,8 @@ mod tests {
                     command: command.clone(),
                     request: Box::new(copy)
                 },
-                Duration::from_secs(2)
+                Duration::from_secs(2),
+                Some(Duration::from_secs(2))
             )
             .is_err());
             assert!(receiver.approvals.snapshots().is_empty());
@@ -911,6 +911,7 @@ mod tests {
                         request: Box::new(copy),
                     },
                     Duration::from_secs(3),
+                    Some(Duration::from_secs(3)),
                 )
             });
             let deadline = Instant::now() + Duration::from_secs(2);
