@@ -3024,33 +3024,40 @@ pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file() && metadata.nlink() == 1
 }
 
-/// Whether a sidecar opened without exclusive creation is a new empty file
-/// of ours, which is what an exclusive create would have made. Anything else
-/// at the name, including an older sidecar with data, takes the checked path.
-pub(super) fn is_fresh_partial(metadata: &fs::Metadata) -> bool {
-    is_owned_partial(metadata) && metadata.len() == 0 && metadata.mode() & 0o7000 == 0
+/// Whether a sidecar opened without exclusive creation is what an exclusive
+/// create with `mode` would have made: a new empty file of ours with no
+/// permission beyond that mode and no set-id bit. Anything else at the name,
+/// including an older sidecar with data or a wider mode, takes the checked
+/// path, which repairs or replaces it before anything is written.
+pub(super) fn is_fresh_partial(metadata: &fs::Metadata, mode: u32) -> bool {
+    is_owned_partial(metadata)
+        && metadata.len() == 0
+        && metadata.mode() & 0o7000 == 0
+        && metadata.mode() & 0o777 & !(mode & 0o777) == 0
 }
 
-/// Whether the kernel refused to open or create the sidecar because of what
+/// Whether the open or create of the sidecar was refused because of what
 /// the name already held: a symlink, a directory, a FIFO without a reader,
-/// or a file this account may not write. The checked path then examines the
-/// name, and repeats the creation for an error that was not about it.
+/// a file this account may not write, or an existing entry that a creation
+/// without an OS error code refused (the macOS ACL sidecar). The checked
+/// path then examines the name, and repeats the creation for an error that
+/// was not about it.
 pub(super) fn existing_leaf_refused(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<io::Error>()
-        .and_then(io::Error::raw_os_error)
-        .is_some_and(|code| {
-            matches!(
-                code,
-                libc::ELOOP
-                    | libc::EISDIR
-                    | libc::ENXIO
-                    | libc::EEXIST
-                    | libc::EACCES
-                    | libc::EPERM
-                    | libc::ETXTBSY
-            )
-        })
+    error_is_kind(error, io::ErrorKind::AlreadyExists)
+        || error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    libc::ELOOP
+                        | libc::EISDIR
+                        | libc::ENXIO
+                        | libc::EACCES
+                        | libc::EPERM
+                        | libc::ETXTBSY
+                )
+            })
 }
 
 pub(super) fn is_safe_rooted_partial(metadata: RootMetadata) -> bool {
@@ -3266,11 +3273,12 @@ fn set_meta_file_inner(
     }
     if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
-        // the mode is already right (but always run it after a chown that could
-        // have cleared setuid/setgid bits we need to restore).
+        // the mode is already right. Always run it for set-id bits after a
+        // chown, which clears them, and when the metadata predates a write,
+        // which clears them for an unprivileged writer.
         let cur = current.mode() & 0o7777;
         let want = meta.mode & 0o7777;
-        if cur != want || (owner_changed && want & 0o6000 != 0) {
+        if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
             f.set_permissions(fs::Permissions::from_mode(want))?;
         }
     }

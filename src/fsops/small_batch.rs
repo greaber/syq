@@ -212,7 +212,7 @@ impl FsOps {
                 // the checked reuse that ranged writes apply.
                 self.uncache_rooted(&target.root, relative);
                 match self.open_or_create_write_only_partial(&target.root, relative, mode) {
-                    Ok((file, created)) if is_fresh_partial(&created) => {
+                    Ok((file, created)) if is_fresh_partial(&created, mode) => {
                         Ok(Some((file, created, None)))
                     }
                     Ok(_) => self.checked_small_stage(&target.root, relative, label, mode),
@@ -507,10 +507,22 @@ mod tests {
         let (relative, _) = rooted_partial_target(&target, &wanted.copy_id).unwrap();
         let sidecar = temporary.path().join(relative.to_path_buf());
         fs::write(temporary.path().join("victim"), b"victim").unwrap();
-        for planted in ["symlink", "fifo", "hardlink", "data"] {
+        for planted in ["symlink", "fifo", "hardlink", "data", "wide"] {
             match planted {
                 "symlink" => {
                     std::os::unix::fs::symlink(temporary.path().join("victim"), &sidecar).unwrap()
+                }
+                "wide" => {
+                    // An empty file of ours with permissions beyond the staging
+                    // mode is not used as it is: the checked path narrows it
+                    // to 0600 before anything is written.
+                    fs::write(&sidecar, b"").unwrap();
+                    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o666)).unwrap();
+                    let target = ops.small_target(&wanted).unwrap();
+                    let stage = ops.create_small_stage(&wanted, target).unwrap();
+                    assert!(stage.reused);
+                    assert_eq!(stage.created.mode() & 0o777, 0o600);
+                    drop(stage);
                 }
                 "fifo" => {
                     let path = std::ffi::CString::new(sidecar.as_os_str().as_bytes()).unwrap();
@@ -596,6 +608,40 @@ mod tests {
         let published = fs::metadata(&destination).unwrap();
         assert_eq!(identity, Some((published.dev(), published.ino())));
         assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        // Writing clears an existing file's set-id bits for an unprivileged
+        // writer; the metadata read before the write must not hide that from
+        // the chmod that restores them.
+        for wanted in [0o4755, 0o2755] {
+            let mut setid = inplace.clone();
+            setid.meta.mode = wanted;
+            setid.flags = flags::MODE;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(wanted)).unwrap();
+            assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, wanted);
+            ops.put_small(&setid).unwrap();
+            assert_eq!(
+                fs::metadata(&destination).unwrap().mode() & 0o7777,
+                wanted,
+                "{wanted:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_creation_is_recognized_with_or_without_an_os_error() {
+        // The macOS ACL sidecar refuses an existing name with an error that
+        // carries only the kind; the kernel's refusals carry an errno.
+        assert!(existing_leaf_refused(&anyhow::Error::from(
+            io::Error::from(io::ErrorKind::AlreadyExists)
+        )));
+        for code in [libc::ELOOP, libc::EISDIR, libc::ENXIO, libc::EACCES] {
+            assert!(existing_leaf_refused(&anyhow::Error::from(
+                io::Error::from_raw_os_error(code)
+            )));
+        }
+        assert!(!existing_leaf_refused(&anyhow::Error::from(
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        )));
+        assert!(!existing_leaf_refused(&anyhow::anyhow!("not an I/O error")));
     }
 
     #[test]

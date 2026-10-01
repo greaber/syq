@@ -485,8 +485,6 @@ impl Root {
     ) -> Result<(File, std::fs::Metadata)> {
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(path)?;
-        // O_NONBLOCK stays set: it has no effect on a regular file, and the
-        // caller closes anything else.
         let file = self
             .open_leaf(
                 path,
@@ -502,6 +500,8 @@ impl Root {
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
         let metadata = file.metadata()?;
+        clear_nonblocking(&file)
+            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
         Ok((file, metadata))
     }
 
