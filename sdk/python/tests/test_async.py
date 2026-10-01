@@ -348,6 +348,17 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn(option, self.argv())
 
+    async def test_mapping_rejects_ignores_before_consuming_entries(self) -> None:
+        async def unread_mapping():
+            self.fail("mapping must not be consumed for an invalid combination")
+            yield
+
+        for options in ({"ignore": "*.txt"}, {"ignore_from": "missing-rules"},
+                        {"ignore": [syq.IgnoreFrom("missing-rules")]}):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(syq.SyqInvocationError, "--mapping.*--ignore"):
+                    await self.client.cp(mapping=unread_mapping(), into="target", **options)
+
     async def test_mapping_failure_happens_before_process_start(self) -> None:
         self.argv_log.unlink(missing_ok=True)
 
