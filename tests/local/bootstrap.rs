@@ -797,7 +797,9 @@ exec /bin/sh -c "$1""#,
             command.args([&t.s("src"), &remote]);
         }
         let output = command
-            .args(["--stats", "--progress", "--results", &t.s("result.ndjson")])
+            .args(["--stats", "--progress"])
+            .arg(if native { "--results" } else { "--syq-results" })
+            .arg(t.path("result.ndjson"))
             .run()
             .unwrap();
         assert_output_ok(&output);
