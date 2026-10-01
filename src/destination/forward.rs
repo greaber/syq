@@ -114,7 +114,7 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
                 args.direct_destination = Some(Box::new(spec));
                 return Ok(None);
             }
-            Err(error) if crate::conn::is_ssh_authentication_error(&error) => error,
+            Err(error) if crate::conn::is_ssh_authorization_fallback_error(&error) => error,
             Err(error) => return Err(error),
         };
         let Some(found) = names.into_iter().find_map(|name| {
@@ -124,7 +124,11 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
             // Do not repeat the failed SSH attempt when no receiver responds.
             return Err(error);
         };
-        crate::output::diagnostic!("syq: {error:#}; trying authorization through @{}", found.0);
+        crate::output::diagnostic!(
+            "syq: {}; trying authorization through @{}",
+            error.root_cause(),
+            found.0
+        );
         found
     };
     Ok(Some(handoff::Selection::new(

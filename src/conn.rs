@@ -318,12 +318,16 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
 #[derive(Debug)]
 struct SshConnectError {
     message: String,
-    authentication_failed: bool,
+    failure: Option<ssh_auth::Failure>,
 }
 
 impl std::fmt::Display for SshConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        if let Some(failure) = self.failure {
+            write!(f, ": {}", failure.description())?;
+        }
+        Ok(())
     }
 }
 
@@ -334,11 +338,11 @@ fn is_ssh_connect_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<SshConnectError>())
 }
 
-pub(crate) fn is_ssh_authentication_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_ssh_authorization_fallback_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<SshConnectError>()
-            .is_some_and(|error| error.authentication_failed)
+            .is_some_and(|error| error.failure.is_some())
     })
 }
 
@@ -694,7 +698,7 @@ impl RemoteConn {
                                     "{}: SSH connection failed ({status})",
                                     self.label
                                 ),
-                                authentication_failed: false,
+                                failure: None,
                             }
                             .into();
                         }
@@ -1594,7 +1598,7 @@ impl RemoteSpec {
     }
 
     /// Ordinary SSH settings, with diagnostics inspected only to decide whether
-    /// automatic authorization can try another machine after authentication fails.
+    /// automatic authorization can try another machine after a recognized failure.
     pub(crate) fn connect_for_authorization(&self, compress: bool) -> Result<RemoteConn> {
         self.connect_with_role(compress, false, ConnectionRole::Control, false, true)
     }
@@ -1918,11 +1922,14 @@ impl RemoteSpec {
             // Drain diagnostics before reporting any error, including helper
             // errors. A ProxyCommand descendant may keep stderr open after ssh
             // exits, so bound the wait and leave unclassified failures alone.
-            let authentication_failed = ssh_failure.is_some_and(|failure| {
-                failure.recv_timeout(std::time::Duration::from_millis(100)) == Ok(true)
+            let failure = ssh_failure.and_then(|failure| {
+                failure
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .ok()
+                    .flatten()
             });
             if let Some(ssh_error) = error.downcast_mut::<SshConnectError>() {
-                ssh_error.authentication_failed = authentication_failed;
+                ssh_error.failure = failure;
             }
             error
         })?;
