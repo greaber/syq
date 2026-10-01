@@ -1960,7 +1960,7 @@
           "const": "syq.automation"
         },
         "schema_version": {
-          "const": 2
+          "const": 4
         },
         "seq": {
           "$ref": "#/$defs/u64"
@@ -2009,7 +2009,7 @@
           "const": "syq.automation"
         },
         "schema_version": {
-          "const": 2
+          "const": 4
         },
         "seq": {
           "$ref": "#/$defs/u64"
@@ -2100,7 +2100,7 @@
           "const": "syq.automation"
         },
         "schema_version": {
-          "const": 3
+          "const": 5
         },
         "seq": {
           "$ref": "#/$defs/u64"
