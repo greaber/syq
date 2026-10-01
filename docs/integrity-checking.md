@@ -115,7 +115,10 @@ change can trigger a retry; a failed check leaves the previous destination in
 place. These checks do not detect every concurrent change. `--inplace` lets
 destination readers see partial updates, including after an interrupted copy.
 
-Normal file copies check for errors reported on closing the destination writer
-before replacing the destination. Successful completion does not guarantee that
+On Linux destinations, normal file copies check for delayed write errors before
+replacing files. This catches failures such as a full NFS export reporting an
+error when the file is closed, and keeps the previous destination in place.
+This protection does not cover every delayed write error and does not apply to
+macOS destinations. Successful completion does not guarantee that
 the copy will survive an immediate power loss: these copies do not force
 transferred data onto durable storage with `fsync`.

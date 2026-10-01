@@ -6152,3 +6152,66 @@ fn late_close_is_reported_after_identity_conditioned_writeback() {
         assert_eq!(fs::read(&target).unwrap(), data);
     }
 }
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn native_copy_reports_original_writer_close_error() {
+    const CHILD: &str = "SYQ_TEST_NATIVE_CLOSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fsops::tests::native_copy_reports_original_writer_close_error",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("SYQ_TEST_FAIL_WRITER_CLOSE", ".syq-tmp.")
+            .capture_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let directory = crate::test_support::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let destination = directory.path().join("destination");
+    fs::write(&source, vec![b'x'; 1 << 20]).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let target = destination.join("target");
+    fs::write(&target, b"previous good copy").unwrap();
+    let before = fs::metadata(&target).unwrap();
+    let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+    worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+    // CopyLocal must collect this error itself. Checking only in Finalize
+    // misses an error discarded when the original writer is dropped.
+    let error = worker
+        .copy_local(
+            &sources[0],
+            b"target",
+            CopyLocalPolicy {
+                replace_partial: false,
+                inplace: false,
+                allow_sequential_nfs_fallback: false,
+                allow_sequential_local_fallback: true,
+                progress: &mut |_| Ok(()),
+            },
+            &[84; 16],
+            1 << 20,
+            0o600,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("close destination writer"),
+        "{error:#}"
+    );
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+        Some(libc::ENOSPC)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"previous good copy");
+    assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
+}

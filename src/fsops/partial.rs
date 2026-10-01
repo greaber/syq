@@ -1381,6 +1381,10 @@ impl FsOps {
             // completed file for writing would fail. Finalize removes every
             // attempt for this path, so CopyLocal needs no wire attempt field.
             self.cache_file(target.location(), 0, false, d);
+        } else {
+            // Finalize reopens the partial. Collect errors on this original
+            // writer now: a later open may not observe an already reported error.
+            close_writer(d, &target_label)?;
         }
         _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
@@ -3334,10 +3338,19 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
 /// original handle pinned for the identity checks and metadata operations that
 /// follow. This is not fsync and does not promise crash durability or collect
 /// every error a filesystem might report on another worker's cached handle.
+/// On macOS a duplicate close does not invoke the filesystem's close operation;
+/// only the last reference does, so this does not collect delayed errors there.
 pub(crate) fn check_writer_close(file: &File, label: &Path) -> Result<()> {
+    let writer = file
+        .try_clone()
+        .with_context(|| format!("duplicate destination writer {}", label.display()))?;
+    close_writer(writer, label)
+}
+
+fn close_writer(file: File, label: &Path) -> Result<()> {
     use std::os::fd::IntoRawFd;
     let check = || -> io::Result<()> {
-        let fd = file.try_clone()?.into_raw_fd();
+        let fd = file.into_raw_fd();
         // SAFETY: into_raw_fd transfers ownership. Close exactly once: retrying
         // an interrupted close can close a descriptor reused by another thread.
         if unsafe { libc::close(fd) } != 0 {

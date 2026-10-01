@@ -36,10 +36,14 @@ fn copy_command(t: &Tmp, route: &str, tuning: &str) -> Command {
 }
 
 fn late_close_preserves_staged_copy(route: &str) {
+    const RANGED: &str = concat!(
+        "workers=4,copy-path=ranges,comparison-block-size=64K,",
+        "request-size=64K,split-min-size=128K",
+    );
     for (size, tuning) in [
         (1024, "workers=1"),
         (1 << 20, "workers=1"),
-        (1 << 20, "workers=4,copy-path=ranges,comparison-block-size=64K,request-size=64K,split-min-size=128K"),
+        (1 << 20, RANGED),
     ] {
         for existing in [false, true] {
             let t = Tmp::new();
@@ -54,29 +58,48 @@ fn late_close_preserves_staged_copy(route: &str) {
             let before = fs::metadata(t.path("dst/late-error")).ok();
             let mut command = copy_command(&t, route, tuning);
             command
-                .args(["--as", &t.s("dst/late-error"), "--results", &t.s("results.ndjson")])
+                .args([
+                    "--as",
+                    &t.s("dst/late-error"),
+                    "--results",
+                    &t.s("results.ndjson"),
+                ])
                 .env("SYQ_TEST_FAIL_WRITER_CLOSE", "late-error");
             let output = command.run().unwrap();
             let context = format!("{route}, size={size}, {tuning}, existing={existing}");
             assert!(!output.status.success(), "{context}: {output:?}");
             let error = stderr_of(&output);
-            assert!(error.contains("close destination writer"), "{context}: {error}");
+            assert!(
+                error.contains("close destination writer"),
+                "{context}: {error}"
+            );
             assert!(error.contains("late-error"), "{context}: {error}");
             if let Some(before) = before {
                 let after = fs::metadata(t.path("dst/late-error")).unwrap();
-                assert_eq!(read(&t.path("dst/late-error")), b"previous good copy", "{context}");
-                assert_eq!((after.ino(), after.mtime(), after.mode()),
-                           (before.ino(), before.mtime(), before.mode()), "{context}");
+                assert_eq!(
+                    read(&t.path("dst/late-error")),
+                    b"previous good copy",
+                    "{context}"
+                );
+                assert_eq!(
+                    (after.ino(), after.mtime(), after.mode()),
+                    (before.ino(), before.mtime(), before.mode()),
+                    "{context}"
+                );
             } else {
                 assert!(!t.path("dst/late-error").exists(), "{context}");
             }
             let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
-            let summary: serde_json::Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            let summary: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
             assert_eq!(summary["files_transferred"], 0, "{context}: {summary}");
             // A reported close error must not turn the retained sidecar into a
             // successful final file. A later copy can still resume and publish.
             fs::remove_file(t.path("results.ndjson")).unwrap();
-            let retry = command.env_remove("SYQ_TEST_FAIL_WRITER_CLOSE").run().unwrap();
+            let retry = command
+                .env_remove("SYQ_TEST_FAIL_WRITER_CLOSE")
+                .run()
+                .unwrap();
             assert_output_ok(&retry);
             assert_eq!(read(&t.path("dst/late-error")), bytes, "{context}");
         }
