@@ -458,6 +458,8 @@ struct Inner {
     files: FileQueue,
     ranges: RangeQueue,
     finishes: Vec<(usize, bool)>,
+    /// Claimed publications remain live until completed or returned to the queue.
+    finishing: usize,
     inflight: Vec<RangeHandle>,
     outstanding: HashMap<usize, u32>,
     failed: HashSet<usize>,
@@ -489,6 +491,7 @@ impl Inner {
     fn finished(&self) -> bool {
         self.scan_done
             && self.probing == 0
+            && self.finishing == 0
             && self.inflight.is_empty()
             && self.files.is_empty()
             && self.ranges.is_empty()
@@ -515,6 +518,7 @@ impl Sched {
                 files: FileQueue::default(),
                 ranges: RangeQueue::default(),
                 finishes: Vec::new(),
+                finishing: 0,
                 inflight: Vec::new(),
                 outstanding: HashMap::new(),
                 failed: HashSet::new(),
@@ -918,7 +922,9 @@ impl Sched {
                 g.ranges.push((range.idx, range.pos, range.end));
             }
             Item::Finish { idx, matched } => {
-                self.inner.lock().unwrap().finishes.push((idx, matched));
+                let mut g = self.inner.lock().unwrap();
+                g.finishes.push((idx, matched));
+                g.finishing -= 1;
             }
         }
         self.cv.notify_all();
@@ -936,6 +942,7 @@ impl Sched {
                     return Item::Range(g.claim_range(idx, off, end));
                 }
                 if let Some((idx, matched)) = g.finishes.pop() {
+                    g.finishing += 1;
                     return Item::Finish { idx, matched };
                 }
                 if let Some((_, Reverse(order))) = g.files.pop() {
@@ -950,7 +957,7 @@ impl Sched {
                     return Item::File(idx);
                 }
             }
-            if g.scan_done && g.probing == 0 && g.inflight.is_empty() {
+            if g.finished() {
                 self.tune_cv.notify_one();
                 return Item::Exit;
             }
@@ -1164,6 +1171,14 @@ impl Sched {
             }
         }
         self.cv.notify_all();
+    }
+
+    /// Release a claimed publication after completion, failure, or queuing its
+    /// retry. Keep it visible until then so other workers cannot exit early.
+    pub fn finish_done(&self) {
+        self.inner.lock().unwrap().finishing -= 1;
+        self.cv.notify_all();
+        self.tune_cv.notify_one();
     }
 
     /// Final publication is separate from range accounting so a lost

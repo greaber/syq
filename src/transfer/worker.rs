@@ -239,12 +239,19 @@ impl Worker {
                 } else {
                     self.finish_file(idx)
                 };
-                if let Err(e) = result {
-                    if self.transport_dead() {
-                        self.sched.requeue_finish(idx, matched);
+                let result = match result {
+                    Err(e) => {
+                        if self.transport_dead() {
+                            self.sched.requeue_finish(idx, matched);
+                        }
+                        self.file_error(idx, e)
                     }
-                    self.file_error(idx, e)?;
-                }
+                    Ok(()) => Ok(()),
+                };
+                // Include error handling and retry publication in the claim's
+                // lifetime; even an early error return must release it.
+                self.sched.finish_done();
+                result?;
             }
         }
         Ok(())
