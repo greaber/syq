@@ -141,8 +141,11 @@ try:
     approved = forwarding_connections()[before:]
     assert len(approved) == 1, ("expected one approved SSH connection on the runner", approved)
     events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
+    # RemoteSpec sets ControlMaster on every transport connection. The same
+    # process also runs ssh -G to read config; that query never connects.
     attempts = [event for event in events
-                if event["phase"] == "start" and event["host"] == "destination"]
+                if event["phase"] == "start" and event["host"] == "destination"
+                and event["control_master"] != "unset"]
     assert len(attempts) == 1, ("expected one source SSH attempt", events)
     exits = [event for event in events
              if event["phase"] == "end" and event["pid"] == attempts[0]["pid"]]
