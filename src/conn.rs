@@ -1879,17 +1879,17 @@ impl RemoteSpec {
             *send_budget = pacing.as_ref().and_then(|p| p.source_budget.clone());
         }
         let conn = hello(conn, compress, Vec::new(), role).map_err(|mut error| {
-            if is_ssh_connect_error(&error) {
-                if let Some(failure) = ssh_failure {
-                    // A ProxyCommand descendant may keep stderr open after ssh
-                    // exits. Unclassified errors never select another authorizer.
-                    if failure.recv_timeout(std::time::Duration::from_millis(100)) == Ok(true) {
-                        error
-                            .downcast_mut::<SshConnectError>()
-                            .unwrap()
-                            .authentication_failed = true;
-                    }
-                }
+            // Drain diagnostics before reporting any error, including helper
+            // errors. A ProxyCommand descendant may keep stderr open after ssh
+            // exits, so bound the wait and leave unclassified failures alone.
+            let authentication_failed = ssh_failure.is_some_and(|failure| {
+                failure.recv_timeout(std::time::Duration::from_millis(100)) == Ok(true)
+            });
+            if authentication_failed && is_ssh_connect_error(&error) {
+                error
+                    .downcast_mut::<SshConnectError>()
+                    .unwrap()
+                    .authentication_failed = true;
             }
             error
         })?;
