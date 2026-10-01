@@ -6032,3 +6032,123 @@ fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
         assert_eq!(fs::read(tree.path().join(partial)).unwrap(), expected);
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn late_close_is_reported_after_identity_conditioned_writeback() {
+    const CHILD: &str = "SYQ_TEST_CONDITIONAL_CLOSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fsops::tests::late_close_is_reported_after_identity_conditioned_writeback",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            // The final name matches; the sidecar .target.syq-tmp.* does not.
+            .env("SYQ_TEST_FAIL_WRITER_CLOSE", "/target")
+            .capture_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for small in [true, false] {
+        let directory = crate::test_support::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, b"previous good copy").unwrap();
+        let before = fs::metadata(&target).unwrap();
+        let mut ops = destination_ops(directory.path());
+        ops.set_hash_policy(crate::hashing::HashPolicy::default());
+        let copy_id = [83; 16];
+        let data = b"updated contents";
+        let meta = Meta {
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            mtime: 1_500_000_000,
+            mtime_nsec: 0,
+            inode_metadata: None,
+        };
+        let condition = TargetCondition::Matches {
+            dev: before.dev(),
+            ino: before.ino(),
+        };
+        let error = if small {
+            ops.put_small(&SmallPut {
+                path: b"target".to_vec(),
+                copy_id,
+                data: data.to_vec(),
+                hash: content_digest(data),
+                meta,
+                flags: flags::TIMES,
+                inplace: false,
+                condition,
+                guard: None,
+                replaces: true,
+            })
+            .unwrap_err()
+        } else {
+            let partial = PartialTarget {
+                path: b"target",
+                id: &copy_id,
+                guard: None,
+            };
+            ops.prepare(
+                partial,
+                PrepareOptions {
+                    size: data.len() as u64,
+                    inplace: false,
+                    mode: 0o600,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap();
+            ops.write_range(
+                PartialTarget {
+                    path: b"target",
+                    id: &copy_id,
+                    guard: None,
+                },
+                false,
+                0,
+                0,
+                content_digest(data),
+                data,
+            )
+            .unwrap();
+            // Exercise publication through a reopened writer, as happens after
+            // cache eviction or when another worker finishes the file.
+            ops.fds.clear();
+            ops.fd_order.clear();
+            ops.finalize(
+                b"target",
+                false,
+                &copy_id,
+                &meta,
+                flags::TIMES,
+                TargetMutation {
+                    condition,
+                    guard: None,
+                },
+            )
+            .unwrap_err()
+        };
+        assert!(
+            error.to_string().contains("close destination writer"),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+        assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
+        assert_ne!(fs::metadata(&target).unwrap().mtime(), 1_500_000_000);
+        assert_eq!(fs::read(&target).unwrap(), data);
+    }
+}

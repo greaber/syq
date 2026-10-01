@@ -2328,6 +2328,54 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
     assert_eq!(server.requests.load(Ordering::Relaxed), 4);
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn s3_late_close_preserves_download_destination() {
+    for multipart in [false, true] {
+        for existing in [false, true] {
+            let server = Server::start("prefix-multipart");
+            let temp = crate::test_support::tempdir().unwrap();
+            let destination = temp.path().join("download");
+            if existing {
+                std::fs::write(&destination, b"original").unwrap();
+            }
+            let mut command = server.command_with_part_size(temp.path(), 0, multipart);
+            command.args([
+                "--s3-endpoint",
+                &server.address,
+                "--from",
+                "s3://bucket",
+                "data/file",
+                "--as",
+                "download",
+            ]);
+            // The default part size keeps this fixture in download_single;
+            // explicit 5 MiB parts take the checkpointed ranged path.
+            let output = command
+                .env("SYQ_TEST_FAIL_WRITER_CLOSE", "download")
+                .capture_output()
+                .unwrap();
+            assert!(!output.status.success(), "{}", output_text(&output));
+            assert!(
+                output_text(&output).contains("close destination writer"),
+                "{}",
+                output_text(&output)
+            );
+            if existing {
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            } else {
+                assert!(!destination.exists());
+            }
+            let retry = command
+                .env_remove("SYQ_TEST_FAIL_WRITER_CLOSE")
+                .capture_output()
+                .unwrap();
+            assert!(retry.status.success(), "{}", output_text(&retry));
+            assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; SIZE]);
+        }
+    }
+}
+
 #[test]
 fn s3_prefix_multipart_download_starts_ranges_without_an_object_head() {
     for existing in [false, true] {
