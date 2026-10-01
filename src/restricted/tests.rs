@@ -2979,6 +2979,94 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
     assert_eq!(verified.terminal.summary.incomplete, 0);
 }
 
+#[test]
+fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_writes() {
+    // Without -p the final step carries RECEIVER_MODE: the authority chooses
+    // the mode and binds its approval to the file's identity and ctime as
+    // they are then, after the data was written. The receiver must check
+    // that against the file as it is now, not as it was when it opened it
+    // before the writes. Both a new and an existing destination.
+    for existing in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        let image = target.join("image");
+        fs::create_dir_all(&target).unwrap();
+        if existing {
+            fs::write(&image, b"an older and longer version").unwrap();
+        }
+        let authority = test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            None,
+        )
+        .unwrap();
+        // The authority attaches its root guard to each request, which is
+        // the receiver's whole authority for them.
+        let mut receiver = crate::fsops::FsOps::new();
+        let copy_id = [7; 16];
+        let mut run = |mut request: Request| {
+            let settlement = authority.authorize(&mut request, false).unwrap();
+            let response = receiver.handle_in_place(&mut request);
+            authority.settle(settlement, &response);
+            response
+        };
+        let prepared = run(Request::Prepare {
+            path: path_bytes(&image),
+            size: 8,
+            inplace: true,
+            copy_id,
+            mode: 0o644,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+        });
+        assert!(
+            matches!(prepared, proto::Response::Prepared(_)),
+            "{existing}: {prepared:?}"
+        );
+        let written = run(Request::WriteRange {
+            path: path_bytes(&image),
+            inplace: true,
+            copy_id,
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(b"contents"),
+            data: b"contents".to_vec().into(),
+            guard: None,
+        });
+        assert!(
+            matches!(written, proto::Response::Ok),
+            "{existing}: {written:?}"
+        );
+        let finalized = run(Request::Finalize {
+            expected_hash: None,
+            path: path_bytes(&image),
+            inplace: true,
+            copy_id,
+            meta: plain_meta(),
+            flags: proto::flags::RECEIVER_MODE,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        });
+        assert!(
+            matches!(
+                finalized,
+                proto::Response::Ok | proto::Response::Published { .. }
+            ),
+            "{existing}: {finalized:?}"
+        );
+        assert_eq!(fs::read(&image).unwrap(), b"contents", "{existing}");
+    }
+}
+
 fn racing_public(authority: &RestrictedAuthority) -> String {
     authority.receipt_key.public_key().to_openssh().unwrap()
 }
