@@ -414,10 +414,7 @@ impl Worker {
             'issuing: loop {
                 // A retired worker finishes its issued groups, but leaves the
                 // unread suffix available to peers instead of refilling the pipe.
-                while self.gate.allowed(self.id)
-                    && !self.sched.is_aborted()
-                    && reads.len() < read_window
-                {
+                while reads.len() < read_window {
                     let started = std::time::Instant::now();
                     if adaptive {
                         // Apply acknowledgments already queued by the reader
@@ -443,6 +440,11 @@ impl Worker {
                         if self.batch_budget.overdue(started, oldest) {
                             break;
                         }
+                    }
+                    // Consuming a queued reply can coincide with cancellation
+                    // or retirement. Check admission after processing that reply.
+                    if !self.gate.allowed(self.id) || self.sched.is_aborted() {
+                        break;
                     }
                     let limit = if adaptive {
                         self.batch_budget.limit()

@@ -3202,7 +3202,8 @@ fn acknowledged_batch_writes_do_not_stall_source_refill() {
 
 #[test]
 fn received_batch_feedback_sizes_the_next_source_request() {
-    for rejected in [false, true] {
+    for outcome in ["success", "rejected", "aborted"] {
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
         let size = 32 << 10;
         let src = Arc::new(Mutex::new(PipelineState {
             auto_small_size: Some(size),
@@ -3211,11 +3212,11 @@ fn received_batch_feedback_sizes_the_next_source_request() {
         let dst = Arc::new(Mutex::new(PipelineState {
             auto_small_size: Some(size),
             immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
-            reject_small_puts: rejected,
+            reject_small_puts: outcome == "rejected",
+            abort_on_receive: (outcome == "aborted").then(|| sched.clone()),
             ..Default::default()
         }));
-        let mut worker =
-            pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
         Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
         let jobs: Vec<_> = (0..12)
             .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
@@ -3238,12 +3239,20 @@ fn received_batch_feedback_sizes_the_next_source_request() {
                 &mut results,
             )
             .unwrap();
-        if rejected {
+        if outcome == "rejected" {
             assert_eq!(next, 4, "reject before claiming more source work");
             assert!(matches!(results[0], Some(Err(_))));
             assert!(results[1..].iter().all(Option::is_none));
             assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
             assert_eq!(dst.lock().unwrap().requests.len(), 1);
+        } else if outcome == "aborted" {
+            assert_eq!(
+                next, 4,
+                "an abort during receipt consumption stops new claims"
+            );
+            assert!(results[..4].iter().all(|r| matches!(r, Some(Ok(_)))));
+            assert!(results[4..].iter().all(Option::is_none));
+            assert_eq!(worker.progress.bytes_done.load(Relaxed), size * 4);
         } else {
             assert_eq!(
                 limits[4].bytes,
