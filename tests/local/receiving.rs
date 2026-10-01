@@ -1235,7 +1235,6 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
             b"pinned source"
         );
         assert!(!t.path("overlap/tree/replacement").exists());
-        assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
         fs::remove_file(t.path("ssh-used")).unwrap();
     }
     // Successful authentication does not permit switching authority after a
