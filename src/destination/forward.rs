@@ -124,10 +124,7 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
             // Do not repeat the failed SSH attempt when no receiver responds.
             return Err(error);
         };
-        crate::output::diagnostic!(
-            "syq: destination SSH connection failed ({error:#}); trying authorization through @{}",
-            found.0
-        );
+        crate::output::diagnostic!("syq: {error:#}; trying authorization through @{}", found.0);
         found
     };
     Ok(Some(handoff::Selection::new(

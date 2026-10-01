@@ -1292,7 +1292,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 255\n",
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];
@@ -1395,7 +1395,11 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         stderr_of(&refused)
     );
     assert!(!refused.status.success());
-    assert!(t.path("ssh-used").exists());
+    assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+    assert_eq!(
+        stderr_of(&refused).matches("SSH connection failed").count(),
+        1
+    );
     fs::remove_file(t.path("ssh-used")).unwrap();
     let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
         .unwrap()
@@ -1471,7 +1475,12 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     // must allow ordinary SSH instead of treating stale names as reservations.
     let offline = run(&["cp", "source", "--to", "backup"]);
     assert!(!offline.status.success());
-    assert!(t.path("ssh-used").exists(), "{}", stderr_of(&offline));
+    assert_eq!(
+        fs::read_to_string(t.path("ssh-used")).unwrap(),
+        "connect\n",
+        "SSH should be attempted once when no receiver answers: {}",
+        stderr_of(&offline),
+    );
 }
 
 #[test]
