@@ -748,3 +748,101 @@ fn persist_connect_prepares_helper_without_selecting_copy_data() {
     assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
     assert!(!Path::new(state["scope"].as_str().unwrap()).exists());
 }
+
+#[test]
+fn transfer_timing_separates_connection_setup_and_helper_installation() {
+    for native in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        setup_release_bootstrap(&t);
+        let script = fs::read_to_string(&rsh).unwrap().replace(
+            "exec /bin/sh -c \"$1\"",
+            r#"case "$1" in
+    *--install-remote-command*) sleep 2 ;;
+    *) if [ ! -f "$FAKE_REMOTE_HOME/connected" ]; then
+           touch "$FAKE_REMOTE_HOME/connected"
+           sleep 1
+       fi ;;
+esac
+exec /bin/sh -c "$1""#,
+        );
+        executable(&rsh, script.as_bytes());
+        write(&t.path("src"), &[42; 4096]);
+        let remote = format!("fake:{}", t.s("dst"));
+        let mut command = remote_syq_command(&t, &rsh, &[]);
+        if native {
+            // Keep the fixture environment but exercise the bounded native copy.
+            let env: Vec<_> = command
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
+                .collect();
+            command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            for (key, value) in env {
+                if let Some(value) = value {
+                    command.env(key, value);
+                } else {
+                    command.env_remove(key);
+                }
+            }
+            command.args(["cp", "--rsh"]).arg(&rsh).args([
+                "--no-tcp",
+                "--src",
+                &t.s("src"),
+                "--to",
+                "fake",
+                "--as",
+                &t.s("dst"),
+            ]);
+        } else {
+            command.args([&t.s("src"), &remote]);
+        }
+        let output = command
+            .args(["--stats", "--progress", "--results", &t.s("result.ndjson")])
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst")), read(&t.path("src")));
+        let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let terminal = records.last().unwrap();
+        let elapsed = terminal["elapsed_ms"].as_u64().unwrap();
+        let setup = terminal["setup_elapsed_ms"].as_u64().unwrap();
+        let transfer = terminal["transfer_elapsed_ms"].as_u64().unwrap();
+        assert!(
+            setup >= 900,
+            "initial connection excluded from setup: {terminal}"
+        );
+        assert!(
+            elapsed >= setup + transfer + 1900,
+            "installation counted: {terminal}"
+        );
+        let final_progress = records
+            .iter()
+            .rev()
+            .find(|r| r["type"] == "progress")
+            .unwrap();
+        assert_eq!(
+            final_progress["transfer_elapsed_ms"],
+            terminal["transfer_elapsed_ms"]
+        );
+        assert_eq!(
+            final_progress["setup_elapsed_ms"],
+            terminal["setup_elapsed_ms"]
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("initial setup: {:.3}s", setup as f64 / 1000.0)),
+            "{stdout}"
+        );
+        let duration = format!("{}:{:02}", transfer / 60_000, transfer / 1000 % 60);
+        assert!(stdout.contains(&format!(", {duration} at ")), "{stdout}");
+        if native {
+            // Native options do not have the fixture's --no-progress appended.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&format!("elapsed {duration}")), "{stderr}");
+        }
+    }
+}

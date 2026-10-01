@@ -353,6 +353,12 @@
         },
         "eta_ms": {
           "$ref": "#/$defs/u64"
+        },
+        "setup_elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "transfer_elapsed_ms": {
+          "$ref": "#/$defs/u64"
         }
       },
       "required": [
@@ -929,6 +935,12 @@
         "bytes_total_known": {
           "type": "boolean",
           "description": "For descriptor copies, false when the source length is unknown. Dry-run byte totals then count only known bytes."
+        },
+        "setup_elapsed_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "transfer_elapsed_ms": {
+          "$ref": "#/$defs/u64"
         }
       },
       "required": [

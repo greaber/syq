@@ -40,7 +40,29 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(current.rate_bytes_per_second, 2)
         self.assertEqual(current.eta_ms, 1000)
         self.assertEqual(self.decode(rate_bytes_per_second=0, eta_ms=0).eta_ms, 0)
-        for field in ("rate_bytes_per_second", "eta_ms"):
+        for field in ("rate_bytes_per_second", "eta_ms", "setup_elapsed_ms", "transfer_elapsed_ms"):
             for value in (-1, True, 1.5, "2", None, 2**64):
                 with self.subTest(field=field, value=value), self.assertRaises(syq.SyqProtocolError):
                     self.decode(**{field: value})
+
+    def test_separate_timing_is_optional_and_preserves_whole_run_time(self):
+        old = self.decode()
+        self.assertIsNone(old.setup_elapsed_ms)
+        self.assertIsNone(old.transfer_elapsed_ms)
+        current = self.decode(setup_elapsed_ms=200, transfer_elapsed_ms=300)
+        self.assertEqual(current.elapsed_ms, 1000)
+        self.assertEqual(current.setup_elapsed_ms, 200)
+        self.assertEqual(current.transfer_elapsed_ms, 300)
+
+    def test_result_timing_and_unchanged_old_stream(self):
+        fixture = Path(__file__).parent / "fixtures/automation-v2-progress.ndjson"
+        for timing in ({}, {"setup_elapsed_ms": 200, "transfer_elapsed_ms": 300}):
+            decoder = AutomationDecoder(prune=False, mapping=False, dry_run=False)
+            for line in fixture.read_bytes().splitlines():
+                record = json.loads(line)
+                if record["type"] == "result":
+                    record.update(timing)
+                decoder.feed(json.dumps(record).encode())
+            result = decoder.finish(0)
+            self.assertEqual(result.setup_elapsed_ms, timing.get("setup_elapsed_ms"))
+            self.assertEqual(result.transfer_elapsed_ms, timing.get("transfer_elapsed_ms"))

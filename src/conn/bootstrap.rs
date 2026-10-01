@@ -8,6 +8,7 @@ impl RemoteSpec {
             return Ok(());
         }
 
+        let started = std::time::Instant::now();
         let bootstrap = self.remote_bootstrap()?;
         let target = bootstrap.target;
         if !self.quiet {
@@ -26,6 +27,8 @@ impl RemoteSpec {
                 target.key
             )
         })?;
+        self.diagnostics.lock().unwrap().helper_installation =
+            Some((started, std::time::Instant::now()));
         *installed = true;
         Ok(())
     }

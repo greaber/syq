@@ -111,7 +111,11 @@ Syq shows a progress bar in a terminal, with elapsed time, speed, and an
 estimated finish time. Buffered local copies report progress while a large file
 is still being copied; filesystem clones and copy offloads report when the
 operation completes. The final summary reports copied and skipped files and any
-errors. Add `-v` to list copied paths.
+errors. For filesystem copies, elapsed time and average speed exclude initial
+setup, including helper installation and connection establishment. Setup time
+is reported separately by `--stats`, excluding helper installation. Connections
+and retries after copying starts count toward transfer time. Add `-v` to list
+copied paths.
 
 Use `--progress` to show the bar when output is redirected, or `--no-progress`
 to hide it. For connection details and ways to investigate performance, see

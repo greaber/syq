@@ -194,6 +194,8 @@ impl Report {
                 bytes_unchanged: 0,
                 copying_elapsed_ms: None,
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
+                setup_elapsed_ms: progress.setup_elapsed_ms(),
+                transfer_elapsed_ms: progress.transfer_elapsed_ms(),
                 deletions_planned: None,
                 deletions_completed: None,
                 deletions_blocked: None,

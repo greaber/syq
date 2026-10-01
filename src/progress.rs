@@ -58,7 +58,12 @@ pub struct Progress {
     pub specials_created: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
+    /// Whole-run clock, retained for automation and tuning history.
     pub start: Instant,
+    separate_transfer_timing: bool,
+    transfer_start: std::sync::OnceLock<Instant>,
+    transfer_end: std::sync::OnceLock<Instant>,
+    setup_excluded_ns: AtomicU64,
     copy_first_ns: AtomicU64,
     copy_last_ns: AtomicU64,
     term: Mutex<TermState>,
@@ -155,6 +160,10 @@ impl Progress {
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start: Instant::now(),
+            separate_transfer_timing: false,
+            transfer_start: std::sync::OnceLock::new(),
+            transfer_end: std::sync::OnceLock::new(),
+            setup_excluded_ns: AtomicU64::new(0),
             copy_first_ns: AtomicU64::new(u64::MAX),
             copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {
@@ -166,6 +175,78 @@ impl Progress {
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn new_transfer(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
+        let mut progress = Self::new(enabled, force, width);
+        Arc::get_mut(&mut progress)
+            .unwrap()
+            .separate_transfer_timing = true;
+        progress
+    }
+
+    /// Initial installs can overlap on a relayed copy. Exclude their union,
+    /// not their sum, from setup time. Called after both control connects join.
+    pub fn exclude_setup_intervals(&self, intervals: impl Iterator<Item = (Instant, Instant)>) {
+        let mut intervals: Vec<_> = intervals.collect();
+        intervals.sort_unstable();
+        let mut end = self.start;
+        let mut excluded = Duration::ZERO;
+        for (first, last) in intervals {
+            excluded += last.saturating_duration_since(first.max(end));
+            end = end.max(last);
+        }
+        self.setup_excluded_ns
+            .store(excluded.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
+    }
+
+    /// Start once the initial transport is ready, before releasing copy work.
+    /// Retries and reconnects after this point remain part of the transfer.
+    pub fn begin_transfer(&self) {
+        let mut term = self.term.lock().unwrap();
+        if self.transfer_start.get().is_none() {
+            let now = Instant::now();
+            let _ = self.transfer_start.set(now);
+            term.samples = VecDeque::from([(now, self.bytes_done.load(Relaxed))]);
+        }
+    }
+
+    pub fn finish_transfer(&self) {
+        if self.transfer_start.get().is_some() {
+            let _ = self.transfer_end.set(Instant::now());
+        }
+    }
+
+    pub fn setup_elapsed_ms(&self) -> Option<u64> {
+        self.transfer_start.get().map(|start| {
+            start
+                .duration_since(self.start)
+                .saturating_sub(Duration::from_nanos(self.setup_excluded_ns.load(Relaxed)))
+                .as_millis() as u64
+        })
+    }
+
+    fn transfer_elapsed(&self) -> Option<Duration> {
+        self.transfer_start.get().map(|start| {
+            self.transfer_end
+                .get()
+                .copied()
+                .unwrap_or_else(Instant::now)
+                .saturating_duration_since(*start)
+        })
+    }
+
+    pub fn transfer_elapsed_ms(&self) -> Option<u64> {
+        self.transfer_elapsed()
+            .map(|elapsed| elapsed.as_millis() as u64)
+    }
+
+    pub fn display_elapsed(&self) -> Duration {
+        if self.separate_transfer_timing {
+            self.transfer_elapsed().unwrap_or_default()
+        } else {
+            self.start.elapsed()
+        }
     }
 
     pub(crate) fn observe_destination_devices<'a>(
@@ -193,6 +274,9 @@ impl Progress {
     }
 
     pub fn copying_interval(&self) -> CopyingInterval<'_> {
+        if self.separate_transfer_timing && self.transfer_start.get().is_none() {
+            self.begin_transfer();
+        }
         self.copy_first_ns.fetch_min(self.copy_clock_ns(), Relaxed);
         CopyingInterval(self)
     }
@@ -331,6 +415,8 @@ impl Progress {
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
                     elapsed_ms: self.start.elapsed().as_millis() as u64,
+                    setup_elapsed_ms: self.setup_elapsed_ms(),
+                    transfer_elapsed_ms: self.transfer_elapsed_ms(),
                     rate_bytes_per_second: rate.round() as u64,
                     eta_ms: eta.map(|seconds| (seconds * 1000.0).round() as u64),
                     activity: t.observation.as_ref(),
@@ -341,7 +427,7 @@ impl Progress {
             return;
         }
         let age = now - t.samples.back().unwrap().0;
-        let elapsed = now - self.start;
+        let elapsed = self.display_elapsed();
         let state = if let Some(status) = status {
             status.to_string()
         } else if !scan_done && self.stream {
@@ -414,6 +500,7 @@ impl Progress {
     /// Leave the final bar visible. Call after joining the ticker, with the
     /// actual operation outcome; a full byte counter alone is not success.
     pub fn finish(&self, success: bool) {
+        self.finish_transfer();
         self.render_status(Some(if success { "done" } else { "incomplete" }));
         if self.enabled {
             crate::output::finish_progress();
@@ -675,6 +762,54 @@ mod tests {
 
     use super::*;
     use crate::tune::Meter;
+
+    #[test]
+    fn transfer_timing_excludes_setup_and_overlapping_installs() {
+        let mut progress = Progress::new_transfer(false, false, None);
+        let origin = Instant::now() - Duration::from_secs(60);
+        Arc::get_mut(&mut progress).unwrap().start = origin;
+        progress.exclude_setup_intervals(
+            [
+                (
+                    origin + Duration::from_secs(20),
+                    origin + Duration::from_secs(40),
+                ),
+                (
+                    origin + Duration::from_secs(10),
+                    origin + Duration::from_secs(30),
+                ),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(progress.transfer_elapsed_ms(), None);
+        assert_eq!(progress.setup_elapsed_ms(), None);
+        assert_eq!(progress.display_elapsed(), Duration::ZERO);
+        progress.begin_transfer();
+        let began = *progress.transfer_start.get().unwrap();
+        let setup = progress.setup_elapsed_ms().unwrap();
+        assert_eq!(
+            setup,
+            began.duration_since(origin).as_millis() as u64 - 30_000
+        );
+        // Use a synthetic sample time so the rate test does not need a sleep.
+        let mut term = progress.term.lock().unwrap();
+        assert_eq!(
+            progress.rate(&mut term, began + Duration::from_secs(2), 400),
+            200.0
+        );
+        drop(term);
+        progress.begin_transfer();
+        assert_eq!(progress.transfer_start.get(), Some(&began));
+        assert_eq!(progress.setup_elapsed_ms(), Some(setup));
+        progress
+            .transfer_end
+            .set(began + Duration::from_secs(2))
+            .unwrap();
+        progress.finish_transfer();
+        assert_eq!(progress.transfer_elapsed_ms(), Some(2_000));
+        assert_eq!(progress.display_elapsed(), Duration::from_secs(2));
+        assert!(progress.start.elapsed() >= Duration::from_secs(60));
+    }
 
     #[test]
     fn copying_interval_excludes_initial_setup_and_counts_overlap_once() {

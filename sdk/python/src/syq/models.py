@@ -376,6 +376,8 @@ class ProgressEvent:
     activity: dict[str, Any] | None = None
     rate_bytes_per_second: int | None = None
     eta_ms: int | None = None
+    setup_elapsed_ms: int | None = None
+    transfer_elapsed_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,6 +552,8 @@ class CpResult(OperationSummary):
     deletions_blocked: int | None
     receipt: ReceiptSummary | None = None
     bytes_total_known: bool | None = None
+    setup_elapsed_ms: int | None = None
+    transfer_elapsed_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

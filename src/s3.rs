@@ -430,6 +430,8 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
             copying_elapsed_ms: progress.copying_elapsed_ms(),
             elapsed_ms: progress.start.elapsed().as_millis() as u64,
+            setup_elapsed_ms: progress.setup_elapsed_ms(),
+            transfer_elapsed_ms: progress.transfer_elapsed_ms(),
             deletions_planned: args
                 .delete
                 .then(|| progress.deletions_planned.load(Relaxed)),

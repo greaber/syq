@@ -1172,6 +1172,7 @@ pub(crate) struct PendingTcpSetup {
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiagnostics {
+    pub helper_installation: Option<(std::time::Instant, std::time::Instant)>,
     pub peer: Option<PeerInfo>,
     pub tcp_probe: Option<TcpProbe>,
     pub tcp_setup_error: Option<String>,

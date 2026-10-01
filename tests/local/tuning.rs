@@ -876,7 +876,13 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
                 .expect("copy timing");
             assert!(span <= terminal["elapsed_ms"].as_u64().unwrap());
         }
-        for key in ["seq", "elapsed_ms", "copying_elapsed_ms"] {
+        for key in [
+            "seq",
+            "elapsed_ms",
+            "copying_elapsed_ms",
+            "setup_elapsed_ms",
+            "transfer_elapsed_ms",
+        ] {
             terminal.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(terminal["type"], "result");
@@ -1239,7 +1245,13 @@ fn small_push_refusals_and_failures_match_the_engine() {
                 .expect("copy timing");
             assert!(span <= terminal["elapsed_ms"].as_u64().unwrap());
         }
-        for key in ["seq", "elapsed_ms", "copying_elapsed_ms"] {
+        for key in [
+            "seq",
+            "elapsed_ms",
+            "copying_elapsed_ms",
+            "setup_elapsed_ms",
+            "transfer_elapsed_ms",
+        ] {
             terminal.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(terminal["type"], "result");

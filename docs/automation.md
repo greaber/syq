@@ -264,13 +264,28 @@ This observes destination state; it does not attest source completeness.
 Exactly one terminal record, always last when the stream completes. Common
 fields are `status`, `exit_code`, `dry_run`, `errors`, and `elapsed_ms`.
 
+Filesystem copies also report `setup_elapsed_ms` and `transfer_elapsed_ms` once
+file work begins. Setup includes connection establishment and preflight;
+helper installation is excluded. Transfer time starts with the first file work
+after its connections are ready and includes the remaining planning, copying, finalization,
+and any later connections or retries. Planning can overlap setup. The progress
+bar, summary, and `--stats` use this transfer time. Progress records carry the
+same two fields, with transfer time advancing until completion. A copy with no
+file work reports zero transfer time.
+
+These fields are optional: older versions, setup failures, other copy engines,
+and receiver-attested terminals may omit them. `elapsed_ms` keeps its existing
+whole-run meaning, including installation and setup measured by the coordinator;
+it is not a measurement of the entire process lifetime.
+
 Copy terminals may also include `copying_elapsed_ms`: the wall-clock span from
 first file work to last completed file work across workers, including per-file
 checks, finalization and gaps. Initial setup before file work is excluded;
 planning and connections can overlap this interval. It is not a sum of worker
 times or pure network time. The field is absent when no bytes moved or the
 coordinator does not supply it, including older releases and attested terminals.
-Use `elapsed_ms` for end-to-end throughput comparisons.
+Use `transfer_elapsed_ms` for the summary's transfer rate and `elapsed_ms` for
+comparisons that include setup.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs

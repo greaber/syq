@@ -871,7 +871,7 @@ fn attempt_small_copy(
     let _native_work = native_actor
         .as_ref()
         .map(|actor| actor.span(crate::transfer_observations::Stage::Work));
-    let copying = progress.copying_interval();
+    let mut copying = None;
     let mut source_reader = None;
     // Preparation selects the destination directory on the receiver. After
     // that, a rejected copy leaves the session changed, so it cannot decline.
@@ -917,6 +917,7 @@ fn attempt_small_copy(
                     return Ok(SmallCopy::Reconnect);
                 }
             }
+            copying = Some(progress.copying_interval());
             let mut blocks = if reads.is_empty() {
                 Vec::new()
             } else {
@@ -1176,6 +1177,7 @@ fn attempt_small_copy(
         ("success", 0)
     };
     drop(copying);
+    progress.finish_transfer();
     let terminal = crate::results::ResultRecord {
         status,
         exit_code,
@@ -1191,6 +1193,8 @@ fn attempt_small_copy(
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         copying_elapsed_ms: progress.copying_elapsed_ms(),
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
+        setup_elapsed_ms: progress.setup_elapsed_ms(),
+        transfer_elapsed_ms: progress.transfer_elapsed_ms(),
         deletions_planned: None,
         deletions_completed: None,
         deletions_blocked: None,
@@ -1203,7 +1207,7 @@ fn attempt_small_copy(
     }
     drop(_native_work);
     progress.finish(exit_code == 0);
-    let elapsed = progress.start.elapsed().as_secs_f64();
+    let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(&terminal, elapsed, "");
     }
@@ -1238,6 +1242,12 @@ fn show_statistics(args: &Args) -> bool {
 /// aborted: the interval is a fact about the data that did move.
 fn print_copying_interval(args: &Args, opts: &Opts, progress: &Progress) {
     if args.stats && show_statistics(args) && !args.quiet && !opts.dry_run {
+        if let Some(ms) = progress.setup_elapsed_ms() {
+            crate::output::human_stdout!(
+                "  initial setup: {:.3}s (excludes helper installation)",
+                ms as f64 / 1000.0
+            );
+        }
         if let Some(ms) = progress.copying_elapsed_ms() {
             crate::output::human_stdout!(
                 "  copying interval: {:.3}s (may overlap planning)",
@@ -1407,7 +1417,7 @@ pub fn run(mut args: Args) -> Result<i32> {
     // failure in this process settles with a terminal record (spec: automation
     // results). A successful exec hands that responsibility to the helper.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;
-    let progress = Progress::new(show_progress, args.progress, args.width);
+    let progress = Progress::new_transfer(show_progress, args.progress, args.width);
     if args.stats || debug() {
         progress
             .observations
@@ -1485,6 +1495,8 @@ pub fn run(mut args: Args) -> Result<i32> {
                     progress.copying_elapsed_ms()
                 },
                 elapsed_ms: progress.start.elapsed().as_millis() as u64,
+                setup_elapsed_ms: progress.setup_elapsed_ms(),
+                transfer_elapsed_ms: progress.transfer_elapsed_ms(),
                 // What the deletion pass did before the run died; zeros
                 // mean it never got that far, and status "failed" already
                 // marks every aggregate here as pre-failure state.
@@ -1981,6 +1993,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let src_ctl = t
             .join()
             .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
+        progress.exclude_setup_intervals([&src_ep, &dst_ep].into_iter().filter_map(|ep| {
+            real_remote_spec(ep).and_then(|spec| spec.diagnostics().helper_installation)
+        }));
         match (src_ctl, dst_ctl) {
             (Ok((a, sources)), Ok(b)) => (a, sources, b),
             (Err(e), _) | (_, Err(e)) => {
@@ -3823,6 +3838,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         ("success", 0)
     };
+    // No scheduled file work (for example an unchanged tree) has a zero
+    // transfer interval; all of its work belongs to setup.
+    progress.begin_transfer();
     progress.finish(exit_code == 0);
     let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
         let planned = match delete_plan {
@@ -3872,6 +3890,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             progress.copying_elapsed_ms()
         },
         elapsed_ms: progress.start.elapsed().as_millis() as u64,
+        setup_elapsed_ms: progress.setup_elapsed_ms(),
+        transfer_elapsed_ms: progress.transfer_elapsed_ms(),
         deletions_planned,
         deletions_completed,
         deletions_blocked,
@@ -3900,7 +3920,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
-    let elapsed = progress.start.elapsed().as_secs_f64();
+    let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !aborted && !args.suppress_summary {
         if opts.dry_run {
             if args.verbose > 0 && dry_run_creates_root {

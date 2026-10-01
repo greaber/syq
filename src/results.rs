@@ -104,6 +104,8 @@ pub struct ProgressRecord<'a> {
     pub scanned: u64,
     pub scan_done: bool,
     pub elapsed_ms: u64,
+    pub setup_elapsed_ms: Option<u64>,
+    pub transfer_elapsed_ms: Option<u64>,
     pub rate_bytes_per_second: u64,
     pub eta_ms: Option<u64>,
 }
@@ -151,6 +153,8 @@ pub struct ResultRecord {
     pub bytes_unchanged: u64,
     pub copying_elapsed_ms: Option<u64>,
     pub elapsed_ms: u64,
+    pub setup_elapsed_ms: Option<u64>,
+    pub transfer_elapsed_ms: Option<u64>,
     /// `--prune` runs only; None keeps the fields out of the record.
     pub deletions_planned: Option<u64>,
     pub deletions_completed: Option<u64>,
@@ -409,6 +413,12 @@ impl ResultsWriter {
             "elapsed_ms": progress.elapsed_ms,
             "rate_bytes_per_second": progress.rate_bytes_per_second,
         });
+        if let Some(ms) = progress.setup_elapsed_ms {
+            record["setup_elapsed_ms"] = ms.into();
+        }
+        if let Some(ms) = progress.transfer_elapsed_ms {
+            record["transfer_elapsed_ms"] = ms.into();
+        }
         if let Some(eta_ms) = progress.eta_ms {
             record["eta_ms"] = eta_ms.into();
         }
@@ -642,6 +652,12 @@ impl ResultsWriter {
         if let Some(known) = known {
             object.insert("bytes_total_known".into(), known.into());
         }
+        if let Some(ms) = result.setup_elapsed_ms {
+            object.insert("setup_elapsed_ms".into(), ms.into());
+        }
+        if let Some(ms) = result.transfer_elapsed_ms {
+            object.insert("transfer_elapsed_ms".into(), ms.into());
+        }
         if let Some(ms) = result.copying_elapsed_ms {
             object.insert("copying_elapsed_ms".into(), ms.into());
         }
@@ -818,6 +834,8 @@ mod tests {
             bytes_unchanged: 0,
             copying_elapsed_ms: None,
             elapsed_ms: 0,
+            setup_elapsed_ms: None,
+            transfer_elapsed_ms: None,
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,
@@ -836,6 +854,8 @@ mod tests {
             scanned: 1,
             scan_done: true,
             elapsed_ms: 1,
+            setup_elapsed_ms: None,
+            transfer_elapsed_ms: None,
             rate_bytes_per_second: 0,
             eta_ms: None,
         });
@@ -854,6 +874,8 @@ mod tests {
             bytes_unchanged: 0,
             copying_elapsed_ms: None,
             elapsed_ms: 0,
+            setup_elapsed_ms: None,
+            transfer_elapsed_ms: None,
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,

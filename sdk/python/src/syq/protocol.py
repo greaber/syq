@@ -380,6 +380,8 @@ class AutomationDecoder:
                 activity=record.get("activity"),
                 rate_bytes_per_second=_optional_integer(record, "rate_bytes_per_second"),
                 eta_ms=_optional_integer(record, "eta_ms"),
+                setup_elapsed_ms=_optional_integer(record, "setup_elapsed_ms"),
+                transfer_elapsed_ms=_optional_integer(record, "transfer_elapsed_ms"),
             )
         if record_type == "trace":
             if self.run.mode != "cp":
@@ -904,6 +906,8 @@ class AutomationDecoder:
             result = CpResult(
                 **common,
                 bytes_total_known=_boolean(record, "bytes_total_known") if "bytes_total_known" in record else None,
+                setup_elapsed_ms=_optional_integer(record, "setup_elapsed_ms"),
+                transfer_elapsed_ms=_optional_integer(record, "transfer_elapsed_ms"),
                 status=status,
                 exit_code=exit_code,
                 dry_run=dry_run,
