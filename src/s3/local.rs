@@ -323,13 +323,17 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
         }
         let mut stack = vec![(source, selection == SourceSelection::Contents, true)];
         while let Some((mut source, contents, selected_root)) = stack.pop() {
-            // Like a filesystem scan, match descendants relative to the selected
-            // directory. Explicit sources (including mapping entries) are roots.
-            if !selected_root
-                && matcher.as_ref().is_some_and(|m| {
+            // Directory roots restart anchoring; explicit leaves match their
+            // source basename, independently of destination placement.
+            let ignored = if selected_root {
+                source.kind() != ObjectKind::Dir
+                    && crate::scan::selected_file_is_ignored(matcher.as_ref(), &source.label)
+            } else {
+                matcher.as_ref().is_some_and(|m| {
                     crate::scan::path_is_ignored(m, &source.path, source.kind() == ObjectKind::Dir)
                 })
-            {
+            };
+            if ignored {
                 prune.protect(source.key.as_bytes());
                 continue;
             }

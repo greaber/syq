@@ -981,6 +981,24 @@ for coordinator in src dst local; do
     ssh destination "test \"\$(cat /tmp/syq-real-ssh/expressions-$coordinator/sub/keep)\" = selected; test ! -e /tmp/syq-real-ssh/expressions-$coordinator/sub/tiny"
 done
 
+printf 'case: explicit file ignores on source, destination, and local coordinators\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/ignore-source; printf selected > /tmp/syq-real-ssh/ignore-source/report.txt'
+for coordinator in src dst local; do
+    set --
+    if [ "$coordinator" = dst ]; then set -- --peer-auth broker; fi
+    syq cp "$@" --from source /tmp/syq-real-ssh/ignore-source/report.txt \
+        --to destination --as "/tmp/syq-real-ssh/ignore-$coordinator" \
+        --coordinate-at "$coordinator" --no-progress --ignore '*.txt'
+    # These paths are controlled fixtures selected by this loop.
+    # shellcheck disable=SC2029
+    ssh destination "test ! -e /tmp/syq-real-ssh/ignore-$coordinator"
+    syq cp "$@" --from source /tmp/syq-real-ssh/ignore-source/report.txt \
+        --to destination --as "/tmp/syq-real-ssh/ignore-$coordinator" \
+        --coordinate-at "$coordinator" --no-progress --ignore '*.txt' --ignore '!report.txt'
+    # shellcheck disable=SC2029
+    ssh destination "test \"\$(cat /tmp/syq-real-ssh/ignore-$coordinator)\" = selected"
+done
+
 printf 'case: restricted expressions preserve container permissions and inheritance\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expression-modes/new /tmp/syq-real-ssh/expression-modes/old; printf selected > /tmp/syq-real-ssh/expression-modes/new/keep; printf selected > /tmp/syq-real-ssh/expression-modes/old/keep; chmod 710 /tmp/syq-real-ssh/expression-modes/new'
 for preservation in default permissions; do

@@ -90,10 +90,39 @@ def check_source_roots():
                     'project-a', 'project-a/build', '--into', overlap, '--ignore', '/build/'])
         assert not (overlap / 'project-a/build').exists()
         assert (overlap / 'build/secret').read_bytes() == b'excluded'
-        selected_file = root / 'selected-file'
-        checks.run(['--from', remote, '-C', original, 'project-a/build/secret',
-                    '--as', selected_file, '--ignore', '*'])
-        assert selected_file.read_bytes() == b'excluded'
+        # Explicit leaves use the source basename on every route, including
+        # when the target is renamed and the source has an ignored parent name.
+        for case, rules, included in [
+            ('all', ['*'], False), ('anchored', ['/secret'], False),
+            ('parent', ['build/'], True), ('negated', ['*', '!secret'], True),
+            ('destination', ['renamed'], True),
+        ]:
+            options = ['--if-exists=update']
+            for rule in rules:
+                options += ['--ignore', rule]
+            expected_file = b'excluded' if included else b'old'
+            for route in ['local', 'uploaded', 'downloaded', 'copied']:
+                destination = root / case / route / 'renamed'
+                key = f'{prefix}/files/{case}/{route}/renamed'
+                to_s3 = route in ('uploaded', 'copied')
+                if to_s3:
+                    checks.request('PUT', key, b'old')
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(b'old')
+                if route in ('downloaded', 'copied'):
+                    args = ['--from', remote, '-C', original, 'project-a/build/secret']
+                else:
+                    args = [source / 'project-a/build/secret']
+                args += ['--to', remote, '--as', key] if to_s3 else ['--as', destination]
+                args += options
+                if route == 'local':
+                    subprocess.run([checks.SYQ, 'cp', '--no-progress', *map(str, args)],
+                                   check=True, timeout=180)
+                else:
+                    checks.run(args)
+                actual = checks.request('GET', key)[1] if to_s3 else destination.read_bytes()
+                assert actual == expected_file, (case, route, actual, expected_file)
     print('Ignore roots and prune protection agree across local and S3 routes', flush=True)
 
 

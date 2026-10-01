@@ -1824,7 +1824,7 @@ impl Engine {
             } else {
                 (exact.await?, None)
             };
-            let already_filtered = self.args.native_mapping.is_none() && exact.is_none();
+            let from_listing = self.args.native_mapping.is_none() && exact.is_none();
             if self.args.native_mapping.is_some() {
                 // Mapping entries name individual objects. A directory entry
                 // copies its marker, while explicit child entries copy children.
@@ -1936,7 +1936,12 @@ impl Engine {
                 };
             for object in objects {
                 let (key, size, path, kind, directory, service_time, source_object) = object?;
-                if !directory && (size < min || size > max) {
+                if !directory
+                    && ((!from_listing
+                        && crate::scan::selected_file_is_ignored(matcher.as_ref(), key.as_bytes()))
+                        || size < min
+                        || size > max)
+                {
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     prune.protect(path.as_bytes());
                     continue;
@@ -1944,7 +1949,7 @@ impl Engine {
                 if path.is_empty() && !directory {
                     bail!("cannot replace the destination directory with an object");
                 }
-                if same_bucket && !already_filtered {
+                if same_bucket && !from_listing {
                     copy_sources.push((key.clone(), false));
                     copy_targets.push((
                         if directory {

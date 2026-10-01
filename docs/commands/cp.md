@@ -36,7 +36,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--src-dirs <DIR>...` | Select several named source directories |
 | `--srcs <PATH>...` | Select several named source objects |
 | `--where <EXPR>` | Select non-directory source entries with a typed expression; directories follow normal copy rules |
-| `--ignore <PATTERN>` | Skip paths within each source root using a gitignore-style pattern (repeatable) |
+| `--ignore <PATTERN>` | Skip directory-relative paths or explicit source basenames using a gitignore-style pattern (repeatable) |
 | `--ignore-from <FILE>` | Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order) |
 | `[PATH]...` | Named source objects (shorthand for --src) |
 
@@ -54,7 +54,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--as <PATH>` | Map one named source exactly to PATH; never follow its final entry |
 | `--as-new <PATH>` | Map one named source exactly to PATH; its final entry must not exist and is never followed |
 | `--as-existing <PATH>` | Map one named source exactly to PATH; its final entry must exist and is never followed |
-| `--mapping <FILE>` | Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before destination changes, instead of selecting sources; entry src paths are relative to -C and dst paths are relative to the --into container |
+| `--mapping <FILE>` | Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before destination changes, instead of selecting sources; entry src paths are relative to -C and dst paths are relative to the --into container. Filter the mapping entries themselves instead of combining this with --ignore or --ignore-from |
 
 <a id="copy-policy-and-filtering"></a>
 

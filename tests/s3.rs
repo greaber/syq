@@ -4101,6 +4101,24 @@ fn s3_ignore_anchoring_restarts_at_each_selected_source() {
             2,
         ),
         (
+            "listing-exact",
+            vec!["data/archive/a", "data/archive/b"],
+            "/a",
+            true,
+            1,
+            1,
+            2,
+        ),
+        (
+            "listing-exact",
+            vec!["data/archive/a", "data/archive/b"],
+            "*",
+            true,
+            2,
+            0,
+            2,
+        ),
+        (
             "listing-empty",
             vec!["--srcs-in", "data"],
             "data/",
@@ -5173,7 +5191,7 @@ fn server_copy_multipart_preserves_tag_characters() {
 }
 
 #[test]
-fn server_copy_ignore_does_not_hide_exact_or_mapping_overlap() {
+fn server_copy_ignore_filters_exact_sources_and_rejects_mappings() {
     for mapping in [false, true] {
         for filter in [None, Some(("--ignore", "original"))] {
             let server = Server::start("server-copy");
@@ -5204,11 +5222,17 @@ fn server_copy_ignore_does_not_hide_exact_or_mapping_overlap() {
             }
             let output = server.cp(temp.path(), &args);
             let diagnostic = output_text(&output);
-            assert!(
-                !output.status.success(),
+            assert_eq!(
+                output.status.success(),
+                !mapping && filter.is_some(),
                 "mapping={mapping}, filter={filter:?}: {diagnostic}"
             );
-            assert!(diagnostic.contains("overlap"), "{diagnostic}");
+            if mapping && filter.is_some() {
+                assert!(diagnostic.contains("cannot be used with"), "{diagnostic}");
+                assert_eq!(server.requests.load(Ordering::Relaxed), 0);
+            } else if filter.is_none() {
+                assert!(diagnostic.contains("overlap"), "{diagnostic}");
+            }
         }
     }
 }

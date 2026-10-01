@@ -176,13 +176,14 @@ def check():
             assert error.code == 404, error
         else:
             raise AssertionError('foreign descendant survived prune')
-        # Ignore rules do not exclude explicitly selected files.
+        # Explicit files match their source basename and leave old data intact.
+        c.request('PUT', name + '-copy', b'ignore-protected')
         c.run(['--from', remote, name, '--to', remote, '--as-existing', name + '-copy',
                '--ignore=*'])
         local_file = root / 'filtered-file'
         local_file.write_bytes(b'filtered')
         c.run([local_file, '--to', remote, '--as-existing', name + '-copy', '--ignore=*'])
-        assert c.request('GET', name + '-copy')[1] == b'filtered'
+        assert c.request('GET', name + '-copy')[1] == b'ignore-protected'
         # Exact target keys may prefix another source key without overwriting it.
         mapped = c.PREFIX + '/exact-map'
         c.request('PUT', mapped + '/source', b'first')

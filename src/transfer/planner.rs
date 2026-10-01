@@ -588,6 +588,21 @@ impl Planner<'_> {
                                 }
                             },
                         });
+                        if root.kind != Kind::Dir
+                            && selection != SourceSelection::Rsync
+                            && crate::scan::selected_file_is_ignored(
+                                crate::scan::build_ignore(&ignore)?.as_ref(),
+                                src_root,
+                            )
+                        {
+                            pl.progress.files_excluded.fetch_add(1, Relaxed);
+                            pl.progress.paths_ignored.fetch_add(1, Relaxed);
+                            pl.dst_seen
+                                .entry(join(dst_root, &sub))
+                                .or_insert(Claim::Weak);
+                            skip_all = true;
+                            return Ok(());
+                        }
                         if root.kind == Kind::Dir && !pl.opts.recursive {
                             if !pl.opts.quiet {
                                 pl.progress
