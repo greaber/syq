@@ -266,7 +266,7 @@ impl Summary {
             Details::Copy { .. } => {
                 let (_, directory) = self.title_and_directory();
                 let verb = if self.remote {
-                    "wants to copy, using your SSH access,"
+                    "wants to copy"
                 } else {
                     "wants to download"
                 };
@@ -1028,7 +1028,7 @@ mod tests {
         )
         .unwrap();
         assert!(remote.desktop_description(false).starts_with(&format!(
-            "wants to copy, using your SSH access,\n\n    rt-bench/dbg\n\nto\n\n    backup:{}\n\n",
+            "wants to copy\n\n    rt-bench/dbg\n\nto\n\n    backup:{}\n\n",
             path.display()
         )));
         assert!(remote
