@@ -226,7 +226,10 @@ pub(super) fn broker(
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
         name: "laptop".into(),
         identity_key: identity::generate_key().unwrap(),
-        requester: "test-server".into(),
+        requester: crate::receive_approval::Requester {
+            server: "test-server".into(),
+            profile: "test".into(),
+        },
         auto_approve_root: Some(root.into()),
         notifications: crate::receive_approval::Notifications::Off,
         approvals: Arc::new(crate::receive_approval::Queue::default()),

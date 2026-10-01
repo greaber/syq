@@ -918,7 +918,7 @@ struct Receiver {
     tcp_peer: crate::conn::RemoteSpec,
     name: String,
     identity_key: ssh_key::PrivateKey,
-    requester: String,
+    requester: crate::receive_approval::Requester,
     auto_approve_root: Option<PathBuf>,
     notifications: crate::receive_approval::Notifications,
     approvals: Arc<crate::receive_approval::Queue>,
@@ -1247,11 +1247,10 @@ pub(crate) fn serve_background(
         tcp_peer,
         name: config.name.clone(),
         identity_key: identity::load_key()?,
-        requester: format!(
-            "{} (receiving profile @{})",
-            spec.endpoint.label(),
-            config.name
-        ),
+        requester: crate::receive_approval::Requester {
+            server: spec.endpoint.label(),
+            profile: config.name.clone(),
+        },
         auto_approve_root: config.auto_approve_root.clone(),
         notifications: config.notifications,
         approvals,

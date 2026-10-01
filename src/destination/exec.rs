@@ -182,7 +182,7 @@ impl Receiver {
         write_message(&mut stream, &Reply::Ready)?;
         let result = execute_command(&request, &cwd, socket.try_clone()?, cancelled);
         if let Err(error) = &result {
-            crate::output::diagnostic!("syq: command from {:?}: {error:#}", self.requester);
+            crate::output::diagnostic!("syq: command from {}: {error:#}", self.requester);
         }
         result
     }
