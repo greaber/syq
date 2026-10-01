@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod batch_progress;
 pub(crate) use batch_progress::BatchProgress;
+#[cfg(test)]
+pub(crate) use batch_progress::BatchReceipts;
 mod bootstrap;
 mod local;
 mod reverse_tcp;

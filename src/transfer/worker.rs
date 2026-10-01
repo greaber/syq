@@ -419,14 +419,20 @@ impl Worker {
                     && reads.len() < read_window
                 {
                     let started = std::time::Instant::now();
-                    let oldest = reads
-                        .front()
-                        .map(|r| r.2)
-                        .into_iter()
-                        .chain(writes.front().map(|w| w.1))
-                        .min();
-                    if adaptive && self.batch_budget.overdue(started, oldest) {
-                        break;
+                    if adaptive {
+                        // Replies may already be queued while we receive source
+                        // data. Only unacknowledged writes can stall refill;
+                        // arrived replies still get validated when consumed.
+                        let received = early.as_ref().map_or(0, |scope| scope.received_count());
+                        let oldest = reads
+                            .front()
+                            .map(|r| r.2)
+                            .into_iter()
+                            .chain(writes.get(received).map(|w| w.1))
+                            .min();
+                        if self.batch_budget.overdue(started, oldest) {
+                            break;
+                        }
                     }
                     let limit = if adaptive {
                         self.batch_budget.limit()

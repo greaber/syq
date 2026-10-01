@@ -85,11 +85,24 @@ struct PipelineState {
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
     auto_small_size: Option<u64>,
+    immediate_batch_receipts: Option<Arc<crate::conn::BatchReceipts>>,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
 
 impl Conn for PipelineConn {
+    fn track_small_batches(
+        &mut self,
+        progress: Arc<Progress>,
+    ) -> Result<Option<crate::conn::BatchProgress>> {
+        self.0
+            .lock()
+            .unwrap()
+            .immediate_batch_receipts
+            .as_ref()
+            .map(|receipts| receipts.begin(progress))
+            .transpose()
+    }
     fn supports_request_pipelining(&self) -> bool {
         {
             let state = self.0.lock().unwrap();
@@ -144,6 +157,10 @@ impl Conn for PipelineConn {
                 ),
                 other => panic!("unexpected automatic small-batch request {other:?}"),
             };
+            if let Some(receipts) = &state.immediate_batch_receipts {
+                receipts.request(&request)?;
+                receipts.response(&response);
+            }
             state.replies.push_back(response);
         }
         if state.auto_ranges {
@@ -3126,6 +3143,113 @@ fn aged_batch_requests_drain_before_refill_at_either_endpoint() {
         assert!(source.replies.is_empty());
         assert!(dst.lock().unwrap().replies.is_empty());
     }
+}
+
+#[test]
+fn acknowledged_batch_writes_do_not_stall_source_refill() {
+    let size = 32 << 10;
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_small_size: Some(size),
+        latency: Some(std::time::Duration::from_millis(150)),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_small_size: Some(size),
+        immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
+    Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+    let jobs: Vec<_> = (0..20)
+        .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
+        .collect();
+    let mut next = 0;
+    let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+    worker
+        .transfer_small_batches(
+            &jobs,
+            |_| {
+                if next == jobs.len() {
+                    return None;
+                }
+                let group = next..next + 1;
+                next += 1;
+                Some(group)
+            },
+            &mut results,
+        )
+        .unwrap();
+    let source = src.lock().unwrap();
+    assert_eq!(
+        source.sent_at_receive,
+        (0..jobs.len())
+            .map(|i| (i + 4).min(jobs.len()))
+            .collect::<Vec<_>>(),
+        "source reads stay pipelined: queued but acknowledged writes are not overdue"
+    );
+    assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
+    assert_eq!(
+        worker.progress.bytes_done.load(Relaxed),
+        size * jobs.len() as u64
+    );
+    assert!(source.replies.is_empty());
+    assert!(dst.lock().unwrap().replies.is_empty());
+}
+
+#[test]
+fn aborted_batches_stop_claiming_groups_and_drain_issued_requests() {
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    let size = 1024;
+    for i in 0..512 {
+        sched.push_file(pipeline_job(format!("file{i}").as_bytes(), size));
+    }
+    sched.scan_done();
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_small_size: Some(size),
+        abort_on_receive: Some(sched.clone()),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_small_size: Some(size),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.tuning = Default::default();
+    opts.block = 4 << 20;
+    worker.fast_batch_files = 2048;
+    worker.process_item(sched.next()).unwrap();
+    assert!(sched.is_aborted());
+    let source = src.lock().unwrap();
+    let reads: Vec<_> = source
+        .requests
+        .iter()
+        .filter_map(|r| match r {
+            Request::ReadSmallBatch(reads) => Some(reads),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        4,
+        "abort prevents refilling the initial read window"
+    );
+    assert_eq!(reads.iter().map(|r| r.len()).sum::<usize>(), 256);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 256 * size);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 256);
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    assert!(source.replies.is_empty(), "issued source replies drained");
+    let destination = dst.lock().unwrap();
+    assert!(
+        destination.replies.is_empty(),
+        "issued destination replies drained"
+    );
+    assert_eq!(destination.received, destination.requests.len());
+    assert_eq!(
+        sched.tuning_work(1, 0, 0).unread_batch_files,
+        0,
+        "no leaked batch ownership"
+    );
 }
 
 #[test]

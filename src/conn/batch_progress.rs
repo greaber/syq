@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Default)]
-pub(super) struct BatchReceipts {
+pub(crate) struct BatchReceipts {
     enabled: AtomicBool,
     active: Mutex<Option<Active>>,
 }
@@ -28,7 +28,7 @@ struct Active {
 /// After a failed drain the connection must be discarded, as for other RPCs.
 pub(crate) struct BatchProgress(Arc<BatchReceipts>);
 impl BatchReceipts {
-    pub(super) fn begin(self: &Arc<Self>, progress: Arc<Progress>) -> Result<BatchProgress> {
+    pub(crate) fn begin(self: &Arc<Self>, progress: Arc<Progress>) -> Result<BatchProgress> {
         let mut active = self.active.lock().unwrap();
         anyhow::ensure!(active.is_none(), "batch progress already active");
         *active = Some(Active {
@@ -40,7 +40,7 @@ impl BatchReceipts {
         Ok(BatchProgress(self.clone()))
     }
 
-    pub(super) fn request(&self, request: &Request) -> Result<()> {
+    pub(crate) fn request(&self, request: &Request) -> Result<()> {
         if !self.enabled.load(Acquire) {
             return Ok(());
         }
@@ -57,7 +57,7 @@ impl BatchReceipts {
         Ok(())
     }
 
-    pub(super) fn response(&self, response: &Response) {
+    pub(crate) fn response(&self, response: &Response) {
         if !self.enabled.load(Acquire) {
             return;
         }
@@ -96,6 +96,19 @@ fn totals(sizes: &[u64], success: impl Iterator<Item = bool>) -> (u64, u64) {
         })
 }
 impl BatchProgress {
+    /// Number of oldest queued writes whose replies have arrived. They still
+    /// need normal validation and consumption, but are no longer outstanding.
+    pub(crate) fn received_count(&self) -> usize {
+        self.0
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("batch progress scope active")
+            .received
+            .len()
+    }
+
     /// Use receipt time for service estimates even if the worker was busy
     /// sending later groups before it consumed this reply.
     pub(crate) fn consume(&self) -> Result<Instant> {
@@ -197,6 +210,28 @@ mod tests {
         assert_eq!(consumed, recorded);
         assert!(before <= consumed && consumed <= after);
         assert!(scope.consume().is_err());
+    }
+
+    #[test]
+    fn received_count_tracks_the_unconsumed_prefix_including_rejections() {
+        let receipts = Arc::new(BatchReceipts::default());
+        let scope = receipts.begin(Progress::new(false, false, None)).unwrap();
+        for _ in 0..3 {
+            receipts.request(&test_request(&[32])).unwrap();
+        }
+        assert_eq!(scope.received_count(), 0);
+        receipts.response(&Response::Applied(vec![None]));
+        assert_eq!(scope.received_count(), 1);
+        receipts.response(&Response::Err("denied".into()));
+        assert_eq!(scope.received_count(), 2);
+        scope.consume().unwrap();
+        assert_eq!(scope.received_count(), 1);
+        scope.consume().unwrap();
+        assert_eq!(scope.received_count(), 0, "third write still outstanding");
+        receipts.response(&Response::Applied(vec![None]));
+        assert_eq!(scope.received_count(), 1);
+        scope.consume().unwrap();
+        assert_eq!(scope.received_count(), 0);
     }
 
     #[test]
