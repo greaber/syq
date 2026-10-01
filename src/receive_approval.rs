@@ -183,7 +183,9 @@ impl Summary {
         };
         // Sources stay as the command wrote them, relative to `cwd` on the
         // server; only the destination is resolved, by this machine.
-        let sources = crate::approval_command::parse(command)
+        let parsed = crate::approval_command::parse(command).ok();
+        let sources = parsed
+            .as_ref()
             .map(|args| {
                 let count = args.locations.len().saturating_sub(1);
                 args.locations
@@ -193,6 +195,7 @@ impl Summary {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let prunes = parsed.as_ref().is_some_and(|args| args.delete);
         let target = match remote {
             None => local_path(&request.copy.destination),
             Some(target) => crate::approval_command::display_arg(
@@ -204,7 +207,9 @@ impl Summary {
             from: format!("{:?}", from.to_string()),
             server: from.server.clone(),
             server_cwd: shown_directory(cwd),
-            verb: if remote.is_some() {
+            verb: if prunes {
+                "wants to sync"
+            } else if remote.is_some() {
                 "wants to copy"
             } else {
                 "wants to download"
@@ -466,16 +471,22 @@ fn storage_request(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let (removes, uploads, dry_run) = match &parsed {
+    let (removes, uploads, prunes, dry_run) = match &parsed {
         Some(args) => (
             args.rm,
             matches!(
                 args.s3.as_ref().map(|options| &options.route),
                 Some(crate::s3::Route::Upload | crate::s3::Route::ServerCopy { .. })
             ),
+            args.delete,
             args.dry_run,
         ),
-        None => (request.delete && !request.upload, request.upload, false),
+        None => (
+            request.delete && !request.upload,
+            request.upload,
+            false,
+            false,
+        ),
     };
     let storage = locations(&request.bucket, &request.scopes);
     let (verb, sources, preposition, target) = if removes {
@@ -487,6 +498,8 @@ fn storage_request(
             "to",
             storage.join("\n    "),
         )
+    } else if uploads && prunes {
+        ("wants to sync", local, "to", storage.join("\n    "))
     } else if uploads {
         ("wants to upload", local, "to", storage.join("\n    "))
     } else {
@@ -496,9 +509,6 @@ fn storage_request(
     let mut notes = Vec::new();
     if dry_run {
         notes.push("preview only".to_owned());
-    }
-    if uploads && !removes && parsed.as_ref().is_some_and(|args| args.delete) {
-        notes.push("removes files missing from the source".to_owned());
     }
     if request.delete
         && matches!(
@@ -1285,13 +1295,9 @@ mod tests {
             "runs",
             "--prune",
         ]);
-        assert_eq!(
-            storage_request(&pruning, &request).4,
-            [
-                "removes files missing from the source",
-                "endpoint https://storage.example"
-            ]
-        );
+        let (verb, _, _, _, notes) = storage_request(&pruning, &request);
+        assert_eq!(verb, "wants to sync");
+        assert_eq!(notes, ["endpoint https://storage.example"]);
         request.endpoint = None;
 
         // A dry run clears the request's write flags; the command still says
@@ -1438,6 +1444,27 @@ mod tests {
             "to\n\n    {}\n\nreplaces existing files\n\ndeletes up to 3 files or folders\n\nsyq cp file",
             file.display()
         )));
+        // Pruning is a sync, whichever way it goes.
+        let pruning: Vec<Vec<u8>> = ["cp", "file", "--to", "@laptop", "--as", "file", "--prune"]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let sync = Summary::new(&requester(), &pruning, "~", &request, TIMEOUT, None).unwrap();
+        assert!(sync
+            .desktop_description(false)
+            .starts_with("wants to sync\n\n    file\n\n"));
+        let sync = Summary::new(
+            &requester(),
+            &pruning,
+            "~",
+            &request,
+            TIMEOUT,
+            Some("backup"),
+        )
+        .unwrap();
+        assert!(sync
+            .desktop_description(false)
+            .starts_with("wants to sync\n\n"));
     }
     #[test]
     fn long_directories_move_from_the_title_to_the_body() {
