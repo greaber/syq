@@ -87,17 +87,30 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     handoff::maybe_exec(&selection)?;
     let registration = selection.registration;
     crate::output::diagnostic!("syq: requesting command permission from @{name}; approve on that machine with its desktop prompt or syq persist receive pending");
-    let (mut stream, reply) = exchange(
+    let (stream, reply) = exchange(
         &registration,
         Message::Exec(request),
         REQUEST_TIMEOUT + Duration::from_secs(10),
+        None,
     )?;
+    receive_approved_output(
+        stream,
+        reply,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+fn receive_approved_output(
+    mut stream: UnixStream,
+    reply: Reply,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<i32> {
     if !matches!(reply, Reply::Ready) {
         bail!("unexpected command approval response");
     }
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    receive_output(&mut stream, &mut std::io::stdout(), &mut std::io::stderr())
+    receive_output(&mut stream, stdout, stderr)
 }
 
 fn receive_output(
@@ -367,6 +380,32 @@ mod tests {
     }
 
     #[test]
+    fn completed_command_keeps_its_buffered_output_and_exit_status() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        write_message(&mut peer, &Reply::Ready).unwrap();
+        write_message(&mut peer, &Event::Stdout(b"finished\n".to_vec())).unwrap();
+        write_message(&mut peer, &Event::Stderr(b"diagnostic\n".to_vec())).unwrap();
+        write_message(
+            &mut peer,
+            &Event::Exited {
+                code: Some(17),
+                signal: None,
+            },
+        )
+        .unwrap();
+        // Force completion before the client handles readiness, without a sleep.
+        drop(peer);
+        let reply = read_message(&mut client).unwrap();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        assert_eq!(
+            receive_approved_output(client, reply, &mut stdout, &mut stderr).unwrap(),
+            17
+        );
+        assert_eq!(stdout, b"finished\n");
+        assert_eq!(stderr, b"diagnostic\n");
+    }
+
+    #[test]
     fn command_permission_is_distinct_from_copy_autoapproval_and_one_use() {
         let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) =
@@ -378,6 +417,7 @@ mod tests {
                     &registration,
                     Message::Exec(request("printf done > marker; printf output; exit 17")),
                     Duration::from_secs(5),
+                    Some(Duration::from_secs(5)),
                 )
             });
             let summary = pending(&receiver);
@@ -467,6 +507,7 @@ mod tests {
                     &registration,
                     Message::Exec(request(script)),
                     Duration::from_secs(5),
+                    Some(Duration::from_secs(5)),
                 )
             });
             let summary = pending(&receiver);
@@ -594,7 +635,13 @@ mod tests {
             super::super::tests::broker(root.path(), Approval::Always);
         let mut req = request("touch marker");
         req.argv[0].push(0);
-        assert!(exchange(&registration, Message::Exec(req), Duration::from_secs(2)).is_err());
+        assert!(exchange(
+            &registration,
+            Message::Exec(req),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2))
+        )
+        .is_err());
         assert!(receiver.approvals.snapshots().is_empty());
         assert!(!root.path().join("marker").exists());
     }

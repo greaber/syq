@@ -345,10 +345,20 @@ pub(crate) fn read_socket_message<T: DeserializeOwned>(
     })
 }
 
-fn connect_socket(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+fn connect_socket(
+    path: &Path,
+    deadline: Instant,
+    stream_timeout: Option<Duration>,
+) -> std::io::Result<UnixStream> {
     use socket2::{Domain, SockAddr, Socket, Type};
     deadline_remaining(deadline)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    // Configure subsequent I/O before connecting: even an immediate rejection
+    // may close the peer before connect returns on macOS.
+    if let Some(timeout) = stream_timeout {
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
+    }
     socket.set_nonblocking(true)?;
     // Unix stream connect completes immediately or fails. In particular,
     // Linux reports EAGAIN for a full listen queue, with no connection pending.
@@ -496,6 +506,7 @@ fn exchange(
     registration: &Registration,
     message: Message,
     timeout: Duration,
+    stream_timeout: Option<Duration>,
 ) -> Result<(UnixStream, Reply)> {
     if !matches!(message, Message::Ping | Message::Identify { .. })
         && registration.identity != crate::identity::build()
@@ -505,7 +516,7 @@ fn exchange(
         );
     }
     let deadline = Instant::now() + timeout;
-    let mut stream = connect_socket(&registration.socket, deadline).map_err(|error| {
+    let mut stream = connect_socket(&registration.socket, deadline, stream_timeout).map_err(|error| {
         let message = if error.kind() == std::io::ErrorKind::WouldBlock {
             "receiving machine is busy; try again shortly"
         } else {
@@ -513,10 +524,8 @@ fn exchange(
         };
         anyhow::Error::new(error).context(message)
     })?;
-    // Configure the next protocol phase before the peer can close after its
-    // reply. macOS may reject socket timeout changes after peer shutdown.
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    // The initial exchange has its own absolute deadline. stream_timeout
+    // controls later I/O without changing socket options after a peer reply.
     let mut io = DeadlineSocket {
         socket: &mut stream,
         deadline,
@@ -805,6 +814,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             request: Box::new(request),
         },
         REQUEST_TIMEOUT + Duration::from_secs(10),
+        None,
     )?;
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
@@ -836,12 +846,11 @@ pub(crate) fn connect(grant: &str, control: bool) -> Result<UnixStream> {
             control,
         },
         START_TIMEOUT,
+        None,
     )?;
     if !matches!(reply, Reply::Ready) {
         bail!("named transfer channel was not opened");
     }
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
     Ok(stream)
 }
 
@@ -1478,7 +1487,7 @@ fn register_inner(
         socket: socket.into(),
         secret: secret.into(),
     };
-    let (_, reply) = exchange(&registration, Message::Ping, handshake_timeout)?;
+    let (_, reply) = exchange(&registration, Message::Ping, handshake_timeout, None)?;
     if !matches!(reply, Reply::Ready) {
         bail!("receiving laptop handshake failed");
     }
@@ -1495,7 +1504,7 @@ fn register_inner(
         // A responsive holder is a duplicate, even when a copied home directory
         // gives both machines the same identity. Never replace a held lock.
         if read_registration(name).is_ok_and(|previous| {
-            exchange(&previous, Message::Ping, Duration::from_secs(1))
+            exchange(&previous, Message::Ping, Duration::from_secs(1), None)
                 .is_ok_and(|(_, reply)| matches!(reply, Reply::Ready))
         }) {
             bail!("destination @{name} is already connected; choose another receiver name to use both connections at the same time");
@@ -1545,7 +1554,7 @@ fn register_inner(
             return Err(error.into());
         }
         if ready == 0 {
-            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(10))?;
+            let (_, reply) = exchange(&registration, Message::Ping, Duration::from_secs(10), None)?;
             if !matches!(reply, Reply::Ready) {
                 bail!("return connection is no longer ready");
             }
@@ -1560,7 +1569,7 @@ fn available(name: &str, timeout: Duration) -> Result<Registration> {
     if let Some(owner) = identity::owner(&registry()?, name)? {
         identity::verify_receiver_with_timeout(name, &registration, Some(&owner), timeout)?;
     } else {
-        let (_, reply) = exchange(&registration, Message::Ping, timeout)?;
+        let (_, reply) = exchange(&registration, Message::Ping, timeout, None)?;
         if !matches!(reply, Reply::Ready) {
             bail!("destination not ready");
         }

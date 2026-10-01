@@ -536,15 +536,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
             destination: None, ..
         } => {}
     }
-    // All foreign descriptor claims and their close-on-exec setup are complete
-    // before readiness is acknowledged or this connection starts its reader.
-    w.write_msg(&Response::HelloOk {
-        identity: crate::identity::build().to_string(),
-        platform: crate::identity::platform(),
-        supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
-        ssh_worker_ticket: if is_control { ssh_worker_ticket } else { None },
-    })?;
-
+    // Configure the data phase before acknowledging Hello. The peer may
+    // send its final requests and close as soon as it sees HelloOk.
     if let Some(socket) = &tcp_socket {
         socket.set_read_timeout(None)?;
         socket.set_write_timeout(None)?;
@@ -553,6 +546,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
         socket.set_read_timeout(None)?;
         socket.set_write_timeout(None)?;
     }
+
+    // All foreign descriptor claims and their close-on-exec setup are complete
+    // before readiness is acknowledged or this connection starts its reader.
+    w.write_msg(&Response::HelloOk {
+        identity: crate::identity::build().to_string(),
+        platform: crate::identity::platform(),
+        supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
+        ssh_worker_ticket: if is_control { ssh_worker_ticket } else { None },
+    })?;
 
     if let Some(pending) = handshake_pending {
         pending.store(false, std::sync::atomic::Ordering::Release);
@@ -1465,7 +1467,7 @@ fn drop_after_handling_for_test(_request: &Request) -> bool {
 }
 
 /// Bound every socket read, including partial IDs and records, by the same
-/// Hello deadline. `serve` clears the shared socket timeout after HelloOk.
+/// Hello deadline. `serve` clears the shared socket timeout before HelloOk.
 struct TcpHandshakeReader {
     stream: TcpStream,
     pending: Arc<std::sync::atomic::AtomicBool>,

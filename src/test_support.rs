@@ -73,3 +73,100 @@ pub(crate) fn register_source_roots<P: AsRef<std::path::Path>>(
         independent_handoff_workers,
     }
 }
+
+/// Drain a Unix stream to EOF within a fixed deadline, without changing socket
+/// options or shared descriptor flags. The peer may already have closed it.
+pub(crate) fn read_until_closed(
+    stream: &std::os::unix::net::UnixStream,
+    timeout: std::time::Duration,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut bytes = [0u8; 4096];
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::TimedOut,
+                    "peer did not close before the deadline",
+                )
+            })?;
+        // Per-call nonblocking reads preserve the flags of any socket clones.
+        let count = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count == 0 {
+            return Ok(output);
+        }
+        if count > 0 {
+            output.extend_from_slice(&bytes[..count as usize]);
+            continue;
+        }
+        let error = Error::last_os_error();
+        match error.kind() {
+            ErrorKind::Interrupted => continue,
+            ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        let mut ready = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
+        if unsafe { libc::poll(&mut ready, 1, millis) } < 0 {
+            let error = Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+#[test]
+fn closed_socket_wait_preserves_buffered_bytes_and_socket_settings() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let flags = unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) };
+    peer.write_all(b"buffered reply").unwrap();
+    drop(peer);
+    assert_eq!(
+        read_until_closed(&client, Duration::from_secs(1)).unwrap(),
+        b"buffered reply"
+    );
+    assert_eq!(client.read_timeout().unwrap(), Some(Duration::from_secs(3)));
+    assert_eq!(
+        unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+}
+
+#[test]
+fn closed_socket_wait_times_out_while_peer_stays_open() {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    let (client, _peer) = UnixStream::pair().unwrap();
+    assert_eq!(
+        read_until_closed(&client, Duration::from_millis(20))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert_eq!(client.read_timeout().unwrap(), None);
+}

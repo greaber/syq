@@ -1458,3 +1458,157 @@ fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates()
     assert!(!failed.status.success());
     assert!(stderr_of(&failed).contains("duplicate receiving profile"));
 }
+
+#[test]
+fn receiving_daemon_survives_clients_closed_before_accept() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    fn wait_for(label: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut progress = Instant::now();
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            if Instant::now() >= progress {
+                eprintln!("Waiting for {label}");
+                progress = Instant::now() + Duration::from_secs(1);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn connect(path: &Path) -> std::io::Result<UnixStream> {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        socket.connect(&SockAddr::unix(path)?)?;
+        Ok(UnixStream::from(OwnedFd::from(socket)))
+    }
+    fn request(stream: &mut UnixStream, stop: bool) {
+        let bytes = serde_json::to_vec(&serde_json::json!({"version":2, "stop":stop})).unwrap();
+        stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(&bytes).unwrap();
+    }
+    fn response(stream: &mut UnixStream) -> serde_json::Value {
+        let mut length = [0; 4];
+        stream.read_exact(&mut length).unwrap();
+        let length = u32::from_be_bytes(length) as usize;
+        assert!(length < 1024 * 1024);
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime());
+        command
+    };
+    let enabled = command(&["persist", "on"]).run().unwrap();
+    assert_output_ok(&enabled);
+    let scope = String::from_utf8(enabled.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("scope: ").map(PathBuf::from))
+        .unwrap();
+    // Keep the real supervisor running without starting any SSH workers.
+    assert_output_ok(
+        &command(&["persist", "receive", "on", "--server", "other.invalid"])
+            .run()
+            .unwrap(),
+    );
+    let identity = command(&["--build-identity"]).run().unwrap();
+    assert_output_ok(&identity);
+    let identity = String::from_utf8(identity.stdout).unwrap();
+    let control = scope.join("cm-0123456789abcdef");
+    let socket_path = control.with_extension("recv");
+    let record = control.with_extension("recv-json");
+    fs::write(
+        &record,
+        serde_json::to_vec(&serde_json::json!({
+            "version":2, "identity":identity.trim(),
+            "endpoint":{"user":null, "host":"socket-test.invalid", "port":null},
+            "program":env!("CARGO_BIN_EXE_syq")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut daemon = crate::process_group::ProcessGroup::spawn(
+        command(&["--receive-service", control.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    )
+    .unwrap();
+    let pid = daemon.child.id() as libc::pid_t;
+    let mut first = None;
+    wait_for("receiving control socket", || {
+        assert!(
+            daemon.poll().unwrap().is_none(),
+            "receiving daemon exited during startup"
+        );
+        first = connect(&socket_path).ok();
+        first.is_some()
+    });
+    let mut first = first.unwrap();
+    request(&mut first, false);
+    assert_eq!(response(&mut first)["pid"], pid);
+    drop(first);
+
+    // Stop the owner before connecting, so every test client has already shut
+    // down when accept returns. Keeping their descriptors open preserves the
+    // queued connections on macOS; no sleep determines the interleaving.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    wait_for("receiving daemon to stop", || {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        info.si_signo != 0 && info.si_code == libc::CLD_STOPPED
+    });
+    let mut abandoned = Vec::new();
+    for partial in [false, true] {
+        let mut client = connect(&socket_path).unwrap();
+        if partial {
+            client.write_all(&[0, 0]).unwrap();
+        }
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        abandoned.push(client);
+    }
+    let mut healthy = connect(&socket_path).unwrap();
+    request(&mut healthy, false);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    assert_eq!(
+        response(&mut healthy)["pid"],
+        pid,
+        "same daemon must serve the next client"
+    );
+    assert!(daemon.poll().unwrap().is_none());
+    drop(abandoned);
+    let mut stop = connect(&socket_path).unwrap();
+    request(&mut stop, true);
+    assert_eq!(response(&mut stop)["pid"], pid);
+    wait_for("receiving daemon to exit", || {
+        daemon.poll().unwrap().is_some()
+    });
+    assert!(daemon.close().unwrap().success());
+    assert!(!socket_path.exists());
+}

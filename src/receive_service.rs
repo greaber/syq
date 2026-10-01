@@ -980,6 +980,12 @@ fn apply_preferences(config: &Preferences) -> Result<()> {
     Ok(())
 }
 
+fn read_control_request(client: &mut UnixStream) -> Result<LocalRequest> {
+    client.set_nonblocking(false)?;
+    client.set_write_timeout(Some(Duration::from_millis(200)))?;
+    crate::destination::read_socket_message(client, Duration::from_millis(200))
+}
+
 fn run(control: &Path) -> Result<()> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
@@ -1031,13 +1037,9 @@ fn run(control: &Path) -> Result<()> {
             }
             match listener.accept() {
                 Ok((mut client, _)) => {
-                    client.set_nonblocking(false)?;
-                    client.set_read_timeout(Some(Duration::from_millis(200)))?;
-                    client.set_write_timeout(Some(Duration::from_millis(200)))?;
-                    if let Ok(request) = crate::destination::read_socket_message::<LocalRequest>(
-                        &mut client,
-                        Duration::from_millis(200),
-                    ) {
+                    // A client may disconnect before accept or during setup.
+                    // Its socket errors must not stop the receiving service.
+                    if let Ok(request) = read_control_request(&mut client) {
                         if request.version == VERSION {
                             if request.stop {
                                 shutdown.store(true, Ordering::Release);

@@ -37,6 +37,7 @@ pub(crate) fn probe(
             congestion_control,
         }),
         START_TIMEOUT,
+        None,
     )?;
     match reply {
         Reply::TcpProbed(candidates) => Ok(candidates),
@@ -54,13 +55,10 @@ pub(crate) fn open(grant: &str, key: Vec<u8>) -> Result<UnixStream> {
             key,
         }),
         START_TIMEOUT,
+        None,
     )?;
     match reply {
-        Reply::Ready => {
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
-            Ok(stream)
-        }
+        Reply::Ready => Ok(stream),
         Reply::TcpCongestionRejected(error) => Err(crate::conn::TcpCongestionError(error).into()),
         _ => bail!("unexpected reverse TCP worker response"),
     }
@@ -171,10 +169,10 @@ impl Receiver {
         let mut proof = vec![0; 16];
         crate::tcp_records::Cipher::new(&request.key, 0, 0).seal_in_place(&mut proof);
         socket.write_all(&proof)?;
-        write_message(&mut channel, &Reply::Ready)?;
         let lifetime = channel.try_clone()?;
         lifetime.set_read_timeout(None)?;
         lifetime.set_write_timeout(None)?;
+        write_message(&mut channel, &Reply::Ready)?;
         let mut watch_channel = channel.try_clone()?;
         let watch_socket = socket.try_clone()?;
         let serve_channel = lifetime.try_clone()?;
