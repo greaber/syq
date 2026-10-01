@@ -493,15 +493,26 @@ fn storage_request(
         ("wants to delete", storage, "", String::new())
     } else if let Some(source) = &request.source {
         (
-            "wants to copy",
+            if prunes {
+                "wants to sync"
+            } else {
+                "wants to copy"
+            },
             locations(&source.bucket, &source.scopes),
             "to",
             storage.join("\n    "),
         )
-    } else if uploads && prunes {
-        ("wants to sync", local, "to", storage.join("\n    "))
     } else if uploads {
-        ("wants to upload", local, "to", storage.join("\n    "))
+        (
+            if prunes {
+                "wants to sync"
+            } else {
+                "wants to upload"
+            },
+            local,
+            "to",
+            storage.join("\n    "),
+        )
     } else {
         let destination = local.last().cloned().unwrap_or_default();
         ("wants to download", storage, "to", destination)
@@ -1298,6 +1309,40 @@ mod tests {
         let (verb, _, _, _, notes) = storage_request(&pruning, &request);
         assert_eq!(verb, "wants to sync");
         assert_eq!(notes, ["endpoint https://storage.example"]);
+        // A copy between buckets prunes too.
+        let mut between = request.clone();
+        between.source = Some(crate::s3::authorization::ReadAccess {
+            bucket: "source".into(),
+            scopes: vec![scope("tree")],
+        });
+        let mirror = command(&[
+            "cp",
+            "--srcs-in",
+            "tree",
+            "--from",
+            "s3://source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--prune",
+        ]);
+        let (verb, sources, _, target, _) = storage_request(&mirror, &between);
+        assert_eq!(verb, "wants to sync");
+        assert_eq!(sources, ["s3://source/tree"]);
+        assert_eq!(target, "s3://bucket/runs");
+        let plain = command(&[
+            "cp",
+            "--srcs-in",
+            "tree",
+            "--from",
+            "s3://source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+        ]);
+        assert_eq!(storage_request(&plain, &between).0, "wants to copy");
         request.endpoint = None;
 
         // A dry run clears the request's write flags; the command still says
