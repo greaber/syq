@@ -11,7 +11,26 @@ pub(super) fn try_clone(input: &File, output: &File, len: u64) -> bool {
     if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
         return false;
     }
-    crate::local_copy::try_clone(input, output, len)
+    if crate::local_copy::try_clone(input, output, len) {
+        return true;
+    }
+    if io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
+        return false;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let Ok(donor) = input.metadata() else {
+        return false;
+    };
+    // A shortened final block may not be cloneable. The preferred I/O size is
+    // only an alignment hint: try one rounded range, then keep the ordinary
+    // fallback if the filesystem refuses it. Never clone the discarded suffix
+    // of a much larger donor. Both callers set the private output's final length
+    // before comparing or exposing any of these bytes.
+    let Some(rounded) = len.checked_next_multiple_of(donor.blksize().max(1)) else {
+        return false;
+    };
+    let rounded = rounded.min(donor.len());
+    rounded > len && crate::local_copy::try_clone(input, output, rounded)
 }
 
 pub(super) fn seed(
@@ -149,6 +168,62 @@ fn buffered(input: &File, output: &File, mut off: u64, end: u64) -> io::Result<(
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shorter_basis_keeps_only_the_requested_prefix_and_survives_donor_changes() {
+        for sparse in [false, true] {
+            let tree = crate::test_support::tempdir().unwrap();
+            let input = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(tree.path().join("input"))
+                .unwrap();
+            let length = (8 << 20) + 123;
+            let mut original = vec![0; length];
+            if !sparse {
+                original.fill(17);
+            }
+            original[..5].copy_from_slice(b"start");
+            original[(4 << 20)..(4 << 20) + 17].fill(23);
+            input.set_len(length as u64).unwrap();
+            crate::sparse::write_at(&input, &original, 0, false).unwrap();
+            input.sync_all().unwrap();
+            let probe = File::create(tree.path().join("probe")).unwrap();
+            let clones_supported = crate::local_copy::try_clone(&input, &probe, length as u64);
+            drop(probe);
+            for wanted in [(4 << 20), (4 << 20) + 17, length - 1, length] {
+                let output = File::options()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(tree.path().join(format!("output-{wanted}")))
+                    .unwrap();
+                let cloned = try_clone(&input, &output, wanted as u64);
+                if clones_supported {
+                    assert!(cloned, "cloneable filesystem rejected prefix {wanted}");
+                    let actual = output.metadata().unwrap().len();
+                    assert!(actual >= wanted as u64 && actual <= length as u64);
+                    assert!(actual - wanted as u64 < input.metadata().unwrap().blksize());
+                } else {
+                    seed(&input, &output, wanted as u64, || Ok(())).unwrap();
+                }
+                // This is the same length boundary imposed by StageBasis.
+                output.set_len(wanted as u64).unwrap();
+                input.write_all_at(b"other", 0).unwrap();
+                let mut actual = vec![0; wanted];
+                output.read_exact_at(&mut actual, 0).unwrap();
+                assert_eq!(actual, original[..wanted]);
+                assert_eq!(output.metadata().unwrap().len(), wanted as u64);
+                if sparse && input.metadata().unwrap().blocks() * 512 < wanted as u64 / 2 {
+                    assert!(output.metadata().unwrap().blocks() * 512 < wanted as u64 / 2);
+                }
+                input.write_all_at(b"start", 0).unwrap();
+                input.sync_all().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn donor_truncated_after_extent_discovery_keeps_available_bytes() {
