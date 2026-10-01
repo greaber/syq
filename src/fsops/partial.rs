@@ -368,9 +368,6 @@ impl FsOps {
         }
         if inplace {
             self.uncache_rooted(&target.root, &target.relative);
-            // An interrupted non-inplace run must not strand this job's
-            // adjacent sidecar when the retry switches to --inplace.
-            let _ = with_rooted_partial(&target, copy_id, |partial, _| target.root.unlink(partial));
             if self
                 .held_basis
                 .as_ref()
@@ -393,18 +390,59 @@ impl FsOps {
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
             }
+            // Open the name directly, creating it when absent, as a small
+            // in-place put does; finalize checks the target condition as it
+            // always did. A regular file there, new or existing, is the
+            // destination: the open is read-write because a resume hashes an
+            // existing file through this descriptor, and a new file keeps
+            // owner access for the other range workers until publication
+            // sets its mode. The metadata read at the open serves finalize.
+            // Anything else at the name is sorted out by the checks below.
+            match target
+                .root
+                .open_or_create_read_write_file(&target.relative, mode | 0o600)
+            {
+                Ok((file, mut opened)) if opened.is_file() => {
+                    let euid = unsafe { libc::geteuid() };
+                    if euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600 {
+                        // A umask or inherited default ACL can remove even
+                        // owner access from a new file; a file of ours that
+                        // opened read-write with less can only be new, since
+                        // the open checks owner bits for everyone but root,
+                        // whose workers reopen any file regardless. An
+                        // existing file of another account that admitted the
+                        // open through other bits is never chmod'ed. Finalize
+                        // decides its chmod from the metadata kept here, so
+                        // read it again.
+                        file.set_permissions(fs::Permissions::from_mode(
+                            opened.mode() & 0o7777 | 0o600,
+                        ))?;
+                        opened = file.metadata()?;
+                    }
+                    self.set_copy_length(&file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    self.cache_opened_file(target.location(), attempt, false, file, opened);
+                    return Ok(Preparation::default());
+                }
+                Ok(_) => {}
+                Err(error) if existing_leaf_refused(&error) => {}
+                Err(error) => return Err(error),
+            }
             for _ in 0..8 {
                 match target.root.metadata_optional(&target.relative)? {
                     Some(metadata) if metadata.is_file() => {
                         // Retain a descriptor that can service the
                         // immediately following destination hash as well
-                        // as range writes.
+                        // as range writes. Its metadata, read before the
+                        // writes, serves finalize.
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
+                        let opened = file.metadata()?;
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
-                        self.cache_file(target.location(), attempt, false, file);
+                        self.cache_opened_file(target.location(), attempt, false, file, opened);
                         return Ok(Preparation::default());
                     }
                     Some(metadata) if metadata.is_dir() => {
@@ -413,10 +451,11 @@ impl FsOps {
                     Some(_) => target.root.unlink(&target.relative)?,
                     None => match Self::create_inplace_file(&target.root, &target.relative, mode) {
                         Ok(file) => {
+                            let opened = file.metadata()?;
                             self.set_copy_length(&file, size).with_context(|| {
                                 format!("resize confined file {}", target.label.display())
                             })?;
-                            self.cache_file(target.location(), attempt, false, file);
+                            self.cache_opened_file(target.location(), attempt, false, file, opened);
                             return Ok(Preparation::default());
                         }
                         Err(error)
@@ -496,7 +535,7 @@ impl FsOps {
             relative,
         };
         match created {
-            Some(created) => self.cache_created_file(location, attempt, true, file, created),
+            Some(created) => self.cache_opened_file(location, attempt, true, file, created),
             None => self.cache_file(location, attempt, true, file),
         }
         Ok(Preparation {
@@ -1105,10 +1144,12 @@ impl FsOps {
             .lock()
             .unwrap()
             .contains(&copy_pair);
-        if copy_pair_unsupported && !use_userspace_fallback && !inplace {
+        if copy_pair_unsupported && !use_userspace_fallback {
             // An earlier file already showed that this pair cannot offload.
-            // Leave the directory alone: a sidecar created only to be removed
-            // costs two directory changes for every file.
+            // Leave the destination alone: a sidecar created only to be
+            // removed costs two directory changes for every file, and an
+            // in-place file opened or created only to be closed costs the
+            // requests of its open and the one that Prepare repeats.
             return Ok(CopyLocalOutcome::Unsupported);
         }
         Self::require_not_self_copy(&target, &source_metadata)?;
@@ -2206,27 +2247,50 @@ impl FsOps {
         let TargetMutation { condition, guard } = mutation;
         let guarded = guard.is_some();
         if inplace {
-            let file = self
-                .uncache_rooted(&target.root, &target.relative)
-                .map(Ok)
-                .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
-            require_open_target(&file, &target.label, condition)?;
+            // The descriptor Prepare opened carries the metadata read then,
+            // before the writes; the condition check, the metadata step and
+            // the identity use it instead of a read after the data, which an
+            // NFS client answers with a request. A reopened file is read as
+            // before.
+            let (file, opened) = match self.uncache_rooted_opened(&target.root, &target.relative) {
+                Some(opened) => opened,
+                None => (
+                    target.root.open_regular_write(&target.relative, false)?,
+                    None,
+                ),
+            };
+            // The file is read at most once here. A restricted receiver
+            // binds its approval of this step to the file's ctime as it is
+            // now, after the writes, so that condition needs fresh metadata;
+            // every other condition, the final identity check and the
+            // reported identity are satisfied by the metadata read at the
+            // open, since writes change neither device nor inode. The
+            // metadata step uses the open-time read when there is one.
+            let fingerprint = matches!(condition, TargetCondition::MatchesFingerprint { .. });
+            let current = match &opened {
+                Some(opened) if !fingerprint => opened.clone(),
+                _ => file.metadata()?,
+            };
+            require_open_target_known(&current, &target.label, condition)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;
                 Self::verify_expected_inode(&file, &reader, expected)?;
             }
-            set_meta_file(&file, meta, flags)
-                .with_context(|| format!("set metadata {}", target.label.display()))?;
+            match &opened {
+                Some(opened) => set_meta_written_file(&file, meta, flags, opened),
+                None => set_meta_file_known(&file, meta, flags, &current),
+            }
+            .with_context(|| format!("set metadata {}", target.label.display()))?;
             if guarded || condition != TargetCondition::Any {
-                require_rooted_named_identity(
+                require_rooted_named_identity_known(
                     &target.root,
                     &target.relative,
                     &target.label,
-                    &file,
+                    &current,
                     condition,
                 )?;
             }
-            return published_identity(&file, flags);
+            return Ok(known_identity(&current, flags));
         }
         // The descriptor that created the sidecar carries the metadata read
         // then, which the metadata step and the identity use instead of a
@@ -2234,7 +2298,7 @@ impl FsOps {
         // sidecar has no such read and takes the reads it always did.
         let (src_relative, src, (file, created)) =
             with_rooted_partial(target, copy_id, |relative, _| {
-                match self.uncache_rooted_created(&target.root, relative) {
+                match self.uncache_rooted_opened(&target.root, relative) {
                     Some(opened) => Ok(opened),
                     None => target
                         .root

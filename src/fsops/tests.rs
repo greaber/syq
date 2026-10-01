@@ -97,6 +97,177 @@ fn selected_hash_is_independent_of_payload_integrity() {
 }
 
 #[test]
+fn an_inplace_ranged_copy_opens_its_destination_directly() {
+    // An in-place destination is opened read-write, created when absent,
+    // without a lookup first; the metadata read at the open serves the
+    // condition check, the metadata step and the identity. A new file
+    // keeps owner access until publication; an existing file keeps its
+    // inode; a symlink or FIFO at the name is replaced; a directory is
+    // refused; a read-only final mode is applied at publication.
+    let directory = crate::test_support::tempdir().unwrap();
+    let copy_id = [6; 16];
+    let mut operations = destination_ops(directory.path());
+    let target = |path: &'static [u8]| PartialTarget {
+        path,
+        id: &copy_id,
+        guard: None,
+    };
+    let prepare = |operations: &mut FsOps, path, mode| {
+        operations
+            .prepare(
+                target(path),
+                PrepareOptions {
+                    size: 8,
+                    inplace: true,
+                    mode,
+                    attempt: 0,
+                    create_if_missing: true,
+                },
+            )
+            .unwrap()
+    };
+    let write = |operations: &mut FsOps, path| {
+        operations
+            .write_range(
+                target(path),
+                true,
+                0,
+                0,
+                content_digest(b"contents"),
+                b"contents",
+            )
+            .unwrap();
+    };
+    let publish = |operations: &mut FsOps, path, mode| {
+        operations.finalize(
+            path,
+            true,
+            &copy_id,
+            &Meta {
+                inode_metadata: None,
+                mode,
+                uid: 0,
+                gid: 0,
+                mtime: 1_000_000_000,
+                mtime_nsec: 123_456_789,
+            },
+            flags::MODE | flags::TIMES | flags::REPORT_IDENTITY,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None,
+            },
+        )
+    };
+    let check = |path: &str, mode: u32| {
+        let published = fs::metadata(directory.path().join(path)).unwrap();
+        assert_eq!(published.mode() & 0o7777, mode, "{path}");
+        assert_eq!(
+            (published.mtime(), published.mtime_nsec()),
+            (1_000_000_000, 123_456_789),
+            "{path}"
+        );
+        assert_eq!(
+            fs::read(directory.path().join(path)).unwrap(),
+            b"contents",
+            "{path}"
+        );
+        published
+    };
+
+    // New, read-only final mode: created with owner access, published 0400.
+    prepare(&mut operations, b"new", 0o400);
+    let created = fs::metadata(directory.path().join("new")).unwrap();
+    assert_eq!(created.mode() & 0o777, 0o600);
+    write(&mut operations, b"new");
+    let identity = publish(&mut operations, b"new", 0o400).unwrap();
+    let published = check("new", 0o400);
+    assert_eq!(identity, Some((published.dev(), published.ino())));
+    assert_eq!(created.ino(), published.ino());
+
+    // Existing: the inode is kept, its longer contents replaced.
+    fs::write(directory.path().join("old"), b"an older and longer version").unwrap();
+    let before = fs::metadata(directory.path().join("old")).unwrap();
+    prepare(&mut operations, b"old", 0o644);
+    write(&mut operations, b"old");
+    let identity = publish(&mut operations, b"old", 0o644).unwrap();
+    assert_eq!(identity, Some((before.dev(), before.ino())));
+    check("old", 0o644);
+
+    // Existing and read-only: an unprivileged account cannot open it for
+    // writing at all; root can, and must not widen it on the way in, since
+    // a receiver choosing the file's own mode later reads the widened one.
+    // Only root reaches this (run the test under `unshare -r` for it).
+    if unsafe { libc::geteuid() } == 0 {
+        fs::write(
+            directory.path().join("sealed"),
+            b"an older and longer version",
+        )
+        .unwrap();
+        fs::set_permissions(
+            directory.path().join("sealed"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        prepare(&mut operations, b"sealed", 0o444);
+        assert_eq!(
+            fs::metadata(directory.path().join("sealed"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o444,
+            "root must not widen an existing read-only file on the way in"
+        );
+        write(&mut operations, b"sealed");
+        publish(&mut operations, b"sealed", 0o444).unwrap();
+        check("sealed", 0o444);
+    }
+
+    // A symlink or FIFO at the name is replaced by a file; the symlink's
+    // target is left alone.
+    fs::write(directory.path().join("victim"), b"victim").unwrap();
+    for planted in ["symlink", "fifo"] {
+        let destination = directory.path().join(planted);
+        match planted {
+            "symlink" => {
+                std::os::unix::fs::symlink(directory.path().join("victim"), &destination).unwrap()
+            }
+            _ => {
+                let path = std::ffi::CString::new(destination.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+        }
+        prepare(&mut operations, planted.as_bytes(), 0o644);
+        write(&mut operations, planted.as_bytes());
+        publish(&mut operations, planted.as_bytes(), 0o644).unwrap();
+        assert!(
+            fs::symlink_metadata(&destination).unwrap().is_file(),
+            "{planted}"
+        );
+        check(planted, 0o644);
+    }
+    assert_eq!(
+        fs::read(directory.path().join("victim")).unwrap(),
+        b"victim"
+    );
+
+    // A directory at the name is refused.
+    fs::create_dir(directory.path().join("dir")).unwrap();
+    let error = operations
+        .prepare(
+            target(b"dir"),
+            PrepareOptions {
+                size: 8,
+                inplace: true,
+                mode: 0o644,
+                attempt: 0,
+                create_if_missing: true,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("is a directory"), "{error}");
+}
+
+#[test]
 fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read() {
     // A new sidecar is opened for writing only, without exclusive creation,
     // in the staged mode the sender chose; the metadata read then decides
@@ -2057,6 +2228,13 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
     fs::write(selected.join("inplace"), b"replacement").unwrap();
 
     let copy_id = [31; 16];
+    // A sidecar at the name an in-place file's staged copy would use. The
+    // in-place preparation below leaves it alone: every invocation has its
+    // own copy id, so a stranded sidecar never carries this one, and the
+    // lookup that once removed it cost a request on NFS for every file.
+    let stale_name = partial_path(&selected.join("inplace"), &copy_id).unwrap();
+    let stale = moved.join(stale_name.file_name().unwrap());
+    fs::write(&stale, b"stale").unwrap();
     let (hashes, held_len) = operations
         .hash_and_hold(
             b"basis",
@@ -2148,9 +2326,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
         0o600
     );
 
-    let stale_name = partial_path(&selected.join("inplace"), &copy_id).unwrap();
-    let stale = moved.join(stale_name.file_name().unwrap());
-    fs::write(&stale, b"stale").unwrap();
+    assert!(stale.exists());
     operations
         .prepare(
             PartialTarget {
@@ -2168,7 +2344,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
         )
         .unwrap();
     assert_eq!(fs::metadata(moved.join("inplace")).unwrap().len(), 2);
-    assert!(!stale.exists());
+    assert_eq!(fs::read(&stale).unwrap(), b"stale");
     assert_eq!(fs::read(selected.join("inplace")).unwrap(), b"replacement");
 
     symlink(&outside, moved.join("redirect")).unwrap();

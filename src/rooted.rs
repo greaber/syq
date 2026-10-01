@@ -483,12 +483,36 @@ impl Root {
         path: &RelativePath,
         mode: u32,
     ) -> Result<(File, std::fs::Metadata)> {
+        self.open_or_create_file_with_access(path, mode, libc::O_WRONLY)
+    }
+
+    /// Open a leaf for reading and writing, creating it when absent, and read
+    /// its metadata before anything is written to it. Like
+    /// `open_or_create_write_only_file`, an existing leaf is opened rather
+    /// than refused, so the caller decides from the metadata whether the
+    /// file is one it may write to; the open follows no symlink and cannot
+    /// block on a FIFO. For a destination written in place, whose existing
+    /// contents a resume hashes.
+    pub(crate) fn open_or_create_read_write_file(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_or_create_file_with_access(path, mode, libc::O_RDWR)
+    }
+
+    fn open_or_create_file_with_access(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+        access: libc::c_int,
+    ) -> Result<(File, std::fs::Metadata)> {
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(path)?;
         let file = self
             .open_leaf(
                 path,
-                libc::O_WRONLY
+                access
                     | libc::O_CREAT
                     | libc::O_NOFOLLOW
                     | libc::O_NONBLOCK
