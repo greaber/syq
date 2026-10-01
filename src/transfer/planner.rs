@@ -9,7 +9,7 @@ pub(super) struct Planner<'a> {
     pub(super) sched: &'a Sched,
     pub(super) progress: &'a Progress,
     pub(super) opts: &'a Opts,
-    /// Compile once, only when a native scan selects a non-directory root.
+    /// Compile once, only when a scan selects a non-directory root.
     /// The outer None means uninitialized; Some(None) means no ignore rules.
     pub(super) selected_file_ignore: Option<Option<ignore::gitignore::Gitignore>>,
     /// Capability reported by the destination receiver's authenticated
@@ -601,10 +601,7 @@ impl Planner<'_> {
                                 }
                             },
                         });
-                        if root.kind != Kind::Dir
-                            && selection != SourceSelection::Rsync
-                            && pl.selected_file_is_ignored(src_root)?
-                        {
+                        if root.kind != Kind::Dir && pl.selected_file_is_ignored(src_root)? {
                             pl.progress.paths_ignored.fetch_add(1, Relaxed);
                             pl.dst_seen
                                 .entry(join(dst_root, &sub))

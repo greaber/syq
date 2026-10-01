@@ -425,7 +425,8 @@ pub struct Args {
     #[arg(skip)]
     pub plan_source_host: Option<String>,
     /// Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
-    /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable; together
+    /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable.
+    /// Named non-directory sources match their basename. Combined
     /// with --syq-ignore-from the patterns act like the lines of one .gitignore file, in
     /// command-line order, anchored at each source root. Skipping a directory skips its
     /// whole subtree, so to copy only *.jpg use: --syq-ignore '*' --syq-ignore '!*/'

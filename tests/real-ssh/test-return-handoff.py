@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 
 
 def run(*args, **kwargs):
@@ -89,6 +90,19 @@ for name in ['keep.txt', 'drop.tmp', 'allow.tmp', 'skip.log', 'drop.cache', 'kee
 (base / 'extra-rules').write_bytes(b'*.cache\n')
 '''
 run("ssh", "source", "python3 -c " + shlex.quote(setup))
+
+print("case: SSH source ignore counts agree in live copies and dry runs", flush=True)
+with tempfile.TemporaryDirectory(prefix="syq-ignore-counts-") as temp:
+    for dry_run in [False, True]:
+        results = str(Path(temp) / f"results-{dry_run}.jsonl")
+        run("syq", "cp", "--from", "source", "--srcs-in",
+            "/tmp/syq-real-ssh/handoff-source/ignore-source",
+            "--into", str(Path(temp) / f"destination-{dry_run}"),
+            "--ignore", "*.tmp", "--results", results,
+            *(["--dry-run"] if dry_run else []))
+        terminal = json.loads(Path(results).read_text().splitlines()[-1])
+        assert terminal["files_excluded"] == 2, terminal
+
 run("syq", "persist", "receive", "on", "--max-delete", "1", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 try:

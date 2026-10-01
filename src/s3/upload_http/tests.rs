@@ -62,7 +62,7 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
             .unwrap();
             let source = crate::s3::local::upload_plan(&args)
                 .unwrap()
-                .0
+                .sources
                 .pop()
                 .unwrap();
             let file = FileBody::new(source, 0, size);

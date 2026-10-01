@@ -672,7 +672,7 @@ fn native_ignore_filters_explicit_files_by_source_basename() {
     let records = fs::read_to_string(results).unwrap();
     let terminal: serde_json::Value =
         serde_json::from_str(records.lines().last().unwrap()).unwrap();
-    assert_eq!(terminal["files_excluded"], 0);
+    assert_eq!(terminal["files_excluded"], 1);
     assert_eq!(terminal["files_transferred"], 0);
     assert!(!t.path("preview").exists());
 }
@@ -720,7 +720,7 @@ fn native_ignore_exclusions_match_for_named_and_scanned_files() {
             let records = fs::read_to_string(results).unwrap();
             let terminal: serde_json::Value =
                 serde_json::from_str(records.lines().last().unwrap()).unwrap();
-            assert_eq!(terminal["files_excluded"], 0, "{terminal}");
+            assert_eq!(terminal["files_excluded"], 1, "{terminal}");
             assert_eq!(terminal["files_transferred"], 0, "{terminal}");
             assert!(!Path::new(&destination).join("report.txt").exists());
         }
@@ -919,6 +919,42 @@ fn ignore_reinclude_subdir_idiom() {
     ]);
     assert!(t.path("dst/logs/keep/k").is_file());
     assert!(!t.path("dst/logs/l1").exists());
+}
+
+#[test]
+fn rsync_ignore_named_sources_use_source_basename() {
+    let t = Tmp::new();
+    write(&t.path("ignored-parent/report.txt"), b"source");
+    std::os::unix::fs::symlink("report.txt", t.path("ignored-parent/link.txt")).unwrap();
+    for (case, rules, excluded) in [
+        ("all", vec!["*"], true),
+        ("basename", vec!["*.txt"], true),
+        ("anchored", vec!["/report.txt"], true),
+        ("parent", vec!["ignored-parent/"], false),
+        ("negated", vec!["*", "!report.txt"], false),
+        ("destination", vec!["renamed"], false),
+    ] {
+        let destination = t.s(&format!("{case}/renamed"));
+        fs::create_dir_all(t.path(case)).unwrap();
+        let source = t.s("ignored-parent/report.txt");
+        let mut args = vec!["-a"];
+        for rule in &rules {
+            args.extend(["--syq-ignore", rule]);
+        }
+        args.extend([&source, &destination]);
+        run_ok(&args);
+        assert_eq!(Path::new(&destination).exists(), !excluded, "{case}");
+    }
+    run_ok(&[
+        "-a",
+        "--syq-ignore",
+        "*.txt",
+        &t.s("ignored-parent/report.txt"),
+        &t.s("ignored-parent/link.txt"),
+        &t.s("multiple/"),
+    ]);
+    assert!(!t.path("multiple/report.txt").exists());
+    assert!(fs::symlink_metadata(t.path("multiple/link.txt")).is_err());
 }
 
 #[test]

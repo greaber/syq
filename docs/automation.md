@@ -165,7 +165,9 @@ An outcome for a completed copy change or a failed mapping entry.
 In attested records, `dst` is relative to the destination area identified by
 `scope`. An attested `set_metadata` omits `kind`.
 
-Unchanged and excluded entries have totals only. Ordinary live streams do not
+Unchanged and excluded entries have totals only. `files_excluded` includes
+ignore-rule skips on every route, in both live copies and dry runs. An ignored
+directory counts once; its unscanned descendants are not counted. Ordinary live streams do not
 emit per-operation records for metadata-only updates, though dry runs emit
 `metadata_differs` traces. Failed implicit parent creation can lack `src` and
 is non-retryable. Do not construct a retry source from its destination name.

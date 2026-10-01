@@ -229,7 +229,8 @@ syq cp --ignore node_modules --ignore '*.o' --srcs-in project --into backup
 ```
 
 Patterns use gitignore syntax and match paths relative to each selected source
-directory, for both filesystem and S3 copies. For example, `/build/` excludes
+directory, for both filesystem and S3 copies. `syq rsync` uses the same matching
+rules with `--syq-ignore` and `--syq-ignore-from`. For example, `/build/` excludes
 the top-level `build` directory inside every selected source; it does not exclude
 the selected directory itself. Explicitly selected non-directory sources match
 by their source basename: `--ignore '*.txt'` excludes `notes/report.txt` even when
