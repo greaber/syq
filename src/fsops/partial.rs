@@ -40,17 +40,22 @@ impl FsOps {
         root.create_file(relative, mode)
     }
 
-    pub(super) fn create_write_only_partial(
+    /// Open or create a small file's sidecar for writing only, with the
+    /// metadata read when it was opened. The caller checks that metadata:
+    /// the name may have held something other than a new file.
+    pub(super) fn open_or_create_write_only_partial(
         &self,
         root: &Root,
         relative: &RelativePath,
         mode: u32,
-    ) -> Result<File> {
+    ) -> Result<(File, fs::Metadata)> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
-            return root.create_private_file(relative);
+            let file = root.create_private_file(relative)?;
+            let metadata = file.metadata()?;
+            return Ok((file, metadata));
         }
-        root.create_write_only_file(relative, mode)
+        root.open_or_create_write_only_file(relative, mode)
     }
 
     fn create_inplace_file(root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
@@ -1414,9 +1419,10 @@ impl FsOps {
             if target.guard.is_some() {
                 bail!("guarded small-file updates require atomic publication");
             }
-            // Read a created file's metadata at once: the create has just
-            // primed an NFS client's attribute cache, so it costs nothing,
-            // and it serves the metadata step and the identity afterwards.
+            // Read a file's metadata as soon as it is open: the open has
+            // just primed an NFS client's attribute cache, so it costs
+            // nothing, and it serves the metadata step and the identity
+            // afterwards.
             let mut created = None;
             let file = match condition {
                 // The whole file is written here and never read back.
@@ -1435,8 +1441,31 @@ impl FsOps {
                     file
                 }
                 TargetCondition::Any => {
-                    let mut opened = None;
+                    // Open the name directly, creating it when absent: a
+                    // regular file there, new or existing, is the in-place
+                    // destination. Looking the name up first cost an NFS
+                    // client a request for every new file. Anything else
+                    // at the name, or an open the kernel refused, is sorted
+                    // out by the checks below.
+                    let mut opened = match rooted
+                        .root
+                        .open_or_create_write_only_file(&rooted.relative, meta.mode)
+                    {
+                        Ok((file, metadata)) if metadata.is_file() => {
+                            if metadata.len() != 0 {
+                                file.set_len(0)?;
+                            }
+                            created = Some(metadata);
+                            Some(file)
+                        }
+                        Ok(_) => None,
+                        Err(error) if existing_leaf_refused(&error) => None,
+                        Err(error) => return Err(error),
+                    };
                     for _ in 0..8 {
+                        if opened.is_some() {
+                            break;
+                        }
                         match rooted.root.metadata_optional(&rooted.relative)? {
                             Some(metadata) if metadata.is_file() => {
                                 let file =
@@ -2995,6 +3024,42 @@ pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file() && metadata.nlink() == 1
 }
 
+/// Whether a sidecar opened without exclusive creation is what an exclusive
+/// create with `mode` would have made: a new empty file of ours with no
+/// permission beyond that mode and no set-id bit. Anything else at the name,
+/// including an older sidecar with data or a wider mode, takes the checked
+/// path, which repairs or replaces it before anything is written.
+pub(super) fn is_fresh_partial(metadata: &fs::Metadata, mode: u32) -> bool {
+    is_owned_partial(metadata)
+        && metadata.len() == 0
+        && metadata.mode() & 0o7000 == 0
+        && metadata.mode() & 0o777 & !(mode & 0o777) == 0
+}
+
+/// Whether the open or create of the sidecar was refused because of what
+/// the name already held: a symlink, a directory, a FIFO without a reader,
+/// a file this account may not write, or an existing entry that a creation
+/// without an OS error code refused (the macOS ACL sidecar). The checked
+/// path then examines the name, and repeats the creation for an error that
+/// was not about it.
+pub(super) fn existing_leaf_refused(error: &anyhow::Error) -> bool {
+    error_is_kind(error, io::ErrorKind::AlreadyExists)
+        || error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    libc::ELOOP
+                        | libc::EISDIR
+                        | libc::ENXIO
+                        | libc::EACCES
+                        | libc::EPERM
+                        | libc::ETXTBSY
+                )
+            })
+}
+
 pub(super) fn is_safe_rooted_partial(metadata: RootMetadata) -> bool {
     metadata.is_file() && metadata.nlink == 1
 }
@@ -3208,11 +3273,12 @@ fn set_meta_file_inner(
     }
     if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
-        // the mode is already right (but always run it after a chown that could
-        // have cleared setuid/setgid bits we need to restore).
+        // the mode is already right. Always run it for set-id bits after a
+        // chown, which clears them, and when the metadata predates a write,
+        // which clears them for an unprivileged writer.
         let cur = current.mode() & 0o7777;
         let want = meta.mode & 0o7777;
-        if cur != want || (owner_changed && want & 0o6000 != 0) {
+        if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
             f.set_permissions(fs::Permissions::from_mode(want))?;
         }
     }

@@ -204,20 +204,25 @@ impl FsOps {
         let mode = staged_file_mode(&put.meta, put.flags);
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
-                // Nothing reads a small file's sidecar, so a new one is
-                // opened for writing only. One left by an earlier attempt
-                // takes the checked reuse that ranged writes apply.
+                // Nothing reads a small file's sidecar, so it is opened for
+                // writing only, and without exclusive creation, which costs
+                // an NFS client a further request. Whatever the name held is
+                // opened too: a new empty file of ours is used as created,
+                // and anything else, or an open the kernel refused, takes
+                // the checked reuse that ranged writes apply.
                 self.uncache_rooted(&target.root, relative);
-                match self.create_write_only_partial(&target.root, relative, mode) {
-                    Ok(file) => Ok(Some((file, None))),
-                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
-                        self.open_private_partial_rooted(&target.root, relative, label, true, mode)
+                match self.open_or_create_write_only_partial(&target.root, relative, mode) {
+                    Ok((file, created)) if is_fresh_partial(&created, mode) => {
+                        Ok(Some((file, created, None)))
+                    }
+                    Ok(_) => self.checked_small_stage(&target.root, relative, label, mode),
+                    Err(error) if existing_leaf_refused(&error) => {
+                        self.checked_small_stage(&target.root, relative, label, mode)
                     }
                     Err(error) => Err(error),
                 }
             })?;
-        let (file, basis_size) = opened.context("sidecar creation was requested")?;
-        let created = file.metadata()?;
+        let (file, created, basis_size) = opened.context("sidecar creation was requested")?;
         Ok(SmallStage {
             target,
             partial,
@@ -226,6 +231,24 @@ impl FsOps {
             reused: basis_size.is_some(),
             created,
         })
+    }
+
+    /// The checked reuse of whatever the sidecar name holds, with the
+    /// metadata of the file it settles on.
+    fn checked_small_stage(
+        &mut self,
+        root: &Root,
+        relative: &RelativePath,
+        label: &Path,
+        mode: u32,
+    ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
+        let Some((file, basis_size)) =
+            self.open_private_partial_rooted(root, relative, label, true, mode)?
+        else {
+            return Ok(None);
+        };
+        let metadata = file.metadata()?;
+        Ok(Some((file, metadata, basis_size)))
     }
 
     pub(super) fn write_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
@@ -447,7 +470,14 @@ mod tests {
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert_eq!(access(&stage), libc::O_WRONLY);
         assert!(!stage.reused);
-        // The same copy finds its sidecar again after an interrupted attempt.
+        // An attempt interrupted before it wrote anything leaves an empty
+        // sidecar, which is what a new one would be; the copy uses it as
+        // created. One interrupted after writing takes the checked reuse.
+        drop(stage);
+        let target = ops.small_target(&file).unwrap();
+        let stage = ops.create_small_stage(&file, target).unwrap();
+        assert!(!stage.reused);
+        ops.write_small_stage(&file, &stage).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
@@ -460,6 +490,158 @@ mod tests {
             b"contents"
         );
         assert_eq!(entries(temporary.path()), 1);
+    }
+
+    #[test]
+    fn whatever_else_the_sidecar_name_holds_takes_the_checked_path() {
+        // The sidecar is created without O_EXCL, so the open can land on
+        // something already at its name. Only a new empty file of ours is
+        // used as opened; a symlink, a FIFO, a second link to a file of ours,
+        // and a file holding data are left to the checked path, which
+        // replaces what is not a safe sidecar and reuses what is. Nothing
+        // planted at the name receives the copy's data.
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = receiver(temporary.path());
+        let wanted = put("file", b"contents");
+        let target = ops.small_target(&wanted).unwrap();
+        let (relative, _) = rooted_partial_target(&target, &wanted.copy_id).unwrap();
+        let sidecar = temporary.path().join(relative.to_path_buf());
+        fs::write(temporary.path().join("victim"), b"victim").unwrap();
+        for planted in ["symlink", "fifo", "hardlink", "data", "wide"] {
+            match planted {
+                "symlink" => {
+                    std::os::unix::fs::symlink(temporary.path().join("victim"), &sidecar).unwrap()
+                }
+                "wide" => {
+                    // An empty file of ours with permissions beyond the staging
+                    // mode is not used as it is: the checked path narrows it
+                    // to 0600 before anything is written.
+                    fs::write(&sidecar, b"").unwrap();
+                    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o666)).unwrap();
+                    let target = ops.small_target(&wanted).unwrap();
+                    let stage = ops.create_small_stage(&wanted, target).unwrap();
+                    assert!(stage.reused);
+                    assert_eq!(stage.created.mode() & 0o777, 0o600);
+                    drop(stage);
+                }
+                "fifo" => {
+                    let path = std::ffi::CString::new(sidecar.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+                "hardlink" => fs::hard_link(temporary.path().join("victim"), &sidecar).unwrap(),
+                "data" => fs::write(&sidecar, b"an earlier attempt").unwrap(),
+                _ => unreachable!(),
+            }
+            let outcomes = ops.put_small_batch(std::slice::from_ref(&wanted));
+            outcomes[0]
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{planted}: {error}"));
+            assert_eq!(
+                fs::read(temporary.path().join("file")).unwrap(),
+                b"contents",
+                "{planted}"
+            );
+            assert_eq!(
+                fs::read(temporary.path().join("victim")).unwrap(),
+                b"victim",
+                "{planted}"
+            );
+            assert!(
+                fs::symlink_metadata(&sidecar).is_err(),
+                "{planted}: the name is free again"
+            );
+            fs::remove_file(temporary.path().join("file")).unwrap();
+        }
+        assert_eq!(entries(temporary.path()), 1);
+    }
+
+    #[test]
+    fn an_inplace_put_opens_its_destination_directly() {
+        // With no condition on the destination, the in-place path opens the
+        // name at once instead of looking it up first. An existing regular
+        // file keeps its inode and loses its contents; a symlink or FIFO at
+        // the name is replaced by a file, leaving a symlink's target alone; a
+        // directory is refused.
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = receiver(temporary.path());
+        let mut inplace = put("file", b"contents");
+        inplace.inplace = true;
+        inplace.flags = flags::REPORT_IDENTITY;
+        let destination = temporary.path().join("file");
+        fs::write(temporary.path().join("victim"), b"victim").unwrap();
+        fs::write(&destination, b"an older and longer version").unwrap();
+        let before = fs::metadata(&destination).unwrap();
+        let identity = ops.put_small(&inplace).unwrap();
+        assert_eq!(identity, Some((before.dev(), before.ino())));
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        for planted in ["symlink", "fifo"] {
+            fs::remove_file(&destination).unwrap();
+            match planted {
+                "symlink" => {
+                    std::os::unix::fs::symlink(temporary.path().join("victim"), &destination)
+                        .unwrap()
+                }
+                _ => {
+                    let path = std::ffi::CString::new(destination.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+            }
+            ops.put_small(&inplace)
+                .unwrap_or_else(|error| panic!("{planted}: {error}"));
+            assert!(
+                fs::symlink_metadata(&destination).unwrap().is_file(),
+                "{planted}"
+            );
+            assert_eq!(fs::read(&destination).unwrap(), b"contents", "{planted}");
+            assert_eq!(
+                fs::read(temporary.path().join("victim")).unwrap(),
+                b"victim",
+                "{planted}"
+            );
+        }
+        fs::remove_file(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let error = ops.put_small(&inplace).unwrap_err();
+        assert!(error.to_string().contains("is a directory"), "{error}");
+        fs::remove_dir(&destination).unwrap();
+        let identity = ops.put_small(&inplace).unwrap();
+        let published = fs::metadata(&destination).unwrap();
+        assert_eq!(identity, Some((published.dev(), published.ino())));
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        // Writing clears an existing file's set-id bits for an unprivileged
+        // writer; the metadata read before the write must not hide that from
+        // the chmod that restores them.
+        for wanted in [0o4755, 0o2755] {
+            let mut setid = inplace.clone();
+            setid.meta.mode = wanted;
+            setid.flags = flags::MODE;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(wanted)).unwrap();
+            assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, wanted);
+            ops.put_small(&setid).unwrap();
+            assert_eq!(
+                fs::metadata(&destination).unwrap().mode() & 0o7777,
+                wanted,
+                "{wanted:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_creation_is_recognized_with_or_without_an_os_error() {
+        // The macOS ACL sidecar refuses an existing name with an error that
+        // carries only the kind; the kernel's refusals carry an errno.
+        assert!(existing_leaf_refused(&anyhow::Error::from(
+            io::Error::from(io::ErrorKind::AlreadyExists)
+        )));
+        for code in [libc::ELOOP, libc::EISDIR, libc::ENXIO, libc::EACCES] {
+            assert!(existing_leaf_refused(&anyhow::Error::from(
+                io::Error::from_raw_os_error(code)
+            )));
+        }
+        assert!(!existing_leaf_refused(&anyhow::Error::from(
+            io::Error::from_raw_os_error(libc::ENOSPC)
+        )));
+        assert!(!existing_leaf_refused(&anyhow::anyhow!("not an I/O error")));
     }
 
     #[test]
