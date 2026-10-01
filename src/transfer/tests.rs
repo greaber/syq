@@ -945,7 +945,7 @@ fn small_batch_tuning_counts_empty_files_but_not_failed_publications() {
         ]));
     let mut results = vec![None, None, None];
     assert!(worker
-        .receive_small_batch(vec![0, 1, 2], &jobs, &mut results)
+        .receive_small_batch(vec![0, 1, 2], &jobs, &mut results, None)
         .unwrap());
     assert_eq!(Meter::files(&*worker.progress), 2);
     assert_eq!(Meter::bytes(&*worker.progress), 0);
@@ -957,7 +957,7 @@ fn small_batch_tuning_counts_empty_files_but_not_failed_publications() {
         .replies
         .push_back(Response::Applied(vec![]));
     assert!(!worker
-        .receive_small_batch(vec![1], &jobs, &mut results)
+        .receive_small_batch(vec![1], &jobs, &mut results, None)
         .unwrap());
     assert_eq!(
         Meter::files(&*worker.progress),

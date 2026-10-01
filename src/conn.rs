@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod batch_progress;
+pub(crate) use batch_progress::BatchProgress;
 mod bootstrap;
 mod local;
 mod reverse_tcp;
@@ -58,6 +60,14 @@ pub trait Conn: Send {
         Ok(None)
     }
     fn recv(&mut self) -> Result<Response>;
+    /// Enter a phase containing only small-file batch writes. Remote readers
+    /// can account for replies before the worker consumes them.
+    fn track_small_batches(
+        &mut self,
+        _progress: std::sync::Arc<crate::progress::Progress>,
+    ) -> Result<Option<BatchProgress>> {
+        Ok(None)
+    }
     /// Wait before the reply starts, excluding its remaining payload transfer
     /// when the connection can observe arrival separately from decoding.
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -396,6 +406,7 @@ impl ReceivedResponse {
 }
 
 pub struct RemoteConn {
+    batch_receipts: std::sync::Arc<batch_progress::BatchReceipts>,
     transport_stop: Option<std::sync::Weak<crate::sched::Sched>>,
     rpc_observation: Option<RpcObservation>,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
@@ -438,7 +449,8 @@ fn spawn_reader(
     std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
     std::thread::JoinHandle<()>,
 ) {
-    spawn_observed_reader(input, read_ahead, Default::default())
+    let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default());
+    (rx, reader)
 }
 fn spawn_observed_reader(
     input: Box<dyn Read + Send>,
@@ -447,6 +459,7 @@ fn spawn_observed_reader(
 ) -> (
     std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
     std::thread::JoinHandle<()>,
+    std::sync::Arc<batch_progress::BatchReceipts>,
 ) {
     // Control requests also pipeline up to the default depth. Keeping that
     // capacity prevents a sequential helper blocking on replies while its
@@ -454,6 +467,8 @@ fn spawn_observed_reader(
     let (tx, rx) = std::sync::mpsc::sync_channel(
         read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH),
     );
+    let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
+    let receipts = batch_receipts.clone();
     let reader = std::thread::spawn(move || {
         let mut r = FrameReader::new(input);
         r.set_limit(MAX_HANDSHAKE_FRAME);
@@ -485,6 +500,7 @@ fn spawn_observed_reader(
                         continue;
                     }
                 }
+                receipts.response(&message.value);
             }
             let failed = msg.is_err();
             if tx.send(msg).is_err() || failed {
@@ -492,7 +508,7 @@ fn spawn_observed_reader(
             }
         }
     });
-    (rx, reader)
+    (rx, reader, batch_receipts)
 }
 
 fn receive_transport_stats(
@@ -570,7 +586,7 @@ impl RemoteConn {
     ) -> Self {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, reader) = spawn_observed_reader(
+        let (rx, reader, batch_receipts) = spawn_observed_reader(
             Box::new(session.stdout),
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
             observation.clone(),
@@ -580,6 +596,7 @@ impl RemoteConn {
             let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
         });
         RemoteConn {
+            batch_receipts,
             transport_stop: None,
             observation,
             child: None,
@@ -812,6 +829,7 @@ impl Conn for RemoteConn {
                 || matches!(req, Request::WriteRange { .. } | Request::WriteStreamFence),
             "only writes and their fence are valid during streaming writes"
         );
+        self.batch_receipts.request(&req)?;
         self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
         Ok(match req {
             Request::WriteRange { data, .. } => Some(data.into_vec()),
@@ -820,6 +838,16 @@ impl Conn for RemoteConn {
     }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)
+    }
+    fn track_small_batches(
+        &mut self,
+        progress: std::sync::Arc<crate::progress::Progress>,
+    ) -> Result<Option<BatchProgress>> {
+        anyhow::ensure!(
+            self.write_stream.is_none(),
+            "streaming writes are already active"
+        );
+        self.batch_receipts.begin(progress).map(Some)
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
         let start = std::time::Instant::now();
@@ -1672,12 +1700,13 @@ impl RemoteSpec {
         if let Some(stream) = return_stream {
             let observation =
                 std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-            let (rx, reader) = spawn_observed_reader(
+            let (rx, reader, batch_receipts) = spawn_observed_reader(
                 Box::new(stream.try_clone()?),
                 self.read_ahead,
                 observation.clone(),
             );
             let conn = RemoteConn {
+                batch_receipts,
                 transport_stop: None,
                 observation,
                 child: None,
@@ -1785,9 +1814,10 @@ impl RemoteSpec {
                 .and_then(|p| p.activity.clone()),
             handshake_pending: handshake.clone(),
         };
-        let (rx, reader) =
+        let (rx, reader, batch_receipts) =
             spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone());
         let conn = RemoteConn {
+            batch_receipts,
             transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: Some(child),
@@ -2140,9 +2170,10 @@ impl RemoteSpec {
         );
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, reader) =
+        let (rx, reader, batch_receipts) =
             spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
         let conn = RemoteConn {
+            batch_receipts,
             transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: None,
