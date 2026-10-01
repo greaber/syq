@@ -1517,12 +1517,9 @@ fn complete_path_for(
         ));
     };
     let authorizer = find_option_value(args, b"--auth-from");
-    if authorizer != Some("ssh")
-        && (authorizer.is_some_and(|value| value != "auto")
-            || (command == "cp" && !crate::destination::connection_names().is_empty()))
-    {
-        // Completion must never request copy approval or inspect hostB through
-        // an automatically selected authorizer. Explicit SSH keeps normal completion.
+    if authorizer.is_some_and(|value| value != "auto" && value != "ssh") {
+        // Completion uses local SSH for auto/ssh, but never requests approval
+        // or falls back to a receiving machine.
         return Ok(Vec::new());
     }
     if endpoint.host.starts_with('@') {

@@ -699,7 +699,7 @@ pub(crate) fn is_named(grant: &Option<String>) -> bool {
     grant.as_deref().is_some_and(|s| s.starts_with(PREFIX))
 }
 
-fn select_copy(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
+fn select_copy(args: &mut crate::cli::Args) -> Result<Option<handoff::Selection>> {
     match &args.auth_from {
         crate::cli::AuthFrom::Return(_) => return forward::select(args),
         crate::cli::AuthFrom::Ssh => {

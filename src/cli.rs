@@ -128,6 +128,9 @@ pub struct Args {
     pub(crate) s3_remove: crate::s3::RemoveFlags,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
+    /// Destination SSH connection opened while choosing automatic authorization.
+    #[arg(skip)]
+    pub(crate) direct_destination: Option<crate::conn::RemoteSpec>,
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]
@@ -1298,7 +1301,7 @@ fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Authorize through @NAME (also S3 copies), or use local SSH access (default: auto)
+    /// Use local SSH first, then an available receiving machine (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator

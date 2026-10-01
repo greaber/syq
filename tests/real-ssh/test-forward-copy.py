@@ -90,7 +90,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                     process.wait(timeout=3)
 
 
-print("case: automatic authorization requires approval even with automatic local receiving", flush=True)
+print("case: automatic authorization falls back after source SSH fails and requires approval", flush=True)
 run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")

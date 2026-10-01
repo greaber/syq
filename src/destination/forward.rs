@@ -74,7 +74,7 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     Ok(target)
 }
 
-pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
+pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Selection>> {
     let explicit = match &args.auth_from {
         crate::cli::AuthFrom::Return(name) => Some(name.clone()),
         _ => handoff::selected_name(handoff::Kind::Forward).map(str::to_owned),
@@ -93,12 +93,41 @@ pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selectio
         let registration = load_registration(&name)?;
         (name, registration)
     } else {
-        let Some(found) = registered_names().into_iter().find_map(|name| {
+        let names = registered_names();
+        if names.is_empty() {
+            return Ok(None);
+        }
+        // Open the actual control connection before considering another
+        // machine's access. Keep a successful connection for the transfer;
+        // probing with a separate SSH command would add a login/round trip.
+        // This must precede reading stdin and opening result files, because
+        // selecting a receiving machine can exec its build-pinned helper.
+        let crate::conn::Endpoint::Remote(spec) =
+            crate::transfer::endpoint(args.locations.last().unwrap(), args)?
+        else {
+            unreachable!("eligible forwarding destination is remote");
+        };
+        let error = match spec.connect_with(args.compress, false) {
+            Ok(connection) => {
+                *spec.primed_control.lock().unwrap() =
+                    crate::conn::PrimedControl::Checked(Some(Box::new(connection)));
+                args.direct_destination = Some(spec);
+                return Ok(None);
+            }
+            Err(error) if crate::conn::is_ssh_connect_error(&error) => error,
+            Err(error) => return Err(error),
+        };
+        let Some(found) = names.into_iter().find_map(|name| {
             let registration = available(&name, Duration::from_secs(2)).ok()?;
             Some((name, registration))
         }) else {
-            return Ok(None);
+            // Do not repeat the failed SSH attempt when no receiver responds.
+            return Err(error);
         };
+        crate::output::diagnostic!(
+            "syq: destination SSH connection failed ({error:#}); trying authorization through @{}",
+            found.0
+        );
         found
     };
     Ok(Some(handoff::Selection::new(

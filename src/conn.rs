@@ -298,6 +298,24 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<WorkerInitializationError>())
 }
 
+/// OpenSSH could not establish the initial helper session (exit 255).
+/// Kept distinct from helper/bootstrap errors and failures after HelloOk so
+/// automatic authorization can fall back before a transfer has begun.
+#[derive(Debug)]
+struct SshConnectError(String);
+
+impl std::fmt::Display for SshConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SshConnectError {}
+
+pub(crate) fn is_ssh_connect_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<SshConnectError>())
+}
+
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
@@ -633,6 +651,13 @@ impl RemoteConn {
                         if self.multiplexed_ssh {
                             return MultiplexedSshSessionError(format!(
                                 "{}: multiplexed SSH session was rejected ({status})",
+                                self.label
+                            ))
+                            .into();
+                        }
+                        if self.peer.is_none() {
+                            return SshConnectError(format!(
+                                "{}: SSH connection failed ({status})",
                                 self.label
                             ))
                             .into();
@@ -1553,9 +1578,19 @@ impl RemoteSpec {
         role: ConnectionRole,
         first_worker: bool,
     ) -> Result<RemoteConn> {
-        if matches!(role, ConnectionRole::Control) && compress {
-            if let Some(conn) = self.take_pooled_control(compress) {
-                return Ok(conn);
+        if matches!(role, ConnectionRole::Control) {
+            // Automatic authorization may already have opened this exact
+            // connection, including for --no-compress. Pool-created sessions
+            // still require compression, as before.
+            if let PrimedControl::Checked(conn) = &mut *self.primed_control.lock().unwrap() {
+                if let Some(conn) = conn.take() {
+                    return Ok(*conn);
+                }
+            }
+            if compress {
+                if let Some(conn) = self.take_pooled_control(compress) {
+                    return Ok(conn);
+                }
             }
         }
         let first = self.connect_retried(compress, limited, role.clone(), first_worker);

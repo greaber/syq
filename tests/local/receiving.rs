@@ -1112,14 +1112,105 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
 }
 
 #[test]
-fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
+fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
+    use std::os::unix::net::UnixListener;
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    let script = t.path("bin/ssh");
+    executable(&script, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nexec \"$SYQ_TEST_REMOTE_BINARY\" --server\n");
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("PATH", &paths)
+            .env("SYQ_TEST_REMOTE_BINARY", env!("CARGO_BIN_EXE_syq"))
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .capture_output()
+            .unwrap()
+    };
+    let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
+    let registry = t.path(".syq-destinations-v3");
+    fs::create_dir(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = t.path("return.sock");
+    let registration = serde_json::json!({"version":3,"identity":identity.trim(),
+        "socket":socket_path,"secret":"test","program":env!("CARGO_BIN_EXE_syq").as_bytes()});
+    let file = registry.join("laptop.json");
+    write(&file, &serde_json::to_vec(&registration).unwrap());
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = UnixListener::bind(socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    for compression in ["--compress", "--no-compress"] {
+        let output = run(&[
+            "cp",
+            "source",
+            "--to",
+            "127.0.0.1",
+            "--as",
+            &t.s("destination"),
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "--performance-tuning=workers=1",
+            compression,
+        ]);
+        assert_output_ok(&output);
+        assert_eq!(fs::read(t.path("destination")).unwrap(), b"payload");
+        assert_eq!(
+            fs::read_to_string(t.path("ssh-used")).unwrap(),
+            "connect\n",
+            "the successful SSH connection must be reused"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_file(t.path("destination")).unwrap();
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
+    // Successful authentication does not permit switching authority after a
+    // destination filesystem error.
+    write(&t.path("parent-is-file"), b"unchanged");
+    let failed = run(&[
+        "cp",
+        "source",
+        "--to",
+        "127.0.0.1",
+        "--as",
+        &t.s("parent-is-file/child"),
+    ]);
+    assert!(!failed.status.success());
+    assert_eq!(fs::read(t.path("parent-is-file")).unwrap(), b"unchanged");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    // A helper that exits unsuccessfully is not an SSH authentication failure.
+    executable(&script, b"#!/bin/sh\nexit 42\n");
+    let failed = run(&["cp", "source", "--to", "127.0.0.1"]);
+    assert!(!failed.status.success());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal() {
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];
@@ -1156,6 +1247,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
     }
     let listener = UnixListener::bind(&socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
+    let ssh_marker = t.path("ssh-used");
     let responder = std::thread::spawn(move || {
         let mut messages = Vec::new();
         for _ in 0..4 {
@@ -1191,6 +1283,7 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
             socket.read_exact(&mut bytes).unwrap();
             let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             let response = if envelope["message"] == "Ping" {
+                assert!(ssh_marker.exists(), "discovery preceded the SSH attempt");
                 serde_json::json!("Ready")
             } else {
                 assert!(envelope["message"].get("Forward").is_some(), "{envelope}");
@@ -1220,7 +1313,8 @@ fn automatic_authorization_selects_live_names_and_stops_after_a_refusal() {
         stderr_of(&refused)
     );
     assert!(!refused.status.success());
-    assert!(!t.path("ssh-used").exists());
+    assert!(t.path("ssh-used").exists());
+    fs::remove_file(t.path("ssh-used")).unwrap();
     let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
         .unwrap()
         .lines()

@@ -1737,7 +1737,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let src_ep = endpoint(&srcs[0], &args)?;
-    let mut dst_ep = endpoint(dst, &args)?;
+    let mut dst_ep = match args.direct_destination.take() {
+        Some(spec) => Endpoint::Remote(spec),
+        None => endpoint(dst, &args)?,
+    };
     if args.tcp_congestion.is_some() && !src_ep.is_remote() && !dst_ep.is_remote() {
         bail!(
             "{} applies only to copies with a remote endpoint",
