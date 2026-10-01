@@ -562,7 +562,9 @@ fn pending_hellos(
                 token: approved.token.clone(),
                 control: false,
             },
-            Duration::from_secs(2),
+            // exchange sets the read timeout before sending Open, while the
+            // peer is still live. Keep that timeout for waiting on expiry.
+            Duration::from_secs(5),
         )
         .unwrap();
         assert!(matches!(reply, Reply::Ready));
@@ -605,11 +607,9 @@ fn named_expired_pending_hellos_release_their_worker_allowance() {
     let (_fixture, registration, approved, _control, pending) =
         pending_hellos(Duration::from_millis(200));
     // The receiver closes each channel when its hello times out; waiting for
-    // that close is waiting for the expiry itself, not a fixed delay.
+    // that close is waiting for the expiry itself, not a fixed delay. Use
+    // the timeout set by exchange: macOS can reject changes after peer close.
     for mut stream in pending {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
         stream.read_to_end(&mut Vec::new()).unwrap();
     }
     // Expired handshakes release their worker allowance while control stays live.
