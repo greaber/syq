@@ -33,7 +33,11 @@ impl WorkBudget {
     /// Configuration RPCs supply a latency allowance on SSH too. Include both
     /// endpoints, but not connection startup, authentication or helper setup.
     pub fn set_latency(&mut self, round_trip: Duration) {
-        self.target = Duration::from_millis(250).max(round_trip.saturating_mul(2));
+        // Replies can include service for the preceding groups in the
+        // pipeline. Allow a full window of round trips before draining or
+        // shrinking; a single-RPC allowance stalls fast delayed connections.
+        self.target = Duration::from_millis(250)
+            .max(round_trip.saturating_mul(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32));
     }
 
     pub fn limit(&self) -> WorkSize {
@@ -152,14 +156,15 @@ mod tests {
         budget.set_latency(Duration::from_millis(400));
         let start = Instant::now();
         assert!(!budget.overdue(start + Duration::from_millis(700), Some(start)));
-        assert!(budget.overdue(start + Duration::from_secs(1), Some(start)));
+        assert!(!budget.overdue(start + Duration::from_secs(1), Some(start)));
+        assert!(budget.overdue(start + Duration::from_secs(2), Some(start)));
         assert!(!budget.overdue(start + Duration::from_secs(20), None));
         budget.observe(budget.limit(), Duration::from_millis(400));
         assert_eq!(
             budget.limit(),
             WorkSize {
-                bytes: 128 << 10,
-                files: 128
+                bytes: 256 << 10,
+                files: 256
             }
         );
     }
