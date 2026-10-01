@@ -212,7 +212,7 @@ impl Summary {
             sources,
             preposition: "to",
             target,
-            notes: Vec::new(),
+            notes: copy_notes(request, remote.is_some()),
             details: Details::Copy {
                 destination,
                 permission,
@@ -366,8 +366,73 @@ fn local_path(path: &[u8]) -> String {
     ))
 }
 
+/// What this copy does beyond moving files: only facts that differ between
+/// requests, such as a preview, a non-default overwrite policy, deletions, or
+/// an existing destination. For a local destination, the named mutation
+/// roots are inspected (never their children or contents). This is a local
+/// hint, not a restriction on the approved policy or a promise that names
+/// cannot change before execution. Another server is not contacted using the
+/// receiving machine's credentials before approval.
+fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<String> {
+    use crate::delegation::{ExistingDestinationPolicy, RootExistence};
+    let options = &request.copy.options;
+    let mut notes = Vec::new();
+    if options.dry_run {
+        notes.push("preview only".to_owned());
+    } else if options.verify_only {
+        notes.push("compares only, writes nothing".to_owned());
+    } else {
+        match request.copy.policy.existing {
+            ExistingDestinationPolicy::Skip => notes.push("keeps existing files".to_owned()),
+            ExistingDestinationPolicy::MustExist => {
+                notes.push("changes existing files only".to_owned())
+            }
+            _ if remote || request.constraints.root_existence == RootExistence::New => {}
+            _ => match destination_exists(request) {
+                Some(true) => notes.push("replaces existing files".to_owned()),
+                Some(false) => {}
+                None => notes.push("may replace existing files".to_owned()),
+            },
+        }
+    }
+    let deletions = request.copy.limits.max_deletions;
+    if deletions > 0 && !options.dry_run && !options.verify_only {
+        notes.push(format!("deletes up to {deletions} files or folders"));
+    }
+    notes
+}
+/// Whether any named mutation root exists on this machine, or `None` when
+/// that cannot be told cheaply. Existing directory scopes need no recursive
+/// inspection: merging into them can overwrite children whose names are not
+/// yet known.
+fn destination_exists(request: &crate::destination::CopyRequest) -> Option<bool> {
+    let scopes = &request.copy.mutation_scopes;
+    if scopes.is_empty() || scopes.len() > 32 {
+        return None;
+    }
+    let root = crate::rooted::Root::open(std::path::Path::new("/")).ok()?;
+    for scope in scopes {
+        let relative = scope.path.strip_prefix(b"/")?;
+        if relative.split(|byte| *byte == b'/').count() > 32 {
+            return None;
+        }
+        let relative = crate::rooted::RelativePath::new(relative).ok()?;
+        match root.metadata(&relative) {
+            Ok(_) => return Some(true),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(false)
+}
+
 /// What a storage authorization lets the server do, in the prompt's shape:
-/// the verb, what, where, and the facts the command does not show.
+/// the verb, what, where, and the facts that differ between requests.
 fn storage_request(
     command: &[Vec<u8>],
     request: &crate::s3::authorization::Request,
@@ -432,6 +497,9 @@ fn storage_request(
     if dry_run {
         notes.push("preview only".to_owned());
     }
+    if uploads && !removes && parsed.as_ref().is_some_and(|args| args.delete) {
+        notes.push("removes files missing from the source".to_owned());
+    }
     if request.delete
         && matches!(
             request.removal,
@@ -440,12 +508,15 @@ fn storage_request(
     {
         notes.push("deleting versions is permanent".to_owned());
     }
-    let days = request.lifetime.div_ceil(24 * 60 * 60);
-    notes.push(if days == 1 {
-        "valid for 1 day".to_owned()
-    } else {
-        format!("valid for {days} days")
-    });
+    // An endpoint from the server's environment is invisible in the command.
+    if let Some(endpoint) = &request.endpoint {
+        if !command.iter().any(|arg| arg.starts_with(b"--s3-endpoint")) {
+            notes.push(format!(
+                "endpoint {}",
+                crate::approval_command::display_arg(endpoint.as_bytes())
+            ));
+        }
+    }
     (verb, sources, preposition, target, notes)
 }
 
@@ -1194,7 +1265,34 @@ mod tests {
         assert_eq!(verb, "wants to upload");
         assert_eq!(sources, ["results"]);
         assert_eq!((preposition, target.as_str()), ("to", "s3://bucket/runs"));
-        assert_eq!(notes, ["valid for 7 days"]);
+        assert_eq!(notes, ["endpoint https://storage.example"]);
+        let named = command(&[
+            "cp",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--s3-endpoint=https://storage.example",
+        ]);
+        assert!(storage_request(&named, &request).4.is_empty());
+        let pruning = command(&[
+            "cp",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--prune",
+        ]);
+        assert_eq!(
+            storage_request(&pruning, &request).4,
+            [
+                "removes files missing from the source",
+                "endpoint https://storage.example"
+            ]
+        );
+        request.endpoint = None;
 
         // A dry run clears the request's write flags; the command still says
         // which way the data goes.
@@ -1212,14 +1310,14 @@ mod tests {
         assert_eq!(verb, "wants to upload");
         assert_eq!(sources, ["results"]);
         assert_eq!(target, "s3://bucket/runs");
-        assert_eq!(notes, ["preview only", "valid for 7 days"]);
+        assert_eq!(notes, ["preview only"]);
 
         let download = command(&["cp", "runs", "--from", "s3://bucket", "--into", "archive"]);
         let (verb, sources, _, target, notes) = storage_request(&download, &request);
         assert_eq!(verb, "wants to download");
         assert_eq!(sources, ["s3://bucket/runs"]);
         assert_eq!(target, "archive");
-        assert_eq!(notes, ["valid for 7 days"]);
+        assert!(notes.is_empty());
 
         request.delete = true;
         request.removal = Some(Removal::AllVersions);
@@ -1238,18 +1336,108 @@ mod tests {
             ]
         );
         assert!(target.is_empty());
-        assert_eq!(notes, ["deleting versions is permanent", "valid for 1 day"]);
+        assert_eq!(notes, ["deleting versions is permanent"]);
 
         let mut summary = summary();
         summary.command = crate::approval_command::display(&upload);
         summary.verb = "wants to delete";
         summary.sources = vec!["s3://bucket/a".into(), "s3://bucket/b".into()];
         summary.target = String::new();
-        summary.notes = vec!["valid for 1 day".into()];
+        summary.notes = vec!["deleting versions is permanent".into()];
         assert_eq!(
             summary.desktop_description(false),
-            "wants to delete\n\n    s3://bucket/a\n\n    s3://bucket/b\n\nvalid for 1 day\n\nsyq cp results --to s3://bucket --into runs"
+            "wants to delete\n\n    s3://bucket/a\n\n    s3://bucket/b\n\ndeleting versions is permanent\n\nsyq cp results --to s3://bucket --into runs"
         );
+    }
+    #[test]
+    fn copy_notes_say_only_what_differs_between_requests() {
+        use crate::delegation::{ExistingDestinationPolicy, RootExistence};
+        use std::os::unix::fs::symlink;
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let missing = root.join("missing");
+        let none: [&str; 0] = [];
+        assert_eq!(copy_notes(&copy_request(&missing), false), none);
+        assert_eq!(
+            copy_notes(&copy_request(&missing.join("child")), false),
+            none
+        );
+
+        let file = root.join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let link = root.join("link");
+        symlink(&missing, &link).unwrap();
+        for path in [&file, &directory, &link] {
+            assert_eq!(
+                copy_notes(&copy_request(path), false),
+                ["replaces existing files"]
+            );
+        }
+        // A parent symlink is not followed, even when its target is missing;
+        // unknown existence is said as such.
+        assert_eq!(
+            copy_notes(&copy_request(&link.join("child")), false),
+            ["may replace existing files"]
+        );
+        assert_eq!(
+            copy_notes(&copy_request(&file.join("child")), false),
+            ["may replace existing files"]
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        let mut many = copy_request(&missing);
+        many.copy.mutation_scopes = vec![many.copy.mutation_scopes[0].clone(); 33];
+        assert_eq!(copy_notes(&many, false), ["may replace existing files"]);
+        // Another server is never inspected, so nothing is claimed about it.
+        assert_eq!(copy_notes(&copy_request(&file), true), none);
+
+        let mut request = copy_request(&file);
+        request.copy.options.dry_run = true;
+        assert_eq!(copy_notes(&request, false), ["preview only"]);
+        request.copy.options.dry_run = false;
+        request.copy.options.verify_only = true;
+        assert_eq!(
+            copy_notes(&request, false),
+            ["compares only, writes nothing"]
+        );
+        request.copy.options.verify_only = false;
+        request.copy.policy.existing = ExistingDestinationPolicy::Skip;
+        assert_eq!(copy_notes(&request, false), ["keeps existing files"]);
+        assert_eq!(copy_notes(&request, true), ["keeps existing files"]);
+        request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
+        assert_eq!(copy_notes(&request, false), ["changes existing files only"]);
+        request.copy.policy.existing = ExistingDestinationPolicy::Replace;
+        request.constraints.root_existence = RootExistence::New;
+        assert_eq!(copy_notes(&request, false), none);
+        request.constraints.root_existence = RootExistence::Any;
+        request.copy.limits.max_deletions = 3;
+        assert_eq!(
+            copy_notes(&request, false),
+            [
+                "replaces existing files",
+                "deletes up to 3 files or folders"
+            ]
+        );
+        assert_eq!(
+            copy_notes(&request, true),
+            ["deletes up to 3 files or folders"]
+        );
+
+        let summary = Summary::new(
+            &requester(),
+            &[b"cp".to_vec(), b"file".to_vec()],
+            "~",
+            &request,
+            TIMEOUT,
+            None,
+        )
+        .unwrap();
+        assert!(summary.desktop_description(false).ends_with(&format!(
+            "to\n\n    {}\n\nreplaces existing files\n\ndeletes up to 3 files or folders\n\nsyq cp file",
+            file.display()
+        )));
     }
     #[test]
     fn long_directories_move_from_the_title_to_the_body() {

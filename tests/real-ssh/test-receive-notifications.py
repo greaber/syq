@@ -114,7 +114,7 @@ def tests():
                 assert app == "syq" and summary.startswith("syq on "), summary
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
-                assert "May create" not in body and "\nFrom: " not in body, body
+                assert "May create" not in body and "\nFrom: " not in body and "existing" not in body, body
                 # What is copied where, then the server's command; the server's
                 # directory comes first only when it does not fit the title.
                 assert 'wants to download\n\n    /tmp/syq-real-ssh/return-source/message.txt\n\nto\n\n    "/tmp/syq-real-ssh-receive/desktop-' in body, body
@@ -142,7 +142,7 @@ def tests():
         result = subprocess.run(["ssh", "source", command], timeout=20)
         assert result.returncode != 0
         assert destination.read_bytes() == b"keep this"
-        assert '\n\nto\n\n    /tmp/syq-real-ssh-receive/desktop-existing\n\n' in observed[-1][2], observed[-1]
+        assert '\n\nto\n\n    /tmp/syq-real-ssh-receive/desktop-existing\n\nreplaces existing files\n\n' in observed[-1][2], observed[-1]
         for choice in ["allow", "deny"]:
             marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
             command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])

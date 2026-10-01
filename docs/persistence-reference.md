@@ -199,6 +199,8 @@ desktop session. After changing sessions, run `syq persist receive off`, then
 enable the profiles you need from a terminal in the new session.
 
 `syq persist receive pending` shows complete requests and prompt errors.
+A prompt's note that a copy replaces existing files is advisory; destination
+entries can change before copying.
 `--notify off` selects terminal approval; `--notify desktop` restores prompts.
 
 Start the connection from your laptop with `syq persist connect server`.
