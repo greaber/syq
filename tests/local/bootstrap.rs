@@ -805,16 +805,20 @@ exec /bin/sh -c "$1""#,
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         let terminal = records.last().unwrap();
-        let elapsed = terminal["elapsed_ms"].as_u64().unwrap();
-        let setup = terminal["setup_elapsed_ms"].as_u64().unwrap();
-        let transfer = terminal["transfer_elapsed_ms"].as_u64().unwrap();
+        let elapsed = terminal["timings"]["total_ms"].as_u64().unwrap();
+        let setup = terminal["timings"]["setup_ms"].as_u64().unwrap();
+        let transfer = terminal["timings"]["transfer_ms"].as_u64().unwrap();
         assert!(
             setup >= 900,
             "initial connection excluded from setup: {terminal}"
         );
         assert!(
-            elapsed >= setup + transfer + 1900,
+            elapsed >= setup + 1900 && transfer < elapsed - 1900,
             "installation counted: {terminal}"
+        );
+        assert!(
+            terminal["timings"]["helper_install_ms"].as_u64().unwrap() >= 1900,
+            "{terminal}"
         );
         let final_progress = records
             .iter()
@@ -822,16 +826,17 @@ exec /bin/sh -c "$1""#,
             .find(|r| r["type"] == "progress")
             .unwrap();
         assert_eq!(
-            final_progress["transfer_elapsed_ms"],
-            terminal["transfer_elapsed_ms"]
+            final_progress["timings"]["transfer_ms"],
+            terminal["timings"]["transfer_ms"]
         );
         assert_eq!(
-            final_progress["setup_elapsed_ms"],
-            terminal["setup_elapsed_ms"]
+            final_progress["timings"]["setup_ms"],
+            terminal["timings"]["setup_ms"]
         );
+        assert_eq!(final_progress["timings"], terminal["timings"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains(&format!("initial setup: {:.3}s", setup as f64 / 1000.0)),
+            stdout.contains(&format!("timing: setup {:.3}s", setup as f64 / 1000.0)),
             "{stdout}"
         );
         let duration = format!("{}:{:02}", transfer / 60_000, transfer / 1000 % 60);

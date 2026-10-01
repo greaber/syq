@@ -143,6 +143,7 @@ impl Conn for PipelineConn {
                         .map(|read| {
                             let data = vec![42; read.len as usize];
                             Ok(SmallBlock {
+                                source: Some(pipeline_job(&read.path, size).entry.clone()),
                                 hash: content_digest(&data),
                                 data,
                             })
@@ -711,7 +712,7 @@ fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
                 }
                 dst.lock().unwrap().replies.push_back(Response::Ok);
                 let mut worker = pipeline_worker(&sched, &src, &dst, streaming);
-                let error = worker.run().unwrap_err();
+                let error = worker.run(None).unwrap_err();
                 assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
                 assert!(sched.is_aborted());
                 assert!(

@@ -3,7 +3,7 @@
 
 Normalization keeps regeneration deterministic so a diff shows only real
 API changes — fixture review is API review. Volatile identity and timing
-fields (run_id, started_at, syq_version, elapsed_ms, copying_elapsed_ms)
+fields (run_id, started_at, syq_version, timings)
 get fixed values, and progress records are dropped with seq renumbered:
 whether a fast run emits its first sample before finishing is a race, and a
 stream with no progress records is itself a real possible stream.
@@ -44,9 +44,8 @@ def normalize(raw, fixture):
     output = []
     for seq, record in enumerate(record for record in records if record.get("type") != "progress"):
         record["seq"] = seq
-        for field in ("elapsed_ms", "copying_elapsed_ms"):
-            if field in record:
-                record[field] = 0
+        if "timings" in record:
+            record["timings"] = dict.fromkeys(record["timings"], 0)
         if record.get("type") == "run":
             record["run_id"] = "6465616462656566000000000000cafe"
             record["started_at"] = 1756800000

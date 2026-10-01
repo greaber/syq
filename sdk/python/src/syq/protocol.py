@@ -48,11 +48,12 @@ from .models import (
     RemovalTrace,
     TraceEvent,
     TraceReason,
+    Timings,
 )
 
 
 SCHEMA = "syq.automation"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 _MAX_U64 = (1 << 64) - 1
 _MAX_I64 = (1 << 63) - 1
 _EnumT = TypeVar("_EnumT")
@@ -106,6 +107,18 @@ def _optional_integer(record: dict[str, Any], key: str) -> int | None:
     if key not in record:
         return None
     return _integer(record, key)
+
+
+def _timings(record: dict[str, Any]) -> Timings:
+    value = record.get("timings")
+    if not isinstance(value, dict):
+        raise SyqProtocolError("automation field 'timings' must be an object")
+    return Timings(
+        total_ms=_integer(value, "total_ms"),
+        **{key: _optional_integer(value, key) for key in (
+            "setup_ms", "planning_ms", "transfer_ms", "finalization_ms", "helper_install_ms"
+        )},
+    )
 
 
 def _boolean(record: dict[str, Any], key: str) -> bool:
@@ -253,7 +266,7 @@ class AutomationDecoder:
             raise ValueError("automation decoder mode must be 'cp' or 'rm'")
         self.stream_entries = stream_entries
         self.stream_outcomes: set[int] = set()
-        self.schema_version = 3 if stream_entries is not None else SCHEMA_VERSION
+        self.schema_version = 5 if stream_entries is not None else SCHEMA_VERSION
         self.expected_mode = mode
         self.expected_prune = prune
         self.expected_mapping = mapping
@@ -376,12 +389,10 @@ class AutomationDecoder:
                 files_excluded=_integer(record, "files_excluded"),
                 scanned=_integer(record, "scanned"),
                 scan_done=_boolean(record, "scan_done"),
-                elapsed_ms=_integer(record, "elapsed_ms"),
+                timings=_timings(record),
                 activity=record.get("activity"),
                 rate_bytes_per_second=_optional_integer(record, "rate_bytes_per_second"),
                 eta_ms=_optional_integer(record, "eta_ms"),
-                setup_elapsed_ms=_optional_integer(record, "setup_elapsed_ms"),
-                transfer_elapsed_ms=_optional_integer(record, "transfer_elapsed_ms"),
             )
         if record_type == "trace":
             if self.run.mode != "cp":
@@ -847,7 +858,7 @@ class AutomationDecoder:
                     entries_already_absent=entries_already_absent,
                     entries_failed=entries_failed,
                     errors=errors,
-                    elapsed_ms=_integer(record, "elapsed_ms"),
+                    timings=_timings(record),
                 )
                 self.result = result
                 return result
@@ -906,8 +917,6 @@ class AutomationDecoder:
             result = CpResult(
                 **common,
                 bytes_total_known=_boolean(record, "bytes_total_known") if "bytes_total_known" in record else None,
-                setup_elapsed_ms=_optional_integer(record, "setup_elapsed_ms"),
-                transfer_elapsed_ms=_optional_integer(record, "transfer_elapsed_ms"),
                 status=status,
                 exit_code=exit_code,
                 dry_run=dry_run,
@@ -920,7 +929,7 @@ class AutomationDecoder:
                 errors=_integer(record, "errors"),
                 bytes_transferred=_integer(record, "bytes_transferred"),
                 bytes_unchanged=_integer(record, "bytes_unchanged"),
-                elapsed_ms=_integer(record, "elapsed_ms"),
+                timings=_timings(record),
                 deletions_planned=deletion_values[0],
                 deletions_completed=deletion_values[1],
                 deletions_blocked=deletion_values[2],

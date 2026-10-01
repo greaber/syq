@@ -1,5 +1,9 @@
 //! A fixed-height aggregate progress bar. Byte accounting belongs to the engine.
 
+mod timing;
+pub(crate) use timing::Measuring;
+pub use timing::Timings;
+
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -63,7 +67,7 @@ pub struct Progress {
     separate_transfer_timing: bool,
     transfer_start: std::sync::OnceLock<Instant>,
     transfer_end: std::sync::OnceLock<Instant>,
-    setup_excluded_ns: AtomicU64,
+    pub(crate) clock: timing::Clock,
     copy_first_ns: AtomicU64,
     copy_last_ns: AtomicU64,
     term: Mutex<TermState>,
@@ -163,7 +167,7 @@ impl Progress {
             separate_transfer_timing: false,
             transfer_start: std::sync::OnceLock::new(),
             transfer_end: std::sync::OnceLock::new(),
-            setup_excluded_ns: AtomicU64::new(0),
+            clock: Default::default(),
             copy_first_ns: AtomicU64::new(u64::MAX),
             copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {
@@ -185,21 +189,6 @@ impl Progress {
         progress
     }
 
-    /// Initial installs can overlap on a relayed copy. Exclude their union,
-    /// not their sum, from setup time. Called after both control connects join.
-    pub fn exclude_setup_intervals(&self, intervals: impl Iterator<Item = (Instant, Instant)>) {
-        let mut intervals: Vec<_> = intervals.collect();
-        intervals.sort_unstable();
-        let mut end = self.start;
-        let mut excluded = Duration::ZERO;
-        for (first, last) in intervals {
-            excluded += last.saturating_duration_since(first.max(end));
-            end = end.max(last);
-        }
-        self.setup_excluded_ns
-            .store(excluded.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
-    }
-
     /// Start once the initial transport is ready, before releasing copy work.
     /// Retries and reconnects after this point remain part of the transfer.
     pub fn begin_transfer(&self) {
@@ -212,18 +201,20 @@ impl Progress {
     }
 
     pub fn finish_transfer(&self) {
+        let last = self.copy_last_ns.load(Relaxed);
         if self.transfer_start.get().is_some() {
-            let _ = self.transfer_end.set(Instant::now());
+            let _ = self
+                .transfer_end
+                .set(self.start + Duration::from_nanos(last));
         }
     }
 
-    pub fn setup_elapsed_ms(&self) -> Option<u64> {
-        self.transfer_start.get().map(|start| {
-            start
-                .duration_since(self.start)
-                .saturating_sub(Duration::from_nanos(self.setup_excluded_ns.load(Relaxed)))
-                .as_millis() as u64
-        })
+    pub fn timings(&self) -> Timings {
+        self.clock.snapshot(
+            self.start,
+            self.separate_transfer_timing
+                .then(|| self.transfer_elapsed().unwrap_or_default()),
+        )
     }
 
     fn transfer_elapsed(&self) -> Option<Duration> {
@@ -234,11 +225,6 @@ impl Progress {
                 .unwrap_or_else(Instant::now)
                 .saturating_duration_since(*start)
         })
-    }
-
-    pub fn transfer_elapsed_ms(&self) -> Option<u64> {
-        self.transfer_elapsed()
-            .map(|elapsed| elapsed.as_millis() as u64)
     }
 
     pub fn display_elapsed(&self) -> Duration {
@@ -414,9 +400,7 @@ impl Progress {
                     files_excluded: self.excluded(),
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
-                    elapsed_ms: self.start.elapsed().as_millis() as u64,
-                    setup_elapsed_ms: self.setup_elapsed_ms(),
-                    transfer_elapsed_ms: self.transfer_elapsed_ms(),
+                    timings: self.timings(),
                     rate_bytes_per_second: rate.round() as u64,
                     eta_ms: eta.map(|seconds| (seconds * 1000.0).round() as u64),
                     activity: t.observation.as_ref(),
@@ -501,6 +485,7 @@ impl Progress {
     /// actual operation outcome; a full byte counter alone is not success.
     pub fn finish(&self, success: bool) {
         self.finish_transfer();
+        self.clock.finish();
         self.render_status(Some(if success { "done" } else { "incomplete" }));
         if self.enabled {
             crate::output::finish_progress();
@@ -764,34 +749,13 @@ mod tests {
     use crate::tune::Meter;
 
     #[test]
-    fn transfer_timing_excludes_setup_and_overlapping_installs() {
+    fn transfer_rate_starts_with_work_and_freezes_before_finalization() {
         let mut progress = Progress::new_transfer(false, false, None);
-        let origin = Instant::now() - Duration::from_secs(60);
-        Arc::get_mut(&mut progress).unwrap().start = origin;
-        progress.exclude_setup_intervals(
-            [
-                (
-                    origin + Duration::from_secs(20),
-                    origin + Duration::from_secs(40),
-                ),
-                (
-                    origin + Duration::from_secs(10),
-                    origin + Duration::from_secs(30),
-                ),
-            ]
-            .into_iter(),
-        );
-        assert_eq!(progress.transfer_elapsed_ms(), None);
-        assert_eq!(progress.setup_elapsed_ms(), None);
+        Arc::get_mut(&mut progress).unwrap().start = Instant::now() - Duration::from_secs(60);
+        assert_eq!(progress.timings().transfer_ms, Some(0));
         assert_eq!(progress.display_elapsed(), Duration::ZERO);
         progress.begin_transfer();
         let began = *progress.transfer_start.get().unwrap();
-        let setup = progress.setup_elapsed_ms().unwrap();
-        assert_eq!(
-            setup,
-            began.duration_since(origin).as_millis() as u64 - 30_000
-        );
-        // Use a synthetic sample time so the rate test does not need a sleep.
         let mut term = progress.term.lock().unwrap();
         assert_eq!(
             progress.rate(&mut term, began + Duration::from_secs(2), 400),
@@ -800,13 +764,13 @@ mod tests {
         drop(term);
         progress.begin_transfer();
         assert_eq!(progress.transfer_start.get(), Some(&began));
-        assert_eq!(progress.setup_elapsed_ms(), Some(setup));
-        progress
-            .transfer_end
-            .set(began + Duration::from_secs(2))
-            .unwrap();
+        let ended = began + Duration::from_secs(2);
+        progress.copy_last_ns.store(
+            ended.duration_since(progress.start).as_nanos() as u64,
+            Relaxed,
+        );
         progress.finish_transfer();
-        assert_eq!(progress.transfer_elapsed_ms(), Some(2_000));
+        assert_eq!(progress.timings().transfer_ms, Some(2_000));
         assert_eq!(progress.display_elapsed(), Duration::from_secs(2));
         assert!(progress.start.elapsed() >= Duration::from_secs(60));
     }

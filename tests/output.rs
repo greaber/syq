@@ -163,7 +163,7 @@ fn full_stdout_keeps_results_progress_running() {
             for line in text.lines() {
                 if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
                     if record["type"] == "progress" {
-                        sampled_times.insert(record["elapsed_ms"].as_u64().unwrap());
+                        sampled_times.insert(record["timings"]["total_ms"].as_u64().unwrap());
                     }
                 }
             }

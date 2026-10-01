@@ -720,6 +720,7 @@ fn attempt_small_copy(
     progress: &Progress,
     t0: std::time::Instant,
 ) -> Result<SmallCopy> {
+    let mut planning = Some(progress.clock.planning.begin());
     // A source named like a syq sidecar gets the engine's warning.
     if srcs
         .iter()
@@ -881,6 +882,8 @@ fn attempt_small_copy(
             if needed.len() != entries.len() {
                 bail!("small copy returned a mismatched selection count");
             }
+            drop(planning.take());
+            let setup = progress.clock.setup.begin();
             // Read through the engine's source-worker path.
             let Ok(mut reader) = src_ep.connect_with_sources(args.compress, roots.to_vec(), true)
             else {
@@ -916,7 +919,8 @@ fn attempt_small_copy(
                     return Ok(SmallCopy::Reconnect);
                 }
             }
-            copying = Some(progress.copying_interval());
+            drop(setup);
+            copying = (!reads.is_empty()).then(|| progress.copying_interval());
             let mut blocks = if reads.is_empty() {
                 Vec::new()
             } else {
@@ -1133,8 +1137,19 @@ fn attempt_small_copy(
     } else {
         ("success", 0)
     };
+    drop(planning);
     drop(copying);
     progress.finish_transfer();
+    let finalization = progress.clock.finalization.begin();
+    if progress.observations.enabled.load(Relaxed) {
+        if let Some(reader) = &mut source_reader {
+            reader.transport_stats();
+        }
+        dst_ctl.transport_stats();
+    }
+    drop(_native_work);
+    drop(finalization);
+    progress.finish(exit_code == 0);
     let terminal = crate::results::ResultRecord {
         status,
         exit_code,
@@ -1148,27 +1163,16 @@ fn attempt_small_copy(
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        copying_elapsed_ms: progress.copying_elapsed_ms(),
-        elapsed_ms: progress.start.elapsed().as_millis() as u64,
-        setup_elapsed_ms: progress.setup_elapsed_ms(),
-        transfer_elapsed_ms: progress.transfer_elapsed_ms(),
+        timings: progress.timings(),
         deletions_planned: None,
         deletions_completed: None,
         deletions_blocked: None,
     };
-    if progress.observations.enabled.load(Relaxed) {
-        if let Some(reader) = &mut source_reader {
-            reader.transport_stats();
-        }
-        dst_ctl.transport_stats();
-    }
-    drop(_native_work);
-    progress.finish(exit_code == 0);
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(&terminal, elapsed, "");
     }
-    print_copying_interval(args, opts, progress);
+    print_timings(args, progress);
     if let Some(benchmark) = &opts.benchmark {
         benchmark.lock().unwrap().native_small_copies += 1;
     }
@@ -1177,7 +1181,6 @@ fn attempt_small_copy(
         print_statistics(
             opts,
             progress,
-            elapsed,
             "none (small files sent on the control connection)",
             "\n  tcp statistics: unavailable (data used the control connection)",
         );
@@ -1195,22 +1198,25 @@ fn show_statistics(args: &Args) -> bool {
     !args.suppress_summary || args.restricted_grant.is_some()
 }
 
-/// The `--stats` copying-interval line, printed even for a copy that was
-/// aborted: the interval is a fact about the data that did move.
-fn print_copying_interval(args: &Args, opts: &Opts, progress: &Progress) {
-    if args.stats && show_statistics(args) && !args.quiet && !opts.dry_run {
-        if let Some(ms) = progress.setup_elapsed_ms() {
-            crate::output::human_stdout!(
-                "  initial setup: {:.3}s (excludes helper installation)",
-                ms as f64 / 1000.0
-            );
-        }
-        if let Some(ms) = progress.copying_elapsed_ms() {
-            crate::output::human_stdout!(
-                "  copying interval: {:.3}s (may overlap planning)",
-                ms as f64 / 1000.0
-            );
-        }
+/// Keep the interactive summary compact; `--stats` also requests it in pipes.
+fn print_timings(args: &Args, progress: &Progress) {
+    use std::io::IsTerminal;
+    if (args.stats || args.progress || std::io::stderr().is_terminal())
+        && show_statistics(args)
+        && !args.quiet
+    {
+        let t = progress.timings();
+        let seconds = |ms: Option<u64>| ms.unwrap_or(0) as f64 / 1000.0;
+        let install = t
+            .helper_install_ms
+            .filter(|ms| *ms > 0)
+            .map(|ms| format!(" · helper install {:.3}s", ms as f64 / 1000.0))
+            .unwrap_or_default();
+        crate::output::human_stdout!(
+            "  timing: setup {:.3}s · planning {:.3}s · transfer {:.3}s · finalization {:.3}s · total {:.3}s{}",
+            seconds(t.setup_ms), seconds(t.planning_ms), seconds(t.transfer_ms),
+            seconds(t.finalization_ms), t.total_ms as f64 / 1000.0, install
+        );
     }
 }
 
@@ -1218,13 +1224,7 @@ fn print_copying_interval(args: &Args, opts: &Opts, progress: &Progress) {
 /// renders, plus how the data travelled. `connections` and `tcp_stats` come
 /// from the path that carried the copy, since a copy that never started data
 /// workers has neither a worker count nor data sockets to report.
-fn print_statistics(
-    opts: &Opts,
-    progress: &Progress,
-    elapsed: f64,
-    connections: &str,
-    tcp_stats: &str,
-) {
+fn print_statistics(opts: &Opts, progress: &Progress, connections: &str, tcp_stats: &str) {
     // --stats is additional human output, not the summary line the local
     // attested settlement re-renders; a delegated coordinator keeps it.
     let (files_label, unchanged_files_label, bytes_label, unchanged_bytes_label, bytes_work) =
@@ -1246,14 +1246,13 @@ fn print_statistics(
             )
         };
     crate::output::human_stdout!(
-        "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  elapsed: {:.2}s\n  connections: {connections}{tcp_stats}",
+        "  scanned entries: {}\n  {files_label}: {}\n  {unchanged_files_label}: {}\n  files excluded: {}\n  {bytes_label}: {}\n  {unchanged_bytes_label}: {}\n  connections: {connections}{tcp_stats}",
         commas(progress.scanned.load(Relaxed)),
         commas(progress.files_total.load(Relaxed)),
         commas(progress.files_unchanged.load(Relaxed)),
         commas(progress.excluded()),
         commas(bytes_work),
         commas(progress.bytes_unchanged.load(Relaxed)),
-        elapsed,
     );
 }
 
@@ -1446,14 +1445,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 errors: progress.errors.load(Relaxed),
                 bytes_transferred: progress.bytes_done.load(Relaxed),
                 bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-                copying_elapsed_ms: if dry_run {
-                    None
-                } else {
-                    progress.copying_elapsed_ms()
-                },
-                elapsed_ms: progress.start.elapsed().as_millis() as u64,
-                setup_elapsed_ms: progress.setup_elapsed_ms(),
-                transfer_elapsed_ms: progress.transfer_elapsed_ms(),
+                timings: progress.timings(),
                 // What the deletion pass did before the run died; zeros
                 // mean it never got that far, and status "failed" already
                 // marks every aggregate here as pre-failure state.
@@ -1526,6 +1518,7 @@ fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
 }
 
 fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
+    let setup = progress.clock.setup.begin();
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
     let mut args = args;
@@ -1895,13 +1888,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
     let small_copy_candidate = small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep);
+    drop(setup);
     let (mut src_ctl, early_sources, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
         let candidates = small_copy_candidate.then(|| srcs.to_vec());
+        let source_progress = progress.clone();
         // Local metadata is usually ready before the SSH handshake completes.
         let t = std::thread::spawn(move || -> Result<_> {
-            let mut connection = connect_ctl(&a, &b)?;
+            let source_setup = source_progress.clock.setup.begin();
+            let connection = connect_ctl(&a, &b);
+            source_setup.exclude(
+                real_remote_spec(&a).and_then(|spec| spec.diagnostics().helper_installation),
+            );
+            let mut connection = connection?;
             let sources = if let Some(sources) = candidates {
+                let _planning = source_progress.clock.planning.begin();
                 let claim_workers = admitted_clone_claim_workers(
                     sources.len(),
                     source_shared_workers,
@@ -1942,17 +1943,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         });
         // The small-copy offer configures hashing and selects entries in the
         // same turn. General copies keep the usual control initialization.
+        let destination_setup = progress.clock.setup.begin();
         let dst_ctl = if small_copy_candidate {
             open_control_connection(&dst_ep, &args)
         } else {
             connect_ctl(&dst_ep, &args)
         };
+        destination_setup.exclude(
+            real_remote_spec(&dst_ep).and_then(|spec| spec.diagnostics().helper_installation),
+        );
         let src_ctl = t
             .join()
             .map_err(|_| anyhow::anyhow!("connect thread panicked"))?;
-        progress.exclude_setup_intervals([&src_ep, &dst_ep].into_iter().filter_map(|ep| {
-            real_remote_spec(ep).and_then(|spec| spec.diagnostics().helper_installation)
-        }));
+        progress
+            .clock
+            .helper_install
+            .set([&src_ep, &dst_ep].into_iter().filter_map(|ep| {
+                real_remote_spec(ep).and_then(|spec| spec.diagnostics().helper_installation)
+            }));
         match (src_ctl, dst_ctl) {
             (Ok((a, sources)), Ok(b)) => (a, sources, b),
             (Err(e), _) | (_, Err(e)) => {
@@ -1961,6 +1969,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     };
+    let planning = progress.clock.planning.begin();
     let clone_claim_workers = match &early_sources {
         Some(sources) => sources.claim_workers,
         None => admitted_clone_claim_workers(
@@ -2126,6 +2135,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
                 // Planner wait is not connection setup. Start once here so
                 // subsequent connection attempts still include retry backoff.
+                let mut setup = Some(progress.clock.setup.begin());
                 gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
@@ -2237,7 +2247,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             t0.elapsed().as_secs_f64()
                         );
                     }
-                    let result = worker.run();
+                    let result = worker.run(setup.take());
                     if let Some(benchmark) = &opts.benchmark {
                         benchmark.lock().unwrap().add(worker.benchmark);
                     }
@@ -2401,6 +2411,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
+    drop(planning);
     // The bounded offer replaces the destination configuration turn. Its
     // selected payloads use this control connection without data workers.
     if small_copy_candidate {
@@ -2429,10 +2440,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
                 return Ok(code);
             }
-            SmallCopy::Declined => configure_hashing(&mut *dst_ctl, opts.hash_policy)?,
-            SmallCopy::Reconnect => dst_ctl = connect_ctl(&dst_ep, &args)?,
+            SmallCopy::Declined => {
+                let _setup = progress.clock.setup.begin();
+                configure_hashing(&mut *dst_ctl, opts.hash_policy)?;
+            }
+            SmallCopy::Reconnect => {
+                let _setup = progress.clock.setup.begin();
+                dst_ctl = connect_ctl(&dst_ep, &args)?;
+            }
         }
     }
+    let setup = progress.clock.setup.begin();
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
     let mut pending_tcp_setups = Vec::new();
     if let Some(ports) = tcp_ports {
@@ -2459,6 +2477,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             t0.elapsed().as_secs_f64()
         );
     }
+    drop(setup);
+    let mut planning = Some(progress.clock.planning.begin());
     // One spelling for the destination root: every derived key — claims,
     // delete roots, destination-walk paths, receiver-computed sidecar names —
     // flows from this, and the receiver rebuilds paths through `Path`, which
@@ -2911,8 +2931,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .iter()
         .any(|(spec, _)| spec.restricted_grant.is_some())
     {
+        drop(planning.take());
+        let setup = progress.clock.setup.begin();
         for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
-            if let Err(error) = spec.finish_tcp_setup(pending) {
+            let result = spec.finish_tcp_setup(pending);
+            if let Some(span) = spec.diagnostics().tcp_probe_time {
+                progress.clock.setup.record(span);
+            }
+            if let Err(error) = result {
                 handle_tcp_setup_error(
                     &args,
                     &spec,
@@ -2923,6 +2949,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 )?;
             }
         }
+        drop(setup);
+        planning = Some(progress.clock.planning.begin());
     }
 
     // Missing directories are created only when the copy may write at all:
@@ -3008,10 +3036,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !remote_root_initially_missing
         && std::env::var_os("SYQ_INTERNAL_DETACH_READY").is_none()
         && !pending_tcp_setups.is_empty();
+    drop(planning);
     let history_context = std::cell::RefCell::new(None);
     let mut finish_transport_setup = |args: &mut Args| -> Result<_> {
+        let _setup = progress.clock.setup.begin();
         for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
-            if let Err(error) = spec.finish_tcp_setup(pending) {
+            let result = spec.finish_tcp_setup(pending);
+            if let Some(span) = spec.diagnostics().tcp_probe_time {
+                progress.clock.setup.record(span);
+            }
+            if let Err(error) = result {
                 handle_tcp_setup_error(
                     args,
                     &spec,
@@ -3149,6 +3183,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         Some(finish_transport_setup(&mut args)?)
     };
+    let mut planning = Some(progress.clock.planning.begin());
     let workers_started = std::cell::Cell::new(false);
     if transport_setup.as_ref().is_some_and(|(tcp, _, _)| *tcp)
         && remote_root_initially_missing
@@ -3387,7 +3422,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     #[cfg(debug_assertions)]
     crate::fsops::record_test_event("SYQ_TEST_SETUP_EVENTS", format_args!("scan_complete"))?;
     if transport_setup.is_none() {
+        drop(planning.take());
         transport_setup = Some(finish_transport_setup(&mut args)?);
+        planning = Some(progress.clock.planning.begin());
     }
     let (all_remote_endpoints_use_tcp, _tuning_key, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
@@ -3604,6 +3641,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         sched.scan_done();
     }
 
+    drop(planning);
     // Join workers; the tuner may add more while we do, until it exits.
     let mut tuner = tuner.lock().unwrap().take();
     let mut tuned = None;
@@ -3648,6 +3686,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
 
+    progress.finish_transfer();
+    let finalization = progress.clock.finalization.begin();
+    #[cfg(debug_assertions)]
+    crate::fsops::test_race_barrier(
+        "SYQ_TEST_FINALIZATION_READY_FILE",
+        "SYQ_TEST_FINALIZATION_CONTINUE_FILE",
+        "copy finalization",
+    )?;
     let aborted = sched.is_aborted();
     if opts.dry_run {
         st.flush_dry_directory_traces();
@@ -3794,9 +3840,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         ("success", 0)
     };
-    // No scheduled file work (for example an unchanged tree) has a zero
-    // transfer interval; all of its work belongs to setup.
-    progress.begin_transfer();
+    drop(finalization);
     progress.finish(exit_code == 0);
     let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
         let planned = match delete_plan {
@@ -3840,14 +3884,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         errors,
         bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        copying_elapsed_ms: if opts.dry_run {
-            None
-        } else {
-            progress.copying_elapsed_ms()
-        },
-        elapsed_ms: progress.start.elapsed().as_millis() as u64,
-        setup_elapsed_ms: progress.setup_elapsed_ms(),
-        transfer_elapsed_ms: progress.transfer_elapsed_ms(),
+        timings: progress.timings(),
         deletions_planned,
         deletions_completed,
         deletions_blocked,
@@ -3906,7 +3943,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    print_copying_interval(&args, &opts, &progress);
+    print_timings(&args, &progress);
     print_benchmark_observations(&opts);
     if args.stats && !args.quiet && !aborted {
         let connections = match &tuned {
@@ -3926,7 +3963,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             matches!(endpoint, Endpoint::Remote(spec) if !spec.local_process && spec.data_transport() == DataTransport::Ssh)
         });
         let tcp_stats = format_tcp_stats(&transport_stats.lock().unwrap(), has_ssh_data);
-        print_statistics(&opts, &progress, elapsed, &connections, &tcp_stats);
+        print_statistics(&opts, &progress, &connections, &tcp_stats);
     }
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);

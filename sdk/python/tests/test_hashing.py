@@ -29,7 +29,7 @@ class HashTests(unittest.TestCase):
         # Unchanged output from the last binary with this mode (2de544d2).
         fixture = Path(__file__).parent / "fixtures/automation-v2-verify-only.ndjson"
         decoder = AutomationDecoder(prune=False, mapping=False, dry_run=False)
-        with self.assertRaisesRegex(syq.SyqProtocolError, "verify-only"):
+        with self.assertRaisesRegex(syq.SyqProtocolError, "schema version"):
             decoder.feed(fixture.read_bytes().splitlines()[0])
 
     def test_algorithms_lengths_and_immutable_canonical_value(self):

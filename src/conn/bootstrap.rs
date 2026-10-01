@@ -9,26 +9,30 @@ impl RemoteSpec {
         }
 
         let started = std::time::Instant::now();
-        let bootstrap = self.remote_bootstrap()?;
-        let target = bootstrap.target;
-        if !self.quiet {
-            crate::output::diagnostic!(
-                "syq: {}: installing {} helper for {}",
-                self.label(),
-                remote_helper::helper_identity(),
-                target.key
-            );
-        }
-        self.bootstrap_helper(bootstrap).with_context(|| {
-            format!(
-                "could not install the matching {} helper on {} ({})",
-                remote_helper::helper_identity(),
-                self.label(),
-                target.key
-            )
-        })?;
+        let result: Result<()> = (|| {
+            let bootstrap = self.remote_bootstrap()?;
+            let target = bootstrap.target;
+            if !self.quiet {
+                crate::output::diagnostic!(
+                    "syq: {}: installing {} helper for {}",
+                    self.label(),
+                    remote_helper::helper_identity(),
+                    target.key
+                );
+            }
+            self.bootstrap_helper(bootstrap).with_context(|| {
+                format!(
+                    "could not install the matching {} helper on {} ({})",
+                    remote_helper::helper_identity(),
+                    self.label(),
+                    target.key
+                )
+            })?;
+            Ok(())
+        })();
         self.diagnostics.lock().unwrap().helper_installation =
             Some((started, std::time::Instant::now()));
+        result?;
         *installed = true;
         Ok(())
     }

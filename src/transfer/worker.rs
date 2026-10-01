@@ -56,7 +56,7 @@ impl Worker {
         Some(job.source.clone())
     }
 
-    pub(super) fn run(&mut self) -> Result<()> {
+    pub(super) fn run(&mut self, setup: Option<crate::progress::Measuring<'_>>) -> Result<()> {
         let r = (|| {
             let configure_start = std::time::Instant::now();
             configure_hashing(&mut *self.src, self.opts.hash_policy)?;
@@ -73,6 +73,7 @@ impl Worker {
             // A prepared connection must finish helper configuration before
             // the tuner can activate it or use its setup time as a forecast.
             self.gate.mark_ready(self.id);
+            drop(setup);
             let _working = self
                 .observation
                 .as_ref()

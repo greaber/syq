@@ -59,8 +59,8 @@
         },
         "schema_version": {
           "enum": [
-            2,
-            3
+            4,
+            5
           ]
         },
         "seq": {
@@ -342,9 +342,6 @@
         "scan_done": {
           "type": "boolean"
         },
-        "elapsed_ms": {
-          "$ref": "#/$defs/u64"
-        },
         "activity": {
           "$ref": "#/$defs/activity"
         },
@@ -354,11 +351,8 @@
         "eta_ms": {
           "$ref": "#/$defs/u64"
         },
-        "setup_elapsed_ms": {
-          "$ref": "#/$defs/u64"
-        },
-        "transfer_elapsed_ms": {
-          "$ref": "#/$defs/u64"
+        "timings": {
+          "$ref": "#/$defs/timings"
         }
       },
       "required": [
@@ -371,7 +365,7 @@
         "files_excluded",
         "scanned",
         "scan_done",
-        "elapsed_ms"
+        "timings"
       ],
       "additionalProperties": false
     },
@@ -898,9 +892,6 @@
         "bytes_unchanged": {
           "$ref": "#/$defs/u64"
         },
-        "elapsed_ms": {
-          "$ref": "#/$defs/u64"
-        },
         "deletions_planned": {
           "$ref": "#/$defs/u64"
         },
@@ -929,18 +920,12 @@
         "receipt_records": {
           "$ref": "#/$defs/u64"
         },
-        "copying_elapsed_ms": {
-          "$ref": "#/$defs/u64"
-        },
         "bytes_total_known": {
           "type": "boolean",
           "description": "For descriptor copies, false when the source length is unknown. Dry-run byte totals then count only known bytes."
         },
-        "setup_elapsed_ms": {
-          "$ref": "#/$defs/u64"
-        },
-        "transfer_elapsed_ms": {
-          "$ref": "#/$defs/u64"
+        "timings": {
+          "$ref": "#/$defs/timings"
         }
       },
       "required": [
@@ -956,7 +941,7 @@
         "errors",
         "bytes_transferred",
         "bytes_unchanged",
-        "elapsed_ms"
+        "timings"
       ],
       "additionalProperties": false
     },
@@ -1014,8 +999,8 @@
         "errors": {
           "$ref": "#/$defs/u64"
         },
-        "elapsed_ms": {
-          "$ref": "#/$defs/u64"
+        "timings": {
+          "$ref": "#/$defs/timings"
         }
       },
       "required": [
@@ -1031,7 +1016,7 @@
         "entries_already_absent",
         "entries_failed",
         "errors",
-        "elapsed_ms"
+        "timings"
       ],
       "additionalProperties": false
     },
@@ -1416,16 +1401,6 @@
         "sample_age_ms": {
           "$ref": "#/$defs/u64"
         },
-        "elapsed_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/u64"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "cpu": {
           "anyOf": [
             {
@@ -1445,13 +1420,23 @@
               "type": "null"
             }
           ]
+        },
+        "sample_duration_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "process",
         "local",
         "sample_age_ms",
-        "elapsed_ms",
+        "sample_duration_ms",
         "cpu",
         "cumulative_cpu"
       ],
@@ -1777,16 +1762,6 @@
             }
           ]
         },
-        "elapsed_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/u64"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "actors": {
           "type": "array",
           "items": {
@@ -1838,13 +1813,23 @@
           "items": {
             "$ref": "#/$defs/activityOperation"
           }
+        },
+        "sample_duration_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "label",
         "sample_age_ms",
         "process",
-        "elapsed_ms",
+        "sample_duration_ms",
         "actors",
         "tcp",
         "tcp_delta",
@@ -1857,9 +1842,6 @@
     "activity": {
       "type": "object",
       "properties": {
-        "elapsed_ms": {
-          "$ref": "#/$defs/u64"
-        },
         "workers": {
           "$ref": "#/$defs/activityWorkers"
         },
@@ -1877,10 +1859,13 @@
         },
         "summary": {
           "type": "string"
+        },
+        "sample_duration_ms": {
+          "$ref": "#/$defs/u64"
         }
       },
       "required": [
-        "elapsed_ms",
+        "sample_duration_ms",
         "workers",
         "processes",
         "endpoints",
@@ -2157,6 +2142,34 @@
         "destination",
         "dry_run",
         "disposition"
+      ],
+      "additionalProperties": false
+    },
+    "timings": {
+      "type": "object",
+      "description": "Wall-clock milliseconds. Total includes helper installation. Copy measurements can overlap; they are not additive. An absent measurement is unavailable; zero means no measured work.",
+      "properties": {
+        "total_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "setup_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "planning_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "transfer_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "finalization_ms": {
+          "$ref": "#/$defs/u64"
+        },
+        "helper_install_ms": {
+          "$ref": "#/$defs/u64"
+        }
+      },
+      "required": [
+        "total_ms"
       ],
       "additionalProperties": false
     }

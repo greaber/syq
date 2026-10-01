@@ -28,7 +28,7 @@ impl Totals {
             json!({"type":"result", "status":"success", "exit_code":0, "dry_run":dry_run,
             "files_transferred":0,"files_unchanged":0,"files_excluded":0,"directories_created":0,
             "symlinks_created":0,"specials_created":0,"errors":0,"bytes_transferred":0,
-            "bytes_unchanged":0,"elapsed_ms":0}),
+            "bytes_unchanged":0,"timings":{"total_ms":0}}),
         )
     }
     fn add(&mut self, name: &str, value: u64) {
@@ -82,7 +82,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     })
     .into();
     totals.0["exit_code"] = code.into();
-    totals.0["elapsed_ms"] = (started.elapsed().as_millis() as u64).into();
+    totals.0["timings"]["total_ms"] = (started.elapsed().as_millis() as u64).into();
     writer.emit_terminal_value(totals.0);
     Ok(if writer.is_dead() { 1 } else { code })
 }

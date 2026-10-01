@@ -12,7 +12,7 @@ or lose its remote connection while the copy continues.
 
 | Activity field | Meaning |
 |---|---|
-| `elapsed_ms` | Time since the preceding coordinator sample |
+| `sample_duration_ms` | Length of the diagnostic sampling window, measured between coordinator samples |
 | `workers` | Counts at sampling time and fractions of observed worker time |
 | `endpoints` | Local operations or the latest reports from remote connections |
 | `processes` | User and system CPU deltas in nanoseconds, once per process |
@@ -71,7 +71,7 @@ kernel clock ticks; short intervals can report zero.
 Remote reports arrive at response boundaries and on connection retirement.
 `sample_age_ms` measures time since receipt, so network delivery delay is additional
 and clocks on different hosts need not agree. `state_at_sample` is the state at that
-report. When no newer report arrives, endpoint `elapsed_ms` is null and `actors` is
+report. When no newer report arrives, endpoint `sample_duration_ms` is null and `actors` is
 empty; process CPU deltas are null too. A blocked remote call can therefore leave
 stale evidence. Endpoint intervals can span several coordinator intervals. The
 first remote CPU sample establishes a baseline and has no delta.
