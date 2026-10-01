@@ -48,9 +48,9 @@ commands, and pending approvals. Other profiles keep working. `receive off`
 without a name stops all profiles; `receive on` enables the first profile, and
 `receive on --name NAME` enables another. Removing the first profile makes the
 next saved profile the default. The last profile can be disabled but cannot be
-removed. `pending`, `approve`, and `deny` work across all profiles; prompts name
-the receiving profile. Without `--name`, `receive wait` waits for every enabled
-profile on that server.
+removed. `pending`, `approve`, and `deny` work across all profiles, and
+`pending` names the receiving profile of each request. Without `--name`,
+`receive wait` waits for every enabled profile on that server.
 
 ### Choose allowed servers
 
@@ -199,7 +199,6 @@ desktop session. After changing sessions, run `syq persist receive off`, then
 enable the profiles you need from a terminal in the new session.
 
 `syq persist receive pending` shows complete requests and prompt errors.
-Overwrite warnings are advisory; destination entries can change before copying.
 `--notify off` selects terminal approval; `--notify desktop` restores prompts.
 
 Start the connection from your laptop with `syq persist connect server`.
