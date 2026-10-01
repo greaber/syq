@@ -260,39 +260,27 @@ impl Summary {
             }
         };
         match &self.details {
-            // The title is the subject, "syq on hetz ... wants to download",
-            // unless a directory line comes between. Paths sit indented on
-            // their own lines, then the command.
             Details::Copy { .. } => {
-                let (_, directory) = self.title_and_directory();
                 let verb = if self.remote {
                     "wants to copy"
                 } else {
                     "wants to download"
                 };
-                let mut request = if directory.is_some() {
-                    format!("syq {verb}")
-                } else {
-                    verb.to_owned()
-                };
+                let mut what = String::new();
                 for source in &self.sources {
-                    request.push_str(&format!("\n\n    {source}"));
+                    what.push_str(&format!("\n\n    {source}"));
                 }
-                request.push_str(&format!("\n\nto\n\n    {}", self.target));
-                let command = self.desktop_command(markup);
-                directory
-                    .map(|directory| text(&format!("in {directory}")))
-                    .into_iter()
-                    .chain([text(&request)])
-                    .chain((!command.is_empty()).then_some(command))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
+                what.push_str(&format!("\n\nto\n\n    {}", self.target));
+                self.request_paragraphs(markup, verb, &what)
             }
-            Details::Command { argv, cwd, .. } => format!(
-                "{}\n{}\n\n{}",
-                text(&format!("{} asks to run in {cwd}:", self.server)),
-                text(&argv.join(" ")),
-                text("Runs with your permissions; the copy root and limits do not apply.")
+            Details::Command { .. } => self.request_paragraphs(
+                markup,
+                "wants to run",
+                &format!(
+                    "\n\n    {}\n\nin\n\n    {}",
+                    self.sources.join(" "),
+                    self.target
+                ),
             ),
             Details::Storage { description, .. } => {
                 let body = self.desktop_storage.as_deref().unwrap_or(description);
@@ -307,6 +295,32 @@ impl Summary {
                 )
             }
         }
+    }
+    /// The title is the subject, "syq on hetz ... wants to download", unless
+    /// a directory line comes between. `what` continues the verb with its
+    /// indented paths; the server's command comes last.
+    fn request_paragraphs(&self, markup: bool, verb: &str, what: &str) -> String {
+        let text = |text: &str| {
+            if markup {
+                escape_markup(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        let (_, directory) = self.title_and_directory();
+        let subject = if directory.is_some() {
+            format!("syq {verb}")
+        } else {
+            verb.to_owned()
+        };
+        let command = self.desktop_command(markup);
+        directory
+            .map(|directory| text(&format!("in {directory}")))
+            .into_iter()
+            .chain([text(&format!("{subject}{what}"))])
+            .chain((!command.is_empty()).then_some(command))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
     fn desktop_command(&self, markup: bool) -> String {
         let text = |text: &str| {
@@ -487,11 +501,14 @@ impl Queue {
             cancelled,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_command(
         &self,
         from: &Requester,
         argv: &[Vec<u8>],
         cwd: &std::path::Path,
+        command: &[Vec<u8>],
+        server_cwd: &str,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
@@ -503,10 +520,17 @@ impl Queue {
             server: from.server.clone(),
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
             notification: "starting".into(),
-            command: Vec::new(),
-            server_cwd: String::new(),
-            sources: Vec::new(),
-            target: String::new(),
+            command: crate::approval_command::display(command),
+            server_cwd: server_cwd.to_owned(),
+            sources: vec![argv
+                .iter()
+                .map(|arg| crate::approval_command::display_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ")],
+            target: crate::approval_command::abbreviate_home(
+                cwd.as_os_str().as_bytes(),
+                std::env::var_os("HOME").as_deref(),
+            ),
             remote: false,
             desktop_storage: None,
             details: Details::Command {
@@ -1162,6 +1186,35 @@ mod tests {
         let details = summary.description(str::to_owned);
         assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
         assert!(details.contains("not been inspected"));
+    }
+    #[test]
+    fn command_prompts_show_the_program_and_its_directory() {
+        let mut summary = summary();
+        summary.command = crate::approval_command::display(&[
+            b"exec".to_vec(),
+            b"--on".to_vec(),
+            b"@laptop".to_vec(),
+            b"--".to_vec(),
+            b"make".to_vec(),
+            b"-j8".to_vec(),
+        ]);
+        summary.sources = vec!["make -j8".into()];
+        summary.target = "~/project".into();
+        summary.details = Details::Command {
+            kind: CommandKind::Command,
+            argv: vec!["\"make\"".into(), "\"-j8\"".into()],
+            cwd: "\"/home/me/project\"".into(),
+            permission: String::new(),
+        };
+        assert_eq!(summary.title(), "syq on server in ~/rt-bench");
+        assert_eq!(
+            summary.desktop_description(false),
+            "wants to run\n\n    make -j8\n\nin\n\n    ~/project\n\nsyq exec --on @laptop -- make -j8"
+        );
+        summary.server_cwd = "~/projects/very-long-directory-name".into();
+        assert!(summary
+            .desktop_description(false)
+            .starts_with("in ~/projects/very-long-directory-name\n\nsyq wants to run\n\n"));
     }
     #[test]
     fn exited_prompt_closes_descendant_output_before_reaping() {

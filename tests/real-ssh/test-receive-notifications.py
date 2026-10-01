@@ -152,11 +152,10 @@ def tests():
                 assert marker.exists() == (choice == "allow")
                 _, title, body, _, _ = observed[-1]
                 assert title.startswith("syq on "), title
-                lead, command, rest = body.split("\n", 2)
-                assert lead.endswith(':') and " asks to run in " in lead, lead
-                assert command.startswith('"touch" '), command
-                assert rest.startswith("\nRuns with your permissions; the copy root and limits do not apply."), rest
-                assert "Details" not in body and "Limits:" not in body, body
+                assert "wants to run\n\n    touch /tmp/syq-real-ssh-receive/exec-desktop-" in body, body
+                assert "\n\nin\n\n    " in body, body
+                assert body.split("\n\n")[-1].startswith("syq exec --on @laptop -- touch "), body
+                assert "Details" not in body and "Limits:" not in body and "Runs with" not in body, body
                 print(f"Command notification {choice}: passed", flush=True)
             finally:
                 if process.poll() is None:
