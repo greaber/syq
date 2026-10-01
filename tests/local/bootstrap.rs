@@ -751,7 +751,7 @@ fn persist_connect_prepares_helper_without_selecting_copy_data() {
 
 #[test]
 fn transfer_timing_separates_connection_setup_and_helper_installation() {
-    for native in [false, true] {
+    for engine in [false, true] {
         let t = Tmp::new();
         let rsh = fake_rsh(&t);
         setup_release_bootstrap(&t);
@@ -768,40 +768,35 @@ exec /bin/sh -c "$1""#,
         );
         executable(&rsh, script.as_bytes());
         write(&t.path("src"), &[42; 4096]);
-        let remote = format!("fake:{}", t.s("dst"));
-        let mut command = remote_syq_command(&t, &rsh, &[]);
-        if native {
-            // Keep the fixture environment but exercise the bounded native copy.
-            let env: Vec<_> = command
-                .get_envs()
-                .map(|(key, value)| (key.to_owned(), value.map(|value| value.to_owned())))
-                .collect();
-            command = Command::new(env!("CARGO_BIN_EXE_syq"));
-            for (key, value) in env {
-                if let Some(value) = value {
-                    command.env(key, value);
-                } else {
-                    command.env_remove(key);
-                }
+        // Reuse bootstrap fixture environment for both native copy engines.
+        let fixture = remote_syq_command(&t, &rsh, &[]);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        for (key, value) in fixture.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
             }
-            command.args(["cp", "--rsh"]).arg(&rsh).args([
-                "--no-tcp",
-                "--src",
-                &t.s("src"),
-                "--to",
-                "fake",
-                "--as",
-                &t.s("dst"),
-            ]);
-        } else {
-            command.args([&t.s("src"), &remote]);
         }
-        let output = command
-            .args(["--stats", "--progress"])
-            .arg(if native { "--results" } else { "--syq-results" })
-            .arg(t.path("result.ndjson"))
-            .run()
-            .unwrap();
+        command.args(["cp", "--rsh"]).arg(&rsh).args([
+            "--no-tcp",
+            "--src",
+            &t.s("src"),
+            "--to",
+            "fake",
+            "--as",
+            &t.s("dst"),
+            "--performance-tuning",
+            "workers=1",
+            "--stats",
+            "--progress",
+            "--results",
+            &t.s("result.ndjson"),
+        ]);
+        if engine {
+            command.args(["--performance-tuning", "copy-path=ranges"]);
+        }
+        let output = command.run().unwrap();
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
         let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
@@ -841,10 +836,7 @@ exec /bin/sh -c "$1""#,
         );
         let duration = format!("{}:{:02}", transfer / 60_000, transfer / 1000 % 60);
         assert!(stdout.contains(&format!(", {duration} at ")), "{stdout}");
-        if native {
-            // Native options do not have the fixture's --no-progress appended.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(stderr.contains(&format!("elapsed {duration}")), "{stderr}");
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&format!("elapsed {duration}")), "{stderr}");
     }
 }
