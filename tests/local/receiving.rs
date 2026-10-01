@@ -1565,9 +1565,9 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
     assert_eq!(response(&mut first)["pid"], pid);
     drop(first);
 
-    // Stop the owner before connecting, so every test client has already shut
-    // down when accept returns. Keeping their descriptors open preserves the
-    // queued connections on macOS; no sleep determines the interleaving.
+    // Stop the owner before connecting, so every test client has already closed
+    // when accept returns. Close the descriptor: shutdown alone does not trigger
+    // macOS's socket-option rejection. No sleep determines the interleaving.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
     wait_for("receiving daemon to stop", || {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -1584,14 +1584,12 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
         );
         info.si_signo != 0 && info.si_code == libc::CLD_STOPPED
     });
-    let mut abandoned = Vec::new();
     for partial in [false, true] {
         let mut client = connect(&socket_path).unwrap();
         if partial {
             client.write_all(&[0, 0]).unwrap();
         }
-        client.shutdown(std::net::Shutdown::Both).unwrap();
-        abandoned.push(client);
+        drop(client);
     }
     let mut healthy = connect(&socket_path).unwrap();
     request(&mut healthy, false);
@@ -1602,7 +1600,6 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
         "same daemon must serve the next client"
     );
     assert!(daemon.poll().unwrap().is_none());
-    drop(abandoned);
     let mut stop = connect(&socket_path).unwrap();
     request(&mut stop, true);
     assert_eq!(response(&mut stop)["pid"], pid);
