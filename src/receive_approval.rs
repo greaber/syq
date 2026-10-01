@@ -212,21 +212,21 @@ impl Summary {
         })
     }
     /// The server and, when it fits the title bar, its working directory;
-    /// otherwise the directory prefixes the command line like a shell prompt.
-    fn title_and_prefix(&self) -> (String, String) {
+    /// otherwise the directory becomes the first line of the body.
+    fn title_and_directory(&self) -> (String, Option<&str>) {
         let short = format!("syq on {}", self.server);
         if self.server_cwd.is_empty() {
-            return (short, String::new());
+            return (short, None);
         }
         let long = format!("{short} in {}", self.server_cwd);
         if long.chars().count() <= TITLE_CHARS {
-            (long, String::new())
+            (long, None)
         } else {
-            (short, format!("{} $ ", self.server_cwd))
+            (short, Some(&self.server_cwd))
         }
     }
     fn title(&self) -> String {
-        self.title_and_prefix().0
+        self.title_and_directory().0
     }
     pub(crate) fn kind(&self) -> Kind {
         match self.details {
@@ -257,20 +257,24 @@ impl Summary {
             }
         };
         match &self.details {
-            // What moves where, then the command that does it. The title names
-            // the server and its directory, so nothing here repeats them.
+            // What moves where, then the command that does it, each on its own
+            // paragraph. The title names the server and its directory, so
+            // nothing here repeats them.
             Details::Copy { .. } => {
                 let arrow = if self.sources.is_empty() {
                     self.target.clone()
                 } else {
                     format!("{} -> {}", self.sources, self.target)
                 };
+                let (_, directory) = self.title_and_directory();
                 let command = self.desktop_command(markup);
-                if command.is_empty() {
-                    return text(&arrow);
-                }
-                let (_, prefix) = self.title_and_prefix();
-                format!("{}\n{}{command}", text(&arrow), text(&prefix))
+                directory
+                    .map(text)
+                    .into_iter()
+                    .chain([text(&arrow)])
+                    .chain((!command.is_empty()).then_some(command))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
             }
             Details::Command { argv, cwd, .. } => format!(
                 "{}\n{}\n\n{}",
@@ -982,7 +986,7 @@ mod tests {
         assert_eq!(
             summary.desktop_description(false),
             format!(
-                "rt-bench/dbg -> {}\nsyq cp rt-bench/dbg --to @laptop --as dbg",
+                "rt-bench/dbg -> {}\n\nsyq cp rt-bench/dbg --to @laptop --as dbg",
                 path.display()
             )
         );
@@ -1010,7 +1014,7 @@ mod tests {
         .unwrap();
         assert!(remote
             .desktop_description(false)
-            .starts_with(&format!("rt-bench/dbg -> backup:{}\n", path.display())));
+            .starts_with(&format!("rt-bench/dbg -> backup:{}\n\n", path.display())));
         assert!(remote
             .details_description(str::to_owned)
             .contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
@@ -1023,7 +1027,7 @@ mod tests {
         let summary = Summary::new(&requester(), &mapping, "~", &request, TIMEOUT, None).unwrap();
         let desktop = summary.desktop_description(false);
         assert!(
-            desktop.starts_with(&format!(". -> {}\nsyq cp --mapping", path.display())),
+            desktop.starts_with(&format!(". -> {}\n\nsyq cp --mapping", path.display())),
             "{desktop}"
         );
     }
@@ -1048,13 +1052,13 @@ mod tests {
         let plain = summary.desktop_description(false);
         assert_eq!(
             plain,
-            "dbg -> ~/Downloads/server/dbg\nsyq cp --mapping \"<map>\" --to @laptop"
+            "dbg -> ~/Downloads/server/dbg\n\nsyq cp --mapping \"<map>\" --to @laptop"
         );
         assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         let markup = summary.desktop_description(true);
         assert_eq!(
             markup,
-            "dbg -&gt; ~/Downloads/server/dbg\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop"
+            "dbg -&gt; ~/Downloads/server/dbg\n\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop"
         );
         assert!(!markup.contains("<map>"));
         let details = summary.details_description(|word| format!("[{word}]"));
@@ -1116,25 +1120,25 @@ mod tests {
         assert!(access.contains("Deleting versions is permanent."));
     }
     #[test]
-    fn long_directories_move_from_the_title_to_the_command_line() {
+    fn long_directories_move_from_the_title_to_the_body() {
         let mut summary = summary();
         summary.command = crate::approval_command::display(&[b"cp".to_vec(), b"dbg".to_vec()]);
         assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         assert_eq!(
             summary.desktop_description(false),
-            "dbg -> ~/Downloads/server/dbg\nsyq cp dbg"
+            "dbg -> ~/Downloads/server/dbg\n\nsyq cp dbg"
         );
         summary.server_cwd = "~/projects/very-long-directory-name".into();
         assert_eq!(summary.title(), "syq on server");
         assert_eq!(
             summary.desktop_description(false),
-            "dbg -> ~/Downloads/server/dbg\n~/projects/very-long-directory-name $ syq cp dbg"
+            "~/projects/very-long-directory-name\n\ndbg -> ~/Downloads/server/dbg\n\nsyq cp dbg"
         );
         summary.server_cwd = String::new();
         assert_eq!(summary.title(), "syq on server");
         assert_eq!(
             summary.desktop_description(false),
-            "dbg -> ~/Downloads/server/dbg\nsyq cp dbg"
+            "dbg -> ~/Downloads/server/dbg\n\nsyq cp dbg"
         );
         // Limits stay in the full description only.
         if let Details::Copy { max_delete, .. } = &mut summary.details {

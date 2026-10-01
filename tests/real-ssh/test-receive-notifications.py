@@ -115,10 +115,12 @@ def tests():
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
                 assert "May create" not in body and "From" not in body, body
-                # What moves where, then the server's command.
-                arrow, command = body.split("\n", 1)
+                # What moves where, then the server's command; the server's directory
+                # comes first only when it does not fit the title.
+                paragraphs = body.split("\n\n")
+                arrow, command = paragraphs[-2], paragraphs[-1]
                 assert arrow.startswith('/tmp/syq-real-ssh/return-source/message.txt -&gt; "/tmp/syq-real-ssh-receive/desktop-'), arrow
-                assert "syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as " in command, command
+                assert command.startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), command
                 assert "Details" not in body and "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
                 assert expiry == 300000
