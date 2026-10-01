@@ -131,7 +131,8 @@ def check_source_roots():
                         else:
                             checks.run(command)
                         terminal = json.loads(results.read_text().splitlines()[-1])
-                        assert terminal['files_excluded'] == 1, (case, dry_run, terminal)
+                        expected_excluded = 1 if rule.startswith('/') else 2
+                        assert terminal['files_excluded'] == expected_excluded, (case, dry_run, terminal)
                         if to_s3:
                             paths = {p[len(key) + 1:] for p in checks.listing(key + '/')}
                         else:
