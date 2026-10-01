@@ -895,6 +895,7 @@ mod tests {
             server_cwd: "~/rt-bench".into(),
             sources: vec!["dbg".into()],
             target: "~/Downloads/server/dbg".into(),
+            remote: false,
             desktop_storage: None,
         }
     }
