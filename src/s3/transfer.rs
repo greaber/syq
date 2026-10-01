@@ -2562,6 +2562,7 @@ impl Engine {
         flushed?;
         let partial = record.lock().await.partial.clone();
         let partial_path = RelativePath::new(partial.as_bytes())?;
+        crate::fsops::check_writer_close(&file, &path.to_path_buf())?;
         for expected in self.download_digests(&metadata, expected_hash) {
             let f = root.open_regular_read(&partial_path)?;
             tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
@@ -2706,6 +2707,7 @@ impl Engine {
                 tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
             }
             self.check_cancelled()?;
+            crate::fsops::check_writer_close(&file, &path_buf)?;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit)?;
             let m = file.metadata()?;
             if self.args.ignore_existing

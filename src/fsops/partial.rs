@@ -1620,6 +1620,7 @@ impl FsOps {
             };
             observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
+            check_writer_close(&file, &rooted.label)?;
             match &created {
                 Some(created) => set_meta_written_file(&file, meta, flags, created),
                 None => set_meta_file(&file, meta, flags),
@@ -1657,6 +1658,7 @@ impl FsOps {
             observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write existing {}", rooted.label.display()))?;
             file.set_len(data.len() as u64)?;
+            check_writer_close(&file, &rooted.label)?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", rooted.label.display()))?;
             require_rooted_named_identity(
@@ -2211,6 +2213,7 @@ impl FsOps {
                 .map(Ok)
                 .unwrap_or_else(|| target.root.open_regular_write(&target.relative, false))?;
             require_open_target(&file, &target.label, condition)?;
+            check_writer_close(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;
                 Self::verify_expected_inode(&file, &reader, expected)?;
@@ -2254,6 +2257,7 @@ impl FsOps {
         if checked_early {
             require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         }
+        check_writer_close(&file, &src)?;
         if let Some(expected) = expected {
             if !checked_early {
                 require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
@@ -2309,6 +2313,7 @@ impl FsOps {
             };
             copy.with_context(|| format!("update existing {}", target.label.display()))?;
             self.set_copy_length(&destination, size)?;
+            check_writer_close(&destination, &target.label)?;
             set_meta_file(&destination, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
             require_rooted_named_identity(
@@ -3322,6 +3327,37 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
         tv_sec: sec as libc::time_t,
         tv_nsec: nsec as libc::c_long,
     }
+}
+
+/// Collect errors reported by close before publishing a completed writer.
+/// Linux NFS flushes writes on close, including close of a duplicate. Keep the
+/// original handle pinned for the identity checks and metadata operations that
+/// follow. This is not fsync and does not promise crash durability or collect
+/// every error a filesystem might report on another worker's cached handle.
+pub(crate) fn check_writer_close(file: &File, label: &Path) -> Result<()> {
+    use std::os::fd::IntoRawFd;
+    let check = || -> io::Result<()> {
+        let fd = file.try_clone()?.into_raw_fd();
+        // SAFETY: into_raw_fd transfers ownership. Close exactly once: retrying
+        // an interrupted close can close a descriptor reused by another thread.
+        if unsafe { libc::close(fd) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(debug_assertions)]
+        if let Some(pattern) = std::env::var_os("SYQ_TEST_FAIL_WRITER_CLOSE") {
+            if !pattern.is_empty()
+                && label
+                    .as_os_str()
+                    .as_bytes()
+                    .windows(pattern.as_bytes().len())
+                    .any(|part| part == pattern.as_bytes())
+            {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+        }
+        Ok(())
+    };
+    check().with_context(|| format!("close destination writer {}", label.display()))
 }
 
 pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
