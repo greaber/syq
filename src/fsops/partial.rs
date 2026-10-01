@@ -445,14 +445,16 @@ impl FsOps {
                     // metadata, read at once, serves publication. Anything
                     // else at the name takes the checked reuse below. Other
                     // range workers reopen the sidecar by name for writing,
-                    // so it keeps owner write until publication sets the
-                    // final mode, as an in-place file does.
-                    let staged = mode | 0o200;
+                    // and verification reopens it for reading, so it keeps
+                    // owner access until publication sets the final mode, as
+                    // an in-place file does; that chmod is paid only by files
+                    // whose final mode lacks it.
+                    let staged = mode | 0o600;
                     self.uncache_rooted(&target.root, relative);
                     match self.open_or_create_write_only_partial(&target.root, relative, staged) {
                         Ok((file, created))
                             if is_fresh_partial(&created, staged)
-                                && created.mode() & 0o200 != 0 =>
+                                && created.mode() & 0o600 == 0o600 =>
                         {
                             return Ok(Some((file, None, Some(created))));
                         }
@@ -2160,12 +2162,21 @@ impl FsOps {
                 }
             })?;
         // The name is checked against the held inode before anything reads
-        // the sidecar, and again before publication. On the plain path that
-        // check comes after the metadata step: its reads of the written file
-        // are then answered from the client's cache, where before the step
-        // they are a request.
-        if let Some(expected) = expected {
+        // the sidecar or changes its metadata, and again before publication.
+        // A reopened descriptor may be whatever the name now holds, so it is
+        // checked at once. The descriptor that created the sidecar is that
+        // inode by construction, so its check waits for the metadata step,
+        // whose SETATTR lets an NFS client answer the check's reads of the
+        // written file from its cache, where before the step they are a
+        // request.
+        let checked_early = created.is_none();
+        if checked_early {
             require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+        }
+        if let Some(expected) = expected {
+            if !checked_early {
+                require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+            }
             let reader = target.root.open_regular_read(&src_relative)?;
             Self::verify_expected_inode(&file, &reader, expected)?;
         }
@@ -2176,7 +2187,9 @@ impl FsOps {
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
             )
         {
-            require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+            if !checked_early {
+                require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
+            }
             // Ordinary identity-conditioned staged updates preserve the
             // existing destination inode.
             // Keep the cached writer pinned while independently opening the
@@ -3065,18 +3078,30 @@ pub(super) const PRIVATE_PARTIAL_MODE: u32 = 0o600;
 /// is a round trip). Special bits are still applied by `set_meta_file` once the
 /// content is written.
 ///
-/// The sidecar stays private when no mode is requested, and when group
-/// preservation is requested: the kernel assigns the receiver's or a setgid
-/// parent's group at creation, and final group bits would let that group read
-/// or write the content until the chown. Without group preservation the group
-/// at creation is the final group, and the owner bits only widen access for
-/// the receiver, which already holds the content.
+/// The sidecar stays private when no mode is requested, when group
+/// preservation is requested, and when an ACL will be applied. The kernel
+/// assigns the receiver's or a setgid parent's group at creation, and final
+/// group bits would let that group read or write the content until the
+/// chown. With an ACL the final group bits are the ACL mask, which can be
+/// wider than what the file grants its owning group. Without either, the
+/// group at creation is the final group, and the owner bits only widen
+/// access for the receiver, which already holds the content.
 pub(crate) fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
-    if flags & flags::MODE_MASK != 0 && flags & flags::GROUP == 0 {
-        meta.mode & 0o777
+    staged_mode(meta.mode, flags, has_acl(meta.inode_metadata.as_deref()))
+}
+
+/// The same from the parts a sender has at hand, without cloning the
+/// file's metadata.
+pub(crate) fn staged_mode(mode: u32, flags: u8, acl: bool) -> u32 {
+    if flags & flags::MODE_MASK != 0 && flags & flags::GROUP == 0 && !acl {
+        mode & 0o777
     } else {
         PRIVATE_PARTIAL_MODE
     }
+}
+
+pub(crate) fn has_acl(metadata: Option<&crate::inode_metadata::InodeMetadata>) -> bool {
+    metadata.is_some_and(|metadata| metadata.acls.is_some() || metadata.macos_acl.is_some())
 }
 
 pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {

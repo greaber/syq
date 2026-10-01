@@ -234,37 +234,71 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
         b"contents"
     );
 
-    // A read-only final mode: the sidecar keeps owner write, so a range
-    // worker that reopens it by name can still write, and publication sets
-    // the final mode.
-    assert_eq!(
-        prepare(&mut operations, b"readonly", 0o444).partial_size,
-        None
-    );
+    // A read-only final mode: the sidecar keeps owner access, so another
+    // worker, which reopens it by name, can still write it and publish it,
+    // and publication sets the final mode. Root is never refused, so the
+    // case proves nothing there.
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(
+            prepare(&mut operations, b"readonly", 0o444).partial_size,
+            None
+        );
+        let (partial, _) = rooted_partial_target(
+            &operations
+                .destination_mutation_target(b"readonly", None)
+                .unwrap(),
+            &copy_id,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(directory.path().join(partial.to_path_buf()))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        let mut other = destination_ops(directory.path());
+        write(&mut other, b"readonly");
+        publish(&mut other, b"readonly", 0o444).unwrap();
+        let published = fs::metadata(directory.path().join("readonly")).unwrap();
+        assert_eq!(published.mode() & 0o7777, 0o444);
+        assert_eq!(
+            fs::read(directory.path().join("readonly")).unwrap(),
+            b"contents"
+        );
+    }
+
+    // A worker without the creating descriptor reopens the sidecar by name
+    // and must check what it got before touching its metadata: a hard link
+    // planted at the name is refused, and the file it leads to keeps its
+    // mode and times.
+    prepare(&mut operations, b"swapped", 0o644);
+    write(&mut operations, b"swapped");
     let (partial, _) = rooted_partial_target(
         &operations
-            .destination_mutation_target(b"readonly", None)
+            .destination_mutation_target(b"swapped", None)
             .unwrap(),
         &copy_id,
     )
     .unwrap();
+    let partial = directory.path().join(partial.to_path_buf());
+    let unrelated = directory.path().join("unrelated");
+    fs::write(&unrelated, b"unrelated").unwrap();
+    fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(&unrelated).unwrap();
+    fs::remove_file(&partial).unwrap();
+    fs::hard_link(&unrelated, &partial).unwrap();
+    let mut other = destination_ops(directory.path());
+    let error = publish(&mut other, b"swapped", 0o644).unwrap_err();
+    assert!(error.to_string().contains("singly-linked"), "{error}");
+    let after = fs::metadata(&unrelated).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o600);
     assert_eq!(
-        fs::metadata(directory.path().join(partial.to_path_buf()))
-            .unwrap()
-            .mode()
-            & 0o777,
-        0o644
+        (after.mtime(), after.mtime_nsec()),
+        (before.mtime(), before.mtime_nsec())
     );
-    let root = operations.destination_root.clone().unwrap();
-    drop(operations.uncache_rooted(&root, &partial));
-    write(&mut operations, b"readonly");
-    publish(&mut operations, b"readonly", 0o444).unwrap();
-    let published = fs::metadata(directory.path().join("readonly")).unwrap();
-    assert_eq!(published.mode() & 0o7777, 0o444);
-    assert_eq!(
-        fs::read(directory.path().join("readonly")).unwrap(),
-        b"contents"
-    );
+    assert!(!directory.path().join("swapped").exists());
+    fs::remove_file(&partial).unwrap();
 
     // A directory at the target name is refused with the same message.
     fs::create_dir(directory.path().join("dir")).unwrap();
@@ -1479,6 +1513,24 @@ fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() 
         staged_file_mode(&meta(0o640), flags::TIMES),
         PRIVATE_PARTIAL_MODE
     );
+    // With an ACL the final group bits are the ACL mask, which may grant
+    // the owning group more than the ACL does, so the sidecar stays private.
+    let with_acl = Meta {
+        inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+            acls: Some(crate::inode_metadata::PosixAcls {
+                access: Some(Vec::new()),
+                default: None,
+            }),
+            ..Default::default()
+        })),
+        ..meta(0o660)
+    };
+    assert_eq!(
+        staged_file_mode(&with_acl, flags::MODE),
+        PRIVATE_PARTIAL_MODE
+    );
+    assert_eq!(staged_mode(0o660, flags::MODE, true), PRIVATE_PARTIAL_MODE);
+    assert_eq!(staged_mode(0o660, flags::MODE, false), 0o660);
 }
 
 #[test]
