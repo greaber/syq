@@ -32,11 +32,13 @@ mod diagnostics;
 mod dry_run;
 mod hardlinks;
 mod planner;
+mod work_budget;
 mod worker;
 
 use diagnostics::*;
 use dry_run::*;
 use planner::*;
+use work_budget::{WorkBudget, WorkSize};
 use worker::*;
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -2249,6 +2251,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         observation: None,
                         benchmark: Default::default(),
                         fast_batch_files,
+                        batch_budget: WorkBudget::default(),
                         setup_elapsed: t0.elapsed(),
                     };
                     #[cfg(debug_assertions)]

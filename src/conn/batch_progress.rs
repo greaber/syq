@@ -9,16 +9,17 @@ use std::sync::atomic::{
     Ordering::{Acquire, Relaxed, Release},
 };
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Default)]
-pub(super) struct BatchReceipts {
+pub(crate) struct BatchReceipts {
     enabled: AtomicBool,
     active: Mutex<Option<Active>>,
 }
 struct Active {
     progress: Arc<Progress>,
     pending: VecDeque<Vec<u64>>,
-    received: VecDeque<(u64, u64)>,
+    received: VecDeque<(u64, u64, Instant)>,
 }
 
 /// The caller enters with no outstanding destination requests and issues only
@@ -27,7 +28,7 @@ struct Active {
 /// After a failed drain the connection must be discarded, as for other RPCs.
 pub(crate) struct BatchProgress(Arc<BatchReceipts>);
 impl BatchReceipts {
-    pub(super) fn begin(self: &Arc<Self>, progress: Arc<Progress>) -> Result<BatchProgress> {
+    pub(crate) fn begin(self: &Arc<Self>, progress: Arc<Progress>) -> Result<BatchProgress> {
         let mut active = self.active.lock().unwrap();
         anyhow::ensure!(active.is_none(), "batch progress already active");
         *active = Some(Active {
@@ -39,7 +40,7 @@ impl BatchReceipts {
         Ok(BatchProgress(self.clone()))
     }
 
-    pub(super) fn request(&self, request: &Request) -> Result<()> {
+    pub(crate) fn request(&self, request: &Request) -> Result<()> {
         if !self.enabled.load(Acquire) {
             return Ok(());
         }
@@ -56,7 +57,7 @@ impl BatchReceipts {
         Ok(())
     }
 
-    pub(super) fn response(&self, response: &Response) {
+    pub(crate) fn response(&self, response: &Response) {
         if !self.enabled.load(Acquire) {
             return;
         }
@@ -80,7 +81,9 @@ impl BatchReceipts {
         };
         active.progress.add_bytes(credit.0);
         active.progress.add_tuning_files(credit.1);
-        active.received.push_back(credit);
+        active
+            .received
+            .push_back((credit.0, credit.1, Instant::now()));
     }
 }
 fn totals(sizes: &[u64], success: impl Iterator<Item = bool>) -> (u64, u64) {
@@ -93,14 +96,29 @@ fn totals(sizes: &[u64], success: impl Iterator<Item = bool>) -> (u64, u64) {
         })
 }
 impl BatchProgress {
-    pub(crate) fn consume(&self) -> Result<()> {
+    /// Number of oldest queued writes whose replies have arrived. They still
+    /// need normal validation and consumption, but are no longer outstanding.
+    pub(crate) fn received_count(&self) -> usize {
+        self.0
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("batch progress scope active")
+            .received
+            .len()
+    }
+
+    /// Use receipt time for service estimates even if the worker was busy
+    /// sending later groups before it consumed this reply.
+    pub(crate) fn consume(&self) -> Result<Instant> {
         let mut active = self.0.active.lock().unwrap();
         let active = active.as_mut().expect("batch progress scope active");
-        anyhow::ensure!(
-            active.received.pop_front().is_some(),
-            "unregistered batch reply"
-        );
-        Ok(())
+        active
+            .received
+            .pop_front()
+            .map(|(_, _, at)| at)
+            .ok_or_else(|| anyhow::anyhow!("unregistered batch reply"))
     }
 }
 impl Drop for BatchProgress {
@@ -110,7 +128,7 @@ impl Drop for BatchProgress {
             let (bytes, files) = active
                 .received
                 .iter()
-                .fold((0, 0), |(b, f), (db, df)| (b + db, f + df));
+                .fold((0, 0), |(b, f), (db, df, _)| (b + db, f + df));
             active.progress.bytes_done.fetch_sub(bytes, Relaxed);
             active.progress.undo_tuning_files(files);
         }
@@ -177,6 +195,43 @@ mod tests {
                 "no duplicate credit on consumption"
             );
         }
+    }
+
+    #[test]
+    fn consumption_preserves_the_acknowledgment_arrival_time() {
+        let receipts = Arc::new(BatchReceipts::default());
+        let scope = receipts.begin(Progress::new(false, false, None)).unwrap();
+        receipts.request(&test_request(&[32])).unwrap();
+        let before = Instant::now();
+        receipts.response(&Response::PublishedBatch(vec![Ok(None)]));
+        let after = Instant::now();
+        let recorded = receipts.active.lock().unwrap().as_ref().unwrap().received[0].2;
+        let consumed = scope.consume().unwrap();
+        assert_eq!(consumed, recorded);
+        assert!(before <= consumed && consumed <= after);
+        assert!(scope.consume().is_err());
+    }
+
+    #[test]
+    fn received_count_tracks_the_unconsumed_prefix_including_rejections() {
+        let receipts = Arc::new(BatchReceipts::default());
+        let scope = receipts.begin(Progress::new(false, false, None)).unwrap();
+        for _ in 0..3 {
+            receipts.request(&test_request(&[32])).unwrap();
+        }
+        assert_eq!(scope.received_count(), 0);
+        receipts.response(&Response::Applied(vec![None]));
+        assert_eq!(scope.received_count(), 1);
+        receipts.response(&Response::Err("denied".into()));
+        assert_eq!(scope.received_count(), 2);
+        scope.consume().unwrap();
+        assert_eq!(scope.received_count(), 1);
+        scope.consume().unwrap();
+        assert_eq!(scope.received_count(), 0, "third write still outstanding");
+        receipts.response(&Response::Applied(vec![None]));
+        assert_eq!(scope.received_count(), 1);
+        scope.consume().unwrap();
+        assert_eq!(scope.received_count(), 0);
     }
 
     #[test]

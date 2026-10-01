@@ -244,8 +244,27 @@ pub struct FastBatchState {
 impl FastBatchState {
     /// Claim immediately before issuing the source request. Once claimed, a
     /// group cannot be stolen, even while its read or write is outstanding.
-    pub fn claim(&mut self) -> Option<std::ops::Range<usize>> {
-        self.groups.pop_front().map(|group| group.files)
+    pub fn claim(&mut self, max_files: usize, max_bytes: u64) -> Option<std::ops::Range<usize>> {
+        let group = self.groups.front_mut()?;
+        let start = group.files.start;
+        let mut end = start;
+        let mut bytes = 0u64;
+        // One whole file must make progress even if it exceeds the time
+        // estimate. Unclaimed siblings remain visible and stealable.
+        while end < group.files.end {
+            let size = self.files[end].0;
+            if end > start && (end - start >= max_files || bytes.saturating_add(size) > max_bytes) {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        group.bytes -= bytes;
+        group.files.start = end;
+        if group.files.is_empty() {
+            self.groups.pop_front();
+        }
+        Some(start..end)
     }
 }
 
