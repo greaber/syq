@@ -1419,9 +1419,10 @@ impl FsOps {
             if target.guard.is_some() {
                 bail!("guarded small-file updates require atomic publication");
             }
-            // Read a created file's metadata at once: the create has just
-            // primed an NFS client's attribute cache, so it costs nothing,
-            // and it serves the metadata step and the identity afterwards.
+            // Read a file's metadata as soon as it is open: the open has
+            // just primed an NFS client's attribute cache, so it costs
+            // nothing, and it serves the metadata step and the identity
+            // afterwards.
             let mut created = None;
             let file = match condition {
                 // The whole file is written here and never read back.
@@ -1440,8 +1441,31 @@ impl FsOps {
                     file
                 }
                 TargetCondition::Any => {
-                    let mut opened = None;
+                    // Open the name directly, creating it when absent: a
+                    // regular file there, new or existing, is the in-place
+                    // destination. Looking the name up first cost an NFS
+                    // client a request for every new file. Anything else
+                    // at the name, or an open the kernel refused, is sorted
+                    // out by the checks below.
+                    let mut opened = match rooted
+                        .root
+                        .open_or_create_write_only_file(&rooted.relative, meta.mode)
+                    {
+                        Ok((file, metadata)) if metadata.is_file() => {
+                            if metadata.len() != 0 {
+                                file.set_len(0)?;
+                            }
+                            created = Some(metadata);
+                            Some(file)
+                        }
+                        Ok(_) => None,
+                        Err(error) if existing_leaf_refused(&error) => None,
+                        Err(error) => return Err(error),
+                    };
                     for _ in 0..8 {
+                        if opened.is_some() {
+                            break;
+                        }
                         match rooted.root.metadata_optional(&rooted.relative)? {
                             Some(metadata) if metadata.is_file() => {
                                 let file =

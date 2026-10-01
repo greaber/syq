@@ -544,6 +544,61 @@ mod tests {
     }
 
     #[test]
+    fn an_inplace_put_opens_its_destination_directly() {
+        // With no condition on the destination, the in-place path opens the
+        // name at once instead of looking it up first. An existing regular
+        // file keeps its inode and loses its contents; a symlink or FIFO at
+        // the name is replaced by a file, leaving a symlink's target alone; a
+        // directory is refused.
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut ops = receiver(temporary.path());
+        let mut inplace = put("file", b"contents");
+        inplace.inplace = true;
+        inplace.flags = flags::REPORT_IDENTITY;
+        let destination = temporary.path().join("file");
+        fs::write(temporary.path().join("victim"), b"victim").unwrap();
+        fs::write(&destination, b"an older and longer version").unwrap();
+        let before = fs::metadata(&destination).unwrap();
+        let identity = ops.put_small(&inplace).unwrap();
+        assert_eq!(identity, Some((before.dev(), before.ino())));
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        for planted in ["symlink", "fifo"] {
+            fs::remove_file(&destination).unwrap();
+            match planted {
+                "symlink" => {
+                    std::os::unix::fs::symlink(temporary.path().join("victim"), &destination)
+                        .unwrap()
+                }
+                _ => {
+                    let path = std::ffi::CString::new(destination.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                }
+            }
+            ops.put_small(&inplace)
+                .unwrap_or_else(|error| panic!("{planted}: {error}"));
+            assert!(
+                fs::symlink_metadata(&destination).unwrap().is_file(),
+                "{planted}"
+            );
+            assert_eq!(fs::read(&destination).unwrap(), b"contents", "{planted}");
+            assert_eq!(
+                fs::read(temporary.path().join("victim")).unwrap(),
+                b"victim",
+                "{planted}"
+            );
+        }
+        fs::remove_file(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let error = ops.put_small(&inplace).unwrap_err();
+        assert!(error.to_string().contains("is a directory"), "{error}");
+        fs::remove_dir(&destination).unwrap();
+        let identity = ops.put_small(&inplace).unwrap();
+        let published = fs::metadata(&destination).unwrap();
+        assert_eq!(identity, Some((published.dev(), published.ino())));
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
+    }
+
+    #[test]
     fn metadata_and_identity_come_from_the_stage_read_at_creation() {
         // The sidecar's metadata is read once, right after it is created;
         // the mode and times set before publication, and the identity
