@@ -120,7 +120,7 @@ impl Summary {
         command: &[Vec<u8>],
         request: &crate::destination::CopyRequest,
         lifetime: Duration,
-        inspect_local_destination: bool,
+        remote: Option<&str>,
     ) -> Result<Self> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
@@ -137,17 +137,24 @@ impl Summary {
                 UpdateIfOlder => bail!("unsupported receiving overwrite policy"),
             }
         };
+        // Debug formatting preserves unusual bytes and escapes terminal
+        // control characters. Do not interpret remote text as UI markup.
+        let path = std::ffi::OsStr::from_bytes(&request.copy.destination);
+        let (destination, permission) = match remote {
+            None => (format!("{path:?}"), permission.to_owned()),
+            // Automatic approval of writes to this machine does not authorize
+            // use of its SSH credentials on another host; say what that use is.
+            Some(target) => (
+                format!("{path:?} on {target:?} using your SSH access"),
+                format!("{permission}. Uses this machine's SSH access to {target:?} and installs the syq helper there if needed"),
+            ),
+        };
         Ok(Self {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
-            // Debug formatting preserves unusual bytes and escapes terminal
-            // control characters. Do not interpret remote text as UI markup.
             from: format!("{from:?}"),
             details: Details::Copy {
-                destination: format!(
-                    "{:?}",
-                    std::ffi::OsStr::from_bytes(&request.copy.destination)
-                ),
-                permission: permission.into(),
+                destination,
+                permission,
                 max_bytes: request.copy.limits.max_total_bytes,
                 max_entries: request.copy.limits.max_entries,
                 max_delete: request.copy.limits.max_deletions,
@@ -157,7 +164,7 @@ impl Summary {
                 + lifetime.as_secs(),
             notification: "starting".into(),
             command: crate::approval_command::display(command),
-            desktop_copy_notice: copy_notice(request, inspect_local_destination),
+            desktop_copy_notice: copy_notice(request, remote),
             desktop_storage: None,
         })
     }
@@ -260,12 +267,9 @@ impl Summary {
 }
 /// Inspect only the named mutation roots, never their children or contents.
 /// This is a local hint, not a restriction on the approved policy or a promise
-/// that names cannot change before execution. Remote destinations are not
+/// that names cannot change before execution. A `remote` destination is not
 /// contacted using the receiving machine's credentials before approval.
-fn copy_notice(
-    request: &crate::destination::CopyRequest,
-    inspect_local_destination: bool,
-) -> Option<String> {
+fn copy_notice(request: &crate::destination::CopyRequest, remote: Option<&str>) -> Option<String> {
     use crate::delegation::{ExistingDestinationPolicy, RootExistence};
     if request.copy.options.dry_run {
         return Some("Preview only; no filesystem changes".into());
@@ -278,16 +282,16 @@ fn copy_notice(
     {
         return None;
     }
+    if let Some(target) = remote {
+        return Some(format!("Existing files on {target:?} may be overwritten."));
+    }
     let unchecked = || {
         Some("Destination entries were not checked; existing entries may be overwritten.".into())
     };
     // Keep work small even for a request containing many source names or very
     // deep paths. Existing directory scopes need no recursive inspection:
     // merging into them can overwrite children whose names are not yet known.
-    if !inspect_local_destination
-        || request.copy.mutation_scopes.is_empty()
-        || request.copy.mutation_scopes.len() > 32
-    {
+    if request.copy.mutation_scopes.is_empty() || request.copy.mutation_scopes.len() > 32 {
         return unchecked();
     }
     let Ok(root) = crate::rooted::Root::open(std::path::Path::new("/")) else {
@@ -423,7 +427,7 @@ impl Queue {
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
         self.wait(
-            Summary::new(from, command, request, TIMEOUT, true)?,
+            Summary::new(from, command, request, TIMEOUT, None)?,
             notifications,
             TIMEOUT,
             cancelled,
@@ -438,25 +442,12 @@ impl Queue {
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
-        let mut summary = Summary::new(from, command, request, TIMEOUT, false)?;
-        if let Details::Copy {
-            destination,
-            permission,
-            ..
-        } = &mut summary.details
-        {
-            *destination = format!(
-                "SSH {target:?}, path {:?} (relative paths and ~ refer to the destination login home)",
-                std::ffi::OsStr::from_bytes(&request.destination)
-            );
-            permission.push_str(". Connect using this machine's SSH access and install the matching syq helper if needed");
-        }
-        let notice = summary.desktop_copy_notice.get_or_insert_with(String::new);
-        if !notice.is_empty() {
-            notice.push(' ');
-        }
-        notice.push_str("Connect using this machine's SSH access and install the matching syq helper if needed.");
-        self.wait(summary, notifications, TIMEOUT, cancelled)
+        self.wait(
+            Summary::new(from, command, request, TIMEOUT, Some(target))?,
+            notifications,
+            TIMEOUT,
+            cancelled,
+        )
     }
     pub(crate) fn request_command(
         &self,
@@ -959,13 +950,28 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let missing = root.join("missing");
         let request = copy_request(&missing);
-        assert_eq!(copy_notice(&request, true), None);
+        assert_eq!(copy_notice(&request, None), None);
         assert_eq!(
-            copy_notice(&copy_request(&missing.join("child")), true),
+            copy_notice(&copy_request(&missing.join("child")), None),
             None
         );
-        let mut summary = Summary::new("server", &[], &request, TIMEOUT, true).unwrap();
+        let mut summary = Summary::new("server", &[], &request, TIMEOUT, None).unwrap();
         assert!(!summary.desktop_description(false).contains("overwrite"));
+        let remote = Summary::new("server", &[], &request, TIMEOUT, Some("backup")).unwrap();
+        let desktop = remote.desktop_description(false);
+        assert!(desktop.contains("Writes to: \"/"), "{desktop}");
+        assert!(
+            desktop.contains("\" on \"backup\" using your SSH access\n"),
+            "{desktop}"
+        );
+        assert!(
+            desktop.ends_with("\n\nExisting files on \"backup\" may be overwritten."),
+            "{desktop}"
+        );
+        assert!(!desktop.contains("helper"), "{desktop}");
+        assert!(remote
+            .details_description(str::to_owned)
+            .contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
         assert!(summary
             .details_description(str::to_owned)
             .contains("May create and overwrite matching entries"));
@@ -988,15 +994,15 @@ mod tests {
         let link = root.join("link");
         symlink(&missing, &link).unwrap();
         for path in [&file, &directory, &link] {
-            assert!(copy_notice(&copy_request(path), true)
+            assert!(copy_notice(&copy_request(path), None)
                 .unwrap()
                 .contains("Existing destination"));
         }
         // A parent symlink is not followed, even when its target is missing.
-        assert!(copy_notice(&copy_request(&link.join("child")), true)
+        assert!(copy_notice(&copy_request(&link.join("child")), None)
             .unwrap()
             .contains("not checked"));
-        assert!(copy_notice(&copy_request(&file.join("child")), true)
+        assert!(copy_notice(&copy_request(&file.join("child")), None)
             .unwrap()
             .contains("not checked"));
         assert_eq!(std::fs::read(file).unwrap(), b"keep");
@@ -1007,15 +1013,15 @@ mod tests {
             .copy
             .mutation_scopes
             .push(copy_request(&link).copy.mutation_scopes.remove(0));
-        assert!(copy_notice(&mixed, true)
+        assert!(copy_notice(&mixed, None)
             .unwrap()
             .contains("Existing destination"));
-        assert!(copy_notice(&request, false)
+        assert!(copy_notice(&request, Some("backup"))
             .unwrap()
-            .contains("not checked"));
+            .contains("Existing files on \"backup\""));
         let mut many = request.clone();
         many.copy.mutation_scopes = vec![request.copy.mutation_scopes[0].clone(); 33];
-        assert!(copy_notice(&many, true).unwrap().contains("not checked"));
+        assert!(copy_notice(&many, None).unwrap().contains("not checked"));
     }
 
     #[test]
@@ -1026,23 +1032,24 @@ mod tests {
         std::fs::write(&path, b"keep").unwrap();
         let mut request = copy_request(&path);
         request.copy.options.dry_run = true;
-        assert!(copy_notice(&request, true)
+        assert!(copy_notice(&request, None)
             .unwrap()
             .starts_with("Preview only"));
         request.copy.options.dry_run = false;
         request.copy.options.verify_only = true;
-        assert!(copy_notice(&request, true)
+        assert!(copy_notice(&request, None)
             .unwrap()
             .starts_with("Compare contents only"));
         request.copy.options.verify_only = false;
         request.copy.policy.existing = ExistingDestinationPolicy::Skip;
-        assert_eq!(copy_notice(&request, true), None);
+        assert_eq!(copy_notice(&request, None), None);
+        assert_eq!(copy_notice(&request, Some("backup")), None);
         request.copy.policy.existing = ExistingDestinationPolicy::Replace;
         request.constraints.root_existence = RootExistence::New;
-        assert_eq!(copy_notice(&request, true), None);
+        assert_eq!(copy_notice(&request, None), None);
         request.constraints.root_existence = RootExistence::Any;
         request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
-        assert!(copy_notice(&request, true)
+        assert!(copy_notice(&request, None)
             .unwrap()
             .contains("Existing destination"));
     }

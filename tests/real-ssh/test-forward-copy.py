@@ -35,7 +35,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
             pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
             assert len(pending) == 1, pending
             request = pending[0]
-            assert 'SSH "destination"' in request["destination"], request
+            assert ' on "destination" using your SSH access' in request["destination"], request
             assert "SSH access" in request["permission"], request
             run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
             run("syq", "persist", "receive", "approve", request["id"], success=False)
