@@ -228,7 +228,7 @@ pub(crate) fn render(
     for word in display {
         length += word.chars().count() + 1;
         if limit.is_some_and(|limit| length > limit) {
-            words.push(plain("… (full command in Details)"));
+            words.push(plain("… (full command in syq persist receive pending)"));
             break;
         }
         // A quoted argument keeps its ASCII option name after the opening quote.

@@ -512,6 +512,6 @@ fn long_commands_are_shortened_in_desktop_prompts() {
     ));
     let short = render(&shown, Some(400), str::to_owned, str::to_owned);
     assert!(short.chars().count() < 450, "{}", short.len());
-    assert!(short.ends_with("… (full command in Details)"));
+    assert!(short.ends_with("… (full command in syq persist receive pending)"));
     assert!(render(&shown, None, str::to_owned, str::to_owned).ends_with("--to @laptop"));
 }

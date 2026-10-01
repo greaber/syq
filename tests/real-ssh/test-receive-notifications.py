@@ -115,12 +115,10 @@ def tests():
                 assert "&lt;b&gt;&amp;" in body and "<b>" not in body, body
                 assert "\\nFrom: fake" in body and "\nFrom: fake" not in body, body
                 assert "May create" not in body and "From" not in body, body
-                # What moves where, then the server's command; the server's directory
-                # comes first only when it does not fit the title.
-                paragraphs = body.split("\n\n")
-                arrow, command = paragraphs[-2], paragraphs[-1]
-                assert arrow.startswith('/tmp/syq-real-ssh/return-source/message.txt -&gt; "/tmp/syq-real-ssh-receive/desktop-'), arrow
-                assert command.startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), command
+                # What is copied where, then the server's command; the server's
+                # directory comes first only when it does not fit the title.
+                assert 'wants to download\n\n    /tmp/syq-real-ssh/return-source/message.txt\n\nto\n\n    "/tmp/syq-real-ssh-receive/desktop-' in body, body
+                assert body.split("\n\n")[-1].startswith("syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as "), body
                 assert "Details" not in body and "Limits:" not in body and "not been inspected" not in body, body
                 assert actions == ["allow", "Allow once", "deny", "Deny"], actions
                 assert expiry == 300000
@@ -144,7 +142,7 @@ def tests():
         result = subprocess.run(["ssh", "source", command], timeout=20)
         assert result.returncode != 0
         assert destination.read_bytes() == b"keep this"
-        assert '-&gt; /tmp/syq-real-ssh-receive/desktop-existing\n' in observed[-1][2], observed[-1]
+        assert '\n\nto\n\n    /tmp/syq-real-ssh-receive/desktop-existing\n\n' in observed[-1][2], observed[-1]
         for choice in ["allow", "deny"]:
             marker = Path("/tmp/syq-real-ssh-receive") / ("exec-desktop-" + choice)
             command = shlex.join(["syq", "exec", "--on", "@laptop", "--", "touch", str(marker)])

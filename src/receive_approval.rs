@@ -89,9 +89,12 @@ pub(crate) struct Summary {
     server_cwd: String,
     /// Copy sources as the command named them, and the resolved destination.
     #[serde(skip)]
-    sources: String,
+    sources: Vec<String>,
     #[serde(skip)]
     target: String,
+    /// The destination is another server, reached with this machine's SSH access.
+    #[serde(skip)]
+    remote: bool,
     #[serde(skip)]
     desktop_storage: Option<String>,
     #[serde(flatten)]
@@ -177,7 +180,6 @@ impl Summary {
                     .take(count)
                     .map(|location| crate::approval_command::display_arg(&location.path))
                     .collect::<Vec<_>>()
-                    .join(" ")
             })
             .unwrap_or_default();
         let target = match remote {
@@ -196,6 +198,7 @@ impl Summary {
             server_cwd: cwd.to_owned(),
             sources,
             target,
+            remote: remote.is_some(),
             details: Details::Copy {
                 destination,
                 permission,
@@ -257,21 +260,25 @@ impl Summary {
             }
         };
         match &self.details {
-            // What moves where, then the command that does it, each on its own
-            // paragraph. The title names the server and its directory, so
-            // nothing here repeats them.
+            // The title is the subject: "syq on hetz ... wants to download".
+            // Paths sit indented on their own lines, then the command.
             Details::Copy { .. } => {
-                let arrow = if self.sources.is_empty() {
-                    self.target.clone()
-                } else {
-                    format!("{} -> {}", self.sources, self.target)
-                };
                 let (_, directory) = self.title_and_directory();
+                let verb = if self.remote {
+                    "wants to copy, using your SSH access,"
+                } else {
+                    "wants to download"
+                };
+                let mut request = String::from(verb);
+                for source in &self.sources {
+                    request.push_str(&format!("\n\n    {source}"));
+                }
+                request.push_str(&format!("\n\nto\n\n    {}", self.target));
                 let command = self.desktop_command(markup);
                 directory
-                    .map(text)
+                    .map(|directory| text(&format!("in {directory}")))
                     .into_iter()
-                    .chain([text(&arrow)])
+                    .chain([text(&request)])
                     .chain((!command.is_empty()).then_some(command))
                     .collect::<Vec<_>>()
                     .join("\n\n")
@@ -493,8 +500,9 @@ impl Queue {
             notification: "starting".into(),
             command: Vec::new(),
             server_cwd: String::new(),
-            sources: String::new(),
+            sources: Vec::new(),
             target: String::new(),
+            remote: false,
             desktop_storage: None,
             details: Details::Command {
                 kind: CommandKind::Command,
@@ -591,8 +599,9 @@ impl Queue {
                 notification: "starting".into(),
                 command: crate::approval_command::display(command),
                 server_cwd: String::new(),
-                sources: String::new(),
+                sources: Vec::new(),
                 target: String::new(),
+                remote: false,
                 desktop_storage: Some(storage_access(command, request)),
                 details: Details::Storage {
                     kind: StorageKind::Storage,
@@ -884,7 +893,7 @@ mod tests {
             notification: String::new(),
             command: Vec::new(),
             server_cwd: "~/rt-bench".into(),
-            sources: "dbg".into(),
+            sources: vec!["dbg".into()],
             target: "~/Downloads/server/dbg".into(),
             desktop_storage: None,
         }
@@ -986,7 +995,7 @@ mod tests {
         assert_eq!(
             summary.desktop_description(false),
             format!(
-                "rt-bench/dbg -> {}\n\nsyq cp rt-bench/dbg --to @laptop --as dbg",
+                "wants to download\n\n    rt-bench/dbg\n\nto\n\n    {}\n\nsyq cp rt-bench/dbg --to @laptop --as dbg",
                 path.display()
             )
         );
@@ -1012,9 +1021,10 @@ mod tests {
             Some("backup"),
         )
         .unwrap();
-        assert!(remote
-            .desktop_description(false)
-            .starts_with(&format!("rt-bench/dbg -> backup:{}\n\n", path.display())));
+        assert!(remote.desktop_description(false).starts_with(&format!(
+            "wants to copy, using your SSH access,\n\n    rt-bench/dbg\n\nto\n\n    backup:{}\n\n",
+            path.display()
+        )));
         assert!(remote
             .details_description(str::to_owned)
             .contains("May create and overwrite matching entries. Uses this machine's SSH access to \"backup\" and installs the syq helper there if needed\n"));
@@ -1027,7 +1037,10 @@ mod tests {
         let summary = Summary::new(&requester(), &mapping, "~", &request, TIMEOUT, None).unwrap();
         let desktop = summary.desktop_description(false);
         assert!(
-            desktop.starts_with(&format!(". -> {}\n\nsyq cp --mapping", path.display())),
+            desktop.starts_with(&format!(
+                "wants to download\n\n    .\n\nto\n\n    {}\n\nsyq cp --mapping",
+                path.display()
+            )),
             "{desktop}"
         );
     }
@@ -1052,13 +1065,13 @@ mod tests {
         let plain = summary.desktop_description(false);
         assert_eq!(
             plain,
-            "dbg -> ~/Downloads/server/dbg\n\nsyq cp --mapping \"<map>\" --to @laptop"
+            "wants to download\n\n    dbg\n\nto\n\n    ~/Downloads/server/dbg\n\nsyq cp --mapping \"<map>\" --to @laptop"
         );
         assert_eq!(summary.title(), "syq on server in ~/rt-bench");
         let markup = summary.desktop_description(true);
         assert_eq!(
             markup,
-            "dbg -&gt; ~/Downloads/server/dbg\n\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop"
+            "wants to download\n\n    dbg\n\nto\n\n    ~/Downloads/server/dbg\n\nsyq cp --mapping <i>\"&lt;map&gt;\"</i> --to @laptop"
         );
         assert!(!markup.contains("<map>"));
         let details = summary.details_description(|word| format!("[{word}]"));
@@ -1124,22 +1137,17 @@ mod tests {
         let mut summary = summary();
         summary.command = crate::approval_command::display(&[b"cp".to_vec(), b"dbg".to_vec()]);
         assert_eq!(summary.title(), "syq on server in ~/rt-bench");
-        assert_eq!(
-            summary.desktop_description(false),
-            "dbg -> ~/Downloads/server/dbg\n\nsyq cp dbg"
-        );
+        let body = "wants to download\n\n    dbg\n\nto\n\n    ~/Downloads/server/dbg\n\nsyq cp dbg";
+        assert_eq!(summary.desktop_description(false), body);
         summary.server_cwd = "~/projects/very-long-directory-name".into();
         assert_eq!(summary.title(), "syq on server");
         assert_eq!(
             summary.desktop_description(false),
-            "~/projects/very-long-directory-name\n\ndbg -> ~/Downloads/server/dbg\n\nsyq cp dbg"
+            format!("in ~/projects/very-long-directory-name\n\n{body}")
         );
         summary.server_cwd = String::new();
         assert_eq!(summary.title(), "syq on server");
-        assert_eq!(
-            summary.desktop_description(false),
-            "dbg -> ~/Downloads/server/dbg\n\nsyq cp dbg"
-        );
+        assert_eq!(summary.desktop_description(false), body);
         // Limits stay in the full description only.
         if let Details::Copy { max_delete, .. } = &mut summary.details {
             *max_delete = 2;
