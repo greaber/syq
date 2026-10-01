@@ -140,12 +140,14 @@ enum Message {
     Exec(exec::ExecRequest),
     // Copy and storage requests carry the command that produced them. The
     // receiving machine derives the request from it and shows it for approval.
-    Storage {
-        command: Vec<Vec<u8>>,
-        request: crate::s3::authorization::Request,
-    },
     // `cwd` is the requesting process's working directory, shown with the
     // command; it is not enforced.
+    Storage {
+        command: Vec<Vec<u8>>,
+        #[serde(default)]
+        cwd: String,
+        request: Box<crate::s3::authorization::Request>,
+    },
     Request {
         command: Vec<Vec<u8>>,
         #[serde(default)]
@@ -1021,7 +1023,11 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
-            Message::Storage { command, request } => self.storage(command, request, stream),
+            Message::Storage {
+                command,
+                cwd,
+                request,
+            } => self.storage(command, cwd, *request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
             Message::Identify { name, challenge } => {
                 if name != self.name {

@@ -87,16 +87,20 @@ pub(crate) struct Summary {
     /// The requesting process's working directory, as the server showed it.
     #[serde(skip)]
     server_cwd: String,
-    /// Copy sources as the command named them, and the resolved destination.
+    /// The prompt's request: "wants to download", what, "to" where. Copy
+    /// sources stay as the command named them; the destination is resolved.
+    #[serde(skip)]
+    verb: &'static str,
     #[serde(skip)]
     sources: Vec<String>,
     #[serde(skip)]
+    preposition: &'static str,
+    #[serde(skip)]
     target: String,
-    /// The destination is another server, reached with this machine's SSH access.
+    /// Facts the command does not show, such as how long storage requests
+    /// stay valid.
     #[serde(skip)]
-    remote: bool,
-    #[serde(skip)]
-    desktop_storage: Option<String>,
+    notes: Vec<String>,
     #[serde(flatten)]
     pub details: Details,
 }
@@ -196,9 +200,15 @@ impl Summary {
             from: format!("{:?}", from.to_string()),
             server: from.server.clone(),
             server_cwd: cwd.to_owned(),
+            verb: if remote.is_some() {
+                "wants to copy"
+            } else {
+                "wants to download"
+            },
             sources,
+            preposition: "to",
             target,
-            remote: remote.is_some(),
+            notes: Vec::new(),
             details: Details::Copy {
                 destination,
                 permission,
@@ -211,7 +221,6 @@ impl Summary {
                 + lifetime.as_secs(),
             notification: "starting".into(),
             command: crate::approval_command::display(command),
-            desktop_storage: None,
         })
     }
     /// The server and, when it fits the title bar, its working directory;
@@ -251,6 +260,10 @@ impl Summary {
     /// Keep the decision visible; the full description remains available in
     /// `persist receive pending` on both platforms. With `markup`, the text is
     /// escaped for notify-send and server inputs are italic.
+    ///
+    /// The title is the subject, "syq on hetz ... wants to download", unless
+    /// a directory line comes between. What moves and where sit indented on
+    /// their own lines; the server's command comes last.
     fn desktop_description(&self, markup: bool) -> String {
         let text = |text: &str| {
             if markup {
@@ -259,65 +272,26 @@ impl Summary {
                 text.to_owned()
             }
         };
-        match &self.details {
-            Details::Copy { .. } => {
-                let verb = if self.remote {
-                    "wants to copy"
-                } else {
-                    "wants to download"
-                };
-                let mut what = String::new();
-                for source in &self.sources {
-                    what.push_str(&format!("\n\n    {source}"));
-                }
-                what.push_str(&format!("\n\nto\n\n    {}", self.target));
-                self.request_paragraphs(markup, verb, &what)
-            }
-            Details::Command { .. } => self.request_paragraphs(
-                markup,
-                "wants to run",
-                &format!(
-                    "\n\n    {}\n\nin\n\n    {}",
-                    self.sources.join(" "),
-                    self.target
-                ),
-            ),
-            Details::Storage { description, .. } => {
-                let body = self.desktop_storage.as_deref().unwrap_or(description);
-                let command = self.desktop_command(markup);
-                if command.is_empty() {
-                    return text(body);
-                }
-                format!(
-                    "{}\n{command}\n\n{}",
-                    text(&format!("{} is running:", self.server)),
-                    text(body)
-                )
-            }
-        }
-    }
-    /// The title is the subject, "syq on hetz ... wants to download", unless
-    /// a directory line comes between. `what` continues the verb with its
-    /// indented paths; the server's command comes last.
-    fn request_paragraphs(&self, markup: bool, verb: &str, what: &str) -> String {
-        let text = |text: &str| {
-            if markup {
-                escape_markup(text)
-            } else {
-                text.to_owned()
-            }
-        };
         let (_, directory) = self.title_and_directory();
-        let subject = if directory.is_some() {
-            format!("syq {verb}")
+        let mut request = if directory.is_some() {
+            format!("syq {}", self.verb)
         } else {
-            verb.to_owned()
+            self.verb.to_owned()
         };
+        for source in &self.sources {
+            request.push_str(&format!("\n\n    {source}"));
+        }
+        if !self.target.is_empty() {
+            request.push_str(&format!("\n\n{}\n\n    {}", self.preposition, self.target));
+        }
+        for note in &self.notes {
+            request.push_str(&format!("\n\n{note}"));
+        }
         let command = self.desktop_command(markup);
         directory
             .map(|directory| text(&format!("in {directory}")))
             .into_iter()
-            .chain([text(&format!("{subject}{what}"))])
+            .chain([text(&request)])
             .chain((!command.is_empty()).then_some(command))
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -370,61 +344,70 @@ impl Summary {
         )
     }
 }
-/// A short storage prompt: what the approval lets the server do, beyond the
-/// command shown above it. The full description stays in Details.
-fn storage_access(command: &[Vec<u8>], request: &crate::s3::authorization::Request) -> String {
+/// What a storage authorization lets the server do, in the prompt's shape:
+/// the verb, what, where, and the facts the command does not show.
+fn storage_request(
+    command: &[Vec<u8>],
+    request: &crate::s3::authorization::Request,
+) -> (&'static str, Vec<String>, &'static str, String, Vec<String>) {
     use crate::s3::authorization::{Removal, Scope};
-    fn locations(bucket: &str, scopes: &[Scope]) -> String {
+    fn locations(bucket: &str, scopes: &[Scope]) -> Vec<String> {
         let mut shown: Vec<_> = scopes
             .iter()
             .take(3)
-            .map(|scope| format!("s3://{bucket}/{}", scope.key))
-            .map(|location| format!("{:?}", location))
+            .map(|scope| {
+                crate::approval_command::display_arg(
+                    format!("s3://{bucket}/{}", scope.key).as_bytes(),
+                )
+            })
             .collect();
         if scopes.len() > 3 {
             shown.push(format!("and {} more", scopes.len() - 3));
         }
-        shown.join(", ")
+        shown
     }
-    let verb = if request.upload {
-        if request.create_only {
-            "Creates in"
-        } else {
-            "Writes to"
-        }
+    // The command's local operands, as it wrote them, for the non-storage side.
+    let local = crate::approval_command::parse(command)
+        .map(|args| {
+            args.locations
+                .iter()
+                .filter(|location| location.host.is_none())
+                .map(|location| crate::approval_command::display_arg(&location.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let storage = locations(&request.bucket, &request.scopes);
+    let (verb, sources, preposition, target) = if let Some(source) = &request.source {
+        (
+            "wants to copy",
+            locations(&source.bucket, &source.scopes),
+            "to",
+            storage.join("\n    "),
+        )
+    } else if request.upload {
+        ("wants to upload", local, "to", storage.join("\n    "))
     } else if request.delete {
-        "Deletes in"
+        ("wants to delete", storage, "", String::new())
     } else {
-        "Reads"
+        let destination = local.last().cloned().unwrap_or_default();
+        ("wants to download", storage, "to", destination)
     };
-    let mut lines = vec![format!(
-        "{verb} {} with your storage credentials.",
-        locations(&request.bucket, &request.scopes)
-    )];
-    if let Some(source) = &request.source {
-        lines.push(format!(
-            "Reads {}.",
-            locations(&source.bucket, &source.scopes)
-        ));
-    }
-    if let Some(endpoint) = &request.endpoint {
-        if !command.iter().any(|arg| arg.starts_with(b"--s3-endpoint")) {
-            lines.push(format!("Endpoint (set on the server): {endpoint:?}"));
-        }
-    }
+    let mut notes = Vec::new();
     if request.delete
         && matches!(
             request.removal,
             Some(Removal::Version(_) | Removal::AllVersions)
         )
     {
-        lines.push("Deleting versions is permanent.".into());
+        notes.push("deleting versions is permanent".to_owned());
     }
-    lines.push(format!(
-        "Signed requests stay usable for up to {} days, even after you disconnect.",
-        request.lifetime.div_ceil(24 * 60 * 60)
-    ));
-    lines.join("\n")
+    let days = request.lifetime.div_ceil(24 * 60 * 60);
+    notes.push(if days == 1 {
+        "valid for 1 day".to_owned()
+    } else {
+        format!("valid for {days} days")
+    });
+    (verb, sources, preposition, target, notes)
 }
 
 struct Pending {
@@ -522,17 +505,18 @@ impl Queue {
             notification: "starting".into(),
             command: crate::approval_command::display(command),
             server_cwd: server_cwd.to_owned(),
+            verb: "wants to run",
             sources: vec![argv
                 .iter()
                 .map(|arg| crate::approval_command::display_arg(arg))
                 .collect::<Vec<_>>()
                 .join(" ")],
+            preposition: "in",
             target: crate::approval_command::abbreviate_home(
                 cwd.as_os_str().as_bytes(),
                 std::env::var_os("HOME").as_deref(),
             ),
-            remote: false,
-            desktop_storage: None,
+            notes: Vec::new(),
             details: Details::Command {
                 kind: CommandKind::Command,
                 argv: argv.iter().map(|arg| format!("{:?}", std::ffi::OsStr::from_bytes(arg))).collect(),
@@ -545,6 +529,7 @@ impl Queue {
         &self,
         from: &Requester,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &crate::s3::authorization::Request,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
@@ -618,6 +603,7 @@ impl Queue {
             if request.upload { "read and upload" } else { "read" },
             if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },
             if request.delete { ", may delete" } else { ", no object deletion" }, request.lifetime);
+        let (verb, sources, preposition, target, notes) = storage_request(command, request);
         self.wait(
             Summary {
                 id: id.iter().map(|b| format!("{b:02x}")).collect(),
@@ -627,11 +613,12 @@ impl Queue {
                     + TIMEOUT.as_secs(),
                 notification: "starting".into(),
                 command: crate::approval_command::display(command),
-                server_cwd: String::new(),
-                sources: Vec::new(),
-                target: String::new(),
-                remote: false,
-                desktop_storage: Some(storage_access(command, request)),
+                server_cwd: cwd.to_owned(),
+                verb,
+                sources,
+                preposition,
+                target,
+                notes,
                 details: Details::Storage {
                     kind: StorageKind::Storage,
                     description,
@@ -922,10 +909,11 @@ mod tests {
             notification: String::new(),
             command: Vec::new(),
             server_cwd: "~/rt-bench".into(),
+            verb: "wants to download",
             sources: vec!["dbg".into()],
+            preposition: "to",
             target: "~/Downloads/server/dbg".into(),
-            remote: false,
-            desktop_storage: None,
+            notes: Vec::new(),
         }
     }
     fn requester() -> Requester {
@@ -1111,7 +1099,7 @@ mod tests {
         assert_eq!(json["command"][0], "syq");
     }
     #[test]
-    fn storage_prompts_summarize_access_beyond_the_command() {
+    fn storage_prompts_name_the_operation_and_its_validity() {
         use crate::s3::authorization::{Removal, Request, Scope};
         let scope = |key: &str| Scope {
             key: key.into(),
@@ -1132,35 +1120,52 @@ mod tests {
             lifetime: crate::s3::authorization::DEFAULT_LIFETIME,
             headers: Default::default(),
         };
-        let command = [b"cp".to_vec()];
-        let access = storage_access(&command, &request);
-        assert!(
-            access.starts_with("Writes to \"s3://bucket/runs\" with your storage credentials.\n"),
-            "{access}"
-        );
-        assert!(access.contains("Endpoint (set on the server): \"https://storage.example\""));
-        assert!(
-            access.ends_with("up to 7 days, even after you disconnect."),
-            "{access}"
-        );
-        let named = [
-            b"cp".to_vec(),
-            b"--s3-endpoint=https://storage.example".to_vec(),
-        ];
-        assert!(!storage_access(&named, &request).contains("Endpoint"));
+        let command = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|part| part.as_bytes().to_vec()).collect()
+        };
+        let upload = command(&["cp", "results", "--to", "s3://bucket", "--into", "runs"]);
+        let (verb, sources, preposition, target, notes) = storage_request(&upload, &request);
+        assert_eq!(verb, "wants to upload");
+        assert_eq!(sources, ["results"]);
+        assert_eq!((preposition, target.as_str()), ("to", "s3://bucket/runs"));
+        assert_eq!(notes, ["valid for 7 days"]);
 
         request.upload = false;
+        let download = command(&["cp", "runs", "--from", "s3://bucket", "--into", "archive"]);
+        let (verb, sources, _, target, _) = storage_request(&download, &request);
+        assert_eq!(verb, "wants to download");
+        assert_eq!(sources, ["s3://bucket/runs"]);
+        assert_eq!(target, "archive");
+
         request.delete = true;
         request.removal = Some(Removal::AllVersions);
         request.scopes = ["a", "b", "c", "d", "e"].map(scope).to_vec();
-        let access = storage_access(&command, &request);
-        assert!(
-            access.starts_with(
-                "Deletes in \"s3://bucket/a\", \"s3://bucket/b\", \"s3://bucket/c\", and 2 more with your storage credentials.\n"
-            ),
-            "{access}"
+        request.lifetime = 60;
+        let (verb, sources, _, target, notes) =
+            storage_request(&command(&["rm", "--on", "s3://bucket"]), &request);
+        assert_eq!(verb, "wants to delete");
+        assert_eq!(
+            sources,
+            [
+                "s3://bucket/a",
+                "s3://bucket/b",
+                "s3://bucket/c",
+                "and 2 more"
+            ]
         );
-        assert!(access.contains("Deleting versions is permanent."));
+        assert!(target.is_empty());
+        assert_eq!(notes, ["deleting versions is permanent", "valid for 1 day"]);
+
+        let mut summary = summary();
+        summary.command = crate::approval_command::display(&upload);
+        summary.verb = "wants to delete";
+        summary.sources = vec!["s3://bucket/a".into(), "s3://bucket/b".into()];
+        summary.target = String::new();
+        summary.notes = vec!["valid for 1 day".into()];
+        assert_eq!(
+            summary.desktop_description(false),
+            "wants to delete\n\n    s3://bucket/a\n\n    s3://bucket/b\n\nvalid for 1 day\n\nsyq cp results --to s3://bucket --into runs"
+        );
     }
     #[test]
     fn long_directories_move_from_the_title_to_the_body() {
@@ -1198,7 +1203,9 @@ mod tests {
             b"make".to_vec(),
             b"-j8".to_vec(),
         ]);
+        summary.verb = "wants to run";
         summary.sources = vec!["make -j8".into()];
+        summary.preposition = "in";
         summary.target = "~/project".into();
         summary.details = Details::Command {
             kind: CommandKind::Command,
