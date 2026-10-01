@@ -471,6 +471,40 @@ impl Root {
         self.create_file_with_access(path, mode, libc::O_WRONLY)
     }
 
+    /// Open a leaf for a writer that never reads it back, creating it when
+    /// absent, and read its metadata before anything is written to it. An
+    /// existing leaf is opened rather than refused, so the caller decides
+    /// from the metadata whether the file is one it may write to. The open
+    /// follows no symlink and cannot block on a FIFO. Creating without
+    /// `O_EXCL` spares an NFS client the SETATTR that follows an exclusive
+    /// create there, and reading the metadata at once costs it nothing.
+    pub(crate) fn open_or_create_write_only_file(
+        &self,
+        path: &RelativePath,
+        mode: u32,
+    ) -> Result<(File, std::fs::Metadata)> {
+        #[cfg(any(target_os = "linux", test))]
+        let permit = self.mutation_permit(path)?;
+        let file = self
+            .open_leaf(
+                path,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_NOCTTY
+                    | libc::O_CLOEXEC,
+                mode & 0o777,
+            )
+            .with_context(|| format!("create confined file {}", path.label()))?;
+        #[cfg(any(target_os = "linux", test))]
+        drop(permit);
+        let metadata = file.metadata()?;
+        clear_nonblocking(&file)
+            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
+        Ok((file, metadata))
+    }
+
     fn create_file_with_access(
         &self,
         path: &RelativePath,
