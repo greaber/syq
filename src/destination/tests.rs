@@ -231,7 +231,10 @@ pub(super) fn broker(
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
         name: "laptop".into(),
         identity_key: identity::generate_key().unwrap(),
-        requester: "test-server".into(),
+        requester: crate::receive_approval::Requester {
+            server: "test-server".into(),
+            profile: "test".into(),
+        },
         auto_approve_root: Some(root.into()),
         notifications: crate::receive_approval::Notifications::Off,
         approvals: Arc::new(crate::receive_approval::Queue::default()),
@@ -288,6 +291,7 @@ fn approve(registration: &Registration, command: Vec<Vec<u8>>, request: CopyRequ
     let (_, reply) = exchange(
         registration,
         Message::Request {
+            cwd: String::new(),
             command,
             request: Box::new(request),
         },
@@ -400,6 +404,7 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
         exchange(
             &registration,
             Message::Request {
+                cwd: String::new(),
                 command,
                 request: Box::new(request),
             },
@@ -785,6 +790,7 @@ fn named_limits_and_scope_validation_precede_approval() {
     assert!(exchange(
         &registration,
         Message::Request {
+            cwd: String::new(),
             command,
             request: Box::new(request),
         },

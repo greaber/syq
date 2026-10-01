@@ -34,6 +34,12 @@ pub(crate) fn command_for_help() -> clap::Command {
 pub(super) struct ExecRequest {
     pub argv: Vec<Vec<u8>>,
     pub cwd: Vec<u8>,
+    /// The requesting syq command and its working directory, shown with the
+    /// prompt; not enforced.
+    #[serde(default)]
+    pub command: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub server_cwd: String,
 }
 impl ExecRequest {
     fn validate(&self) -> Result<()> {
@@ -76,6 +82,8 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let request = ExecRequest {
         argv: command.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
         cwd: command.cwd.as_bytes().to_vec(),
+        command: crate::approval_command::current()?,
+        server_cwd: crate::approval_command::current_directory(),
     };
     request.validate()?;
     let selection = handoff::Selection::new(
@@ -185,6 +193,8 @@ impl Receiver {
             &self.requester,
             &request.argv,
             &cwd,
+            &request.command,
+            &request.server_cwd,
             self.notifications,
             cancelled,
         )?;
@@ -195,7 +205,7 @@ impl Receiver {
         write_message(&mut stream, &Reply::Ready)?;
         let result = execute_command(&request, &cwd, socket.try_clone()?, cancelled);
         if let Err(error) = &result {
-            crate::output::diagnostic!("syq: command from {:?}: {error:#}", self.requester);
+            crate::output::diagnostic!("syq: command from {}: {error:#}", self.requester);
         }
         result
     }
@@ -345,6 +355,8 @@ mod tests {
         ExecRequest {
             argv: vec![b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
             cwd: b".".to_vec(),
+            command: Vec::new(),
+            server_cwd: String::new(),
         }
     }
     fn pending(receiver: &Receiver) -> crate::receive_approval::Summary {
@@ -596,6 +608,8 @@ mod tests {
         let request = ExecRequest {
             argv: vec![b"./probe".to_vec(), b"literal value".to_vec()],
             cwd: b".".to_vec(),
+            command: Vec::new(),
+            server_cwd: String::new(),
         };
         let (status, stdout, stderr) = run_direct(request, root.path());
         assert_eq!(status, 0);

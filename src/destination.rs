@@ -140,17 +140,25 @@ enum Message {
     Exec(exec::ExecRequest),
     // Copy and storage requests carry the command that produced them. The
     // receiving machine derives the request from it and shows it for approval.
+    // `cwd` is the requesting process's working directory, shown with the
+    // command; it is not enforced.
     Storage {
         command: Vec<Vec<u8>>,
-        request: crate::s3::authorization::Request,
+        #[serde(default)]
+        cwd: String,
+        request: Box<crate::s3::authorization::Request>,
     },
     Request {
         command: Vec<Vec<u8>>,
+        #[serde(default)]
+        cwd: String,
         request: Box<CopyRequest>,
     },
     Forward {
         target: String,
         command: Vec<Vec<u8>>,
+        #[serde(default)]
+        cwd: String,
         request: Box<CopyRequest>,
     },
     Open {
@@ -811,6 +819,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         &registration,
         Message::Request {
             command: crate::approval_command::current()?,
+            cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },
         REQUEST_TIMEOUT + Duration::from_secs(10),
@@ -927,7 +936,7 @@ struct Receiver {
     tcp_peer: crate::conn::RemoteSpec,
     name: String,
     identity_key: ssh_key::PrivateKey,
-    requester: String,
+    requester: crate::receive_approval::Requester,
     auto_approve_root: Option<PathBuf>,
     notifications: crate::receive_approval::Notifications,
     approvals: Arc<crate::receive_approval::Queue>,
@@ -955,6 +964,7 @@ impl Receiver {
     fn authorize_request(
         &self,
         command: &[Vec<u8>],
+        cwd: &str,
         request: &CopyRequest,
         socket: &UnixStream,
         generation: u64,
@@ -983,6 +993,7 @@ impl Receiver {
             self.approvals.request(
                 &self.requester,
                 command,
+                cwd,
                 request,
                 self.notifications,
                 cancelled,
@@ -1021,7 +1032,11 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
-            Message::Storage { command, request } => self.storage(command, request, stream),
+            Message::Storage {
+                command,
+                cwd,
+                request,
+            } => self.storage(command, cwd, *request, stream),
             Message::Ping => write_message(&mut stream, &Reply::Ready),
             Message::Identify { name, challenge } => {
                 if name != self.name {
@@ -1033,9 +1048,14 @@ impl Receiver {
             Message::Forward {
                 target,
                 command,
+                cwd,
                 request,
-            } => self.forward(target, command, *request, stream),
-            Message::Request { command, request } => {
+            } => self.forward(target, command, cwd, *request, stream),
+            Message::Request {
+                command,
+                cwd,
+                request,
+            } => {
                 let _request = self.request_lock.try_lock().map_err(|_| {
                     anyhow::anyhow!(
                         "another transfer is awaiting approval; retry after it is decided"
@@ -1086,6 +1106,7 @@ impl Receiver {
                     crate::restricted::named_authority(&container, request.clone())?;
                 self.authorize_request(
                     &command,
+                    &cwd,
                     &request,
                     &stream.try_clone()?,
                     generation,
@@ -1256,11 +1277,10 @@ pub(crate) fn serve_background(
         tcp_peer,
         name: config.name.clone(),
         identity_key: identity::load_key()?,
-        requester: format!(
-            "{} (receiving profile @{})",
-            spec.endpoint.label(),
-            config.name
-        ),
+        requester: crate::receive_approval::Requester {
+            server: spec.endpoint.label(),
+            profile: config.name.clone(),
+        },
         auto_approve_root: config.auto_approve_root.clone(),
         notifications: config.notifications,
         approvals,

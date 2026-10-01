@@ -135,6 +135,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         Message::Forward {
             target,
             command: crate::approval_command::current()?,
+            cwd: crate::approval_command::current_directory(),
             request: Box::new(request),
         },
         REQUEST_TIMEOUT + SETUP_TIMEOUT + Duration::from_secs(10),
@@ -172,6 +173,7 @@ impl Receiver {
         &self,
         target: String,
         command: Vec<Vec<u8>>,
+        cwd: String,
         request: CopyRequest,
         mut stream: TrackedStream,
     ) -> Result<()> {
@@ -226,6 +228,7 @@ impl Receiver {
         self.approvals.request_remote(
             &self.requester,
             &command,
+            &cwd,
             &target,
             &request,
             self.notifications,
@@ -884,6 +887,7 @@ mod tests {
                 Message::Forward {
                     target,
                     command: command.clone(),
+                    cwd: String::new(),
                     request: Box::new(copy)
                 },
                 Duration::from_secs(2),
@@ -908,6 +912,7 @@ mod tests {
                     Message::Forward {
                         target: "backup".into(),
                         command,
+                        cwd: "~/rt-bench".into(),
                         request: Box::new(copy),
                     },
                     Duration::from_secs(3),

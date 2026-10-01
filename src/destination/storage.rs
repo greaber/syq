@@ -30,7 +30,8 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
         &registration,
         Message::Storage {
             command: crate::approval_command::current()?,
-            request,
+            cwd: crate::approval_command::current_directory(),
+            request: Box::new(request),
         },
         REQUEST_TIMEOUT + Duration::from_secs(10),
         Some(Duration::from_secs(60)),
@@ -134,6 +135,7 @@ impl Receiver {
     pub(super) fn storage(
         &self,
         command: Vec<Vec<u8>>,
+        cwd: String,
         request: Request,
         mut stream: TrackedStream,
     ) -> Result<()> {
@@ -158,6 +160,7 @@ impl Receiver {
         self.approvals.request_storage(
             &self.requester,
             &command,
+            &cwd,
             &request,
             self.notifications,
             cancelled,
