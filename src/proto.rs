@@ -1373,6 +1373,8 @@ pub enum Response {
         len: u32,
     },
     SendBudget(crate::descriptor_broker::DescriptorTicket),
+    /// Aggregate ignore exclusions, sent once before ScanDone when nonzero.
+    ScanIgnoredCount(u64),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

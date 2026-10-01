@@ -421,7 +421,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             dry_run: args.dry_run,
             files_transferred: progress.files_done.load(Relaxed),
             files_unchanged: progress.files_unchanged.load(Relaxed),
-            files_excluded: progress.files_excluded.load(Relaxed),
+            files_excluded: progress.excluded(),
             directories_created: progress.directories_created.load(Relaxed),
             symlinks_created: progress.symlinks_created.load(Relaxed),
             specials_created: 0,

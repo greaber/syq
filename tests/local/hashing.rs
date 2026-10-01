@@ -728,10 +728,7 @@ fn dry_run_hash_compares_contents_and_metadata_without_writing() {
         assert_eq!(summary["bytes_transferred"], 10, "{route}: {summary}");
         assert_eq!(summary["files_unchanged"], 2, "{route}: {summary}");
         assert_eq!(summary["bytes_unchanged"], 9, "{route}: {summary}");
-        assert_eq!(
-            summary["files_excluded"], 0,
-            "ignore exclusions use paths_ignored"
-        );
+        assert_eq!(summary["files_excluded"], 1, "{route}: {summary}");
         assert!(!records.iter().any(|r| r["type"] == "operation_result"));
         for (name, reason, bytes) in [
             ("corrupt", "content_differs", Some(4)),

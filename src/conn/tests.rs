@@ -1359,6 +1359,33 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
 }
 
 #[test]
+fn remote_scan_returns_aggregate_ignores_without_path_batches() {
+    for count in [0, 25_000] {
+        let mut root = entry(b"");
+        root.kind = Kind::Dir;
+        let mut responses = vec![Response::ScanBatch(vec![root])];
+        if count > 0 {
+            responses.push(Response::ScanIgnoredCount(count));
+        }
+        responses.push(Response::ScanDone);
+        let mut conn = connection_replaying(&responses);
+        let actual = conn
+            .scan(
+                b"source",
+                None,
+                false,
+                &["*.tmp".into()],
+                false,
+                &mut |_| Ok(()),
+                &mut |_| panic!("ignored paths were not requested"),
+                &mut |warning| panic!("{warning}"),
+            )
+            .unwrap();
+        assert_eq!(actual, count);
+    }
+}
+
+#[test]
 fn remote_scan_paths_are_rooted_and_normalized() {
     let mut saw_root = false;
     validate_remote_scan_batch(&[entry(b""), entry(b"dir/file")], &mut saw_root, None).unwrap();

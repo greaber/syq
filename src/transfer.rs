@@ -1182,7 +1182,7 @@ fn attempt_small_copy(
         dry_run: false,
         files_transferred: progress.files_done.load(Relaxed),
         files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: progress.files_excluded.load(Relaxed),
+        files_excluded: progress.excluded(),
         directories_created: 0,
         symlinks_created: 0,
         specials_created: 0,
@@ -1283,7 +1283,7 @@ fn print_statistics(
         commas(progress.scanned.load(Relaxed)),
         commas(progress.files_total.load(Relaxed)),
         commas(progress.files_unchanged.load(Relaxed)),
-        commas(progress.files_excluded.load(Relaxed)),
+        commas(progress.excluded()),
         commas(bytes_work),
         commas(progress.bytes_unchanged.load(Relaxed)),
         elapsed,
@@ -1470,7 +1470,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 dry_run,
                 files_transferred: progress.files_done.load(Relaxed),
                 files_unchanged: progress.files_unchanged.load(Relaxed),
-                files_excluded: progress.files_excluded.load(Relaxed),
+                files_excluded: progress.excluded(),
                 // Mutations that settled (and streamed their records)
                 // before the run died must not vanish from the aggregates.
                 directories_created: progress.directories_created.load(Relaxed),
@@ -3845,7 +3845,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dry_run: opts.dry_run,
         files_transferred: progress.files_done.load(Relaxed),
         files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: progress.files_excluded.load(Relaxed),
+        files_excluded: progress.excluded(),
         // Live counters only move when mutations run; a dry run reports the
         // planned work it traced instead.
         directories_created: if opts.dry_run {
@@ -4476,21 +4476,15 @@ fn scan_into_planner(
 ) -> Result<()> {
     let progress = pl.progress;
     let quiet = pl.opts.quiet;
-    let report_ignored = pl.opts.dry_run;
     let warned = std::cell::Cell::new(false);
     let res = src.scan(
         root,
         source,
         follow_root,
         ignore,
-        report_ignored,
+        false,
         &mut |batch| f(pl, batch),
-        &mut |paths| {
-            progress
-                .paths_ignored
-                .fetch_add(paths.len() as u64, Relaxed);
-            Ok(())
-        },
+        &mut |_| Ok(()),
         &mut |w| {
             // "skipping …" is a notice (nothing the copy owes is missing);
             // anything else from the scanner means an entry was lost.
@@ -4507,7 +4501,8 @@ fn scan_into_planner(
     if warned.get() {
         pl.scan_warned = true;
     }
-    res
+    progress.paths_ignored.fetch_add(res?, Relaxed);
+    Ok(())
 }
 
 /// If `entry` is a symlink whose (possibly chained) target is a directory,

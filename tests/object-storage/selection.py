@@ -90,6 +90,58 @@ def check_source_roots():
                     'project-a', 'project-a/build', '--into', overlap, '--ignore', '/build/'])
         assert not (overlap / 'project-a/build').exists()
         assert (overlap / 'build/secret').read_bytes() == b'excluded'
+        # A child selected into the same destination restarts ignore anchoring
+        # for pruning too, regardless of selector order. Ignored descendants of
+        # that child must still survive, including on a dry run.
+        for rule in ['/build/', 'build/']:
+            for reverse in [False, True]:
+                for route in ['local', 'uploaded', 'downloaded', 'copied']:
+                    case = f"overlap-{rule.startswith('/')}-{reverse}-{route}"
+                    destination = root / case
+                    key = f'{prefix}/{case}'
+                    to_s3 = route in ('uploaded', 'copied')
+                    seed = {'build/extra': b'delete', 'build/build/protected': b'keep'}
+                    for path, data in seed.items():
+                        if to_s3:
+                            checks.request('PUT', f'{key}/{path}', data)
+                        else:
+                            file = destination / path
+                            file.parent.mkdir(parents=True, exist_ok=True)
+                            file.write_bytes(data)
+                    if route in ('downloaded', 'copied'):
+                        args = ['--from', remote, '-C', original]
+                        parent = 'project-a'
+                        child = 'project-a/build'
+                    else:
+                        args = []
+                        parent = source / 'project-a'
+                        child = parent / 'build'
+                    selections = [['--srcs-in', parent], ['--src-dir', child]]
+                    if reverse:
+                        selections.reverse()
+                    args += [part for selector in selections for part in selector]
+                    args += ['--to', remote, '--into', key] if to_s3 else ['--into', destination]
+                    args += ['--ignore', rule, '--prune']
+                    for dry_run in [True, False]:
+                        results = root / f'{case}-{dry_run}.jsonl'
+                        command = [*args, '--results', results, *(['--dry-run'] if dry_run else [])]
+                        if route == 'local':
+                            completed = subprocess.run(
+                                [checks.SYQ, 'cp', '--no-progress', *map(str, command)],
+                                timeout=180, capture_output=True)
+                            assert completed.returncode == 0, (case, dry_run, completed)
+                        else:
+                            checks.run(command)
+                        terminal = json.loads(results.read_text().splitlines()[-1])
+                        expected_excluded = 1 if rule.startswith('/') else 2
+                        assert terminal['files_excluded'] == expected_excluded, (case, dry_run, terminal)
+                        if to_s3:
+                            paths = {p[len(key) + 1:] for p in checks.listing(key + '/')}
+                        else:
+                            paths = {str(p.relative_to(destination)) for p in destination.rglob('*')}
+                        assert ('build/extra' in paths) == dry_run, (case, dry_run, paths)
+                        assert 'build/build/protected' in paths, (case, dry_run, paths)
+                        assert ('build/secret' in paths) == (not dry_run), (case, dry_run, paths)
         # Explicit leaves use the source basename on every route, including
         # when the target is renamed and the source has an ignored parent name.
         for case, rules, included in [
@@ -115,12 +167,15 @@ def check_source_roots():
                 else:
                     args = [source / 'project-a/build/secret']
                 args += ['--to', remote, '--as', key] if to_s3 else ['--as', destination]
-                args += options
+                results = root / f'named-{case}-{route}.jsonl'
+                args += [*options, '--results', results]
                 if route == 'local':
                     subprocess.run([checks.SYQ, 'cp', '--no-progress', *map(str, args)],
                                    check=True, timeout=180)
                 else:
                     checks.run(args)
+                terminal = json.loads(results.read_text().splitlines()[-1])
+                assert terminal['files_excluded'] == int(not included), (case, route, terminal)
                 actual = checks.request('GET', key)[1] if to_s3 else destination.read_bytes()
                 assert actual == expected_file, (case, route, actual, expected_file)
     print('Ignore roots and prune protection agree across local and S3 routes', flush=True)

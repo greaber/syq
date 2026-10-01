@@ -265,7 +265,7 @@ impl Conn for PipelineConn {
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         _: &mut dyn FnMut(String),
-    ) -> Result<()> {
+    ) -> Result<u64> {
         unreachable!()
     }
     fn native_remove(
@@ -1682,7 +1682,7 @@ impl Conn for SetupConn {
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         _: &mut dyn FnMut(String),
-    ) -> Result<()> {
+    ) -> Result<u64> {
         unreachable!()
     }
     fn native_remove(
@@ -2095,7 +2095,7 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
             _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
             _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
             _: &mut dyn FnMut(String),
-        ) -> Result<()> {
+        ) -> Result<u64> {
             unreachable!()
         }
         fn native_remove(

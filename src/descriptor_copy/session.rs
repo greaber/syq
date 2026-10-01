@@ -389,7 +389,7 @@ mod tests {
             _: &mut dyn FnMut(Vec<crate::proto::Entry>) -> Result<()>,
             _: &mut dyn FnMut(Vec<crate::proto::PathBytes>) -> Result<()>,
             _: &mut dyn FnMut(String),
-        ) -> Result<()> {
+        ) -> Result<u64> {
             unreachable!("stream control does not scan")
         }
         fn native_remove(

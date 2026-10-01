@@ -265,7 +265,7 @@ impl Conn for LocalConn {
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let mut capture = |mut batch: Vec<Entry>| {
             self.ops
                 .capture_scan_metadata(root, source, follow_root, &mut batch)?;

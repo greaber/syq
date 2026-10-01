@@ -672,7 +672,7 @@ fn native_ignore_filters_explicit_files_by_source_basename() {
     let records = fs::read_to_string(results).unwrap();
     let terminal: serde_json::Value =
         serde_json::from_str(records.lines().last().unwrap()).unwrap();
-    assert_eq!(terminal["files_excluded"], 0);
+    assert_eq!(terminal["files_excluded"], 1);
     assert_eq!(terminal["files_transferred"], 0);
     assert!(!t.path("preview").exists());
 }
@@ -720,7 +720,7 @@ fn native_ignore_exclusions_match_for_named_and_scanned_files() {
             let records = fs::read_to_string(results).unwrap();
             let terminal: serde_json::Value =
                 serde_json::from_str(records.lines().last().unwrap()).unwrap();
-            assert_eq!(terminal["files_excluded"], 0, "{terminal}");
+            assert_eq!(terminal["files_excluded"], 1, "{terminal}");
             assert_eq!(terminal["files_transferred"], 0, "{terminal}");
             assert!(!Path::new(&destination).join("report.txt").exists());
         }
@@ -919,6 +919,86 @@ fn ignore_reinclude_subdir_idiom() {
     ]);
     assert!(t.path("dst/logs/keep/k").is_file());
     assert!(!t.path("dst/logs/l1").exists());
+}
+
+#[test]
+fn rsync_ignore_named_sources_use_source_basename() {
+    let t = Tmp::new();
+    write(&t.path("ignored-parent/report.txt"), b"source");
+    std::os::unix::fs::symlink("report.txt", t.path("ignored-parent/link.txt")).unwrap();
+    for (case, rules, excluded) in [
+        ("all", vec!["*"], true),
+        ("basename", vec!["*.txt"], true),
+        ("anchored", vec!["/report.txt"], true),
+        ("parent", vec!["ignored-parent/"], false),
+        ("negated", vec!["*", "!report.txt"], false),
+        ("destination", vec!["renamed"], false),
+    ] {
+        let destination = t.s(&format!("{case}/renamed"));
+        fs::create_dir_all(t.path(case)).unwrap();
+        let source = t.s("ignored-parent/report.txt");
+        let mut args = vec!["-a"];
+        for rule in &rules {
+            args.extend(["--syq-ignore", rule]);
+        }
+        args.extend([source.as_str(), destination.as_str()]);
+        run_ok(&args);
+        assert_eq!(Path::new(&destination).exists(), !excluded, "{case}");
+    }
+    run_ok(&[
+        "-a",
+        "--syq-ignore",
+        "*.txt",
+        &t.s("ignored-parent/report.txt"),
+        &t.s("ignored-parent/link.txt"),
+        &t.s("multiple/"),
+    ]);
+    assert!(!t.path("multiple/report.txt").exists());
+    assert!(fs::symlink_metadata(t.path("multiple/link.txt")).is_err());
+}
+
+#[test]
+fn rsync_delete_excluded_removes_ignored_named_sources() {
+    let t = Tmp::new();
+    write(&t.path("source/report.txt"), b"new");
+    std::os::unix::fs::symlink("report.txt", t.path("source/link.txt")).unwrap();
+    fs::create_dir(t.path("dir")).unwrap();
+    for delete_excluded in [false, true] {
+        for dry_run in [false, true] {
+            for reverse in [false, true] {
+                let destination = format!("dst-{delete_excluded}-{dry_run}-{reverse}");
+                for name in ["report.txt", "link.txt", "other.txt"] {
+                    write(&t.path(&format!("{destination}/{name}")), b"old");
+                }
+                let source = t.s("source/report.txt");
+                let link = t.s("source/link.txt");
+                let directory = t.s("dir/");
+                let destination = t.s(&format!("{destination}/"));
+                let mut args = vec!["-a", "--delete", "--syq-ignore", "*.txt"];
+                if delete_excluded {
+                    args.push("--delete-excluded");
+                }
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                if reverse {
+                    args.extend([directory.as_str(), source.as_str(), link.as_str()]);
+                } else {
+                    args.extend([source.as_str(), link.as_str(), directory.as_str()]);
+                }
+                args.push(&destination);
+                run_ok(&args);
+                for name in ["report.txt", "link.txt", "other.txt"] {
+                    let path = Path::new(&destination).join(name);
+                    if dry_run || !delete_excluded {
+                        assert_eq!(read(&path), b"old", "{}", path.display());
+                    } else {
+                        assert!(!path.exists(), "{}", path.display());
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

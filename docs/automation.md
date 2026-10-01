@@ -272,11 +272,15 @@ times or pure network time. The field is absent when no bytes moved or the
 coordinator does not supply it, including older releases and attested terminals.
 Use `elapsed_ms` for end-to-end throughput comparisons.
 
-Copy totals include transferred/unchanged/excluded files, created directories,
+Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
 `deletions_planned`, `deletions_completed`, and `deletions_blocked`. A fatal
 failure reports what finished before it stopped. Dry-run totals describe
 planned work, not committed changes.
+
+For results without destination attestations, `files_excluded` includes
+ignore-rule skips on filesystem and S3 routes, in both live copies and dry runs.
+An ignored directory counts once; its unscanned descendants are not counted.
 
 Attested terminals add `receipt_status` (`clean`, `failed`, or `incomplete`),
 provenance, and receipt counts. They can attest only what the receiver saw:

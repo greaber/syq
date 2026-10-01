@@ -162,7 +162,16 @@ pub(super) fn join(a: &str, b: &str) -> String {
     }
 }
 
-pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Plan)> {
+pub(super) struct UploadPlan {
+    pub sources: Vec<Source>,
+    pub prune: super::prune::Plan,
+    pub ignored: u64,
+    pub excluded: u64,
+}
+
+pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
+    let mut ignored_count = 0;
+    let mut excluded = 0;
     let mut prune = super::prune::Plan::default();
     let count = args.locations.len() - 1;
     let target = key_path(&args.locations[count].path)?;
@@ -334,7 +343,13 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 })
             };
             if ignored {
-                prune.protect(source.key.as_bytes());
+                ignored_count += 1;
+                // Descendants are protected by the destination matcher, which
+                // restarts anchoring at the most specific selected root. An
+                // explicit leaf can be renamed, so protect its target directly.
+                if selected_root {
+                    prune.protect(source.key.as_bytes());
+                }
                 continue;
             }
             if source.kind() == ObjectKind::File
@@ -343,6 +358,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                 if !source.meta.is_file() {
                     bail!("special files cannot be uploaded to S3");
                 }
+                excluded += 1;
                 prune.protect(source.key.as_bytes());
                 continue;
             }
@@ -389,6 +405,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
                     .selects(&source.expression_file()?, source.expression_path())
                     .with_context(|| format!("source {}", String::from_utf8_lossy(&source.label)))?
             {
+                excluded += 1;
                 prune.protect(source.key.as_bytes());
                 continue;
             }
@@ -403,7 +420,12 @@ pub(super) fn upload_plan(args: &Args) -> Result<(Vec<Source>, super::prune::Pla
             out.push(source);
         }
     }
-    Ok((out, prune))
+    Ok(UploadPlan {
+        sources: out,
+        prune,
+        ignored: ignored_count,
+        excluded,
+    })
 }
 
 pub(super) fn claim(

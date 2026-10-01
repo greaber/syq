@@ -184,6 +184,7 @@ pub trait Conn: Send {
     }
     /// Streamed scan; `sink` gets batches, `warn` gets non-fatal messages,
     /// `ignored` gets the paths the patterns pruned (only if `report_ignored`).
+    /// Returns the number of ignored entries/subtrees.
     #[allow(clippy::too_many_arguments)]
     fn scan(
         &mut self,
@@ -195,7 +196,7 @@ pub trait Conn: Send {
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
-    ) -> Result<()>;
+    ) -> Result<u64>;
     /// Stream descendants of disjoint selections relative to one registered base.
     /// Return false without invoking callbacks when this endpoint needs the
     /// ordinary per-selection scan path. Selected roots are already planned.
@@ -930,7 +931,7 @@ impl Conn for RemoteConn {
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(String),
-    ) -> Result<()> {
+    ) -> Result<u64> {
         self.send(Request::Scan {
             root: root.to_vec(),
             source: source.cloned(),
@@ -941,6 +942,7 @@ impl Conn for RemoteConn {
         })?;
         let matcher = crate::scan::build_ignore(ignore)?;
         let mut saw_root = false;
+        let mut ignored_count = 0;
         loop {
             match self.recv()? {
                 Response::ScanBatch(b) => {
@@ -949,8 +951,9 @@ impl Conn for RemoteConn {
                     sink(b)?;
                 }
                 Response::ScanIgnored(v) => ignored(v)?,
+                Response::ScanIgnoredCount(count) => ignored_count = count,
                 Response::ScanWarn(w) => warn(w),
-                Response::ScanDone if saw_root => return Ok(()),
+                Response::ScanDone if saw_root => return Ok(ignored_count),
                 Response::ScanDone => bail!("{}: remote scan returned no root entry", self.label),
                 Response::Err(e) => bail!("{}: scan: {e}", self.label),
                 other => bail!("{}: unexpected response during scan: {other:?}", self.label),
