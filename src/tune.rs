@@ -927,7 +927,7 @@ enum SlotPhase {
 struct Slot {
     phase: SlotPhase,
     setup_started: Option<Instant>,
-    whole_file: bool,
+    active_work: usize,
 }
 
 impl Default for Slot {
@@ -935,7 +935,7 @@ impl Default for Slot {
         Self {
             phase: SlotPhase::Absent,
             setup_started: None,
-            whole_file: false,
+            active_work: 0,
         }
     }
 }
@@ -961,14 +961,14 @@ pub struct Gate {
     history: std::sync::OnceLock<history::Recorder>,
 }
 
-pub(crate) struct WholeFile {
+pub(crate) struct WorkGuard {
     gate: Arc<Gate>,
     id: usize,
 }
 
-impl Drop for WholeFile {
+impl Drop for WorkGuard {
     fn drop(&mut self) {
-        self.gate.slots.lock().unwrap()[self.id].whole_file = false;
+        self.gate.slots.lock().unwrap()[self.id].active_work -= 1;
     }
 }
 
@@ -1134,27 +1134,27 @@ impl Gate {
         id < self.connect_target.load(Relaxed)
     }
 
-    pub(crate) fn whole_file(self: &Arc<Self>, id: usize) -> WholeFile {
+    pub(crate) fn work(self: &Arc<Self>, id: usize) -> WorkGuard {
         let mut slots = self.slots.lock().unwrap();
         grow_to(&mut slots, id + 1);
-        slots[id].whole_file = true;
-        WholeFile {
+        slots[id].active_work += 1;
+        WorkGuard {
             gate: self.clone(),
             id,
         }
     }
 
-    fn whole_files_draining(&self, n: usize) -> bool {
+    fn workers_draining(&self, n: usize) -> bool {
         self.slots
             .lock()
             .unwrap()
             .iter()
             .skip(n)
-            .any(|slot| slot.whole_file)
+            .any(|slot| slot.active_work > 0)
     }
 
     pub(crate) fn measurement_ready(&self, n: usize) -> bool {
-        self.ready_through(n) && !self.whole_files_draining(n)
+        self.ready_through(n) && !self.workers_draining(n)
     }
 
     pub fn ready_through(&self, n: usize) -> bool {

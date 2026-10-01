@@ -899,6 +899,31 @@ impl Sched {
         self.cv.notify_all();
     }
 
+    /// Return an assignment claimed while a worker was being retired, before
+    /// it issued any requests. Keep the work visible throughout the handoff.
+    pub fn return_unstarted(&self, item: Item) {
+        match item {
+            Item::Exit => return,
+            Item::File(idx) => {
+                let size = self.jobs.lock().unwrap()[idx].entry.size;
+                let mut g = self.inner.lock().unwrap();
+                g.probing -= 1;
+                g.files.push((size, Reverse(FileOrder::new(idx))));
+            }
+            Item::Range(handle) => {
+                let mut g = self.inner.lock().unwrap();
+                g.inflight.retain(|h| !Arc::ptr_eq(h, &handle));
+                let range = handle.lock().unwrap();
+                // The queued range keeps the assignment's outstanding share.
+                g.ranges.push((range.idx, range.pos, range.end));
+            }
+            Item::Finish { idx, matched } => {
+                self.inner.lock().unwrap().finishes.push((idx, matched));
+            }
+        }
+        self.cv.notify_all();
+    }
+
     pub fn next(&self) -> Item {
         let mut g = self.inner.lock().unwrap();
         loop {
