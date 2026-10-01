@@ -90,6 +90,7 @@ COPY tests/real-ssh/test-return-exec.py /usr/local/libexec/syq-test-return-exec.
 COPY tests/real-ssh/test-receive-profiles.py /usr/local/libexec/syq-test-receive-profiles.py
 
 COPY tests/real-ssh/test-return-handoff.py /usr/local/libexec/syq-test-return-handoff.py
+COPY tests/real-ssh/test-handoff-timing.py /usr/local/libexec/syq-test-handoff-timing.py
 
 COPY tests/real-ssh/test-root-security.py /usr/local/libexec/syq-test-root-security.py
 

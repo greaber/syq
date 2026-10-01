@@ -8,6 +8,7 @@ host='unset'
 next_is_control_path=false
 next_is_host=false
 restricted_worker=no
+return_receiver=no
 for argument do
     if [ "$next_is_host" = true ]; then
         host=$argument
@@ -23,6 +24,7 @@ for argument do
         ControlMaster=*) control_master=${argument#ControlMaster=} ;;
         ControlPath=*) control_path=${argument#ControlPath=} ;;
         *--restricted-worker=*) restricted_worker=yes ;;
+        *--return-receiver*) return_receiver=yes ;;
         -S) next_is_control_path=true ;;
         --) next_is_host=true ;;
     esac
@@ -42,9 +44,10 @@ if [ "${SYQ_REAL_SSH_STRICT_MUX_FAILURE:-0}" = 1 ] &&
     strict_mux=yes
 fi
 
-trace=/tmp/syq-real-ssh-ssh.trace
-printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\n' \
-    "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" >>"$trace"
+trace=${SYQ_REAL_SSH_TRACE_FILE:-/tmp/syq-real-ssh-ssh.trace}
+# Append fields so positional readers of the existing columns remain valid.
+printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\treturn_receiver=%s\n' \
+    "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$return_receiver" >>"$trace"
 if [ "$restricted_worker" = yes ] && [ -f /tmp/syq-real-ssh-block-restricted-workers ]; then
     printf 'restricted SSH worker blocked by the route test\n' >&2
     status=255
@@ -57,6 +60,6 @@ else
     /usr/bin/ssh "$@"
     status=$?
 fi
-printf 'phase=end\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\tstatus=%s\n' \
-    "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$status" >>"$trace"
+printf 'phase=end\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\tstatus=%s\treturn_receiver=%s\n' \
+    "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$status" "$return_receiver" >>"$trace"
 exit "$status"

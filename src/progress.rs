@@ -132,6 +132,15 @@ impl Progress {
     }
 
     pub fn new(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
+        Self::starting_at(enabled, force, width, Instant::now())
+    }
+
+    pub fn starting_at(
+        enabled: bool,
+        force: bool,
+        width: Option<usize>,
+        start: Instant,
+    ) -> Arc<Self> {
         Arc::new(Progress {
             tuning_destination_devices: Default::default(),
             tuning_history: std::sync::OnceLock::new(),
@@ -163,7 +172,7 @@ impl Progress {
             symlinks_created: AtomicU64::new(0),
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
-            start: Instant::now(),
+            start,
             separate_transfer_timing: false,
             transfer_start: std::sync::OnceLock::new(),
             transfer_end: std::sync::OnceLock::new(),
@@ -181,8 +190,13 @@ impl Progress {
         })
     }
 
-    pub fn new_transfer(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
-        let mut progress = Self::new(enabled, force, width);
+    pub fn transfer_starting_at(
+        enabled: bool,
+        force: bool,
+        width: Option<usize>,
+        start: Instant,
+    ) -> Arc<Self> {
+        let mut progress = Self::starting_at(enabled, force, width, start);
         Arc::get_mut(&mut progress)
             .unwrap()
             .separate_transfer_timing = true;
@@ -767,8 +781,12 @@ mod tests {
 
     #[test]
     fn transfer_rate_starts_with_work_and_freezes_before_finalization() {
-        let mut progress = Progress::new_transfer(false, false, None);
-        Arc::get_mut(&mut progress).unwrap().start = Instant::now() - Duration::from_secs(60);
+        let progress = Progress::transfer_starting_at(
+            false,
+            false,
+            None,
+            Instant::now() - Duration::from_secs(60),
+        );
         assert_eq!(progress.timings().transfer_ms, Some(0));
         assert_eq!(progress.display_elapsed(), Duration::ZERO);
         progress.begin_transfer();

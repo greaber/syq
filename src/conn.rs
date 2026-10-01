@@ -23,6 +23,7 @@ pub(crate) use batch_progress::BatchReceipts;
 mod bootstrap;
 mod local;
 mod reverse_tcp;
+mod ssh_auth;
 mod ssh_multiplexer;
 mod tcp_socket;
 pub(crate) use reverse_tcp::ReverseTcp;
@@ -309,6 +310,36 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<WorkerInitializationError>())
+}
+
+/// OpenSSH could not establish the initial helper session (exit 255).
+/// Kept distinct from helper/bootstrap errors and failures after HelloOk so
+/// automatic authorization can fall back before a transfer has begun.
+#[derive(Debug)]
+struct SshConnectError {
+    message: String,
+    authentication_failed: bool,
+}
+
+impl std::fmt::Display for SshConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SshConnectError {}
+
+#[cfg(test)]
+fn is_ssh_connect_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<SshConnectError>())
+}
+
+pub(crate) fn is_ssh_authentication_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SshConnectError>()
+            .is_some_and(|error| error.authentication_failed)
+    })
 }
 
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
@@ -655,6 +686,16 @@ impl RemoteConn {
                                 "{}: multiplexed SSH session was rejected ({status})",
                                 self.label
                             ))
+                            .into();
+                        }
+                        if self.peer.is_none() {
+                            return SshConnectError {
+                                message: format!(
+                                    "{}: SSH connection failed ({status})",
+                                    self.label
+                                ),
+                                authentication_failed: false,
+                            }
                             .into();
                         }
                         return anyhow!("{}: remote syq exited ({status})", self.label);
@@ -1551,7 +1592,13 @@ impl RemoteSpec {
         } else {
             ConnectionRole::Control
         };
-        self.connect_with_role(compress, limited, role, false)
+        self.connect_with_role(compress, limited, role, false, false)
+    }
+
+    /// Ordinary SSH settings, with diagnostics inspected only to decide whether
+    /// automatic authorization can try another machine after authentication fails.
+    pub(crate) fn connect_for_authorization(&self, compress: bool) -> Result<RemoteConn> {
+        self.connect_with_role(compress, false, ConnectionRole::Control, false, true)
     }
 
     /// One non-retrying control connection for speculative shell completion.
@@ -1563,7 +1610,7 @@ impl RemoteSpec {
             return Ok(conn);
         }
         let role = ConnectionRole::Control;
-        let first = self.connect_once(false, SshConnection::Control, role.clone());
+        let first = self.connect_once(false, SshConnection::Control, role.clone(), false);
         let Err(first_error) = first else {
             return first;
         };
@@ -1571,7 +1618,7 @@ impl RemoteSpec {
             return Err(first_error);
         }
         self.install_helper()?;
-        self.connect_once(false, SshConnection::Control, role)
+        self.connect_once(false, SshConnection::Control, role, false)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -1587,13 +1634,30 @@ impl RemoteSpec {
         limited: bool,
         role: ConnectionRole,
         first_worker: bool,
+        classify_ssh_failure: bool,
     ) -> Result<RemoteConn> {
-        if matches!(role, ConnectionRole::Control) && compress {
-            if let Some(conn) = self.take_pooled_control(compress) {
-                return Ok(conn);
+        if matches!(role, ConnectionRole::Control) {
+            // Automatic authorization may already have opened this exact
+            // connection, including for --no-compress. Pool-created sessions
+            // still require compression, as before.
+            if let PrimedControl::Checked(conn) = &mut *self.primed_control.lock().unwrap() {
+                if let Some(conn) = conn.take() {
+                    return Ok(*conn);
+                }
+            }
+            if compress {
+                if let Some(conn) = self.take_pooled_control(compress) {
+                    return Ok(conn);
+                }
             }
         }
-        let first = self.connect_retried(compress, limited, role.clone(), first_worker);
+        let first = self.connect_retried(
+            compress,
+            limited,
+            role.clone(),
+            first_worker,
+            classify_ssh_failure,
+        );
         let Err(first_error) = first else {
             return first;
         };
@@ -1602,7 +1666,7 @@ impl RemoteSpec {
         }
 
         self.install_helper()?;
-        self.connect_retried(compress, limited, role, first_worker)
+        self.connect_retried(compress, limited, role, first_worker, classify_ssh_failure)
             .with_context(|| {
                 format!(
                     "could not start the {} helper installed on {}",
@@ -1618,6 +1682,7 @@ impl RemoteSpec {
         limited: bool,
         role: ConnectionRole,
         mut first_worker: bool,
+        classify_ssh_failure: bool,
     ) -> Result<RemoteConn> {
         let mut delay = std::time::Duration::from_millis(200);
         let mut last = None;
@@ -1628,7 +1693,7 @@ impl RemoteSpec {
         for attempt in 0..attempts {
             let _slot = limited.then(connect_slot);
             let ssh_connection = self.ssh_connection(limited, first_worker);
-            match self.connect_once(compress, ssh_connection, role.clone()) {
+            match self.connect_once(compress, ssh_connection, role.clone(), classify_ssh_failure) {
                 Ok(c) => return Ok(c),
                 Err(e)
                     if ssh_connection == SshConnection::Worker
@@ -1687,6 +1752,7 @@ impl RemoteSpec {
         compress: bool,
         ssh_connection: SshConnection,
         role: ConnectionRole,
+        classify_ssh_failure: bool,
     ) -> Result<RemoteConn> {
         // The receiver child is on this machine, not across the network.
         // Recompressing forwarded blocks here adds CPU work to downloads.
@@ -1779,9 +1845,13 @@ impl RemoteSpec {
             command.arg(remote_command);
             command
         };
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(
+            if classify_ssh_failure && !self.local_process {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            },
+        );
         let mut child = cmd.spawn_guarded().with_context(|| {
             if self.local_process {
                 "spawn local receiver".to_string()
@@ -1789,6 +1859,7 @@ impl RemoteSpec {
                 format!("spawn {:?}", self.rsh[0])
             }
         })?;
+        let ssh_failure = child.stderr.take().map(ssh_auth::capture);
         let stdin = child.stdin.take().unwrap();
         let pacing = (!matches!(role, ConnectionRole::Control))
             .then(|| self.pacing.lock().unwrap().clone())
@@ -1845,7 +1916,18 @@ impl RemoteSpec {
         if let ConnectionRole::SourceWorker { send_budget, .. } = &mut role {
             *send_budget = pacing.as_ref().and_then(|p| p.source_budget.clone());
         }
-        let conn = hello(conn, compress, Vec::new(), role)?;
+        let conn = hello(conn, compress, Vec::new(), role).map_err(|mut error| {
+            // Drain diagnostics before reporting any error, including helper
+            // errors. A ProxyCommand descendant may keep stderr open after ssh
+            // exits, so bound the wait and leave unclassified failures alone.
+            let authentication_failed = ssh_failure.is_some_and(|failure| {
+                failure.recv_timeout(std::time::Duration::from_millis(100)) == Ok(true)
+            });
+            if let Some(ssh_error) = error.downcast_mut::<SshConnectError>() {
+                ssh_error.authentication_failed = authentication_failed;
+            }
+            error
+        })?;
         handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         if ssh_connection == SshConnection::Control
@@ -2725,6 +2807,7 @@ impl Endpoint {
                     true,
                     role,
                     first_worker,
+                    false,
                 )?))
             }
         }
