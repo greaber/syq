@@ -1032,6 +1032,7 @@ impl FsOps {
         self.held_basis.take();
         let CopyLocalPolicy {
             inplace,
+            replace_partial,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
             progress,
@@ -1180,9 +1181,13 @@ impl FsOps {
             target_label = label;
             let (d, basis_size) = opened.context("sidecar creation was requested")?;
             if basis_size.is_some() {
-                // Preserve resumable data. The streaming path will hash and
-                // reuse it after CopyLocal reports that it is unavailable.
-                return Ok(CopyLocalOutcome::Unsupported);
+                if !replace_partial {
+                    // Preserve resumable data unless the coordinator chose
+                    // whole-file copying for a source-change retry.
+                    return Ok(CopyLocalOutcome::Unsupported);
+                }
+                d.set_len(0)
+                    .context("truncate partial for local-copy retry")?;
             }
             d
         };
@@ -1405,9 +1410,22 @@ impl FsOps {
         let (source, source_metadata, target, ()) = self.prepare_local_copy(source, dst, |_| ())?;
         Self::require_not_self_copy(&target, &source_metadata)?;
         let root = target.root.clone();
-        let (partial, _) = rooted_partial_target(&target, copy_id)?;
+        let (partial, label) = rooted_partial_target(&target, copy_id)?;
         self.uncache_rooted(&root, &target.relative);
         self.uncache_rooted(&root, &partial);
+        if policy.replace_partial {
+            if let Some(metadata) = root.metadata_optional(&partial)? {
+                if is_owned_rooted_partial(metadata) {
+                    discard_rooted_copy_partial(
+                        &root,
+                        &partial,
+                        &label,
+                        metadata.dev,
+                        metadata.ino,
+                    )?;
+                }
+            }
+        }
         let outcome = root.clone_file(&source, &source_metadata, &partial, size)?;
         if outcome == CopyLocalOutcome::Copied {
             _copy.bytes(size);
@@ -1428,6 +1446,69 @@ impl FsOps {
         _mode: u32,
     ) -> Result<CopyLocalOutcome> {
         Ok(CopyLocalOutcome::Unsupported)
+    }
+
+    fn read_small_batch(&mut self, reads: &[SmallRead]) -> Result<Response> {
+        let total: u64 = reads.iter().map(|read| u64::from(read.len)).sum();
+        if total > MAX_READ_BYTES {
+            bail!("small-file batch requests {total} bytes, exceeding the {MAX_READ_BYTES}-byte protocol limit");
+        }
+        let mut blocks: Vec<_> = reads
+            .iter()
+            .map(|read| {
+                // Metadata is enough for an empty file, even with mode 000.
+                let result = if read.len == 0 {
+                    self.source_content_target(read.source.as_ref())
+                        .map(|_| (Vec::new(), self.observed_payload_hash(&[])))
+                } else {
+                    self.read_range(&read.path, read.source.as_ref(), read.attempt, 0, read.len)
+                        .and_then(|response| match response {
+                            Response::Block { data, hash, .. } => Ok((data, hash)),
+                            other => bail!("unexpected response {other:?}"),
+                        })
+                };
+                result
+                    .map(|(data, hash)| SmallBlock {
+                        source: None,
+                        data,
+                        hash,
+                    })
+                    .map_err(|error| errstr(&error))
+            })
+            .collect();
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SOURCE_RECHECK_READY_FILE",
+            "SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE",
+            "small-file source recheck before sending",
+        )?;
+        // Keep the existing parallel metadata lookup and return its results
+        // alongside the data, avoiding a separate round trip. Never substitute
+        // a diagnostic path for a registered source's capability.
+        for registered in [true, false] {
+            let indices: Vec<_> = reads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, read)| {
+                    (blocks[i].is_ok() && read.source.is_some() == registered).then_some(i)
+                })
+                .collect();
+            if indices.is_empty() {
+                continue;
+            }
+            let paths: Vec<_> = indices.iter().map(|&i| reads[i].path.clone()).collect();
+            let sources: Option<Vec<_>> = registered.then(|| {
+                indices
+                    .iter()
+                    .map(|&i| reads[i].source.clone().unwrap())
+                    .collect()
+            });
+            let entries = self.stat_many_request(&paths, sources.as_deref(), false, None)?;
+            for (i, entry) in indices.into_iter().zip(entries) {
+                blocks[i].as_mut().unwrap().source = entry;
+            }
+        }
+        Ok(Response::SmallBlocks(blocks))
     }
 
     /// Write a whole small file through its private partial and atomically
@@ -2800,6 +2881,7 @@ impl FsOps {
                 source,
                 dst,
                 inplace,
+                replace_partial,
                 allow_sequential_nfs_fallback,
                 allow_sequential_local_fallback,
                 copy_id,
@@ -2811,6 +2893,7 @@ impl FsOps {
                     dst,
                     CopyLocalPolicy {
                         inplace: *inplace,
+                        replace_partial: *replace_partial,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,
                         progress,
@@ -2869,37 +2952,7 @@ impl FsOps {
                 len,
                 ..
             } => self.read_range(path, source.as_ref(), *attempt, *off, *len),
-            Request::ReadSmallBatch(reads) => {
-                // Every block is collected before the batch is answered, so
-                // bound the whole batch, not just each read.
-                let total: u64 = reads.iter().map(|read| u64::from(read.len)).sum();
-                if total > MAX_READ_BYTES {
-                    Err(anyhow!(
-                        "small-file batch requests {total} bytes, exceeding the {MAX_READ_BYTES}-byte protocol limit"
-                    ))
-                } else {
-                    Ok(Response::SmallBlocks(
-                        reads
-                            .iter()
-                            .map(|read| {
-                                match self.read_range(
-                                    &read.path,
-                                    read.source.as_ref(),
-                                    read.attempt,
-                                    0,
-                                    read.len,
-                                ) {
-                                    Ok(Response::Block { data, hash, .. }) => {
-                                        Ok(SmallBlock { data, hash })
-                                    }
-                                    Ok(other) => Err(format!("unexpected response {other:?}")),
-                                    Err(error) => Err(errstr(&error)),
-                                }
-                            })
-                            .collect(),
-                    ))
-                }
-            }
+            Request::ReadSmallBatch(reads) => self.read_small_batch(reads),
             Request::WriteRange {
                 path,
                 inplace,

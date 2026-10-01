@@ -109,8 +109,11 @@ to report them as errors instead. For machine-readable output, add
 A copy reads files over time. If another program changes them while syq is
 reading, the result may combine data from different moments. Syq does not
 create a snapshot; use a filesystem snapshot or stop the writer when you need
-a consistent view. `--inplace` also lets destination readers see partial
-updates, including after an interrupted copy.
+a consistent view. Filesystem-to-filesystem copies recheck source size and
+modification time after reading, before replacing the destination. A detected
+change can trigger a retry; a failed check leaves the previous destination in
+place. These checks do not detect every concurrent change. `--inplace` lets
+destination readers see partial updates, including after an interrupted copy.
 
 Successful completion does not guarantee that the copy will survive an
 immediate power loss. Normal file copies do not force transferred data onto
