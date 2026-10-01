@@ -700,7 +700,14 @@ fn native_ignore_exclusions_match_for_named_and_scanned_files() {
             if dry_run {
                 args.push("--dry-run");
             }
-            let output = run_native_ok(&args);
+            // The usual native test helper adds -q, which hides the summary.
+            let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(&args)
+                .arg("--no-progress")
+                .run()
+                .unwrap();
+            assert!(output.status.success(), "{}", stderr_of(&output));
+            let output = String::from_utf8_lossy(&output.stdout);
             if dry_run {
                 assert_eq!(
                     output
