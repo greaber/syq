@@ -53,8 +53,13 @@ fn authentication_failed(stderr: &[u8]) -> bool {
     {
         return true;
     }
-    last.rsplit_once(": Permission denied (")
-        .is_some_and(|(_, methods)| {
+    // OpenSSH 7.4/7.5 omit the user@host prefix; 7.6 added it.
+    last.strip_prefix("Permission denied (")
+        .or_else(|| {
+            last.rsplit_once(": Permission denied (")
+                .map(|(_, methods)| methods)
+        })
+        .is_some_and(|methods| {
             methods.strip_suffix(").").is_some_and(|methods| {
                 !methods.is_empty()
                     && methods
@@ -71,6 +76,10 @@ mod tests {
     #[test]
     fn recognizes_authentication_refusals_but_not_transport_or_host_trust_failures() {
         for diagnostic in [
+            // Unchanged diagnostic formats from OpenSSH's sshconnect2.c:
+            // V_7_4_P1 and V_7_5_P1 userauth(), before the V_7_6_P1 prefix.
+            "Permission denied (publickey).\r\n",
+            "Permission denied (publickey,gssapi-keyex,gssapi-with-mic).\n",
             "user@host: Permission denied (publickey).\r\n",
             "debuguser@host: Permission denied (publickey).",
             "debug1: offering key\nuser@host: Permission denied (publickey,password).\n",

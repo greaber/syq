@@ -114,9 +114,9 @@ import subprocess
 import time
 
 config = Path.home() / ".ssh/config"
-original = config.read_bytes()
+original = config.read_bytes() if config.exists() else None
 try:
-    config.write_bytes(b"Host syq-timeout-fixture\\n  HostName destination\\n  ProxyCommand sleep 10\\n  ConnectTimeout 1\\nHost *\\n" + original)
+    config.write_bytes(b"Host syq-timeout-fixture\\n  HostName destination\\n  ProxyCommand sleep 10\\n  ConnectTimeout 1\\nHost *\\n" + (original or b""))
     started = time.monotonic()
     result = subprocess.run([
         "syq", "cp", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin",
@@ -128,7 +128,10 @@ try:
     assert "requesting permission" not in result.stderr, result
     print("SSH timeout returned after", round(time.monotonic() - started, 2), "seconds", flush=True)
 finally:
-    config.write_bytes(original)
+    if original is None:
+        config.unlink()
+    else:
+        config.write_bytes(original)
 """)
 assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 remote("test ! -e /tmp/syq-real-ssh/forward/timed-out")
