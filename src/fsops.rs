@@ -2835,7 +2835,7 @@ fn hash_reader_observed(
     }
     let n = usize::try_from(len.div_ceil(block)).context("hash count exceeds this platform")?;
     let mut hashes = Vec::with_capacity(n);
-    let mut buf = vec![0u8; block as usize];
+    let mut buf = vec![0u8; block.min(len) as usize];
     let mut remaining = len;
     while remaining > 0 {
         let want = remaining.min(block) as usize;
