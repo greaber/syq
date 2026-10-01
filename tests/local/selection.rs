@@ -611,6 +611,159 @@ fn native_as_file_over_directory_fails_the_same_in_dry_run_and_execution() {
 }
 
 #[test]
+fn native_ignore_filters_explicit_files_by_source_basename() {
+    let t = Tmp::new();
+    write(&t.path("archive/report.txt"), b"source");
+    std::os::unix::fs::symlink("report.txt", t.path("archive/link.txt")).unwrap();
+    for (case, rules, excluded) in [
+        ("glob", vec!["*.txt"], true),
+        ("anchored", vec!["/report.txt"], true),
+        ("all", vec!["*"], true),
+        ("parent", vec!["archive/"], false),
+        ("source-path", vec!["archive/report.txt"], false),
+        ("destination", vec!["renamed"], false),
+        ("negated", vec!["*.txt", "!report.txt"], false),
+    ] {
+        let destination = t.s(&format!("{case}/renamed"));
+        write(Path::new(&destination), b"old");
+        let source = t.s("archive/report.txt");
+        let mut args = vec!["cp", &source, "--as", &destination, "--if-exists=update"];
+        for rule in &rules {
+            args.extend(["--ignore", rule]);
+        }
+        run_native_ok(&args);
+        assert_eq!(
+            read(Path::new(&destination)),
+            if excluded {
+                &b"old"[..]
+            } else {
+                &b"source"[..]
+            },
+            "{case}"
+        );
+    }
+    for source in ["report.txt", "link.txt"] {
+        let destination = t.s(&format!("excluded-{source}"));
+        run_native_ok(&[
+            "cp",
+            "-C",
+            &t.s("archive"),
+            "--src-non-dir",
+            source,
+            "--into",
+            &destination,
+            "--ignore",
+            "*.txt",
+        ]);
+        assert!(!Path::new(&destination).join(source).exists());
+    }
+    let results = t.s("preview.jsonl");
+    run_native_ok(&[
+        "cp",
+        &t.s("archive/report.txt"),
+        "--as",
+        &t.s("preview"),
+        "--ignore",
+        "*",
+        "--dry-run",
+        "--results",
+        &results,
+    ]);
+    let records = fs::read_to_string(results).unwrap();
+    let terminal: serde_json::Value =
+        serde_json::from_str(records.lines().last().unwrap()).unwrap();
+    assert_eq!(terminal["files_excluded"], 0);
+    assert_eq!(terminal["files_transferred"], 0);
+    assert!(!t.path("preview").exists());
+}
+
+#[test]
+fn native_ignore_exclusions_match_for_named_and_scanned_files() {
+    let t = Tmp::new();
+    write(&t.path("source/report.txt"), b"ignored");
+    for named in [false, true] {
+        for dry_run in [false, true] {
+            let destination = t.s(&format!("destination-{named}-{dry_run}"));
+            let results = t.s(&format!("results-{named}-{dry_run}.jsonl"));
+            let source = t.s(if named { "source/report.txt" } else { "source" });
+            let mut args = vec![
+                "cp",
+                if named { "--src" } else { "--srcs-in" },
+                &source,
+                "--into",
+                &destination,
+                "--ignore",
+                "*.txt",
+                "--results",
+                &results,
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            // The usual native test helper adds -q, which hides the summary.
+            let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+                .args(&args)
+                .arg("--no-progress")
+                .run()
+                .unwrap();
+            assert!(output.status.success(), "{}", stderr_of(&output));
+            let output = String::from_utf8_lossy(&output.stdout);
+            if dry_run {
+                assert_eq!(
+                    output
+                        .lines()
+                        .find(|line| line.trim_start().starts_with("exclusions:")),
+                    Some("  exclusions: 1 path/subtree skipped by ignore rules"),
+                    "{output}"
+                );
+            }
+            let records = fs::read_to_string(results).unwrap();
+            let terminal: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            assert_eq!(terminal["files_excluded"], 0, "{terminal}");
+            assert_eq!(terminal["files_transferred"], 0, "{terminal}");
+            assert!(!Path::new(&destination).join("report.txt").exists());
+        }
+    }
+}
+
+#[test]
+fn native_mapping_rejects_ignore_options_before_reading_inputs() {
+    let t = Tmp::new();
+    write(&t.path("empty-rules"), b"");
+    for (option, value) in [
+        ("--ignore", "*.txt"),
+        ("--ignore-from", "missing-rules"),
+        ("--ignore-from", "empty-rules"),
+    ] {
+        let output = native_syq(&[
+            "cp",
+            "-C",
+            &t.s("missing-source"),
+            "--mapping",
+            &t.s("missing-mapping"),
+            "--into",
+            &t.s("destination"),
+            option,
+            &if option == "--ignore-from" {
+                t.s(value)
+            } else {
+                value.to_owned()
+            },
+        ]);
+        let message = stderr_of(&output);
+        assert!(!output.status.success());
+        assert!(
+            message.contains("--mapping")
+                && message.contains(option)
+                && message.contains("cannot be used with"),
+            "{message}"
+        );
+        assert!(!t.path("destination").exists());
+    }
+}
+
+#[test]
 fn ignore_patterns_prune_dirs_and_files() {
     let t = Tmp::new();
     make_ignore_tree(&t.path("src"));

@@ -76,24 +76,25 @@ fn copy_requests_must_match_the_command_shown() {
 #[test]
 fn server_files_supply_only_their_own_contents() {
     // Parsing on this machine must not read the server's files.
-    let with_files = command(&[
-        "cp",
-        "--mapping",
-        "/nonexistent/mapping",
-        "--ignore-from",
-        "/nonexistent/ignore",
-        "--to",
-        "@laptop",
-        "--into",
-        "runs",
-    ]);
-    let mut request =
-        crate::restricted::named_request(&parse(&with_files).unwrap(), policy()).unwrap();
-    request.constraints.filters.ignore = vec!["*.tmp".into()];
-    request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
-    check_copy(&with_files, &request, Some("laptop"), None).unwrap();
-    request.copy.policy.deletion = crate::delegation::DeletionPolicy::DeleteDestinationOnly;
-    assert!(check_copy(&with_files, &request, Some("laptop"), None).is_err());
+    for file_args in [
+        &["--mapping", "/nonexistent/mapping"][..],
+        &["--src", "results", "--ignore-from", "/nonexistent/ignore"],
+    ] {
+        let mut argv = vec!["cp"];
+        argv.extend_from_slice(file_args);
+        argv.extend(["--to", "@laptop", "--into", "runs"]);
+        let with_file = command(&argv);
+        let args = parse(&with_file).unwrap();
+        let mut request = crate::restricted::named_request(&args, policy()).unwrap();
+        if args.native_mapping.is_some() {
+            request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
+        } else {
+            request.constraints.filters.ignore = vec!["*.tmp".into()];
+        }
+        check_copy(&with_file, &request, Some("laptop"), None).unwrap();
+        request.copy.policy.deletion = crate::delegation::DeletionPolicy::DeleteDestinationOnly;
+        assert!(check_copy(&with_file, &request, Some("laptop"), None).is_err());
+    }
 
     // Without a mapping file, the server cannot add a mapping.
     let inline = command(&[

@@ -3,9 +3,127 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import subprocess
 import tempfile
 
 import check as checks
+
+
+def check_source_roots():
+    remote = 's3://' + checks.BUCKET
+    prefix = checks.PREFIX + '/roots'
+    source_files = {
+        'build/secret': b'excluded',
+        'logs/drop': b'excluded',
+        'logs/keep/file': b'included',
+        'nested/build/file': b'nested',
+        'src/file': b'source',
+    }
+    names = ['project-a', 'project-b']
+    protected = {'build/old': b'protected build', 'logs/old': b'protected logs'}
+    expected = {f'{name}/{path}': data for name in names
+                for path, data in {**{p: d for p, d in source_files.items()
+                                      if p not in ('build/secret', 'logs/drop')}, **protected}.items()}
+    with tempfile.TemporaryDirectory(prefix='syq-ignore-roots-') as temp:
+        root = Path(temp).resolve()
+        source = root / 'ignored-parent'
+        for name in names:
+            for path, data in source_files.items():
+                file = source / name / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(data)
+        rules = root / 'rules'
+        rules.write_text('/build/\nlogs/*\n!logs/keep/\nproject-a/\nignored-parent/\n')
+        selectors = ['--src-dirs', *[source / name for name in names]]
+        options = ['--ignore-from', rules, '--prune']
+
+        def seed_local(destination):
+            for name in names:
+                for path, data in {**protected, 'extra': b'delete'}.items():
+                    file = destination / name / path
+                    file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_bytes(data)
+
+        def check_local(destination):
+            actual = {str(p.relative_to(destination)): p.read_bytes()
+                      for p in destination.rglob('*') if p.is_file()}
+            assert actual == expected, (destination, actual, expected)
+
+        def seed_remote(destination):
+            for name in names:
+                for path, data in {**protected, 'extra': b'delete'}.items():
+                    checks.request('PUT', f'{destination}/{name}/{path}', data)
+
+        def check_remote(destination):
+            actual = {key[len(destination) + 1:]: checks.request('GET', key)[1]
+                      for key in checks.listing(destination + '/') if not key.endswith('/')}
+            assert actual == expected, (destination, actual, expected)
+
+        # The same roots and rule file must select and protect the same paths
+        # locally, on upload, on download, and between buckets/prefixes.
+        local = root / 'local'
+        seed_local(local)
+        subprocess.run([checks.SYQ, 'cp', '--no-progress',
+                        *map(str, [*selectors, '--into', local, *options])],
+                       check=True, timeout=180)
+        check_local(local)
+        uploaded = prefix + '/uploaded'
+        seed_remote(uploaded)
+        checks.run([*selectors, '--to', remote, '--into', uploaded, *options])
+        check_remote(uploaded)
+
+        original = prefix + '/ignored-parent'
+        checks.run([*selectors, '--to', remote, '--into', original])
+        remote_sources = ['--from', remote, '-C', original, '--src-dirs', *names]
+        downloaded = root / 'downloaded'
+        seed_local(downloaded)
+        checks.run([*remote_sources, '--into', downloaded, *options])
+        check_local(downloaded)
+        copied = prefix + '/copied'
+        seed_remote(copied)
+        checks.run([*remote_sources, '--to', remote, '--into', copied, *options])
+        check_remote(copied)
+
+        # An excluded subtree becomes an included root when selected separately.
+        overlap = root / 'overlap'
+        checks.run(['--from', remote, '-C', original, '--src-dirs',
+                    'project-a', 'project-a/build', '--into', overlap, '--ignore', '/build/'])
+        assert not (overlap / 'project-a/build').exists()
+        assert (overlap / 'build/secret').read_bytes() == b'excluded'
+        # Explicit leaves use the source basename on every route, including
+        # when the target is renamed and the source has an ignored parent name.
+        for case, rules, included in [
+            ('all', ['*'], False), ('anchored', ['/secret'], False),
+            ('parent', ['build/'], True), ('negated', ['*', '!secret'], True),
+            ('destination', ['renamed'], True),
+        ]:
+            options = ['--if-exists=update']
+            for rule in rules:
+                options += ['--ignore', rule]
+            expected_file = b'excluded' if included else b'old'
+            for route in ['local', 'uploaded', 'downloaded', 'copied']:
+                destination = root / case / route / 'renamed'
+                key = f'{prefix}/files/{case}/{route}/renamed'
+                to_s3 = route in ('uploaded', 'copied')
+                if to_s3:
+                    checks.request('PUT', key, b'old')
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(b'old')
+                if route in ('downloaded', 'copied'):
+                    args = ['--from', remote, '-C', original, 'project-a/build/secret']
+                else:
+                    args = [source / 'project-a/build/secret']
+                args += ['--to', remote, '--as', key] if to_s3 else ['--as', destination]
+                args += options
+                if route == 'local':
+                    subprocess.run([checks.SYQ, 'cp', '--no-progress', *map(str, args)],
+                                   check=True, timeout=180)
+                else:
+                    checks.run(args)
+                actual = checks.request('GET', key)[1] if to_s3 else destination.read_bytes()
+                assert actual == expected_file, (case, route, actual, expected_file)
+    print('Ignore roots and prune protection agree across local and S3 routes', flush=True)
 
 
 def check():
@@ -79,6 +197,7 @@ def check():
         (source / 'two').write_bytes(b'two')
         checks.run(['--srcs-in', source, '--to', remote, '--into', prefix, '--prune'])
         assert set(checks.listing(prefix + '/')) == {prefix + '/one', prefix + '/two'}
+    check_source_roots()
     print('Paginated S3 selection, directory markers, ordered negations, and empty selection passed', flush=True)
 
 

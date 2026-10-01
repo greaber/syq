@@ -64,6 +64,14 @@ pub(crate) fn path_is_ignored(matcher: &Gitignore, path: &[u8], is_dir: bool) ->
             }))
 }
 
+/// An explicitly selected non-directory is matched by its source basename,
+/// independently of its parent path and destination placement.
+pub(crate) fn selected_file_is_ignored(matcher: Option<&Gitignore>, path: &[u8]) -> bool {
+    matcher.is_some_and(|m| {
+        crate::cli::native_basename(path).is_some_and(|name| path_is_ignored(m, name, false))
+    })
+}
+
 enum ScanEvent {
     Entry(Entry),
     Ignored(PathBytes),

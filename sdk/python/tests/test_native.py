@@ -872,6 +872,22 @@ class NativeClientTests(unittest.TestCase):
             list(stream)
         self.assertEqual(stream.cwd, home / "selected")
 
+    def test_mapping_rejects_ignores_before_consuming_entries(self) -> None:
+        def unread_mapping():
+            self.fail("mapping must not be consumed for an invalid combination")
+            yield
+
+        for options in (
+            {"ignore": "*.txt"}, {"ignore": ""},
+            {"ignore": [syq.IgnoreFrom("missing-rules")]},
+            {"ignore": iter(["*.txt"])},
+            {"ignore_from": "missing-rules"},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(syq.SyqInvocationError, "--mapping.*--ignore"):
+                    self.client.cp(mapping=unread_mapping(), into="target", **options)
+        self.client.cp(mapping="manifest", into="target", ignore=[], ignore_from=[])
+
     def test_structural_validation_happens_before_launch(self) -> None:
         with self.assertRaisesRegex(syq.SyqInvocationError, "exactly one"):
             self.client.cp("source")

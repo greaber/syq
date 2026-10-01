@@ -1204,7 +1204,7 @@ struct NativeCopyOperationalArgs {
     /// Print transfer statistics, worker waits, endpoint operations and CPU at the end
     #[arg(long)]
     stats: bool,
-    /// Skip paths matching a gitignore-style pattern (repeatable)
+    /// Skip directory-relative paths or explicit source basenames using a gitignore-style pattern (repeatable)
     #[arg(long = "ignore", value_name = "PATTERN")]
     ignore: Vec<String>,
     /// Securely open and read gitignore-style patterns from raw-byte FILE (repeatable; stacks in command-line order)
@@ -1434,8 +1434,9 @@ struct NativeCopyFields {
     as_existing: Option<OsString>,
     /// Copy the entries of a local NDJSON mapping manifest (`-` reads stdin), acquired before
     /// destination changes, instead of selecting sources; entry src paths are relative to
-    /// -C and dst paths are relative to the --into container
-    #[arg(long, value_name = "FILE")]
+    /// -C and dst paths are relative to the --into container. Filter the mapping entries
+    /// themselves instead of combining this with --ignore or --ignore-from.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["ignore", "ignore_from"])]
     mapping: Option<OsString>,
     /// Programmatic stream-mapping control socket (protocol in docs/stream-mappings.md).
     #[arg(long, hide = true, requires = "mapping", conflicts_with_all = ["src_fd", "as_fd"])]

@@ -662,6 +662,7 @@ def _copy_arguments(
     max_delete: int | None,
     integrity_checking: str | None = None,
     allow_missing_placement: bool = False,
+    mapping: bool = False,
     where: str | None = None,
     copy_if: str | None = None,
 ) -> tuple[list[Argument], int, int]:
@@ -762,6 +763,7 @@ def _copy_arguments(
         if receipt_value not in {"sizes", "hashes"}:
             raise SyqInvocationError("--receiver-receipt must be sizes or hashes")
         argv.extend(("--receiver-receipt", receipt_value))
+    ignore_start = len(argv)
     if ignore is not None:
         rules = (ignore,) if isinstance(ignore, (str, IgnoreFrom)) else tuple(ignore)
         for rule in rules:
@@ -778,6 +780,11 @@ def _copy_arguments(
                     "--ignore entries must be text or syq.IgnoreFrom"
                 )
     _append_paths(argv, "--ignore-from", ignore_from)
+    if mapping and len(argv) != ignore_start:
+        raise SyqInvocationError(
+            "--mapping cannot be combined with --ignore or --ignore-from; "
+            "filter the mapping entries instead"
+        )
     if copy_metadata is not None:
         attributes = (copy_metadata,) if isinstance(copy_metadata, str) else tuple(copy_metadata)
         for attribute in attributes:
@@ -1347,6 +1354,7 @@ class Client:
             inplace=inplace,
             max_delete=max_delete,
             allow_missing_placement=mapping is not None and not isinstance(mapping, (str, bytes, os.PathLike)),
+            mapping=mapping is not None,
         )
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header)
