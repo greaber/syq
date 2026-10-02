@@ -68,9 +68,9 @@ def pull(name, *, allow=True, success=True, extra=(), cancel=False, binary="syq"
         try:
             approve(allow)
             if cancel:
-                code = ("import json,pathlib; p=pathlib.Path(" + repr(destination) + "); "
-                        "print(json.dumps(any(f.stat().st_size > 1024*1024 "
-                        "for f in p.glob('.cancelled.syq-tmp.*'))))")
+                code = ("import hashlib,json,pathlib; p=pathlib.Path(" + repr(destination) + "); "
+                        "print(json.dumps(any(hashlib.sha256(f.open('rb').read(4*1024*1024)).hexdigest() == "
+                        + repr(prefix) + " for f in p.glob('.cancelled.syq-tmp.*'))))")
                 wait_for("partial source download", lambda: json.loads(
                     remote("source", "python3 -c " + shlex.quote(code))))
                 run("syq", "persist", "receive", "off", "--name", "laptop")
@@ -121,6 +121,8 @@ try:
     remote("destination", "dd if=/dev/urandom of=" + shlex.quote(source + "/data")
            + " bs=1M count=8 status=none && chmod 444 " + shlex.quote(source + "/data"))
     expected, keys = digest("destination", source + "/data"), source_keys()
+    prefix = remote("destination", "dd if=" + shlex.quote(source + "/data")
+                    + " bs=1M count=4 status=none | sha256sum").split()[0]
 
     print("case: source access requires separate approval despite automatic receiving", flush=True)
     pull("denied", allow=False, success=False)
@@ -151,7 +153,10 @@ try:
     remote("source", "test ! -e " + shlex.quote(destination + "/cancelled"))
     run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
-    pull("cancelled")
+    results = destination + "/resume.ndjson"
+    pull("cancelled", extra=("--results", results))
+    records = [json.loads(line) for line in remote("source", "cat " + shlex.quote(results)).splitlines()]
+    assert records[-1]["type"] == "result" and records[-1]["bytes_unchanged"] >= 4 * 1024 * 1024, records
     assert digest("source", destination + "/cancelled") == expected
     assert source_keys() == keys
 finally:

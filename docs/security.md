@@ -266,7 +266,7 @@ persistent connections, including receiving.
 
 With receiving enabled, servers you have persistent connections to can request
 copies to or commands on your machine, SSH account access on another server,
-or authorization for copies to another server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
+or authorization for copies to or from another server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
 disables these requests while keeping SSH reuse.
 
 Requests from a server are subject to local approval:
@@ -274,9 +274,9 @@ Requests from a server are subject to local approval:
 | Request | Approval on your machine |
 |---|---|
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
-| Use your SSH access for a copy to another server | Always required |
+| Authorize one copy to or from another server | Always required |
 | Run a command on your machine | Always required |
-| Open an SSH session to another server account | Always required; grants that account's authority |
+| Authorize an SSH login to another server account | Always required; grants that account's authority, optionally for a reusable connection |
 | Use your storage credentials for a transfer | Always required |
 
 The prompt shows the server account and the requested command. For copies and

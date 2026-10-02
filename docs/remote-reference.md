@@ -175,7 +175,7 @@ encrypted direct TCP, with no SSH fallback or relay through the laptop.
 `--no-tcp` and descriptor streams are unsupported on this per-copy route.
 A separately approved account connection supports SSH-only downloads.
 
-On this route, quoted `~` and `~/archive` select the destination account's home
+For per-copy uploads, quoted `~` and `~/archive` select the destination account's home
 directory. Use `./~/archive` for a literal directory called `~`. Avoid
 `~//archive`: explicit receiving authorization keeps it under the home directory,
 but automatic selection uses ordinary SSH, where it resolves to `/archive`.
