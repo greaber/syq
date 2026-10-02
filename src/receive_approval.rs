@@ -685,6 +685,7 @@ impl Queue {
             },
         }, notifications, TIMEOUT, cancelled)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_ssh(
         &self,
         from: &Requester,

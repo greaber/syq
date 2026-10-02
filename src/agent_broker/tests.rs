@@ -515,7 +515,7 @@ fn resolved_policy_exports_only_keys_above_laptop_rsa_minimum() {
         std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let policy = resolve_host_policy(ssh.to_str().unwrap(), None, "vault").unwrap();
-    assert_eq!(policy.host_keys, [large.clone()]);
+    assert_eq!(policy.host_keys.as_slice(), std::slice::from_ref(&large));
     assert_eq!(
         policy.known_hosts("syq-copy-peer").unwrap(),
         format!("syq-copy-peer {}\n", public(large))
