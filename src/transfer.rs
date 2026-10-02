@@ -1955,7 +1955,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .unwrap_or_default(),
         block,
         block_explicit: args.block_size_explicit,
-        tuning: args.tuning_options.unwrap_or_default(),
+        tuning: args.transfer_tuning(),
         benchmark: ((args.tuning_options.is_some() || debug())
             && !args.quiet
             && (args.stats || args.verbose > 0 || debug()))
@@ -3267,9 +3267,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .as_ref()
                     .map(|fs| fs.identity.as_str()),
                 tune::history::activity_mode(format!(
-                    "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}",
+                    "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}{}",
                     opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
-                    args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type
+                    args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type,
+                    args.exchange_strategy.map(|strategy| format!(";exchange-strategy={}", strategy.as_str())).unwrap_or_default()
                 ), transport_activity),
             );
             history.context(&key);

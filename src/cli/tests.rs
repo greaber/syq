@@ -1043,3 +1043,52 @@ fn block_reuse_is_a_native_filesystem_control() {
         "{error}"
     );
 }
+
+#[test]
+fn exchange_strategy_preserves_automatic_tuning_and_existing_defaults() {
+    for (strategy, reuse) in [("whole-file", false), ("fixed-block", true)] {
+        let args = parse_native_copy(&argv(&[
+            "source",
+            "--as",
+            "destination",
+            "--exchange-strategy",
+            strategy,
+        ]))
+        .unwrap();
+        assert!(args.tuning_options.is_none());
+        assert!(args.connections_default);
+        for local in [false, true] {
+            assert_eq!(
+                args.transfer_tuning().reuse_destination_blocks(local),
+                reuse
+            );
+        }
+    }
+    let args = parse_native_copy(&argv(&["source", "--as", "destination"])).unwrap();
+    assert!(args.transfer_tuning().reuse_destination_blocks(false));
+    assert!(!args.transfer_tuning().reuse_destination_blocks(true));
+}
+
+#[test]
+fn exchange_strategy_rejects_conflicting_and_nonfilesystem_controls() {
+    for legacy in ["auto", "on", "off"] {
+        let error = parse_native_copy(&argv(&[
+            "source",
+            "--as",
+            "destination",
+            "--exchange-strategy=whole-file",
+            &format!("--performance-tuning=block-reuse={legacy}"),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicts"), "{error}");
+    }
+    for extra in [
+        vec!["source", "--to", "s3://bucket", "--as", "object"],
+        vec!["--src-fd", "0", "--as", "destination"],
+    ] {
+        let mut command = extra;
+        command.push("--exchange-strategy=fixed-block");
+        let error = parse_native_copy(&argv(&command)).unwrap_err();
+        assert!(error.to_string().contains("--exchange-strategy"), "{error}");
+    }
+}

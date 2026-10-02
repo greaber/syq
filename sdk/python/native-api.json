@@ -59,7 +59,8 @@
         "resource-limits",
         "integrity-checking",
         "where",
-        "copy-if"
+        "copy-if",
+        "exchange-strategy"
       ],
       "internal": [
         "delegated-operands-b64",

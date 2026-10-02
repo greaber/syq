@@ -175,6 +175,35 @@ applies to individual selected entries.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
+## Choose an exchange strategy
+
+`--exchange-strategy` chooses how filesystem copies exchange the contents of
+files selected for copying. It is available in `syq cp` and `syq rsync`.
+
+| Strategy | Behavior |
+|---|---|
+| `whole-file` | Copy the selected file without comparing or reusing blocks from the final destination |
+| `fixed-block` | Compare fixed-offset blocks and reuse matching destination blocks; shifted blocks are not matched |
+
+By default, local copies use `whole-file`, including copies through mounted
+network filesystems. Copies with a remote syq endpoint use `fixed-block`.
+To choose explicitly:
+
+```sh
+syq cp --srcs-in source --to server --into destination \
+  --exchange-strategy whole-file
+```
+
+Both strategies keep size/time skips, explicit `--hash` comparisons, integrity
+checks, and partial-file resume. Changed files use atomic replacement unless
+`--inplace` is selected. The strategy does not fix worker counts or request
+sizes; automatic tuning remains enabled.
+
+S3 and descriptor copies do not accept this option. It conflicts with
+`--performance-tuning block-reuse=...`. See
+[comparison tuning](tuning.md#compare-block-reuse-with-full-replacement)
+for block size and controlled comparisons.
+
 ## Preview changes
 
 Add `--dry-run -v` to list planned changes without copying or deleting files.

@@ -22,6 +22,26 @@ pub enum Placement {
     As,
 }
 
+/// How a filesystem copy exchanges the contents of selected files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExchangeStrategy {
+    /// Copy selected files without comparing blocks in the final destination.
+    WholeFile,
+    /// Compare fixed-offset blocks and reuse matches from the final destination.
+    FixedBlock,
+}
+
+impl ExchangeStrategy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WholeFile => "whole-file",
+            Self::FixedBlock => "fixed-block",
+        }
+    }
+}
+
+const EXCHANGE_STRATEGY_HELP: &str = "Choose how filesystem copies exchange file contents: whole-file copies selected files without reusing blocks from the final destination; fixed-block compares fixed-offset blocks and reuses matches. By default, local copies use whole-file and copies with a remote syq endpoint use fixed-block. Size/time skips, explicit content checks, and partial-file resume apply to both. Conflicts with performance-tuning block-reuse.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
     #[default]
@@ -323,6 +343,9 @@ pub struct Args {
     pub block_size: u64,
     #[arg(skip)]
     pub block_size_explicit: bool,
+    /// Choose whole-file copying or reuse of matching fixed-offset blocks
+    #[arg(long, value_enum, value_name = "STRATEGY", long_help = EXCHANGE_STRATEGY_HELP)]
+    pub exchange_strategy: Option<ExchangeStrategy>,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -756,6 +779,17 @@ impl Args {
             );
         }
 
+        if self.exchange_strategy.is_some() {
+            anyhow::ensure!(
+                !self.tuning_options.is_some_and(|t| t.block_reuse.is_some()),
+                "--exchange-strategy conflicts with performance-tuning block-reuse"
+            );
+            anyhow::ensure!(
+                !self.rm && self.s3.is_none() && self.descriptor_copy.is_none(),
+                "--exchange-strategy requires a filesystem copy"
+            );
+        }
+
         if let Some(tuning) = self.tuning_options {
             if self.s3.is_none() && tuning.has_s3_controls() {
                 bail!("S3 performance tuning requires an S3 endpoint");
@@ -808,6 +842,17 @@ impl Args {
         self.connections_default = self.connections_opt.is_none();
         self.connections = self.connections_opt.unwrap_or(8);
         Ok(())
+    }
+
+    pub(crate) fn transfer_tuning(&self) -> crate::transfer_tuning::TransferTuning {
+        let mut tuning = self.tuning_options.unwrap_or_default();
+        if let Some(strategy) = self.exchange_strategy {
+            tuning.block_reuse = Some(match strategy {
+                ExchangeStrategy::WholeFile => crate::transfer_tuning::BlockReuse::Off,
+                ExchangeStrategy::FixedBlock => crate::transfer_tuning::BlockReuse::On,
+            });
+        }
+        tuning
     }
 
     /// Without encryption, TCP data has only TCP's 16-bit checksum. A fast
@@ -1185,6 +1230,9 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
+    /// Choose whole-file copying or reuse of matching fixed-offset blocks
+    #[arg(long, value_enum, value_name = "STRATEGY", long_help = EXCHANGE_STRATEGY_HELP)]
+    exchange_strategy: Option<ExchangeStrategy>,
     /// How to handle existing destination files; directories remain containers
     #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::Update)]
     if_exists: IfExists,
@@ -2874,6 +2922,7 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        exchange_strategy,
         where_expression,
         copy_if,
         if_exists,
@@ -2900,6 +2949,7 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
+    args.exchange_strategy = exchange_strategy;
     args.if_exists = Some(if_exists);
     args.ignore_existing = if_exists == IfExists::Keep;
     anyhow::ensure!(

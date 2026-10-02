@@ -24,7 +24,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
-| `block-reuse` | `auto` | `auto`, `on` or `off`; filesystem copies only |
+| `block-reuse` | `auto` | Legacy strategy override: `auto`, `on` or `off`; prefer `--exchange-strategy` |
 | `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
@@ -177,19 +177,15 @@ and whole-file shortcuts, including local kernel copying and APFS cloning.
 
 ### Compare block reuse with full replacement
 
-`block-reuse=auto` enables block comparison and reuse for copies with a
-remote syq endpoint. Same-machine copies default to full replacement
-of files selected for copying, including copies to or from a mounted NFS share.
-Without a helper beside that storage, comparison requires reading the old
-contents through the mount; those reads can cost more than the writes saved.
-
-Use `on` to compare and reuse existing destination blocks regardless of placement. It bypasses whole-file copy shortcuts for files that
-need comparison. Use `off` to disable comparison and reuse of the final
-destination. These controls apply to filesystem copies on Linux and macOS; S3 and descriptor copies do not accept them.
+Choose `--exchange-strategy=fixed-block` or `whole-file` to compare block reuse
+with full replacement. See [exchange strategies](reference.md#choose-an-exchange-strategy)
+for defaults and interactions. The older `block-reuse=on` and `off` tuning
+values select the same behavior; `auto` keeps the placement-based default.
+Do not combine that tuning key with `--exchange-strategy`.
 
 ```sh
 syq cp --srcs-in source --into destination \
-  --performance-tuning block-reuse=on
+  --exchange-strategy fixed-block
 ```
 
 Size/time quick checks still skip completed files. Explicit `--hash` (or rsync
@@ -215,7 +211,8 @@ count increases this memory cost.
 
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare
-`copy-path=ranges,block-reuse=on` with `copy-path=ranges,block-reuse=off`.
+`--performance-tuning=copy-path=ranges --exchange-strategy=fixed-block`
+with `--performance-tuning=copy-path=ranges --exchange-strategy=whole-file`.
 Restore the same initial destination before each run and keep worker counts,
 request sizes and cache preparation identical. Leave `--inplace` unchanged too:
 normal staging must populate a new file, whereas in-place updates can leave

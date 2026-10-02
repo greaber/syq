@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn exchange_strategies_select_payloads_for_local_and_remote_replacements() {
+    for remote in [false, true] {
+        for (strategy, transferred, unchanged) in [
+            ("whole-file", 12 << 20, 0),
+            ("fixed-block", 4 << 20, 8 << 20),
+        ] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            t.expose_remote_syq();
+            let data = prng(12 << 20, 482);
+            write(&t.path("source"), &data);
+            set_mtime(&t.path("source"), 1_700_000_001);
+            for hash in [false, true] {
+                let mut previous = data.clone();
+                *previous.last_mut().unwrap() ^= 1;
+                write(&t.path("destination"), &previous);
+                set_mtime(&t.path("destination"), 1_700_000_000);
+                for repeat in [false, true] {
+                    let result = t.path(&format!("result-{hash}-{repeat}.ndjson"));
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                    command.args(["cp", "--no-progress", "--exchange-strategy", strategy]);
+                    command.arg(t.path("source"));
+                    if remote {
+                        command.args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"]);
+                        command.arg(&rsh);
+                    }
+                    command.arg("--as").arg(t.path("destination"));
+                    if hash {
+                        command.arg("--hash");
+                    }
+                    let output = command
+                        .arg("--results")
+                        .arg(&result)
+                        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                        .env("XDG_CACHE_HOME", t.path("cache"))
+                        .run()
+                        .unwrap();
+                    assert_output_ok(&output);
+                    assert_eq!(read(&t.path("destination")), data);
+                    let records = fs::read_to_string(&result).unwrap();
+                    let summary: serde_json::Value =
+                        serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                    assert_eq!(
+                        summary["bytes_transferred"],
+                        if repeat { 0 } else { transferred },
+                        "{remote} {strategy} {hash}: {summary}"
+                    );
+                    assert_eq!(
+                        summary["bytes_unchanged"],
+                        if repeat { 12 << 20 } else { unchanged },
+                        "{remote} {strategy} {hash}: {summary}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn source_fd_budget_handles_deep_tree_with_96_slots() {
     let t = Tmp::new();
     let mut deepest = t.path("source");

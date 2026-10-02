@@ -225,6 +225,7 @@ impl Options {
         }
         for id in [
             "inplace",
+            "exchange_strategy",
             "via",
             "coordinate_at",
             "rsh",
