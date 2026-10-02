@@ -1066,3 +1066,54 @@ fn block_reuse_is_a_native_filesystem_control() {
         "{error}"
     );
 }
+
+#[test]
+fn account_auth_selection_is_explicit_for_each_ssh_operation() {
+    for words in [
+        vec!["map", "--from", "server", "file", "--auth-from", "@laptop"],
+        vec!["rm", "--on", "server", "file", "--auth-from", "@laptop"],
+        vec![
+            "clean-partials",
+            "--on",
+            "server",
+            "tree",
+            "--auth-from",
+            "@laptop",
+        ],
+        vec![
+            "rsync",
+            "server:file",
+            "local",
+            "--syq-auth-from",
+            "@laptop",
+        ],
+    ] {
+        let args = crate::approval_command::parse(
+            &words
+                .iter()
+                .map(|word| word.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(args.auth_from_explicit, "{words:?}");
+        assert_eq!(args.auth_from, super::AuthFrom::Return("laptop".into()));
+    }
+    for words in [
+        vec!["map", "file"],
+        vec!["rm", "file"],
+        vec!["clean-partials", "tree"],
+    ] {
+        let mut words = words;
+        words.extend(["--auth-from", "@laptop"]);
+        assert!(
+            crate::approval_command::parse(
+                &words
+                    .iter()
+                    .map(|word| word.as_bytes().to_vec())
+                    .collect::<Vec<_>>()
+            )
+            .is_err(),
+            "{words:?}"
+        );
+    }
+}

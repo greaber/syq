@@ -1,7 +1,7 @@
 //! Copies may reuse a separately approved account login. A copy never creates
 //! this broader authority; without a live master it follows per-copy approval.
-use crate::cli::{Args, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
-use anyhow::Result;
+use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
+use anyhow::{bail, Result};
 
 pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
     if args.interface != Interface::NativeCp
@@ -57,6 +57,51 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
     Ok(true)
 }
 
+/// Non-copy operations may use full account access that was approved separately.
+/// Per-copy authorization remains selected once, before the transfer starts.
+pub(crate) fn operation(
+    location: &Location,
+    args: &Args,
+) -> Result<Option<crate::conn::RemoteSpec>> {
+    let Some(host) = &location.host else {
+        return Ok(None);
+    };
+    if args.s3.is_some()
+        || args.delegated
+        || args.restricted_grant.is_some()
+        || args.return_source.is_some()
+        || args.named_receipt.is_some()
+        || (args.interface == Interface::NativeCp && args.coordinate_at != CoordinateAt::Local)
+    {
+        return Ok(None);
+    }
+    if host.starts_with('@') {
+        bail!("named receiving machines support syq cp and syq ssh; use an SSH endpoint for this operation");
+    }
+    if args.rsh.is_some() || args.pscope_explicit {
+        if args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_)) {
+            bail!("--auth-from @NAME cannot be combined with --rsh or --pscope");
+        }
+        return Ok(None);
+    }
+    let mode = crate::auth_from::resolve(
+        host,
+        args.auth_from_explicit.then(|| args.auth_from.clone()),
+    )?;
+    let requested = NativeEndpoint {
+        user: location.user.clone(),
+        host: host.clone(),
+        port: location.port,
+    };
+    if let Some(cached) = super::ssh::persistent::select_cached(&requested, &mode)? {
+        return connection(args, location, cached.endpoint(), cached.options()).map(Some);
+    }
+    if let AuthFrom::Return(name) = mode {
+        bail!("no approved SSH account connection for this endpoint through @{name}; first run `syq persist connect ENDPOINT --auth-from @{name}` with the same user, host and port, and approve account access on the laptop");
+    }
+    Ok(None)
+}
+
 fn connection(
     args: &Args,
     location: &Location,
@@ -76,6 +121,7 @@ fn connection(
             .collect::<Result<Vec<_>>>()?,
     );
     transport.rsh = Some(shell_words::join(words));
+    transport.auth_from_explicit = false;
     let mut location = location.clone();
     location.user = endpoint.user.clone();
     location.host = Some(endpoint.host.clone());

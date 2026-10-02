@@ -780,6 +780,13 @@ fn select_copy(
     args: &mut crate::cli::Args,
     progress: Option<&crate::progress::Progress>,
 ) -> Result<Option<handoff::Selection>> {
+    // These operations use only an independently approved account connection.
+    // They do not turn a copy request into broader account approval.
+    if args.interface != crate::cli::Interface::NativeCp
+        || args.coordinate_at == crate::cli::CoordinateAt::Local
+    {
+        return Ok(None);
+    }
     // A helper handoff carries the already selected, identity-checked receiver.
     // Re-reading mutable defaults here could redirect the original request.
     if let Some(name) = handoff::selected_name(handoff::Kind::Forward)

@@ -141,7 +141,8 @@ pub struct Args {
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
-    #[arg(skip)]
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, default_value = "auto")]
     pub(crate) auth_from: AuthFrom,
     #[arg(skip)]
     pub(crate) auth_from_explicit: bool,
@@ -902,6 +903,8 @@ impl Args {
 }
 
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
+    args.auth_from_explicit =
+        matches.value_source("auth_from") == Some(clap::parser::ValueSource::CommandLine);
     args.apply_advanced()?;
     args.block_size_explicit =
         matches.value_source("block_size") == Some(clap::parser::ValueSource::CommandLine);
@@ -1565,6 +1568,9 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
     override_usage = "syq map [OPTIONS] PATH...\n       syq map [OPTIONS] --srcs-in DIR"
 )]
 struct NativeMapCommand {
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
     /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
@@ -1598,8 +1604,8 @@ struct NativeMapCommand {
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
-    /// Request storage authorization from a connected receiving machine
-    #[arg(long, value_name = "@NAME", value_parser = parse_auth_from)]
+    /// Use approved SSH account access, or request S3 authorization from a receiving machine
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     #[command(flatten)]
     s3: crate::s3::Flags,
@@ -1627,6 +1633,9 @@ struct NativeRmCommand {
     before_help = "Examples:\n  syq clean-partials --dry-run backup\n  syq clean-partials --on nas /backup"
 )]
 struct CleanPartialsCommand {
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
     /// Directory trees to search
     #[arg(value_name = "TREE", required = true)]
     trees: Vec<OsString>,
@@ -1656,6 +1665,9 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         .unwrap_or_else(|error| error.exit());
     let parsed = CleanPartialsCommand::from_arg_matches(&matches)?;
     let endpoint = parse_native_endpoint(parsed.on.as_deref())?;
+    if endpoint.is_none() && parsed.auth_from.is_some() {
+        bail!("--auth-from requires an SSH removal endpoint");
+    }
     if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
         bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
     }
@@ -1669,6 +1681,8 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         parsed.results_output,
     )?;
     args.clean_partials = true;
+    args.auth_from_explicit = parsed.auth_from.is_some();
+    args.auth_from = parsed.auth_from.unwrap_or_default();
     args.locations = parsed
         .trees
         .into_iter()
@@ -2495,6 +2509,9 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     } else {
         parse_native_endpoint(parsed.from.as_deref())?
     };
+    if endpoint.is_none() && parsed.auth_from.is_some() {
+        bail!("--auth-from requires an SSH source for map");
+    }
     if endpoint.is_none()
         && (parsed.rsh.is_some() || parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap)
     {
@@ -2559,6 +2576,8 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
 
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeMap;
+    args.auth_from_explicit = parsed.auth_from.is_some();
+    args.auth_from = parsed.auth_from.unwrap_or_default();
     args.placement = placement;
     args.locations = locations;
     args.native_map_cwd = map_cwd;
@@ -2633,9 +2652,6 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .as_deref()
         .filter(|s| s.starts_with("s3://"));
     let s3 = crate::s3::Options::parse(parsed.s3, s3_endpoint, None, &matches)?;
-    if parsed.auth_from.is_some() && s3.is_none() {
-        bail!("--auth-from for rm requires --on s3://BUCKET");
-    }
     if s3.is_some() && parsed.selection.follow_src {
         bail!("--follow-src is not supported for S3 removal; object keys have no parent symlinks");
     }
@@ -2655,6 +2671,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     } else {
         parse_native_endpoint(parsed.selection.from.as_deref())?
     };
+    if endpoint.is_none() && s3.is_none() && parsed.auth_from.is_some() {
+        bail!("--auth-from requires an SSH or S3 removal endpoint");
+    }
     if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
         bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
     }

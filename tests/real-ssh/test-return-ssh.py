@@ -200,6 +200,8 @@ def persistent_cases(expected):
     assert direct.encode() == expected, direct
     for _ in range(3):
         assert source_run(["ssh", "--auth-from", "@laptop", "destination", "--", "hostname"]).encode() == expected
+    # A warm account login is usable without a saved preference.
+    assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
     # A preference selects the same existing authority without changing the
     # approval command or consulting preferences on the laptop.
     source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
@@ -211,6 +213,15 @@ def persistent_cases(expected):
         source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/data", "--no-tcp"])
         source_run(["cp", "--from", "destination", copy_root + "/data", "--as", root + "/roundtrip", "--no-tcp"])
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/roundtrip"))
+        mapping = source_run(["map", "--from", "destination", "-C", copy_root, "data"])
+        assert len(mapping.splitlines()) == 1, mapping
+        source_run(["rsync", "-a", "--no-tcp", root + "/data", "destination:" + copy_root + "/rsync-data"])
+        source_run(["rsync", "-a", "--no-tcp", "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"])
+        run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/rsync-roundtrip"))
+        source_run(["clean-partials", "--on", "destination", copy_root, "--auth-from", "@laptop"])
+        run("ssh", "destination", "test -f " + shlex.quote(copy_root + "/data"))
+        source_run(["rm", "--on", "destination", copy_root + "/rsync-data", "--auth-from", "@laptop"])
+        run("ssh", "destination", "test ! -e " + shlex.quote(copy_root + "/rsync-data"))
     finally:
         run("ssh", "destination", "rm -rf -- " + shlex.quote(copy_root))
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
@@ -221,6 +232,14 @@ def persistent_cases(expected):
     source_run(["persist", "off"])
     run("ssh", "source", "test ! -S " + shlex.quote(control))
     assert json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"] == []
+    # Operations never broaden a missing copy permission into account access.
+    for words in [
+        ["rm", "--on", "destination", root + "/absent", "--auth-from", "@laptop"],
+        ["map", "--from", "destination", "absent", "--auth-from", "@laptop"],
+        ["rsync", "--syq-auth-from", "@laptop", "destination:/absent", root + "/absent"],
+    ]:
+        source_run(words, success=False)
+    assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
     run("ssh", "source", shlex.join(["env", native_path, "ssh", "-F", "/dev/null", "-S", control,
                  "-o", "ProxyCommand=false", "-o", "BatchMode=yes", "destination", "hostname"]), success=False)
     # Losing the laptop profile also closes the reusable master, including an

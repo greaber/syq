@@ -340,6 +340,9 @@ fn print_benchmark_observations(opts: &Opts) {
 }
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
+    if let Some(spec) = crate::destination::account_copy::operation(loc, args)? {
+        return Ok(Endpoint::Remote(spec));
+    }
     Ok(match &loc.host {
         None => Endpoint::local(),
         Some(h) => {
