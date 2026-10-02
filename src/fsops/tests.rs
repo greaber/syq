@@ -6316,7 +6316,7 @@ fn late_close_is_reported_after_identity_conditioned_writeback() {
             .unwrap_err()
         };
         assert!(
-            error.to_string().contains("close destination writer"),
+            error.to_string().contains("check destination writes"),
             "{error:#}"
         );
         assert_eq!(
@@ -6381,7 +6381,7 @@ fn native_copy_reports_original_writer_close_error() {
         )
         .unwrap_err();
     assert!(
-        error.to_string().contains("close destination writer"),
+        error.to_string().contains("check destination writes"),
         "{error:#}"
     );
     assert_eq!(

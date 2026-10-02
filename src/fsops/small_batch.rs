@@ -263,7 +263,7 @@ impl FsOps {
         }
         observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
             .with_context(|| format!("write {}", stage.label.display()))?;
-        check_writer_close(&stage.file, &stage.label)?;
+        check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
         #[cfg(debug_assertions)]

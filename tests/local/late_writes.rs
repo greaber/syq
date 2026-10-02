@@ -70,7 +70,7 @@ fn late_close_preserves_staged_copy(route: &str) {
             assert!(!output.status.success(), "{context}: {output:?}");
             let error = stderr_of(&output);
             assert!(
-                error.contains("close destination writer"),
+                error.contains("check destination writes"),
                 "{context}: {error}"
             );
             assert!(error.contains("late-error"), "{context}: {error}");
@@ -139,7 +139,7 @@ fn late_close_does_not_report_inplace_writes_as_success() {
                 .unwrap();
             assert!(!output.status.success(), "size={size}: {output:?}");
             let error = stderr_of(&output);
-            assert!(error.contains("close destination writer"), "{error}");
+            assert!(error.contains("check destination writes"), "{error}");
             let after = fs::metadata(t.path("dst/late-error")).unwrap();
             assert_eq!(after.ino(), before.ino());
             assert_ne!(
@@ -147,6 +147,70 @@ fn late_close_does_not_report_inplace_writes_as_success() {
                 1_600_000_000,
                 "failed write must not claim source mtime"
             );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_flushes_only_network_destinations_before_publication() {
+    let t = Tmp::new();
+    let library = t.path("write-errors.dylib");
+    let compiled = Command::new("cc")
+        .args(["-Wall", "-Werror", "-dynamiclib"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/macos-write-errors.c"
+        ))
+        .arg("-o")
+        .arg(&library)
+        .run()
+        .unwrap();
+    assert_output_ok(&compiled);
+    fs::create_dir_all(t.path("dst")).unwrap();
+    for kind in ["apfs", "nfs", "smbfs"] {
+        for size in [1024, 1 << 20] {
+            write(&t.path("src/late-error"), &vec![b'x'; size]);
+            set_mtime(&t.path("src/late-error"), 1_600_000_000);
+            write(&t.path("dst/late-error"), b"previous good copy");
+            set_mtime(&t.path("dst/late-error"), 1_500_000_000);
+            let before = fs::metadata(t.path("dst/late-error")).unwrap();
+            let mut command = copy_command(&t, "local", "workers=1,copy-path=ranges");
+            let output = command
+                .args(["--as", &t.s("dst/late-error")])
+                .env("DYLD_INSERT_LIBRARIES", &library)
+                .env("SYQ_TEST_FLUSH_DESTINATION", t.path("dst"))
+                .env("SYQ_TEST_FLUSH_FILESYSTEM", kind)
+                .env("SYQ_TEST_FLUSH_PROBES", t.path("probes"))
+                .run()
+                .unwrap();
+            let context = format!("{kind}, size={size}: {output:?}");
+            // An unloaded interposer must not make the local case pass silently.
+            assert!(fs::read_to_string(t.path("probes"))
+                .unwrap()
+                .contains("probe"));
+            fs::remove_file(t.path("probes")).unwrap();
+            if kind == "apfs" {
+                assert_output_ok(&output);
+                assert_eq!(read(&t.path("dst/late-error")), vec![b'x'; size]);
+            } else {
+                assert!(!output.status.success(), "{context}");
+                assert!(
+                    stderr_of(&output).contains("check destination writes"),
+                    "{context}"
+                );
+                let after = fs::metadata(t.path("dst/late-error")).unwrap();
+                assert_eq!(
+                    read(&t.path("dst/late-error")),
+                    b"previous good copy",
+                    "{context}"
+                );
+                assert_eq!(
+                    (after.ino(), after.mtime()),
+                    (before.ino(), before.mtime()),
+                    "{context}"
+                );
+            }
         }
     }
 }

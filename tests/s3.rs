@@ -2357,7 +2357,7 @@ fn s3_late_close_preserves_download_destination() {
                 .unwrap();
             assert!(!output.status.success(), "{}", output_text(&output));
             assert!(
-                output_text(&output).contains("close destination writer"),
+                output_text(&output).contains("check destination writes"),
                 "{}",
                 output_text(&output)
             );
