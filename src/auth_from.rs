@@ -140,17 +140,19 @@ pub(crate) fn resolve(host: &str, explicit: Option<AuthFrom>) -> Result<AuthFrom
 }
 
 pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
-    if args.auth_from_explicit
-        || args.s3.is_some()
-        || crate::destination::forward_target(args).is_err()
-    {
+    if args.auth_from_explicit || args.s3.is_some() {
         return Ok(());
     }
-    let host = args
-        .locations
-        .last()
+    let location = if crate::destination::forward_target(args).is_ok() {
+        args.locations.last()
+    } else if crate::destination::pull::eligible_target(args).is_ok() {
+        args.locations.first()
+    } else {
+        return Ok(());
+    };
+    let host = location
         .and_then(|location| location.host.as_deref())
-        .context("authorization destination missing")?;
+        .context("authorization endpoint missing")?;
     args.auth_from = resolve(host, None)?;
     Ok(())
 }

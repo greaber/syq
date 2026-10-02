@@ -13,6 +13,7 @@ fn policy(path: &Path) -> SourcePolicy {
             path: path.as_os_str().as_bytes().to_vec(),
             follow_root: false,
         }],
+        selection_types: vec![crate::cli::SourceSelection::Named],
         symlink_policy: OperatorSymlinkPolicy::Refuse,
         hashing: Default::default(),
         preservation: Default::default(),
@@ -538,4 +539,25 @@ fn checked_whole_file_hash_stops_between_chunks() {
         });
     assert!(result.is_err());
     assert_eq!(largest, 1 << 20);
+}
+
+#[test]
+fn typed_source_selections_cannot_gain_a_different_read_scope() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let file = directory.path().join("file");
+    fs::write(&file, b"payload").unwrap();
+    for (path, kind) in [
+        (directory.path(), crate::cli::SourceSelection::File),
+        (file.as_path(), crate::cli::SourceSelection::Directory),
+        (file.as_path(), crate::cli::SourceSelection::Contents),
+    ] {
+        let mut policy = policy(path);
+        policy.selection_types = vec![kind];
+        let request = registration(&policy);
+        let authority = SourceAuthority::new(policy).unwrap();
+        let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
+        assert!(control.register(&mut FsOps::new(), &request).is_err());
+        assert!(authority.state.lock().unwrap().roots.is_empty());
+    }
+    assert_eq!(fs::read(file).unwrap(), b"payload");
 }

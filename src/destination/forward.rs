@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::AtomicUsize;
 
 const HELPER_VERSION: u16 = 1;
-const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,7 +17,7 @@ struct HelperRequest {
     request: CopyRequest,
 }
 
-fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
+pub(super) fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
     if target.len() > 512 {
         bail!("destination SSH endpoint is too long");
     }
@@ -195,7 +195,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     Ok(())
 }
 
-struct Slot<'a>(&'a AtomicUsize);
+pub(super) struct Slot<'a>(pub(super) &'a AtomicUsize);
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
@@ -275,16 +275,20 @@ impl Receiver {
         // This lock only serializes decisions, not SSH setup or active copies.
         drop(request_lock);
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-        let (mut child, mut approved) = ForwardChild::connect(
+        let (mut child, reply) = ForwardChild::connect(
             &encoded,
             &HelperRequest {
                 version: HELPER_VERSION,
                 identity: crate::identity::build().into(),
                 request,
             },
+            "--return-receiver",
             Instant::now() + SETUP_TIMEOUT,
             &setup_cancelled,
         )?;
+        let Reply::Approved(mut approved) = reply else {
+            bail!("invalid destination setup response");
+        };
         let session =
             ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
         approved.token = session.token();
@@ -302,19 +306,20 @@ impl Receiver {
 
 /// Kill before reaping, including bootstrap/ProxyCommand descendants. Capture
 /// is bounded while the complete pipe is drained; diagnostics never block SSH.
-struct ForwardChild {
-    child: Child,
+pub(super) struct ForwardChild {
+    pub(super) child: Child,
     errors: Arc<Mutex<Vec<u8>>>,
     capture: Option<std::thread::JoinHandle<()>>,
     closed: bool,
 }
 impl ForwardChild {
-    fn connect(
+    pub(super) fn connect<T: Serialize>(
         target: &str,
-        request: &HelperRequest,
+        request: &T,
+        operation: &str,
         deadline: Instant,
         cancelled: &impl Fn() -> bool,
-    ) -> Result<(Self, Approved)> {
+    ) -> Result<(Self, Reply)> {
         for install in [false, true] {
             let mut command = Command::new(std::env::current_exe()?);
             command.args([
@@ -324,6 +329,7 @@ impl ForwardChild {
                     "--return-connect"
                 },
                 target,
+                operation,
             ]);
             let mut child = Self::spawn_command(command)?;
             let reply = (|| {
@@ -342,7 +348,9 @@ impl ForwardChild {
                 })
             })();
             match reply {
-                Ok(Reply::Approved(approved)) => return Ok((child, approved)),
+                Ok(reply @ (Reply::Approved(_) | Reply::SourceApproved)) => {
+                    return Ok((child, reply))
+                }
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
                 Ok(
                     Reply::Ready
@@ -465,7 +473,7 @@ impl ForwardChild {
         }
         status
     }
-    fn errors(&self) -> String {
+    pub(super) fn errors(&self) -> String {
         format!(
             "{:?}",
             String::from_utf8_lossy(&self.errors.lock().unwrap())
@@ -496,7 +504,7 @@ fn pump(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64>
     }
 }
 
-fn relay(
+pub(super) fn relay(
     mut socket: UnixStream,
     mut input: std::process::ChildStdin,
     mut output: std::process::ChildStdout,
@@ -530,10 +538,10 @@ fn relay(
     result
 }
 
-struct DeadlineIo<'a, T> {
-    inner: &'a mut T,
-    deadline: Instant,
-    cancelled: Option<&'a dyn Fn() -> bool>,
+pub(super) struct DeadlineIo<'a, T> {
+    pub(super) inner: &'a mut T,
+    pub(super) deadline: Instant,
+    pub(super) cancelled: Option<&'a dyn Fn() -> bool>,
 }
 impl<T: Read + AsRawFd> Read for DeadlineIo<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -561,7 +569,7 @@ impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     }
 }
 
-struct HandshakeInput<R> {
+pub(super) struct HandshakeInput<R> {
     inner: R,
     pending: Arc<AtomicBool>,
     deadline: Instant,
@@ -569,7 +577,7 @@ struct HandshakeInput<R> {
     started: bool,
 }
 impl<R> HandshakeInput<R> {
-    fn new(
+    pub(super) fn new(
         inner: R,
         pending: Arc<AtomicBool>,
         start_timeout: Duration,
@@ -730,18 +738,26 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 .context("invalid return target")
                 .and_then(|target| connect(target, false, "--return-ssh-setup")),
         ),
-        "--return-connect" | "--return-connect-install" if argv.len() == 3 => Some(
-            argv[2]
-                .to_str()
-                .context("invalid return target")
-                .and_then(|target| {
-                    connect(
-                        target,
-                        argv[1] == "--return-connect-install",
-                        "--return-receiver",
-                    )
-                }),
-        ),
+        "--return-source-probe" if argv.len() == 2 => Some(Ok(0)),
+        "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
+        "--return-connect" | "--return-connect-install" if argv.len() == 3 || argv.len() == 4 => {
+            Some(
+                argv[2]
+                    .to_str()
+                    .context("invalid return target")
+                    .and_then(|target| {
+                        connect(
+                            target,
+                            argv[1] == "--return-connect-install",
+                            match argv.get(3).and_then(|arg| arg.to_str()) {
+                                None | Some("--return-receiver") => "--return-receiver",
+                                Some("--return-source") => "--return-source",
+                                _ => bail!("invalid return helper operation"),
+                            },
+                        )
+                    }),
+            )
+        }
         _ => None,
     }
 }

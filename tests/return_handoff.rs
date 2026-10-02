@@ -290,3 +290,65 @@ fn ignore_input_errors_keep_the_argument_error_lane_and_do_not_open_results() {
     );
     assert!(!fixture.temp.path().join("destination").exists());
 }
+
+#[test]
+fn source_handoff_probes_older_helper_before_sending_the_new_guard() {
+    let fixture = Fixture::new();
+    let helper = fixture.script(
+        r#"
+import pathlib, sys
+assert sys.argv[1:] == ['--return-source-probe'], sys.argv
+pathlib.Path('probed').write_text('yes')
+sys.exit(2)
+"#,
+    );
+    fixture.registration(&helper, "released-old-build");
+    let output = fixture.run(&[
+        "cp",
+        "--from",
+        "backup",
+        "--src",
+        "selected",
+        "--as",
+        "output",
+        "--auth-from",
+        "@laptop",
+    ]);
+    assert_failure(&output, "does not support source authorization");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("update syq"));
+    assert_eq!(
+        fs::read_to_string(fixture.temp.path().join("probed")).unwrap(),
+        "yes"
+    );
+    assert!(!fixture.temp.path().join("output").exists());
+}
+
+#[test]
+fn source_handoff_keeps_the_selected_route_for_a_capable_helper() {
+    let fixture = Fixture::new();
+    let helper = fixture.script(
+        r#"
+import json, sys
+if sys.argv[1:] == ['--return-source-probe']:
+    sys.exit(0)
+assert sys.argv[1] == '--return-handoff-v1', sys.argv
+guard = json.loads(sys.argv[2])
+assert guard['kind'] == 'Pull' and guard['name'] == 'laptop', guard
+assert sys.argv[3:6] == ['cp', '--from', 'backup'], sys.argv
+sys.exit(23)
+"#,
+    );
+    fixture.registration(&helper, "another-build");
+    let output = fixture.run(&[
+        "cp",
+        "--from",
+        "backup",
+        "--src",
+        "selected",
+        "--as",
+        "output",
+        "--auth-from",
+        "@laptop",
+    ]);
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+}

@@ -10,7 +10,9 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 
 mod interfaces;
@@ -342,6 +344,7 @@ pub(crate) fn run_authorized_source<R: Read + Send + 'static, W: Write>(
 /// A private-broker source worker. Its outer SSH/Unix-channel authentication
 /// must be complete before entry. Only source worker Hello roles are allowed;
 /// the live authority validates the exact descriptors installed by control.
+#[cfg(test)]
 pub(crate) fn run_authorized_source_worker(
     input: crate::private_broker::TrackedStream,
     output: std::os::unix::net::UnixStream,
@@ -748,9 +751,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 w.write_msg(&response)?;
                 continue;
             }
-            if let Err(error) = source.authorize(&req) {
-                w.write_msg(&Response::Err(format!("{error:#}")))?;
-                continue;
+            // Whole-file hashing authorizes and checks each chunk in its
+            // dedicated executor below, including standalone callers.
+            if !matches!(req, Request::FileHash { .. }) {
+                if let Err(error) = source.authorize(&req) {
+                    w.write_msg(&Response::Err(format!("{error:#}")))?;
+                    continue;
+                }
             }
         }
         // A fence performs no filesystem operation and grants no authority.

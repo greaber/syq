@@ -30,6 +30,7 @@ use std::time::Instant;
 pub(crate) struct SourcePolicy {
     pub base: SourceRootBase,
     pub selections: Vec<SourceRootSelection>,
+    pub selection_types: Vec<crate::cli::SourceSelection>,
     pub symlink_policy: OperatorSymlinkPolicy,
     pub hashing: crate::hashing::HashPolicy,
     pub preservation: crate::inode_metadata::Selection,
@@ -76,6 +77,10 @@ impl SourceAuthority {
         ensure!(
             !policy.selections.is_empty(),
             "source approval has no selections"
+        );
+        ensure!(
+            policy.selection_types.len() == policy.selections.len(),
+            "source selection types differ in length"
         );
         ensure!(
             policy.limits.max_connections > 0,
@@ -333,12 +338,26 @@ impl SourceConnection {
         );
         let response = ops.handle_in_place(&mut request.clone());
         if let Response::SourceRootsRegistered(roots) = &response {
-            for root in roots {
+            for (root, kind) in roots.iter().zip(&policy.selection_types) {
                 root.validate()?;
+                match kind {
+                    crate::cli::SourceSelection::File => ensure!(
+                        root.expected_leaf.is_some(),
+                        "approved exact source is a directory"
+                    ),
+                    crate::cli::SourceSelection::Directory
+                    | crate::cli::SourceSelection::Contents => ensure!(
+                        root.expected_leaf.is_none(),
+                        "approved source directory is a non-directory entry"
+                    ),
+                    _ => {}
+                }
                 ensure!(
                     !root.allow_unconfined_paths,
                     "unconfined source registration refused"
                 );
+            }
+            for root in roots {
                 state.roots.insert(root.selection.root(), root.clone());
             }
         }

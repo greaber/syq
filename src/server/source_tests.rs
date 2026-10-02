@@ -66,6 +66,7 @@ fn source_policy(path: &Path) -> SourcePolicy {
             path: path.as_os_str().as_bytes().to_vec(),
             follow_root: false,
         }],
+        selection_types: vec![crate::cli::SourceSelection::Named],
         symlink_policy: OperatorSymlinkPolicy::Refuse,
         hashing: crate::hashing::HashPolicy {
             algorithm: crate::hashing::HashAlgorithm::Sha256,

@@ -32,6 +32,7 @@ pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
 mod identity;
+pub(crate) mod pull;
 pub(crate) mod ssh;
 pub(crate) mod ssh_auth;
 pub(crate) mod storage;
@@ -128,6 +129,10 @@ impl ReturnConnection {
         })
     }
 
+    pub(crate) fn has_ssh(&self) -> bool {
+        self.ssh.is_some()
+    }
+
     pub(crate) fn ssh_command(&self) -> Result<Command> {
         self.ssh
             .as_ref()
@@ -179,6 +184,12 @@ enum Message {
         cwd: String,
         request: Box<CopyRequest>,
     },
+    Pull {
+        target: String,
+        command: Vec<Vec<u8>>,
+        cwd: String,
+        request: Box<pull::PullRequest>,
+    },
     ForwardSsh {
         token: String,
         public_key: String,
@@ -197,6 +208,7 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    SourceApproved,
     ForwardSsh(forward::ssh::Peer),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
@@ -739,10 +751,21 @@ fn select_copy(
 ) -> Result<Option<handoff::Selection>> {
     // A helper handoff carries the already selected, identity-checked receiver.
     // Re-reading mutable defaults here could redirect the original request.
-    if let Some(name) = handoff::selected_name(handoff::Kind::Forward) {
+    if let Some(name) = handoff::selected_name(handoff::Kind::Forward)
+        .or_else(|| handoff::selected_name(handoff::Kind::Pull))
+    {
         args.auth_from = crate::cli::AuthFrom::Return(name.to_owned());
     } else {
         crate::auth_from::apply_copy(args)?;
+    }
+    let is_pull = args
+        .locations
+        .split_last()
+        .is_some_and(|(destination, sources)| {
+            !destination.is_remote() && sources.iter().any(|source| source.is_remote())
+        });
+    if is_pull {
+        return pull::select(args, progress);
     }
     match &args.auth_from {
         crate::cli::AuthFrom::Return(_) => return forward::select(args, progress),
@@ -823,6 +846,9 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         return Ok(());
     };
     handoff::check_selection(&selection)?;
+    if selection.kind == handoff::Kind::Pull {
+        return pull::prepare(args, selection);
+    }
     if selection.kind == handoff::Kind::Forward {
         return forward::prepare(args, selection);
     }
@@ -1074,6 +1100,12 @@ impl Receiver {
                 let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
                 write_message(&mut stream, &Reply::Identity(proof))
             }
+            Message::Pull {
+                target,
+                command,
+                cwd,
+                request,
+            } => self.pull(target, command, cwd, *request, stream),
             Message::ForwardSsh { token, public_key } => {
                 self.forward_ssh(token, public_key, stream)
             }

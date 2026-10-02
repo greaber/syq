@@ -52,6 +52,7 @@ pub(crate) enum Kind {
     Command,
     Ssh,
     Storage,
+    Source,
 }
 impl Kind {
     pub(crate) fn is_copy(&self) -> bool {
@@ -110,6 +111,14 @@ pub(crate) struct Summary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Details {
+    Source {
+        kind: SourceKind,
+        source: String,
+        scopes: Vec<String>,
+        permission: String,
+        max_bytes: u64,
+        max_entries: u64,
+    },
     Ssh {
         kind: SshKind,
         reusable: bool,
@@ -149,6 +158,11 @@ pub(crate) enum SshKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StorageKind {
     Storage,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceKind {
+    Source,
 }
 impl Summary {
     fn new(
@@ -264,6 +278,7 @@ impl Summary {
     }
     pub(crate) fn kind(&self) -> Kind {
         match self.details {
+            Details::Source { .. } => Kind::Source,
             Details::Copy { .. } => Kind::Copy,
             Details::Command { .. } => Kind::Command,
             Details::Ssh { .. } => Kind::Ssh,
@@ -345,6 +360,7 @@ impl Summary {
             )
         };
         let body = match &self.details {
+            Details::Source { source, scopes, permission, max_bytes, max_entries, .. } => format!("{source}\n{}\n{permission}\nAt most {max_bytes} bytes and {max_entries} entries", scopes.join("\n")),
             Details::Storage { description, .. } => description.clone(),
             Details::Ssh { destination, permission, .. } => format!("{destination}\n{permission}"),
             Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
@@ -357,6 +373,7 @@ impl Summary {
     /// `server_input` styles arguments naming files that the server reads.
     pub(crate) fn description(&self, server_input: impl Fn(&str) -> String) -> String {
         let question = match self.kind() {
+            Kind::Source => "Allow these source reads once?",
             Kind::Copy => "Allow this copy once?",
             Kind::Command => "Run this command once?",
             Kind::Ssh => "Allow access to this SSH account?",
@@ -714,6 +731,60 @@ impl Queue {
                 },
             },
         }, notifications, TIMEOUT, cancelled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_source(
+        &self,
+        from: &Requester,
+        command: &[Vec<u8>],
+        cwd: &str,
+        target: &str,
+        request: &crate::destination::pull::PullRequest,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        let scopes = request.scopes();
+        let base = request
+            .base
+            .path
+            .as_deref()
+            .map(crate::approval_command::display_arg)
+            .unwrap_or_else(|| "source login directory".into());
+        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission. {}: {base}. Uses this machine's SSH access and installs the syq helper if needed. File data travels directly between the servers; no source mutations are allowed.", if request.base.confined { "Hard source root" } else { "Source working directory" });
+        self.wait(
+            Summary {
+                id: id.iter().map(|b| format!("{b:02x}")).collect(),
+                from: format!("{:?}", from.to_string()),
+                server: from.server.clone(),
+                expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+                    + TIMEOUT.as_secs(),
+                notification: "starting".into(),
+                command: crate::approval_command::display(command),
+                server_cwd: shown_directory(cwd),
+                verb: "wants to read",
+                sources: scopes.clone(),
+                preposition: "from",
+                target: target.into(),
+                notes: vec![
+                    permission.clone(),
+                    "Read authority ends when this copy closes, or after seven days.".into(),
+                ],
+                details: Details::Source {
+                    kind: SourceKind::Source,
+                    source: target.into(),
+                    scopes,
+                    permission,
+                    max_bytes: request.limits.max_total_bytes,
+                    max_entries: request.limits.max_entries,
+                },
+            },
+            notifications,
+            TIMEOUT,
+            cancelled,
+        )
     }
 
     pub(crate) fn request_storage(

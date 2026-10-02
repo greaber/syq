@@ -767,7 +767,7 @@ pub(crate) fn connect_for_authorization(
     Ok(connection)
 }
 
-fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
+pub(crate) fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
     let mut seen = std::collections::HashSet::new();
     sources
         .iter()
@@ -1478,6 +1478,17 @@ fn handle_tcp_setup_error(
                 args.tcp_congestion.as_deref().unwrap_or_default()
             )
         });
+    }
+    if args
+        .return_source
+        .as_ref()
+        .is_some_and(|source| !source.has_ssh())
+    {
+        sched.abort();
+        progress.stop();
+        return Err(error).context(
+            "approved source requires direct TCP; SSH source authorization is unavailable",
+        );
     }
     if !args.quiet || debug() {
         let congestion_note =
@@ -2506,7 +2517,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Signed/named routes keep their separately authorized resource policy.
     let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
         Endpoint::Remote(spec) => {
-            spec.local_process || (spec.restricted_grant.is_none() && spec.forwarded.is_none())
+            spec.local_process
+                || (spec.restricted_grant.is_none()
+                    && (spec.forwarded.is_none() || args.return_source.is_some()))
         }
         _ => true,
     });
@@ -4417,14 +4430,15 @@ fn check_operator_directory_ancestry(
     }
 }
 
-fn register_source_roots(
-    conn: &mut dyn Conn,
+/// The same source selection drives ordinary registration and laptop approval.
+pub(crate) fn source_registration(
     sources: &[Location],
     args: &Args,
-    shared_workers: usize,
-    independent_handoff_workers: usize,
-) -> Result<Vec<RegisteredSourceRoot>> {
-    let source_is_local = !sources.iter().any(Location::is_remote);
+) -> (
+    SourceRootBase,
+    Vec<SourceRootSelection>,
+    OperatorSymlinkPolicy,
+) {
     let base = if let Some(path) = &args.native_source_root {
         SourceRootBase {
             path: Some(path.clone()),
@@ -4447,11 +4461,26 @@ fn register_source_roots(
                 || source.follows_root(args.follows_native_source_paths()),
         })
         .collect();
+    (
+        base,
+        selections,
+        source_operator_symlink_policy(args, !sources.iter().any(Location::is_remote)),
+    )
+}
+
+fn register_source_roots(
+    conn: &mut dyn Conn,
+    sources: &[Location],
+    args: &Args,
+    shared_workers: usize,
+    independent_handoff_workers: usize,
+) -> Result<Vec<RegisteredSourceRoot>> {
+    let (base, selections, symlink_policy) = source_registration(sources, args);
     match ok(
         conn.call(Request::RegisterSourceRoots {
             base,
             selections,
-            symlink_policy: source_operator_symlink_policy(args, source_is_local),
+            symlink_policy,
             allow_unconfined_paths: false,
             shared_workers,
             independent_handoff_workers,

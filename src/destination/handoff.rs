@@ -38,6 +38,7 @@ pub(crate) fn copy_start() -> std::time::Instant {
 pub(super) enum Kind {
     Copy,
     Forward,
+    Pull,
     Command,
     Ssh,
     SshPersistent,
@@ -135,7 +136,7 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     let command = argv.get(3).and_then(|arg| arg.to_str());
     if !matches!(
         (guard.kind, command),
-        (Kind::Copy | Kind::Forward, Some("cp"))
+        (Kind::Copy | Kind::Forward | Kind::Pull, Some("cp"))
             | (Kind::Command, Some("exec"))
             | (Kind::Ssh, Some("ssh"))
             | (Kind::SshPersistent, Some("persist"))
@@ -145,7 +146,7 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     if guard.kind == Kind::SshPersistent && argv.get(4).is_none_or(|arg| arg != "connect") {
         bail!("invalid persistent SSH handoff command");
     }
-    if matches!(guard.kind, Kind::Copy | Kind::Forward) {
+    if matches!(guard.kind, Kind::Copy | Kind::Forward | Kind::Pull) {
         if let Some(start) = inherited_start.and_then(|value| value.parse().ok()) {
             let _ = COPY_START.set(start);
         }
@@ -197,6 +198,16 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
         return Ok(());
     }
     let program = std::ffi::OsStr::from_bytes(&selection.registration.program);
+    if selection.kind == Kind::Pull {
+        let supported = Command::new(program)
+            .arg("--return-source-probe")
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .capture_output()
+            .is_ok_and(|output| output.status.success());
+        if !supported {
+            bail!("the registered helper for @{} does not support source authorization; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+        }
+    }
     if matches!(selection.kind, Kind::Ssh | Kind::SshPersistent) {
         // Help is a read-only capability probe. Older helpers do not know the
         // new guard kind; give a recovery step before handing them this argv.
@@ -238,13 +249,14 @@ pub(crate) fn copy(
     }
     let selection = select_copy(args, Some(progress))?;
     if let Some(selection) = &selection {
-        if args.hardlinks
-            || args.acls
-            || args.xattrs
-            || args.atimes > 0
-            || args.crtimes
-            || args.open_noatime
-            || args.sparse
+        if selection.kind != Kind::Pull
+            && (args.hardlinks
+                || args.acls
+                || args.xattrs
+                || args.atimes > 0
+                || args.crtimes
+                || args.open_noatime
+                || args.sparse)
         {
             bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
         }
