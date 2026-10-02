@@ -20,6 +20,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod ssh_config;
+
 const CONFIG_FILE: &str = "persistence.json";
 const SCOPE_MARKER: &str = ".syq-persistence";
 const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
@@ -39,6 +41,8 @@ struct PersistCommand {
 enum PersistAction {
     /// Choose default authorization for server copies and SSH sessions
     AuthFrom(crate::auth_from::PreferenceCommand),
+    /// Export native OpenSSH configuration for one already approved account connection
+    SshConfig(ssh_config::ExportCommand),
     /// Configure receiving and decide incoming copy or command requests
     Receive(crate::receive_service::ReceiveCommand),
     /// Inspect named return destinations available to this server account
@@ -190,6 +194,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     match command.action {
         PersistAction::AuthFrom(command) => return crate::auth_from::run(command),
+        PersistAction::SshConfig(command) => return ssh_config::run(command),
         PersistAction::Receive(command) => return crate::receive_service::run_command(command),
         PersistAction::Destinations(command) => return crate::destination::run_command(command),
         PersistAction::Connect {

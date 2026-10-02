@@ -133,6 +133,9 @@ fn validate_record(record: &Record) -> Result<()> {
 
 pub(crate) struct Cached(Record);
 impl Cached {
+    pub(crate) fn control(&self) -> &Path {
+        &self.0.control
+    }
     pub(crate) fn endpoint(&self) -> &NativeEndpoint {
         &self.0.endpoint
     }

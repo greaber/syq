@@ -142,7 +142,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     foreground::run(&mut command, || session.cancelled())
 }
 
-fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
+pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
     if endpoint.host.is_empty()
         || endpoint.host.starts_with('-')
         || !endpoint
