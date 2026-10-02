@@ -214,7 +214,16 @@ fn exact_leaf_reads_ignore_display_paths_and_refuse_siblings_and_guards() {
     assert!(fixture.control.authorize(&guarded).is_err());
     fs::rename(&approved, temp.path().join("old")).unwrap();
     fs::write(&approved, b"replaced").unwrap();
-    assert!(error_response(&fixture.ops.handle(&request)));
+    // The existing read descriptor still names the approved inode. A fresh
+    // attempt must not open the replacement now occupying its old pathname.
+    assert!(
+        matches!(fixture.ops.handle(&request), Response::Block { data, .. } if data == b"approved")
+    );
+    let mut reopened = request;
+    if let Request::ReadRange { attempt, .. } = &mut reopened {
+        *attempt = 1;
+    }
+    assert!(error_response(&fixture.ops.handle(&reopened)));
 }
 
 #[test]
