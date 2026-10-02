@@ -143,7 +143,9 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     if args.auth_from_explicit || args.s3.is_some() {
         return Ok(());
     }
-    let location = if crate::destination::forward_target(args).is_ok() {
+    let location = if let Some((location, _)) = crate::destination::account_copy::remote(args) {
+        Some(location)
+    } else if crate::destination::forward_target(args).is_ok() {
         args.locations.last()
     } else if crate::destination::pull::eligible_target(args).is_ok() {
         args.locations.first()

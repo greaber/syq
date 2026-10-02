@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
+pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
@@ -757,6 +758,9 @@ fn select_copy(
         args.auth_from = crate::cli::AuthFrom::Return(name.to_owned());
     } else {
         crate::auth_from::apply_copy(args)?;
+        if account_copy::select(args)? {
+            return Ok(None);
+        }
     }
     let is_pull = args
         .locations
