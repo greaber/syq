@@ -388,10 +388,10 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
         let mut args = path;
         args.push("--help");
         let short = help(&args);
-        assert!(short.contains(if args[0] == "exec" {
-            "--cwd"
-        } else {
-            "--timeout"
+        assert!(short.contains(match args[0] {
+            "ssh" => "--auth-from",
+            "exec" => "--cwd",
+            _ => "--timeout",
         }));
     }
 }
