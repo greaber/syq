@@ -7,7 +7,7 @@ For everyday setup, start with [Keep connections open](persistence.md) or
 
 ## Authorization defaults
 
-On a server, choose the receiving machine that should authorize later copies and `syq ssh` sessions:
+On a server, choose the receiving machine for later SSH access:
 
 ```sh
 syq persist auth-from @laptop
@@ -20,22 +20,29 @@ syq persist auth-from --reset
 `@laptop` goes straight to that machine without first trying the server's SSH
 credentials. If it is unavailable or refuses the request, the command fails.
 The setting chooses where to ask; every request still needs its normal approval.
-`ssh` uses the server's own access. For copies, `auto` tries SSH first and can ask an available
-receiving machine after an eligible SSH failure. For `syq ssh`, both `auto` and
-`ssh` execute native SSH once; login and command failures never trigger a retry.
+`ssh` uses the server's own access and ignores approved account connections.
+`auto` first reuses an existing approved account login for the exact typed
+endpoint. If more than one receiving name has approved that endpoint, choose
+one explicitly. Without an approved login, native copies try SSH and can ask
+an available receiving machine after an eligible SSH failure. Other commands
+run native SSH once; login and command failures never trigger a retry.
 
 A `--for HOST` override wins over the default. Matching uses the exact hostname
 or SSH alias typed in the command, for every login and port; aliases are
 not expanded through SSH configuration or DNS. `--for` takes no login or port.
-An explicit `--auth-from`, including `auto`, wins over both saved settings.
+An explicit `--auth-from` (`--syq-auth-from` for `syq rsync`), including `auto`,
+wins over both saved settings.
 `--reset --for HOST` removes one override; `--reset` restores the default to
 `auto` while keeping host overrides. Omit the value to show saved choices, or
 add `--for HOST` to show that host's effective choice.
 
-Defaults apply to `syq ssh` and native copies to or from one SSH server that support receiving authorization.
-Creating reusable account access with `persist connect` always requires an explicit `--auth-from @NAME`.
-Custom `--rsh` routes, copies to receiving names, object storage, and other routes
-keep their own authentication. The setting works independently of `persist on`
+Defaults apply to `syq ssh`, copies to or from one SSH server, and the SSH
+endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
+using `--coordinate-at local` selects access separately for each endpoint.
+Creating reusable account access with `persist connect` always requires an
+explicit `--auth-from @NAME`. Custom `--rsh` routes, explicit persistence
+scopes, copies to receiving names, and object storage keep their own
+authentication. The setting works independently of `persist on`
 and `off`. It is saved in `auth-from.json` alongside `persistence.json`; older
 syq versions ignore it. If it is unreadable or has an unknown format, repair the
 file or pass `--auth-from` explicitly for that command.
@@ -55,12 +62,34 @@ name, login, typed host/alias, and port selects the same approved login.
 A dead master detected before command execution requires fresh approval; a
 failure after execution starts ends that command without a retry.
 
-Native copies with the same `--auth-from @NAME` choice also reuse that login.
-They may use SSH for data in either direction, including `--no-tcp`, and do
-not request a per-copy grant. Custom shell routes, explicit persistence scopes,
-detached or remote-to-remote copies, and copies requesting a receiver receipt
-do not select it. If no approved login is available, the command uses the
-usual per-copy authorization path and its restrictions.
+Copies can reuse the login with `auto` or the matching `@NAME`, including SSH
+data in either direction with `--no-tcp`. They do not request a per-copy
+grant. Custom shell routes, explicit persistence scopes, detached copies,
+and copies requesting a receiver receipt do not select it. Direct copies
+between two other servers keep their existing authorization path; an explicit
+`--coordinate-at local` can reuse local account connections for both endpoints.
+Without an approved login, eligible native copies use the usual per-copy
+authorization path and its restrictions.
+
+`rsync`, `rm`, `map`, and `clean-partials` also reuse account access. Selecting
+`@NAME` for these commands requires an existing login from
+`persist connect HOST --auth-from @NAME`; it never requests broader account
+permission on behalf of a file operation. Remote path completion follows the
+same choice, but only uses existing approval and never prompts for access.
+
+`syq persist ssh-config HOST [--auth-from auto|ssh|@NAME]` prints a standalone
+OpenSSH configuration for one existing approved login. Use it with `ssh`,
+`scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.
+The endpoint must match the user, host spelling, and port used by
+`persist connect`; the configuration then supplies the laptop-resolved host,
+account, and port. It never requests approval or opens a login. Native-only
+`ssh` selection cannot export approved account access.
+
+The exported configuration is a snapshot. Its socket is bound to the resolved
+host, account, and port; changing those options does not select the approved
+socket. Missing or closed connections fail without attempting other
+authentication. Export again after reconnecting. The output contains no private
+key; syq writes only a temporary socket alias inside the connection's scope.
 
 These connections have separate temporary scopes and an `authorized-ssh-v1`
 index under syq's runtime directory. Existing persistence settings and endpoint

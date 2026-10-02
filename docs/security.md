@@ -363,7 +363,9 @@ to that command. Copy paths, download roots, and copy limits do not constrain
 this permission. `syq persist connect HOST --auth-from @NAME` separately asks
 for reusable account access: later commands and copies may use that login
 without another approval while the laptop remains connected. Any process
-running as the requesting account can use its owner-only SSH control socket.
+running as the requesting account can use its owner-only SSH control socket,
+including ordinary SSH tools configured by `persist ssh-config`. The export
+uses only the selected account connection and fails when it closes.
 A one-time SSH invocation does not create this reusable permission.
 
 The laptop supplies a signing service restricted to the destination's trusted

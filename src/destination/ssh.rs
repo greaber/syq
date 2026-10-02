@@ -16,7 +16,7 @@ pub(crate) mod persistent;
     long_about = "Open an SSH shell or run a command. With no command, open a shell. Like ssh, the remote shell interprets command arguments joined with spaces; quote shell syntax for the remote shell. This differs from syq exec --on @NAME, which passes literal arguments."
 )]
 struct SshCommand {
-    /// Authorization source; omitted uses the saved preference, then native SSH
+    /// Authorization source; omitted uses the saved preference, then an approved account connection or native SSH
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Request a terminal, including when running a command

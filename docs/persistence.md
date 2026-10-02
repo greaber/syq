@@ -52,30 +52,36 @@ On a server connected to your laptop, explicitly keep an approved login open:
 
 ```sh
 syq persist connect hostB --auth-from @laptop
-syq ssh --auth-from @laptop hostB -- hostname
-syq ssh --auth-from @laptop hostB
+syq ssh hostB -- hostname
+syq cp report --to hostB --as report
+syq ssh hostB
 syq persist off
 ```
 
 The laptop asks for **reusable account access**: commands and copies may use
 that account's full authority while the laptop connection remains open.
-This is broader than approving one copy. Later commands using the same
-receiving name and typed endpoint reuse the login without another approval.
+This is broader than approving one copy. Later commands using the same typed
+endpoint reuse the login without another approval. This includes `syq ssh`,
+`cp`, `rsync`, `rm`, `map`, and `clean-partials`, and remote path completion.
 An ordinary `syq ssh` invocation never creates a reusable login automatically.
 The laptop needs the [SSH account authorization requirements](commands/ssh.md#account-access-requires-approval).
 
-`syq persist status` shows the connection and its SSH control socket.
-Other OpenSSH tools can use that socket too. For example, copy the printed
-path into `SOCKET` and use:
+For ordinary SSH tools, export a configuration on the server:
 
 ```sh
-ssh -F /dev/null -S "$SOCKET" -o ProxyCommand=false hostB hostname
-scp -F /dev/null -o "ControlPath=$SOCKET" -o ProxyCommand=false report hostB:report
+syq persist ssh-config hostB > hostB.ssh
+ssh -F hostB.ssh hostB hostname
+scp -F hostB.ssh report hostB:report
+sftp -F hostB.ssh hostB
+GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
+rsync -e 'ssh -F hostB.ssh' report hostB:report
 ```
 
-`ProxyCommand=false` makes these commands fail if the master is gone instead
-of attempting another login. These commands use the account already connected
-through the socket. They need no forwarded agent.
+The configuration uses this approved account connection and needs no forwarded
+agent. It fails if the connection closes or the requested host, account, or
+port changes. Export again after approving a replacement connection. Use the
+configuration's absolute path when a tool runs from a different directory.
+Syq does not edit your SSH configuration.
 
 `syq persist off`, stopping the laptop's receiving profile, or losing its
 connection closes this login and its active sessions. Reconnecting the laptop
