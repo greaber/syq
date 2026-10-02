@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{
     collections::BTreeMap,
+    ffi::OsStr,
     fs::File,
     io::Read,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -140,15 +141,20 @@ pub(super) fn hash_file_as(
 }
 
 pub(super) fn key_path(bytes: &[u8]) -> Result<String> {
-    let path = std::str::from_utf8(bytes).context("S3 keys require UTF-8 filenames")?;
+    let path = std::str::from_utf8(bytes).with_context(|| {
+        format!(
+            "S3 keys require UTF-8 filenames: {:?}",
+            OsStr::from_bytes(bytes)
+        )
+    })?;
     let path = if path == "." { "" } else { path };
     if !path.is_empty() {
-        RelativePath::new(path.as_bytes()).context(
-            "S3 keys used as paths must have relative, nonempty components without . or ..",
-        )?;
+        RelativePath::new(path.as_bytes()).with_context(|| {
+            format!("S3 key {path:?} must have relative, nonempty components without . or ..")
+        })?;
     }
     if path.len() > 1024 {
-        bail!("S3 key exceeds 1024 bytes");
+        bail!("S3 key exceeds 1024 bytes: {path:?}");
     }
     Ok(path.to_owned())
 }
@@ -230,9 +236,14 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
                 join(
                     &target,
                     &key_path(
-                        crate::cli::native_basename(&location.path)
-                            .context("source has no basename")?,
-                    )?,
+                        crate::cli::native_basename(&location.path).with_context(|| {
+                            format!(
+                                "source has no basename: {:?}",
+                                OsStr::from_bytes(&location.path)
+                            )
+                        })?,
+                    )
+                    .with_context(|| format!("source {:?}", OsStr::from_bytes(&location.path)))?,
                 )
             };
             selectors.push((
@@ -356,7 +367,10 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
                 && (!source.meta.is_file() || source.meta.len < min || source.meta.len > max)
             {
                 if !source.meta.is_file() {
-                    bail!("special files cannot be uploaded to S3");
+                    bail!(
+                        "special files cannot be uploaded to S3: {:?}",
+                        OsStr::from_bytes(&source.label)
+                    );
                 }
                 excluded += 1;
                 prune.protect(source.key.as_bytes());
@@ -384,11 +398,16 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
                     }
                     child.path.extend_from_slice(&name);
                     child.meta = child.root.metadata(&RelativePath::new(&child.path)?)?;
-                    child.key = join(&source.key, &key_path(&name)?);
                     if !child.label.is_empty() {
                         child.label.push(b'/');
                     }
                     child.label.extend_from_slice(&name);
+                    child.key = join(
+                        &source.key,
+                        &key_path(&name).with_context(|| {
+                            format!("source {:?}", OsStr::from_bytes(&child.label))
+                        })?,
+                    );
                     stack.push((child, false, false));
                 }
                 if contents {
@@ -415,7 +434,11 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
                 source.kind() == ObjectKind::Dir,
             )?;
             if source.key.len() > 1024 {
-                bail!("S3 key exceeds 1024 bytes");
+                bail!(
+                    "S3 key exceeds 1024 bytes: {:?} (source {:?})",
+                    source.key,
+                    OsStr::from_bytes(&source.label)
+                );
             }
             out.push(source);
         }
