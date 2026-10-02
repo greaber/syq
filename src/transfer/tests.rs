@@ -732,7 +732,7 @@ fn range_mismatch_aborts_worker_with_both_pipelines_outstanding() {
                 }
                 dst.lock().unwrap().replies.push_back(Response::Ok);
                 let mut worker = pipeline_worker(&sched, &src, &dst, streaming);
-                let error = worker.run().unwrap_err();
+                let error = worker.run(None).unwrap_err();
                 assert!(error.is::<RangeReplyMismatch>(), "{error:#}");
                 assert!(sched.is_aborted());
                 assert!(

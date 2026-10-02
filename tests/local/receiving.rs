@@ -1174,8 +1174,12 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
         )
         .unwrap();
         assert!(
-            terminal["elapsed_ms"].as_u64().unwrap() >= 175,
+            terminal["timings"]["total_ms"].as_u64().unwrap() >= 175,
             "SSH setup disappeared from elapsed time: {terminal}"
+        );
+        assert!(
+            terminal["timings"]["setup_ms"].as_u64().unwrap() >= 175,
+            "SSH authorization connection disappeared from setup time: {terminal}"
         );
         assert_eq!(fs::read(t.path("destination")).unwrap(), b"payload");
         assert_eq!(
@@ -1313,8 +1317,12 @@ exit 255
     .unwrap();
     assert_eq!(terminal["status"], "failed");
     assert!(
-        terminal["elapsed_ms"].as_u64().unwrap() >= 175,
+        terminal["timings"]["total_ms"].as_u64().unwrap() >= 175,
         "failed SSH setup disappeared from elapsed time: {terminal}"
+    );
+    assert!(
+        terminal["timings"]["setup_ms"].as_u64().unwrap() >= 175,
+        "{terminal}"
     );
     assert_eq!(
         listener.accept().unwrap_err().kind(),

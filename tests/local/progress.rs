@@ -626,7 +626,7 @@ fn small_push_mtime_precision_matches_stats_dry_run_and_hash() {
                     ),
                     "{stdout}"
                 );
-                assert_eq!(stdout.contains("copying interval:"), !matches, "{stdout}");
+                assert!(stdout.contains("timing: setup"), "{stdout}");
             }
             let skipped = matches && option != Some("--hash");
             let unchanged = skipped || option == Some("--dry-run");

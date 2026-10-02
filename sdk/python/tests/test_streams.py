@@ -24,7 +24,7 @@ def ready_stub() -> str:
     fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/automation/success.ndjson"
     run = json.loads(fixture.read_text().splitlines()[0])
     run["mapping"] = False
-    ready = dict(schema="syq.automation", schema_version=2, seq=1, type="stream_ready")
+    ready = dict(schema="syq.automation", schema_version=4, seq=1, type="stream_ready")
     data = (json.dumps(run) + "\n" + json.dumps(ready) + "\n").encode()
     return (f'#!{sys.executable}\nimport os, sys, time\n'
             f'os.write(int(sys.argv[sys.argv.index("--results-fd") + 1]), {data!r})\n'

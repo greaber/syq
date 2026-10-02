@@ -1149,7 +1149,7 @@ const DOC_JQ_DATE_PARTITION: &str = r#"select(.kind == "file")
 
 const DOC_JQ_MIN_SIZE: &str = r#"select(.kind != "file" or .size >= 1048576)"#;
 
-const DOC_JQ_RETRY_GATE: &str = r#"if any(.[]; .schema != "syq.automation" or .schema_version != 2)
+const DOC_JQ_RETRY_GATE: &str = r#"if any(.[]; .schema != "syq.automation" or .schema_version != 4)
         then "unsupported results schema for pathname retry" | halt_error
         elif (.[-1].type? // "") != "result"
         then "incomplete results stream (no terminal record)" | halt_error
@@ -1326,7 +1326,7 @@ fn automation_md_retry_gate_example_works_verbatim() {
     // A callback cannot be reconstructed from pathname retry records.
     let callbacks = String::from_utf8(results.clone())
         .unwrap()
-        .replace("\"schema_version\":2", "\"schema_version\":3");
+        .replace("\"schema_version\":4", "\"schema_version\":5");
     let out = jq(DOC_JQ_RETRY_GATE, &["-cs"], callbacks.as_bytes());
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unsupported results schema"));
@@ -1341,7 +1341,7 @@ fn automation_md_retry_gate_example_works_verbatim() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("incomplete results stream"));
     // Aborted terminal record: refused with advice to rerun.
     let mut aborted = truncated.clone();
-    aborted.extend_from_slice(b"\n{\"schema\":\"syq.automation\",\"schema_version\":2,\"type\":\"result\",\"status\":\"aborted\"}\n");
+    aborted.extend_from_slice(b"\n{\"schema\":\"syq.automation\",\"schema_version\":4,\"type\":\"result\",\"status\":\"aborted\"}\n");
     let out = jq(DOC_JQ_RETRY_GATE, &["-cs"], &aborted);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("run stopped early (status aborted)"));

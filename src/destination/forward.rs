@@ -74,7 +74,10 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     Ok(target)
 }
 
-pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Selection>> {
+pub(super) fn select(
+    args: &mut crate::cli::Args,
+    progress: Option<&crate::progress::Progress>,
+) -> Result<Option<handoff::Selection>> {
     let explicit = match &args.auth_from {
         crate::cli::AuthFrom::Return(name) => Some(name.clone()),
         _ => handoff::selected_name(handoff::Kind::Forward).map(str::to_owned),
@@ -107,7 +110,7 @@ pub(super) fn select(args: &mut crate::cli::Args) -> Result<Option<handoff::Sele
         else {
             unreachable!("eligible forwarding destination is remote");
         };
-        let error = match crate::transfer::connect_for_authorization(args, &spec) {
+        let error = match crate::transfer::connect_for_authorization(args, &spec, progress) {
             Ok(connection) => {
                 *spec.primed_control.lock().unwrap() =
                     crate::conn::PrimedControl::Checked(Some(Box::new(connection)));

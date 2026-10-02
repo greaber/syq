@@ -1005,6 +1005,9 @@ mod fifo;
 mod hardlinks;
 #[path = "local/hashing.rs"]
 mod hashing;
+#[cfg(debug_assertions)]
+#[path = "local/late_writes.rs"]
+mod late_writes;
 #[path = "local/local_copy_selection.rs"]
 mod local_copy_selection;
 #[path = "local/map.rs"]

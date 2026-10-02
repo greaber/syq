@@ -83,11 +83,12 @@ def check(current, helper, *, legacy=False):
         assert "registered helper predates handoff timing" not in result.stderr, result.stderr
         invocations = calls.read_text().splitlines() if calls.exists() else []
         assert invocations == ([] if current == helper else ["called"]), invocations
-        assert terminal["elapsed_ms"] <= wall_ms + 50, (terminal, wall_ms)
+        elapsed_ms = terminal["elapsed_ms"] if legacy else terminal["timings"]["total_ms"]
+        assert elapsed_ms <= wall_ms + 50, (terminal, wall_ms)
         if not legacy:
-            assert terminal["elapsed_ms"] >= 175, (terminal, wall_ms, result.stderr)
+            assert elapsed_ms >= 175, (terminal, wall_ms, result.stderr)
         print(json.dumps(dict(helper=identity, legacy=legacy, wall_ms=round(wall_ms),
-                              elapsed_ms=terminal["elapsed_ms"])), flush=True)
+                              elapsed_ms=elapsed_ms)), flush=True)
 
 
 if __name__ == "__main__":

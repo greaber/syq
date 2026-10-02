@@ -1,5 +1,9 @@
 //! A fixed-height aggregate progress bar. Byte accounting belongs to the engine.
 
+mod timing;
+pub(crate) use timing::Measuring;
+pub use timing::Timings;
+
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -58,7 +62,12 @@ pub struct Progress {
     pub specials_created: AtomicU64,
     /// Workers currently allowed to take work (0 = fixed -j, not shown).
     pub active_workers: AtomicU64,
+    /// Whole-run clock, retained for automation and tuning history.
     pub start: Instant,
+    separate_transfer_timing: bool,
+    transfer_start: std::sync::OnceLock<Instant>,
+    transfer_end: std::sync::OnceLock<Instant>,
+    pub(crate) clock: timing::Clock,
     copy_first_ns: AtomicU64,
     copy_last_ns: AtomicU64,
     term: Mutex<TermState>,
@@ -164,6 +173,10 @@ impl Progress {
             specials_created: AtomicU64::new(0),
             active_workers: AtomicU64::new(0),
             start,
+            separate_transfer_timing: false,
+            transfer_start: std::sync::OnceLock::new(),
+            transfer_end: std::sync::OnceLock::new(),
+            clock: Default::default(),
             copy_first_ns: AtomicU64::new(u64::MAX),
             copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {
@@ -175,6 +188,72 @@ impl Progress {
             stop: AtomicBool::new(false),
             results: std::sync::OnceLock::new(),
         })
+    }
+
+    pub fn transfer_starting_at(
+        enabled: bool,
+        force: bool,
+        width: Option<usize>,
+        start: Instant,
+    ) -> Arc<Self> {
+        let mut progress = Self::starting_at(enabled, force, width, start);
+        Arc::get_mut(&mut progress)
+            .unwrap()
+            .separate_transfer_timing = true;
+        progress
+    }
+
+    /// Start once the initial transport is ready, before releasing copy work.
+    /// Retries and reconnects after this point remain part of the transfer.
+    pub fn begin_transfer(&self) {
+        let mut term = self.term.lock().unwrap();
+        if self.transfer_start.get().is_none() {
+            let now = Instant::now();
+            let _ = self.transfer_start.set(now);
+            term.samples = VecDeque::from([(now, self.bytes_done.load(Relaxed))]);
+        }
+    }
+
+    pub fn finish_transfer(&self) {
+        let last = self.copy_last_ns.load(Relaxed);
+        if self.transfer_start.get().is_some() {
+            let _ = self
+                .transfer_end
+                .set(self.start + Duration::from_nanos(last));
+        }
+    }
+
+    pub fn timings(&self) -> Timings {
+        let transfer = self.transfer_elapsed();
+        let mut timings = self.clock.snapshot(
+            self.start,
+            self.separate_transfer_timing
+                .then(|| transfer.unwrap_or_default()),
+        );
+        // Engines without coordinator setup/planning measurements can still
+        // report the file-work interval they already measure (for example S3).
+        if !self.separate_transfer_timing {
+            timings.transfer_ms = transfer.map(|elapsed| elapsed.as_millis() as u64);
+        }
+        timings
+    }
+
+    fn transfer_elapsed(&self) -> Option<Duration> {
+        self.transfer_start.get().map(|start| {
+            self.transfer_end
+                .get()
+                .copied()
+                .unwrap_or_else(Instant::now)
+                .saturating_duration_since(*start)
+        })
+    }
+
+    pub fn display_elapsed(&self) -> Duration {
+        if self.separate_transfer_timing {
+            self.transfer_elapsed().unwrap_or_default()
+        } else {
+            self.start.elapsed()
+        }
     }
 
     pub(crate) fn observe_destination_devices<'a>(
@@ -202,6 +281,9 @@ impl Progress {
     }
 
     pub fn copying_interval(&self) -> CopyingInterval<'_> {
+        if self.transfer_start.get().is_none() {
+            self.begin_transfer();
+        }
         self.copy_first_ns.fetch_min(self.copy_clock_ns(), Relaxed);
         CopyingInterval(self)
     }
@@ -267,6 +349,16 @@ impl Progress {
     }
 
     fn rate(&self, t: &mut TermState, now: Instant, done: u64) -> f64 {
+        if let (Some(start), Some(end)) = (self.transfer_start.get(), self.transfer_end.get()) {
+            // Once file work has settled, show its average rate, matching the
+            // summary. Finalization redraws must not extend the rate window.
+            let seconds = end.saturating_duration_since(*start).as_secs_f64();
+            return if seconds > 0.0 {
+                done as f64 / seconds
+            } else {
+                0.0
+            };
+        }
         if t.samples
             .back()
             .is_some_and(|&(_, previous)| done < previous)
@@ -339,7 +431,7 @@ impl Progress {
                     files_excluded: self.excluded(),
                     scanned: self.scanned.load(Relaxed),
                     scan_done,
-                    elapsed_ms: self.start.elapsed().as_millis() as u64,
+                    timings: self.timings(),
                     rate_bytes_per_second: rate.round() as u64,
                     eta_ms: eta.map(|seconds| (seconds * 1000.0).round() as u64),
                     activity: t.observation.as_ref(),
@@ -350,7 +442,7 @@ impl Progress {
             return;
         }
         let age = now - t.samples.back().unwrap().0;
-        let elapsed = now - self.start;
+        let elapsed = self.display_elapsed();
         let state = if let Some(status) = status {
             status.to_string()
         } else if !scan_done && self.stream {
@@ -423,6 +515,8 @@ impl Progress {
     /// Leave the final bar visible. Call after joining the ticker, with the
     /// actual operation outcome; a full byte counter alone is not success.
     pub fn finish(&self, success: bool) {
+        self.finish_transfer();
+        self.clock.finish();
         self.render_status(Some(if success { "done" } else { "incomplete" }));
         if self.enabled {
             crate::output::finish_progress();
@@ -686,6 +780,45 @@ mod tests {
     use crate::tune::Meter;
 
     #[test]
+    fn transfer_rate_starts_with_work_and_freezes_before_finalization() {
+        let progress = Progress::transfer_starting_at(
+            false,
+            false,
+            None,
+            Instant::now() - Duration::from_secs(60),
+        );
+        assert_eq!(progress.timings().transfer_ms, Some(0));
+        assert_eq!(progress.display_elapsed(), Duration::ZERO);
+        progress.begin_transfer();
+        let began = *progress.transfer_start.get().unwrap();
+        let mut term = progress.term.lock().unwrap();
+        assert_eq!(
+            progress.rate(&mut term, began + Duration::from_secs(2), 400),
+            200.0
+        );
+        drop(term);
+        progress.begin_transfer();
+        assert_eq!(progress.transfer_start.get(), Some(&began));
+        let ended = began + Duration::from_secs(2);
+        progress.copy_last_ns.store(
+            ended.duration_since(progress.start).as_nanos() as u64,
+            Relaxed,
+        );
+        progress.finish_transfer();
+        assert_eq!(progress.timings().transfer_ms, Some(2_000));
+        assert_eq!(progress.display_elapsed(), Duration::from_secs(2));
+        let mut term = progress.term.lock().unwrap();
+        for delay in [0, 4, 30] {
+            assert_eq!(
+                progress.rate(&mut term, ended + Duration::from_secs(delay), 400),
+                200.0,
+                "finalization must not dilute the completed transfer rate"
+            );
+        }
+        assert!(progress.start.elapsed() >= Duration::from_secs(60));
+    }
+
+    #[test]
     fn copying_interval_excludes_initial_setup_and_counts_overlap_once() {
         let mut progress = Progress::new(false, false, None);
         // Move the origin back without sleeping: setup must not enter the span.
@@ -707,6 +840,20 @@ mod tests {
         // A measured sub-millisecond copy is distinct from absent timing.
         progress.copy_last_ns.store(began + 999_999, Relaxed);
         assert_eq!(progress.copying_elapsed_ms(), Some(0));
+    }
+
+    #[test]
+    fn engines_without_coordinator_measurements_preserve_transfer_timing() {
+        let progress = Progress::new(false, false, None);
+        assert!(progress.timings().transfer_ms.is_none());
+        drop(progress.copying_interval());
+        progress.finish_transfer();
+        let timings = progress.timings();
+        assert!(timings.transfer_ms.is_some());
+        assert!(timings.setup_ms.is_none());
+        assert!(timings.planning_ms.is_none());
+        assert!(timings.finalization_ms.is_none());
+        assert!(timings.helper_install_ms.is_none());
     }
 
     #[test]

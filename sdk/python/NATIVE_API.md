@@ -429,7 +429,7 @@ entry index, `source` and `destination` (`PathValue`, or `None` for a callback),
 `disposition`, `dry_run`, optional `bytes`, and optional error `message`.
 After a completed run, use failed entry indices to construct an application
 retry. Callbacks are never replayed automatically. Their automation records use
-schema version 3; ordinary pathname and descriptor calls retain version 2.
+schema version 5; ordinary pathname and descriptor calls use version 4.
 
 <a id="digest-and-hashalgorithm"></a>
 
@@ -594,8 +594,24 @@ Both `CpResult` and `RmResult` include:
 | `exit_code` | `int` | syq process exit code |
 | `dry_run` | `bool` | Whether this was a preview |
 | `errors` | `int` | Counted errors |
-| `elapsed_ms` | `int` | Run duration in milliseconds |
+| `timings` | `Timings` | Run and work measurements in milliseconds |
 | `protocol` | `ProtocolMetadata` | Automation envelope; also present on every event |
+
+### Timings
+
+Frozen dataclass accessed through `result.timings` or `event.timings` on progress
+events. Durations are wall-clock milliseconds. Work measurements can overlap and
+must not be added together. `None` means unavailable; zero means no work or less than a millisecond.
+See [measurement boundaries](https://greaber.github.io/syq/automation.html#result).
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `total_ms` | `int` | Measured run, including helper installation |
+| `setup_ms` | `int \| None` | Endpoint and connection setup, excluding installation |
+| `planning_ms` | `int \| None` | Discovery, destination inspection, and work preparation |
+| `transfer_ms` | `int \| None` | First through last selected file operation |
+| `finalization_ms` | `int \| None` | Remaining work after file workers finish |
+| `helper_install_ms` | `int \| None` | Helper and remote command installation |
 
 ### ProtocolMetadata
 
@@ -606,7 +622,7 @@ or diagnosing a stream.
 | Attribute | Type | Meaning |
 |---|---|---|
 | `schema` | `str` | `"syq.automation"` |
-| `schema_version` | `int` | `2` |
+| `schema_version` | `int` | `4`; callback mappings use `5` |
 | `seq` | `int` | Record sequence number, starting at zero |
 | `type` | `str` | Wire record type; `"result"` for terminal totals |
 
@@ -686,7 +702,7 @@ endpoints: tuple[Endpoint, ...]
 
 Sampled progress for displays; use the terminal result for final totals.
 Byte fields measure file content,
-`scanned` counts scanned entries, and `elapsed_ms` is milliseconds. Optional
+`scanned` counts scanned entries, and `timings` contains elapsed measurements. Optional
 `activity` contains [diagnostic measurements](https://greaber.github.io/syq/performance-measurements.html)
 when the producer collects them; otherwise it is `None`.
 Optional `rate_bytes_per_second` and `eta_ms` provide rate and remaining-time
@@ -704,7 +720,7 @@ files_unchanged: int
 files_excluded: int
 scanned: int
 scan_done: bool
-elapsed_ms: int
+timings: Timings
 activity: dict[str, Any] | None
 rate_bytes_per_second: int | None
 eta_ms: int | None

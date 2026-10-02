@@ -377,7 +377,7 @@ fn automatic_streaming_pull_preserves_average_bandwidth_pacing() {
         let terminal: serde_json::Value =
             serde_json::from_str(results.lines().last().unwrap()).unwrap();
         assert!(
-            terminal["copying_elapsed_ms"].as_u64().unwrap() >= 1800,
+            terminal["timings"]["transfer_ms"].as_u64().unwrap() >= 1800,
             "{terminal}"
         );
         let observed = tuning_observed(&out);
@@ -871,12 +871,12 @@ fn small_pushes_take_one_turn_and_match_the_engine() {
         operations.sort();
         let mut terminal = records.last().unwrap().clone();
         if terminal["bytes_transferred"].as_u64().unwrap() > 0 {
-            let span = terminal["copying_elapsed_ms"]
+            let span = terminal["timings"]["transfer_ms"]
                 .as_u64()
                 .expect("copy timing");
-            assert!(span <= terminal["elapsed_ms"].as_u64().unwrap());
+            assert!(span <= terminal["timings"]["total_ms"].as_u64().unwrap());
         }
-        for key in ["seq", "elapsed_ms", "copying_elapsed_ms"] {
+        for key in ["seq", "timings"] {
             terminal.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(terminal["type"], "result");
@@ -1234,12 +1234,12 @@ fn small_push_refusals_and_failures_match_the_engine() {
         operations.sort();
         let mut terminal = records.last().unwrap().clone();
         if terminal["bytes_transferred"].as_u64().unwrap() > 0 {
-            let span = terminal["copying_elapsed_ms"]
+            let span = terminal["timings"]["transfer_ms"]
                 .as_u64()
                 .expect("copy timing");
-            assert!(span <= terminal["elapsed_ms"].as_u64().unwrap());
+            assert!(span <= terminal["timings"]["total_ms"].as_u64().unwrap());
         }
-        for key in ["seq", "elapsed_ms", "copying_elapsed_ms"] {
+        for key in ["seq", "timings"] {
             terminal.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(terminal["type"], "result");
