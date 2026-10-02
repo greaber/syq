@@ -75,6 +75,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
                 loopback_only: false,
                 named_socket: None,
                 authority: Some(server_authority),
+                source_authority: None,
                 descriptor_session: DescriptorSessionSlot::default(),
             },
         )
@@ -251,6 +252,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
+                source_authority: None,
                 descriptor_session: server_session,
             },
         )
@@ -513,6 +515,7 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
+                source_authority: None,
                 descriptor_session: DescriptorSessionSlot::default(),
             },
         )
@@ -579,6 +582,7 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
+                source_authority: None,
                 descriptor_session: DescriptorSessionSlot::default(),
             },
         )
@@ -667,6 +671,7 @@ fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
             false,
             &seen,
             Some(authority.clone()),
+            None,
             DescriptorSessionSlot::default(),
             None,
             std::time::Instant::now() + Duration::from_secs(1),
@@ -741,6 +746,7 @@ fn tcp_partial_handshakes_time_out_without_reserving_ids() {
                     false,
                     &seen,
                     None,
+                    None,
                     DescriptorSessionSlot::default(),
                     None,
                     std::time::Instant::now() + Duration::from_millis(100),
@@ -781,6 +787,7 @@ fn tcp_hello_clears_timeouts_only_after_authentication() {
                 false,
                 &seen,
                 Some(authority),
+                None,
                 DescriptorSessionSlot::default(),
                 None,
                 std::time::Instant::now() + Duration::from_millis(100),
@@ -884,6 +891,7 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
         None,
         None,
         Some(authority.clone()),
+        None,
         descriptor_session.clone(),
     )
     .unwrap();
@@ -987,6 +995,7 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
+                source_authority: None,
                 descriptor_session: shared,
             },
         )

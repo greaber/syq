@@ -6,16 +6,17 @@
 //! from a worker. No enrollment, signed-grant, or durable-state format changes.
 //!
 //! Server integration must retain a `SourceConnection` per admitted connection,
-//! use `register` for source registration, and call `authorize` before every
+//! initialize its executor before HelloOk, use `register` for source registration,
+//! and call `authorize` before every
 //! other request (including each generated ReadRange in a ReadStream). Call
 //! `check_response` before emitting ordinary replies and `record_scan` before
 //! emitting scan/ignored batches. FsOps still executes the approved requests:
 //! its registered descriptors enforce symlink and exact-leaf confinement.
 //! FileHash must execute through `file_hash`, which checks each hashing chunk.
-//! Transport setup is deliberately not admitted by this read-only API.
+//! TCP listeners and sender budgets use only the approved transport settings.
 
 use crate::delegation::CopyLimits;
-use crate::descriptor_broker::RegisteredRootId;
+use crate::descriptor_broker::{DescriptorSessionSlot, DescriptorTicket, RegisteredRootId};
 use crate::fsops::FsOps;
 use crate::proto::{
     ConnectionRole, OperatorSymlinkPolicy, RegisteredPath, RegisteredSourceRoot, Request, Response,
@@ -34,8 +35,16 @@ pub(crate) struct SourcePolicy {
     pub preservation: crate::inode_metadata::Selection,
     pub sparse: bool,
     pub compressed: bool,
+    pub tcp: Option<SourceTcpPolicy>,
+    pub send_rate: Option<u64>,
     pub limits: CopyLimits,
     pub deadline: Instant,
+}
+
+pub(crate) struct SourceTcpPolicy {
+    pub port_lo: u16,
+    pub port_hi: u16,
+    pub congestion_control: Option<String>,
 }
 
 struct State {
@@ -45,6 +54,8 @@ struct State {
     roots: HashMap<RegisteredRootId, RegisteredSourceRoot>,
     paths: HashSet<(RegisteredRootId, Vec<u8>)>,
     requested_bytes: u64,
+    tcp_listener_started: bool,
+    send_budget: Option<DescriptorTicket>,
 }
 
 pub(crate) struct SourceAuthority {
@@ -71,6 +82,13 @@ impl SourceAuthority {
             "source connection limit is zero"
         );
         ensure!(policy.limits.max_entries > 0, "source entry limit is zero");
+        ensure!(policy.send_rate != Some(0), "source sender rate is zero");
+        if let Some(tcp) = &policy.tcp {
+            ensure!(
+                tcp.port_lo <= tcp.port_hi,
+                "source TCP port range is reversed"
+            );
+        }
         for selection in &policy.selections {
             ensure!(
                 !selection.path.is_empty() && !selection.path.contains(&0),
@@ -86,12 +104,52 @@ impl SourceAuthority {
                 roots: HashMap::new(),
                 paths: HashSet::new(),
                 requested_bytes: 0,
+                tcp_listener_started: false,
+                send_budget: None,
             }),
         }))
     }
 
     pub(crate) fn close(&self) {
         self.state.lock().unwrap().open = false;
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.check_open(&self.state.lock().unwrap()).is_ok()
+    }
+
+    /// The descriptor session owns one rate and one budget across TCP and SSH
+    /// workers. Worker omission of a ticket never disables the approved rate.
+    pub(crate) fn sending_budget(
+        &self,
+        session: &DescriptorSessionSlot,
+    ) -> Result<Option<(Arc<crate::bwlimit::transport::Budget>, DescriptorTicket)>> {
+        let mut state = self.state.lock().unwrap();
+        self.check_open(&state)?;
+        let Some(rate) = self.policy.send_rate else {
+            return Ok(None);
+        };
+        let (budget, ticket) = session.send_budget(rate)?;
+        state.send_budget = Some(ticket.clone());
+        Ok(Some((budget, ticket)))
+    }
+
+    pub(crate) fn check_response(&self, response: &Response) -> Result<()> {
+        if matches!(
+            response,
+            Response::Err(_) | Response::EndpointError(_) | Response::ReadStreamDone
+        ) {
+            return Ok(());
+        }
+        let state = self.state.lock().unwrap();
+        self.check_open(&state)?;
+        if let Response::FileHash { size, .. } = response {
+            ensure!(
+                *size <= self.policy.limits.max_file_bytes,
+                "source per-file byte limit exceeded"
+            );
+        }
+        Ok(())
     }
 
     fn check_open(&self, state: &State) -> Result<()> {
@@ -128,10 +186,18 @@ impl SourceAuthority {
                 true
             }
             ConnectionRole::SourceWorker { roots, send_budget } => {
-                ensure!(
-                    send_budget.is_none(),
-                    "source worker sender budget was not approved"
-                );
+                if let Some(ticket) = send_budget {
+                    let approved = state
+                        .send_budget
+                        .as_ref()
+                        .context("source sender budget was not issued")?;
+                    ensure!(
+                        ticket.is_bandwidth()
+                            && ticket.same_session(approved)
+                            && ticket.root_id() == approved.root_id(),
+                        "source worker sender budget differs from approval"
+                    );
+                }
                 ensure!(!roots.is_empty(), "source worker has no approved roots");
                 let mut seen = HashSet::new();
                 for root in roots {
@@ -202,6 +268,26 @@ impl SourceAuthority {
 }
 
 impl SourceConnection {
+    /// Install approved read settings even when the client omits their optional
+    /// configuration requests. Workers receive the same settings as control.
+    pub(crate) fn initialize(&self, ops: &mut FsOps) -> Result<()> {
+        self.authority
+            .check_open(&self.authority.state.lock().unwrap())?;
+        let policy = &self.authority.policy;
+        ops.set_hash_policy(policy.hashing);
+        let response = ops.handle_in_place(&mut Request::ConfigurePreservation {
+            selection: policy.preservation,
+            sparse: policy.sparse,
+            destination: false,
+        });
+        match response {
+            Response::Ok => Ok(()),
+            Response::Err(error) => bail!("configure approved source: {error}"),
+            Response::EndpointError(error) => bail!("configure approved source: {}", error.message),
+            _ => bail!("unexpected approved-source configuration response"),
+        }
+    }
+
     /// Only this trusted executor may turn the approved path selections into
     /// capabilities. Never accept a registration response supplied by a peer.
     pub(crate) fn register(&self, ops: &mut FsOps, request: &Request) -> Result<Response> {
@@ -209,6 +295,7 @@ impl SourceConnection {
             self.control,
             "source registration requires the control connection"
         );
+        self.initialize(ops)?;
         let mut state = self.authority.state.lock().unwrap();
         self.authority.check_open(&state)?;
         ensure!(
@@ -275,6 +362,17 @@ impl SourceConnection {
         let policy = &self.authority.policy;
         let mut paths = Vec::new();
         let mut bytes = 0u64;
+        ensure!(
+            !self.control
+                || !matches!(
+                    request,
+                    Request::ReadRange { .. }
+                        | Request::ReadComparedRange { .. }
+                        | Request::ReadSmallBatch(_)
+                        | Request::ReadStream(_)
+                ),
+            "source payload requires a direct data worker"
+        );
         let source = |source: &Option<RegisteredPath>| -> Result<RegisteredPath> {
             source
                 .clone()
@@ -297,6 +395,46 @@ impl SourceConnection {
             Ok(())
         };
         match request {
+            Request::TcpListen {
+                key,
+                token,
+                port_lo,
+                port_hi,
+                congestion_control,
+                send_rate,
+            } => {
+                ensure!(
+                    self.control,
+                    "source TCP listener requires the control connection"
+                );
+                let tcp = policy
+                    .tcp
+                    .as_ref()
+                    .context("source TCP listener was not approved")?;
+                ensure!(
+                    key.as_ref()
+                        .is_some_and(|key| key.len() == crate::tcp_records::KEY_LEN)
+                        && token.len() == 16,
+                    "approved source requires encrypted authenticated TCP"
+                );
+                ensure!(
+                    (*port_lo, *port_hi) == (tcp.port_lo, tcp.port_hi)
+                        && congestion_control == &tcp.congestion_control
+                        && *send_rate == policy.send_rate,
+                    "source TCP settings differ from approval"
+                );
+                ensure!(
+                    !state.tcp_listener_started,
+                    "approved source TCP listener already started"
+                );
+                state.tcp_listener_started = true;
+            }
+            Request::CreateSendBudget { rate } => {
+                ensure!(
+                    self.control && Some(*rate) == policy.send_rate,
+                    "source sender budget differs from approval"
+                );
+            }
             Request::ConfigureHashing(hashing) => {
                 ensure!(
                     *hashing == policy.hashing,
@@ -439,27 +577,6 @@ impl SourceConnection {
         self.authority.record_paths(&mut state, &paths)
     }
 
-    /// Check limits and revocation before sending an ordinary executor reply.
-    /// Scans use record_scan for every batch instead; protocol errors carry no
-    /// file data and may still be sent after cancellation.
-    pub(crate) fn check_response(&self, response: &Response) -> Result<()> {
-        if matches!(
-            response,
-            Response::Err(_) | Response::EndpointError(_) | Response::ReadStreamDone
-        ) {
-            return Ok(());
-        }
-        let state = self.authority.state.lock().unwrap();
-        self.authority.check_open(&state)?;
-        if let Response::FileHash { size, .. } = response {
-            ensure!(
-                *size <= self.authority.policy.limits.max_file_bytes,
-                "source per-file byte limit exceeded"
-            );
-        }
-        Ok(())
-    }
-
     /// Whole-file hashing has no length in its wire request. Bound it while
     /// reading, rather than learning that it exceeded approval after EOF.
     pub(crate) fn file_hash(&self, ops: &mut FsOps, request: &Request) -> Result<Response> {
@@ -476,6 +593,7 @@ impl SourceConnection {
         ops.file_hash_checked(path, source.as_ref(), guard.as_ref(), &mut |file, size| {
             let state = self.authority.state.lock().unwrap();
             self.authority.check_open(&state)?;
+            drop(state);
             if first {
                 ensure!(
                     file.metadata()?.len() <= self.authority.policy.limits.max_file_bytes,

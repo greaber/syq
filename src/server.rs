@@ -10,7 +10,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 mod interfaces;
@@ -126,6 +126,7 @@ struct ServeSession {
     loopback_only: bool,
     named_socket: Option<std::os::unix::net::UnixStream>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 }
 
@@ -192,6 +193,7 @@ pub fn run(local_receiver: bool) -> Result<()> {
             loopback_only: local_receiver,
             named_socket: None,
             authority: None,
+            source_authority: None,
             descriptor_session: descriptor_session.clone(),
         },
     );
@@ -222,6 +224,7 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
             loopback_only: false,
             named_socket: None,
             authority: Some(Arc::clone(&authority)),
+            source_authority: None,
             descriptor_session: descriptor_session.clone(),
         },
     );
@@ -251,6 +254,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
             loopback_only: false,
             named_socket: None,
             authority: Some(authority.clone()),
+            source_authority: None,
             descriptor_session: descriptor_session.clone(),
         },
     );
@@ -291,6 +295,7 @@ pub(crate) fn run_named(
             loopback_only: false,
             named_socket: Some(socket),
             authority: Some(Arc::clone(&authority)),
+            source_authority: None,
             descriptor_session: descriptor_session.clone(),
         },
     );
@@ -299,6 +304,77 @@ pub(crate) fn run_named(
         authority.close_control();
     }
     result
+}
+
+/// One approved source control stream. The caller creates a fresh descriptor
+/// session and shares it with its private worker broker; this control owns the
+/// session lifetime. Dropping that broker after this returns wakes idle workers.
+pub(crate) fn run_authorized_source<R: Read + Send + 'static, W: Write>(
+    input: R,
+    output: W,
+    authority: Arc<crate::restricted::source::SourceAuthority>,
+    descriptor_session: DescriptorSessionSlot,
+    pending: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<()> {
+    let result = serve(
+        input,
+        output,
+        true,
+        None,
+        None,
+        None,
+        ServeSession {
+            handshake_pending: pending,
+            ssh_worker_ticket: None,
+            allow_tcp: true,
+            loopback_only: false,
+            named_socket: None,
+            authority: None,
+            source_authority: Some(authority.clone()),
+            descriptor_session: descriptor_session.clone(),
+        },
+    );
+    authority.close();
+    descriptor_session.close();
+    result
+}
+
+/// A private-broker source worker. Its outer SSH/Unix-channel authentication
+/// must be complete before entry. Only source worker Hello roles are allowed;
+/// the live authority validates the exact descriptors installed by control.
+pub(crate) fn run_authorized_source_worker(
+    input: crate::private_broker::TrackedStream,
+    output: std::os::unix::net::UnixStream,
+    authority: Arc<crate::restricted::source::SourceAuthority>,
+    descriptor_session: DescriptorSessionSlot,
+) -> Result<()> {
+    let socket = output.try_clone()?;
+    let timeout = socket
+        .read_timeout()?
+        .context("source worker handshake requires a timeout")?;
+    let reader = NamedHandshakeReader {
+        inner: input,
+        socket: socket.try_clone()?,
+        deadline: Instant::now() + timeout,
+    };
+    serve(
+        reader,
+        output,
+        false,
+        None,
+        None,
+        None,
+        ServeSession {
+            handshake_pending: None,
+            ssh_worker_ticket: None,
+            allow_tcp: false,
+            loopback_only: false,
+            named_socket: Some(socket),
+            authority: None,
+            source_authority: Some(authority),
+            descriptor_session,
+        },
+    )
 }
 
 /// A laptop-initiated TCP worker, admitted through its approved SSH channel.
@@ -329,6 +405,7 @@ pub(crate) fn run_named_tcp(
             loopback_only: false,
             named_socket: Some(channel),
             authority: Some(authority),
+            source_authority: None,
             descriptor_session: descriptor_session.clone(),
         },
     );
@@ -365,18 +442,29 @@ fn serve<R: Read + Send + 'static, W: Write>(
         loopback_only,
         named_socket,
         authority,
+        source_authority,
         descriptor_session,
     } = session;
+    anyhow::ensure!(
+        authority.is_none() || source_authority.is_none(),
+        "a server session cannot combine source and destination authority"
+    );
     let mut r = FrameReader::new(r);
     r.set_limit(MAX_HANDSHAKE_FRAME);
     let sending_budget = Arc::new(std::sync::OnceLock::new());
     let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopped = disconnected.clone();
+    let source_stopped = source_authority.clone();
     let mut w = FrameWriter::new(
         crate::bwlimit::transport::SessionWriter {
             inner: w,
             budget: sending_budget.clone(),
-            stopped: move || stopped.load(std::sync::atomic::Ordering::Acquire),
+            stopped: move || {
+                stopped.load(std::sync::atomic::Ordering::Acquire)
+                    || source_stopped
+                        .as_ref()
+                        .is_some_and(|source| !source.is_open())
+            },
         },
         false,
     );
@@ -390,6 +478,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // Held for the life of the connection; dropping it releases the worker
     // permit even when a later request fails.
     let _permit: Option<ConnectionPermit>;
+    let source_permit;
     let (hello, _hello_hold) = r.read_budgeted::<Request>()?.into_parts();
     match hello {
         Request::Hello {
@@ -430,6 +519,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
             if let Some(authority) = &authority {
                 authority.validate_hello(compress)?;
             }
+            source_permit = match &source_authority {
+                Some(source) => match source.acquire(&requested_role, compress) {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        w.write_msg(&Response::Err(format!("{error:#}")))?;
+                        return Err(error);
+                    }
+                },
+                None => None,
+            };
             role = requested_role;
             w.compress = compress;
         }
@@ -448,7 +547,18 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
     }
-    let mut initial_sending_budget = None;
+    if let Some(source) = &source_permit {
+        source.initialize(&mut ops)?;
+    }
+    let mut initial_sending_budget = match source_authority
+        .as_ref()
+        .filter(|_| is_source_worker && tcp_socket.is_none())
+    {
+        Some(source) => source
+            .sending_budget(&descriptor_session)?
+            .map(|(budget, _)| budget),
+        None => None,
+    };
     match &role {
         ConnectionRole::SourceWorker { .. } if authority.is_some() => {
             w.write_msg(&Response::Err(
@@ -457,7 +567,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             bail!("command-restricted receiver rejected supplied source roots");
         }
         ConnectionRole::SourceWorker { roots, send_budget } => {
-            if let Some(ticket) = send_budget {
+            if let Some(ticket) = send_budget.as_ref().filter(|_| source_authority.is_none()) {
                 anyhow::ensure!(over_ssh, "SSH sender budget supplied over TCP");
                 anyhow::ensure!(ticket.is_bandwidth(), "not a bandwidth budget ticket");
                 let file = descriptor_session.acquire(ticket)?;
@@ -581,6 +691,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         last: std::time::Instant::now(),
         enabled: false,
         socket: telemetry_socket,
+        source_authority: source_authority.clone(),
     };
 
     let (mut blocks, mut bytes) = (0u64, 0u64);
@@ -628,6 +739,20 @@ fn serve<R: Read + Send + 'static, W: Write>(
             ))?;
             continue;
         }
+        if let Some(source) = &source_permit {
+            if matches!(req, Request::RegisterSourceRoots { .. }) {
+                let response = match source.register(&mut ops, &req) {
+                    Ok(response) => response,
+                    Err(error) => Response::Err(format!("{error:#}")),
+                };
+                w.write_msg(&response)?;
+                continue;
+            }
+            if let Err(error) = source.authorize(&req) {
+                w.write_msg(&Response::Err(format!("{error:#}")))?;
+                continue;
+            }
+        }
         // A fence performs no filesystem operation and grants no authority.
         // It must work after expiration/revocation too: preceding writes have
         // already received their individual authorization/error responses.
@@ -671,7 +796,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
         match req {
             Request::Shutdown => break,
             Request::CreateSendBudget { rate } => {
-                let response = if authority.is_none() && over_ssh {
+                let response = if let Some(source) = &source_authority {
+                    match source.sending_budget(&descriptor_session) {
+                        Ok(Some((_, ticket))) => Response::SendBudget(ticket),
+                        Ok(None) => Response::Err("source sender budget was not approved".into()),
+                        Err(error) => Response::Err(format!("{error:#}")),
+                    }
+                } else if authority.is_none() && over_ssh {
                     match descriptor_session.send_budget(rate) {
                         Ok((_, ticket)) => Response::SendBudget(ticket),
                         Err(error) => Response::Err(format!("{error:#}")),
@@ -716,7 +847,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         // on the next iteration, without another read or RTT.
                         continue;
                     }
-                    let response = ops.handle_in_place(&mut stream.next_request());
+                    let mut request = stream.next_request();
+                    let response = match source_permit
+                        .as_ref()
+                        .map(|source| source.authorize(&request))
+                        .transpose()
+                    {
+                        Ok(_) => ops.handle_in_place(&mut request),
+                        Err(error) => Response::Err(format!("{error:#}")),
+                    };
                     if let Response::Block { data, .. } = &response {
                         stream.off += data.len() as u64;
                         blocks += 1;
@@ -773,6 +912,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     congestion_control.as_deref(),
                     send_rate,
                     authority.clone(),
+                    source_authority.clone(),
                     descriptor_session.clone(),
                 ) {
                     Ok((port, families, congestion_control)) => {
@@ -894,6 +1034,14 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 let warns = std::cell::RefCell::new(Vec::new());
                 let wref = std::cell::RefCell::new(&mut w);
                 let mut sink = |mut batch: Vec<crate::proto::Entry>| {
+                    if let Some(permit) = &source_permit {
+                        permit.record_scan(
+                            source
+                                .as_ref()
+                                .context("approved source scan omitted its reference")?,
+                            batch.iter().map(|entry| entry.path.as_slice()),
+                        )?;
+                    }
                     ops.capture_scan_metadata(
                         &requested_root,
                         source.as_ref(),
@@ -924,6 +1072,14 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     }
                 };
                 let mut ignored = |paths: Vec<crate::proto::PathBytes>| {
+                    if let Some(permit) = &source_permit {
+                        permit.record_scan(
+                            source
+                                .as_ref()
+                                .context("approved source scan omitted its reference")?,
+                            paths.iter().map(Vec::as_slice),
+                        )?;
+                    }
                     if let Some(authority) = &authority {
                         authority
                             .record_scanned(&requested_root, paths.iter().map(Vec::as_slice))?;
@@ -1034,10 +1190,20 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 ))?,
             },
             mut other => {
-                let resp = ops.handle_with_copy_progress(&mut other, &mut |bytes| {
-                    w.write_msg(&Response::CopyLocalProgress(bytes))?;
-                    Ok(())
-                });
+                let resp = if let Some(source) = source_permit
+                    .as_ref()
+                    .filter(|_| matches!(other, Request::FileHash { .. }))
+                {
+                    match source.file_hash(&mut ops, &other) {
+                        Ok(response) => response,
+                        Err(error) => Response::Err(format!("{error:#}")),
+                    }
+                } else {
+                    ops.handle_with_copy_progress(&mut other, &mut |bytes| {
+                        w.write_msg(&Response::CopyLocalProgress(bytes))?;
+                        Ok(())
+                    })
+                };
                 if let (Some(authority), Some(settlement)) = (&authority, settlement) {
                     authority.settle(settlement, &resp);
                 }
@@ -1162,15 +1328,22 @@ fn tcp_listen(
     congestion_control: Option<&str>,
     send_rate: Option<u64>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
     descriptor_session: DescriptorSessionSlot,
 ) -> Result<(u16, BoundFamilies, Option<String>)> {
-    let pacing = send_rate
-        .map(|rate| {
-            descriptor_session
-                .send_budget(rate)
-                .map(|(budget, _)| budget)
-        })
-        .transpose()?;
+    let pacing = if let Some(source) = &source_authority {
+        source
+            .sending_budget(&descriptor_session)?
+            .map(|(budget, _)| budget)
+    } else {
+        send_rate
+            .map(|rate| {
+                descriptor_session
+                    .send_budget(rate)
+                    .map(|(budget, _)| budget)
+            })
+            .transpose()?
+    };
     #[cfg(debug_assertions)]
     let loopback_only = loopback_only || std::env::var_os("SYQ_TEST_TCP_LOOPBACK_ONLY").is_some();
     let (port, listeners) = bind_data_listeners(lo, hi, loopback_only)?;
@@ -1207,13 +1380,14 @@ fn tcp_listen(
     // token, connection limit, replay set, and id sequence.
     for listener in listeners {
         listener.set_nonblocking(true)?;
-        let (key, token, next_id, live, seen, authority, descriptor_session) = (
+        let (key, token, next_id, live, seen, authority, source_authority, descriptor_session) = (
             key.clone(),
             token.clone(),
             next_id.clone(),
             live.clone(),
             seen.clone(),
             authority.clone(),
+            source_authority.clone(),
             descriptor_session.clone(),
         );
         let pacing = pacing.clone();
@@ -1229,6 +1403,7 @@ fn tcp_listen(
                 max_live,
                 seen,
                 authority,
+                source_authority,
                 descriptor_session,
                 pacing,
             )
@@ -1249,6 +1424,7 @@ fn accept_data_connections(
     max_live: u32,
     seen: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
     descriptor_session: DescriptorSessionSlot,
     pacing: Option<Arc<crate::bwlimit::transport::Budget>>,
 ) {
@@ -1257,6 +1433,9 @@ fn accept_data_connections(
             || authority
                 .as_ref()
                 .is_some_and(|authority| !authority.control_is_open())
+            || source_authority
+                .as_ref()
+                .is_some_and(|source| !source.is_open())
         {
             break;
         }
@@ -1293,12 +1472,13 @@ fn accept_data_connections(
             }
             continue; // drop; stream closes
         }
-        let (key, token, live, seen, authority, descriptor_session) = (
+        let (key, token, live, seen, authority, source_authority, descriptor_session) = (
             key.clone(),
             token.clone(),
             live.clone(),
             seen.clone(),
             authority.clone(),
+            source_authority.clone(),
             descriptor_session.clone(),
         );
         let pacing = pacing.clone();
@@ -1312,6 +1492,7 @@ fn accept_data_connections(
                 compress,
                 &seen,
                 authority.clone(),
+                source_authority.clone(),
                 descriptor_session,
                 pacing,
                 handshake_deadline,
@@ -1335,6 +1516,7 @@ fn serve_tcp(
     _compress: bool,
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
+    source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
     descriptor_session: DescriptorSessionSlot,
     pacing: Option<Arc<crate::bwlimit::transport::Budget>>,
     handshake_deadline: std::time::Instant,
@@ -1384,12 +1566,15 @@ fn serve_tcp(
     let output: Box<dyn Write + Send> = if let Some(budget) = pacing {
         let session = descriptor_session.clone();
         let socket = stream.try_clone()?;
+        let source = source_authority.clone();
         Box::new(crate::bwlimit::transport::PacedWriter {
             inner: stream.try_clone()?,
             budget,
             handshake_pending: Some(handshake_pending.clone()),
             stopped: move || {
-                session.is_closed() || crate::bwlimit::transport::socket_closed(&socket)
+                session.is_closed()
+                    || source.as_ref().is_some_and(|source| !source.is_open())
+                    || crate::bwlimit::transport::socket_closed(&socket)
             },
         })
     } else {
@@ -1415,6 +1600,7 @@ fn serve_tcp(
             loopback_only: false,
             named_socket: None,
             authority,
+            source_authority,
             descriptor_session,
         },
     );
@@ -1498,9 +1684,19 @@ struct ObservedWriter<W: Write> {
     last: std::time::Instant,
     enabled: bool,
     socket: Option<std::net::TcpStream>,
+    source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
 }
 impl<W: Write> ObservedWriter<W> {
     fn write_msg(&mut self, response: &Response) -> std::io::Result<()> {
+        if let Some(authority) = &self.source_authority {
+            if let Err(error) = authority.check_response(response) {
+                self.inner.write_msg(&Response::Err(format!("{error:#}")))?;
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    error.to_string(),
+                ));
+            }
+        }
         if self.enabled
             && self.last.elapsed() >= std::time::Duration::from_secs(1)
             && !matches!(response, Response::TransportStats(_))
@@ -1520,6 +1716,8 @@ impl<W: Write> ObservedWriter<W> {
     }
 }
 
+#[cfg(test)]
+mod source_tests;
 #[cfg(test)]
 mod tests;
 

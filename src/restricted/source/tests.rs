@@ -18,6 +18,8 @@ fn policy(path: &Path) -> SourcePolicy {
         preservation: Default::default(),
         sparse: false,
         compressed: false,
+        tcp: None,
+        send_rate: None,
         limits: CopyLimits {
             max_entries: 100,
             max_total_bytes: 1024,
@@ -194,14 +196,15 @@ fn exact_leaf_reads_ignore_display_paths_and_refuse_siblings_and_guards() {
     fs::write(&approved, b"approved").unwrap();
     fs::write(&secret, b"secret").unwrap();
     let mut fixture = Fixture::new(policy(&approved));
+    let worker = fixture.worker();
     let request = read(Some(fixture.source()), 8);
-    fixture.control.authorize(&request).unwrap();
+    worker.authorize(&request).unwrap();
     let response = fixture.ops.handle(&request);
-    fixture.control.check_response(&response).unwrap();
+    fixture.authority.check_response(&response).unwrap();
     assert!(matches!(response, Response::Block { data, .. } if data == b"approved"));
     let sibling = RegisteredPath::new(fixture.source().root(), b"secret".to_vec()).unwrap();
-    assert!(fixture.control.authorize(&read(Some(sibling), 6)).is_err());
-    assert!(fixture.control.authorize(&read(None, 6)).is_err());
+    assert!(worker.authorize(&read(Some(sibling), 6)).is_err());
+    assert!(worker.authorize(&read(None, 6)).is_err());
     let guarded = Request::FileHash {
         path: secret.as_os_str().as_bytes().to_vec(),
         source: Some(fixture.source()),
@@ -211,7 +214,7 @@ fn exact_leaf_reads_ignore_display_paths_and_refuse_siblings_and_guards() {
             ino: 0,
         }),
     };
-    assert!(fixture.control.authorize(&guarded).is_err());
+    assert!(worker.authorize(&guarded).is_err());
     fs::rename(&approved, temp.path().join("old")).unwrap();
     fs::write(&approved, b"replaced").unwrap();
     // The existing read descriptor still names the approved inode. A fresh
@@ -237,15 +240,16 @@ fn directory_reads_and_scans_keep_pinned_roots_and_refuse_symlink_escapes() {
     fs::write(outside.join("file"), b"secret!!").unwrap();
     symlink(&outside, directory.join("escape")).unwrap();
     let mut fixture = Fixture::new(policy(&directory));
+    let worker = fixture.worker();
     let escape = read(Some(fixture.source().join(b"escape/file").unwrap()), 8);
-    fixture.control.authorize(&escape).unwrap();
+    worker.authorize(&escape).unwrap();
     assert!(error_response(&fixture.ops.handle(&escape)));
     assert!(fixture.source().join(b"../outside/file").is_err());
 
     fs::rename(&directory, temp.path().join("moved")).unwrap();
     symlink(&outside, &directory).unwrap();
     let request = read(Some(fixture.source().join(b"file").unwrap()), 8);
-    fixture.control.authorize(&request).unwrap();
+    worker.authorize(&request).unwrap();
     assert!(
         matches!(fixture.ops.handle(&request), Response::Block { data, .. } if data == b"approved")
     );
@@ -259,7 +263,7 @@ fn directory_reads_and_scans_keep_pinned_roots_and_refuse_symlink_escapes() {
         report_ignored: false,
         guard: None,
     };
-    fixture.control.authorize(&scan).unwrap();
+    worker.authorize(&scan).unwrap();
     let source = fixture.ops.source_scan_root(Some(&root)).unwrap().unwrap();
     let mut entries = Vec::new();
     crate::scan::scan_descriptor(
@@ -305,8 +309,9 @@ fn followed_operator_symlinks_work_but_never_escape_a_hard_root() {
     };
     approved.selections[0].path = b"inside".to_vec();
     let mut fixture = Fixture::new(approved);
+    let worker = fixture.worker();
     let request = read(Some(fixture.source()), 8);
-    fixture.control.authorize(&request).unwrap();
+    worker.authorize(&request).unwrap();
     assert!(
         matches!(fixture.ops.handle(&request), Response::Block { data, .. } if data == b"approved")
     );
@@ -414,6 +419,7 @@ fn rejected_batches_do_not_consume_authority_and_streams_charge_each_chunk() {
     let mut approved = policy(temp.path());
     approved.limits.max_total_bytes = 8;
     let fixture = Fixture::new(approved);
+    let worker = fixture.worker();
     let reference = fixture.source().join(b"file").unwrap();
     let bad = Request::ReadSmallBatch(vec![
         SmallRead {
@@ -429,7 +435,7 @@ fn rejected_batches_do_not_consume_authority_and_streams_charge_each_chunk() {
             len: 4,
         },
     ]);
-    assert!(fixture.control.authorize(&bad).is_err());
+    assert!(worker.authorize(&bad).is_err());
     assert_eq!(fixture.authority.state.lock().unwrap().requested_bytes, 0);
     assert!(fixture.authority.state.lock().unwrap().paths.is_empty());
     let stream = ReadStreamRequest {
@@ -440,16 +446,12 @@ fn rejected_batches_do_not_consume_authority_and_streams_charge_each_chunk() {
         end: 8,
         block: 512,
     };
-    fixture
-        .control
+    worker
         .authorize(&Request::ReadStream(stream.clone()))
         .unwrap();
     assert_eq!(fixture.authority.state.lock().unwrap().requested_bytes, 0);
-    fixture.control.authorize(&stream.next_request()).unwrap();
-    assert!(fixture
-        .control
-        .authorize(&read(Some(reference), 1))
-        .is_err());
+    worker.authorize(&stream.next_request()).unwrap();
+    assert!(worker.authorize(&read(Some(reference), 1)).is_err());
 }
 
 #[test]
@@ -461,9 +463,12 @@ fn control_close_and_expiry_revoke_existing_workers_and_pending_output() {
     drop(fixture.control);
     assert!(worker.authorize(&read(Some(source.clone()), 1)).is_err());
     assert!(worker.record_scan(&source, [b"file".as_slice()]).is_err());
-    assert!(worker.check_response(&Response::Ok).is_err());
+    assert!(worker.authority.check_response(&Response::Ok).is_err());
     worker.authorize(&Request::StopReadStream).unwrap();
-    worker.check_response(&Response::ReadStreamDone).unwrap();
+    worker
+        .authority
+        .check_response(&Response::ReadStreamDone)
+        .unwrap();
     let mut expired = policy(temp.path());
     expired.deadline = Instant::now() - Duration::from_secs(1);
     let authority = SourceAuthority::new(expired).unwrap();
