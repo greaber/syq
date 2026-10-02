@@ -36,12 +36,17 @@ pub(crate) struct Session {
     stream: UnixStream,
     _broker: PrivateBroker,
     endpoint: NativeEndpoint,
+    peer: super::forward::ssh::Peer,
     options: Vec<OsString>,
 }
 
 impl Session {
     pub(crate) fn endpoint(&self) -> &NativeEndpoint {
         &self.endpoint
+    }
+
+    pub(crate) fn peer(&self) -> &super::forward::ssh::Peer {
+        &self.peer
     }
 
     pub(crate) fn options(&self) -> Vec<OsString> {
@@ -178,6 +183,11 @@ fn authorize_mode(
     Ok(Session {
         stream,
         _broker: broker,
+        peer: super::forward::ssh::Peer::from_approved(
+            &approved.endpoint,
+            &approved.known_hosts,
+            &approved.host_algorithms,
+        )?,
         endpoint: approved.endpoint,
         options,
     })

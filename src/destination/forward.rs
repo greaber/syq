@@ -11,10 +11,32 @@ pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HelperRequest {
+pub(super) struct HelperRequest {
     version: u16,
     identity: String,
     request: CopyRequest,
+}
+
+pub(super) fn peer_receiver(
+    spec: &crate::conn::RemoteSpec,
+    request: CopyRequest,
+    deadline: Instant,
+) -> Result<(ForwardChild, Approved)> {
+    let (child, reply) = ForwardChild::over_spec(
+        spec,
+        "--peer-receiver",
+        &HelperRequest {
+            version: HELPER_VERSION,
+            identity: crate::identity::build().into(),
+            request,
+        },
+        deadline,
+        &|| false,
+    )?;
+    let Reply::Approved(approved) = reply else {
+        bail!("invalid peer receiver setup response")
+    };
+    Ok((child, approved))
 }
 
 pub(super) fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
@@ -395,9 +417,85 @@ impl ForwardChild {
         }
         unreachable!("the second helper attempt returns its result")
     }
-    fn wait_for_exit(
+    /// Reuse an already authorized account transport without another login.
+    pub(super) fn over_spec<T: Serialize>(
+        spec: &crate::conn::RemoteSpec,
+        operation: &str,
+        request: &T,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(Self, Reply)> {
+        for install in [false, true] {
+            anyhow::ensure!(
+                !cancelled() && Instant::now() < deadline,
+                "copy setup stopped"
+            );
+            if install {
+                spec.install_helper()?;
+            }
+            let mut child = Self::spawn_command(spec.helper_command(&[operation.into()]))?;
+            let reply = (|| {
+                write_message(
+                    &mut DeadlineIo {
+                        inner: child.child.stdin.as_mut().unwrap(),
+                        deadline,
+                        cancelled: Some(cancelled),
+                    },
+                    request,
+                )?;
+                read_message(&mut DeadlineIo {
+                    inner: child.child.stdout.as_mut().unwrap(),
+                    deadline,
+                    cancelled: Some(cancelled),
+                })
+            })();
+            match reply {
+                Ok(Reply::Error(error)) => bail!("remote copy helper refused setup: {error}"),
+                Ok(reply) => return Ok((child, reply)),
+                Err(error) => {
+                    let status = child.wait_for_exit(deadline, cancelled);
+                    if !install
+                        && spec.bootstrap_helper
+                        && status
+                            .as_ref()
+                            .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
+                    {
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("approved account helper failed: {}", child.errors())
+                    });
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    pub(super) fn spawn_streaming_command(mut command: Command) -> Result<Self> {
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .process_group(0)
+            .spawn_guarded()?;
+        Ok(Self {
+            child,
+            errors: Arc::new(Mutex::new(Vec::new())),
+            capture: None,
+            closed: false,
+        })
+    }
+
+    pub(super) fn wait_for_exit(
         &mut self,
         deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<std::process::ExitStatus> {
+        self.wait_until_exit(Some(deadline), cancelled)
+    }
+    pub(super) fn wait_until_exit(
+        &mut self,
+        deadline: Option<Instant>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<std::process::ExitStatus> {
         loop {
@@ -422,14 +520,14 @@ impl ForwardChild {
             if info.si_signo != 0 {
                 return Ok(self.close()?);
             }
-            if cancelled() || Instant::now() >= deadline {
+            if cancelled() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 let _ = self.close();
                 bail!("return helper stopped while waiting for its exit status");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    fn spawn_command(mut command: Command) -> Result<Self> {
+    pub(super) fn spawn_command(mut command: Command) -> Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -505,28 +603,65 @@ fn pump(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64>
 }
 
 pub(super) fn relay(
+    socket: UnixStream,
+    input: std::process::ChildStdin,
+    output: std::process::ChildStdout,
+    cancelled: impl Fn() -> bool,
+    child: &mut ForwardChild,
+) -> Result<()> {
+    relay_inner(socket, input, output, cancelled, child, false).map(|_| ())
+}
+
+/// Wait for the coordinator to release its control after peer EOF. Its final
+/// stdout may be slow without leaving any live destination authority behind.
+pub(super) fn relay_peer(
+    socket: UnixStream,
+    input: std::process::ChildStdin,
+    output: std::process::ChildStdout,
+    cancelled: impl Fn() -> bool,
+    child: &mut ForwardChild,
+) -> Result<bool> {
+    relay_inner(socket, input, output, cancelled, child, true)
+}
+
+fn relay_inner(
     mut socket: UnixStream,
     mut input: std::process::ChildStdin,
     mut output: std::process::ChildStdout,
     cancelled: impl Fn() -> bool,
     child: &mut ForwardChild,
-) -> Result<()> {
+    wait_for_release: bool,
+) -> Result<bool> {
     let mut writer = socket.try_clone()?;
     let shutdown = socket.try_clone()?;
     let (done, completions) = mpsc::channel();
     let sent = done.clone();
     let upload = std::thread::spawn(move || {
-        let _ = sent.send(pump(&mut socket, &mut input));
+        let _ = sent.send((true, pump(&mut socket, &mut input)));
     });
     let download = std::thread::spawn(move || {
-        let _ = done.send(pump(&mut output, &mut writer));
+        let _ = done.send((false, pump(&mut output, &mut writer)));
     });
+    let mut release_deadline = None;
     let result = loop {
         if cancelled() {
             break Err(anyhow::anyhow!("return connection stopped during copy"));
         }
-        match completions.recv_timeout(Duration::from_millis(100)) {
-            Ok(result) => break result.map(|_| ()).map_err(Into::into),
+        if release_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break Ok(false);
+        }
+        match completions.recv_timeout(Duration::from_millis(10)) {
+            Ok((true, result)) => break result.map(|_| true).map_err(Into::into),
+            Ok((false, result)) if !wait_for_release => {
+                break result.map(|_| false).map_err(Into::into)
+            }
+            Ok((false, _)) => {
+                // Do not shut the read side: only a natural upload EOF proves
+                // that B has released control, including on normal completion.
+                let _ = shutdown.shutdown(std::net::Shutdown::Write);
+                let _ = child.close();
+                release_deadline = Some(Instant::now() + Duration::from_secs(2));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => break Err(error.into()),
         }
@@ -627,7 +762,7 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
     resolve_destination(home, None, path)
 }
 
-fn receive() -> Result<i32> {
+fn receive(metadata_control: bool) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
@@ -661,6 +796,9 @@ fn receive() -> Result<i32> {
             return Err(error);
         }
     };
+    let _lifetime = metadata_control
+        .then(|| crate::server::ControlLifetime::watch(&input, authority.clone()))
+        .transpose()?;
     let workers = ssh::Server::start(authority.clone())?;
     let mut approved = approved;
     approved.token = workers.ticket()?;
@@ -675,6 +813,7 @@ fn receive() -> Result<i32> {
             Duration::from_secs(10),
         ),
         pending,
+        metadata_control,
     );
     authority.close_control();
     drop(workers);
@@ -775,7 +914,8 @@ fn read_source_hostname(
 
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
-        "--return-receiver" if argv.len() == 2 => Some(receive()),
+        "--return-receiver" if argv.len() == 2 => Some(receive(false)),
+        "--peer-receiver" if argv.len() == 2 => Some(receive(true)),
         "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
         "--return-ssh-worker" if argv.len() == 3 => Some(
             argv[2]

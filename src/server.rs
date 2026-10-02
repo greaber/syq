@@ -123,6 +123,8 @@ struct ServeSession {
     handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     ssh_worker_ticket: Option<std::result::Result<String, String>>,
     allow_tcp: bool,
+    /// A bridged control may carry metadata and receipts, never file payloads.
+    metadata_control: bool,
     /// A local copy's receiver: listen for data on loopback only and
     /// advertise no interface addresses.
     loopback_only: bool,
@@ -192,6 +194,7 @@ pub fn run(local_receiver: bool) -> Result<()> {
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: true,
+            metadata_control: false,
             loopback_only: local_receiver,
             named_socket: None,
             authority: None,
@@ -223,6 +226,7 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
             handshake_pending: None,
             ssh_worker_ticket: Some(ticket),
             allow_tcp: true,
+            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority: Some(Arc::clone(&authority)),
@@ -240,6 +244,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
     authority: Arc<crate::restricted::RestrictedAuthority>,
     input: R,
     pending: Arc<std::sync::atomic::AtomicBool>,
+    metadata_control: bool,
 ) -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
@@ -253,6 +258,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
+            metadata_control,
             loopback_only: false,
             named_socket: None,
             authority: Some(authority.clone()),
@@ -263,6 +269,81 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
     descriptor_session.close();
     authority.close_control();
     result
+}
+
+/// Revoke even if the protocol reader is blocked behind queued metadata work.
+/// The authenticated control owns this guard; no worker may prolong its life.
+pub(crate) struct ControlLifetime {
+    wake: std::os::unix::net::UnixStream,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl ControlLifetime {
+    pub(crate) fn watch(
+        input: &impl std::os::fd::AsFd,
+        authority: Arc<crate::restricted::RestrictedAuthority>,
+    ) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let input = input.as_fd().try_clone_to_owned()?;
+        let (wake, stopped) =
+            crate::process::with_inheritance_guard(std::os::unix::net::UnixStream::pair)?;
+        let thread = std::thread::Builder::new()
+            .name("copy-control-lifetime".into())
+            .spawn(move || loop {
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: input.as_raw_fd(),
+                        events: 0,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: stopped.as_raw_fd(),
+                        events: 0,
+                        revents: 0,
+                    },
+                ];
+                let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+                if descriptors[1].revents != 0 {
+                    break;
+                }
+                if result > 0
+                    && descriptors[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                        != 0
+                {
+                    authority.close_control();
+                    break;
+                }
+                if result < 0 && io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    authority.close_control();
+                    break;
+                }
+            })?;
+        Ok(Self {
+            wake,
+            thread: Some(thread),
+        })
+    }
+}
+impl Drop for ControlLifetime {
+    fn drop(&mut self) {
+        let _ = self.wake.shutdown(std::net::Shutdown::Both);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn file_payload_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::WriteRange { .. }
+            | Request::PutSmallBatch(_)
+            | Request::CopySmallFiles(_)
+            | Request::DescriptorCopy(_)
+            | Request::ReadRange { .. }
+            | Request::ReadComparedRange { .. }
+            | Request::ReadSmallBatch(_)
+            | Request::ReadStream(_)
+    )
 }
 
 /// An authenticated named-destination channel. Worker admission and path
@@ -294,6 +375,7 @@ pub(crate) fn run_named(
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
+            metadata_control: false,
             loopback_only: false,
             named_socket: Some(socket),
             authority: Some(Arc::clone(&authority)),
@@ -329,6 +411,7 @@ pub(crate) fn run_authorized_source<R: Read + Send + 'static, W: Write>(
             handshake_pending: pending,
             ssh_worker_ticket: None,
             allow_tcp: true,
+            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority: None,
@@ -371,6 +454,7 @@ pub(crate) fn run_authorized_source_worker(
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
+            metadata_control: false,
             loopback_only: false,
             named_socket: Some(socket),
             authority: None,
@@ -405,6 +489,7 @@ pub(crate) fn run_named_tcp(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
+            metadata_control: false,
             loopback_only: false,
             named_socket: Some(channel),
             authority: Some(authority),
@@ -442,6 +527,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
         handshake_pending,
         ssh_worker_ticket,
         allow_tcp,
+        metadata_control,
         loopback_only,
         named_socket,
         authority,
@@ -518,6 +604,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     "build identity mismatch (remote {expected_identity}, client {identity})"
                 )))?;
                 bail!("build identity mismatch");
+            }
+            if metadata_control && !matches!(requested_role, ConnectionRole::Control) {
+                w.write_msg(&Response::Err(
+                    "bridged connection requires the control role".into(),
+                ))?;
+                bail!("bridged connection requires the control role");
             }
             if let Some(authority) = &authority {
                 authority.validate_hello(compress)?;
@@ -708,6 +800,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
         };
         drop(waiting);
         let (mut req, _request_hold) = queued.into_parts();
+        if metadata_control && file_payload_request(&req) {
+            w.write_msg(&Response::Err(
+                "file payload requires a direct data worker".into(),
+            ))?;
+            continue;
+        }
+
         if !is_control
             && matches!(
                 &req,
@@ -1604,6 +1703,7 @@ fn serve_tcp(
             handshake_pending: Some(handshake_pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
+            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority,

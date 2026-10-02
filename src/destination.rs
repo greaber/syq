@@ -33,6 +33,7 @@ pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
 mod identity;
+pub(crate) mod peer_bridge;
 pub(crate) mod pull;
 pub(crate) mod ssh;
 pub(crate) mod ssh_auth;
@@ -136,6 +137,19 @@ impl ReturnConnection {
         validate_data_hostname(&data_hostname)?;
         Ok(Arc::new(Self {
             ssh: None,
+            data_hostname: Some(data_hostname),
+            control: Mutex::new(Some(stream)),
+        }))
+    }
+
+    pub(super) fn peer(
+        stream: UnixStream,
+        ssh: forward::ssh::Client,
+        data_hostname: String,
+    ) -> Result<Arc<Self>> {
+        validate_data_hostname(&data_hostname)?;
+        Ok(Arc::new(Self {
+            ssh: Some(ssh),
             data_hostname: Some(data_hostname),
             control: Mutex::new(Some(stream)),
         }))
@@ -787,6 +801,9 @@ fn select_copy(
     {
         return Ok(None);
     }
+    if peer_bridge::configure(args)? {
+        return Ok(None);
+    }
     // A helper handoff carries the already selected, identity-checked receiver.
     // Re-reading mutable defaults here could redirect the original request.
     if let Some(name) = handoff::selected_name(handoff::Kind::Forward)
@@ -795,6 +812,10 @@ fn select_copy(
         args.auth_from = crate::cli::AuthFrom::Return(name.to_owned());
     } else {
         crate::auth_from::apply_copy(args)?;
+        if let Some(selection) = peer_bridge::select(args)? {
+            args.peer_bridge = Some(Arc::new(selection));
+            return Ok(None);
+        }
         if account_copy::select(args)? {
             return Ok(None);
         }
@@ -879,6 +900,9 @@ fn select_copy(
 }
 
 pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+    if peer_bridge::configure(args)? {
+        return Ok(());
+    }
     let selection = match args.return_selection.take() {
         Some(selection) => selection,
         None => select_copy(args, None)?,
@@ -1782,6 +1806,9 @@ fn destinations(action: DestinationAction) -> Result<i32> {
     }
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if let Some(result) = peer_bridge::dispatch(argv) {
+        return Some(result);
+    }
     if let Some(result) = ssh::persistent::dispatch(argv) {
         return Some(result);
     }

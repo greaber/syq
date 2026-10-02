@@ -207,6 +207,31 @@ pub(super) fn setup() -> Result<i32> {
     Ok(0)
 }
 
+pub(in crate::destination) fn setup_over_spec(
+    spec: &crate::conn::RemoteSpec,
+    ticket: &str,
+    public_key: &str,
+    cancelled: &impl Fn() -> bool,
+) -> Result<()> {
+    let (_child, reply) = ForwardChild::over_spec(
+        spec,
+        "--return-ssh-setup",
+        &SetupRequest {
+            identity: crate::identity::build().into(),
+            ticket: ticket.into(),
+            public_key: canonical_key(public_key)?,
+        },
+        Instant::now() + SETUP_TIMEOUT,
+        cancelled,
+    )?;
+    anyhow::ensure!(
+        matches!(reply, Reply::Ready),
+        "invalid peer SSH setup response"
+    );
+    anyhow::ensure!(!cancelled(), "peer copy closed during SSH setup");
+    Ok(())
+}
+
 /// sshd ignores the caller's requested command and runs exactly this worker.
 pub(super) fn worker(encoded: &str) -> Result<i32> {
     let mut socket = Ticket::decode(encoded)?.connect()?;
@@ -224,7 +249,7 @@ pub(super) fn worker(encoded: &str) -> Result<i32> {
     Ok(0)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Peer {
     host: String,
@@ -234,6 +259,78 @@ pub(crate) struct Peer {
     algorithms: String,
 }
 impl Peer {
+    pub(crate) fn from_approved(
+        endpoint: &crate::cli::NativeEndpoint,
+        known_hosts: &str,
+        algorithms: &str,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            known_hosts.len() <= 64 * 1024,
+            "approved host keys are too long"
+        );
+        let mut normalized = String::new();
+        for line in known_hosts.lines() {
+            let (alias, key) = line.split_once(' ').context("invalid approved host key")?;
+            anyhow::ensure!(
+                matches!(alias, "syq-approved-peer" | "syq-copy-peer"),
+                "invalid approved host-key alias"
+            );
+            let key = ssh_key::PublicKey::from_openssh(key)?;
+            normalized.push_str("syq-copy-peer ");
+            normalized.push_str(&key.to_openssh()?);
+            normalized.push('\n');
+        }
+        let peer = Self {
+            host: endpoint.host.clone(),
+            user: endpoint
+                .user
+                .clone()
+                .context("approved peer has no login user")?,
+            port: endpoint.port.context("approved peer has no port")?,
+            known_hosts: normalized,
+            algorithms: algorithms.into(),
+        };
+        peer.validate_endpoint(endpoint)?;
+        Ok(peer)
+    }
+
+    pub(crate) fn validate_endpoint(&self, endpoint: &crate::cli::NativeEndpoint) -> Result<()> {
+        super::super::validate_data_hostname(&self.host)?;
+        anyhow::ensure!(
+            self.host == endpoint.host
+                && endpoint.user.as_deref() == Some(&self.user)
+                && endpoint.port == Some(self.port)
+                && self.port != 0,
+            "approved SSH peer differs from account endpoint"
+        );
+        anyhow::ensure!(
+            !self.user.is_empty()
+                && self.user.len() <= 1024
+                && !self.user.bytes().any(|b| b.is_ascii_control()),
+            "invalid approved SSH user"
+        );
+        anyhow::ensure!(
+            !self.algorithms.is_empty()
+                && self.algorithms.len() <= 4096
+                && self
+                    .algorithms
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_,.@".contains(&b)),
+            "invalid approved SSH algorithms"
+        );
+        anyhow::ensure!(
+            !self.known_hosts.is_empty() && self.known_hosts.len() <= 64 * 1024,
+            "invalid approved SSH host keys"
+        );
+        for line in self.known_hosts.lines() {
+            let key = line
+                .strip_prefix("syq-copy-peer ")
+                .context("invalid approved host-key alias")?;
+            ssh_key::PublicKey::from_openssh(key).context("invalid approved host key")?;
+        }
+        Ok(())
+    }
+
     fn resolve(target: &str) -> Result<Self> {
         let endpoint = target_endpoint(target)?;
         let policy = crate::agent_broker::resolve_host_policy_at(
@@ -362,9 +459,15 @@ impl Receiver {
 /// Requester state. Debug deliberately excludes registration credentials,
 /// private-key paths, and all contents of the key.
 pub(crate) struct Client {
-    registration: Registration,
-    token: String,
+    setup: Setup,
     state: Mutex<Option<Ready>>,
+}
+enum Setup {
+    Return {
+        registration: Registration,
+        token: String,
+    },
+    PeerBridge(super::super::peer_bridge::Ticket),
 }
 struct Ready {
     directory: tempfile::TempDir,
@@ -379,17 +482,35 @@ impl std::fmt::Debug for Client {
 impl Client {
     pub(in crate::destination) fn new(registration: Registration, token: String) -> Self {
         Self {
-            registration,
-            token,
+            setup: Setup::Return {
+                registration,
+                token,
+            },
+            state: Mutex::new(None),
+        }
+    }
+    pub(in crate::destination) fn peer_bridge(ticket: super::super::peer_bridge::Ticket) -> Self {
+        Self {
+            setup: Setup::PeerBridge(ticket),
             state: Mutex::new(None),
         }
     }
     pub(crate) fn command(&self) -> Result<Command> {
         self.command_with(|public_key| {
+            let Setup::Return {
+                registration,
+                token,
+            } = &self.setup
+            else {
+                let Setup::PeerBridge(ticket) = &self.setup else {
+                    unreachable!()
+                };
+                return ticket.ssh(public_key);
+            };
             let (_, reply) = exchange(
-                &self.registration,
+                registration,
                 Message::ForwardSsh {
-                    token: self.token.clone(),
+                    token: token.clone(),
                     public_key: public_key.to_owned(),
                 },
                 SETUP_TIMEOUT + Duration::from_secs(10),

@@ -142,6 +142,32 @@ impl Cached {
     pub(crate) fn options(&self) -> Vec<OsString> {
         master_options(&self.0)
     }
+    /// Optional process-lifetime metadata; old account records remain usable.
+    pub(crate) fn peer(&self) -> Result<super::super::forward::ssh::Peer> {
+        read_peer(&self.0)
+    }
+}
+
+fn peer_path(record: &Record) -> std::path::PathBuf {
+    record.control.with_extension("peer.json")
+}
+
+fn read_peer(record: &Record) -> Result<super::super::forward::ssh::Peer> {
+    let file = OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(peer_path(record))
+        .context("approved account has no pinned peer metadata; reconnect with syq persist connect ENDPOINT --auth-from @NAME")?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0
+            && metadata.len() <= 128 * 1024,
+        "approved SSH peer metadata must be a bounded owner-only file"
+    );
+    let peer: super::super::forward::ssh::Peer = serde_json::from_reader(file)?;
+    peer.validate_endpoint(&record.endpoint)?;
+    Ok(peer)
 }
 
 pub(crate) fn cached(authorizer: &str, requested: &NativeEndpoint) -> Result<Option<Cached>> {
@@ -582,6 +608,15 @@ fn keeper(startup: Startup) -> Result<()> {
         }
         signals.wait(POLL)?;
     }
+    // Keep the unchanged v1 index readable by older helpers. The optional peer
+    // policy lives only with this master, in its owner-only temporary scope.
+    let mut peer_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(peer_path(&record))?;
+    serde_json::to_writer(&mut peer_file, session.peer())?;
+    peer_file.write_all(b"\n")?;
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     serde_json::to_writer(&mut temporary, &record)?;
     temporary.write_all(b"\n")?;
@@ -683,6 +718,54 @@ mod tests {
         .unwrap();
         assert!(read_record(&path).is_err());
         assert!(read_record(&root.path().join("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn peer_sidecar_preserves_old_account_records_and_requires_exact_endpoint() {
+        // Unchanged v1 shape: an old reader also rejects unknown Record fields.
+        let old = r#"{"version":1,"authorizer":"laptop","requested":{"user":null,"host":"alias","port":null},"endpoint":{"user":"user","host":"server","port":22},"control":"/tmp/old/socket"}"#;
+        let mut record: Record = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        assert!(master_options(&record)
+            .iter()
+            .any(|word| word == "ForwardAgent=no"));
+        let root = crate::test_support::tempdir().unwrap();
+        record.control = root.path().join("socket");
+        let missing = read_peer(&record).unwrap_err();
+        assert!(format!("{missing:#}").contains("reconnect with syq persist connect"));
+        let key = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+            "",
+        )
+        .unwrap();
+        let peer = super::super::super::forward::ssh::Peer::from_approved(
+            &record.endpoint,
+            &format!(
+                "syq-approved-peer {}\n",
+                key.public_key().to_openssh().unwrap()
+            ),
+            "ssh-ed25519",
+        )
+        .unwrap();
+        let path = peer_path(&record);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &peer).unwrap();
+        assert!(read_peer(&record).is_ok());
+        record.endpoint.host = "different".into();
+        assert!(read_peer(&record).is_err());
+        record.endpoint.host = "server".into();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_peer(&record).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let saved = root.path().join("saved");
+        fs::rename(&path, &saved).unwrap();
+        std::os::unix::fs::symlink(saved, path).unwrap();
+        assert!(read_peer(&record).is_err());
     }
 
     #[test]

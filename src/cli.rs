@@ -128,6 +128,9 @@ pub struct Args {
     pub(crate) s3_remove: crate::s3::RemoveFlags,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
+    /// Approved account pair selected once for a direct peer copy.
+    #[arg(skip)]
+    pub(crate) peer_bridge: Option<std::sync::Arc<crate::destination::peer_bridge::Selection>>,
     /// Destination SSH connection opened while choosing automatic authorization.
     #[arg(skip)]
     pub(crate) direct_destination: Option<Box<crate::conn::RemoteSpec>>,
