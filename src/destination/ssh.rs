@@ -281,7 +281,12 @@ mod tests {
         assert!(brief.contains("-t"));
         assert!(brief.contains("-T"));
         assert!(brief.contains("[COMMAND]"));
-        let full = command_for_help().render_long_help().to_string();
+        let full = command_for_help()
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(full.contains("joined with spaces"));
         assert!(full.contains("literal arguments"));
         assert!(full.contains("enclose IPv6 addresses in brackets"));
