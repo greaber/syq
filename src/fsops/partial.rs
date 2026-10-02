@@ -1688,37 +1688,6 @@ impl FsOps {
                 None => published_identity(&file, flags),
             };
         }
-        if target.guard.is_none()
-            && matches!(
-                condition,
-                TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
-            )
-        {
-            // Ordinary existing-file updates preserve the selected inode.
-            // Validate before truncation, then prove the rooted name still
-            // identifies that descriptor after the update.
-            let file = rooted.root.open_regular_write(&rooted.relative, false)?;
-            require_open_target(&file, &rooted.label, condition)?;
-            file.set_len(0)?;
-            observed_write(&self.operation, &file, data, 0, self.sparse)
-                .with_context(|| format!("write existing {}", rooted.label.display()))?;
-            file.set_len(data.len() as u64)?;
-            check_destination_writes(&file, &rooted.label)?;
-            set_meta_file(&file, meta, flags)
-                .with_context(|| format!("set metadata {}", rooted.label.display()))?;
-            require_rooted_named_identity(
-                &rooted.root,
-                &rooted.relative,
-                &rooted.label,
-                &file,
-                condition,
-            )?;
-            return published_identity(&file, flags);
-        }
-
-        // New/replace small files, and the existing guarded-receiver
-        // policy, stage through the same private rooted sidecar as ranged
-        // writes do.
         let stage = self.create_small_stage(put, rooted)?;
         self.write_small_stage(put, &stage)?;
         self.publish_small_stage(put, &stage)?;
@@ -2332,73 +2301,6 @@ impl FsOps {
             }
             let reader = target.root.open_regular_read(&src_relative)?;
             Self::verify_expected_inode(&file, &reader, expected)?;
-        }
-
-        if !guarded
-            && matches!(
-                condition,
-                TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
-            )
-        {
-            if !checked_early {
-                require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
-            }
-            // Ordinary identity-conditioned staged updates preserve the
-            // existing destination inode.
-            // Keep the cached writer pinned while independently opening the
-            // exact same named sidecar for reading.
-            let staged_metadata = file.metadata()?;
-            let mut staged = target.root.open_regular_read(&src_relative)?;
-            require_safe_rooted_named_partial(&target.root, &src_relative, &src, &staged)?;
-            let reopened_metadata = staged.metadata()?;
-            if staged_metadata.dev() != reopened_metadata.dev()
-                || staged_metadata.ino() != reopened_metadata.ino()
-            {
-                bail!("partial {} changed before publication", src.display());
-            }
-
-            self.uncache_rooted(&target.root, &target.relative);
-            let mut destination = target.root.open_regular_write(&target.relative, false)?;
-            require_open_target(&destination, &target.label, condition)?;
-            let size = reopened_metadata.len();
-            destination.set_len(0)?;
-            staged.seek(SeekFrom::Start(0))?;
-            destination.seek(SeekFrom::Start(0))?;
-            let copy = if self.sparse {
-                let mut buffer = vec![0; 1 << 20];
-                let mut offset = 0;
-                (|| -> io::Result<u64> {
-                    while offset < size {
-                        let want = (size - offset).min(buffer.len() as u64) as usize;
-                        staged.read_exact(&mut buffer[..want])?;
-                        crate::sparse::write_at(&destination, &buffer[..want], offset, false)?;
-                        offset += want as u64;
-                    }
-                    Ok(offset)
-                })()
-            } else {
-                io::copy(&mut staged, &mut destination)
-            };
-            copy.with_context(|| format!("update existing {}", target.label.display()))?;
-            self.set_copy_length(&destination, size)?;
-            check_destination_writes(&destination, &target.label)?;
-            set_meta_file(&destination, meta, flags)
-                .with_context(|| format!("set metadata {}", target.label.display()))?;
-            require_rooted_named_identity(
-                &target.root,
-                &target.relative,
-                &target.label,
-                &destination,
-                condition,
-            )?;
-            discard_safe_rooted_partial_if_same(
-                &target.root,
-                &src_relative,
-                staged_metadata.dev(),
-                staged_metadata.ino(),
-                &src,
-            )?;
-            return published_identity(&destination, flags);
         }
 
         match &created {
