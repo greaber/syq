@@ -223,7 +223,7 @@ pub(in crate::destination) fn setup_over_spec(
         },
         Instant::now() + SETUP_TIMEOUT,
         cancelled,
-    )?;
+    ).context("set up direct SSH data workers; the approved destination connection must allow a second concurrent SSH session (sshd MaxSessions >= 2); direct TCP does not need that session")?;
     anyhow::ensure!(
         matches!(reply, Reply::Ready),
         "invalid peer SSH setup response"
