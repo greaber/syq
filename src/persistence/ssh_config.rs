@@ -47,6 +47,7 @@ fn export(requested: &NativeEndpoint, endpoint: &NativeEndpoint, control: &Path)
             .to_str()
             .context("SSH config export requires a UTF-8 persistence path")?
     );
+    let config = render(requested, endpoint, &pattern)?;
     let alias = expanded_control(&pattern, endpoint)?;
     ensure!(
         alias.parent() == Some(scope)
@@ -74,7 +75,7 @@ fn export(requested: &NativeEndpoint, endpoint: &NativeEndpoint, control: &Path)
         }
         Err(error) => return Err(error).context("create exported SSH socket alias"),
     }
-    render(requested, endpoint, &pattern)
+    Ok(config)
 }
 
 fn expanded_control(pattern: &str, endpoint: &NativeEndpoint) -> Result<PathBuf> {
@@ -189,7 +190,7 @@ mod tests {
 
     #[test]
     fn native_config_keeps_overridden_endpoints_away_from_the_socket() {
-        let temporary = crate::test_support::tempdir();
+        let temporary = crate::test_support::tempdir().unwrap();
         let config = temporary.path().join("config");
         let endpoint = endpoint();
         let requested = NativeEndpoint {
@@ -243,7 +244,7 @@ mod tests {
         assert!(quote("bad\rHost *").is_err());
         let pattern = "/tmp/path with space/quote\"back\\slash/%%value-%C";
         let endpoint = endpoint();
-        let temporary = crate::test_support::tempdir();
+        let temporary = crate::test_support::tempdir().unwrap();
         let config = temporary.path().join("config");
         fs::write(&config, render(&endpoint, &endpoint, pattern).unwrap()).unwrap();
         let output = Command::new("ssh")
