@@ -1596,28 +1596,38 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
-    for selector in [
-        vec![],
-        vec!["--auth-from", "@laptop"],
-        vec!["--auth-from", "auto"],
-    ] {
-        let uses_ssh = !selector.contains(&"@laptop");
-        let mut words = vec!["syq", "cp", "source", "--to", "backup"];
-        words.extend(selector);
-        words.extend(["--into", "anything"]);
-        let index = (words.len() - 1).to_string();
-        let mut args = vec!["__complete", "fish", &index, "--"];
-        args.extend(words);
-        let output = completion_command(&t, &args)
-            .current_dir(t.path(""))
-            .env("PATH", t.path("bin"))
-            .capture_output()
-            .unwrap();
-        assert_output_ok(&output);
-        assert!(output.stdout.is_empty(), "{output:?}");
-        assert_eq!(t.path("home/ssh-used").exists(), uses_ssh);
-        if uses_ssh {
-            fs::remove_file(t.path("home/ssh-used")).unwrap();
+    for source in [false, true] {
+        for selector in [
+            vec![],
+            vec!["--auth-from", "@laptop"],
+            vec!["--auth-from", "auto"],
+            vec!["--auth-from", "ssh"],
+        ] {
+            let uses_ssh = !selector.contains(&"@laptop");
+            let mut words = if source {
+                vec!["syq", "cp", "--from", "backup"]
+            } else {
+                vec!["syq", "cp", "source", "--to", "backup"]
+            };
+            words.extend(selector);
+            if !source {
+                words.push("--into");
+            }
+            words.push("anything");
+            let index = (words.len() - 1).to_string();
+            let mut args = vec!["__complete", "fish", &index, "--"];
+            args.extend(words);
+            let output = completion_command(&t, &args)
+                .current_dir(t.path(""))
+                .env("PATH", t.path("bin"))
+                .capture_output()
+                .unwrap();
+            assert_output_ok(&output);
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(t.path("home/ssh-used").exists(), uses_ssh);
+            if uses_ssh {
+                fs::remove_file(t.path("home/ssh-used")).unwrap();
+            }
         }
     }
 }
@@ -1905,4 +1915,278 @@ fn completion_cache_skips_repeated_hosts_and_replaces_damaged_files() {
     let listed = completion_command(&t, &["cache", "list"]).run().unwrap();
     assert_output_ok(&listed);
     assert_eq!(listed.stdout, b"fake.example\n");
+}
+
+// A recorded approved master with a fake SSH liveness check. The serialized
+// format stays independent of completion: it is the existing version-1 index.
+fn approved_completion_master(t: &Tmp, authorizer: &str) -> PathBuf {
+    let scope = ephemeral_scope(t);
+    let parent = scope.parent().unwrap();
+    let approved = parent.join(format!("approved-{authorizer}"));
+    let index = parent.join("authorized-ssh-v1");
+    fs::rename(&scope, &approved).unwrap();
+    fs::create_dir_all(&index).unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+    let control = approved.join("s");
+    let _listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
+    let requested = r#"{"user":null,"host":"backup","port":null}"#;
+    let identity = format!(
+        "[{},{}]",
+        serde_json::to_string(authorizer).unwrap(),
+        requested
+    );
+    let record = serde_json::json!({
+        "version": 1, "authorizer": authorizer,
+        "requested": serde_json::from_str::<serde_json::Value>(requested).unwrap(),
+        "endpoint": {"user": "approved", "host": "resolved.example", "port": 2222},
+        "control": control,
+    });
+    let path = index.join(format!(
+        "{}.json",
+        blake3::hash(identity.as_bytes()).to_hex()
+    ));
+    write(&path, &serde_json::to_vec(&record).unwrap());
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    control
+}
+
+fn approved_completion_fixture(t: &Tmp) {
+    fs::create_dir(t.runtime()).unwrap();
+    fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
+    let ssh = fake_ssh(t);
+    let script = fs::read_to_string(&ssh).unwrap()
+        .replace("-o|-l|-p|-S)", "-o|-l|-p|-S|-F)")
+        .replace("shift\nHOME=", "shift\nif [ -n \"${FAKE_SSH_SESSION_STATUS:-}\" ]; then exit \"$FAKE_SSH_SESSION_STATUS\"; fi\nHOME=");
+    executable(&ssh, script.as_bytes());
+    assert_output_ok(&persistence_command(t, &["on"]).run().unwrap());
+}
+
+fn approved_completion_command(t: &Tmp, words: &[&str]) -> Command {
+    let index = (words.len() - 1).to_string();
+    let mut args = vec!["__complete", "bash", &index, "--"];
+    args.extend_from_slice(words);
+    let mut command = completion_command(t, &args);
+    command
+        .current_dir(t.path(""))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.path("bin").display()))
+        .env("SYQ_COMPLETION_DEBUG", "1");
+    command
+}
+
+#[test]
+fn approved_completion_respects_authorization_for_source_and_destination_paths() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    let control = approved_completion_master(&t, "laptop");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    for source in [false, true] {
+        for mode in [None, Some("auto"), Some("@laptop"), Some("ssh")] {
+            let mut words = vec!["syq", "cp", "--syq-path", env!("CARGO_BIN_EXE_syq")];
+            if source {
+                words.extend(["--from", "backup"]);
+            } else {
+                words.extend(["file", "--to", "backup"]);
+            }
+            if let Some(mode) = mode {
+                words.extend(["--auth-from", mode]);
+            }
+            if !source {
+                words.push("--into");
+            }
+            words.push(&path);
+            let output = approved_completion_command(&t, &words).run().unwrap();
+            assert_output_ok(&output);
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(
+                completion_values(&output.stdout),
+                vec![(
+                    b'p',
+                    t.path("remote-home/data/nested/")
+                        .into_os_string()
+                        .into_vec()
+                )]
+            );
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            if mode == Some("ssh") {
+                assert!(!log.contains("ProxyCommand=false"), "{log}");
+                assert!(!log.contains("resolved.example"), "{log}");
+                assert!(log.contains("backup"), "{log}");
+            } else {
+                assert!(log.contains(&format!("-S {}", control.display())), "{log}");
+                assert!(log.contains("ProxyCommand=false"), "{log}");
+                assert!(
+                    log.contains("-l approved -p 2222 -- resolved.example"),
+                    "{log}"
+                );
+                assert!(!log.contains("ControlMaster=auto"), "{log}");
+                assert!(!log.contains("-- backup"), "{log}");
+            }
+            fs::remove_file(t.path("rsh.log")).unwrap();
+        }
+    }
+    // Saved defaults and overrides also use the common path for other commands.
+    write(
+        &t.path("config/syq/auth-from.json"),
+        br#"{"default":"ssh","hosts":{"backup":"@laptop"}}"#,
+    );
+    for (command, endpoint_flag) in [
+        ("cp", "--from"),
+        ("map", "--from"),
+        ("rm", "--on"),
+        ("clean-partials", "--on"),
+    ] {
+        let words = [
+            "syq",
+            command,
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            endpoint_flag,
+            "backup",
+            &path,
+        ];
+        let output = approved_completion_command(&t, &words).run().unwrap();
+        assert_output_ok(&output);
+        assert!(!output.stdout.is_empty(), "{command}: {output:?}");
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        assert!(log.contains("ProxyCommand=false"), "{command}: {log}");
+        fs::remove_file(t.path("rsh.log")).unwrap();
+    }
+    let remote_path = format!("backup:{path}");
+    let output = approved_completion_command(
+        &t,
+        &[
+            "syq",
+            "rsync",
+            "--rsync-path",
+            env!("CARGO_BIN_EXE_syq"),
+            &remote_path,
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&output);
+    assert!(!output.stdout.is_empty(), "{output:?}");
+    assert!(fs::read_to_string(t.path("rsh.log"))
+        .unwrap()
+        .contains("ProxyCommand=false"));
+}
+
+#[test]
+fn approved_completion_missing_ambiguous_and_failed_masters_never_fall_back() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    let control = approved_completion_master(&t, "laptop");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let words = |mode| {
+        vec![
+            "syq",
+            "cp",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--from",
+            "backup",
+            "--auth-from",
+            mode,
+            &path,
+        ]
+    };
+    let output = approved_completion_command(&t, &words("@missing"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no live approved account connection"),
+        "{output:?}"
+    );
+    assert!(!t.path("rsh.log").exists());
+
+    let _other = approved_completion_master(&t, "other");
+    let output = approved_completion_command(&t, &words("auto"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("more than one laptop"),
+        "{output:?}"
+    );
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(log.lines().all(|line| line.contains("-O check")), "{log}");
+    fs::remove_file(t.path("rsh.log")).unwrap();
+
+    let output = approved_completion_command(&t, &words("@laptop"))
+        .env("FAKE_SSH_SESSION_STATUS", "55")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty());
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        log.lines().all(|line| line.contains("ProxyCommand=false")),
+        "{log}"
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| !line.contains("-O check"))
+            .count(),
+        1,
+        "{log}"
+    );
+    fs::remove_file(t.path("rsh.log")).unwrap();
+
+    fs::remove_file(control).unwrap();
+    let output = approved_completion_command(&t, &words("@laptop"))
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty());
+    assert!(!t.path("rsh.log").exists());
+}
+
+#[test]
+fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    approved_completion_master(&t, "laptop");
+    write(
+        &t.path("config/syq/auth-from.json"),
+        br#"{"default":"@missing"}"#,
+    );
+    let scope = ephemeral_scope(&t);
+    let path = format!("{}/n", t.s("remote-home/data"));
+    for source in [false, true] {
+        for scope_route in [false, true] {
+            let mut words = vec!["syq", "cp", "--syq-path", env!("CARGO_BIN_EXE_syq")];
+            if source {
+                words.extend(["--from", "backup"]);
+            } else {
+                words.extend(["file", "--to", "backup"]);
+            }
+            if scope_route {
+                words.extend(["--pscope", scope.to_str().unwrap()]);
+            } else {
+                words.extend(["--rsh", "custom-shell"]);
+            }
+            if !source {
+                words.push("--into");
+            }
+            words.push(&path);
+            let output = approved_completion_command(&t, &words).run().unwrap();
+            assert_output_ok(&output);
+            if scope_route {
+                assert!(!output.stdout.is_empty(), "{output:?}");
+                let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+                assert!(!log.contains("ProxyCommand=false"), "{log}");
+                assert!(log.contains(scope.to_str().unwrap()), "{log}");
+                fs::remove_file(t.path("rsh.log")).unwrap();
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!t.path("rsh.log").exists());
+            }
+        }
+    }
 }
