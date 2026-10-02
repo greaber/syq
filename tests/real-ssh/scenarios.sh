@@ -474,6 +474,9 @@ python3 /usr/local/libexec/syq-test-pull-copy.py
 printf 'case: direct SSH sessions authorized through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-ssh.py
 
+printf 'case: native tools reuse laptop-approved account connections\n'
+python3 /usr/local/libexec/syq-test-ssh-tools.py
+
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
 
