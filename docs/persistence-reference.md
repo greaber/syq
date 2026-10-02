@@ -19,7 +19,8 @@ syq persist auth-from --reset
 
 `@laptop` goes straight to that machine without first trying the server's SSH
 credentials. If it is unavailable or refuses the request, the command fails.
-The setting chooses where to ask; every request still needs its normal approval.
+New authorization still needs its normal approval; existing account access can
+be reused.
 `ssh` uses the server's own access and ignores approved account connections.
 `auto` first reuses an existing approved account login for the exact typed
 endpoint. If more than one receiving name has approved that endpoint, choose
