@@ -24,6 +24,12 @@ pub(crate) struct RemoveFlags {
     pub s3_version_id: Option<String>,
 }
 impl RemoveFlags {
+    fn individual_deletes(&self, tuning: &super::tuning::Tuning, authorized: bool) -> bool {
+        // Tigris supports version IDs on DeleteObject, but ignores them on
+        // DeleteObjects. Ordinary deletion can still use batches there.
+        authorized || (tuning.tigris() && (self.s3_all_versions || self.s3_version_id.is_some()))
+    }
+
     pub fn validate(&self, s3: bool, count: usize, kinds: &[SourceSelection]) -> Result<()> {
         if !s3 && (self.s3_all_versions || self.s3_version_id.is_some()) {
             bail!("--s3-all-versions and --s3-version-id require --on s3://BUCKET");
@@ -449,18 +455,11 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 Ok(())
             };
             let tuning = super::tuning::Tuning::new(&options, &args, control);
-            if tuning.tigris() && authorization.is_none()
-                && (args.s3_remove.s3_all_versions || args.s3_remove.s3_version_id.is_some())
-            {
-                progress.warning(
-                    "Tigris versioned bulk deletion has been observed to ignore version IDs, leaving versions intact and creating delete markers. Continuing with standard S3 requests; verify the resulting version history. Provider behavior may have changed.",
-                );
-            }
             let deleter = delete::Deleter {
                 client: &client,
                 bucket: &options.bucket,
                 budget: &tuning.requests,
-                individual: authorization.is_some(),
+                individual: args.s3_remove.individual_deletes(&tuning, authorization.is_some()),
             };
             let identify = |entry: &Entry| delete::Target {
                 key: entry.key.clone(),
@@ -618,3 +617,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "remove/request_tests.rs"]
+mod request_tests;
