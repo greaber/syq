@@ -1283,6 +1283,7 @@ impl FsOps {
         }
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
+        check_destination_writes(&file, &label)?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the open

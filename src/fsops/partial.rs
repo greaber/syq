@@ -1422,6 +1422,10 @@ impl FsOps {
             // completed file for writing would fail. Finalize removes every
             // attempt for this path, so CopyLocal needs no wire attempt field.
             self.cache_file(target.location(), 0, false, d);
+        } else {
+            // Finalize reopens the partial. Collect errors on this original
+            // writer now: a later open may not observe an already reported error.
+            close_writer(d, &target_label)?;
         }
         _copy.bytes(size);
         Ok(CopyLocalOutcome::Copied)
@@ -1661,6 +1665,7 @@ impl FsOps {
             };
             observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
+            check_destination_writes(&file, &rooted.label)?;
             match &created {
                 Some(created) => set_meta_written_file(&file, meta, flags, created),
                 None => set_meta_file(&file, meta, flags),
@@ -1698,6 +1703,7 @@ impl FsOps {
             observed_write(&self.operation, &file, data, 0, self.sparse)
                 .with_context(|| format!("write existing {}", rooted.label.display()))?;
             file.set_len(data.len() as u64)?;
+            check_destination_writes(&file, &rooted.label)?;
             set_meta_file(&file, meta, flags)
                 .with_context(|| format!("set metadata {}", rooted.label.display()))?;
             require_rooted_named_identity(
@@ -2272,6 +2278,7 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
+            check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;
                 Self::verify_expected_inode(&file, &reader, expected)?;
@@ -2318,6 +2325,7 @@ impl FsOps {
         if checked_early {
             require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         }
+        check_destination_writes(&file, &src)?;
         if let Some(expected) = expected {
             if !checked_early {
                 require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
@@ -2373,6 +2381,7 @@ impl FsOps {
             };
             copy.with_context(|| format!("update existing {}", target.label.display()))?;
             self.set_copy_length(&destination, size)?;
+            check_destination_writes(&destination, &target.label)?;
             set_meta_file(&destination, meta, flags)
                 .with_context(|| format!("set metadata {}", target.label.display()))?;
             require_rooted_named_identity(
@@ -3386,6 +3395,79 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
         tv_sec: sec as libc::time_t,
         tv_nsec: nsec as libc::c_long,
     }
+}
+
+/// Collect pending write errors before metadata changes and publication, while
+/// keeping the original inode pinned. Linux NFS flushes on a duplicate close.
+/// macOS closes duplicates without calling the filesystem, so flush NFS/SMB
+/// explicitly there. This is not a general crash-durability guarantee and does
+/// not collect every error reported on other workers' cached handles.
+pub(crate) fn check_destination_writes(file: &File, label: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let check = || -> io::Result<()> {
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: fstatfs initializes stats, including a NUL-terminated type
+            // name, on success. Inspect this inode, not a root that might have
+            // a different filesystem mounted underneath it.
+            crate::sys::retry_zero(|| unsafe {
+                libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr())
+            })?;
+            let stats = unsafe { stats.assume_init() };
+            let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+            if matches!(kind.to_bytes(), b"nfs" | b"smbfs") {
+                // Use ordinary fsync: Rust's sync_all/sync_data request the
+                // stronger, expensive F_FULLFSYNC on macOS. Local filesystems
+                // need neither this flush nor an ineffective duplicate close.
+                // SAFETY: file keeps this descriptor alive through the call.
+                crate::sys::retry_zero(|| unsafe { libc::fsync(file.as_raw_fd()) })?;
+            }
+            #[cfg(debug_assertions)]
+            fail_writer_close_for_test(label)?;
+            Ok(())
+        };
+        check().with_context(|| format!("check destination writes {}", label.display()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let writer = file
+            .try_clone()
+            .with_context(|| format!("duplicate destination writer {}", label.display()))?;
+        close_writer(writer, label)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn close_writer(file: File, label: &Path) -> Result<()> {
+    use std::os::fd::IntoRawFd;
+    let check = || -> io::Result<()> {
+        let fd = file.into_raw_fd();
+        // SAFETY: into_raw_fd transfers ownership. Close exactly once: retrying
+        // an interrupted close can close a descriptor reused by another thread.
+        if unsafe { libc::close(fd) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(debug_assertions)]
+        fail_writer_close_for_test(label)?;
+        Ok(())
+    };
+    check().with_context(|| format!("check destination writes {}", label.display()))
+}
+
+#[cfg(debug_assertions)]
+fn fail_writer_close_for_test(label: &Path) -> io::Result<()> {
+    if let Some(pattern) = std::env::var_os("SYQ_TEST_FAIL_WRITER_CLOSE") {
+        if !pattern.is_empty()
+            && label
+                .as_os_str()
+                .as_bytes()
+                .windows(pattern.as_bytes().len())
+                .any(|part| part == pattern.as_bytes())
+        {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {

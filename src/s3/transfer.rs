@@ -2562,6 +2562,13 @@ impl Engine {
         flushed?;
         let partial = record.lock().await.partial.clone();
         let partial_path = RelativePath::new(partial.as_bytes())?;
+        // A network filesystem may flush here; keep that off the async workers.
+        let writer = file.clone();
+        let label = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::fsops::check_destination_writes(&writer, &label)
+        })
+        .await??;
         for expected in self.download_digests(&metadata, expected_hash) {
             let f = root.open_regular_read(&partial_path)?;
             tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
@@ -2706,6 +2713,12 @@ impl Engine {
                 tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
             }
             self.check_cancelled()?;
+            let writer = file.clone();
+            let label = path_buf.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::fsops::check_destination_writes(&writer, &label)
+            })
+            .await??;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit)?;
             let m = file.metadata()?;
             if self.args.ignore_existing
