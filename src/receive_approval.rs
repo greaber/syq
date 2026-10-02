@@ -50,6 +50,7 @@ pub(crate) enum Kind {
     #[default]
     Copy,
     Command,
+    Ssh,
     Storage,
 }
 impl Kind {
@@ -109,6 +110,11 @@ pub(crate) struct Summary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Details {
+    Ssh {
+        kind: SshKind,
+        destination: String,
+        permission: String,
+    },
     Storage {
         kind: StorageKind,
         description: String,
@@ -132,6 +138,11 @@ pub(crate) enum Details {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CommandKind {
     Command,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SshKind {
+    Ssh,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +265,7 @@ impl Summary {
         match self.details {
             Details::Copy { .. } => Kind::Copy,
             Details::Command { .. } => Kind::Command,
+            Details::Ssh { .. } => Kind::Ssh,
             Details::Storage { .. } => Kind::Storage,
         }
     }
@@ -333,6 +345,7 @@ impl Summary {
         };
         let body = match &self.details {
             Details::Storage { description, .. } => description.clone(),
+            Details::Ssh { destination, permission, .. } => format!("{destination}\n{permission}"),
             Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
                 format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine."),
             Details::Command { argv, cwd, permission, .. } =>
@@ -345,6 +358,7 @@ impl Summary {
         let question = match self.kind() {
             Kind::Copy => "Allow this copy once?",
             Kind::Command => "Run this command once?",
+            Kind::Ssh => "Allow access to this SSH account?",
             Kind::Storage => "Authorize this storage access?",
         };
         format!(
@@ -653,6 +667,44 @@ impl Queue {
             },
         }, notifications, TIMEOUT, cancelled)
     }
+    pub(crate) fn request_ssh(
+        &self,
+        from: &Requester,
+        command: &[Vec<u8>],
+        cwd: &str,
+        endpoint: &crate::cli::NativeEndpoint,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        let target = format!(
+            "{}@{}:{}",
+            endpoint.user.as_deref().unwrap_or(""),
+            endpoint.host,
+            endpoint.port.unwrap_or(22)
+        );
+        self.wait(Summary {
+            id: id.iter().map(|b| format!("{b:02x}")).collect(),
+            from: format!("{:?}", from.to_string()),
+            server: from.server.clone(),
+            expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
+            notification: "starting".into(),
+            command: crate::approval_command::display(command),
+            server_cwd: shown_directory(cwd),
+            verb: "wants SSH account access",
+            sources: Vec::new(),
+            preposition: "to",
+            target: target.clone(),
+            notes: vec!["This grants account access, not permission for only the displayed command.".into()],
+            details: Details::Ssh {
+                kind: SshKind::Ssh,
+                destination: target,
+                permission: "May use this account's full authority for this SSH login. Copy roots and limits do not apply. Session traffic travels directly between the servers.".into(),
+            },
+        }, notifications, TIMEOUT, cancelled)
+    }
+
     pub(crate) fn request_storage(
         &self,
         from: &Requester,

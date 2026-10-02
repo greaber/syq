@@ -33,6 +33,7 @@ mod forward;
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod ssh;
+pub(crate) mod ssh_auth;
 pub(crate) mod storage;
 pub(crate) mod tcp;
 
@@ -139,6 +140,7 @@ enum Message {
         challenge: String,
     },
     Exec(exec::ExecRequest),
+    Ssh(ssh_auth::Request),
     // Copy and storage requests carry the command that produced them. The
     // receiving machine derives the request from it and shows it for approval.
     // `cwd` is the requesting process's working directory, shown with the
@@ -1023,6 +1025,7 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
+            Message::Ssh(request) => self.authorize_ssh(request, stream),
             Message::Storage {
                 command,
                 cwd,

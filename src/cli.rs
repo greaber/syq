@@ -3060,7 +3060,7 @@ pub(crate) fn native_basename(path: &[u8]) -> Option<&[u8]> {
     (!name.is_empty() && name != b"." && name != b"..").then_some(name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NativeEndpoint {
     pub(crate) user: Option<String>,
     pub(crate) host: String,
