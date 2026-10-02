@@ -324,7 +324,7 @@ impl Drop for Starting {
 pub(crate) fn connect(request: SessionRequest) -> Result<()> {
     super::super::ssh_auth::prepare_persistent(&request)?;
     let scope = crate::persistence::enable_global_scope()?;
-    if command(&request)?.is_some() {
+    if command(&request, &AuthFrom::Return(request.authorizer.clone()))?.is_some() {
         crate::output::human_stdout!(
             "SSH account connection ready through @{}",
             request.authorizer
