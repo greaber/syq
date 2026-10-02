@@ -1260,6 +1260,7 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
         "Connection timed out during banner exchange",
         "ssh: Could not resolve hostname backup: Operation timed out",
         "ssh: Could not resolve hostname backup: Temporary failure in name resolution",
+        "ssh: Could not resolve hostname backup: Try again",
         "ssh: connect to host backup port 22: Network is unreachable",
         "ssh: connect to host backup port 22: Permission denied",
         "user@backup: Permission denied (publickey).\nConnection to backup timed out",

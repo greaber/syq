@@ -71,12 +71,14 @@ fn classify(stderr: &[u8]) -> Option<Failure> {
     if let Some(message) = last.strip_prefix("ssh: Could not resolve hostname ") {
         let (_, reason) = message.rsplit_once(": ")?;
         let reason = reason.to_ascii_lowercase();
-        // DNS timeouts can also appear as a temporary resolution failure.
-        // Neither permits switching authorizers under the no-timeout policy.
+        // DNS timeouts can also appear as a temporary resolution failure,
+        // which musl's gai_strerror calls "Try again". Neither permits
+        // switching authorizers under the no-timeout policy.
         return (!reason.contains("timed out")
             && !reason.contains("timeout")
-            && !reason.contains("temporary"))
-        .then_some(Failure::Hostname);
+            && !reason.contains("temporary")
+            && reason != "try again")
+            .then_some(Failure::Hostname);
     }
     if last.starts_with("ssh: connect to host ") && last.ends_with(": Connection refused") {
         return Some(Failure::ConnectionRefused);
@@ -125,6 +127,7 @@ mod tests {
             ("Host key verification failed.", Failure::HostKey),
             ("ssh: connect to host host port 22: Connection refused", Failure::ConnectionRefused),
             ("ssh: Could not resolve hostname host: Name or service not known", Failure::Hostname),
+            ("ssh: Could not resolve hostname host: Name does not resolve", Failure::Hostname),
             ("ssh: Could not resolve hostname host: nodename nor servname provided, or not known", Failure::Hostname),
         ] {
             assert_eq!(classify(diagnostic.as_bytes()), Some(failure), "{diagnostic}");
@@ -137,6 +140,7 @@ mod tests {
             "user@host: Permission denied (publickey).\nConnection to host timed out",
             "ssh: Could not resolve hostname host: Operation timed out",
             "ssh: Could not resolve hostname host: Temporary failure in name resolution",
+            "ssh: Could not resolve hostname host: Try again",
             "Host key verification failed.\nConnection to host timed out",
         ] {
             assert_eq!(classify(diagnostic.as_bytes()), None, "{diagnostic}");
