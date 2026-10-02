@@ -2120,24 +2120,23 @@ impl Worker {
                     }
                 }
                 released |= !self.gate.allowed(self.id);
-                // Check cancellation and optionally claim work with one scheduler
-                // lock, including while the last read replies are draining.
-                if adaptive && !released && !refresh_latency {
+                if adaptive && !released {
                     if let Some(slot) = current {
-                        if budget.range_latency_check_due(std::time::Instant::now()) {
-                            refresh_latency = true;
-                            if slow {
-                                // Peers can start the unread suffix while this
-                                // worker drains its already-issued requests.
-                                self.update_range_split(
-                                    &flights[slot].as_ref().expect("readable range").handle,
-                                    budget.request_bytes(),
-                                    block,
-                                );
-                            }
+                        refresh_latency |=
+                            budget.range_latency_check_due(std::time::Instant::now());
+                        if refresh_latency && slow {
+                            // Keep peers informed as replies reveal slower
+                            // service during the drain, before the next read.
+                            self.update_range_split(
+                                &flights[slot].as_ref().expect("readable range").handle,
+                                budget.request_bytes(),
+                                block,
+                            );
                         }
                     }
                 }
+                // Check cancellation and optionally claim work with one scheduler
+                // lock, including while the last read replies are draining.
                 let claim = (!released
                     && !refresh_latency
                     && current.is_none()

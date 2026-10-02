@@ -87,6 +87,7 @@ struct PipelineState {
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
     arrival_delay: Option<std::time::Duration>,
+    arrival_delays: std::collections::VecDeque<std::time::Duration>,
     early_range_acks: bool,
     steal_range_at: Option<(usize, Arc<Sched>)>,
     stolen_range: Option<RangeHandle>,
@@ -253,7 +254,12 @@ impl Conn for PipelineConn {
     }
     fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
         let response = self.recv()?;
-        let delay = self.0.lock().unwrap().arrival_delay.unwrap_or_default();
+        let mut state = self.0.lock().unwrap();
+        let delay = state
+            .arrival_delays
+            .pop_front()
+            .or(state.arrival_delay)
+            .unwrap_or_default();
         Ok((response, std::time::Instant::now() + delay))
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -3705,15 +3711,20 @@ fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
 
 #[test]
 fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
-    check_adaptive_range_handoff(false);
+    check_adaptive_range_handoff(false, 5);
 }
 
 #[test]
 fn slow_ranges_become_shareable_before_draining_for_a_latency_check() {
-    check_adaptive_range_handoff(true);
+    check_adaptive_range_handoff(true, 5);
 }
 
-fn check_adaptive_range_handoff(recheck: bool) {
+#[test]
+fn slow_ranges_keep_split_hints_current_while_draining() {
+    check_adaptive_range_handoff(true, 6);
+}
+
+fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
     let block = 4 << 20;
     let size = 16 << 20;
     let sched = Arc::new(Sched::new(block, 32 << 20));
@@ -3723,13 +3734,19 @@ fn check_adaptive_range_handoff(recheck: bool) {
     let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
     let src = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
-        steal_range_at: Some((5, sched.clone())),
+        steal_range_at: Some((steal_at, sched.clone())),
         ..Default::default()
     }));
     let dst = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
         // Inject service time without a slow or timing-sensitive test.
         arrival_delay: Some(std::time::Duration::from_secs(1)),
+        // The second completion can reveal worse service during the drain.
+        arrival_delays: if steal_at == 6 {
+            [1, 4].map(std::time::Duration::from_secs).into()
+        } else {
+            Default::default()
+        },
         ..Default::default()
     }));
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
@@ -3752,7 +3769,8 @@ fn check_adaptive_range_handoff(recheck: bool) {
     if recheck {
         let state = src.lock().unwrap();
         assert_eq!(
-            state.sent_at_receive[4], 7,
+            state.sent_at_receive[steal_at - 1],
+            7,
             "no refill before the peer steals"
         );
         assert!(
@@ -3777,6 +3795,12 @@ fn check_adaptive_range_handoff(recheck: bool) {
     }));
     let mut peer = pipeline_worker(&sched, &peer_src, &peer_dst, false);
     let expected_start = peer_range.lock().unwrap().split.unwrap().minimum / 2;
+    if steal_at == 6 {
+        assert!(
+            expected_start <= 128 << 10,
+            "the peer must inherit the smaller hint from the second slow completion: {expected_start}"
+        );
+    }
     assert!(
         expected_start < 1 << 20,
         "the donor has measured slow service"
