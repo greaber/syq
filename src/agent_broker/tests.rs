@@ -505,7 +505,7 @@ fn resolved_policy_exports_only_keys_above_laptop_rsa_minimum() {
     // Supply the laptop's effective policy without making this regression
     // depend on the test machine supporting the newer OpenSSH directive.
     std::fs::write(&ssh, format!(
-        "#!/bin/sh\nconfiguration={}\nfor arg in \"$@\"; do if [ \"$arg\" = /dev/null ]; then configuration=/dev/null; fi; done\necho \"debug1: Reading configuration data $configuration\" >&2\nprintf '%s\\n' 'user backup' 'hostname vault' 'port 22' {} 'globalknownhostsfile none' 'hostkeyalgorithms rsa-sha2-512' 'requiredrsasize 3072'\n",
+        "#!/bin/sh\nconfiguration={}\nfor arg in \"$@\"; do if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi; done\necho \"debug1: Reading configuration data $configuration\" >&2\nprintf '%s\\n' 'user backup' 'hostname vault' 'port 22' {} 'globalknownhostsfile none' 'hostkeyalgorithms rsa-sha2-512' 'requiredrsasize 3072'\n",
         shell_words::quote(config.to_str().unwrap()),
         shell_words::quote(&format!("userknownhostsfile {}", known_hosts.display())),
     )).unwrap();
