@@ -9,19 +9,20 @@ Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/
 ### Upgrade notes
 
 - Automation output now uses schema 4 for ordinary calls and schema 5 for
-  callback mappings. Replace the top-level `elapsed_ms` and
-  `copying_elapsed_ms` fields with `timings.total_ms` and `timings.transfer_ms`.
-  Diagnostic sampling windows now use `sample_duration_ms`. The Python SDK
-  exposes these measurements through `Timings`; update the SDK and executable
-  together, since older and newer versions reject each other's output schemas.
+  stream mappings. Top-level `elapsed_ms` moves to `timings.total_ms`;
+  `copying_elapsed_ms` moves to `timings.transfer_ms` for filesystem and S3
+  copies. In activity objects, including per-endpoint entries, `elapsed_ms`
+  is now `sample_duration_ms`. The Python SDK exposes these measurements
+  through `Timings`; update the SDK and executable together, since older and
+  newer versions reject each other's output schemas.
 
 ### Transfer timing
 
-- Report setup, planning, transfer, finalization, total run time, and helper
-  installation separately. These measurements can overlap. Transfer elapsed
-  time and speed exclude initial setup and helper installation, and stop
-  advancing during finalization. Interactive copies show a compact timing
-  summary; automation exposes the measurements in `timings`.
+- Filesystem copies report setup, planning, transfer, finalization, total run
+  time, and helper installation separately. These measurements can overlap.
+  Transfer elapsed time and speed exclude initial setup and helper installation,
+  and stop advancing during finalization. Interactive copies show a compact
+  timing summary; automation exposes the measurements in `timings`.
 
 ## 0.7.1 — 2026-09-22
 
