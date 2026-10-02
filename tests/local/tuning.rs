@@ -1614,10 +1614,20 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
             "--into",
             &t.s("private-destination"),
             "--no-progress",
+            "--results",
+            &t.s("results.ndjson"),
         ])
         .run()
         .unwrap();
     assert_output_ok(&output);
+    let terminal: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(t.path("results.ndjson"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
     let output = history_command(&t)
         .args(["tuning-cache", "export"])
         .run()
@@ -1632,6 +1642,10 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(records[0]["run"]["status"], "success");
+    let copying_ms = records[0]["run"]["summary"]["copying_elapsed_ms"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(terminal["timings"]["transfer_ms"], copying_ms);
     assert!(records[0]["run"]["selected_workers"].is_null());
     assert!(records
         .iter()

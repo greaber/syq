@@ -4,6 +4,27 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## Unreleased
+
+### Upgrade notes
+
+- Automation output now uses schema 4 for ordinary calls and schema 5 for
+  stream mappings. Top-level `elapsed_ms` moves to `timings.total_ms`;
+  `copying_elapsed_ms` moves to `timings.transfer_ms` for filesystem and S3
+  copies. In activity objects, including per-endpoint entries, `elapsed_ms`
+  is now `sample_duration_ms`. The Python SDK exposes these measurements
+  through `Timings`; update the SDK and executable together, since older and
+  newer versions reject each other's output schemas.
+
+### Transfer timing
+
+- Filesystem copies report setup, planning, transfer, finalization, total run
+  time, and helper installation separately. These measurements can overlap.
+  Transfer elapsed time and speed exclude initial setup and helper installation,
+  and stop advancing during finalization. Interactive copies show a compact
+  timing summary; automation exposes the measurements in `timings`.
+  S3 progress rates also stop updating during pruning.
+
 ## 0.7.1 — 2026-09-22
 
 - Strengthen single-part S3 upload integrity by reusing the prepared SHA-256

@@ -1367,6 +1367,21 @@ fn serve(
         return;
     }
     if fault.starts_with("prune-") {
+        if fault == "prune-timing" {
+            if method == "HEAD" {
+                reply(&mut socket, 404, &[], b"", true);
+                return;
+            }
+            if method == "PUT" {
+                let length: usize = headers["content-length"].parse().unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                assert_eq!(body, b"payload");
+                gate.0.store(true, Ordering::Release);
+                reply(&mut socket, 200, &[], b"", false);
+                return;
+            }
+        }
         if method == "GET" {
             let keys: Vec<String> = match fault {
                 "prune-outside" => vec!["elsewhere/extra".into()],
@@ -1413,6 +1428,10 @@ fn serve(
                 .map(|s| s.split("</Key>").next().unwrap())
                 .collect();
             assert!(!keys.is_empty() && keys.len() <= 1000);
+            if fault == "prune-timing" {
+                assert!(gate.0.load(Ordering::Acquire), "pruned before uploading");
+                thread::sleep(Duration::from_millis(2100));
+            }
             if fault == "prune-concurrent" {
                 let (arrived, peer) = if keys.len() == 1000 {
                     (&gate.0, &gate.1)
@@ -3287,6 +3306,59 @@ fn s3_review_upload_hash_compares_objects_without_matching_stored_digest() {
             server.gate.0.load(Ordering::Acquire),
             changed,
             "{fault}: unchanged object was uploaded again"
+        );
+    }
+}
+
+#[test]
+fn s3_transfer_timing_excludes_delayed_pruning() {
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    std::fs::write(temp.path().join("source/data"), b"payload").unwrap();
+    let server = Server::start("prune-timing");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune",
+            "--results",
+            "results.ndjson",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    let records: Vec<serde_json::Value> =
+        std::fs::read_to_string(temp.path().join("results.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["status"], "success");
+    assert_eq!(terminal["bytes_transferred"], 7);
+    assert_eq!(terminal["deletions_completed"], 1);
+    let total = terminal["timings"]["total_ms"].as_u64().unwrap();
+    let transfer = terminal["timings"]["transfer_ms"].as_u64().unwrap();
+    assert!(total >= transfer + 2000, "{terminal}");
+    let progress: Vec<_> = records.iter().filter(|r| r["type"] == "progress").collect();
+    let (final_progress, live_progress) = progress.split_last().unwrap();
+    assert_eq!(final_progress["timings"], terminal["timings"]);
+    let during_prune: Vec<_> = live_progress
+        .iter()
+        .filter(|r| {
+            r["files_done"] == 1 && r["timings"]["total_ms"].as_u64().unwrap() + 500 <= total
+        })
+        .collect();
+    assert!(!during_prune.is_empty(), "no live progress during pruning");
+    for record in during_prune {
+        assert_eq!(record["timings"]["transfer_ms"], transfer, "{record}");
+        assert_eq!(
+            record["rate_bytes_per_second"], final_progress["rate_bytes_per_second"],
+            "{record}"
         );
     }
 }

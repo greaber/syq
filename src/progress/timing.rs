@@ -17,8 +17,8 @@ pub struct Timings {
     pub helper_install_ms: Option<u64>,
 }
 
-/// Only coarse coordinator work uses these guards. Per-file measurement keeps
-/// the existing atomic first/last timestamps, without locking on each file.
+/// Only coarse coordinator work uses these guards. File work shares one start
+/// timestamp and an atomic last-completion timestamp, without locking on each file.
 #[derive(Default)]
 pub struct Measurement(Mutex<Vec<(Instant, Option<Instant>)>>);
 

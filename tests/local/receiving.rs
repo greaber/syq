@@ -1262,9 +1262,11 @@ fn automatic_authorization_reuses_working_ssh_without_contacting_receivers() {
     for diagnostic in [
         "ssh: connect to host backup port 22: Connection timed out",
         "Connection timed out during banner exchange",
-        "ssh: connect to host backup port 22: Connection refused",
+        "ssh: Could not resolve hostname backup: Operation timed out",
+        "ssh: Could not resolve hostname backup: Temporary failure in name resolution",
+        "ssh: Could not resolve hostname backup: Try again",
+        "ssh: connect to host backup port 22: Network is unreachable",
         "ssh: connect to host backup port 22: Permission denied",
-        "Host key verification failed.",
         "user@backup: Permission denied (publickey).\nConnection to backup timed out",
         "",
     ] {
@@ -1338,24 +1340,25 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\necho 'Permission denied (publickey).' >&2\nexit 255\n",
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let paths = std::env::join_paths(paths).unwrap();
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
+    let command = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_RUNTIME_DIR", t.path("runtime"))
             .env("PATH", &paths)
             .env("SYQ_NO_UPDATE_CHECK", "1")
-            .current_dir(t.path(""))
-            .capture_output()
-            .unwrap()
+            .current_dir(t.path(""));
+        command
     };
+    let run = |args: &[&str]| command(args).capture_output().unwrap();
     let identity = String::from_utf8(run(&["--build-identity"]).stdout).unwrap();
     let registry = t.path(".syq-destinations-v3");
     fs::create_dir(&registry).unwrap();
@@ -1378,7 +1381,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     let ssh_marker = t.path("ssh-used");
     let responder = std::thread::spawn(move || {
         let mut messages = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..10 {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
@@ -1442,9 +1445,11 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     );
     assert!(!refused.status.success());
     assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
-    assert_eq!(
-        stderr_of(&refused).matches("SSH connection failed").count(),
-        1
+    assert!(
+        stderr_of(&refused).lines().any(|line| line
+            == "syq: backup: SSH connection failed (exit status: 255): credentials were rejected; trying authorization through @laptop"),
+        "{}",
+        stderr_of(&refused)
     );
     fs::remove_file(t.path("ssh-used")).unwrap();
     let records: Vec<serde_json::Value> = fs::read_to_string(t.path("result.ndjson"))
@@ -1453,6 +1458,32 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(records.last().unwrap()["status"], "failed");
+
+    for (diagnostic, reason) in [
+        (
+            "Host key verification failed.",
+            "host key verification failed on the source machine",
+        ),
+        (
+            "ssh: Could not resolve hostname backup: Name or service not known",
+            "destination hostname could not be resolved",
+        ),
+        (
+            "ssh: connect to host backup port 22: Connection refused",
+            "connection was refused",
+        ),
+    ] {
+        let refused = command(&["cp", "source", "--to", "backup"])
+            .env("SYQ_TEST_SSH_FAILURE", diagnostic)
+            .capture_output()
+            .unwrap();
+        let stderr = stderr_of(&refused);
+        assert!(!refused.status.success());
+        assert!(stderr.contains("copy denied by fixture"), "{stderr}");
+        assert!(stderr.contains(reason), "{stderr}");
+        assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
 
     // Unsupported options and explicit SSH never ask a receiving machine.
     for extra in [
@@ -1515,8 +1546,13 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         messages[1]["message"]["Forward"]["request"]["copy"]["policy"]["existing"],
         "Replace"
     );
-    assert_eq!(messages[2]["secret"], "z-other");
-    assert_eq!(messages[3]["secret"], "ssh");
+    for pair in messages[2..8].chunks_exact(2) {
+        assert_eq!(pair[0]["secret"], "laptop");
+        assert_eq!(pair[0]["message"], "Ping");
+        assert!(pair[1]["message"].get("Forward").is_some());
+    }
+    assert_eq!(messages[8]["secret"], "z-other");
+    assert_eq!(messages[9]["secret"], "ssh");
     // The registry remains, but every socket is now unavailable. Discovery
     // must allow ordinary SSH instead of treating stale names as reservations.
     let offline = run(&["cp", "source", "--to", "backup"]);
@@ -1527,6 +1563,19 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         "SSH should be attempted once when no receiver answers: {}",
         stderr_of(&offline),
     );
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    let host_key = command(&["cp", "source", "--to", "backup"])
+        .env("SYQ_TEST_SSH_FAILURE", "Host key verification failed.")
+        .capture_output()
+        .unwrap();
+    assert!(!host_key.status.success());
+    let stderr = stderr_of(&host_key);
+    assert!(
+        stderr.lines().any(|line| line.starts_with("syq:")
+            && line.contains("host key verification failed on the source machine")),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
 }
 
 #[test]
