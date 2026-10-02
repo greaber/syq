@@ -1088,13 +1088,7 @@ fn account_auth_selection_is_explicit_for_each_ssh_operation() {
             "@laptop",
         ],
     ] {
-        let args = crate::approval_command::parse(
-            &words
-                .iter()
-                .map(|word| word.as_bytes().to_vec())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+        let args = Args::parse_args(&argv(&words)).unwrap();
         assert!(args.auth_from_explicit, "{words:?}");
         assert_eq!(args.auth_from, super::AuthFrom::Return("laptop".into()));
     }
@@ -1105,15 +1099,6 @@ fn account_auth_selection_is_explicit_for_each_ssh_operation() {
     ] {
         let mut words = words;
         words.extend(["--auth-from", "@laptop"]);
-        assert!(
-            crate::approval_command::parse(
-                &words
-                    .iter()
-                    .map(|word| word.as_bytes().to_vec())
-                    .collect::<Vec<_>>()
-            )
-            .is_err(),
-            "{words:?}"
-        );
+        assert!(Args::parse_args(&argv(&words)).is_err(), "{words:?}");
     }
 }

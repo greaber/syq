@@ -215,8 +215,8 @@ def persistent_cases(expected):
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/roundtrip"))
         mapping = source_run(["map", "--from", "destination", "-C", copy_root, "data"])
         assert len(mapping.splitlines()) == 1, mapping
-        source_run(["rsync", "-a", "--no-tcp", root + "/data", "destination:" + copy_root + "/rsync-data"])
-        source_run(["rsync", "-a", "--no-tcp", "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"])
+        source_run(["rsync", "-a", "--syq-no-tcp", root + "/data", "destination:" + copy_root + "/rsync-data"])
+        source_run(["rsync", "-a", "--syq-no-tcp", "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"])
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/rsync-roundtrip"))
         source_run(["clean-partials", "--on", "destination", copy_root, "--auth-from", "@laptop"])
         run("ssh", "destination", "test -f " + shlex.quote(copy_root + "/data"))
