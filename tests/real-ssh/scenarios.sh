@@ -477,6 +477,9 @@ python3 /usr/local/libexec/syq-test-return-ssh.py
 printf 'case: native tools reuse laptop-approved account connections\n'
 python3 /usr/local/libexec/syq-test-ssh-tools.py
 
+printf 'case: direct three-server copies use approved account connections\n'
+python3 /usr/local/libexec/syq-test-peer-bridge.py
+
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
 
