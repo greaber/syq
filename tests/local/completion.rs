@@ -1586,6 +1586,15 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
         &["@ssh"],
     );
     assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-from", "au"], &["auto"]);
+    for (command, flag) in [
+        ("rm", "--auth-from"),
+        ("map", "--auth-from"),
+        ("clean-partials", "--auth-from"),
+        ("rsync", "--syq-auth-from"),
+    ] {
+        assert_completion_candidates(&t, &["syq", command, flag, "@lap"], &["@laptop"]);
+        assert_completion_candidates(&t, &["syq", command, flag, "ss"], &["ssh"]);
+    }
     assert_completion_candidates(
         &t,
         &["syq", "cp", "source", "--into", "local-f"],
@@ -2082,6 +2091,32 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
     assert!(fs::read_to_string(t.path("rsh.log"))
         .unwrap()
         .contains("ProxyCommand=false"));
+    fs::remove_file(t.path("rsh.log")).unwrap();
+    for mode in ["@missing", "ssh"] {
+        let output = approved_completion_command(
+            &t,
+            &[
+                "syq",
+                "rsync",
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--syq-auth-from",
+                mode,
+                &remote_path,
+            ],
+        )
+        .env("FAKE_SSH_SESSION_STATUS", "55")
+        .run()
+        .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stdout.is_empty(), "{output:?}");
+        if mode == "ssh" {
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            assert!(!log.contains("ProxyCommand=false"), "{log}");
+        } else {
+            assert!(!t.path("rsh.log").exists());
+        }
+    }
 }
 
 #[test]
