@@ -1103,3 +1103,100 @@ exit 0
             .unwrap(),
     );
 }
+
+#[test]
+fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
+    let t = Tmp::new();
+    // Unchanged persistence format from released v0.7.1. An older binary
+    // ignores auth-from.json and can still read its own settings unchanged.
+    let old = b"{\"enabled\":false}\n";
+    write(&t.path("config/syq/persistence.json"), old);
+    let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();
+    assert_output_ok(&run(&["auth-from", "@laptop"]));
+    assert_output_ok(&run(&["auth-from", "ssh", "--for", "backup"]));
+    let shown = run(&["auth-from"]);
+    assert_output_ok(&shown);
+    assert_eq!(
+        String::from_utf8(shown.stdout).unwrap(),
+        "default: @laptop\nbackup: ssh\n"
+    );
+    assert_eq!(read(&t.path("config/syq/persistence.json")), old);
+    assert_output_ok(&run(&["status"]));
+    assert_output_ok(&run(&["auth-from", "--reset", "--for", "backup"]));
+    let shown = run(&["auth-from", "--for", "backup"]);
+    assert_eq!(
+        String::from_utf8(shown.stdout).unwrap(),
+        "backup: @laptop (default)\n"
+    );
+    assert_output_ok(&run(&["auth-from", "--reset"]));
+    assert_eq!(
+        String::from_utf8(run(&["auth-from"]).stdout).unwrap(),
+        "default: auto\n"
+    );
+    assert!(!run(&["auth-from", "ssh", "--reset"]).status.success());
+}
+
+#[test]
+fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\necho 'Permission denied (publickey).' >&2\nexit 255\n");
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .capture_output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["persist", "auth-from", "@missing"]));
+    let output = run(&["cp", "source", "--to", "backup"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("missing"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    assert_output_ok(&run(&["persist", "auth-from", "ssh", "--for", "backup"]));
+    assert!(!run(&["cp", "source", "--to", "user@backup:2222"])
+        .status
+        .success());
+    assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    write(&t.path("config/syq/auth-from.json"), b"future schema");
+    let output = run(&["cp", "source", "--to", "backup"]);
+    assert!(
+        stderr_of(&output).contains("pass --auth-from explicitly"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    for mode in ["auto", "ssh"] {
+        let output = run(&["cp", "source", "--to", "backup", "--auth-from", mode]);
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
+    let output = run(&["cp", "source", "--to", "backup", "--auth-from", "@other"]);
+    assert!(
+        stderr_of(&output).contains("other"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    // Routes that do not use return authorization do not read these settings.
+    let output = run(&["cp", "source", "--as", "local-copy"]);
+    assert_output_ok(&output);
+    let output = run(&["cp", "source", "--to", "backup", "--rsh", "ssh"]);
+    assert!(!output.status.success());
+    assert!(t.path("ssh-used").exists());
+    assert!(!stderr_of(&output).contains("authorization choice"));
+}

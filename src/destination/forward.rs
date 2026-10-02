@@ -215,6 +215,7 @@ impl Receiver {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
         target_endpoint(&target)?;
+        crate::approval_command::check_authorizer(&command, &self.name)?;
         crate::approval_command::check_copy(&command, &request, None, Some(&target))?;
         if request.copy.destination != REQUEST_ROOT
             || request.destination.len() > 4096
