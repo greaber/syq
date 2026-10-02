@@ -370,7 +370,8 @@ pub(crate) struct Client {
 }
 struct Ready {
     directory: tempfile::TempDir,
-    peer: Peer,
+    public_key: String,
+    peer: Option<Peer>,
 }
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -386,6 +387,23 @@ impl Client {
         }
     }
     pub(crate) fn command(&self) -> Result<Command> {
+        self.command_with(|public_key| {
+            let (_, reply) = exchange(
+                &self.registration,
+                Message::ForwardSsh {
+                    token: self.token.clone(),
+                    public_key: public_key.to_owned(),
+                },
+                SETUP_TIMEOUT + Duration::from_secs(10),
+                None,
+            )?;
+            let Reply::ForwardSsh(peer) = reply else {
+                bail!("unexpected copy SSH authorization response");
+            };
+            Ok(peer)
+        })
+    }
+    fn command_with(&self, setup: impl FnOnce(&str) -> Result<Peer>) -> Result<Command> {
         let mut state = self.state.lock().unwrap();
         if state.is_none() {
             let directory = crate::private_broker::private_temp_dir("syq-copy-key-")?;
@@ -400,22 +418,24 @@ impl Client {
                 .mode(0o600)
                 .open(directory.path().join("key"))?;
             file.write_all(key.to_openssh(ssh_key::LineEnding::LF)?.as_bytes())?;
-            let (_, reply) = exchange(
-                &self.registration,
-                Message::ForwardSsh {
-                    token: self.token.clone(),
-                    public_key: key.public_key().to_openssh()?,
-                },
-                SETUP_TIMEOUT + Duration::from_secs(10),
-                None,
-            )?;
-            let Reply::ForwardSsh(peer) = reply else {
-                bail!("unexpected copy SSH authorization response");
-            };
-            fs::write(directory.path().join("known_hosts"), &peer.known_hosts)?;
-            *state = Some(Ready { directory, peer });
+            // Keep the same key when a setup reply is lost after the destination
+            // installed it. The live destination only accepts idempotent retries.
+            *state = Some(Ready {
+                directory,
+                public_key: key.public_key().to_openssh()?,
+                peer: None,
+            });
         }
-        let ready = state.as_ref().unwrap();
+        let ready = state.as_mut().unwrap();
+        if ready.peer.is_none() {
+            let peer = setup(&ready.public_key)?;
+            fs::write(
+                ready.directory.path().join("known_hosts"),
+                &peer.known_hosts,
+            )?;
+            ready.peer = Some(peer);
+        }
+        let peer = ready.peer.as_ref().unwrap();
         let mut command = Command::new("ssh");
         command.args(["-F", "/dev/null", "-a", "-x", "-k", "-T"]);
         for option in [
@@ -447,20 +467,17 @@ impl Client {
         ));
         command
             .arg("-o")
-            .arg(format!("HostKeyAlgorithms={}", ready.peer.algorithms));
+            .arg(format!("HostKeyAlgorithms={}", peer.algorithms));
         command
             .arg("-o")
-            .arg(format!("RequiredRSASize={}", ready.peer.required_rsa_size));
+            .arg(format!("RequiredRSASize={}", peer.required_rsa_size));
         command.arg("-i").arg(ready.directory.path().join("key"));
         command
             .arg("-l")
-            .arg(&ready.peer.user)
+            .arg(&peer.user)
             .arg("-p")
-            .arg(ready.peer.port.to_string());
-        command
-            .arg("--")
-            .arg(&ready.peer.host)
-            .arg("syq-copy-worker");
+            .arg(peer.port.to_string());
+        command.arg("--").arg(&peer.host).arg("syq-copy-worker");
         Ok(command)
     }
 }
@@ -594,6 +611,37 @@ mod tests {
             "stolen key/ticket must not survive copy closure"
         );
         assert!(reader.read_msg::<Response>().is_err());
+    }
+
+    #[test]
+    fn requester_keeps_same_copy_key_after_a_lost_setup_reply() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, _receiver, registration, _) =
+            crate::destination::tests::broker(root.path(), Approval::Always);
+        let client = Client::new(registration, "copy".into());
+        let mut first = String::new();
+        assert!(client
+            .command_with(|key| {
+                first = key.into();
+                bail!("reply lost after installing key")
+            })
+            .is_err());
+        client
+            .command_with(|key| {
+                assert_eq!(key, first);
+                Ok(Peer {
+                    host: "backup".into(),
+                    user: "copy".into(),
+                    port: 22,
+                    known_hosts: "pinned host key".into(),
+                    algorithms: "ssh-ed25519".into(),
+                    required_rsa_size: 2048,
+                })
+            })
+            .unwrap();
+        client
+            .command_with(|_| panic!("ready copy must reuse setup"))
+            .unwrap();
     }
 
     #[test]
