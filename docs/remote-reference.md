@@ -150,8 +150,13 @@ SSH destination, while `--to @NAME` sends files to a receiving machine.
 
 SSH authorization through a receiving machine does not support `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
-or `--coordinate-at`, `--no-tcp`, or `--no-tcp-encryption`. It requires direct encrypted
-TCP from source to destination. Destination completion does not request
+or `--coordinate-at`, or `--no-tcp-encryption`. File data goes directly from
+source to destination over encrypted TCP, falling back to SSH between those same
+servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
+key already trusted by the authorizing machine and writable
+`~/.ssh/authorized_keys` on the destination. Syq temporarily adds a key that can
+join only this approved copy, then removes it when the copy closes. The source
+receives no laptop credentials or general SSH access. Destination completion does not request
 permission through a receiving machine. With `auto` or `ssh`, completion uses
 the source's own SSH access and does not fall back to a receiving machine.
 

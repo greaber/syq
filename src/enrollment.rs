@@ -146,7 +146,7 @@ fn validate_ed25519_blob(mut blob: &[u8]) -> Result<()> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedKeyEntry {
-    id: EnrollmentId,
+    marker: String,
     key: EnrollmentPublicKey,
     line: String,
 }
@@ -162,7 +162,7 @@ impl AuthorizedKeyEntry {
             id.marker()
         );
         Ok(Self {
-            id,
+            marker: id.marker(),
             key: key.clone(),
             line,
         })
@@ -172,8 +172,37 @@ impl AuthorizedKeyEntry {
         &self.line
     }
 
+    /// A temporary key can enter only one live copy's worker socket. Its
+    /// marker is separate from durable receiver enrollments.
+    pub(crate) fn copy_worker(
+        id: EnrollmentId,
+        receiver_path: &Path,
+        ticket: &str,
+        key: &EnrollmentPublicKey,
+    ) -> Result<Self> {
+        let receiver = safe_receiver_path(receiver_path)?;
+        if ticket.is_empty()
+            || !ticket
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            bail!("invalid copy worker admission");
+        }
+        let marker = format!("syq-copy-worker-{id}");
+        let command = format!("{receiver} --return-ssh-worker {ticket}");
+        let line = format!(
+            "restrict,command=\"{command}\" {} {} {marker}",
+            key.algorithm, key.blob
+        );
+        Ok(Self {
+            marker,
+            key: key.clone(),
+            line,
+        })
+    }
+
     pub fn marker(&self) -> String {
-        self.id.marker()
+        self.marker.clone()
     }
 }
 

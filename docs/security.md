@@ -316,7 +316,14 @@ private key stays on your machine and grants no SSH login access.
 
 A connected server can ask your laptop to authorize a copy to another server.
 The copy uses your laptop's SSH access and the restricted receiver protections
-described in [Copies between servers](#copies-between-servers).
+described in [Copies between servers](#copies-between-servers). File data goes
+directly between the servers over encrypted TCP or SSH. When SSH data is needed,
+syq gives the source a temporary key whose destination authorization forces it
+into this copy's live worker connection, with terminal access, forwarding and
+user startup scripts disabled. The destination still enforces the approved
+copy scope. Closing the copy invalidates its worker connections and removes
+the key entry; an entry left by an interrupted cleanup cannot join another
+copy. Your laptop's credentials and signing agent remain on the laptop.
 
 <a id="approved-commands-on-receiving-machines"></a>
 

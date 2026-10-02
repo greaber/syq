@@ -1034,7 +1034,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
 }
 
 #[test]
-fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
+fn return_via_requires_approval_and_rejects_unsupported_routes() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
     write(
@@ -1488,7 +1488,6 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     // Unsupported options and explicit SSH never ask a receiving machine.
     for extra in [
         vec!["--auth-from", "ssh"],
-        vec!["--no-tcp"],
         vec!["--copy-metadata", "ownership"],
         vec!["--inplace"],
         vec!["--prune", "--into", "out"],

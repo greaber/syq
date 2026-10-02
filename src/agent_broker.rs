@@ -79,6 +79,10 @@ impl HostPolicy {
         Ok(lines)
     }
 
+    pub(crate) fn required_rsa_size(&self) -> usize {
+        self.required_rsa_size
+    }
+
     fn authorizes_binding(&self, binding: &SessionBind) -> bool {
         key_is_cryptographically_verifiable(&binding.host_key)
             && signature_algorithm_is_cryptographically_verifiable(&binding.signature.algorithm())

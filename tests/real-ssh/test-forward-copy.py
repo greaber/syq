@@ -310,10 +310,31 @@ authorized = remote("sha256sum ~/.ssh/authorized_keys")
 copy(".ssh/authorized_keys", success=False)
 assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
 
-print("case: unreachable TCP fails without an SSH data fallback", flush=True)
+print("case: unreachable TCP falls back to direct restricted SSH data", flush=True)
 port = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
-copy("/tmp/syq-real-ssh/forward/blocked", extra=("--tcp-ports", f"{port}-{port}"), success=False)
-remote("test ! -e /tmp/syq-real-ssh/forward/blocked")
+started = time.monotonic()
+copy("/tmp/syq-real-ssh/forward/blocked", extra=("--tcp-ports", f"{port}-{port}"))
+print("cold approved SSH fallback including approval polling:", round(time.monotonic() - started, 3), "seconds", flush=True)
+assert remote("sha256sum /tmp/syq-real-ssh/forward/blocked").split()[0] == source_hash
+def wait_key_cleanup():
+    deadline = time.monotonic() + 10
+    report = time.monotonic() + 2
+    while True:
+        state = remote("sha256sum ~/.ssh/authorized_keys")
+        if state == authorized:
+            return
+        assert time.monotonic() < deadline, ("temporary copy SSH key was not removed", state)
+        if time.monotonic() >= report:
+            print("Waiting for temporary copy SSH key cleanup", flush=True)
+            report += 2
+        time.sleep(.05)
+
+wait_key_cleanup()
+
+print("case: explicit SSH uses a temporary forced key without source credentials", flush=True)
+copy("/tmp/syq-real-ssh/forward/ssh", extra=("--no-tcp",), auth=("--auth-from", "@laptop"))
+assert remote("sha256sum /tmp/syq-real-ssh/forward/ssh").split()[0] == source_hash
+wait_key_cleanup()
 
 print("case: receiver restart revokes an active remote copy; a new approval can resume", flush=True)
 source = "/tmp/syq-real-ssh/return-source/forward-resume.bin"
