@@ -326,7 +326,7 @@ size, `batch-bytes`, and `request-size`.
 
 `split-min-size` controls how small a region an idle worker can take from another
 worker. Lower values allow finer sharing; higher values reduce assignments.
-Explicit splits align to comparison blocks and need twice the minimum remaining
+Splits normally align to comparison blocks and need twice the minimum remaining
 size. With automatic ordinary remote requests, slow workers can share smaller
 unread regions without changing comparison blocks.
 
