@@ -12,6 +12,7 @@ syq persist <COMMAND>
 | Command | Purpose |
 |---|---|
 | [`persist auth-from`](#syq-persist-auth-from) | Choose default authorization for server copies and SSH sessions |
+| [`persist ssh-config`](#syq-persist-ssh-config) | Export native OpenSSH configuration for one already approved account connection |
 | [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
 | [`persist destinations`](#syq-persist-destinations) | Inspect or recover named return destinations |
 | [`persist connect`](#syq-persist-connect) | Connect with native SSH, or request reusable account access with --auth-from @NAME |
@@ -50,6 +51,14 @@ syq persist auth-from [OPTIONS] [auto|ssh|@NAME]
 | `--for <HOST>` | Apply to this exact destination hostname or SSH alias, for any login/port |
 | `--reset` | Remove the selected override so it inherits the default |
 
+<!-- /CLI -->
+
+## syq persist ssh-config
+
+Export an existing [approved account connection](../persistence-reference.md#approved-account-connections)
+for native SSH tools. Save the output to a file and pass it through `-F`.
+
+<!-- CLI: persist ssh-config -->
 <!-- /CLI -->
 
 ## syq persist receive

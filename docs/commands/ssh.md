@@ -29,7 +29,7 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME>` | Authorization source; omitted uses the saved preference, then native SSH |
+| `--auth-from <auto\|ssh\|@NAME>` | Authorization source; omitted uses the saved preference, then an approved account connection or native SSH |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |
 

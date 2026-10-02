@@ -141,9 +141,6 @@ pub struct Args {
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
-    /// Use an approved SSH account connection, or native SSH authentication
-    #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, default_value = "auto")]
-    pub(crate) auth_from: AuthFrom,
     #[arg(skip)]
     pub(crate) auth_from_explicit: bool,
     /// Which public command produced this execution request.
@@ -398,6 +395,9 @@ pub struct Args {
     /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, default_value = "auto")]
+    pub(crate) auth_from: AuthFrom,
     /// Use this exact syq executable on the remote instead of the managed helper
     #[arg(long = "rsync-path", value_name = "PATH")]
     pub syq_path: Option<String>,
@@ -1568,9 +1568,6 @@ fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()>
     override_usage = "syq map [OPTIONS] PATH...\n       syq map [OPTIONS] --srcs-in DIR"
 )]
 struct NativeMapCommand {
-    /// Use an approved SSH account connection, or native SSH authentication
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
-    auth_from: Option<AuthFrom>,
     /// Source endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
     #[arg(long, value_name = "ENDPOINT")]
     from: Option<String>,
@@ -1585,6 +1582,9 @@ struct NativeMapCommand {
     rsh: Option<String>,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
     #[command(flatten)]
     s3: crate::s3::Flags,
     #[command(flatten)]
@@ -1633,9 +1633,6 @@ struct NativeRmCommand {
     before_help = "Examples:\n  syq clean-partials --dry-run backup\n  syq clean-partials --on nas /backup"
 )]
 struct CleanPartialsCommand {
-    /// Use an approved SSH account connection, or native SSH authentication
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
-    auth_from: Option<AuthFrom>,
     /// Directory trees to search
     #[arg(value_name = "TREE", required = true)]
     trees: Vec<OsString>,
@@ -1652,6 +1649,9 @@ struct CleanPartialsCommand {
     operational: NativeOperationalArgs,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
     #[command(flatten)]
     results_output: NativeResultsArgs,
 }

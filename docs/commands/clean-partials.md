@@ -29,6 +29,14 @@ entries, and recover anything you need before removing them manually.
 syq clean-partials [OPTIONS] <TREE>...
 ```
 
+## SSH and transport
+
+| Argument / option | Meaning |
+|---|---|
+| `--auth-from <auto\|ssh\|@NAME>` | Use an approved SSH account connection, or native SSH authentication |
+| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
+| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
+
 ## Sources and selection
 
 | Argument / option | Meaning |
@@ -60,13 +68,6 @@ syq clean-partials [OPTIONS] <TREE>...
 | `--no-progress` | Never show the human progress display |
 | `--results <FILE>` | Write the machine-readable NDJSON result stream to FILE (created fresh; an existing file is refused) |
 | `--results-fd <FD>` | Write the result stream to an inherited file descriptor the caller opened (e.g. `--results-fd 3 3>run.ndjson`); must be above 2 |
-
-## SSH and transport
-
-| Argument / option | Meaning |
-|---|---|
-| `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
-| `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
 
 ## Help and version
 
