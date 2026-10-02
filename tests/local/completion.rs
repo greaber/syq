@@ -1997,18 +1997,28 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
                 words.push("--into");
             }
             words.push(&path);
-            let output = approved_completion_command(&t, &words).run().unwrap();
+            let mut invocation = approved_completion_command(&t, &words);
+            if mode == Some("ssh") {
+                // Refuse native login before it can warm the unrelated native
+                // helper pool. This case checks routing, not that pool's lifecycle.
+                invocation.env("FAKE_SSH_SESSION_STATUS", "55");
+            }
+            let output = invocation.run().unwrap();
             assert_output_ok(&output);
-            assert!(output.stderr.is_empty(), "{output:?}");
-            assert_eq!(
-                completion_values(&output.stdout),
-                vec![(
-                    b'p',
-                    t.path("remote-home/data/nested/")
-                        .into_os_string()
-                        .into_vec()
-                )]
-            );
+            if mode == Some("ssh") {
+                assert!(output.stdout.is_empty(), "{output:?}");
+            } else {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                assert_eq!(
+                    completion_values(&output.stdout),
+                    vec![(
+                        b'p',
+                        t.path("remote-home/data/nested/")
+                            .into_os_string()
+                            .into_vec()
+                    )]
+                );
+            }
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
             if mode == Some("ssh") {
                 assert!(!log.contains("ProxyCommand=false"), "{log}");
@@ -2175,14 +2185,28 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
                 words.push("--into");
             }
             words.push(&path);
-            let output = approved_completion_command(&t, &words).run().unwrap();
+            let output = approved_completion_command(&t, &words)
+                .env("FAKE_SSH_SESSION_STATUS", "55")
+                .run()
+                .unwrap();
             assert_output_ok(&output);
+            assert!(output.stdout.is_empty(), "{output:?}");
             if scope_route {
-                assert!(!output.stdout.is_empty(), "{output:?}");
                 let log = fs::read_to_string(t.path("rsh.log")).unwrap();
                 assert!(!log.contains("ProxyCommand=false"), "{log}");
                 assert!(log.contains(scope.to_str().unwrap()), "{log}");
                 fs::remove_file(t.path("rsh.log")).unwrap();
+                // An explicit authorizer is stronger than the saved choice:
+                // the unsupported combination must not try a native login.
+                let mut explicit = words.clone();
+                explicit.splice(
+                    explicit.len() - 1..explicit.len() - 1,
+                    ["--auth-from", "@laptop"],
+                );
+                let output = approved_completion_command(&t, &explicit).run().unwrap();
+                assert_output_ok(&output);
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!t.path("rsh.log").exists());
             } else {
                 assert!(output.stdout.is_empty(), "{output:?}");
                 assert!(!t.path("rsh.log").exists());

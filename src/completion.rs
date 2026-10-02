@@ -1671,23 +1671,27 @@ fn remote_path_candidates(
         },
     );
     let pscope = pscope_from_args(command, args).map(PathBuf::from);
-    // An explicit scope owns its native connection selection. Otherwise every
-    // source and destination path uses the same saved/explicit authorization.
+    let explicit = find_option_bytes(
+        args,
+        if command == "rsync" {
+            b"--syq-auth-from"
+        } else {
+            b"--auth-from"
+        },
+    )
+    .map(std::str::from_utf8)
+    .transpose()?
+    .map(crate::cli::parse_auth_from)
+    .transpose()?;
+    // An explicit scope owns its native connection selection. It bypasses
+    // saved preferences, but cannot override an explicitly named authorizer.
     let auth_from = if pscope.is_some() {
+        anyhow::ensure!(
+            !matches!(explicit, Some(AuthFrom::Return(_))),
+            "an explicit authorizer cannot be combined with an explicit persistence scope"
+        );
         None
     } else {
-        let explicit = find_option_bytes(
-            args,
-            if command == "rsync" {
-                b"--syq-auth-from"
-            } else {
-                b"--auth-from"
-            },
-        )
-        .map(std::str::from_utf8)
-        .transpose()?
-        .map(crate::cli::parse_auth_from)
-        .transpose()?;
         Some(crate::auth_from::resolve(&endpoint.host, explicit)?)
     };
     let endpoint_for_thread = endpoint.clone();
