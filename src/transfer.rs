@@ -135,6 +135,7 @@ pub struct Opts {
     hardlink_expected_hashes:
         std::sync::OnceLock<std::collections::HashMap<PathBytes, crate::hashing::ExpectedHashes>>,
     pub block: u64,
+    pub block_explicit: bool,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
     /// Settled before sharing these options; clone claims must fit preflight.
@@ -1944,6 +1945,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             })
             .unwrap_or_default(),
         block,
+        block_explicit: args.block_size_explicit,
         tuning: args.tuning_options.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
             && !args.quiet
@@ -2364,6 +2366,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         benchmark: Default::default(),
                         fast_batch_files,
                         batch_budget: WorkBudget::default(),
+                        range_budget: None,
                         setup_elapsed: t0.elapsed(),
                     };
                     #[cfg(debug_assertions)]

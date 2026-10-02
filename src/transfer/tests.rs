@@ -86,6 +86,9 @@ struct PipelineState {
     tuning_check: Option<(Arc<Sched>, Arc<Gate>, usize)>,
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
+    arrival_delay: Option<std::time::Duration>,
+    steal_range_at: Option<(usize, Arc<Sched>)>,
+    stolen_range: Option<RangeHandle>,
     auto_small_size: Option<u64>,
     reject_small_puts: bool,
     immediate_batch_receipts: Option<Arc<crate::conn::BatchReceipts>>,
@@ -228,6 +231,11 @@ impl Conn for PipelineConn {
             .max(state.requests.len().saturating_sub(state.received));
         Ok(())
     }
+    fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
+        let response = self.recv()?;
+        let delay = self.0.lock().unwrap().arrival_delay.unwrap_or_default();
+        Ok((response, std::time::Instant::now() + delay))
+    }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
         let start = std::time::Instant::now();
         let response = self.recv()?;
@@ -251,6 +259,21 @@ impl Conn for PipelineConn {
             let tuning = crate::tune::Meter::files(&**progress);
             state.progress_at_receive.push(snapshot);
             state.tuning_at_receive.push(tuning);
+        }
+        if state
+            .steal_range_at
+            .as_ref()
+            .is_some_and(|(at, _)| *at == state.received)
+        {
+            let (_, sched) = state.steal_range_at.take().unwrap();
+            assert!(
+                sched.tuning_work(2, 0, 0).sufficient,
+                "a slow range must expose usable work to another worker"
+            );
+            let Item::Range(range) = sched.next() else {
+                panic!("expected unread range")
+            };
+            state.stolen_range = Some(range);
         }
         if let Some(sched) = state.steal_on_receive.take() {
             assert!(
@@ -355,6 +378,7 @@ fn pipeline_worker(
         mapping_expected_hashes: Default::default(),
         hardlink_expected_hashes: Default::default(),
         block: 512,
+        block_explicit: false,
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
             pipeline_depth: (!streaming).then_some(4),
@@ -413,6 +437,7 @@ fn pipeline_worker(
         benchmark: Default::default(),
         fast_batch_files: 1,
         batch_budget: WorkBudget::default(),
+        range_budget: None,
         setup_elapsed: std::time::Duration::ZERO,
     }
 }
@@ -3655,5 +3680,118 @@ fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
         assert_eq!(next, 16, "no further work admitted");
         assert!(results[..16].iter().all(|r| matches!(r, Some(Ok(_)))));
         assert!(results[16..].iter().all(Option::is_none));
+    }
+}
+
+#[test]
+fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
+    let block = 4 << 20;
+    let size = 8 << 20;
+    let sched = Arc::new(Sched::new(block, 32 << 20));
+    let idx = sched.push_file(pipeline_job(b"file", size));
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(_)));
+    let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        steal_range_at: Some((5, sched.clone())),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        // Inject service time without a slow or timing-sensitive test.
+        arrival_delay: Some(std::time::Duration::from_secs(1)),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = block;
+    opts.tuning = Default::default();
+    let mut credited = 0;
+    worker.transfer_range(&range, &mut credited).unwrap();
+    let peer_range = src
+        .lock()
+        .unwrap()
+        .stolen_range
+        .take()
+        .expect("peer claimed tail");
+    assert!(!sched.range_done(&range));
+    let peer_src = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        ..Default::default()
+    }));
+    let peer_dst = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        ..Default::default()
+    }));
+    let mut peer = pipeline_worker(&sched, &peer_src, &peer_dst, false);
+    Arc::get_mut(&mut peer.opts).unwrap().block = block;
+    let mut peer_credited = 0;
+    peer.transfer_range(&peer_range, &mut peer_credited)
+        .unwrap();
+    assert!(sched.range_done(&peer_range));
+    assert!(matches!(sched.next(), Item::Exit));
+    assert_eq!(credited + peer_credited, size);
+    assert!(credited > 0 && peer_credited > 0);
+    let mut writes = Vec::new();
+    for endpoint in [&dst, &peer_dst] {
+        let state = endpoint.lock().unwrap();
+        assert_eq!(state.requests.len(), state.received);
+        for request in &state.requests {
+            if let Request::WriteRange { off, data, .. } = request {
+                assert!(data.iter().all(|byte| *byte == 42));
+                writes.push((*off, data.len() as u64));
+            }
+        }
+    }
+    writes.sort_unstable();
+    let mut end = 0;
+    for (off, len) in writes {
+        assert_eq!(off, end);
+        end += len;
+    }
+    assert_eq!(end, size, "each byte written exactly once across the steal");
+}
+
+#[test]
+fn explicit_range_controls_preserve_fixed_requests() {
+    let block = 4 << 20;
+    for (options, legacy_block) in [
+        ("request-size=4M", false),
+        ("pipeline-depth=4", false),
+        ("comparison-block-size=4M", false),
+        ("split-min-size=32M", false),
+        ("", true),
+    ] {
+        let sched = Arc::new(Sched::new(block, 32 << 20));
+        let idx = sched.push_file(pipeline_job(b"file", 2 * block));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(_)));
+        let range = sched.ranges_ready(idx, vec![(0, 2 * block)]).unwrap();
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        opts.block_explicit = legacy_block;
+        opts.tuning = if options.is_empty() {
+            Default::default()
+        } else {
+            options.parse().unwrap()
+        };
+        worker.transfer_range(&range, &mut 0).unwrap();
+        assert!(range.lock().unwrap().split.is_none());
+        let state = src.lock().unwrap();
+        assert_eq!(state.requests.len(), 2, "{options} legacy={legacy_block}");
+        assert!(state
+            .requests
+            .iter()
+            .all(|r| matches!(r, Request::ReadRange { len, .. } if u64::from(*len)==block)));
     }
 }

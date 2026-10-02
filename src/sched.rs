@@ -226,6 +226,15 @@ pub struct RangeState {
     pub pos: u64,
     /// Exclusive end; a stealer may move it down (never below `pos`).
     pub end: u64,
+    /// Ordinary requests can expose smaller suffixes after observing slow
+    /// service. Comparison windows retain the scheduler's hash alignment.
+    pub split: Option<RangeSplit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeSplit {
+    pub block: u64,
+    pub minimum: u64,
 }
 
 pub type RangeHandle = Arc<Mutex<RangeState>>;
@@ -502,7 +511,12 @@ struct Inner {
 
 impl Inner {
     fn claim_range(&mut self, idx: usize, off: u64, end: u64) -> RangeHandle {
-        let handle = Arc::new(Mutex::new(RangeState { idx, pos: off, end }));
+        let handle = Arc::new(Mutex::new(RangeState {
+            idx,
+            pos: off,
+            end,
+            split: None,
+        }));
         self.inflight.push(handle.clone());
         handle
     }
@@ -899,10 +913,34 @@ impl Sched {
         evidence.activity =
             bytes.saturating_add((available_files as u64).saturating_mul(file_credit));
         evidence.work_units = available_files + g.ranges.len() + g.inflight.len();
+        for handle in &g.inflight {
+            let range = handle.lock().unwrap();
+            if let Some(split) = range.split {
+                // Stealing halves an interval. Count a conservative number
+                // of balanced shares, not bytes that are already in flight.
+                let shares = range.end.saturating_sub(range.pos) / split.minimum;
+                let balanced = shares.checked_ilog2().map_or(0, |n| 1u64 << n);
+                evidence.work_units = evidence
+                    .work_units
+                    .saturating_add(balanced.saturating_sub(1).min(usize::MAX as u64) as usize);
+            }
+        }
         evidence.parallel =
             evidence.work_units >= n || bytes >= (n as u64).saturating_mul(self.min_split);
         evidence.sufficient = evidence.parallel && evidence.activity >= minimum_activity;
         evidence
+    }
+
+    /// Wake waiting workers when a slow ordinary range exposes smaller shares.
+    /// Match next()'s lock order and condition-variable predicate.
+    pub fn update_range_split(&self, handle: &RangeHandle, split: RangeSplit) {
+        if handle.lock().unwrap().split == Some(split) {
+            return;
+        }
+        let _guard = self.inner.lock().unwrap();
+        handle.lock().unwrap().split = Some(split);
+        self.cv.notify_all();
+        self.tune_cv.notify_one();
     }
 
     /// Hand the unread remainder of an in-flight range back to the queue (a
@@ -991,7 +1029,8 @@ impl Sched {
         for (i, h) in g.inflight.iter().enumerate() {
             let r = h.lock().unwrap();
             let rem = r.end.saturating_sub(r.pos);
-            if rem >= 2 * self.min_split && best.is_none_or(|(b, _)| rem > b) {
+            let minimum = r.split.map_or(self.min_split, |s| s.minimum);
+            if rem >= 2 * minimum && best.is_none_or(|(b, _)| rem > b) {
                 best = Some((rem, i));
             }
         }
@@ -999,7 +1038,9 @@ impl Sched {
         let victim = g.inflight[i].clone();
         let mut r = victim.lock().unwrap();
         let rem = r.end - r.pos;
-        let split = (r.pos + rem / 2).div_ceil(self.block) * self.block;
+        let policy = r.split;
+        let block = policy.map_or(self.block, |s| s.block);
+        let split = (r.pos + rem / 2).div_ceil(block) * block;
         if split >= r.end || split <= r.pos {
             return None;
         }
@@ -1007,7 +1048,9 @@ impl Sched {
         r.end = split;
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
-        Some(g.claim_range(idx, split, old_end))
+        let handle = g.claim_range(idx, split, old_end);
+        handle.lock().unwrap().split = policy;
+        Some(handle)
     }
 
     /// Pop further queued files no larger than `max_size` (largest-first order

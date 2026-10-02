@@ -591,6 +591,7 @@ fn tuning_split_threshold_controls_when_idle_workers_can_help() {
         let sched = Sched::new(4 << 20, tuning.split_min_size(4 << 20));
         let mut inner = sched.inner.lock().unwrap();
         inner.inflight.push(Arc::new(Mutex::new(RangeState {
+            split: None,
             idx: 0,
             pos: 0,
             end: 48 << 20,
@@ -837,6 +838,7 @@ fn single_file_group_is_not_registered_for_stealing() {
 fn retry_range_replaces_the_failed_inflight_share() {
     let sched = Sched::new(64, 128);
     let range = Arc::new(Mutex::new(RangeState {
+        split: None,
         idx: 4,
         pos: 192,
         end: 256,
@@ -857,6 +859,7 @@ fn retry_range_replaces_the_failed_inflight_share() {
 fn retry_of_an_empty_claim_preserves_finalization() {
     let sched = Sched::new(64, 128);
     let range = Arc::new(Mutex::new(RangeState {
+        split: None,
         idx: 5,
         pos: 256,
         end: 256,

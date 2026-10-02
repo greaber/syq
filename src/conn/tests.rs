@@ -497,6 +497,7 @@ fn local_source_worker_rejects_destination_mutation_requests() {
             Response::Ok
         ));
         let range = std::sync::Arc::new(std::sync::Mutex::new(crate::sched::RangeState {
+            split: None,
             idx: 0,
             pos: 0,
             end,

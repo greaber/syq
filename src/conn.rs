@@ -63,6 +63,13 @@ pub trait Conn: Send {
         Ok(None)
     }
     fn recv(&mut self) -> Result<Response>;
+    /// Arrival timestamp excludes time a reply spent queued behind other
+    /// worker operations. Used to time payload-free write acknowledgments.
+    fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
+        let response = self.recv()?;
+        Ok((response, std::time::Instant::now()))
+    }
+
     /// Enter a phase containing only small-file batch writes. Remote readers
     /// can account for replies before the worker consumes them.
     fn track_small_batches(
@@ -882,6 +889,11 @@ impl Conn for RemoteConn {
     }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)
+    }
+    fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
+        let response = self.receive_response()?;
+        let completed = response.started_at;
+        Ok((response.into_inner(), completed))
     }
     fn track_small_batches(
         &mut self,

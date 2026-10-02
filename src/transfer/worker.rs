@@ -40,6 +40,7 @@ pub(super) struct Worker {
     pub(super) benchmark: crate::transfer_tuning::BenchmarkStats,
     pub(super) fast_batch_files: usize,
     pub(super) batch_budget: WorkBudget,
+    pub(super) range_budget: Option<WorkBudget>,
     pub(super) setup_elapsed: std::time::Duration,
 }
 
@@ -2027,6 +2028,39 @@ impl Worker {
         }
     }
 
+    fn receive_range_write(
+        &mut self,
+        job: &WorkerJob,
+        flights: &mut [Option<RangeFlight>],
+        (slot, n, started): (usize, u64, std::time::Instant),
+        budget: &mut WorkBudget,
+        adaptive: bool,
+    ) -> Result<bool> {
+        let slow = if adaptive {
+            let (response, arrived) = self.dst.recv_with_arrival()?;
+            ok(response, "write")?;
+            let elapsed = arrived.saturating_duration_since(started);
+            let slow = elapsed > budget.latency_target();
+            budget.observe(WorkSize { bytes: n, files: 0 }, elapsed);
+            slow
+        } else {
+            ok(self.dst.recv()?, "write")?;
+            false
+        };
+        Self::acknowledge_range_write(&self.sched, &self.progress, job, flights, slot, n);
+        Ok(slow)
+    }
+
+    fn adaptive_ranges(&self) -> bool {
+        let tuning = self.opts.tuning;
+        !self.opts.same_host
+            && !self.opts.block_explicit
+            && tuning.request_size.is_none()
+            && tuning.comparison_block_size.is_none()
+            && tuning.pipeline_depth.is_none()
+            && tuning.split_min_size.is_none()
+    }
+
     pub(super) fn transfer_range_pipeline(
         &mut self,
         job: &WorkerJob,
@@ -2047,13 +2081,26 @@ impl Worker {
             .opts
             .tuning
             .ordinary_range_limit(self.opts.same_host, block);
+        let adaptive = self.adaptive_ranges();
+        let mut budget = self
+            .range_budget
+            .take()
+            .unwrap_or_else(|| WorkBudget::ranges(block, self.batch_budget.latency_target()));
+        let mut slow = primary.lock().unwrap().split.is_some();
+        let mut refresh_latency = false;
         let mut released = false;
         let result = (|| -> Result<()> {
             loop {
                 released |= !self.gate.allowed(self.id);
                 // Check cancellation and optionally claim work with one scheduler
                 // lock, including while the last read replies are draining.
-                let claim = (!released && current.is_none() && pending_reads.len() < read_window)
+                if adaptive && current.is_some() {
+                    refresh_latency |= budget.latency_check_due(std::time::Instant::now());
+                }
+                let claim = (!released
+                    && !refresh_latency
+                    && current.is_none()
+                    && pending_reads.len() < read_window)
                     .then_some(max_range);
                 let mut next = match self.sched.range_work(idx, claim) {
                     RangeWork::Cancelled => break,
@@ -2067,7 +2114,7 @@ impl Worker {
                         self.sched.release_rest(&flight.handle);
                     }
                 }
-                while !released && pending_reads.len() < read_window {
+                while !released && !refresh_latency && pending_reads.len() < read_window {
                     if current.is_none() {
                         // Claim only when there is room to issue a read now.
                         // Larger ranges retain their streaming selection, and
@@ -2089,9 +2136,27 @@ impl Worker {
                     }
                     let slot = current.expect("readable range");
                     let flight = flights[slot].as_mut().expect("readable range");
+                    let request = if adaptive {
+                        budget.request_bytes()
+                    } else {
+                        block
+                    };
+                    if adaptive && slow {
+                        self.sched.update_range_split(
+                            &flight.handle,
+                            crate::sched::RangeSplit {
+                                block: 512,
+                                minimum: if request == block {
+                                    self.sched.min_split
+                                } else {
+                                    request.saturating_mul(2).min(self.sched.min_split)
+                                },
+                            },
+                        );
+                    }
                     let (off, n) = {
                         let mut range = flight.handle.lock().unwrap();
-                        let n = (range.end - range.pos).min(block);
+                        let n = (range.end - range.pos).min(request);
                         let off = range.pos;
                         range.pos += n;
                         if range.pos == range.end {
@@ -2100,6 +2165,7 @@ impl Worker {
                         (off, n)
                     };
                     flight.pending += 1;
+                    let started = std::time::Instant::now();
                     self.limit(n);
                     self.src.send(Request::ReadRange {
                         path: job.src.clone(),
@@ -2110,12 +2176,37 @@ impl Worker {
                     })?;
                     self.benchmark.range_requests += 1;
                     self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(n);
-                    pending_reads.push_back((slot, off, n));
+                    pending_reads.push_back((slot, off, n, started));
                     if current.is_none() && pending_reads.len() < read_window {
                         next = self.sched.take_short_range(idx, max_range);
                     }
                 }
-                let Some((slot, expected_off, expected_len)) = pending_reads.pop_front() else {
+                let Some((slot, expected_off, expected_len, started)) = pending_reads.pop_front()
+                else {
+                    if let Some(write) = pending_writes.pop_front() {
+                        slow |= self.receive_range_write(
+                            job,
+                            &mut flights,
+                            write,
+                            &mut budget,
+                            adaptive,
+                        )?;
+                        continue;
+                    }
+                    if refresh_latency && !released && !self.sched.is_aborted() {
+                        let began = std::time::Instant::now();
+                        configure_hashing(&mut *self.src, self.opts.hash_policy)?;
+                        if !self.gate.allowed(self.id)
+                            || self.sched.is_aborted()
+                            || self.sched.is_failed(idx)
+                        {
+                            continue;
+                        }
+                        configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
+                        budget.refreshed_latency(began.elapsed(), std::time::Instant::now());
+                        refresh_latency = false;
+                        continue;
+                    }
                     break;
                 };
 
@@ -2136,20 +2227,11 @@ impl Worker {
                     data: data.into(),
                     guard: job.container_guard.clone(),
                 })?;
-                pending_writes.push_back((slot, n));
+                pending_writes.push_back((slot, n, started));
                 if pending_writes.len() >= write_window {
-                    let (slot, n) = pending_writes.pop_front().expect("pending write");
-
-                    let response = self.dst.recv();
-                    ok(response?, "write")?;
-                    Self::acknowledge_range_write(
-                        &self.sched,
-                        &self.progress,
-                        job,
-                        &mut flights,
-                        slot,
-                        n,
-                    );
+                    let write = pending_writes.pop_front().expect("pending write");
+                    slow |=
+                        self.receive_range_write(job, &mut flights, write, &mut budget, adaptive)?;
                 }
             }
             Ok(())
@@ -2168,7 +2250,7 @@ impl Worker {
                 &mut *self.dst,
                 pending_writes,
                 "write",
-                |(slot, n)| {
+                |(slot, n, _)| {
                     Self::acknowledge_range_write(
                         &self.sched,
                         &self.progress,
@@ -2181,6 +2263,7 @@ impl Worker {
             );
             result.and(source_end).and(destination_end)
         };
+        self.range_budget = Some(budget);
         *credited += flights[0].as_ref().expect("primary share").credited;
         for flight in flights.into_iter().skip(1).flatten() {
             if result.is_err() && self.transport_dead() {
