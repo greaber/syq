@@ -81,6 +81,14 @@ authorization path and its restrictions.
 permission on behalf of a file operation. Remote path completion follows the
 same choice, but only uses existing approval and never prompts for access.
 
+SSH data through one approved account connection shares the server's session
+limit with its control connection and any other tools using that login. Leave
+room for the control session when choosing a worker ceiling with
+`--resource-limits workers=N`. A server configured with `MaxSessions 1` can use
+TCP data, but cannot open the concurrent SSH data workers needed by larger
+copies or byte streams. Syq does not bypass the selected approval with another
+SSH login when the session limit is reached.
+
 `syq persist ssh-config HOST [--auth-from auto|ssh|@NAME]` prints a standalone
 OpenSSH configuration for one existing approved login. Use it with `ssh`,
 `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.

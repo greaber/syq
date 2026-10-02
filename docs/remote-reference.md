@@ -199,7 +199,10 @@ destination coordination, and other peer-auth modes keep their separate
 connection requirements. `--coordinate-at local` can reuse approved access to
 each endpoint and explicitly relays file data through the invoking machine.
 
-The source's SSH server must permit remote Unix-socket forwarding. The socket
+The source's SSH server must permit remote Unix-socket forwarding. SSH fallback
+also needs two simultaneous sessions on the destination's approved connection
+(`sshd MaxSessions` of at least 2); direct TCP data does not need the second
+session. The socket
 carries control, metadata, and worker setup; payload goes directly between the
 source and destination. Disabled forwarding is an error and never selects a
 payload relay. Syq creates a receiver for this copy over the destination's
