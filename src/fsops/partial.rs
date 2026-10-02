@@ -2345,6 +2345,18 @@ impl FsOps {
         source: Option<&RegisteredPath>,
         guard: Option<&ContainerGuard>,
     ) -> Result<Response> {
+        self.file_hash_checked(path, source, guard, &mut |_, _| Ok(()))
+    }
+
+    /// Check an approved source hash's size and lifetime before reading and
+    /// after each bounded chunk. Ordinary hashing supplies a no-op check.
+    pub(crate) fn file_hash_checked(
+        &mut self,
+        path: &[u8],
+        source: Option<&RegisteredPath>,
+        guard: Option<&ContainerGuard>,
+        check: &mut impl FnMut(&File, u64) -> Result<()>,
+    ) -> Result<Response> {
         let mut f = if source.is_some()
             || (self.destination_root.is_none() && !self.source_roots.is_empty())
         {
@@ -2365,17 +2377,20 @@ impl FsOps {
         } else {
             open_existing_regular(&resolve(path), false)?
         };
+        check(&f, 0)?;
         crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         let mut h = self.hash_policy.algorithm.hasher();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
         loop {
+            check(&f, size)?;
             let n = f.read(&mut buf)?;
             if n == 0 {
                 break;
             }
-            h.update(&buf[..n]);
             size += n as u64;
+            check(&f, size)?;
+            h.update(&buf[..n]);
         }
         Ok(Response::FileHash {
             size,

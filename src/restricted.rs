@@ -38,6 +38,7 @@ mod enroll;
 mod grant;
 mod install;
 mod receiver;
+pub(crate) mod source;
 mod ssh;
 mod statefs;
 mod temporary_key;
