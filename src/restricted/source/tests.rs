@@ -561,3 +561,36 @@ fn typed_source_selections_cannot_gain_a_different_read_scope() {
     }
     assert_eq!(fs::read(file).unwrap(), b"payload");
 }
+
+#[test]
+fn overlapping_native_descriptor_estimates_keep_the_live_worker_limit() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let mut policy = policy(directory.path());
+    policy.limits.max_connections = 3; // Two workers and one control.
+    let mut request = registration(&policy);
+    if let Request::RegisterSourceRoots {
+        shared_workers,
+        independent_handoff_workers,
+        ..
+    } = &mut request
+    {
+        // Native TCP registration estimates both its shared workers and the
+        // independent handoffs those same workers may need for SSH fallback.
+        *shared_workers = 2;
+        *independent_handoff_workers = 2;
+    }
+    let authority = SourceAuthority::new(policy).unwrap();
+    let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
+    let mut ops = FsOps::new();
+    let Response::SourceRootsRegistered(roots) = control.register(&mut ops, &request).unwrap()
+    else {
+        panic!("registration failed");
+    };
+    let role = ConnectionRole::SourceWorker {
+        roots,
+        send_budget: None,
+    };
+    let _first = authority.acquire(&role, false).unwrap();
+    let _second = authority.acquire(&role, false).unwrap();
+    assert!(authority.acquire(&role, false).is_err());
+}

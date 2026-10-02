@@ -331,9 +331,12 @@ impl SourceConnection {
                         && actual.follow_root == approved.follow_root),
             "source registration differs from approval"
         );
+        // These are separate descriptor-capacity estimates, not two sets of
+        // live workers: TCP workers may also need an independent SSH handoff.
+        // Actual admission below remains shared across every transport.
         ensure!(
-            shared_workers.saturating_add(*independent_handoff_workers)
-                < usize::from(policy.limits.max_connections),
+            *shared_workers < usize::from(policy.limits.max_connections)
+                && *independent_handoff_workers < usize::from(policy.limits.max_connections),
             "source registration exceeds the connection limit"
         );
         let response = ops.handle_in_place(&mut request.clone());
