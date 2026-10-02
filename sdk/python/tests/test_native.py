@@ -546,7 +546,10 @@ class NativeClientTests(unittest.TestCase):
         self.client.rm("file", on="server", auth_from="@laptop")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
         with self.client.map("file", from_="server", auth_from="@laptop") as stream:
-            self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+            list(stream)
+        self.assertEqual(self.argv()[0], "map")
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        with self.client.map("file", from_="server", auth_from="@laptop") as stream:
             transformed = stream.transform(lambda entry: entry)
             with self.assertRaisesRegex(syq.SyqInvocationError, "auth_from"):
                 self.client.cp(mapping=transformed, into="output", auth_from="@other")
