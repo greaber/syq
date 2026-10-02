@@ -31,9 +31,9 @@
 use crate::fsops::CopyLocalOutcome;
 use crate::proto::OperatorSymlinkPolicy;
 use crate::sys::{
-    absent_or_nondirectory, directory_names, get_errno, open_at, retry_zero, set_errno, stat_dev,
-    stat_mode, COMMON_NAME_MAX, MODE_DIRECTORY, MODE_FIFO, MODE_REGULAR, MODE_SYMLINK,
-    MODE_TYPE_MASK, NAME_MAX_CACHE_CAP,
+    absent_or_nondirectory, directory_is_empty, directory_names, get_errno, open_at, retry_zero,
+    set_errno, stat_dev, stat_mode, COMMON_NAME_MAX, MODE_DIRECTORY, MODE_FIFO, MODE_REGULAR,
+    MODE_SYMLINK, MODE_TYPE_MASK, NAME_MAX_CACHE_CAP,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
@@ -974,6 +974,14 @@ impl Root {
         let readable = open_readable_directory_at(directory, b".")
             .context("open readable confined directory")?;
         directory_names(readable).context("read confined directory")
+    }
+
+    /// Whether a retained directory has no entries, reading only as far as
+    /// the first.
+    pub(crate) fn open_directory_is_empty(&self, directory: &File) -> Result<bool> {
+        let readable = open_readable_directory_at(directory, b".")
+            .context("open readable confined directory")?;
+        directory_is_empty(readable).context("read confined directory")
     }
 
     /// Read up to about `limit` entries of a retained directory, keeping

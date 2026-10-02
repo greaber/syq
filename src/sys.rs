@@ -156,6 +156,21 @@ pub(crate) fn directory_names(directory: File) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
+/// Whether a directory has no entries but `.` and `..`, reading no further
+/// than the first one. Takes over `directory` like [`directory_names`].
+pub(crate) fn directory_is_empty(directory: File) -> io::Result<bool> {
+    let mut empty = true;
+    let stop = |_: &[u8]| {
+        empty = false;
+        false
+    };
+    #[cfg(target_os = "linux")]
+    read_directory_in_steps(&directory, 8 << 10, stop)?;
+    #[cfg(not(target_os = "linux"))]
+    read_directory_entries_until(directory, stop)?;
+    Ok(empty)
+}
+
 /// Read about `limit` entries of a directory without keeping them, and
 /// return how many it read. The read itself is the point: on NFS it
 /// refreshes the client's entries and attributes for what it read. The
@@ -347,6 +362,9 @@ mod tests {
         let open = || File::open(dir.path()).unwrap();
         assert_eq!(walk_directory_entries(open(), usize::MAX).unwrap(), 1000);
         assert_eq!(walk_directory_entries(open(), 10).unwrap(), 10);
+        assert!(!directory_is_empty(open()).unwrap());
+        let empty = crate::test_support::tempdir().unwrap();
+        assert!(directory_is_empty(File::open(empty.path()).unwrap()).unwrap());
         let mut names = Vec::new();
         read_directory_in_steps(&open(), 8 << 10, |name| {
             names.push(name.to_vec());

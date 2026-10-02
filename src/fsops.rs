@@ -1915,9 +1915,7 @@ impl FsOps {
     /// namespace replacement cannot redirect the read outside the capability.
     fn selected_directory_empty(directory: &File) -> Option<bool> {
         let root = Root::from_directory(directory.try_clone().ok()?).ok()?;
-        root.read_open_directory(directory)
-            .ok()
-            .map(|entries| entries.is_empty())
+        root.open_directory_is_empty(directory).ok()
     }
 
     fn destination_relative(&self, path: &[u8]) -> Result<PathBytes> {
