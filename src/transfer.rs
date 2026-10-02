@@ -343,6 +343,12 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
     Ok(match &loc.host {
         None => Endpoint::local(),
         Some(h) => {
+            let forwarded = args.return_source.clone().or_else(|| {
+                args.named_receipt
+                    .as_ref()
+                    .filter(|_| matches!(args.auth_from, crate::cli::AuthFrom::Return(_)))
+                    .and_then(|receipt| receipt.connection.clone())
+            });
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
                 bail!(
@@ -372,7 +378,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     }
                 }),
             };
-            let ssh_multiplexer = match sharing {
+            let ssh_multiplexer = match sharing.filter(|_| forwarded.is_none()) {
                 None => None,
                 // A restricted grant keeps a private connection for this run.
                 Some(_) if args.restricted_grant.is_some() => {
@@ -432,7 +438,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                bootstrap_helper: args.restricted_grant.is_none()
+                bootstrap_helper: forwarded.is_none()
+                    && args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
                 restricted_grant: args.restricted_grant.clone(),
@@ -443,10 +450,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
-                forwarded: args
-                    .named_receipt
-                    .clone()
-                    .filter(|_| matches!(args.auth_from, crate::cli::AuthFrom::Return(_))),
+                forwarded,
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
@@ -1855,9 +1859,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let prepared_source = args.prepared_source.take();
-    let src_ep = match &prepared_source {
-        Some(source) => source.endpoint.clone(),
-        None => endpoint(&srcs[0], &args)?,
+    let src_ep = match args.direct_source.take() {
+        Some(spec) => Endpoint::Remote(*spec),
+        None => match &prepared_source {
+            Some(source) => source.endpoint.clone(),
+            None => endpoint(&srcs[0], &args)?,
+        },
     };
     let mut dst_ep = match args.direct_destination.take() {
         Some(spec) => Endpoint::Remote(*spec),

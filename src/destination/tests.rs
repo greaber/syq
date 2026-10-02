@@ -3,6 +3,28 @@ use crate::cli::{Args, Interface, Location, Placement};
 use crate::conn::Conn;
 use crate::proto::{Request, Response};
 
+#[test]
+fn approved_source_uses_its_control_channel_without_a_native_ssh_pool() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let mut args = args(directory.path(), "target");
+    args.locations[0].host = Some("source".into());
+    args.locations.last_mut().unwrap().host = None;
+    let (control, _peer) = UnixStream::pair().unwrap();
+    let approved = ReturnConnection::new(control, None);
+    args.return_source = Some(approved.clone());
+    let crate::conn::Endpoint::Remote(source) =
+        crate::transfer::endpoint(&args.locations[0], &args).unwrap()
+    else {
+        panic!("source must remain remote");
+    };
+    assert!(Arc::ptr_eq(source.forwarded.as_ref().unwrap(), &approved));
+    assert!(source.ssh_multiplexer.is_none());
+    assert!(!source.bootstrap_helper);
+    assert!(approved.take_control().is_ok());
+    assert!(approved.take_control().is_err());
+    assert!(approved.ssh_command().is_err());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn full_listen_queue_reports_busy_without_reconnect_advice() {
@@ -731,8 +753,7 @@ fn named_copy_with_transport(tcp: bool) {
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration, approved.token.clone()));
     args.named_receipt = Some(Arc::new(NamedReceipt {
-        ssh: None,
-        control: Mutex::new(None),
+        connection: None,
         secret,
         approved,
         policy,

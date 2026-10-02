@@ -106,14 +106,28 @@ pub(crate) struct Approved {
 
 #[derive(Debug)]
 pub(crate) struct NamedReceipt {
-    ssh: Option<forward::ssh::Client>,
-    control: Mutex<Option<UnixStream>>,
+    pub(crate) connection: Option<Arc<ReturnConnection>>,
     secret: crate::receipt::RecipientSecret,
     approved: Approved,
     policy: crate::receipt::ReceiptPolicy,
 }
 
-impl NamedReceipt {
+/// One approved control channel and its direct worker transport. Copies from
+/// an approved source use this without a destination receipt.
+#[derive(Debug)]
+pub(crate) struct ReturnConnection {
+    ssh: Option<forward::ssh::Client>,
+    control: Mutex<Option<UnixStream>>,
+}
+
+impl ReturnConnection {
+    pub(super) fn new(stream: UnixStream, ssh: Option<forward::ssh::Client>) -> Arc<Self> {
+        Arc::new(Self {
+            ssh,
+            control: Mutex::new(Some(stream)),
+        })
+    }
+
     pub(crate) fn ssh_command(&self) -> Result<Command> {
         self.ssh
             .as_ref()
@@ -844,8 +858,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         })?)
     ));
     args.named_receipt = Some(Arc::new(NamedReceipt {
-        control: Mutex::new(None),
-        ssh: None,
+        connection: None,
         secret,
         approved,
         policy,

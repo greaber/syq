@@ -1314,7 +1314,7 @@ pub struct RemoteSpec {
     /// still filling its pipeline. Readers also reserve the default depth
     /// for pipelined control lookups.
     pub(crate) read_ahead: usize,
-    pub(crate) forwarded: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
+    pub(crate) forwarded: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
 }
 
 #[derive(Debug, Default)]
@@ -1525,6 +1525,7 @@ impl RemoteSpec {
         if !multiplexer.persistent
             || !multiplexer.session_pool
             || self.local_process
+            || self.forwarded.is_some()
             || self.restricted_grant.is_some()
             || !self
                 .rsh

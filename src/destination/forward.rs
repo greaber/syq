@@ -187,8 +187,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     args.restricted_grant = Some("return-control-v1".into());
     let ssh = ssh::Client::new(registration, approved.token.clone());
     args.named_receipt = Some(Arc::new(NamedReceipt {
-        ssh: Some(ssh),
-        control: Mutex::new(Some(stream)),
+        connection: Some(ReturnConnection::new(stream, Some(ssh))),
         secret,
         approved,
         policy,

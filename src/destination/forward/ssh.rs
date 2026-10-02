@@ -378,7 +378,7 @@ impl std::fmt::Debug for Client {
     }
 }
 impl Client {
-    pub(super) fn new(registration: Registration, token: String) -> Self {
+    pub(in crate::destination) fn new(registration: Registration, token: String) -> Self {
         Self {
             registration,
             token,

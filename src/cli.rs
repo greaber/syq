@@ -131,6 +131,11 @@ pub struct Args {
     /// Destination SSH connection opened while choosing automatic authorization.
     #[arg(skip)]
     pub(crate) direct_destination: Option<Box<crate::conn::RemoteSpec>>,
+    /// Source SSH connection opened while choosing automatic authorization.
+    #[arg(skip)]
+    pub(crate) direct_source: Option<Box<crate::conn::RemoteSpec>>,
+    #[arg(skip)]
+    pub(crate) return_source: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
     /// Local source work overlapped with the automatic authorization SSH attempt.
     #[arg(skip)]
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
