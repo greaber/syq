@@ -68,6 +68,17 @@ impl HostPolicy {
         self.host_key_algorithms.join(",")
     }
 
+    pub(crate) fn known_hosts(&self, alias: &str) -> Result<String> {
+        let mut lines = String::new();
+        for key in &self.host_keys {
+            lines.push_str(alias);
+            lines.push(' ');
+            lines.push_str(&PublicKey::new(key.clone(), "").to_openssh()?);
+            lines.push('\n');
+        }
+        Ok(lines)
+    }
+
     fn authorizes_binding(&self, binding: &SessionBind) -> bool {
         key_is_cryptographically_verifiable(&binding.host_key)
             && signature_algorithm_is_cryptographically_verifiable(&binding.signature.algorithm())

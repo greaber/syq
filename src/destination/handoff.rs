@@ -39,6 +39,7 @@ pub(super) enum Kind {
     Copy,
     Forward,
     Command,
+    Ssh,
 }
 
 #[derive(Clone)]
@@ -133,7 +134,9 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     let command = argv.get(3).and_then(|arg| arg.to_str());
     if !matches!(
         (guard.kind, command),
-        (Kind::Copy | Kind::Forward, Some("cp")) | (Kind::Command, Some("exec"))
+        (Kind::Copy | Kind::Forward, Some("cp"))
+            | (Kind::Command, Some("exec"))
+            | (Kind::Ssh, Some("ssh"))
     ) {
         bail!("invalid return handoff command");
     }
