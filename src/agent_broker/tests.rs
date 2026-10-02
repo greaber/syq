@@ -477,6 +477,52 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
 }
 
 #[test]
+fn resolved_policy_exports_only_keys_above_laptop_rsa_minimum() {
+    use ssh_agent_lib::ssh_key::{public::RsaPublicKey, Mpint};
+    let temp = crate::test_support::tempdir().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let config = temp.path().join("config");
+    let ssh = temp.path().join("ssh");
+    let rsa = |bytes| {
+        KeyData::Rsa(RsaPublicKey {
+            e: Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+            n: Mpint::from_positive_bytes(&vec![0x80; bytes]).unwrap(),
+        })
+    };
+    let small = rsa(256);
+    let large = rsa(512);
+    let public = |key| PublicKey::new(key, "").to_openssh().unwrap();
+    std::fs::write(
+        &known_hosts,
+        format!("vault {}\nvault {}\n", public(small), public(large.clone())),
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        format!("UserKnownHostsFile {}\n", known_hosts.display()),
+    )
+    .unwrap();
+    // Supply the laptop's effective policy without making this regression
+    // depend on the test machine supporting the newer OpenSSH directive.
+    std::fs::write(&ssh, format!(
+        "#!/bin/sh\nconfiguration={}\nfor arg in \"$@\"; do if [ \"$arg\" = /dev/null ]; then configuration=/dev/null; fi; done\necho \"debug1: Reading configuration data $configuration\" >&2\nprintf '%s\\n' 'user backup' 'hostname vault' 'port 22' {} 'globalknownhostsfile none' 'hostkeyalgorithms rsa-sha2-512' 'requiredrsasize 3072'\n",
+        shell_words::quote(config.to_str().unwrap()),
+        shell_words::quote(&format!("userknownhostsfile {}", known_hosts.display())),
+    )).unwrap();
+    let keygen = temp.path().join("ssh-keygen");
+    std::fs::write(&keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
+    for program in [&ssh, &keygen] {
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let policy = resolve_host_policy(ssh.to_str().unwrap(), None, "vault").unwrap();
+    assert_eq!(policy.host_keys, [large.clone()]);
+    assert_eq!(
+        policy.copy_known_hosts().unwrap(),
+        format!("syq-copy-peer {}\n", public(large))
+    );
+}
+
+#[test]
 fn signature_algorithm_and_flags_must_match_key_blob() {
     let mut rsa = Vec::new();
     b"ssh-rsa".as_slice().encode(&mut rsa).unwrap();

@@ -68,6 +68,9 @@ impl HostPolicy {
         self.host_key_algorithms.join(",")
     }
 
+    // Policy construction already excludes keys below RequiredRSASize and
+    // algorithms outside HostKeyAlgorithms. Export only those exact keys so
+    // older OpenSSH clients need not understand the newer RSA-size directive.
     pub(crate) fn copy_known_hosts(&self) -> Result<String> {
         self.host_keys
             .iter()
@@ -78,10 +81,6 @@ impl HostPolicy {
                 ))
             })
             .collect()
-    }
-
-    pub(crate) fn required_rsa_size(&self) -> usize {
-        self.required_rsa_size
     }
 
     fn authorizes_binding(&self, binding: &SessionBind) -> bool {
