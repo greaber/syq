@@ -9,8 +9,8 @@ import tempfile
 import time
 
 
-def run(*args, success=True):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=40)
+def run(*args, success=True, stdin=None):
+    result = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=40)
     assert (result.returncode == 0) == success, (args, result)
     return result.stdout
 
@@ -20,10 +20,12 @@ def remote(command, *, success=True):
 
 
 def copy(path, *, allow=True, success=True, extra=(), cancel=False,
-         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None):
+         source="/tmp/syq-real-ssh/return-source/subdir/chunks.bin", prefix=None, after_approval=None, auth=(), binary="syq", stdin=None, ssh_trace=None):
 
     argv = [binary, "cp", "-vv", source, "--to", "destination",
             *auth, "--as", path, "--performance-tuning", "workers=2", *extra]
+    if ssh_trace is not None:
+        argv = ["env", "SYQ_REAL_SSH_TRACE_FILE=" + ssh_trace, *argv]
     command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(["ssh", "source", command], stdout=output, stderr=output,
@@ -90,10 +92,50 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                     process.wait(timeout=3)
 
 
-print("case: automatic authorization requires approval even with automatic local receiving", flush=True)
+print("case: automatic authorization falls back after source SSH fails and requires approval", flush=True)
 run("syq", "persist", "receive", "on", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 remote("mkdir -p /tmp/syq-real-ssh/forward")
+print("case: automatic authorization uses working source SSH without requesting approval", flush=True)
+# Forwarding a credential does not also transfer host trust. Reuse the
+# destination key already trusted by the runner in this isolated lab.
+trusted_destination = run("ssh-keygen", "-F", "destination", "-f", str(Path.home() / ".ssh/known_hosts"))
+run("ssh", "source", "umask 077; cat >> ~/.ssh/known_hosts", stdin=trusted_destination)
+run("ssh", "-A", "source", "timeout 20 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
+    "--to destination --as /tmp/syq-real-ssh/forward/source-ssh")
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+assert remote("sha256sum /tmp/syq-real-ssh/forward/source-ssh").split()[0] == run(
+    "ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
+
+print("case: a configured SSH handshake timeout never requests laptop approval", flush=True)
+run("ssh", "source", "python3 -", stdin="""
+from pathlib import Path
+import subprocess
+import time
+
+config = Path.home() / ".ssh/config"
+original = config.read_bytes() if config.exists() else None
+try:
+    config.write_bytes(b"Host syq-timeout-fixture\\n  HostName destination\\n  ProxyCommand sleep 10\\n  ConnectTimeout 1\\nHost *\\n" + (original or b""))
+    started = time.monotonic()
+    result = subprocess.run([
+        "syq", "cp", "/tmp/syq-real-ssh/return-source/subdir/chunks.bin",
+        "--to", "syq-timeout-fixture", "--as", "/tmp/syq-real-ssh/forward/timed-out",
+    ], capture_output=True, text=True, timeout=8)
+    print(result.stderr, end="", flush=True)
+    assert result.returncode != 0, result
+    assert "timed out" in result.stderr.lower(), result
+    assert "requesting permission" not in result.stderr, result
+    print("SSH timeout returned after", round(time.monotonic() - started, 2), "seconds", flush=True)
+finally:
+    if original is None:
+        config.unlink()
+    else:
+        config.write_bytes(original)
+""")
+assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+remote("test ! -e /tmp/syq-real-ssh/forward/timed-out")
+
 print("case: explicit SSH fails without source credentials and never requests approval", flush=True)
 run("ssh", "source", "timeout 15 syq cp /tmp/syq-real-ssh/return-source/subdir/chunks.bin "
     "--to destination --as /tmp/syq-real-ssh/forward/direct-ssh --auth-from ssh", success=False)
@@ -104,14 +146,41 @@ remote("test ! -e /tmp/syq-real-ssh/forward/denied")
 
 print("case: approved copy uses direct encrypted TCP without source SSH credentials", flush=True)
 trace = Path("/tmp/syq-real-ssh-ssh.trace")
-def destination_connections():
-    events = [dict(field.split("=", 1) for field in line.split("\t"))
-              for line in trace.read_text().splitlines()]
-    return sum(event["phase"] == "start" and event["host"] == "destination" for event in events)
 
-before = destination_connections()
-copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",))
-assert destination_connections() - before == 1, "a cached helper must need only the copy's SSH connection"
+
+def trace_events(text):
+    return [dict(field.split("=", 1) for field in line.split("\t"))
+            for line in text.splitlines()]
+
+
+def forwarding_connections():
+    # Pool warming also connects to destination in the background. Only the
+    # approved copy launches --return-receiver in this container.
+    return [event for event in trace_events(trace.read_text())
+            if event["phase"] == "start" and event["host"] == "destination"
+            and event["return_receiver"] == "yes"]
+
+
+before = len(forwarding_connections())
+# The source has its own trace filesystem. Give this copy a separate file so
+# an older source session's background activity cannot enter the assertion.
+source_trace = run("ssh", "source", "mktemp /tmp/syq-real-ssh/forward-ssh.XXXXXX").strip()
+try:
+    copy("/tmp/syq-real-ssh/forward/approved", extra=("--stats",), ssh_trace=source_trace)
+    approved = forwarding_connections()[before:]
+    assert len(approved) == 1, ("expected one approved SSH connection on the runner", approved)
+    events = trace_events(run("ssh", "source", "cat " + shlex.quote(source_trace)))
+    # RemoteSpec sets ControlMaster on every transport connection. The same
+    # process also runs ssh -G to read config; that query never connects.
+    attempts = [event for event in events
+                if event["phase"] == "start" and event["host"] == "destination"
+                and event["control_master"] != "unset"]
+    assert len(attempts) == 1, ("expected one source SSH attempt", events)
+    exits = [event for event in events
+             if event["phase"] == "end" and event["pid"] == attempts[0]["pid"]]
+    assert len(exits) == 1 and exits[0]["status"] == "255", events
+finally:
+    run("ssh", "source", "rm -f " + shlex.quote(source_trace))
 expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/return-source/subdir/chunks.bin").split()[0]
 assert remote("sha256sum /tmp/syq-real-ssh/forward/approved").split()[0] == expected
 

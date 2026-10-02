@@ -395,7 +395,7 @@ impl Worker {
         mut next_group: impl FnMut(WorkSize) -> Option<std::ops::Range<usize>>,
         results: &mut [Option<SmallPutOutcome>],
     ) -> Result<()> {
-        let early = self.dst.track_small_batches(self.progress.clone())?;
+        let mut early = self.dst.track_small_batches(self.progress.clone())?;
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let mut read_window = if self.src.supports_request_pipelining() {
             window
@@ -424,6 +424,8 @@ impl Worker {
             std::collections::VecDeque::<(std::ops::Range<usize>, usize, std::time::Instant)>::new(
             );
         let mut writes = std::collections::VecDeque::<(Vec<usize>, std::time::Instant)>::new();
+        let mut refresh_latency = false;
+        let mut issued_end = 0;
         let result = (|| -> Result<()> {
             'issuing: loop {
                 // A retired worker finishes its issued groups, but leaves the
@@ -444,6 +446,14 @@ impl Worker {
                             )? {
                                 break 'issuing;
                             }
+                        }
+                        // First drain successful work. Repeating the unchanged
+                        // hashing configuration then measures a round trip with
+                        // no file work or earlier requests ahead of it.
+                        refresh_latency |=
+                            self.batch_budget.latency_check_due(started) && issued_end < jobs.len();
+                        if refresh_latency {
+                            break;
                         }
                         let oldest = reads
                             .front()
@@ -468,6 +478,7 @@ impl Worker {
                     let Some(group) = next_group(limit) else {
                         break;
                     };
+                    issued_end = group.end;
                     let mut requests = Vec::new();
                     for job in &jobs[group.clone()] {
                         self.limit(job.entry.size);
@@ -496,6 +507,30 @@ impl Worker {
                         }
                         continue;
                     }
+                    if refresh_latency && self.gate.allowed(self.id) && !self.sched.is_aborted() {
+                        // Batch receipt tracking accepts only data writes. All
+                        // their replies have been consumed before this RPC.
+                        drop(early.take());
+                        let began = std::time::Instant::now();
+                        configure_hashing(&mut *self.src, self.opts.hash_policy)?;
+                        if !self.gate.allowed(self.id) || self.sched.is_aborted() {
+                            break;
+                        }
+                        configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
+                        if debug() {
+                            crate::output::diagnostic!("syq: worker {}: batch latency recheck {:.3}s after {:.3}s; previous target {:.3}s, budget {:?}", self.id, began.elapsed().as_secs_f64(), self.progress.start.elapsed().as_secs_f64(), self.batch_budget.latency_target().as_secs_f64(), self.batch_budget.limit());
+                        }
+                        self.batch_budget
+                            .refreshed_latency(began.elapsed(), std::time::Instant::now());
+                        early = self.dst.track_small_batches(self.progress.clone())?;
+                        read_window = if self.src.supports_request_pipelining() {
+                            window
+                        } else {
+                            1
+                        };
+                        refresh_latency = false;
+                        continue;
+                    }
                     break;
                 };
                 let (blocks, waited) = if count == 0 {
@@ -514,6 +549,11 @@ impl Worker {
                             break 'issuing;
                         }
                     }
+                };
+                let read_stall_budget = if adaptive {
+                    read_stall_budget.max(self.batch_budget.latency_target())
+                } else {
+                    read_stall_budget
                 };
                 if read_window > 1 && waited > read_stall_budget && self.gate.active() > 1 {
                     if debug() {

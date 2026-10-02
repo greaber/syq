@@ -2258,8 +2258,9 @@ impl FsOps {
         self.cache_entry(location, attempt, private, CachedFile::new(file));
     }
 
-    /// Cache the descriptor that created a file, with the metadata read then.
-    fn cache_created_file(
+    /// Cache a descriptor with the metadata read when it opened or created
+    /// its file, before any write.
+    fn cache_opened_file(
         &mut self,
         location: FileLocation,
         attempt: u32,
@@ -2271,7 +2272,7 @@ impl FsOps {
             location,
             attempt,
             private,
-            CachedFile::created(file, metadata),
+            CachedFile::opened(file, metadata),
         );
     }
 
@@ -2318,9 +2319,9 @@ impl FsOps {
             .map(CachedFile::into_file)
     }
 
-    /// The cached descriptor with the metadata read when it created its
-    /// file, if it did.
-    fn uncache_rooted_created(
+    /// The cached descriptor with the metadata read when it opened its
+    /// file, if that was kept.
+    fn uncache_rooted_opened(
         &mut self,
         root: &Root,
         relative: &RelativePath,
