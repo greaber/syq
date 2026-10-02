@@ -12,30 +12,66 @@ pub(super) struct Lifetime {
     _master: OwnedFd,
 }
 
-pub(super) fn attach(command: &mut Command) -> io::Result<Lifetime> {
-    let (master, slave) = crate::process::with_inheritance_guard(|| -> io::Result<_> {
-        let (mut master, mut slave) = (-1, -1);
-        // No terminal names are needed, so no fixed-size path buffer is involved.
-        if unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        } < 0
-        {
+#[cfg(target_os = "linux")]
+fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    // Linux's spawn guard deliberately has no lock, so both descriptors need
+    // CLOEXEC at creation rather than a later fcntl after openpty.
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if master < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    if unsafe { libc::grantpt(master.as_raw_fd()) } < 0
+        || unsafe { libc::unlockpt(master.as_raw_fd()) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+    let result = unsafe { libc::ptsname_r(master.as_raw_fd(), path.as_mut_ptr(), path.len()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let slave = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((master, unsafe { OwnedFd::from_raw_fd(slave) }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (mut master, mut slave) = (-1, -1);
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openpty returned two distinct owned descriptors. On Darwin the
+    // caller holds the process inheritance guard until CLOEXEC is installed.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    for descriptor in [&master, &slave] {
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: openpty returned two distinct owned descriptors.
-        let (master, slave) =
-            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        for descriptor in [&master, &slave] {
-            if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
+    }
+    Ok((master, slave))
+}
+
+pub(super) fn attach(command: &mut Command) -> io::Result<Lifetime> {
+    let (master, slave) = crate::process::with_inheritance_guard(|| -> io::Result<_> {
+        let (master, slave) = pair()?;
         let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(slave.as_raw_fd(), termios.as_mut_ptr()) } < 0 {
             return Err(io::Error::last_os_error());
