@@ -3939,13 +3939,24 @@ fn explicit_range_controls_preserve_fixed_requests() {
 
 #[test]
 fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
-    for abort in [false, true] {
+    for (abort, starting_bytes) in [
+        (false, 1 << 20),
+        (true, 1 << 20),
+        (false, 64 << 10),
+        (true, 64 << 10),
+    ] {
         let block = 4 << 20;
         let sched = Arc::new(Sched::new(block, 32 << 20));
         let idx = sched.push_file(pipeline_job(b"file", 8 << 20));
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(_)));
         let range = sched.ranges_ready(idx, vec![(0, 8 << 20)]).unwrap();
+        if starting_bytes != 1 << 20 {
+            range.lock().unwrap().split = Some(crate::sched::RangeSplit {
+                block: 512,
+                minimum: 2 * starting_bytes,
+            });
+        }
         let src = Arc::new(Mutex::new(PipelineState {
             auto_ranges: true,
             ..Default::default()
@@ -3988,7 +3999,7 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
             let Item::Range(tail) = sched.next() else {
                 panic!("unread tail returned")
             };
-            assert_eq!(tail.lock().unwrap().pos, 4 * (1 << 20));
+            assert_eq!(tail.lock().unwrap().pos, 4 * starting_bytes);
             assert!(sched.range_done(&tail));
         }
     }
