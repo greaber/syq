@@ -1589,6 +1589,47 @@ mod tests {
         assert!(details.contains("not been inspected"));
     }
     #[test]
+    fn ssh_access_requires_its_own_explicit_approval_kind() {
+        let queue = Arc::new(Queue::default());
+        let waiter = queue.clone();
+        let task = std::thread::spawn(move || {
+            waiter.request_ssh(
+                &requester(),
+                &[b"syq".to_vec(), b"ssh".to_vec(), b"hostB".to_vec()],
+                "/tmp/project",
+                &crate::cli::NativeEndpoint {
+                    user: Some("alice".into()),
+                    host: "hostB".into(),
+                    port: Some(2222),
+                },
+                Notifications::Off,
+                || false,
+            )
+        });
+        wait_pending(&queue);
+        let pending = queue.snapshots().pop().unwrap();
+        assert_eq!(pending.kind(), Kind::Ssh);
+        assert!(pending
+            .desktop_description(false)
+            .contains("account access"));
+        assert!(pending
+            .desktop_description(false)
+            .contains("not permission for only"));
+        let details = pending.description(str::to_owned);
+        assert!(details.contains("alice@hostB:2222"));
+        assert!(details.contains("full authority"));
+        assert!(details.contains("directly between the servers"));
+        let json = serde_json::to_value(&pending).unwrap();
+        assert_eq!(json["kind"], "ssh");
+        assert!(json.get("max_bytes").is_none());
+        for other in [Kind::Copy, Kind::Command, Kind::Storage] {
+            assert!(queue.decide(&pending.id, true, other).is_err());
+        }
+        queue.decide(&pending.id, false, Kind::Ssh).unwrap();
+        assert!(task.join().unwrap().is_err());
+    }
+
+    #[test]
     fn command_prompts_show_the_program_and_its_directory() {
         let mut summary = summary();
         summary.command = crate::approval_command::display(&[
