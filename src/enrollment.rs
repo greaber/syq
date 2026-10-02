@@ -220,9 +220,9 @@ fn safe_receiver_path(path: &Path) -> Result<String> {
         .to_str()
         .context("restricted receiver path is not valid UTF-8")?;
     if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+        })
     {
         bail!("restricted receiver path contains shell-sensitive characters");
     }
@@ -581,6 +581,18 @@ mod tests {
         assert!(entry
             .line()
             .ends_with(" syq-enrollment:00112233445566778899aabbccddeeff"));
+    }
+
+    #[test]
+    fn copy_worker_accepts_installed_source_build_path() {
+        let entry = AuthorizedKeyEntry::copy_worker(
+            id(),
+            Path::new("/home/backup/.cache/syq/v0.7.1+dev.source.123/syq"),
+            "ticket",
+            &key(),
+        )
+        .unwrap();
+        assert!(entry.line().starts_with("restrict,command=\"/home/backup/.cache/syq/v0.7.1+dev.source.123/syq --return-ssh-worker ticket\""));
     }
 
     #[test]
