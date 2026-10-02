@@ -337,6 +337,29 @@ fn automatic_workers_still_respect_restricted_receiver_authority() {
 }
 
 #[test]
+fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
+    let mut args = native_engine_defaults();
+    let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    args.return_source = Some(crate::destination::ReturnConnection::new(control, None));
+    assert_eq!(args.automatic_worker_limit(), 128);
+    args.resource_limits = Some(crate::advanced::ResourceLimits {
+        workers: Some(3),
+        ..Default::default()
+    });
+    assert_eq!(args.automatic_worker_limit(), 3);
+    args.resource_limits.as_mut().unwrap().workers = Some(1000);
+    assert_eq!(args.automatic_worker_limit(), 128);
+    // Account-authorized copies use a primed ordinary RemoteSpec instead of
+    // the per-copy source-authority control channel.
+    args.return_source = None;
+    args.auth_from = AuthFrom::Return("laptop".into());
+    args.direct_source = Some(Box::new(crate::conn::RemoteSpec::local_receiver(true)));
+    assert_eq!(args.automatic_worker_limit(), 1000);
+    args.resource_limits = None;
+    assert_eq!(args.automatic_worker_limit(), usize::MAX);
+}
+
+#[test]
 fn resource_limits_keep_automatic_workers_and_reject_conflicts() {
     let args = parse_native_copy(
         &["source", "--as", "target", "--resource-limits=workers=3"].map(OsString::from),

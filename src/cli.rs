@@ -857,8 +857,9 @@ impl Args {
             .and_then(|limits| limits.workers)
             .unwrap_or(usize::MAX);
         // Removing the tuner's default ceiling does not expand signed
-        // receiver authority. The receiver still enforces its specific grant.
-        if self.restricted_grant.is_some() {
+        // receiver or approved source authority. Each endpoint still enforces
+        // its particular grant; cached full-account SSH has no such ceiling.
+        if self.restricted_grant.is_some() || self.return_source.is_some() {
             requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))
         } else {
             requested
