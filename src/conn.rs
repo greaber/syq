@@ -2216,7 +2216,19 @@ impl RemoteSpec {
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());
         }
-        let out = Command::new(&self.rsh[0])
+        let out = self.ssh_hostname_command().capture_output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find_map(|l| l.strip_prefix("hostname "))
+            .map(|h| h.trim().to_string())
+            .or_else(|| Some(self.host.clone()))
+    }
+
+    /// Read the effective SSH configuration without opening a connection.
+    /// Callers that own a setup deadline can supervise this command themselves.
+    pub(crate) fn ssh_hostname_command(&self) -> Command {
+        let mut command = Command::new(&self.rsh[0]);
+        command
             .args(&self.rsh[1..])
             .arg("-G")
             .args(
@@ -2231,14 +2243,8 @@ impl RemoteSpec {
                     .unwrap_or_default(),
             )
             .arg("--")
-            .arg(&self.host)
-            .capture_output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.lines()
-            .find_map(|l| l.strip_prefix("hostname "))
-            .map(|h| h.trim().to_string())
-            .or_else(|| Some(self.host.clone()))
+            .arg(&self.host);
+        command
     }
 
     /// Open one data connection, spreading successive connections across the

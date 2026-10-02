@@ -727,10 +727,48 @@ pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
     })
 }
 
-pub(super) fn source_data_hostname(target: &str) -> Result<String> {
-    let hostname = target_spec(target)?
-        .resolved_hostname()
-        .context("could not resolve source SSH hostname on the authorizing machine")?;
+pub(super) fn source_data_hostname(
+    spec: &crate::conn::RemoteSpec,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    read_source_hostname(spec.ssh_hostname_command(), deadline, cancelled)
+}
+
+fn read_source_hostname(
+    command: Command,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    // Reuse helper process-group ownership, bounded stderr capture, and the
+    // setup's absolute deadline. A local Match exec must not outlive revocation.
+    let mut child = ForwardChild::spawn_command(command)?;
+    drop(child.child.stdin.take());
+    let mut output = Vec::new();
+    DeadlineIo {
+        inner: child.child.stdout.as_mut().unwrap(),
+        deadline,
+        cancelled: Some(cancelled),
+    }
+    .take(MAX_MESSAGE as u64 + 1)
+    .read_to_end(&mut output)?;
+    anyhow::ensure!(
+        output.len() <= MAX_MESSAGE,
+        "source SSH configuration output is too large"
+    );
+    let status = child.wait_for_exit(deadline, cancelled)?;
+    anyhow::ensure!(
+        status.success(),
+        "resolve source SSH hostname: {}",
+        child.errors()
+    );
+    let text = std::str::from_utf8(&output).context("source SSH configuration is not UTF-8")?;
+    let hostname = text
+        .lines()
+        .find_map(|line| line.strip_prefix("hostname "))
+        .context("source SSH configuration did not report its hostname")?
+        .trim()
+        .to_owned();
     validate_data_hostname(&hostname)?;
     Ok(hostname)
 }
@@ -779,6 +817,25 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use crate::destination::tests::{args, broker, request};
+
+    #[test]
+    fn source_hostname_lookup_obeys_setup_deadline_and_cancellation() {
+        for cancelled in [false, true] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30; printf 'hostname example.test\n'"]);
+            let start = Instant::now();
+            let result =
+                read_source_hostname(command, start + Duration::from_millis(20), &|| cancelled);
+            assert!(result.is_err());
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'hostname example.test\n'; exit 1"]);
+        assert!(
+            read_source_hostname(command, Instant::now() + Duration::from_secs(2), &|| false)
+                .is_err()
+        );
+    }
 
     #[test]
     fn hello_has_a_separate_start_budget_and_partial_bytes_do_not_extend_it() {

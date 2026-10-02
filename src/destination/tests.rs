@@ -1178,7 +1178,9 @@ fn source_data_hostname_preserves_laptop_alias_and_never_uses_requester_config()
     laptop
         .rsh
         .extend(["-F".into(), laptop_config.to_str().unwrap().into()]);
-    let hostname = laptop.resolved_hostname().unwrap();
+    let hostname =
+        forward::source_data_hostname(&laptop, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap();
     assert_eq!(hostname, "203.0.113.42");
     let (control, _peer) = UnixStream::pair().unwrap();
     let approved = ReturnConnection::source(control, hostname).unwrap();

@@ -351,7 +351,12 @@ impl Receiver {
         drop(request_lock);
         // Resolve on the machine that owns the SSH alias, after approval. The
         // requester may have different config and cannot infer this address.
-        let data_hostname = forward::source_data_hostname(&target)?;
+        let deadline = Instant::now() + forward::SETUP_TIMEOUT;
+        let data_hostname = forward::source_data_hostname(
+            &forward::target_spec(&target)?,
+            deadline,
+            &setup_cancelled,
+        )?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
         let (mut child, reply) = forward::ForwardChild::connect(
             &encoded,
@@ -361,7 +366,7 @@ impl Receiver {
                 request,
             },
             "--return-source",
-            Instant::now() + forward::SETUP_TIMEOUT,
+            deadline,
             &setup_cancelled,
         )?;
         anyhow::ensure!(
