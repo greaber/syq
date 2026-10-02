@@ -39,6 +39,7 @@ pub(super) enum Kind {
     Copy,
     Forward,
     Command,
+    Ssh,
 }
 
 #[derive(Clone)]
@@ -133,7 +134,9 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     let command = argv.get(3).and_then(|arg| arg.to_str());
     if !matches!(
         (guard.kind, command),
-        (Kind::Copy | Kind::Forward, Some("cp")) | (Kind::Command, Some("exec"))
+        (Kind::Copy | Kind::Forward, Some("cp"))
+            | (Kind::Command, Some("exec"))
+            | (Kind::Ssh, Some("ssh"))
     ) {
         bail!("invalid return handoff command");
     }
@@ -189,6 +192,18 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
         return Ok(());
     }
     let program = std::ffi::OsStr::from_bytes(&selection.registration.program);
+    if selection.kind == Kind::Ssh {
+        // Help is a read-only capability probe. Older helpers do not know the
+        // new guard kind; give a recovery step before handing them this argv.
+        let supported = Command::new(program)
+            .args(["help", "ssh"])
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .capture_output()
+            .is_ok_and(|output| output.status.success());
+        if !supported {
+            bail!("the registered helper for @{} does not support syq ssh; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+        }
+    }
     let guard = serde_json::to_string(&selection.guard()?)?;
     let argv = command_line()?;
     let mut command = Command::new(program);
@@ -236,4 +251,24 @@ pub(crate) fn copy(
     // a different authorizer after output files or stdin have been consumed.
     args.return_selection = Some(selection);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_handoff_guard_json_remains_readable_and_unchanged() {
+        // Fixed JSON from the e4c130af guard format: do not regenerate these
+        // fixtures from the serializer whose compatibility they check.
+        for encoded in [
+            r#"{"name":"laptop","identity":"old-build","kind":"Copy","registration":"old-registration-digest"}"#,
+            r#"{"name":"laptop","identity":"old-build","kind":"Forward","registration":"old-registration-digest"}"#,
+            r#"{"name":"laptop","identity":"old-build","kind":"Command","registration":"old-registration-digest"}"#,
+        ] {
+            let guard: Guard = serde_json::from_str(encoded).unwrap();
+            assert_eq!(serde_json::to_string(&guard).unwrap(), encoded);
+            assert_ne!(guard.kind, Kind::Ssh);
+        }
+    }
 }

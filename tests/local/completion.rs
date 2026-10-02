@@ -166,6 +166,7 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["syq", "help", ""],
         &[
             "cp",
+            "ssh",
             "exec",
             "rm",
             "map",
@@ -1615,6 +1616,33 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
             fs::remove_file(t.path("home/ssh-used")).unwrap();
         }
     }
+}
+
+#[test]
+fn ssh_completion_never_probes_destination_or_suggests_implicit_authorization() {
+    let t = Tmp::new();
+    write(&t.path("home/.syq-destinations-v3/laptop.json"), b"{}");
+    fs::set_permissions(
+        t.path("home/.syq-destinations-v3"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    write(
+        &t.path("bin/ssh"),
+        b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+    );
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_completion_candidates(&t, &["syq", "ss"], &["ssh"]);
+    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", ""], &["@laptop"]);
+    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "auto"], &[]);
+    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "ssh"], &[]);
+    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "@laptop", "host"], &[]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "ssh", "--auth-from", "@laptop", "host", "--", "--he"],
+        &[],
+    );
+    assert!(!t.path("home/ssh-used").exists());
 }
 
 #[test]

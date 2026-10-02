@@ -32,7 +32,6 @@ pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
 mod identity;
-#[cfg(test)]
 pub(crate) mod ssh;
 pub(crate) mod storage;
 pub(crate) mod tcp;

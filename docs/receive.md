@@ -6,6 +6,8 @@ Receiving lets you use your laptop from a connected server:
 
 - [Copy files to your laptop](#copy-files-to-your-laptop).
 - [Run commands on your laptop](#run-commands-on-your-laptop).
+- [Open a shell on another server](#open-a-shell-on-another-server)
+  using your laptop's SSH credentials.
 - [Authorize copies between servers](#authorize-copies-between-servers)
   using your laptop's SSH credentials.
 - [Authorize object-storage transfers](object-storage.md#authorize-from-your-laptop)
@@ -130,8 +132,8 @@ Automatic approval trusts all processes running as the connected server accounts
 including for overwrites inside that directory. You can
 [limit a profile to particular servers](persistence-reference.md#choose-allowed-servers).
 
-Commands on your laptop, authorization for copies between servers, and
-storage authorization require approval every time. See
+Commands on your laptop, SSH account access, authorization for copies between
+servers, and storage authorization require approval every time. See
 [Receivers](security.md#receivers) for the trust boundary.
 
 To require approval for every download again:
@@ -171,6 +173,22 @@ Output streams back to the server terminal, and syq returns the command's exit
 code. Interrupting the request or stopping receiving stops the command;
 completed changes are not rolled back. See [`syq exec`](commands/exec.md)
 for arguments, working directories, and cancellation details.
+
+## Open a shell on another server
+
+From hostA, use your laptop's SSH credentials to open a direct connection to
+hostB:
+
+```sh
+syq ssh --auth-from @laptop user@hostB
+syq ssh --auth-from @laptop hostB -- hostname
+```
+
+Approve the destination account on your laptop. This permits arbitrary
+commands as that account; the approval is not limited to the command shown.
+Session traffic goes directly between the servers, and your ordinary SSH
+agent is not forwarded. Keep the laptop connection open during the session.
+See [`syq ssh`](commands/ssh.md) for commands, terminals, and requirements.
 
 ## Authorize copies between servers
 

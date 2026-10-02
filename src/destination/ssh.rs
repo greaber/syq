@@ -5,6 +5,8 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
+mod foreground;
+
 #[derive(Parser)]
 #[command(
     name = "syq ssh",
@@ -80,6 +82,19 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
         },
         command: parsed.command,
     })
+}
+
+pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
+    let request = parse(argv)?;
+    crate::fsops::reserve_startup_descriptors();
+    let session = super::ssh_auth::authorize(&request)?;
+    let mut command = std::process::Command::new("ssh");
+    command
+        .args(session.options())
+        .args(request.ssh_arguments(session.endpoint())?);
+    // OpenSSH owns the inherited terminal and all session I/O. Keep the
+    // authorization alive until it exits; never retry a remote command.
+    foreground::run(&mut command, || session.cancelled())
 }
 
 fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
