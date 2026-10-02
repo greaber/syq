@@ -59,6 +59,14 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     {
         return Ok(None);
     }
+    // A custom native route bypasses optional saved authorizer choices.
+    if args.rsh.is_some() || args.pscope_explicit {
+        anyhow::ensure!(
+            !(args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_))),
+            "--auth-from @NAME cannot be combined with --rsh or --pscope"
+        );
+        return Ok(None);
+    }
     let mode = |location: &Location| {
         crate::auth_from::resolve(
             location.host.as_deref().unwrap(),
@@ -69,9 +77,7 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     let destination_mode = mode(destination)?;
     let named = matches!(source_mode, AuthFrom::Return(_))
         || matches!(destination_mode, AuthFrom::Return(_));
-    if args.rsh.is_some()
-        || args.pscope_explicit
-        || args.detach
+    if args.detach
         || args.peer_auth != PeerAuth::Restricted
         || !matches!(args.coordinate_at, CoordinateAt::Auto | CoordinateAt::Src)
         || source.same_host(destination)
@@ -631,4 +637,100 @@ fn coordinator() -> Result<i32> {
         })
         .status_guarded()?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args() -> Args {
+        crate::approval_command::parse(
+            &[
+                "cp",
+                "--from",
+                "source.example",
+                "file",
+                "--to",
+                "destination.example",
+                "--as",
+                "out",
+                "--auth-from",
+                "ssh",
+            ]
+            .map(|word| word.as_bytes().to_vec()),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn explicit_native_peer_routes_remain_native_including_same_host() {
+        let mut args = args();
+        assert!(super::super::select_copy(&mut args, None)
+            .unwrap()
+            .is_none());
+        assert!(args.peer_bridge.is_none());
+        args.locations.last_mut().unwrap().host = Some("source.example".into());
+        assert!(super::super::select_copy(&mut args, None)
+            .unwrap()
+            .is_none());
+        assert!(args.peer_bridge.is_none());
+    }
+    #[test]
+    fn custom_routes_bypass_saved_choices_but_reject_explicit_authorizers() {
+        for use_rsh in [false, true] {
+            let mut args = args();
+            args.auth_from = AuthFrom::Return("laptop".into());
+            if use_rsh {
+                args.rsh = Some("ssh -i /custom/key".into());
+            } else {
+                args.pscope_explicit = true;
+            }
+            args.auth_from_explicit = false;
+            assert!(select(&args).unwrap().is_none());
+            args.auth_from_explicit = true;
+            assert!(select(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined"));
+        }
+    }
+    #[test]
+    fn unsupported_explicit_peer_modes_cannot_fall_back_to_native_credentials() {
+        for mode in 0..3 {
+            let mut args = args();
+            args.auth_from = AuthFrom::Return("laptop".into());
+            args.auth_from_explicit = true;
+            match mode {
+                0 => args.coordinate_at = CoordinateAt::Dst,
+                1 => args.detach = true,
+                _ => args.peer_auth = PeerAuth::Broker,
+            }
+            assert!(select(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("source coordination"));
+        }
+    }
+    #[test]
+    fn peer_forward_paths_and_tickets_reject_parser_expansion_and_wrong_builds() {
+        for path in ["relative", "/tmp/a:b", "/tmp/%h", "/tmp/a b", "/tmp/a\nb"] {
+            assert!(socket_path(Path::new(path)).is_err(), "{path}");
+        }
+        let mut ticket = Ticket {
+            version: VERSION,
+            identity: crate::identity::build().into(),
+            socket: "/tmp/syq-peer-Abc123/control".into(),
+            secret: random_token().unwrap(),
+        };
+        ticket.validate().unwrap();
+        ticket.identity.push('x');
+        assert!(ticket.validate().is_err());
+        ticket.identity = crate::identity::build().into();
+        ticket.version += 1;
+        assert!(ticket.validate().is_err());
+        // The setup protocol has no caller-selected host, command, path or ticket.
+        assert!(
+            serde_json::from_str::<Action>(r#"{"Ssh":{"public_key":"key","host":"other"}}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<Action>(r#"{"Exec":{"command":"anything"}}"#).is_err());
+    }
 }

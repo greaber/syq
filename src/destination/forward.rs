@@ -650,7 +650,11 @@ fn relay_inner(
         if release_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break Ok(false);
         }
-        match completions.recv_timeout(Duration::from_millis(10)) {
+        match completions.recv_timeout(Duration::from_millis(if wait_for_release {
+            10
+        } else {
+            100
+        })) {
             Ok((true, result)) => break result.map(|_| true).map_err(Into::into),
             Ok((false, result)) if !wait_for_release => {
                 break result.map(|_| false).map_err(Into::into)
@@ -1108,6 +1112,87 @@ mod tests {
         result.unwrap();
         assert_eq!(&response, b"hello");
     }
+    #[test]
+    fn peer_relay_release_allows_slow_final_coordinator_output() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf done"]);
+        let mut peer = ForwardChild::spawn_command(command).unwrap();
+        let input = peer.child.stdin.take().unwrap();
+        let output = peer.child.stdout.take().unwrap();
+        let thread =
+            std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
+        let mut result = Vec::new();
+        client.read_to_end(&mut result).unwrap();
+        assert_eq!(result, b"done");
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        let released = thread.join().unwrap().unwrap();
+        assert!(released);
+        // The independently owned coordinator may still flush its final stdout.
+        // No fixed deadline applies after it released its peer control.
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2.2; printf final"]);
+        let mut coordinator = ForwardChild::spawn_command(command).unwrap();
+        let mut output = coordinator.child.stdout.take().unwrap();
+        assert!(coordinator
+            .wait_until_exit(None, &|| !released)
+            .unwrap()
+            .success());
+        result.clear();
+        output.read_to_end(&mut result).unwrap();
+        assert_eq!(result, b"final");
+    }
+
+    #[test]
+    fn peer_relay_loss_without_control_release_stops_the_coordinator() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut peer = ForwardChild::spawn_command(command).unwrap();
+        let input = peer.child.stdin.take().unwrap();
+        let output = peer.child.stdout.take().unwrap();
+        let started = Instant::now();
+        let thread =
+            std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        // Keep B's read/upload side alive even though C disappeared.
+        assert!(!thread.join().unwrap().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(client.write_all(b"late").is_err());
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let mut coordinator = ForwardChild::spawn_command(command).unwrap();
+        assert!(coordinator.wait_until_exit(None, &|| true).is_err());
+        assert!(coordinator.child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn peer_relay_cancellation_wakes_both_blocked_pumps() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let mut command = Command::new("cat");
+        command.arg("-");
+        let mut peer = ForwardChild::spawn_command(command).unwrap();
+        let input = peer.child.stdin.take().unwrap();
+        let output = peer.child.stdout.take().unwrap();
+        let started = Instant::now();
+        assert!(relay_peer(
+            server,
+            input,
+            output,
+            || started.elapsed() >= Duration::from_millis(20),
+            &mut peer
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(peer.child.try_wait().unwrap().is_some());
+    }
+
     #[test]
     fn remote_targets_are_endpoints_not_shell_or_ssh_options() {
         for target in ["backup", "alice@backup:2222", "alice@[2001:db8::1]:22"] {

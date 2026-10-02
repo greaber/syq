@@ -832,6 +832,27 @@ fn select_copy(
     match &args.auth_from {
         crate::cli::AuthFrom::Return(_) => return forward::select(args, progress),
         crate::cli::AuthFrom::Ssh => {
+            if args
+                .locations
+                .split_last()
+                .is_some_and(|(destination, sources)| {
+                    destination.is_remote()
+                        && destination
+                            .host
+                            .as_deref()
+                            .is_none_or(|host| !host.starts_with('@'))
+                        && !sources.is_empty()
+                        && sources.iter().all(|source| {
+                            source.is_remote()
+                                && source
+                                    .host
+                                    .as_deref()
+                                    .is_none_or(|host| !host.starts_with('@'))
+                        })
+                })
+            {
+                return Ok(None);
+            }
             let (destination, sources) = args
                 .locations
                 .split_last()
