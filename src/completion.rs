@@ -1788,16 +1788,31 @@ fn connect_completion_endpoint(
         if let Some(AuthFrom::Return(name)) = auth_from {
             bail!("no live approved account connection for {} through @{name}; connect first with syq persist connect {} --auth-from @{name}", endpoint_label(&endpoint), endpoint_label(&endpoint));
         }
-        Some(match crate::persistence::scope_for_implicit_ssh(pscope)? {
-            Some(scope) => Arc::new(SshMultiplexer::persistent(
-                &scope,
-                endpoint.user.as_deref(),
-                &endpoint.host,
-                endpoint.port,
-                None,
-            )?),
-            None => Arc::new(SshMultiplexer::new()?),
-        })
+        let persistent = crate::persistence::scope_for_implicit_ssh(pscope).and_then(|scope| {
+            scope
+                .map(|scope| {
+                    SshMultiplexer::persistent(
+                        &scope,
+                        endpoint.user.as_deref(),
+                        &endpoint.host,
+                        endpoint.port,
+                        None,
+                    )
+                })
+                .transpose()
+        });
+        let persistent = match persistent {
+            Ok(multiplexer) => multiplexer,
+            Err(error) if pscope.is_none() => {
+                crate::output::diagnostic!("syq: warning: cannot use persistent SSH connections ({error:#}); continuing without persistence");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        Some(Arc::new(match persistent {
+            Some(multiplexer) => multiplexer,
+            None => SshMultiplexer::new()?,
+        }))
     };
     for option in [
         "BatchMode=yes",

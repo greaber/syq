@@ -2249,3 +2249,126 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
         }
     }
 }
+
+#[test]
+fn approved_completion_auto_ignores_malformed_optional_state() {
+    for damaged in [
+        "unrelated-index",
+        "persistence-with-index",
+        "persistence-without-index",
+    ] {
+        let t = Tmp::new();
+        approved_completion_fixture(&t);
+        let index = if damaged != "persistence-without-index" {
+            let control = approved_completion_master(&t, "laptop");
+            Some(
+                control
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("authorized-ssh-v1"),
+            )
+        } else {
+            None
+        };
+        if damaged == "unrelated-index" {
+            let path = index.as_ref().unwrap().join("unrelated.json");
+            write(&path, b"{");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        } else {
+            write(&t.path("config/syq/persistence.json"), b"{");
+        }
+        let path = format!("{}/n", t.s("remote-home/data"));
+        for source in [false, true] {
+            let mut words = vec!["syq", "cp", "--syq-path", env!("CARGO_BIN_EXE_syq")];
+            if source {
+                words.extend(["--from", "backup"]);
+            } else {
+                words.extend(["file", "--to", "backup", "--into"]);
+            }
+            words.push(&path);
+            // Refuse the mock native login before Hello, avoiding its helper
+            // pool while proving that optional state did not block the route.
+            let output = approved_completion_command(&t, &words)
+                .env("FAKE_SSH_SESSION_STATUS", "55")
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("warning:"),
+                "{damaged}: {output:?}"
+            );
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            let sessions: Vec<_> = log
+                .lines()
+                .filter(|line| !line.contains("-O check"))
+                .collect();
+            assert_eq!(sessions.len(), 1, "{damaged}: {log}");
+            assert!(sessions[0].contains("-- backup"), "{damaged}: {log}");
+            assert!(
+                !sessions[0].contains("ProxyCommand=false"),
+                "{damaged}: {log}"
+            );
+            fs::remove_file(t.path("rsh.log")).unwrap();
+        }
+        if damaged == "unrelated-index" {
+            // Explicit selection must expose damage to its selected authority,
+            // even though automatic reuse treats an unusable index as optional.
+            for entry in fs::read_dir(index.unwrap()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|value| value == "json") {
+                    write(&path, b"{");
+                }
+            }
+        }
+        let output = approved_completion_command(
+            &t,
+            &[
+                "syq",
+                "cp",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--from",
+                "backup",
+                "--auth-from",
+                "@laptop",
+                &path,
+            ],
+        )
+        .run()
+        .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
+        assert!(!output.stderr.is_empty(), "{damaged}: {output:?}");
+        assert!(!t.path("rsh.log").exists(), "{damaged}");
+    }
+}
+
+#[test]
+fn approved_completion_explicit_scope_errors_remain_errors() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    let scope = t.s("missing-scope");
+    let output = approved_completion_command(
+        &t,
+        &[
+            "syq",
+            "cp",
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--from",
+            "backup",
+            "--pscope",
+            &scope,
+            "anything",
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(!output.stderr.is_empty(), "{output:?}");
+    assert!(!t.path("rsh.log").exists());
+}
