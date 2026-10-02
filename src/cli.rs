@@ -1309,7 +1309,7 @@ fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Use local SSH first, then an available receiving machine if authentication fails (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies)
+    /// Use local SSH first, then an available receiving machine for credential, host-key, hostname, or refused-connection errors (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies)
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator

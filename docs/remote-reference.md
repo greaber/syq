@@ -127,9 +127,12 @@ still be running. The coordinating server needs `/bin/kill` and either
 For `syq cp` with local sources and an SSH destination, `--auth-from auto`
 (the default) first uses the source machine's SSH access, including existing
 connections. SSH keeps its normal prompts and configured timeouts. If SSH
-reports rejected credentials, syq tries live receiving machines in alphabetical
-order, allowing up to two seconds for each reply. Connection timeouts, host-key
-failures, and other SSH errors end the attempt without trying a receiving machine.
+reports rejected credentials, a host-key verification failure, an unresolved
+hostname, or a refused connection, syq tries live receiving machines in
+alphabetical order, allowing up to two seconds for each reply. The receiving
+machine uses its own SSH configuration and trusted host keys. Timeouts,
+temporary DNS failures, and unrecognized SSH errors end the attempt without
+trying a receiving machine.
 Offline or unsupported receiving connections are skipped. With none available,
 the SSH error is reported. Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
