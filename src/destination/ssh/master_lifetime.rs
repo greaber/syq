@@ -51,8 +51,8 @@ fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     } < 0
     {
@@ -95,7 +95,7 @@ pub(super) fn attach(command: &mut Command) -> io::Result<Lifetime> {
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0
-                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0
+                || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
                 || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
             {
                 return Err(io::Error::last_os_error());
