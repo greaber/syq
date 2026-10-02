@@ -286,12 +286,14 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         REQUEST_TIMEOUT + forward::SETUP_TIMEOUT + Duration::from_secs(10),
         None,
     )?;
-    anyhow::ensure!(
-        matches!(reply, Reply::SourceApproved),
-        "unexpected source approval response"
-    );
+    let Reply::SourceApproved {
+        data_hostname: Some(data_hostname),
+    } = reply
+    else {
+        bail!("source approval did not provide its resolved data hostname");
+    };
     args.auth_from = crate::cli::AuthFrom::Return(name);
-    args.return_source = Some(ReturnConnection::new(stream, None));
+    args.return_source = Some(ReturnConnection::source(stream, data_hostname)?);
     Ok(())
 }
 
@@ -347,6 +349,9 @@ impl Receiver {
         )?;
         anyhow::ensure!(!setup_cancelled(), "source copy disconnected before setup");
         drop(request_lock);
+        // Resolve on the machine that owns the SSH alias, after approval. The
+        // requester may have different config and cannot infer this address.
+        let data_hostname = forward::source_data_hostname(&target)?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
         let (mut child, reply) = forward::ForwardChild::connect(
             &encoded,
@@ -360,7 +365,7 @@ impl Receiver {
             &setup_cancelled,
         )?;
         anyhow::ensure!(
-            matches!(reply, Reply::SourceApproved),
+            matches!(reply, Reply::SourceApproved { .. }),
             "invalid source setup response"
         );
         let result = (|| {
@@ -368,7 +373,12 @@ impl Receiver {
             let output = child.child.stdout.take().unwrap();
             socket.set_read_timeout(None)?;
             socket.set_write_timeout(None)?;
-            write_message(&mut stream, &Reply::SourceApproved)?;
+            write_message(
+                &mut stream,
+                &Reply::SourceApproved {
+                    data_hostname: Some(data_hostname),
+                },
+            )?;
             forward::relay(socket.try_clone()?, input, output, cancelled, &mut child)
         })();
         result.with_context(|| format!("copy via this machine from {target:?}: {}", child.errors()))
@@ -402,7 +412,12 @@ pub(super) fn receive() -> Result<i32> {
             return Err(error);
         }
     };
-    write_message(&mut std::io::stdout(), &Reply::SourceApproved)?;
+    write_message(
+        &mut std::io::stdout(),
+        &Reply::SourceApproved {
+            data_hostname: None,
+        },
+    )?;
     let pending = Arc::new(AtomicBool::new(true));
     crate::server::run_authorized_source(
         forward::HandshakeInput::new(

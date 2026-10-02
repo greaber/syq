@@ -119,6 +119,7 @@ pub(crate) struct NamedReceipt {
 #[derive(Debug)]
 pub(crate) struct ReturnConnection {
     ssh: Option<forward::ssh::Client>,
+    data_hostname: Option<String>,
     control: Mutex<Option<UnixStream>>,
 }
 
@@ -126,8 +127,22 @@ impl ReturnConnection {
     pub(super) fn new(stream: UnixStream, ssh: Option<forward::ssh::Client>) -> Arc<Self> {
         Arc::new(Self {
             ssh,
+            data_hostname: None,
             control: Mutex::new(Some(stream)),
         })
+    }
+
+    pub(super) fn source(stream: UnixStream, data_hostname: String) -> Result<Arc<Self>> {
+        validate_data_hostname(&data_hostname)?;
+        Ok(Arc::new(Self {
+            ssh: None,
+            data_hostname: Some(data_hostname),
+            control: Mutex::new(Some(stream)),
+        }))
+    }
+
+    pub(crate) fn data_hostname(&self) -> Option<&str> {
+        self.data_hostname.as_deref()
     }
 
     pub(crate) fn has_ssh(&self) -> bool {
@@ -148,6 +163,21 @@ impl ReturnConnection {
             .take()
             .context("approved return control connection was already consumed")
     }
+}
+
+/// This value is a TCP address candidate only, never SSH or shell syntax.
+fn validate_data_hostname(host: &str) -> Result<()> {
+    anyhow::ensure!(
+        !host.is_empty()
+            && host.len() <= 512
+            && !host.starts_with('-')
+            && (host.parse::<std::net::Ipv6Addr>().is_ok()
+                || host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))),
+        "approved source data hostname is not a plain hostname or IP address"
+    );
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -209,7 +239,7 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
-    SourceApproved,
+    SourceApproved { data_hostname: Option<String> },
     ForwardSsh(forward::ssh::Peer),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),

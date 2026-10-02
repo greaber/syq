@@ -2205,13 +2205,26 @@ impl RemoteSpec {
     }
 
     /// The real host name behind an ssh config alias.
-    fn resolved_hostname(&self) -> Option<String> {
+    pub(crate) fn resolved_hostname(&self) -> Option<String> {
+        if let Some(host) = self
+            .forwarded
+            .as_ref()
+            .and_then(|connection| connection.data_hostname())
+        {
+            return Some(host.to_owned());
+        }
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());
         }
         let out = Command::new(&self.rsh[0])
             .args(&self.rsh[1..])
             .arg("-G")
+            .args(
+                self.user
+                    .as_ref()
+                    .map(|user| vec!["-l".to_owned(), user.clone()])
+                    .unwrap_or_default(),
+            )
             .args(
                 self.port
                     .map(|port| vec!["-p".to_owned(), port.to_string()])

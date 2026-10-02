@@ -348,7 +348,7 @@ impl ForwardChild {
                 })
             })();
             match reply {
-                Ok(reply @ (Reply::Approved(_) | Reply::SourceApproved)) => {
+                Ok(reply @ (Reply::Approved(_) | Reply::SourceApproved { .. })) => {
                     return Ok((child, reply))
                 }
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
@@ -685,8 +685,16 @@ fn connect(target: &str, install: bool, operation: &str) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let target =
         String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(target)?)?;
-    let endpoint = target_endpoint(&target)?;
-    let spec = crate::conn::RemoteSpec {
+    let spec = target_spec(&target)?;
+    if install {
+        spec.install_helper()?;
+    }
+    Err(spec.helper_command(&[operation.into()]).exec().into())
+}
+/// Build the same SSH route for helper setup and laptop-side address lookup.
+pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
+    let endpoint = target_endpoint(target)?;
+    Ok(crate::conn::RemoteSpec {
         local_process: false,
         user: endpoint.user,
         host: endpoint.host,
@@ -716,12 +724,17 @@ fn connect(target: &str, install: bool, operation: &str) -> Result<i32> {
         primed_control: Default::default(),
         forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
-    };
-    if install {
-        spec.install_helper()?;
-    }
-    Err(spec.helper_command(&[operation.into()]).exec().into())
+    })
 }
+
+pub(super) fn source_data_hostname(target: &str) -> Result<String> {
+    let hostname = target_spec(target)?
+        .resolved_hostname()
+        .context("could not resolve source SSH hostname on the authorizing machine")?;
+    validate_data_hostname(&hostname)?;
+    Ok(hostname)
+}
+
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
         "--return-receiver" if argv.len() == 2 => Some(receive()),
