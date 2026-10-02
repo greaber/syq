@@ -1307,6 +1307,7 @@ fn value_completion(
             _ => None,
         },
         "rm" | "clean-partials" => match option {
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--results" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1322,6 +1323,7 @@ fn value_completion(
             _ => None,
         },
         "map" => match option {
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
@@ -1345,6 +1347,7 @@ fn value_completion(
             _ => None,
         },
         "rsync" => match option {
+            b"--syq-auth-from" => Some(ValueCompletion::AuthFrom),
             b"--files-from" | b"--syq-ignore-from" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
