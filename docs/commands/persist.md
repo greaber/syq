@@ -59,6 +59,22 @@ Export an existing [approved account connection](../persistence-reference.md#app
 for native SSH tools. Save the output to a file and pass it through `-F`.
 
 <!-- CLI: persist ssh-config -->
+```text
+syq persist ssh-config [OPTIONS] <HOST>
+```
+
+**Arguments**
+
+| Argument / option | Meaning |
+|---|---|
+| `<HOST>` | Approved SSH endpoint: [USER@]HOST[:PORT] |
+
+**Options**
+
+| Argument / option | Meaning |
+|---|---|
+| `--auth-from <auto\|ssh\|@NAME>` | Select existing approval; omitted uses the saved preference, then auto |
+
 <!-- /CLI -->
 
 ## syq persist receive

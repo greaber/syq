@@ -76,7 +76,7 @@ pub(crate) fn operation(
         return Ok(None);
     }
     if host.starts_with('@') {
-        bail!("named receiving machines support syq cp and syq ssh; use an SSH endpoint for this operation");
+        bail!("named receiving machines support syq cp and syq exec; use an SSH endpoint for this operation");
     }
     if args.rsh.is_some() || args.pscope_explicit {
         if args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_)) {

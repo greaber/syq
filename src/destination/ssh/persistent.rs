@@ -185,13 +185,29 @@ pub(crate) fn select_cached(requested: &NativeEndpoint, mode: &AuthFrom) -> Resu
         AuthFrom::Return(authorizer) => return cached(authorizer, requested),
         AuthFrom::Auto => {}
     }
+    let mut matches = match automatic_matches(requested) {
+        Ok(matches) => matches,
+        Err(error) => {
+            // This is optional cached authority. Discard the entire scan on
+            // failure rather than selecting an incompletely checked result.
+            crate::output::diagnostic!("syq: warning: cannot inspect approved SSH connections ({error:#}); continuing without account connection reuse");
+            return Ok(None);
+        }
+    };
+    anyhow::ensure!(matches.len() <= 1,
+        "more than one laptop has approved this SSH endpoint; select one with --auth-from @NAME or syq persist auth-from @NAME --for {}",
+        requested.host);
+    Ok(matches.pop())
+}
+
+fn automatic_matches(requested: &NativeEndpoint) -> Result<Vec<Cached>> {
     let index = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+    let mut matches = Vec::new();
     if !index.exists() || !crate::persistence::global_enabled()? {
-        return Ok(None);
+        return Ok(matches);
     }
     // Validate the existing directory before looking at any of its records.
     let index = directory()?;
-    let mut selected = None;
     for entry in fs::read_dir(index)? {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -204,13 +220,10 @@ pub(crate) fn select_cached(requested: &NativeEndpoint, mode: &AuthFrom) -> Resu
             continue;
         }
         if let Some(active) = active_record(record)? {
-            anyhow::ensure!(selected.is_none(),
-                "more than one laptop has approved this SSH endpoint; select one with --auth-from @NAME or syq persist auth-from @NAME --for {}",
-                requested.host);
-            selected = Some(active);
+            matches.push(active);
         }
     }
-    Ok(selected)
+    Ok(matches)
 }
 
 #[derive(Serialize)]
