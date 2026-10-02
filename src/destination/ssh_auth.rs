@@ -40,8 +40,28 @@ impl Session {
     }
 
     pub(crate) fn cancelled(&self) -> bool {
-        requester_closed(&self.stream)
+        disconnected(&self.stream)
     }
+}
+
+fn disconnected(socket: &UnixStream) -> bool {
+    let mut byte = 0u8;
+    let result = unsafe {
+        libc::recv(
+            socket.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    // Authentication replies belong to the agent relay. Peeking must neither
+    // consume them nor mistake a pending reply for session cancellation.
+    result == 0
+        || (result < 0
+            && !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ))
 }
 
 impl Drop for Session {
@@ -270,6 +290,20 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agent_replies_do_not_cancel_the_ssh_session() {
+        let (mut local, mut remote) = UnixStream::pair().unwrap();
+        assert!(!disconnected(&local));
+        remote.write_all(b"reply").unwrap();
+        assert!(!disconnected(&local));
+        let mut reply = [0; 5];
+        local.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"reply");
+        assert!(!disconnected(&local));
+        drop(remote);
+        assert!(disconnected(&local));
+    }
+
     #[test]
     fn native_ssh_uses_only_the_approved_agent_and_host_policy() {
         let options = ssh_options(
