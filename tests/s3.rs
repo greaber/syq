@@ -1430,7 +1430,7 @@ fn serve(
             assert!(!keys.is_empty() && keys.len() <= 1000);
             if fault == "prune-timing" {
                 assert!(gate.0.load(Ordering::Acquire), "pruned before uploading");
-                thread::sleep(Duration::from_millis(1100));
+                thread::sleep(Duration::from_millis(2100));
             }
             if fault == "prune-concurrent" {
                 let (arrived, peer) = if keys.len() == 1000 {
@@ -3343,13 +3343,24 @@ fn s3_transfer_timing_excludes_delayed_pruning() {
     assert_eq!(terminal["deletions_completed"], 1);
     let total = terminal["timings"]["total_ms"].as_u64().unwrap();
     let transfer = terminal["timings"]["transfer_ms"].as_u64().unwrap();
-    assert!(total >= transfer + 1000, "{terminal}");
-    let final_progress = records
-        .iter()
-        .rev()
-        .find(|r| r["type"] == "progress")
-        .unwrap();
+    assert!(total >= transfer + 2000, "{terminal}");
+    let progress: Vec<_> = records.iter().filter(|r| r["type"] == "progress").collect();
+    let (final_progress, live_progress) = progress.split_last().unwrap();
     assert_eq!(final_progress["timings"], terminal["timings"]);
+    let during_prune: Vec<_> = live_progress
+        .iter()
+        .filter(|r| {
+            r["files_done"] == 1 && r["timings"]["total_ms"].as_u64().unwrap() >= transfer + 500
+        })
+        .collect();
+    assert!(!during_prune.is_empty(), "no live progress during pruning");
+    for record in during_prune {
+        assert_eq!(record["timings"]["transfer_ms"], transfer, "{record}");
+        assert_eq!(
+            record["rate_bytes_per_second"], final_progress["rate_bytes_per_second"],
+            "{record}"
+        );
+    }
 }
 
 #[test]

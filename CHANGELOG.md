@@ -23,6 +23,9 @@ Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/
   Transfer elapsed time and speed exclude initial setup and helper installation,
   and stop advancing during finalization. Interactive copies show a compact
   timing summary; automation exposes the measurements in `timings`.
+- S3 progress records stop transfer timing and rate updates when file work
+  finishes, before pruning and directory metadata. Transfer duration stays
+  consistent between live progress and the final result.
 
 ## 0.7.1 — 2026-09-22
 

@@ -280,6 +280,7 @@ impl Engine {
             })
             .await?;
         }
+        self.progress.finish_transfer();
         self.prune(prune, None).await?;
         Ok(())
     }
