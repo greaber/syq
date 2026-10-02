@@ -25,6 +25,8 @@ struct Startup {
     command: Vec<Vec<u8>>,
     authorizer: String,
     scope: PathBuf,
+    scope_device: u64,
+    scope_inode: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,6 +178,12 @@ pub(crate) struct Status {
     connected: bool,
 }
 pub(crate) fn status() -> Result<Vec<Status>> {
+    if !crate::persistence::runtime_parent_path()
+        .join("authorized-ssh-v1")
+        .exists()
+    {
+        return Ok(Vec::new());
+    }
     let directory = directory()?;
     let mut rows = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -282,6 +290,7 @@ pub(crate) fn connect(request: SessionRequest) -> Result<()> {
         );
         return Ok(());
     }
+    let metadata = scope.symlink_metadata()?;
     let startup = Startup {
         command: super::super::handoff::command_line()?
             .iter()
@@ -289,6 +298,8 @@ pub(crate) fn connect(request: SessionRequest) -> Result<()> {
             .collect(),
         authorizer: request.authorizer,
         scope,
+        scope_device: metadata.dev(),
+        scope_inode: metadata.ino(),
     };
     let signals = foreground::Signals::new()?;
     let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
@@ -359,10 +370,26 @@ impl Drop for Index {
     }
 }
 
+fn global_still_open(startup: &Startup) -> Result<bool> {
+    if !crate::persistence::global_enabled()?
+        || startup.scope.join(crate::receive_service::CLOSING).exists()
+    {
+        return Ok(false);
+    }
+    match startup.scope.symlink_metadata() {
+        Ok(metadata) => {
+            Ok(metadata.dev() == startup.scope_device && metadata.ino() == startup.scope_inode)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn keeper(startup: Startup) -> Result<()> {
     let command: Vec<OsString> = startup
         .command
-        .into_iter()
+        .iter()
+        .cloned()
         .map(OsString::from_vec)
         .collect();
     let request = crate::persistence::parse_account_connect(
@@ -371,10 +398,8 @@ fn keeper(startup: Startup) -> Result<()> {
             .context("persistent SSH startup command missing")?,
         &startup.authorizer,
     )?;
-    super::super::handoff::record_command_line(&command);
-    if !crate::persistence::is_global_scope(&startup.scope)?
-        || !crate::persistence::global_enabled()?
-    {
+
+    if !crate::persistence::is_global_scope(&startup.scope)? || !global_still_open(&startup)? {
         bail!("persistent SSH scope was disabled before setup");
     }
     crate::persistence::validate_scope(&startup.scope)?;
@@ -397,7 +422,14 @@ fn keeper(startup: Startup) -> Result<()> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("this approved SSH connection is already starting or open; retry after it is ready");
     }
-    let session = super::super::ssh_auth::authorize_persistent(&request)?;
+    let session = super::super::ssh_auth::authorize_persistent(
+        &request,
+        command
+            .iter()
+            .skip(1)
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect(),
+    )?;
     let signals = foreground::Signals::new()?;
     let options = session.options();
     // Keep released endpoint records byte-compatible and separate from native masters.
@@ -440,7 +472,7 @@ fn keeper(startup: Startup) -> Result<()> {
         command: Vec::new(),
     };
     master.args(connect_request.ssh_arguments(endpoint)?);
-    let mut master = crate::process_group::ProcessGroup::spawn(&mut master)?;
+    let mut master = foreground::ForegroundChild::spawn(&mut master, &signals)?;
     let record = Record {
         version: 1,
         authorizer: request.authorizer,
@@ -452,7 +484,7 @@ fn keeper(startup: Startup) -> Result<()> {
     loop {
         if signals.received.load(Ordering::Acquire) != 0
             || session.cancelled()
-            || !crate::persistence::global_enabled()?
+            || !global_still_open(&startup)?
         {
             bail!("persistent SSH authorization ended during connection setup");
         }
@@ -496,14 +528,14 @@ fn keeper(startup: Startup) -> Result<()> {
     while master.poll()?.is_none() {
         if signals.received.load(Ordering::Acquire) != 0
             || session.cancelled()
-            || !crate::persistence::global_enabled()?
+            || !global_still_open(&startup)?
             || scope.path().join(crate::receive_service::CLOSING).exists()
         {
             break;
         }
         signals.wait(POLL)?;
     }
-    master.close()?;
+    master.stop(libc::SIGTERM)?;
     Ok(())
 }
 
@@ -522,4 +554,79 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
         }
         Ok(0)
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn authority_index_rejects_links_public_files_and_unknown_versions() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("record");
+        let record = Record {
+            version: 1,
+            authorizer: "laptop".into(),
+            requested: NativeEndpoint {
+                user: None,
+                host: "alias".into(),
+                port: None,
+            },
+            endpoint: NativeEndpoint {
+                user: Some("user".into()),
+                host: "server".into(),
+                port: Some(22),
+            },
+            control: root.path().join("socket"),
+        };
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_record(&path).unwrap().unwrap().requested.host, "alias");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_record(&link).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_record(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&Record {
+                version: 2,
+                ..record
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(read_record(&path).is_err());
+        assert!(read_record(&root.path().join("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn cached_commands_cannot_authenticate_when_the_master_is_gone() {
+        let root = crate::test_support::tempdir().unwrap();
+        let record = Record {
+            version: 1,
+            authorizer: "laptop".into(),
+            requested: NativeEndpoint {
+                user: None,
+                host: "alias".into(),
+                port: None,
+            },
+            endpoint: NativeEndpoint {
+                user: Some("user".into()),
+                host: "127.0.0.1".into(),
+                port: Some(1),
+            },
+            control: root.path().join("missing"),
+        };
+        let result = master_command(&record)
+            .args(["-p", "1", "--", "127.0.0.1", "exit 17"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status_guarded()
+            .unwrap();
+        assert_eq!(result.code(), Some(255));
+    }
 }

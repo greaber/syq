@@ -77,20 +77,28 @@ impl Drop for Signals {
     }
 }
 
-struct ForegroundChild<'a> {
+pub(super) struct ForegroundChild<'a> {
     child: Child,
     status: Option<ExitStatus>,
     signals: &'a Signals,
 }
-impl ForegroundChild<'_> {
-    fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
+impl<'a> ForegroundChild<'a> {
+    pub(super) fn spawn(command: &mut Command, signals: &'a Signals) -> std::io::Result<Self> {
+        Ok(Self {
+            child: command.spawn_guarded()?,
+            status: None,
+            signals,
+        })
+    }
+
+    pub(super) fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
         if self.status.is_none() {
             self.status = self.child.try_wait()?;
         }
         Ok(self.status)
     }
 
-    fn stop(&mut self, signal: i32) -> std::io::Result<()> {
+    pub(super) fn stop(&mut self, signal: i32) -> std::io::Result<()> {
         if self.poll()?.is_some() {
             return Ok(());
         }
@@ -128,12 +136,7 @@ pub(super) fn run(command: &mut Command, cancelled: impl Fn() -> bool) -> Result
     if signal != 0 {
         return Ok(128 + signal);
     }
-    let child = command.spawn_guarded().context("start SSH session")?;
-    let mut child = ForegroundChild {
-        child,
-        status: None,
-        signals: &signals,
-    };
+    let mut child = ForegroundChild::spawn(command, &signals).context("start SSH session")?;
     loop {
         if let Some(status) = child.poll().context("wait for SSH session")? {
             return Ok(status

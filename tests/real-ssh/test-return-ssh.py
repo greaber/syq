@@ -39,13 +39,16 @@ def wait_for(description, predicate, timeout=10):
     raise AssertionError(("Timed out", description, "last state", state))
 
 
-def pending(allow=True):
+def pending(allow=True, reusable=False):
     items = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
     assert len(items) == 1, items
     request = items[0]
     assert request["kind"] == "ssh", request
     assert "syq@destination:22" == request["destination"], request
     assert "full authority" in request["permission"], request
+    assert request["reusable"] == reusable, request
+    if reusable:
+        assert "commands and copies" in request["permission"], request
     run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
     run("syq", "persist", "receive", "approve", request["id"], success=False)
 
@@ -151,6 +154,75 @@ def interactive_shell():
             os.waitpid(child, 0)
 
 
+def source_run(args, success=True):
+    return run("ssh", "source", "exec env " + native_path + " " + shlex.join(["syq", *args]), success=success)
+
+
+def persistent_connect(allow=True):
+    args = ["persist", "connect", "destination", "--auth-from", "@laptop"]
+    process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(["syq", *args])],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        pending(allow, reusable=True)
+        out, err = process.communicate(timeout=30)
+        assert (process.returncode == 0) == allow, (process.returncode, out, err)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=5)
+
+
+def persistent_cases(expected):
+    print("case: reusable account access has separate explicit approval", flush=True)
+    persistent_connect(False)
+    persistent_connect()
+    rows = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+    assert len(rows) == 1 and rows[0]["connected"], rows
+    control = rows[0]["control"]
+    # OpenSSH tools can also use the explicitly approved connection. A missing
+    # master must not trigger a fresh login through local keys or other config.
+    direct = run("ssh", "source", shlex.join(["env", native_path, "ssh", "-F", "/dev/null", "-S", control,
+                 "-o", "ProxyCommand=false", "-o", "BatchMode=yes", "destination", "hostname"]))
+    assert direct.encode() == expected, direct
+    for _ in range(3):
+        assert source_run(["ssh", "--auth-from", "@laptop", "destination", "--", "hostname"]).encode() == expected
+    # A preference selects the same existing authority without changing the
+    # approval command or consulting preferences on the laptop.
+    source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
+    assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
+    assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+    # Native auth must not retry through the saved laptop preference on failure.
+    source_run(["ssh", "--auth-from", "ssh", "destination", "--", "hostname"], success=False)
+    assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+    source_run(["persist", "auth-from", "--for", "destination", "--reset"])
+    source_run(["persist", "off"])
+    run("ssh", "source", "test ! -S " + shlex.quote(control))
+    assert json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"] == []
+    run("ssh", "source", shlex.join(["env", native_path, "ssh", "-F", "/dev/null", "-S", control,
+                 "-o", "ProxyCommand=false", "-o", "BatchMode=yes", "destination", "hostname"]), success=False)
+    # Losing the laptop profile also closes the reusable master, including an
+    # active command. Reconnection alone must not restore that account login.
+    persistent_connect()
+    rows = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+    control = rows[0]["control"]
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(["ssh", "source", source_command(["printf READY; exec sleep 60"])], stdout=output, stderr=subprocess.PIPE)
+        try:
+            wait_for("reused SSH command output", lambda: b"READY" in os.pread(output.fileno(), 4096, 0))
+            run("syq", "persist", "receive", "off", "--name", "laptop")
+            _, err = process.communicate(timeout=10)
+            assert process.returncode != 0, err
+            run("ssh", "source", "test ! -S " + shlex.quote(control))
+        finally:
+            if process.poll() is None:
+                process.kill(); process.wait(timeout=5)
+    run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
+    ready()
+    assert json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"] == []
+    assert execute(["hostname"])[0] == expected
+    source_run(["persist", "off"])
+
+
 try:
     print("case: direct SSH always asks for account approval", flush=True)
     Path("/tmp/syq-real-ssh-receive").mkdir(exist_ok=True)
@@ -200,6 +272,8 @@ assert 'does not match' in reply['Error'], reply
             run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
             ready()
     assert execute(["hostname"])[0] == expected
+    persistent_cases(expected)
     print("Direct laptop-authorized SSH passed", flush=True)
 finally:
+    source_run(["persist", "off"])
     run("ssh", "source", "rm -rf -- " + shlex.quote(root))

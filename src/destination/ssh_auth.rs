@@ -81,7 +81,7 @@ impl Drop for Session {
 }
 
 pub(crate) fn authorize(request: &ssh::SessionRequest) -> Result<Session> {
-    authorize_mode(request, Mode::Once)
+    authorize_mode(request, Mode::Once, None)
 }
 
 pub(crate) fn prepare_persistent(request: &ssh::SessionRequest) -> Result<()> {
@@ -94,11 +94,18 @@ pub(crate) fn prepare_persistent(request: &ssh::SessionRequest) -> Result<()> {
     handoff::maybe_exec(&selection)
 }
 
-pub(crate) fn authorize_persistent(request: &ssh::SessionRequest) -> Result<Session> {
-    authorize_mode(request, Mode::Persistent)
+pub(crate) fn authorize_persistent(
+    request: &ssh::SessionRequest,
+    command: Vec<Vec<u8>>,
+) -> Result<Session> {
+    authorize_mode(request, Mode::Persistent, Some(command))
 }
 
-fn authorize_mode(request: &ssh::SessionRequest, mode: Mode) -> Result<Session> {
+fn authorize_mode(
+    request: &ssh::SessionRequest,
+    mode: Mode,
+    command: Option<Vec<Vec<u8>>>,
+) -> Result<Session> {
     crate::conn::require_constrained_openssh("ssh", "on this machine")?;
     let selection = handoff::Selection::new(
         request.authorizer.clone(),
@@ -124,7 +131,9 @@ fn authorize_mode(request: &ssh::SessionRequest, mode: Mode) -> Result<Session> 
         Message::Ssh(Request {
             mode,
             target: request.destination.clone(),
-            command: crate::approval_command::current()?,
+            command: command
+                .map(Ok)
+                .unwrap_or_else(crate::approval_command::current)?,
             cwd: crate::approval_command::current_directory(),
         }),
         REQUEST_TIMEOUT + Duration::from_secs(30),
@@ -251,7 +260,7 @@ impl Receiver {
                 if command.first().is_none_or(|arg| arg != "ssh") {
                     bail!("SSH approval needs the requesting syq ssh command");
                 }
-                ssh::parse(&command)?
+                ssh::parse_for_approval(&command, &self.name)?
             }
             Mode::Persistent => crate::persistence::parse_account_connect(&command, &self.name)?,
         };

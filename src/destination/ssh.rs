@@ -1,5 +1,5 @@
 //! SSH session arguments. Authorization and process lifetime belong to the caller.
-use crate::cli::NativeEndpoint;
+use crate::cli::{AuthFrom, NativeEndpoint};
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::ffi::OsString;
@@ -11,13 +11,13 @@ pub(crate) mod persistent;
 #[derive(Parser)]
 #[command(
     name = "syq ssh",
-    about = "Open an SSH shell or run a command using authorization from a receiving machine",
-    long_about = "Open an SSH shell or run a command using authorization from a receiving machine. With no command, open a shell. Like ssh, the remote shell interprets command arguments joined with spaces; quote shell syntax for the remote shell. This differs from syq exec --on @NAME, which passes literal arguments."
+    about = "Open an SSH shell or run a command",
+    long_about = "Open an SSH shell or run a command. With no command, open a shell. Like ssh, the remote shell interprets command arguments joined with spaces; quote shell syntax for the remote shell. This differs from syq exec --on @NAME, which passes literal arguments."
 )]
 struct SshCommand {
-    /// Receiving machine that authorizes access to the destination
-    #[arg(long, value_name = "@NAME")]
-    auth_from: String,
+    /// Authorization source; omitted uses the saved preference, then native SSH
+    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = crate::cli::parse_auth_from)]
+    auth_from: Option<AuthFrom>,
     /// Request a terminal, including when running a command
     #[arg(short = 't', conflicts_with = "no_tty")]
     tty: bool,
@@ -50,18 +50,14 @@ pub(crate) struct SessionRequest {
 
 pub(crate) fn command_for_help() -> clap::Command {
     crate::help::configure(SshCommand::command().bin_name("syq ssh"))
+        .mut_arg("auth_from", |arg| arg.hide_short_help(false))
         .mut_arg("tty", |arg| arg.hide_short_help(false))
         .mut_arg("no_tty", |arg| arg.hide_short_help(false))
 }
 
-pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
+fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>)> {
     let matches = command_for_help().try_get_matches_from(argv)?;
     let parsed = SshCommand::from_arg_matches(&matches)?;
-    let authorizer = parsed
-        .auth_from
-        .strip_prefix('@')
-        .context("SSH authorization requires a receiving machine named @NAME")?;
-    super::validate_name(authorizer)?;
     if parsed.destination.len() > 512 {
         bail!("destination SSH endpoint is too long");
     }
@@ -71,23 +67,68 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
     if parsed.command.iter().any(|arg| arg.as_bytes().contains(&0)) {
         bail!("SSH command arguments must not contain NUL");
     }
-    Ok(SessionRequest {
-        authorizer: authorizer.to_owned(),
-        destination,
-        tty: if parsed.tty {
-            Tty::Request
-        } else if parsed.no_tty {
-            Tty::Disabled
-        } else {
-            Tty::Default
+    Ok((
+        SessionRequest {
+            authorizer: String::new(),
+            destination,
+            tty: if parsed.tty {
+                Tty::Request
+            } else if parsed.no_tty {
+                Tty::Disabled
+            } else {
+                Tty::Default
+            },
+            command: parsed.command,
         },
-        command: parsed.command,
-    })
+        parsed.auth_from,
+    ))
+}
+
+/// An explicit receiving name, used for persistent account requests.
+pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
+    let (mut request, mode) = parse_command(argv)?;
+    let Some(AuthFrom::Return(name)) = mode else {
+        bail!("SSH authorization requires a receiving machine named @NAME");
+    };
+    request.authorizer = name;
+    Ok(request)
+}
+
+/// Validate the displayed command without reading the laptop's preferences.
+pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<SessionRequest> {
+    let (mut request, mode) = parse_command(argv)?;
+    match mode {
+        None => {}
+        Some(AuthFrom::Return(name)) if name == expected => {}
+        _ => bail!("SSH authorizer does not match the shown command"),
+    }
+    request.authorizer = expected.to_owned();
+    Ok(request)
 }
 
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
-    let request = parse(argv)?;
+    let (mut request, explicit) = parse_command(argv)?;
+    let mode = crate::auth_from::resolve(&request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
+    let AuthFrom::Return(authorizer) = mode else {
+        let mut command = std::process::Command::new("ssh");
+        if let Some(scope) = crate::persistence::scope_for_implicit_ssh(None)? {
+            let control = crate::persistence::prepare_endpoint(
+                &scope,
+                request.destination.user.as_deref(),
+                &request.destination.host,
+                request.destination.port,
+                None,
+            )?;
+            command
+                .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=yes", "-S"])
+                .arg(crate::persistence::openssh_control_path(&control));
+        }
+        command.args(request.ssh_arguments(&request.destination)?);
+        // Native auth executes once: a failing command must never run again through a laptop.
+        return foreground::run(&mut command, || false);
+    };
+    request.authorizer = authorizer;
     if let Some(mut command) = persistent::command(&request)? {
         return foreground::run(&mut command, || false);
     }
@@ -96,8 +137,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     command
         .args(session.options())
         .args(request.ssh_arguments(session.endpoint())?);
-    // OpenSSH owns the inherited terminal and all session I/O. Keep the
-    // authorization alive until it exits; never retry a remote command.
+    // OpenSSH owns terminal I/O; authorization lives until this one child exits.
     foreground::run(&mut command, || session.cancelled())
 }
 
@@ -181,6 +221,30 @@ mod tests {
         ] {
             assert!(request(&args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn native_choices_and_approval_validation_do_not_read_preferences() {
+        for selector in ["auto", "ssh"] {
+            let argv: Vec<OsString> = ["ssh", "--auth-from", selector, "hostB", "--", "exit 17"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            assert!(parse_command(&argv).is_ok());
+            assert!(parse_for_approval(&argv, "laptop").is_err());
+        }
+        let argv: Vec<OsString> = ["ssh", "hostB", "--", "exit 17"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let approved = parse_for_approval(&argv, "laptop").unwrap();
+        assert_eq!(approved.authorizer, "laptop");
+        assert_eq!(approved.command, [OsString::from("exit 17")]);
+        let mismatch: Vec<OsString> = ["ssh", "--auth-from", "@other", "hostB"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert!(parse_for_approval(&mismatch, "laptop").is_err());
     }
 
     #[test]

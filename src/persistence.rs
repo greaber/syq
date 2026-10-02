@@ -1210,6 +1210,63 @@ mod tests {
     }
 
     #[test]
+    fn approved_records_preserve_v0_7_1_json_and_endpoint_keys() {
+        // Unchanged released v0.7.1 EndpointRecord representation and key algorithm.
+        const FIXTURE: &str = r#"{"user":"alice","host":"example","port":2222}"#;
+        const KEY: &str = "cm-4adf1f61aa19aead";
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let scope = temporary.path().join("approved-fixture");
+        initialize_scope(&scope).unwrap();
+        let path = scope.join(format!("{KEY}.json"));
+        std::fs::write(&path, FIXTURE).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let records = scope_records(&scope).unwrap();
+        assert_eq!(records[0].0, KEY);
+        assert_eq!(serde_json::to_string(&records[0].1).unwrap(), FIXTURE);
+        let socket = prepare_endpoint(&scope, Some("alice"), "example", Some(2222), None).unwrap();
+        assert_eq!(socket.file_name().unwrap(), KEY);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+        close_scope(&scope).unwrap();
+    }
+
+    #[test]
+    fn persistent_account_approval_requires_the_explicit_matching_connect_command() {
+        let parse = |args: &[&str]| {
+            parse_account_connect(
+                &args.iter().map(OsString::from).collect::<Vec<_>>(),
+                "laptop",
+            )
+        };
+        let request = parse(&[
+            "persist",
+            "connect",
+            "alice@hostB:2222",
+            "--auth-from",
+            "@laptop",
+        ])
+        .unwrap();
+        assert_eq!(request.destination.user.as_deref(), Some("alice"));
+        assert_eq!(request.destination.port, Some(2222));
+        for args in [
+            vec!["persist", "connect", "hostB"],
+            vec!["persist", "connect", "hostB", "--auth-from", "@other"],
+            vec![
+                "persist",
+                "connect",
+                "hostB",
+                "--auth-from",
+                "@laptop",
+                "--pscope",
+                "/tmp/scope",
+            ],
+            vec!["persist", "off"],
+            vec!["ssh", "--auth-from", "@laptop", "hostB"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn endpoint_records_are_stable_and_inactive_scopes_close_cleanly() {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let scope = temporary.path().join("scope");

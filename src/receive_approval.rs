@@ -112,6 +112,7 @@ pub(crate) struct Summary {
 pub(crate) enum Details {
     Ssh {
         kind: SshKind,
+        reusable: bool,
         destination: String,
         permission: String,
     },
@@ -704,6 +705,7 @@ impl Queue {
             }],
             details: Details::Ssh {
                 kind: SshKind::Ssh,
+                reusable: persistent,
                 destination: target,
                 permission: if persistent {
                     "May reuse this account's full authority for repeated SSH commands and copies while the laptop stays connected. Copy roots and limits do not apply. Close this login with syq persist off.".into()

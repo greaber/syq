@@ -1280,7 +1280,7 @@ fn value_completion(
 ) -> Option<ValueCompletion> {
     let known = match command {
         "ssh" => match option {
-            b"--auth-from" => Some(ValueCompletion::ReturnName),
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             _ => None,
         },
         "exec" => match option {
