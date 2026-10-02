@@ -707,6 +707,13 @@ fn select_copy(
     args: &mut crate::cli::Args,
     progress: Option<&crate::progress::Progress>,
 ) -> Result<Option<handoff::Selection>> {
+    // A helper handoff carries the already selected, identity-checked receiver.
+    // Re-reading mutable defaults here could redirect the original request.
+    if let Some(name) = handoff::selected_name(handoff::Kind::Forward) {
+        args.auth_from = crate::cli::AuthFrom::Return(name.to_owned());
+    } else {
+        crate::auth_from::apply_copy(args)?;
+    }
     match &args.auth_from {
         crate::cli::AuthFrom::Return(_) => return forward::select(args, progress),
         crate::cli::AuthFrom::Ssh => {

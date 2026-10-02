@@ -37,6 +37,8 @@ struct PersistCommand {
 
 #[derive(Subcommand, Debug)]
 enum PersistAction {
+    /// Choose default authorization for server copies and SSH sessions
+    AuthFrom(crate::auth_from::PreferenceCommand),
     /// Configure receiving and decide incoming copy or command requests
     Receive(crate::receive_service::ReceiveCommand),
     /// Inspect named return destinations available to this server account
@@ -184,6 +186,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let command = PersistCommand::from_arg_matches(&matches)?;
     crate::fsops::reserve_startup_descriptors();
     match command.action {
+        PersistAction::AuthFrom(command) => return crate::auth_from::run(command),
         PersistAction::Receive(command) => return crate::receive_service::run_command(command),
         PersistAction::Destinations(command) => return crate::destination::run_command(command),
         PersistAction::Connect {

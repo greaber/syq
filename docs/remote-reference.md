@@ -124,8 +124,9 @@ still be running. The coordinating server needs `/bin/kill` and either
 
 ## Authorization selection
 
-For `syq cp` with local sources and an SSH destination, `--auth-from auto`
-(the default) first uses the source machine's SSH access, including existing
+For `syq cp` with local sources and an SSH destination, omitted `--auth-from`
+uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
+or `auto` if none is set. `--auth-from auto` first uses the source machine's SSH access, including existing
 connections. SSH keeps its normal prompts and configured timeouts. If SSH
 reports rejected credentials, a host-key verification failure, an unresolved
 hostname, or a refused connection, syq tries live receiving machines in

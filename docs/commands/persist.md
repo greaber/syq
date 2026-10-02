@@ -11,6 +11,7 @@ syq persist <COMMAND>
 
 | Command | Purpose |
 |---|---|
+| [`persist auth-from`](#syq-persist-auth-from) | Choose default authorization for later commands |
 | [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
 | [`persist destinations`](#syq-persist-destinations) | Inspect or recover named return destinations |
 | [`persist connect`](#syq-persist-connect) | Connect to an SSH server and wait until enabled receiving is ready |
@@ -24,6 +25,23 @@ syq persist <COMMAND>
 |---|---|
 | `-h, --help` | Show common usage and options |
 | `--help-all` | Show all options and details |
+
+<!-- /CLI -->
+
+## syq persist auth-from
+
+Choose or show [authorization defaults](../persistence-reference.md#authorization-defaults).
+
+<!-- CLI: persist auth-from -->
+```text
+syq persist auth-from [OPTIONS] [auto|ssh|@NAME]
+```
+
+| Argument / option | Meaning |
+|---|---|
+| `[auto\|ssh\|@NAME]` | Authorization for later commands; omit to show saved defaults |
+| `--for <HOST>` | Apply to this exact hostname or SSH alias, for any login or port |
+| `--reset` | Remove the selected override so it inherits the default |
 
 <!-- /CLI -->
 

@@ -5,6 +5,39 @@ See [`syq persist`](commands/persist.md) for the option list.
 For everyday setup, start with [Keep connections open](persistence.md) or
 [Use your laptop from a server](receive.md).
 
+## Authorization defaults
+
+On a server, choose the receiving machine that should authorize later copies:
+
+```sh
+syq persist auth-from @laptop
+syq persist auth-from ssh --for backup
+syq persist auth-from
+syq persist auth-from --reset --for backup
+syq persist auth-from --reset
+```
+
+`@laptop` goes straight to that machine without first trying the server's SSH
+credentials. If it is unavailable or refuses the request, the command fails.
+The setting chooses where to ask; every request still needs its normal approval.
+`ssh` uses the server's own access. `auto` tries SSH first and can ask an available
+receiving machine after an eligible SSH failure.
+
+A `--for HOST` override wins over the default. Matching uses the exact hostname
+or SSH alias typed in the copy command, for every login and port; aliases are
+not expanded through SSH configuration or DNS. `--for` takes no login or port.
+An explicit `--auth-from`, including `auto`, wins over both saved settings.
+`--reset --for HOST` removes one override; `--reset` restores the default to
+`auto` while keeping host overrides. Omit the value to show saved choices, or
+add `--for HOST` to show that host's effective choice.
+
+Defaults apply to native local-to-SSH copies that support receiving authorization.
+Custom `--rsh` routes, copies to receiving names, object storage, and other routes
+keep their own authentication. The setting works independently of `persist on`
+and `off`. It is saved in `auth-from.json` alongside `persistence.json`; older
+syq versions ignore it. If it is unreadable or has an unknown format, repair the
+file or pass `--auth-from` explicitly for that command.
+
 ## Names and profiles
 
 Give a project its own receiving name and directory:

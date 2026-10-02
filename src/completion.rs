@@ -873,6 +873,7 @@ fn management_candidates(
     }
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
+        ("persist", "auth-from") => Ok(auth_from_candidates(current)),
         ("persist", "connect") => Ok(endpoint_candidates(
             current,
             EndpointSyntax::Native,
@@ -1386,15 +1387,7 @@ fn complete_value(
             .filter(|name| name.starts_with(current))
             .map(Candidate::text)
             .collect()),
-        ValueCompletion::AuthFrom => Ok([b"auto".to_vec(), b"ssh".to_vec()]
-            .into_iter()
-            .filter(|value| value.starts_with(current))
-            .map(Candidate::text)
-            .chain(
-                return_name_candidates(current)
-                    .filter(|candidate| candidate.value != b"auto" && candidate.value != b"ssh"),
-            )
-            .collect()),
+        ValueCompletion::AuthFrom => Ok(auth_from_candidates(current)),
         ValueCompletion::ReturnName => Ok(return_name_candidates(current).collect()),
         ValueCompletion::NamedOrSshDestination => {
             let mut candidates = endpoint_candidates(
@@ -2057,6 +2050,15 @@ fn path_candidates_from_entries(
         }
     }
     candidates
+}
+
+fn auth_from_candidates(current: &[u8]) -> Vec<Candidate> {
+    [b"auto".to_vec(), b"ssh".to_vec()]
+        .into_iter()
+        .filter(|value| value.starts_with(current))
+        .map(Candidate::text)
+        .chain(return_name_candidates(current))
+        .collect()
 }
 
 fn endpoint_candidates(
