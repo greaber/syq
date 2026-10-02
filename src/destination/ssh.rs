@@ -40,7 +40,7 @@ pub(crate) enum Tty {
     Disabled,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SessionRequest {
     pub(crate) authorizer: String,
     pub(crate) destination: NativeEndpoint,

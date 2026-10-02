@@ -42,9 +42,46 @@ for the security implications.
 Inspect connections with `syq persist status`. Close them, including receiving
 connections, with `syq persist off`.
 
-Receiving reconnects after a network interruption or laptop sleep; other SSH
+Receiving reconnects after a network interruption or laptop sleep; native SSH
 connections reopen on their next use. An interrupted copy still needs to be
 rerun to resume. After rebooting, run `syq persist connect server` again.
+
+## Reuse laptop-authorized account access
+
+On a server connected to your laptop, explicitly keep an approved login open:
+
+```sh
+syq persist connect hostB --auth-from @laptop
+syq ssh --auth-from @laptop hostB -- hostname
+syq ssh --auth-from @laptop hostB
+syq persist off
+```
+
+The laptop asks for **reusable account access**: commands and copies may use
+that account's full authority while the laptop connection remains open.
+This is broader than approving one copy. Later commands using the same
+receiving name and typed endpoint reuse the login without another approval.
+An ordinary `syq ssh` invocation never creates a reusable login automatically.
+The laptop needs the [SSH account authorization requirements](commands/ssh.md#account-access-requires-approval).
+
+`syq persist status` shows the connection and its SSH control socket.
+Other OpenSSH tools can use that socket too. For example, copy the printed
+path into `SOCKET` and use:
+
+```sh
+ssh -F /dev/null -S "$SOCKET" -o ProxyCommand=false hostB hostname
+scp -F /dev/null -o "ControlPath=$SOCKET" -o ProxyCommand=false report hostB:report
+```
+
+`ProxyCommand=false` makes these commands fail if the master is gone instead
+of attempting another login. These commands use the account already connected
+through the socket. They need no forwarded agent.
+
+`syq persist off`, stopping the laptop's receiving profile, or losing its
+connection closes this login and its active sessions. Reconnecting the laptop
+does not reopen it: run `persist connect --auth-from @NAME` again to approve
+another reusable login. See [SSH account access](security.md#ssh-account-access)
+for the authority this grants.
 
 See [Persistence details](persistence-reference.md) for troubleshooting,
 upgrading, and isolated connections for scripts, or [`syq persist`](commands/persist.md)

@@ -422,15 +422,40 @@ fn keeper(startup: Startup) -> Result<()> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("this approved SSH connection is already starting or open; retry after it is ready");
     }
-    let session = super::super::ssh_auth::authorize_persistent(
-        &request,
-        command
-            .iter()
-            .skip(1)
-            .map(|arg| arg.as_bytes().to_vec())
-            .collect(),
-    )?;
     let signals = foreground::Signals::new()?;
+    let approval_request = request.clone();
+    let shown_command = command
+        .iter()
+        .skip(1)
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // The keeper is a dedicated child process. If setup is cancelled, it exits
+    // and closes the pending return request even while approval is blocked.
+    std::thread::Builder::new()
+        .name("syq-ssh-approve".into())
+        .spawn(move || {
+            let _ = sender.send(super::super::ssh_auth::authorize_persistent(
+                &approval_request,
+                shown_command,
+            ));
+        })?;
+    let approval_deadline = Instant::now() + Duration::from_secs(330);
+    let session = loop {
+        if signals.received.load(Ordering::Acquire) != 0 || !global_still_open(&startup)? {
+            bail!("persistent SSH setup cancelled before approval");
+        }
+        match receiver.recv_timeout(POLL) {
+            Ok(result) => break result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("persistent SSH authorization ended without a result")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= approval_deadline {
+            bail!("persistent SSH authorization exceeded its deadline");
+        }
+    };
     let options = session.options();
     // Keep released endpoint records byte-compatible and separate from native masters.
     let scope = tempfile::Builder::new()

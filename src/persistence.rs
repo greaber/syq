@@ -28,7 +28,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. An ephemeral scope only reuses forward SSH logins, with a five-minute idle timeout. Select it by passing its printed path back with --pscope."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from @NAME, explicitly approve a reusable account login instead; it closes when the receiving connection ends. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. An ephemeral scope only reuses forward SSH logins, with a five-minute idle timeout. Select it by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]
@@ -43,7 +43,7 @@ enum PersistAction {
     Receive(crate::receive_service::ReceiveCommand),
     /// Inspect named return destinations available to this server account
     Destinations(crate::destination::Destinations),
-    /// Connect to an SSH server and wait until enabled receiving is ready
+    /// Connect with native SSH, or request reusable account access with --auth-from @NAME
     Connect {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
