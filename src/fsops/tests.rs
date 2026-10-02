@@ -5402,7 +5402,7 @@ fn reused_parent_errors_keep_paths_and_os_error_codes() {
 }
 
 #[test]
-fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
+fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
     let directory = crate::test_support::tempdir().unwrap();
     let target = directory.path().join("target");
     fs::write(&target, b"old destination").unwrap();
@@ -5469,11 +5469,14 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
         .unwrap();
     File::open(&target).unwrap().sync_all().unwrap();
     let after = fs::metadata(&target).unwrap();
-    assert_eq!(after.ino(), before.ino());
+    assert_ne!(after.ino(), before.ino());
     assert_eq!(after.len(), data.len() as u64);
     assert!(after.blocks() * 512 < after.len() / 4);
     assert_eq!(fs::read(&target).unwrap(), data);
-    assert_eq!(fs::read(directory.path().join("alias")).unwrap(), data);
+    assert_eq!(
+        fs::read(directory.path().join("alias")).unwrap(),
+        b"old destination"
+    );
 }
 
 #[cfg(target_os = "macos")]
