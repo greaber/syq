@@ -218,6 +218,11 @@ def persistent_cases(expected):
         source_run(["rsync", "-a", "--syq-no-tcp", root + "/data", "destination:" + copy_root + "/rsync-data"])
         source_run(["rsync", "-a", "--syq-no-tcp", "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"])
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/rsync-roundtrip"))
+        stream_data = "stream through approved SSH\n"
+        run("ssh", "source", "exec env " + native_path + " " + shlex.join([
+            "syq", "cp", "--src-fd", "0", "--to", "destination", "--as", copy_root + "/stream",
+            "--no-tcp", "--auth-from", "@laptop"]), stdin=stream_data)
+        assert source_run(["cp", "--from", "destination", copy_root + "/stream", "--as-fd", "1", "--no-tcp"]) == stream_data
         source_run(["clean-partials", "--on", "destination", copy_root, "--auth-from", "@laptop"])
         run("ssh", "destination", "test -f " + shlex.quote(copy_root + "/data"))
         source_run(["rm", "--on", "destination", copy_root + "/rsync-data", "--auth-from", "@laptop"])

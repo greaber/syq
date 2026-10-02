@@ -63,6 +63,16 @@ pub(crate) fn operation(
     location: &Location,
     args: &Args,
 ) -> Result<Option<crate::conn::RemoteSpec>> {
+    if args.interface == Interface::NativeCp && args.coordinate_at != CoordinateAt::Local {
+        return Ok(None);
+    }
+    approved_operation(location, args)
+}
+
+pub(crate) fn approved_operation(
+    location: &Location,
+    args: &Args,
+) -> Result<Option<crate::conn::RemoteSpec>> {
     let Some(host) = &location.host else {
         return Ok(None);
     };
@@ -71,7 +81,6 @@ pub(crate) fn operation(
         || args.restricted_grant.is_some()
         || args.return_source.is_some()
         || args.named_receipt.is_some()
-        || (args.interface == Interface::NativeCp && args.coordinate_at != CoordinateAt::Local)
     {
         return Ok(None);
     }

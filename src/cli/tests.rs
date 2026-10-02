@@ -1070,6 +1070,27 @@ fn block_reuse_is_a_native_filesystem_control() {
 #[test]
 fn account_auth_selection_is_explicit_for_each_ssh_operation() {
     for words in [
+        vec![
+            "cp",
+            "--src-fd",
+            "0",
+            "--to",
+            "server",
+            "--as",
+            "file",
+            "--auth-from",
+            "@laptop",
+        ],
+        vec![
+            "cp",
+            "--from",
+            "server",
+            "file",
+            "--as-fd",
+            "1",
+            "--auth-from",
+            "@laptop",
+        ],
         vec!["map", "--from", "server", "file", "--auth-from", "@laptop"],
         vec!["rm", "--on", "server", "file", "--auth-from", "@laptop"],
         vec![

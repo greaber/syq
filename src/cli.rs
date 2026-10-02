@@ -1324,7 +1324,7 @@ pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Override saved authorization: try local SSH first (auto), require local SSH (ssh), or authorize through @NAME (also S3 copies). Auto falls back for credential, host-key, hostname, or refused-connection errors
+    /// Override saved authorization: reuse approved access or try local SSH (auto), require native SSH (ssh), or authorize through @NAME (also S3 copies). Eligible native copies can request laptop authorization after SSH failure
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
@@ -2208,9 +2208,14 @@ fn parse_descriptor_copy(
     crate::descriptor_copy::validate_controls(&mut args)?;
     apply_native_remote(&mut args, parsed.remote)?;
     if args.s3.is_none()
+        && !args
+            .descriptor_copy
+            .as_ref()
+            .and_then(|plan| plan.location.as_ref())
+            .is_some_and(Location::is_remote)
         && matches.value_source("auth_from") == Some(clap::parser::ValueSource::CommandLine)
     {
-        bail!("--auth-from with descriptor copies requires an S3 endpoint");
+        bail!("--auth-from with descriptor copies requires an SSH or S3 endpoint");
     }
     Ok(args)
 }

@@ -72,7 +72,7 @@ between two other servers keep their existing authorization path; an explicit
 Without an approved login, eligible native copies use the usual per-copy
 authorization path and its restrictions.
 
-`rsync`, `rm`, `map`, and `clean-partials` also reuse account access. Selecting
+`rsync`, `rm`, `map`, `clean-partials`, and descriptor copies also reuse account access. Selecting
 `@NAME` for these commands requires an existing login from
 `persist connect HOST --auth-from @NAME`; it never requests broader account
 permission on behalf of a file operation. Remote path completion follows the
