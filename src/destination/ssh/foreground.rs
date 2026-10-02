@@ -1,6 +1,9 @@
 //! Keep a foreground OpenSSH child and its authorization alive together.
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::{
@@ -15,12 +18,16 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 struct Signals {
     received: Arc<AtomicUsize>,
     registrations: Vec<signal_hook::SigId>,
+    wake: UnixStream,
 }
 impl Signals {
     fn new() -> std::io::Result<Self> {
+        let (wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
+        wake.set_nonblocking(true)?;
         let mut guard = Self {
             received: Arc::new(AtomicUsize::new(0)),
             registrations: Vec::new(),
+            wake,
         };
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             guard.registrations.push(signal_hook::flag::register_usize(
@@ -29,7 +36,37 @@ impl Signals {
                 signal as usize,
             )?);
         }
+        for signal in [libc::SIGCHLD, libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            guard
+                .registrations
+                .push(signal_hook::low_level::pipe::register(
+                    signal,
+                    sender.try_clone()?,
+                )?);
+        }
         Ok(guard)
+    }
+
+    fn wait(&self, timeout: Duration) -> std::io::Result<()> {
+        let mut descriptor = libc::pollfd {
+            fd: self.wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis() as i32) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut wake = &self.wake;
+        loop {
+            match wake.read(&mut [0; 128]) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 impl Drop for Signals {
@@ -40,11 +77,12 @@ impl Drop for Signals {
     }
 }
 
-struct ForegroundChild {
+struct ForegroundChild<'a> {
     child: Child,
     status: Option<ExitStatus>,
+    signals: &'a Signals,
 }
-impl ForegroundChild {
+impl ForegroundChild<'_> {
     fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
         if self.status.is_none() {
             self.status = self.child.try_wait()?;
@@ -71,11 +109,11 @@ impl ForegroundChild {
                 self.status = Some(self.child.wait()?);
                 return Ok(());
             }
-            std::thread::sleep(POLL);
+            self.signals.wait(POLL)?;
         }
     }
 }
-impl Drop for ForegroundChild {
+impl Drop for ForegroundChild<'_> {
     fn drop(&mut self) {
         let _ = self.stop(libc::SIGTERM);
     }
@@ -86,10 +124,15 @@ pub(super) fn run(command: &mut Command, cancelled: impl Fn() -> bool) -> Result
     if cancelled() {
         bail!("SSH authorization ended before the session started");
     }
+    let signal = signals.received.load(Ordering::Acquire) as i32;
+    if signal != 0 {
+        return Ok(128 + signal);
+    }
     let child = command.spawn_guarded().context("start SSH session")?;
     let mut child = ForegroundChild {
         child,
         status: None,
+        signals: &signals,
     };
     loop {
         if let Some(status) = child.poll().context("wait for SSH session")? {
@@ -108,7 +151,9 @@ pub(super) fn run(command: &mut Command, cancelled: impl Fn() -> bool) -> Result
                 .context("stop revoked SSH session")?;
             bail!("SSH authorization was revoked or its receiving connection ended");
         }
-        std::thread::sleep(POLL);
+        // SIGCHLD wakes completed commands immediately; only return-channel
+        // revocation relies on the bounded timeout.
+        signals.wait(POLL).context("wait for SSH session state")?;
     }
 }
 
