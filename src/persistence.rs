@@ -47,6 +47,9 @@ enum PersistAction {
     Connect {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
+        /// Authorize a reusable destination-account login through a receiving machine
+        #[arg(long, value_name = "@NAME", conflicts_with_all = ["syq_path", "no_bootstrap", "pscope"])]
+        auth_from: Option<String>,
         /// Use this remote syq executable instead of installing a matching helper
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
         syq_path: Option<String>,
@@ -191,11 +194,22 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         PersistAction::Destinations(command) => return crate::destination::run_command(command),
         PersistAction::Connect {
             host,
+            auth_from,
             syq_path,
             no_bootstrap,
             timeout,
             pscope,
         } => {
+            if let Some(authorizer) = auth_from {
+                let request = crate::destination::ssh::parse(&[
+                    "ssh".into(),
+                    "--auth-from".into(),
+                    authorizer.into(),
+                    host.into(),
+                ])?;
+                crate::destination::ssh::persistent::connect(request)?;
+                return Ok(0);
+            }
             connect(
                 &host,
                 syq_path,
@@ -233,6 +247,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             // Disable first so a later command cannot intentionally join the
             // global scope while its existing masters are being closed.
             write_global_config(false)?;
+            crate::destination::ssh::persistent::stop_all()?;
             let scope = global_scope_path()?;
             match scope.symlink_metadata() {
                 Ok(_) => close_scope(&scope)?,
@@ -270,10 +285,13 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     if json {
                         println!(
                             "{}",
-                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": []})
+                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": [], "authorized_ssh": crate::destination::ssh::persistent::status()?})
                         );
                     } else {
                         crate::output::human_stdout!("connections: 0");
+                        crate::destination::ssh::persistent::print_status(
+                            &crate::destination::ssh::persistent::status()?,
+                        );
                     }
                 }
                 Err(error) => {
@@ -288,6 +306,49 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
 
 /// Establish authority through ordinary SSH, without selecting or copying files.
 /// Repeated connects leave a healthy receiving process and its approvals alone.
+/// Parse only the displayed command; the approving laptop must not consult
+/// its own authorization preferences when checking a server's request.
+pub(crate) fn parse_account_connect(
+    argv: &[OsString],
+    authorizer: &str,
+) -> Result<crate::destination::ssh::SessionRequest> {
+    if argv.first().is_none_or(|arg| arg != "persist") {
+        bail!("persistent SSH approval needs a syq persist connect command");
+    }
+    let matches = command_for_help().try_get_matches_from(argv)?;
+    let command = PersistCommand::from_arg_matches(&matches)?;
+    let PersistAction::Connect {
+        host,
+        auth_from,
+        syq_path,
+        no_bootstrap,
+        pscope,
+        ..
+    } = command.action
+    else {
+        bail!("persistent SSH approval needs a syq persist connect command");
+    };
+    if syq_path.is_some() || no_bootstrap || pscope.is_some() {
+        bail!("laptop-authorized SSH persistence does not take helper or scope overrides");
+    }
+    let selected = auth_from.context("persistent SSH approval requires --auth-from @NAME")?;
+    if selected != format!("@{authorizer}") {
+        bail!("persistent SSH authorizer does not match the shown command");
+    }
+    crate::destination::ssh::parse(&[
+        "ssh".into(),
+        "--auth-from".into(),
+        selected.into(),
+        host.into(),
+    ])
+}
+
+pub(crate) fn enable_global_scope() -> Result<PathBuf> {
+    let scope = ensure_global_scope()?;
+    write_global_config(true)?;
+    Ok(scope)
+}
+
 fn connect(
     host: &str,
     syq_path: Option<String>,
@@ -618,7 +679,7 @@ pub(crate) fn is_global_scope(scope: &Path) -> Result<bool> {
     Ok(candidate == global)
 }
 
-fn ensure_runtime_parent() -> Result<PathBuf> {
+pub(crate) fn ensure_runtime_parent() -> Result<PathBuf> {
     let path = runtime_parent_path();
     validate_openssh_control_path(&path)?;
     secure_directory(&path, true, true)?;
@@ -947,12 +1008,18 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             session_pool: crate::session_pool::is_running(&control),
         });
     }
+    let authorized_ssh = if kind == "global" {
+        crate::destination::ssh::persistent::status()?
+    } else {
+        Vec::new()
+    };
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "enabled": if kind == "global" { global_enabled()? } else { true },
                 "scope": scope, "connections": connections, "receiving_error": receiving_error,
+                "authorized_ssh": authorized_ssh,
             })
         );
         return Ok(());
@@ -962,6 +1029,7 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
         crate::output::human_stdout!("Receiving configuration failed: {error}");
     }
     crate::output::human_stdout!("connections: {}", connections.len());
+    crate::destination::ssh::persistent::print_status(&authorized_ssh);
     for connection in connections {
         let mut line = format!("  {}", connection.endpoint);
         if !connection.ssh_options.is_empty() {

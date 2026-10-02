@@ -673,6 +673,7 @@ impl Queue {
         command: &[Vec<u8>],
         cwd: &str,
         endpoint: &crate::cli::NativeEndpoint,
+        persistent: bool,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
@@ -696,11 +697,19 @@ impl Queue {
             sources: Vec::new(),
             preposition: "to",
             target: target.clone(),
-            notes: vec!["This grants account access, not permission for only the displayed command.".into()],
+            notes: vec![if persistent {
+                "This permits repeated commands and copies through a reusable SSH login while the laptop stays connected. Close it with syq persist off.".into()
+            } else {
+                "This grants account access, not permission for only the displayed command.".into()
+            }],
             details: Details::Ssh {
                 kind: SshKind::Ssh,
                 destination: target,
-                permission: "May use this account's full authority for this SSH login. Copy roots and limits do not apply. Session traffic travels directly between the servers.".into(),
+                permission: if persistent {
+                    "May reuse this account's full authority for repeated SSH commands and copies while the laptop stays connected. Copy roots and limits do not apply. Close this login with syq persist off.".into()
+                } else {
+                    "May use this account's full authority for this SSH login. Copy roots and limits do not apply. Session traffic travels directly between the servers.".into()
+                },
             },
         }, notifications, TIMEOUT, cancelled)
     }
@@ -1602,6 +1611,7 @@ mod tests {
                     host: "hostB".into(),
                     port: Some(2222),
                 },
+                false,
                 Notifications::Off,
                 || false,
             )

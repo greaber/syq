@@ -1709,6 +1709,9 @@ fn destinations(action: DestinationAction) -> Result<i32> {
     }
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if let Some(result) = ssh::persistent::dispatch(argv) {
+        return Some(result);
+    }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--destination-register" => Some((|| {
             if argv.len() != 5 {

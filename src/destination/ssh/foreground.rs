@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_millis(20);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Signals {
-    received: Arc<AtomicUsize>,
+pub(super) struct Signals {
+    pub(super) received: Arc<AtomicUsize>,
     registrations: Vec<signal_hook::SigId>,
     wake: UnixStream,
 }
 impl Signals {
-    fn new() -> std::io::Result<Self> {
+    pub(super) fn new() -> std::io::Result<Self> {
         let (wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
         wake.set_nonblocking(true)?;
         let mut guard = Self {
@@ -47,7 +47,7 @@ impl Signals {
         Ok(guard)
     }
 
-    fn wait(&self, timeout: Duration) -> std::io::Result<()> {
+    pub(super) fn wait(&self, timeout: Duration) -> std::io::Result<()> {
         let mut descriptor = libc::pollfd {
             fd: self.wake.as_raw_fd(),
             events: libc::POLLIN,
