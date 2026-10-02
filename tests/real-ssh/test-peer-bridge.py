@@ -77,6 +77,47 @@ assert result.returncode == 0, "live copy key could not enter its forced worker"
 assert b"SHELL_ESCAPE" not in result.stdout, "copy key executed a shell command"
 print("true")
 ''',
+    "workers": r'''
+from pathlib import Path
+import socket
+workers = []
+for p in Path("/proc").iterdir():
+    if not p.name.isdigit():
+        continue
+    try:
+        if p.joinpath("exe").readlink() != Path("/usr/bin/ssh"):
+            continue
+        args = p.joinpath("cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+        if args[-1:] == ["syq-copy-worker"]:
+            assert socket.gethostbyname(args[-2]) == socket.gethostbyname("destination")
+            stat = p.joinpath("stat").read_text().rsplit(") ", 1)[1].split()
+            workers.append([int(p.name), stat[19]])
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+print(json.dumps(workers))
+''',
+    "workers_exited": r'''
+from pathlib import Path
+active = []
+for pid, started in v["workers"]:
+    try:
+        stat = Path("/proc", str(pid), "stat").read_text().rsplit(") ", 1)[1].split()
+        if stat[19] == started and stat[0] != "Z":
+            active.append(pid)
+    except FileNotFoundError:
+        pass
+print(json.dumps(not active))
+''',
+    "kill_requester": r'''
+from pathlib import Path
+import os, signal
+pid = int(Path(v["pidfile"]).read_text())
+args = Path("/proc", str(pid), "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+assert Path(args[0]).name == "syq" and args[1] == "cp", "PID is not the requesting syq copy"
+assert v["destination"] in args, "PID belongs to a different copy"
+os.kill(pid, signal.SIGKILL)
+print("true")
+''',
     "late_worker": r'''
 import subprocess
 try:
@@ -257,20 +298,23 @@ def main():
                         + " bs=1M count=1 status=none | sha256sum").split()[0]
         outside = c + "/outside-copy"
 
-        def copy_command(name, extra=(), auth=("--auth-from", "@laptop")):
-            argv = ["syq", "cp", "--from", "source", b + "/data", "--to", "destination",
+        def copy_command(name, extra=(), auth=("--auth-from", "@laptop"), source="data"):
+            argv = ["syq", "cp", "--from", "source", b + "/" + source, "--to", "destination",
                     "--as", c + "/" + name, *auth, "--performance-tuning", "workers=2",
                     "--no-progress", "--results", a + "/" + name + ".ndjson", *extra]
-            return ("test -z \"${SSH_AUTH_SOCK:-}\" && echo $$ > " + shlex.quote(a + "/pid")
-                    + " && exec env PATH=/usr/bin:/bin:/usr/local/bin timeout 90 " + shlex.join(argv))
+            command = ("test -z \"${SSH_AUTH_SOCK:-}\" && echo $$ > " + shlex.quote(a + "/pid")
+                       + " && exec env PATH=/usr/bin:/bin:/usr/local/bin " + shlex.join(argv))
+            # The recorded PID becomes syq itself. Killing timeout or a tracing
+            # shell would test a different process-lifetime boundary.
+            return shlex.join(["timeout", "90", "sh", "-c", command])
 
-        def copying(name, extra=(), auth=("--auth-from", "@laptop")):
-            return running(copy_command(name, extra, auth), pidfile=a + "/pid")
+        def copying(name, extra=(), auth=("--auth-from", "@laptop"), source="data"):
+            return running(copy_command(name, extra, auth, source), pidfile=a + "/pid")
 
-        def partial(name):
-            return probe("destination", "partial", root=c, name=name, digest=prefix)
+        def partial(name, expected_prefix=prefix):
+            return probe("destination", "partial", root=c, name=name, digest=expected_prefix)
 
-        def assert_results(name):
+        def assert_results(name, expected_digest=expected):
             records = [json.loads(line) for line in remote("requester", "cat "
                        + shlex.quote(a + "/" + name + ".ndjson")).splitlines()]
             terminal = records[-1]
@@ -280,7 +324,7 @@ def main():
             assert terminal["files_transferred"] == 1, terminal
             assert any(record["type"] == "final_state" and record["provenance"] == "receiver_attested"
                        for record in records), records
-            assert digest("destination", c + "/" + name) == expected
+            assert digest("destination", c + "/" + name) == expected_digest
             assert fingerprint("source") == b_keys
             wait_for("destination temporary key cleanup", lambda: fingerprint("destination") == c_keys)
             assert json.loads(remote("source", "syq persist status --json"))["authorized_ssh"] == []
@@ -316,7 +360,6 @@ def main():
             wait_for("SSH-only copy data", lambda: partial("cancelled"))
             assert probe("source", "forced_command", outside=outside)
             remote("destination", "test ! -e " + shlex.quote(outside))
-            # timeout owns the transfer's process group and relays TERM to it.
             remote("requester", "kill -TERM $(cat " + shlex.quote(a + "/pid") + ")")
             finish(process, output, success=False)
         wait_for("cancelled destination key cleanup", lambda: fingerprint("destination") == c_keys)
@@ -327,6 +370,64 @@ def main():
         with copying("cancelled", ("--no-tcp",)) as (process, output):
             finish(process, output)
         assert_results("cancelled")
+
+        print("case: requester SIGKILL closes direct workers and the copy authority", flush=True)
+        # More than the active workers can publish before the kill: this checks
+        # loss during transfer rather than racing an already-admitted finalize.
+        remote("source", "dd if=/dev/urandom of=" + shlex.quote(b + "/crash-data")
+               + " bs=1M count=32 status=none")
+        crash_digest = digest("source", b + "/crash-data")
+        crash_prefix = remote("source", "dd if=" + shlex.quote(b + "/crash-data")
+                              + " bs=1M count=1 status=none | sha256sum").split()[0]
+        controls = {row["control"] for row in json.loads(requester("persist", "status", "--json"))["authorized_ssh"]}
+        with copying("crashed", ("--no-tcp", "--resource-limits", "bandwidth=256K"),
+                     source="crash-data") as (process, output):
+            wait_for("copy before requester crash", lambda: partial("crashed", crash_prefix))
+            ticket = probe("destination", "ticket")
+            assert ticket
+            workers = probe("source", "workers")
+            assert workers, "crash copy has no direct B-to-C SSH worker"
+            assert probe("requester", "kill_requester", pidfile=a + "/pid", destination=c + "/crashed")
+            wait_for("direct workers after requester crash", lambda: probe("source", "workers_exited", workers=workers))
+            wait_for("destination key cleanup after requester crash", lambda: fingerprint("destination") == c_keys)
+            assert probe("destination", "late_worker", ticket=ticket)
+            finish(process, output, success=False)
+        remote("destination", "test ! -e " + shlex.quote(c + "/crashed"))
+        assert fingerprint("source") == b_keys
+        assert_no_native_credentials("source")
+        rows = json.loads(requester("persist", "status", "--json"))["authorized_ssh"]
+        assert len(rows) == 2 and all(row["connected"] for row in rows), rows
+        assert {row["control"] for row in rows} == controls, "requester crash replaced account authority"
+        no_pending()
+        with copying("crashed", ("--no-tcp",), source="crash-data") as (process, output):
+            finish(process, output)
+        assert_results("crashed", crash_digest)
+
+        print("case: losing only C's account connection stops B's active data workers", flush=True)
+        accounts = {row["requested"]["host"]: row for row in
+                    json.loads(requester("persist", "status", "--json"))["authorized_ssh"]}
+        destination_account = accounts["destination"]
+        endpoint = destination_account["endpoint"]
+        with copying("peer-loss", ("--no-tcp", "--resource-limits", "bandwidth=256K"),
+                     source="crash-data") as (process, output):
+            wait_for("copy before destination connection loss", lambda: partial("peer-loss", crash_prefix))
+            workers = probe("source", "workers")
+            assert workers
+            remote("requester", shlex.join(["/usr/bin/ssh", "-F", "/dev/null", "-S", destination_account["control"],
+                   "-o", "ControlMaster=no", "-o", "ProxyCommand=false", "-o", "BatchMode=yes",
+                   "-l", endpoint["user"], "-p", str(endpoint["port"]), "-O", "exit", "--", endpoint["host"]]))
+            wait_for("direct workers after destination connection loss", lambda: probe("source", "workers_exited", workers=workers))
+            finish(process, output, success=False)
+        wait_for("destination key cleanup after connection loss", lambda: fingerprint("destination") == c_keys)
+        remote("destination", "test ! -e " + shlex.quote(c + "/peer-loss"))
+        rows = json.loads(requester("persist", "status", "--json"))["authorized_ssh"]
+        assert len(rows) == 1 and rows[0]["connected"] and rows[0]["control"] == accounts["source"]["control"], rows
+        assert requester("ssh", "--auth-from", "@laptop", "source", "--", "id -un").strip() == "syq"
+        no_pending()
+        approve_account("destination")
+        with copying("peer-loss", ("--no-tcp",), source="crash-data") as (process, output):
+            finish(process, output)
+        assert_results("peer-loss", crash_digest)
 
         print("case: withdrawing account authority cancels the bridge and requires new approval", flush=True)
         with copying("revoked", ("--no-tcp", "--resource-limits", "bandwidth=256K")) as (process, output):
