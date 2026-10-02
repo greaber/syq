@@ -1595,7 +1595,7 @@ mod tests {
         let task = std::thread::spawn(move || {
             waiter.request_ssh(
                 &requester(),
-                &[b"syq".to_vec(), b"ssh".to_vec(), b"hostB".to_vec()],
+                &[b"ssh".to_vec(), b"hostB".to_vec()],
                 "/tmp/project",
                 &crate::cli::NativeEndpoint {
                     user: Some("alice".into()),

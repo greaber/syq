@@ -210,10 +210,10 @@ impl Receiver {
             .cloned()
             .map(OsString::from_vec)
             .collect();
-        if command.get(1).is_none_or(|value| value != "ssh") {
+        if command.first().is_none_or(|value| value != "ssh") {
             bail!("SSH approval needs the requesting syq ssh command");
         }
-        let parsed = ssh::parse(&command[1..])?;
+        let parsed = ssh::parse(&command)?;
         if parsed.destination != request.target || parsed.authorizer != self.name {
             bail!("SSH destination or authorizer does not match the shown command");
         }
