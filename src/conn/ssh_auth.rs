@@ -71,10 +71,12 @@ fn classify(stderr: &[u8]) -> Option<Failure> {
     if let Some(message) = last.strip_prefix("ssh: Could not resolve hostname ") {
         let (_, reason) = message.rsplit_once(": ")?;
         let reason = reason.to_ascii_lowercase();
-        // A resolver can itself report a timeout. Keep the no-timeout policy
-        // even when that error appears in a hostname-resolution diagnostic.
-        return (!reason.contains("timed out") && !reason.contains("timeout"))
-            .then_some(Failure::Hostname);
+        // DNS timeouts can also appear as a temporary resolution failure.
+        // Neither permits switching authorizers under the no-timeout policy.
+        return (!reason.contains("timed out")
+            && !reason.contains("timeout")
+            && !reason.contains("temporary"))
+        .then_some(Failure::Hostname);
     }
     if last.starts_with("ssh: connect to host ") && last.ends_with(": Connection refused") {
         return Some(Failure::ConnectionRefused);
@@ -134,6 +136,7 @@ mod tests {
             "Connection timed out during banner exchange",
             "user@host: Permission denied (publickey).\nConnection to host timed out",
             "ssh: Could not resolve hostname host: Operation timed out",
+            "ssh: Could not resolve hostname host: Temporary failure in name resolution",
             "Host key verification failed.\nConnection to host timed out",
         ] {
             assert_eq!(classify(diagnostic.as_bytes()), None, "{diagnostic}");

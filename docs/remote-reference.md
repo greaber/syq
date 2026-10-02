@@ -130,8 +130,9 @@ connections. SSH keeps its normal prompts and configured timeouts. If SSH
 reports rejected credentials, a host-key verification failure, an unresolved
 hostname, or a refused connection, syq tries live receiving machines in
 alphabetical order, allowing up to two seconds for each reply. The receiving
-machine uses its own SSH configuration and trusted host keys. Timeouts and
-unrecognized SSH errors end the attempt without trying a receiving machine.
+machine uses its own SSH configuration and trusted host keys. Timeouts,
+temporary DNS failures, and unrecognized SSH errors end the attempt without
+trying a receiving machine.
 Offline or unsupported receiving connections are skipped. With none available,
 the SSH error is reported. Unsupported copy options use only the source
 machine's SSH access. Helper setup and copy errors do not trigger another
