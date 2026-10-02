@@ -468,6 +468,9 @@ python3 /usr/local/libexec/syq-test-forward-copy.py
 printf 'case: remote commands run through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-exec.py
 
+printf 'case: direct SSH sessions authorized through the return connection\n'
+python3 /usr/local/libexec/syq-test-return-ssh.py
+
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
 
