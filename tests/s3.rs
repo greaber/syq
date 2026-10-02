@@ -3350,7 +3350,7 @@ fn s3_transfer_timing_excludes_delayed_pruning() {
     let during_prune: Vec<_> = live_progress
         .iter()
         .filter(|r| {
-            r["files_done"] == 1 && r["timings"]["total_ms"].as_u64().unwrap() >= transfer + 500
+            r["files_done"] == 1 && r["timings"]["total_ms"].as_u64().unwrap() + 500 <= total
         })
         .collect();
     assert!(!during_prune.is_empty(), "no live progress during pruning");
