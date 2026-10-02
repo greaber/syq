@@ -127,8 +127,10 @@ still be running. The coordinating server needs `/bin/kill` and either
 
 For `syq cp` between this machine and one SSH server, omitted `--auth-from`
 uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
-or `auto` if none is set. `--auth-from auto` first uses this machine's SSH access, including existing
-connections. SSH keeps its normal prompts and configured timeouts. If SSH
+or `auto` if none is set. `--auth-from auto` first reuses an existing approved
+account connection for that exact endpoint. Without one, it tries this
+machine's native SSH access. SSH keeps its normal prompts and configured
+timeouts. If SSH
 reports rejected credentials, a host-key verification failure, an unresolved
 hostname, or a refused connection, syq tries live receiving machines in
 alphabetical order, allowing up to two seconds for each reply. The receiving
@@ -145,11 +147,11 @@ may omit time spent before the handoff.
 For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).
 
-For SSH copies, `--auth-from @NAME` requires that receiving machine
-to authorize the copy. `--auth-from ssh` uses this machine's SSH access.
+For SSH copies, `--auth-from @NAME` selects that receiving machine.
 An existing [approved account connection](persistence-reference.md#approved-account-connections)
 for the same authorizer and endpoint supplies full account access without
-another prompt. Otherwise syq asks for per-copy authorization.
+another prompt. Otherwise an eligible copy asks for per-copy authorization.
+`--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
@@ -161,9 +163,9 @@ servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
 key already trusted by the authorizing machine and writable
 `~/.ssh/authorized_keys` on the destination. Syq temporarily adds a key that can
 join only this approved copy, then removes it when the copy closes. The source
-receives no laptop credentials or general SSH access. Destination completion does not request
-permission through a receiving machine. With `auto` or `ssh`, completion uses
-the source's own SSH access and does not fall back to a receiving machine.
+receives no laptop credentials or general SSH access. Remote path completion
+can reuse existing account approval, but never requests approval itself. Without
+an approved connection, `auto` and `ssh` completion use native SSH.
 
 For downloads (`--from HOST` to this machine), approval grants read access
 to the displayed source files and directory trees. `--src-non-dir` grants only
