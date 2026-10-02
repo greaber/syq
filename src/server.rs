@@ -1849,3 +1849,6 @@ fn write_metadata_batches<W: std::io::Write, T>(
     }
     writer.write_msg(&last(batch))
 }
+
+#[cfg(test)]
+mod peer_control_tests;
