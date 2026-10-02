@@ -90,13 +90,26 @@ impl HostPolicy {
 
 #[derive(Clone, Debug)]
 pub struct BrokerPolicy {
-    coordinator: HostPolicy,
+    coordinator: Option<HostPolicy>,
     peer: HostPolicy,
 }
 
 impl BrokerPolicy {
     pub fn new(coordinator: HostPolicy, peer: HostPolicy) -> Self {
-        Self { coordinator, peer }
+        Self {
+            coordinator: Some(coordinator),
+            peer,
+        }
+    }
+
+    /// The return channel has already authenticated the requesting server.
+    /// Its SSH client must prove only the approved destination, without any
+    /// forwarding hop or authority to sign for a different login account.
+    pub(crate) fn direct(peer: HostPolicy) -> Self {
+        Self {
+            coordinator: None,
+            peer,
+        }
     }
 }
 
@@ -898,6 +911,20 @@ fn validate_openssh_option_path(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Carry bounded agent requests over an already authenticated return stream.
+/// The upstream constrained broker validates every operation before signing.
+pub(crate) fn relay_frames(
+    downstream: &mut (impl Read + Write),
+    upstream: &mut (impl Read + Write),
+) -> Result<()> {
+    while let Some(request) = read_frame(downstream)? {
+        write_frame(upstream, &request)?;
+        let response = read_frame(upstream)?.context("authorization service disconnected")?;
+        write_frame(downstream, &response)?;
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct BindState {
     bindings: Vec<SessionBind>,
@@ -916,14 +943,16 @@ impl BindState {
         binding
             .verify_signature()
             .context("invalid session-bind host-key signature")?;
-        match self.bindings.len() {
-            0 if binding.is_forwarding && policy.coordinator.authorizes_binding(&binding) => {}
-            1 if !binding.is_forwarding && policy.peer.authorizes_binding(&binding) => {}
-            0 => bail!(
+        match (self.bindings.len(), policy.coordinator.as_ref()) {
+            (0, Some(coordinator))
+                if binding.is_forwarding && coordinator.authorizes_binding(&binding) => {}
+            (1, Some(_)) | (0, None)
+                if !binding.is_forwarding && policy.peer.authorizes_binding(&binding) => {}
+            (0, Some(coordinator)) => bail!(
                 "first session-bind did not identify trusted coordinator {}",
-                policy.coordinator.known_hosts_name
+                coordinator.known_hosts_name
             ),
-            1 => bail!(
+            (1, Some(_)) | (0, None) => bail!(
                 "final session-bind did not identify trusted peer {}",
                 policy.peer.known_hosts_name
             ),
@@ -941,8 +970,9 @@ impl BindState {
     }
 
     fn authorize(&self, policy: &BrokerPolicy, request: &SignRequest) -> Result<()> {
-        let [_, peer] = self.bindings.as_slice() else {
-            bail!("signature requested before the exact two-hop path was bound");
+        let peer = match (policy.coordinator.as_ref(), self.bindings.as_slice()) {
+            (Some(_), [_, peer]) | (None, [peer]) => peer,
+            _ => bail!("signature requested before the exact authorized path was bound"),
         };
         let parsed = HostboundUserauth::parse(&request.data)?;
         if parsed.session_id != peer.session_id {
