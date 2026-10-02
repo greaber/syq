@@ -1623,7 +1623,7 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
 }
 
 #[test]
-fn ssh_completion_never_probes_destination_or_suggests_implicit_authorization() {
+fn ssh_completion_offers_auth_modes_without_probing_destinations() {
     let t = Tmp::new();
     write(&t.path("home/.syq-destinations-v3/laptop.json"), b"{}");
     fs::set_permissions(
@@ -1637,9 +1637,13 @@ fn ssh_completion_never_probes_destination_or_suggests_implicit_authorization() 
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_completion_candidates(&t, &["syq", "ss"], &["ssh"]);
-    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", ""], &["@laptop"]);
-    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "auto"], &[]);
-    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "ssh"], &[]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "ssh", "--auth-from", ""],
+        &["@laptop", "auto", "ssh"],
+    );
+    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "auto"], &["auto"]);
+    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "ssh"], &["ssh"]);
     assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "@laptop", "host"], &[]);
     assert_completion_candidates(
         &t,
