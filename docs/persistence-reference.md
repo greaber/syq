@@ -32,7 +32,7 @@ An explicit `--auth-from`, including `auto`, wins over both saved settings.
 `auto` while keeping host overrides. Omit the value to show saved choices, or
 add `--for HOST` to show that host's effective choice.
 
-Defaults apply to `syq ssh` and native local-to-SSH copies that support receiving authorization.
+Defaults apply to `syq ssh` and native copies to or from one SSH server that support receiving authorization.
 Creating reusable account access with `persist connect` always requires an explicit `--auth-from @NAME`.
 Custom `--rsh` routes, copies to receiving names, object storage, and other routes
 keep their own authentication. The setting works independently of `persist on`
@@ -54,6 +54,13 @@ endpoints, `control` socket path, and `connected` state. A matching receiving
 name, login, typed host/alias, and port selects the same approved login.
 A dead master detected before command execution requires fresh approval; a
 failure after execution starts ends that command without a retry.
+
+Native copies with the same `--auth-from @NAME` choice also reuse that login.
+They may use SSH for data in either direction, including `--no-tcp`, and do
+not request a per-copy grant. Custom shell routes, explicit persistence scopes,
+detached or remote-to-remote copies, and copies requesting a receiver receipt
+do not select it. If no approved login is available, the command uses the
+usual per-copy authorization path and its restrictions.
 
 These connections have separate temporary scopes and an `authorized-ssh-v1`
 index under syq's runtime directory. Existing persistence settings and endpoint

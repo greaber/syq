@@ -132,8 +132,8 @@ Automatic approval trusts all processes running as the connected server accounts
 including for overwrites inside that directory. You can
 [limit a profile to particular servers](persistence-reference.md#choose-allowed-servers).
 
-Commands on your laptop, SSH account access, authorization for copies between
-servers, and storage authorization require approval every time. See
+Commands on your laptop, new SSH account access, authorization for individual
+copies between servers, and storage authorization always require approval. See
 [Receivers](security.md#receivers) for the trust boundary.
 
 To require approval for every download again:
@@ -192,26 +192,30 @@ See [`syq ssh`](commands/ssh.md) for commands, terminals, and requirements.
 
 ## Authorize copies between servers
 
-Use your laptop's SSH access to [copy directly between servers](remote-to-remote.md),
-while running the command in your source server's shell:
+Use your laptop's SSH access while working in hostA's shell:
 
 ```sh
-# Run on hostA, including in an existing tmux shell.
 syq cp results --to hostB --into /archive --auth-from @laptop
+syq cp --from hostB /archive/results --into . --auth-from @laptop
 ```
 
-Your laptop asks for approval for each copy, then uses its SSH access to hostB
-to authorize it without giving the source server your private SSH keys.
-Trust hostB's SSH host key on the laptop beforehand. Relative destination paths
-start in the hostB account's home directory; your laptop's receiving root does
-not contain this copy, but its transfer limits still apply.
+Your laptop asks for approval for each copy and uses its SSH access to hostB.
+Trust hostB's SSH host key on the laptop beforehand. Approval names the
+files or directories hostA may write or read; your laptop's receiving root
+does not contain this copy, but its transfer limits still apply.
 
-Files go directly from hostA to hostB over encrypted TCP, with SSH between
-those servers as a fallback. Use `--no-tcp` to choose SSH directly. SSH data
-needs writable `~/.ssh/authorized_keys` on hostB for a temporary key restricted
-to this copy. Keep the laptop connection and source command running until
-completion. See
-[Authorization selection](remote-reference.md#authorization-selection) for
-automatic selection, other authorizers, and supported options.
+Uploads send data directly between the servers over encrypted TCP, with SSH
+as a fallback. `--no-tcp` chooses SSH directly and needs writable
+`~/.ssh/authorized_keys` on hostB for a temporary key restricted to this copy.
+Downloads with source-read approval require a direct TCP data port on hostB;
+they fail if it is unavailable and do not write SSH authorization on hostB.
+Keep the laptop connection and copying command running until completion.
+
+For repeated work, you can instead [approve reusable account access](persistence.md#reuse-laptop-authorized-account-access).
+Copies then use that existing SSH login without another prompt, including
+uploads and downloads with `--no-tcp`. This grants the account's full access
+rather than restricting each copy to approved paths.
+See [Authorization selection](remote-reference.md#authorization-selection)
+for automatic selection, other authorizers, and supported options.
 
 See [Multiple profiles and server-specific settings](persistence-reference.md#names-and-profiles).

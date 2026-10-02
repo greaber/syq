@@ -117,6 +117,7 @@ try:
     run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off",
         "--auto-approve-root", "/tmp/syq-real-ssh-receive")
     run("syq", "persist", "connect", "source")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
     remote("destination", "dd if=/dev/urandom of=" + shlex.quote(source + "/data")
            + " bs=1M count=8 status=none && chmod 444 " + shlex.quote(source + "/data"))
     expected, keys = digest("destination", source + "/data"), source_keys()

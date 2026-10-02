@@ -325,6 +325,14 @@ copy scope. Closing the copy invalidates its worker connections and removes
 the key entry; an entry left by an interrupted cleanup cannot join another
 copy. Your laptop's credentials and signing agent remain on the laptop.
 
+A server can also request source-read approval to download files from another
+server. The source helper confines reads to the approved files and directory
+trees, checks the selected symlink behavior, and enforces the copy's byte,
+entry, and connection limits. It accepts no writes or removal operations.
+File data uses authenticated encrypted TCP directly between the servers;
+metadata and control use the laptop connection. If direct TCP is unavailable,
+the copy fails. Closing the approval connection stops further reads.
+
 <a id="approved-commands-on-receiving-machines"></a>
 
 ### Running commands on your laptop

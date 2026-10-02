@@ -204,6 +204,15 @@ def persistent_cases(expected):
     # approval command or consulting preferences on the laptop.
     source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
     assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
+    print("case: reusable account approval supports SSH-only uploads and downloads", flush=True)
+    copy_root = run("ssh", "destination", "mktemp -d /tmp/syq-account-copy.XXXXXX").strip()
+    try:
+        run("ssh", "source", "dd if=/dev/urandom of=" + shlex.quote(root + "/data") + " bs=1M count=3 status=none")
+        source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/data", "--no-tcp"])
+        source_run(["cp", "--from", "destination", copy_root + "/data", "--as", root + "/roundtrip", "--no-tcp"])
+        run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/roundtrip"))
+    finally:
+        run("ssh", "destination", "rm -rf -- " + shlex.quote(copy_root))
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
     # Native auth must not retry through the saved laptop preference on failure.
     source_run(["ssh", "--auth-from", "ssh", "destination", "--", "hostname"], success=False)

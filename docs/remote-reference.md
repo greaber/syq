@@ -107,8 +107,9 @@ To make hostB pull from hostA using credentials already on hostB:
 syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to hostB --into /archive
 ```
 
-There is no restricted source receiver, so direct pulls require one of these
-alternatives to the default authentication.
+Destination-coordinated remote-to-remote copies require one of these
+alternatives to the default authentication. A copy started in a server shell
+can instead request the source-read authorization described below.
 
 ## Detached copies
 
@@ -124,9 +125,9 @@ still be running. The coordinating server needs `/bin/kill` and either
 
 ## Authorization selection
 
-For `syq cp` with local sources and an SSH destination, omitted `--auth-from`
+For `syq cp` between this machine and one SSH server, omitted `--auth-from`
 uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
-or `auto` if none is set. `--auth-from auto` first uses the source machine's SSH access, including existing
+or `auto` if none is set. `--auth-from auto` first uses this machine's SSH access, including existing
 connections. SSH keeps its normal prompts and configured timeouts. If SSH
 reports rejected credentials, a host-key verification failure, an unresolved
 hostname, or a refused connection, syq tries live receiving machines in
@@ -145,13 +146,16 @@ For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).
 
 For SSH copies, `--auth-from @NAME` requires that receiving machine
-to authorize the copy. `--auth-from ssh` uses the source machine's SSH access.
+to authorize the copy. `--auth-from ssh` uses this machine's SSH access.
+An existing [approved account connection](persistence-reference.md#approved-account-connections)
+for the same authorizer and endpoint supplies full account access without
+another prompt. Otherwise syq asks for per-copy authorization.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
-SSH authorization through a receiving machine does not support `--detach`, custom
+Per-copy SSH authorization through a receiving machine does not support `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
-or `--coordinate-at`, or `--no-tcp-encryption`. File data goes directly from
+or `--coordinate-at`, or `--no-tcp-encryption`. Uploads send file data directly from
 source to destination over encrypted TCP, falling back to SSH between those same
 servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
 key already trusted by the authorizing machine and writable
@@ -160,6 +164,16 @@ join only this approved copy, then removes it when the copy closes. The source
 receives no laptop credentials or general SSH access. Destination completion does not request
 permission through a receiving machine. With `auto` or `ssh`, completion uses
 the source's own SSH access and does not fall back to a receiving machine.
+
+For downloads (`--from HOST` to this machine), approval grants read access
+to the displayed source files and directory trees. `--src-non-dir` grants only
+that entry; directory selectors grant their trees. An untyped source grants
+the entry or tree according to its type on the source. Filters narrow the copy,
+but do not narrow the approved tree. Symlinks follow the command's selection
+rules; the source helper enforces them and refuses writes. File data requires
+encrypted direct TCP, with no SSH fallback or relay through the laptop.
+`--no-tcp` and descriptor streams are unsupported on this per-copy route.
+A separately approved account connection supports SSH-only downloads.
 
 On this route, quoted `~` and `~/archive` select the destination account's home
 directory. Use `./~/archive` for a literal directory called `~`. Avoid
