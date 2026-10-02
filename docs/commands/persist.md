@@ -11,10 +11,10 @@ syq persist <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`persist auth-from`](#syq-persist-auth-from) | Choose default authorization for later commands |
+| [`persist auth-from`](#syq-persist-auth-from) | Choose default authorization for server copies and SSH sessions |
 | [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
 | [`persist destinations`](#syq-persist-destinations) | Inspect or recover named return destinations |
-| [`persist connect`](#syq-persist-connect) | Connect to an SSH server and wait until enabled receiving is ready |
+| [`persist connect`](#syq-persist-connect) | Connect with native SSH, or request reusable account access with --auth-from @NAME |
 | [`persist on`](#syq-persist-on) | Enable persistent connections for later syq commands |
 | [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
@@ -37,10 +37,17 @@ Choose or show [authorization defaults](../persistence-reference.md#authorizatio
 syq persist auth-from [OPTIONS] [auto|ssh|@NAME]
 ```
 
+**Arguments**
+
 | Argument / option | Meaning |
 |---|---|
 | `[auto\|ssh\|@NAME]` | Authorization for later commands; omit to show saved defaults |
-| `--for <HOST>` | Apply to this exact hostname or SSH alias, for any login or port |
+
+**Options**
+
+| Argument / option | Meaning |
+|---|---|
+| `--for <HOST>` | Apply to this exact destination hostname or SSH alias, for any login/port |
 | `--reset` | Remove the selected override so it inherits the default |
 
 <!-- /CLI -->
@@ -316,6 +323,7 @@ syq persist connect [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
+| `--auth-from <@NAME>` | Authorize a reusable destination-account login through a receiving machine |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a matching helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a matching helper |
 | `--timeout <TIMEOUT>` | Wait this many seconds for receiving after SSH/helper setup<br><br>[default: 30] |

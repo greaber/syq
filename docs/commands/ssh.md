@@ -15,7 +15,7 @@ session traffic go directly between the two servers.
 
 <!-- CLI: ssh -->
 ```text
-syq ssh [OPTIONS] --auth-from <@NAME> <HOST> [-- [COMMAND]...]
+syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 ```
 
 ## Arguments
@@ -29,7 +29,7 @@ syq ssh [OPTIONS] --auth-from <@NAME> <HOST> [-- [COMMAND]...]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <@NAME>` | Receiving machine that authorizes access to the destination |
+| `--auth-from <auto\|ssh\|@NAME>` | Authorization source; omitted uses the saved preference, then native SSH |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |
 
