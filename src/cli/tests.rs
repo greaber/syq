@@ -352,7 +352,7 @@ fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
     // Account-authorized copies use a primed ordinary RemoteSpec instead of
     // the per-copy source-authority control channel.
     args.return_source = None;
-    args.auth_from = AuthFrom::Return("laptop".into());
+    args.auth_from = crate::cli::AuthFrom::Return("laptop".into());
     args.direct_source = Some(Box::new(crate::conn::RemoteSpec::local_receiver(true)));
     assert_eq!(args.automatic_worker_limit(), 1000);
     args.resource_limits = None;
