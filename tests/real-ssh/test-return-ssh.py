@@ -154,8 +154,10 @@ def interactive_shell():
             os.waitpid(child, 0)
 
 
-def source_run(args, success=True):
-    return run("ssh", "source", "exec env " + native_path + " " + shlex.join(["syq", *args]), success=success)
+def source_run(args, success=True, *, stdin=None, tcp=False):
+    environment = native_path + (" SYQ_TEST_REQUIRE_TCP=1" if tcp else "")
+    return run("ssh", "source", "exec env " + environment + " " + shlex.join(["syq", *args]),
+               success=success, stdin=stdin)
 
 
 def persistent_connect(allow=True):
@@ -206,23 +208,33 @@ def persistent_cases(expected):
     # approval command or consulting preferences on the laptop.
     source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
     assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
-    print("case: reusable account approval supports SSH-only uploads and downloads", flush=True)
+    single_session = os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1"
+    transport = [] if single_session else ["--no-tcp"]
+    rsync_transport = [] if single_session else ["--syq-no-tcp"]
+    print("case: reusable account approval supports", "TCP" if single_session else "SSH-only",
+          "uploads and downloads", flush=True)
     copy_root = run("ssh", "destination", "mktemp -d /tmp/syq-account-copy.XXXXXX").strip()
     try:
         run("ssh", "source", "dd if=/dev/urandom of=" + shlex.quote(root + "/data") + " bs=1M count=3 status=none")
-        source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/data", "--no-tcp"])
-        source_run(["cp", "--from", "destination", copy_root + "/data", "--as", root + "/roundtrip", "--no-tcp"])
+        source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/data", *transport], tcp=single_session)
+        source_run(["cp", "--from", "destination", copy_root + "/data", "--as", root + "/roundtrip", *transport], tcp=single_session)
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/roundtrip"))
         mapping = source_run(["map", "--from", "destination", "-C", copy_root, "data"])
         assert len(mapping.splitlines()) == 1, mapping
-        source_run(["rsync", "-a", "--syq-no-tcp", root + "/data", "destination:" + copy_root + "/rsync-data"])
-        source_run(["rsync", "-a", "--syq-no-tcp", "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"])
+        source_run(["rsync", "-a", *rsync_transport, root + "/data", "destination:" + copy_root + "/rsync-data"], tcp=single_session)
+        source_run(["rsync", "-a", *rsync_transport, "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"], tcp=single_session)
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/rsync-roundtrip"))
         stream_data = "stream through approved SSH\n"
-        run("ssh", "source", "exec env " + native_path + " " + shlex.join([
-            "syq", "cp", "--src-fd", "0", "--to", "destination", "--as", copy_root + "/stream",
-            "--no-tcp", "--auth-from", "@laptop"]), stdin=stream_data)
-        assert source_run(["cp", "--from", "destination", copy_root + "/stream", "--as-fd", "1", "--no-tcp"]) == stream_data
+        source_run(["cp", "--src-fd", "0", "--to", "destination", "--as", copy_root + "/stream",
+                    *transport, "--auth-from", "@laptop"], stdin=stream_data, tcp=single_session)
+        assert source_run(["cp", "--from", "destination", copy_root + "/stream", "--as-fd", "1", *transport],
+                          tcp=single_session) == stream_data
+        if single_session:
+            print("case: MaxSessions=1 SSH-only account copy fails without requesting more authority", flush=True)
+            source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/ssh-refused",
+                        "--no-tcp", "--auth-from", "@laptop", "--performance-tuning", "workers=1"], success=False)
+            run("ssh", "destination", "test ! -e " + shlex.quote(copy_root + "/ssh-refused"))
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
         source_run(["clean-partials", "--on", "destination", copy_root, "--auth-from", "@laptop"])
         run("ssh", "destination", "test -f " + shlex.quote(copy_root + "/data"))
         source_run(["rm", "--on", "destination", copy_root + "/rsync-data", "--auth-from", "@laptop"])
