@@ -1920,7 +1920,8 @@ impl Engine {
                                 } else {
                                     suffix
                                 };
-                                let suffix = local::key_path(suffix.as_bytes())?;
+                                let suffix = local::key_path(suffix.as_bytes())
+                                    .with_context(|| format!("S3 source key {object:?}"))?;
                                 let kind = if directory {
                                     ObjectKind::Dir
                                 } else {
