@@ -143,6 +143,7 @@
         "from",
         "include",
         "where",
+        "auth-from",
         "rsh",
         "syq-path",
         "no-bootstrap",
@@ -179,7 +180,8 @@
         "syq-path",
         "no-bootstrap",
         "results",
-        "performance-tuning"
+        "performance-tuning",
+        "auth-from"
       ],
       "follow_up": []
     }

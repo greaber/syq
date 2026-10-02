@@ -542,6 +542,20 @@ class NativeClientTests(unittest.TestCase):
         self.assertIn("--dry-run", argv)
         self.assertNotIn("--coordinate-at", argv)
 
+    def test_ssh_account_authorization_for_removal_and_mapping(self) -> None:
+        self.client.rm("file", on="server", auth_from="@laptop")
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        with self.client.map("file", from_="server", auth_from="@laptop") as stream:
+            self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+            transformed = stream.transform(lambda entry: entry)
+            with self.assertRaisesRegex(syq.SyqInvocationError, "auth_from"):
+                self.client.cp(mapping=transformed, into="output", auth_from="@other")
+            self.client.cp(mapping=transformed, into="output")
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        for endpoint in (None, "s3://bucket"):
+            with self.assertRaisesRegex(syq.SyqInvocationError, "SSH source"):
+                self.client.map("file", from_=endpoint, auth_from="@laptop")
+
     def test_s3_removal_arguments_and_validation(self) -> None:
         self.client.rm("key", on="s3://bucket", auth_from="@laptop", s3_all_versions=True, s3_endpoint="http://localhost:9000", s3_header=["X-Test: yes"])
         argv = self.argv()

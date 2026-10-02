@@ -879,8 +879,10 @@ def _rm_arguments(
             argv, "--pscope", _argument(pscope, label="pscope")
         )
     is_s3 = on is not None and on.startswith("s3://")
+    if auth_from is not None and on is None:
+        raise SyqInvocationError("auth_from requires an SSH or S3 removal endpoint")
     if not is_s3 and (
-        auth_from is not None or s3_all_versions or s3_version_id is not None
+        s3_all_versions or s3_version_id is not None
         or any(v is not None for v in (s3_endpoint, s3_region, s3_profile, s3_header))
     ):
         raise SyqInvocationError("S3 removal options require on='s3://BUCKET'")
@@ -1293,7 +1295,7 @@ class Client:
         check: bool = True,
     ) -> CpResult:
         connection = _connection_options(mapping, _Connection(
-            rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header,
+            rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header, auth_from,
         ))
         from_, cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
@@ -1359,8 +1361,8 @@ class Client:
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header)
         _s3_write_arguments(argv, s3_write_header)
-        if auth_from is not None:
-            argv.extend(("--auth-from", _text_arg(auth_from, label="auth_from")))
+        if connection.auth_from is not None:
+            argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
         _append_remote_arguments(
             argv,
             coordinate_at=coordinate_at,
@@ -1520,6 +1522,7 @@ class Client:
         from_: str | None = None,
         include: Iterable[str] | None = None,
         where: str | None = None,
+        auth_from: str | None = None,
         rsh: str | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
@@ -1581,9 +1584,13 @@ class Client:
             where=where,
         )
         connection = _Connection(rsh, syq_path, no_bootstrap,
-                                 s3_endpoint, s3_region, s3_profile, s3_header)
+                                 s3_endpoint, s3_region, s3_profile, s3_header, auth_from)
         _map_options(argv, include=include, rsh=connection.rsh, syq_path=connection.syq_path,
                      no_bootstrap=connection.no_bootstrap)
+        if connection.auth_from is not None:
+            if from_ is None or from_.startswith("s3://"):
+                raise SyqInvocationError("auth_from requires an SSH source for map")
+            argv.extend(("--auth-from", _text_arg(connection.auth_from, label="auth_from")))
         _s3_arguments(argv, connection.s3_endpoint, connection.s3_region,
                       connection.s3_profile, connection.s3_header)
         if source_count == 0:
