@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
 mod foreground;
+mod master_lifetime;
 pub(crate) mod persistent;
 
 #[derive(Parser)]

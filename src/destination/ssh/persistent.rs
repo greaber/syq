@@ -497,6 +497,7 @@ fn keeper(startup: Startup) -> Result<()> {
         command: Vec::new(),
     };
     master.args(connect_request.ssh_arguments(endpoint)?);
+    let _lifetime = super::master_lifetime::attach(&mut master)?;
     let mut master = foreground::ForegroundChild::spawn(&mut master, &signals)?;
     let record = Record {
         version: 1,

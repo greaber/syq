@@ -237,6 +237,50 @@ def persistent_cases(expected):
     source_run(["persist", "off"])
 
 
+def persistent_crash():
+    print("case: killing the keeper hangs up its active native master", flush=True)
+    persistent_connect()
+    rows = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+    control = rows[0]["control"]
+    with tempfile.TemporaryFile() as output:
+        process = subprocess.Popen(["ssh", "source", source_command(["printf READY; exec sleep 60"])], stdout=output, stderr=subprocess.PIPE)
+        try:
+            wait_for("command before keeper crash", lambda: b"READY" in os.pread(output.fileno(), 4096, 0))
+            run("ssh", "source", "python3 -", stdin="control = " + repr(control) + "\n" + r'''
+import os, pathlib, signal, time
+matches = []
+for entry in pathlib.Path('/proc').iterdir():
+    if not entry.name.isdigit(): continue
+    try:
+        args = (entry/'cmdline').read_bytes().split(b'\0')
+        if not args or pathlib.Path(os.fsdecode(args[0])).name != 'ssh': continue
+        if os.fsencode(control) not in args: continue
+        stat = (entry/'stat').read_text().rsplit(') ', 1)[1].split()
+        keeper = int(stat[1])
+        owner = pathlib.Path('/proc')/str(keeper)/'cmdline'
+        if b'--approved-ssh-master' in owner.read_bytes().split(b'\0'):
+            matches.append((int(entry.name), keeper))
+    except FileNotFoundError: pass
+assert len(matches) == 1, matches
+master, keeper = matches[0]
+os.kill(keeper, signal.SIGKILL)
+deadline, progress = time.monotonic()+5, time.monotonic()+1
+while pathlib.Path(control).exists():
+    assert time.monotonic() < deadline, ('master survived keeper', master, keeper)
+    if time.monotonic() >= progress:
+        print('Waiting for crashed keeper master', master, flush=True); progress += 1
+    time.sleep(.025)
+''')
+            _, err = process.communicate(timeout=10)
+            assert process.returncode == 255, (process.returncode, err)
+            assert json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"] == []
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+        finally:
+            if process.poll() is None:
+                process.kill(); process.wait(timeout=5)
+    source_run(["persist", "off"])
+
+
 try:
     print("case: direct SSH always asks for account approval", flush=True)
     Path("/tmp/syq-real-ssh-receive").mkdir(exist_ok=True)
@@ -287,6 +331,7 @@ assert 'does not match' in reply['Error'], reply
             ready()
     assert execute(["hostname"])[0] == expected
     persistent_cases(expected)
+    persistent_crash()
     print("Direct laptop-authorized SSH passed", flush=True)
 finally:
     source_run(["persist", "off"])
