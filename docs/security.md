@@ -265,8 +265,8 @@ persistent connections, including receiving.
 ## Receivers
 
 With receiving enabled, servers you have persistent connections to can request
-copies to or commands on your machine, or authorization for copies to another
-server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
+copies to or commands on your machine, SSH account access on another server,
+or authorization for copies to another server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
 disables these requests while keeping SSH reuse.
 
 Requests from a server are subject to local approval:
@@ -276,6 +276,7 @@ Requests from a server are subject to local approval:
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Use your SSH access for a copy to another server | Always required |
 | Run a command on your machine | Always required |
+| Open an SSH session to another server account | Always required; grants that account's authority |
 | Use your storage credentials for a transfer | Always required |
 
 The prompt shows the server account and the requested command. For copies and
@@ -336,3 +337,26 @@ a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
 signed receipts do not apply.
+
+## SSH account access
+
+`syq ssh --auth-from @laptop` asks your laptop to authorize an SSH login to
+another server. Approval grants the destination account's authority, including
+arbitrary commands and access to its files. The displayed command describes
+what the requester intends to run; syq does not restrict the approved account
+to that command. Copy paths, download roots, and copy limits do not constrain
+this permission.
+
+The laptop supplies a signing service restricted to the destination's trusted
+host key and login account. It does not expose your ordinary SSH agent or
+private keys, and the requesting server cannot use this permission to sign
+arbitrary messages or authenticate to a different host or account. As with
+other receiving requests, trust extends to every process under the requesting
+server account, not just the shell that requested permission.
+
+Stopping receiving or losing the return connection closes the signing service
+and stops the requesting syq process's SSH client. This prevents further use of
+that signing service. It cannot undo changes already made on the destination,
+stop detached remote processes, or revoke independent access that the approved
+account created. SSH account approval is therefore broader than a
+command-restricted copy grant.

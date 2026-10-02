@@ -593,7 +593,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "exec" | "tuning-cache" | "_ls" => {
+        "completion" | "persist" | "receiver" | "exec" | "ssh" | "tuning-cache" | "_ls" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -739,6 +739,7 @@ fn bash_replacement_candidates(
 fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     [
         "cp",
+        "ssh",
         "exec",
         "rm",
         "clean-partials",
@@ -766,6 +767,7 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "completion" => Some(command_for_help()),
         "persist" => Some(crate::persistence::command_for_help()),
         "receiver" => Some(crate::help::receiver()),
+        "ssh" => Some(crate::destination::ssh::command_for_help()),
         "exec" => Some(crate::destination::exec::command_for_help()),
         "--self-update" => Some(crate::help::lifecycle()),
         "tuning-cache" => Some(crate::tune::history::command_for_help()),
@@ -1276,6 +1278,10 @@ fn value_completion(
     command_meta: &clap::Command,
 ) -> Option<ValueCompletion> {
     let known = match command {
+        "ssh" => match option {
+            b"--auth-from" => Some(ValueCompletion::ReturnName),
+            _ => None,
+        },
         "exec" => match option {
             b"--on" => Some(ValueCompletion::ReturnName),
             _ => None,

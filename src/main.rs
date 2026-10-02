@@ -276,6 +276,18 @@ fn main() {
         std::process::exit(2);
     }
     destination::handoff::record_command_line(&argv);
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
+        match destination::ssh::run(&argv[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<clap::Error>() {
+                    error.exit();
+                }
+                crate::output::diagnostic!("syq ssh: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec") {
         match destination::exec::run(&argv[1..]) {
             Ok(code) => std::process::exit(code),

@@ -30,6 +30,7 @@
   - [rm](commands/rm.md)
   - [clean-partials](commands/clean-partials.md)
   - [map](commands/map.md)
+  - [ssh](commands/ssh.md)
   - [exec](commands/exec.md)
   - [rsync](commands/rsync.md)
   - [persist](commands/persist.md)
