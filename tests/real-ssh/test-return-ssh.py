@@ -174,7 +174,7 @@ try:
     run("ssh", "source", "python3 -", stdin='''
 import json, pathlib, socket, struct
 r = json.loads((pathlib.Path.home()/'.syq-destinations-v3/laptop.json').read_text())
-command = ['syq','ssh','--auth-from','@laptop','destination','--','hostname']
+command = ['ssh','--auth-from','@laptop','destination','--','hostname']
 request = {'version':2,'identity':r['identity'],'secret':r['secret'],
            'message':{'Ssh':{'target':{'user':None,'host':'source','port':None},
                              'command':[list(a.encode()) for a in command],'cwd':'/tmp'}}}
