@@ -6,7 +6,7 @@
 //! the other shells pass their already-tokenized words. All command awareness,
 //! endpoint selection, and local/remote directory discovery remains in Rust.
 
-use crate::cli::{parse_native_endpoint, NativeEndpoint};
+use crate::cli::{parse_native_endpoint, AuthFrom, NativeEndpoint};
 use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
 use crate::proto::{CompletionEntry, OperatorSymlinkPolicy, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
@@ -1515,12 +1515,6 @@ fn complete_path_for(
             path_policy(command, args, false, true),
         ));
     };
-    let authorizer = find_option_value(args, b"--auth-from");
-    if authorizer.is_some_and(|value| value != "auto" && value != "ssh") {
-        // Completion uses local SSH for auto/ssh, but never requests approval
-        // or falls back to a receiving machine.
-        return Ok(Vec::new());
-    }
     if endpoint.host.starts_with('@') {
         return Ok(Vec::new());
     }
@@ -1649,7 +1643,7 @@ fn remote_path_candidates(
     base: Option<SourceBase<'_>>,
     policy: PathCompletionPolicy,
 ) -> Result<Vec<Candidate>> {
-    if has_explicit_rsh(command, args) {
+    if has_explicit_rsh(command, args) || endpoint.host.starts_with('@') {
         return Ok(Vec::new());
     }
     let (directory, typed_directory, prefix) = split_path(current);
@@ -1674,6 +1668,25 @@ fn remote_path_candidates(
         },
     );
     let pscope = pscope_from_args(command, args).map(PathBuf::from);
+    // An explicit scope owns its native connection selection. Otherwise every
+    // source and destination path uses the same saved/explicit authorization.
+    let auth_from = if pscope.is_some() {
+        None
+    } else {
+        let explicit = find_option_bytes(
+            args,
+            if command == "rsync" {
+                b"--syq-auth-from"
+            } else {
+                b"--auth-from"
+            },
+        )
+        .map(std::str::from_utf8)
+        .transpose()?
+        .map(crate::cli::parse_auth_from)
+        .transpose()?;
+        Some(crate::auth_from::resolve(&endpoint.host, explicit)?)
+    };
     let endpoint_for_thread = endpoint.clone();
     let directory_for_thread = directory.path;
     let root_for_thread = directory.confined_root;
@@ -1683,6 +1696,7 @@ fn remote_path_candidates(
         let connection = connect_completion_endpoint(
             endpoint_for_thread,
             pscope.as_deref(),
+            auth_from,
             syq_path,
             no_bootstrap,
         );
@@ -1735,44 +1749,69 @@ fn remote_path_candidates(
 }
 
 fn connect_completion_endpoint(
-    endpoint: NativeEndpoint,
+    mut endpoint: NativeEndpoint,
     pscope: Option<&Path>,
+    auth_from: Option<AuthFrom>,
     syq_path: Option<String>,
     no_bootstrap: bool,
 ) -> Result<RemoteConn> {
-    let multiplexer = match crate::persistence::scope_for_implicit_ssh(pscope)? {
-        Some(scope) => Arc::new(SshMultiplexer::persistent(
-            &scope,
-            endpoint.user.as_deref(),
-            &endpoint.host,
-            endpoint.port,
-            None,
-        )?),
-        None => Arc::new(SshMultiplexer::new()?),
+    let cached = auth_from
+        .as_ref()
+        .map(|mode| crate::destination::ssh::persistent::select_cached(&endpoint, mode))
+        .transpose()?
+        .flatten();
+    let mut rsh = vec!["ssh".into()];
+    let ssh_multiplexer = if let Some(cached) = cached {
+        endpoint = cached.endpoint().clone();
+        rsh.extend(
+            cached
+                .options()
+                .into_iter()
+                .map(|option| {
+                    option
+                        .into_string()
+                        .map_err(|_| anyhow!("approved SSH option is not UTF-8"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        // These options require the existing approved master. Neither the
+        // completion helper nor a disappearing socket may start a new login.
+        None
+    } else {
+        if let Some(AuthFrom::Return(name)) = auth_from {
+            bail!("no live approved account connection for {} through @{name}; connect first with syq persist connect {} --auth-from @{name}", endpoint_label(&endpoint), endpoint_label(&endpoint));
+        }
+        Some(match crate::persistence::scope_for_implicit_ssh(pscope)? {
+            Some(scope) => Arc::new(SshMultiplexer::persistent(
+                &scope,
+                endpoint.user.as_deref(),
+                &endpoint.host,
+                endpoint.port,
+                None,
+            )?),
+            None => Arc::new(SshMultiplexer::new()?),
+        })
     };
+    for option in [
+        "BatchMode=yes",
+        "ConnectTimeout=3",
+        "ConnectionAttempts=1",
+        "ServerAliveInterval=5",
+        "ServerAliveCountMax=1",
+    ] {
+        rsh.extend(["-o".into(), option.into()]);
+    }
     let spec = RemoteSpec {
         local_process: false,
         user: endpoint.user,
         host: endpoint.host,
         port: endpoint.port,
-        rsh: vec![
-            "ssh".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=3".into(),
-            "-o".into(),
-            "ConnectionAttempts=1".into(),
-            "-o".into(),
-            "ServerAliveInterval=5".into(),
-            "-o".into(),
-            "ServerAliveCountMax=1".into(),
-        ],
+        rsh,
         syq_path: syq_path.clone(),
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
         restricted_grant: None,
         helper_install: Default::default(),
-        ssh_multiplexer: Some(multiplexer),
+        ssh_multiplexer,
         quiet: true,
         pacing: Default::default(),
         tcp: Default::default(),
