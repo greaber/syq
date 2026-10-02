@@ -521,7 +521,11 @@ fn bind_state_rejects_bad_signatures_wrong_hosts_and_extra_hops() {
     let policy = policy(source.clone(), destination.clone());
 
     let mut disallowed_algorithm = policy.clone();
-    disallowed_algorithm.coordinator.host_key_algorithms = vec!["rsa-sha2-512".into()];
+    disallowed_algorithm
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .host_key_algorithms = vec!["rsa-sha2-512".into()];
     assert!(BindState::default()
         .add(
             &disallowed_algorithm,
@@ -642,6 +646,75 @@ fn authorization_is_exact_for_user_session_host_and_method() {
     ] {
         assert!(state.authorize(&policy, &denied).is_err());
     }
+}
+
+#[test]
+fn direct_authorization_requires_the_exact_peer_and_login_without_forwarding() {
+    let (peer_private, peer) = key(101);
+    let (other_private, other) = key(102);
+    let (_, identity) = key(103);
+    let policy = BrokerPolicy::direct(host_policy("backup", "destination", peer.clone()));
+    let allowed = sign_request(
+        b"direct-session",
+        b"backup",
+        b"publickey-hostbound-v00@openssh.com",
+        identity.clone(),
+        &peer,
+    );
+    assert!(BindState::default().authorize(&policy, &allowed).is_err());
+    for denied in [
+        binding(&peer_private, peer.clone(), b"direct-session", true),
+        binding(&other_private, other.clone(), b"direct-session", false),
+        binding(&other_private, peer.clone(), b"direct-session", false),
+    ] {
+        assert!(BindState::default().add(&policy, denied).is_err());
+    }
+    let mut state = BindState::default();
+    state
+        .add(
+            &policy,
+            binding(&peer_private, peer.clone(), b"direct-session", false),
+        )
+        .unwrap();
+    state.authorize(&policy, &allowed).unwrap();
+    for denied in [
+        sign_request(
+            b"other-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            identity.clone(),
+            &peer,
+        ),
+        sign_request(
+            b"direct-session",
+            b"root",
+            b"publickey-hostbound-v00@openssh.com",
+            identity.clone(),
+            &peer,
+        ),
+        sign_request(
+            b"direct-session",
+            b"backup",
+            b"publickey",
+            identity.clone(),
+            &peer,
+        ),
+        sign_request(
+            b"direct-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            identity,
+            &other,
+        ),
+    ] {
+        assert!(state.authorize(&policy, &denied).is_err());
+    }
+    assert!(state
+        .add(
+            &policy,
+            binding(&peer_private, peer, b"extra-session", false)
+        )
+        .is_err());
 }
 
 #[test]
