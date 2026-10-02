@@ -102,7 +102,6 @@ In addition to the shared arguments above, it accepts:
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
 | `s3_write_header` | Iterable of `"NAME: VALUE"` strings; applied only to requests that create or replace objects |
-| `auth_from` | Credential source string |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
 | `syq_path` | Remote executable path |
@@ -310,7 +309,7 @@ For S3, `mtime` is stored filesystem time, omitted when unavailable;
 `s3_last_modified` is the independent S3 object modification time. Requesting
 `kind` or `mtime` reads S3 object metadata; generation never downloads bodies.
 
-Connection options are `rsh`, `syq_path`, `no_bootstrap`, `s3_endpoint`,
+Connection options are `auth_from`, `rsh`, `syq_path`, `no_bootstrap`, `s3_endpoint`,
 `s3_region`, `s3_profile`, and `s3_header`, with the same types as on `cp`.
 Explicit connection options are kept through transformations and copying.
 For example, the consumer uses the same object service here:
@@ -337,7 +336,7 @@ with a different `process_cwd`.
 `Mapping(entries, *, from_=None, cwd=None, root=None, follow_src=False,
 **connection_options)` accepts an iterable of `MappingEntry`.
 `AsyncMapping(...)` accepts an async iterable. The connection options are the
-same seven options listed for `map` above.
+same options listed for `map` above.
 
 Supply at most one of `cwd` and `root`; `root` confines source resolution.
 Local relative bases resolve against the Python process directory at
