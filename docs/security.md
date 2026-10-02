@@ -345,7 +345,11 @@ another server. Approval grants the destination account's authority, including
 arbitrary commands and access to its files. The displayed command describes
 what the requester intends to run; syq does not restrict the approved account
 to that command. Copy paths, download roots, and copy limits do not constrain
-this permission.
+this permission. `syq persist connect HOST --auth-from @NAME` separately asks
+for reusable account access: later commands and copies may use that login
+without another approval while the laptop remains connected. Any process
+running as the requesting account can use its owner-only SSH control socket.
+A one-time SSH invocation does not create this reusable permission.
 
 The laptop supplies a signing service restricted to the destination's trusted
 host key and login account. It does not expose your ordinary SSH agent or

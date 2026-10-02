@@ -174,6 +174,20 @@ def persistent_connect(allow=True):
 
 def persistent_cases(expected):
     print("case: reusable account access has separate explicit approval", flush=True)
+    # Turning persistence off while approval is pending closes that request too.
+    args = ["syq", "persist", "connect", "destination", "--auth-from", "@laptop"]
+    process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(args)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        items = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+        assert len(items) == 1 and items[0]["reusable"], items
+        source_run(["persist", "off"])
+        out, err = process.communicate(timeout=10)
+        assert process.returncode != 0, (out, err)
+        wait_for("cancelled persistent approval", lambda: not json.loads(run("syq", "persist", "receive", "pending", "--json")))
+    finally:
+        if process.poll() is None:
+            process.kill(); process.wait(timeout=5)
     persistent_connect(False)
     persistent_connect()
     rows = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]

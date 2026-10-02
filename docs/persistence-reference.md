@@ -7,7 +7,7 @@ For everyday setup, start with [Keep connections open](persistence.md) or
 
 ## Authorization defaults
 
-On a server, choose the receiving machine that should authorize later copies:
+On a server, choose the receiving machine that should authorize later copies and `syq ssh` sessions:
 
 ```sh
 syq persist auth-from @laptop
@@ -20,23 +20,46 @@ syq persist auth-from --reset
 `@laptop` goes straight to that machine without first trying the server's SSH
 credentials. If it is unavailable or refuses the request, the command fails.
 The setting chooses where to ask; every request still needs its normal approval.
-`ssh` uses the server's own access. `auto` tries SSH first and can ask an available
-receiving machine after an eligible SSH failure.
+`ssh` uses the server's own access. For copies, `auto` tries SSH first and can ask an available
+receiving machine after an eligible SSH failure. For `syq ssh`, both `auto` and
+`ssh` execute native SSH once; login and command failures never trigger a retry.
 
 A `--for HOST` override wins over the default. Matching uses the exact hostname
-or SSH alias typed in the copy command, for every login and port; aliases are
+or SSH alias typed in the command, for every login and port; aliases are
 not expanded through SSH configuration or DNS. `--for` takes no login or port.
 An explicit `--auth-from`, including `auto`, wins over both saved settings.
 `--reset --for HOST` removes one override; `--reset` restores the default to
 `auto` while keeping host overrides. Omit the value to show saved choices, or
 add `--for HOST` to show that host's effective choice.
 
-Defaults apply to native local-to-SSH copies that support receiving authorization.
+Defaults apply to `syq ssh` and native local-to-SSH copies that support receiving authorization.
+Creating reusable account access with `persist connect` always requires an explicit `--auth-from @NAME`.
 Custom `--rsh` routes, copies to receiving names, object storage, and other routes
 keep their own authentication. The setting works independently of `persist on`
 and `off`. It is saved in `auth-from.json` alongside `persistence.json`; older
 syq versions ignore it. If it is unreadable or has an unknown format, repair the
 file or pass `--auth-from` explicitly for that command.
+
+## Approved account connections
+
+`syq persist connect HOST --auth-from @NAME` enables persistence and requests
+reusable SSH account access. It does not install a syq helper or enable
+receiving on `HOST`. Helper and `--pscope` overrides do not apply to this mode.
+Readiness means the approved SSH master accepts sessions. A failed or denied
+connection leaves persistence enabled; use `syq persist off` to disable it.
+
+`persist status --json` adds an `authorized_ssh` array alongside the usual
+`connections`. Each entry contains the authorizer name, requested and resolved
+endpoints, `control` socket path, and `connected` state. A matching receiving
+name, login, typed host/alias, and port selects the same approved login.
+A dead master detected before command execution requires fresh approval; a
+failure after execution starts ends that command without a retry.
+
+These connections have separate temporary scopes and an `authorized-ssh-v1`
+index under syq's runtime directory. Existing persistence settings and endpoint
+records retain their formats. Older syq versions ignore the new index in
+`persist status`. Their `persist off` still ends these connections because
+the process keeping each connection open observes the disabled setting.
 
 ## Names and profiles
 
