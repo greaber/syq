@@ -2458,7 +2458,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("existing")).unwrap(), b"new");
-    assert_eq!(
+    assert_ne!(
         fs::metadata(moved.join("existing")).unwrap().ino(),
         existing.ino()
     );
