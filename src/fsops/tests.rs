@@ -479,6 +479,35 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     assert!(error.to_string().contains("is a directory"), "{error}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for() {
+    // Sixteen names in one directory make it worth a listing; fewer do not;
+    // absolute paths are left to the stat itself, and files at the root
+    // count for the root. The first requested name of each batch is what
+    // the listing is conditioned on.
+    let mut requests = HashMap::new();
+    let mut paths: Vec<PathBytes> = (0..16).map(|i| format!("d/f{i}").into_bytes()).collect();
+    paths.extend((0..15).map(|i| format!("e/f{i}").into_bytes()));
+    paths.extend((0..16).map(|i| format!("r{i}").into_bytes()));
+    paths.extend((0..20).map(|i| format!("/abs/f{i}").into_bytes()));
+    let mut listed = directories_to_list(&paths, &mut requests);
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![(&b""[..], &b"r0"[..], 16), (&b"d"[..], &b"d/f0"[..], 16)]
+    );
+
+    // Names count across batches: one more name in `e` makes sixteen. A
+    // directory that has been listed is not offered again.
+    requests.insert(b"d".to_vec(), None);
+    let paths: Vec<PathBytes> = vec![b"e/f15".to_vec(), b"d/f16".to_vec()];
+    assert_eq!(
+        directories_to_list(&paths, &mut requests),
+        vec![(&b"e"[..], &b"e/f15"[..], 16)]
+    );
+}
+
 #[test]
 fn payload_integrity_checks_are_explicit() {
     use crate::hashing::{HashAlgorithm, HashPolicy};

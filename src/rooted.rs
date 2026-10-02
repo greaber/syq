@@ -976,6 +976,17 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
+    /// Read up to about `limit` entries of a retained directory, keeping
+    /// nothing: what the read leaves in the kernel's caches is the point.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn walk_open_directory(&self, directory: &File, limit: usize) -> Result<()> {
+        let readable = open_readable_directory_at(directory, b".")
+            .context("open readable confined directory")?;
+        crate::sys::walk_directory_entries(readable, limit)
+            .map(|_| ())
+            .context("read confined directory")
+    }
+
     /// Start with the common Linux limit, independent of previous failures.
     /// Some filesystems report a conservative limit but accept longer names;
     /// learning a limit must not change a name that already opened successfully.
