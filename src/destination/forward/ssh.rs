@@ -232,7 +232,6 @@ pub(crate) struct Peer {
     port: u16,
     known_hosts: String,
     algorithms: String,
-    required_rsa_size: usize,
 }
 impl Peer {
     fn resolve(target: &str) -> Result<Self> {
@@ -249,7 +248,6 @@ impl Peer {
             port: policy.port(),
             known_hosts: policy.known_hosts("syq-copy-peer")?,
             algorithms: policy.host_key_algorithms(),
-            required_rsa_size: policy.required_rsa_size(),
         })
     }
 }
@@ -468,9 +466,6 @@ impl Client {
         command
             .arg("-o")
             .arg(format!("HostKeyAlgorithms={}", peer.algorithms));
-        command
-            .arg("-o")
-            .arg(format!("RequiredRSASize={}", peer.required_rsa_size));
         command.arg("-i").arg(ready.directory.path().join("key"));
         command
             .arg("-l")
@@ -635,13 +630,15 @@ mod tests {
                     port: 22,
                     known_hosts: "pinned host key".into(),
                     algorithms: "ssh-ed25519".into(),
-                    required_rsa_size: 2048,
                 })
             })
             .unwrap();
-        client
+        let command = client
             .command_with(|_| panic!("ready copy must reuse setup"))
             .unwrap();
+        assert!(!command
+            .get_args()
+            .any(|arg| arg.to_string_lossy().starts_with("RequiredRSASize=")));
     }
 
     #[test]
