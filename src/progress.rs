@@ -6,7 +6,10 @@ pub use timing::Timings;
 
 use std::collections::VecDeque;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -66,9 +69,9 @@ pub struct Progress {
     pub start: Instant,
     separate_transfer_timing: bool,
     transfer_start: std::sync::OnceLock<Instant>,
-    transfer_end: std::sync::OnceLock<Instant>,
+    transfer_finished: AtomicBool,
     pub(crate) clock: timing::Clock,
-    copy_first_ns: AtomicU64,
+    /// Last completed file operation, shared by live timing and tuning history.
     copy_last_ns: AtomicU64,
     term: Mutex<TermState>,
     stop: AtomicBool,
@@ -175,9 +178,8 @@ impl Progress {
             start,
             separate_transfer_timing: false,
             transfer_start: std::sync::OnceLock::new(),
-            transfer_end: std::sync::OnceLock::new(),
+            transfer_finished: AtomicBool::new(false),
             clock: Default::default(),
-            copy_first_ns: AtomicU64::new(u64::MAX),
             copy_last_ns: AtomicU64::new(0),
             term: Mutex::new(TermState {
                 samples: VecDeque::from([(Instant::now(), 0)]),
@@ -203,7 +205,7 @@ impl Progress {
         progress
     }
 
-    /// Start once the initial transport is ready, before releasing copy work.
+    /// Start with the first selected file operation.
     /// Retries and reconnects after this point remain part of the transfer.
     pub fn begin_transfer(&self) {
         let mut term = self.term.lock().unwrap();
@@ -215,11 +217,10 @@ impl Progress {
     }
 
     pub fn finish_transfer(&self) {
-        let last = self.copy_last_ns.load(Relaxed);
+        // All file-work guards have finished before the coordinator calls this.
+        // Publish their last timestamp to the progress ticker.
         if self.transfer_start.get().is_some() {
-            let _ = self
-                .transfer_end
-                .set(self.start + Duration::from_nanos(last));
+            self.transfer_finished.store(true, Release);
         }
     }
 
@@ -240,12 +241,17 @@ impl Progress {
 
     fn transfer_elapsed(&self) -> Option<Duration> {
         self.transfer_start.get().map(|start| {
-            self.transfer_end
-                .get()
-                .copied()
-                .unwrap_or_else(Instant::now)
-                .saturating_duration_since(*start)
+            let end = if self.transfer_finished.load(Acquire) {
+                self.last_copy_end()
+            } else {
+                Instant::now()
+            };
+            end.saturating_duration_since(*start)
         })
+    }
+
+    fn last_copy_end(&self) -> Instant {
+        self.start + Duration::from_nanos(self.copy_last_ns.load(Relaxed))
     }
 
     pub fn display_elapsed(&self) -> Duration {
@@ -284,14 +290,18 @@ impl Progress {
         if self.transfer_start.get().is_none() {
             self.begin_transfer();
         }
-        self.copy_first_ns.fetch_min(self.copy_clock_ns(), Relaxed);
         CopyingInterval(self)
     }
 
     pub fn copying_elapsed_ms(&self) -> Option<u64> {
-        let first = self.copy_first_ns.load(Relaxed);
-        let last = self.copy_last_ns.load(Relaxed);
-        (self.bytes_done.load(Relaxed) > 0 && last >= first).then(|| (last - first) / 1_000_000)
+        // Preserve the tuning-history convention: no measurement until bytes
+        // have transferred and at least one file-work operation has completed.
+        if self.bytes_done.load(Relaxed) == 0 {
+            return None;
+        }
+        self.last_copy_end()
+            .checked_duration_since(*self.transfer_start.get()?)
+            .map(|elapsed| elapsed.as_millis() as u64)
     }
 
     pub fn add_bytes(&self, n: u64) {
@@ -349,10 +359,10 @@ impl Progress {
     }
 
     fn rate(&self, t: &mut TermState, now: Instant, done: u64) -> f64 {
-        if let (Some(start), Some(end)) = (self.transfer_start.get(), self.transfer_end.get()) {
+        if self.transfer_finished.load(Acquire) {
             // Once file work has settled, show its average rate, matching the
             // summary. Finalization redraws must not extend the rate window.
-            let seconds = end.saturating_duration_since(*start).as_secs_f64();
+            let seconds = self.transfer_elapsed().unwrap_or_default().as_secs_f64();
             return if seconds > 0.0 {
                 done as f64 / seconds
             } else {
@@ -825,21 +835,27 @@ mod tests {
         Arc::get_mut(&mut progress).unwrap().start = Instant::now() - Duration::from_secs(60);
         assert_eq!(progress.copying_elapsed_ms(), None);
         let first = progress.copying_interval();
-        let began = progress.copy_first_ns.load(Relaxed);
-        assert!(began >= 60_000_000_000);
+        let began = *progress.transfer_start.get().unwrap();
+        assert!(began.duration_since(progress.start) >= Duration::from_secs(60));
         let overlapping = progress.copying_interval();
         drop(first);
         let first_end = progress.copy_last_ns.load(Relaxed);
         drop(overlapping);
-        assert_eq!(progress.copy_first_ns.load(Relaxed), began);
+        assert_eq!(progress.transfer_start.get(), Some(&began));
         assert!(progress.copy_last_ns.load(Relaxed) >= first_end);
         assert_eq!(progress.copying_elapsed_ms(), None);
         progress.add_bytes(1);
-        let span = (progress.copy_last_ns.load(Relaxed) - began) / 1_000_000;
+        let span = progress.last_copy_end().duration_since(began).as_millis() as u64;
         assert_eq!(progress.copying_elapsed_ms(), Some(span));
+        progress.finish_transfer();
+        assert_eq!(progress.timings().transfer_ms, Some(span));
         // A measured sub-millisecond copy is distinct from absent timing.
-        progress.copy_last_ns.store(began + 999_999, Relaxed);
+        progress.copy_last_ns.store(
+            began.duration_since(progress.start).as_nanos() as u64 + 999_999,
+            Relaxed,
+        );
         assert_eq!(progress.copying_elapsed_ms(), Some(0));
+        assert_eq!(progress.timings().transfer_ms, Some(0));
     }
 
     #[test]
