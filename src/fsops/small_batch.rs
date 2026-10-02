@@ -25,17 +25,6 @@ pub(super) struct SmallStage {
     created: fs::Metadata,
 }
 
-/// Whether a put publishes through a sidecar. In-place writes and ordinary
-/// conditional updates of an existing inode keep their one-file path.
-fn staged(put: &SmallPut) -> bool {
-    !put.inplace
-        && (put.guard.is_some()
-            || matches!(
-                put.condition,
-                TargetCondition::Any | TargetCondition::Absent
-            ))
-}
-
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
 /// Every worker of the process draws on the same allowance, so bursts shrink
 /// under a low open-file limit instead of exhausting it.
@@ -85,7 +74,7 @@ impl FsOps {
         let mut carried = None;
         let mut next = 0;
         while next < puts.len() || carried.is_some() {
-            if carried.is_none() && !staged(&puts[next]) {
+            if carried.is_none() && puts[next].inplace {
                 results[next] = self
                     .put_small(&puts[next])
                     .map_err(|error| wire_error(&error));
@@ -102,7 +91,7 @@ impl FsOps {
                 names.extend(sibling_name(&target, &target).map(<[u8]>::to_vec));
                 run.push((index, target));
             }
-            while run.len() <= reserved.0 && next < puts.len() && staged(&puts[next]) {
+            while run.len() <= reserved.0 && next < puts.len() && !puts[next].inplace {
                 let index = next;
                 next += 1;
                 let target = match self.small_target(&puts[index]) {
@@ -457,6 +446,55 @@ mod tests {
             before
         );
         assert_eq!(entries(temporary.path()), 4);
+    }
+
+    #[test]
+    fn identity_conditioned_puts_publish_atomically() {
+        for batched in [false, true] {
+            for fingerprint in [false, true] {
+                for changed in [false, true] {
+                    let temporary = crate::test_support::tempdir().unwrap();
+                    let target = temporary.path().join("file");
+                    let alias = temporary.path().join("alias");
+                    fs::write(&target, b"old contents").unwrap();
+                    fs::hard_link(&target, &alias).unwrap();
+                    let before = fs::metadata(&target).unwrap();
+                    let mut put = put("file", b"replacement");
+                    put.flags = flags::REPORT_IDENTITY;
+                    put.condition = if fingerprint {
+                        TargetCondition::MatchesFingerprint {
+                            dev: before.dev(),
+                            ino: before.ino(),
+                            ctime: before.ctime() + i64::from(changed),
+                            ctime_nsec: before.ctime_nsec() as u32,
+                        }
+                    } else {
+                        TargetCondition::Matches {
+                            dev: before.dev(),
+                            ino: before.ino() ^ u64::from(changed),
+                        }
+                    };
+                    let mut ops = receiver(temporary.path());
+                    let result = if batched {
+                        ops.put_small_batch(&[put]).pop().unwrap()
+                    } else {
+                        ops.put_small(&put).map_err(|error| wire_error(&error))
+                    };
+                    let after = fs::metadata(&target).unwrap();
+                    if changed {
+                        assert!(result.is_err());
+                        assert_eq!(after.ino(), before.ino());
+                        assert_eq!(fs::read(&target).unwrap(), b"old contents");
+                    } else {
+                        assert_eq!(result, Ok(Some((after.dev(), after.ino()))));
+                        assert_ne!(after.ino(), before.ino());
+                        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+                        assert_eq!(entries(temporary.path()), 2);
+                    }
+                    assert_eq!(fs::read(&alias).unwrap(), b"old contents");
+                }
+            }
+        }
     }
 
     #[test]

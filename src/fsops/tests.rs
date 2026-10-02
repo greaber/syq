@@ -2458,7 +2458,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("existing")).unwrap(), b"new");
-    assert_eq!(
+    assert_ne!(
         fs::metadata(moved.join("existing")).unwrap().ino(),
         existing.ino()
     );
@@ -5402,7 +5402,7 @@ fn reused_parent_errors_keep_paths_and_os_error_codes() {
 }
 
 #[test]
-fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
+fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
     let directory = crate::test_support::tempdir().unwrap();
     let target = directory.path().join("target");
     fs::write(&target, b"old destination").unwrap();
@@ -5469,11 +5469,14 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_existing_inode() {
         .unwrap();
     File::open(&target).unwrap().sync_all().unwrap();
     let after = fs::metadata(&target).unwrap();
-    assert_eq!(after.ino(), before.ino());
+    assert_ne!(after.ino(), before.ino());
     assert_eq!(after.len(), data.len() as u64);
     assert!(after.blocks() * 512 < after.len() / 4);
     assert_eq!(fs::read(&target).unwrap(), data);
-    assert_eq!(fs::read(directory.path().join("alias")).unwrap(), data);
+    assert_eq!(
+        fs::read(directory.path().join("alias")).unwrap(),
+        b"old destination"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -6211,18 +6214,18 @@ fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn late_close_is_reported_after_identity_conditioned_writeback() {
+fn late_close_is_reported_before_identity_conditioned_publication() {
     const CHILD: &str = "SYQ_TEST_CONDITIONAL_CLOSE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "fsops::tests::late_close_is_reported_after_identity_conditioned_writeback",
+                "fsops::tests::late_close_is_reported_before_identity_conditioned_publication",
                 "--nocapture",
             ])
             .env(CHILD, "1")
-            // The final name matches; the sidecar .target.syq-tmp.* does not.
-            .env("SYQ_TEST_FAIL_WRITER_CLOSE", "/target")
+            // Fail the sidecar check before it can replace the destination.
+            .env("SYQ_TEST_FAIL_WRITER_CLOSE", ".syq-tmp.")
             .capture_output()
             .unwrap();
         assert!(
@@ -6324,8 +6327,8 @@ fn late_close_is_reported_after_identity_conditioned_writeback() {
             Some(libc::ENOSPC)
         );
         assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
-        assert_ne!(fs::metadata(&target).unwrap().mtime(), 1_500_000_000);
-        assert_eq!(fs::read(&target).unwrap(), data);
+        assert_eq!(fs::metadata(&target).unwrap().mtime(), before.mtime());
+        assert_eq!(fs::read(&target).unwrap(), b"previous good copy");
     }
 }
 
