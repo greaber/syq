@@ -253,6 +253,7 @@ pub(super) fn broker(
         )),
         exec_count: AtomicU64::new(0),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
+        forward_sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
         stop: Arc::new(AtomicBool::new(false)),
     });
@@ -730,6 +731,7 @@ fn named_copy_with_transport(tcp: bool) {
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration, approved.token.clone()));
     args.named_receipt = Some(Arc::new(NamedReceipt {
+        ssh: None,
         control: Mutex::new(None),
         secret,
         approved,

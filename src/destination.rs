@@ -104,6 +104,7 @@ pub(crate) struct Approved {
 
 #[derive(Debug)]
 pub(crate) struct NamedReceipt {
+    ssh: Option<forward::ssh::Client>,
     control: Mutex<Option<UnixStream>>,
     secret: crate::receipt::RecipientSecret,
     approved: Approved,
@@ -111,6 +112,13 @@ pub(crate) struct NamedReceipt {
 }
 
 impl NamedReceipt {
+    pub(crate) fn ssh_command(&self) -> Result<Command> {
+        self.ssh
+            .as_ref()
+            .context("copy has no SSH worker authorization")?
+            .command()
+    }
+
     pub(crate) fn take_control(&self) -> Result<UnixStream> {
         self.control
             .lock()
@@ -154,6 +162,10 @@ enum Message {
         cwd: String,
         request: Box<CopyRequest>,
     },
+    ForwardSsh {
+        token: String,
+        public_key: String,
+    },
     Forward {
         target: String,
         command: Vec<Vec<u8>>,
@@ -168,6 +180,7 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    ForwardSsh(forward::ssh::Peer),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
     Ready,
@@ -829,6 +842,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     ));
     args.named_receipt = Some(Arc::new(NamedReceipt {
         control: Mutex::new(None),
+        ssh: None,
         secret,
         approved,
         policy,
@@ -945,6 +959,7 @@ struct Receiver {
     active_streams: Arc<crate::private_broker::ConnectionRegistry>,
     exec_count: AtomicU64,
     forward_count: std::sync::atomic::AtomicUsize,
+    forward_sessions: Mutex<HashMap<String, Arc<forward::ssh::Session>>>,
     request_lock: Mutex<()>,
     stop: Arc<AtomicBool>,
 }
@@ -1034,6 +1049,9 @@ impl Receiver {
                 }
                 let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
                 write_message(&mut stream, &Reply::Identity(proof))
+            }
+            Message::ForwardSsh { token, public_key } => {
+                self.forward_ssh(token, public_key, stream)
             }
             Message::Forward {
                 target,
@@ -1291,6 +1309,7 @@ pub(crate) fn serve_background(
         )),
         exec_count: AtomicU64::new(0),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
+        forward_sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
         stop: stop.clone(),
     });

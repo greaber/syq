@@ -188,10 +188,11 @@ Trust hostB's SSH host key on the laptop beforehand. Relative destination paths
 start in the hostB account's home directory; your laptop's receiving root does
 not contain this copy, but its transfer limits still apply.
 
-Files go directly from hostA to hostB over encrypted TCP. HostB needs a
-reachable data port; see [Make TCP reachable](server-tuning.md#make-tcp-reachable).
-This route cannot use SSH for file data. Keep the laptop connection and source
-command running until completion. See
+Files go directly from hostA to hostB over encrypted TCP, with SSH between
+those servers as a fallback. Use `--no-tcp` to choose SSH directly. SSH data
+needs writable `~/.ssh/authorized_keys` on hostB for a temporary key restricted
+to this copy. Keep the laptop connection and source command running until
+completion. See
 [Authorization selection](remote-reference.md#authorization-selection) for
 automatic selection, other authorizers, and supported options.
 

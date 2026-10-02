@@ -1475,14 +1475,6 @@ fn handle_tcp_setup_error(
             )
         });
     }
-    if spec.forwarded.is_some() {
-        sched.abort();
-        progress.stop();
-        return Err(error).with_context(|| {
-            let reason = "return authorization requires direct encrypted TCP data connections";
-            format!("{}: {reason}", spec.label())
-        });
-    }
     if !args.quiet || debug() {
         let congestion_note =
             crate::conn::tcp_congestion_fallback_note(args.tcp_congestion.as_deref());

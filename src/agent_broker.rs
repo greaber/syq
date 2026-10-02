@@ -68,6 +68,22 @@ impl HostPolicy {
         self.host_key_algorithms.join(",")
     }
 
+    pub(crate) fn copy_known_hosts(&self) -> Result<String> {
+        self.host_keys
+            .iter()
+            .map(|key| {
+                Ok(format!(
+                    "syq-copy-peer {}\n",
+                    ssh_key::PublicKey::new(key.clone(), "").to_openssh()?
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn required_rsa_size(&self) -> usize {
+        self.required_rsa_size
+    }
+
     fn authorizes_binding(&self, binding: &SessionBind) -> bool {
         key_is_cryptographically_verifiable(&binding.host_key)
             && signature_algorithm_is_cryptographically_verifiable(&binding.signature.algorithm())

@@ -1799,10 +1799,9 @@ impl RemoteSpec {
         // Recompressing forwarded blocks here adds CPU work to downloads.
         let compress = compress && !self.local_process;
         let return_stream = if let Some(approved) = &self.forwarded {
-            if !matches!(role, ConnectionRole::Control) {
-                bail!("copies via a return connection require encrypted TCP workers");
-            }
-            Some(approved.take_control()?)
+            matches!(role, ConnectionRole::Control)
+                .then(|| approved.take_control())
+                .transpose()?
         } else if crate::destination::is_named(&self.restricted_grant) {
             Some(crate::destination::connect(
                 self.restricted_grant.as_deref().unwrap(),
@@ -1842,7 +1841,11 @@ impl RemoteSpec {
             return Ok(conn);
         }
         let mut server_args = vec!["--server".into()];
-        if let Some(grant) = &self.restricted_grant {
+        if let Some(grant) = self
+            .restricted_grant
+            .as_ref()
+            .filter(|_| self.forwarded.is_none())
+        {
             if matches!(role, ConnectionRole::Control) {
                 server_args.push(format!("--restricted-grant={grant}"));
             } else {
@@ -1861,7 +1864,9 @@ impl RemoteSpec {
                 server_args.push(format!("--restricted-worker={ticket}"));
             }
         }
-        let mut cmd = if self.local_process {
+        let mut cmd = if let Some(approved) = &self.forwarded {
+            approved.ssh_command()?
+        } else if self.local_process {
             let mut command = Command::new(std::env::current_exe()?);
             // The same executable receives, so this internal flag is always
             // understood; it keeps the data listener on loopback.
@@ -2810,12 +2815,6 @@ impl Endpoint {
                             return Err(e)
                         }
                         Err(e) => {
-                            if spec.forwarded.is_some() {
-                                return Err(e).with_context(|| {
-                                    let reason = "TCP data connection failed; return authorization requires direct encrypted TCP and cannot fall back to SSH data";
-                                    format!("{}: {reason}", spec.label())
-                                });
-                            }
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
@@ -2840,11 +2839,6 @@ impl Endpoint {
                             }
                         }
                     }
-                }
-                if spec.forwarded.is_some() {
-                    let reason =
-                        "return authorization has no authorized encrypted TCP data connection";
-                    bail!("{}: {reason}", spec.label());
                 }
                 Ok(Box::new(spec.connect_with_role(
                     compress,

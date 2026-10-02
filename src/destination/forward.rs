@@ -1,5 +1,6 @@
 //! One approved control stream through the receiving machine; data goes to the
-//! destination's restricted TCP workers. There is no remote signing interface.
+//! destination's restricted TCP or SSH workers. There is no remote signing interface.
+pub(super) mod ssh;
 use super::*;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -58,12 +59,11 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
-        || args.no_tcp
         || args.no_tcp_encryption
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --no-tcp-encryption, --peer-auth, or --coordinate-at");
+        bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
     if args.owner || args.group || args.devices || args.inplace {
         bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
@@ -183,9 +183,11 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.auth_from = crate::cli::AuthFrom::Return(name);
     // The actual authority never leaves the destination helper. This internal
-    // marker makes the engine require TCP and suppress ordinary SSH fallback.
+    // marker selects its restricted executor and per-copy worker admission.
     args.restricted_grant = Some("return-control-v1".into());
+    let ssh = ssh::Client::new(registration, approved.token.clone());
     args.named_receipt = Some(Arc::new(NamedReceipt {
+        ssh: Some(ssh),
         control: Mutex::new(Some(stream)),
         secret,
         approved,
@@ -273,7 +275,7 @@ impl Receiver {
         // This lock only serializes decisions, not SSH setup or active copies.
         drop(request_lock);
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-        let (mut child, approved) = ForwardChild::connect(
+        let (mut child, mut approved) = ForwardChild::connect(
             &encoded,
             &HelperRequest {
                 version: HELPER_VERSION,
@@ -283,6 +285,9 @@ impl Receiver {
             Instant::now() + SETUP_TIMEOUT,
             &setup_cancelled,
         )?;
+        let session =
+            ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
+        approved.token = session.token();
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();
@@ -343,7 +348,8 @@ impl ForwardChild {
                     Reply::Ready
                     | Reply::Identity(_)
                     | Reply::TcpProbed(_)
-                    | Reply::TcpCongestionRejected(_),
+                    | Reply::TcpCongestionRejected(_)
+                    | Reply::ForwardSsh(_),
                 ) => {
                     bail!("invalid destination setup response")
                 }
@@ -647,10 +653,13 @@ fn receive() -> Result<i32> {
             return Err(error);
         }
     };
+    let workers = ssh::Server::start(authority.clone())?;
+    let mut approved = approved;
+    approved.token = workers.ticket()?;
     write_message(&mut std::io::stdout(), &Reply::Approved(approved))?;
     let pending = Arc::new(AtomicBool::new(true));
-    crate::server::run_forwarded(
-        authority,
+    let result = crate::server::run_forwarded(
+        authority.clone(),
         HandshakeInput::new(
             input,
             pending.clone(),
@@ -658,10 +667,13 @@ fn receive() -> Result<i32> {
             Duration::from_secs(10),
         ),
         pending,
-    )?;
+    );
+    authority.close_control();
+    drop(workers);
+    result?;
     Ok(0)
 }
-fn connect(target: &str, install: bool) -> Result<i32> {
+fn connect(target: &str, install: bool, operation: &str) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let target =
         String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(target)?)?;
@@ -700,19 +712,35 @@ fn connect(target: &str, install: bool) -> Result<i32> {
     if install {
         spec.install_helper()?;
     }
-    Err(spec
-        .helper_command(&["--return-receiver".into()])
-        .exec()
-        .into())
+    Err(spec.helper_command(&[operation.into()]).exec().into())
 }
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
         "--return-receiver" if argv.len() == 2 => Some(receive()),
+        "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
+        "--return-ssh-worker" if argv.len() == 3 => Some(
+            argv[2]
+                .to_str()
+                .context("invalid copy worker admission")
+                .and_then(ssh::worker),
+        ),
+        "--return-ssh-connect" if argv.len() == 3 => Some(
+            argv[2]
+                .to_str()
+                .context("invalid return target")
+                .and_then(|target| connect(target, false, "--return-ssh-setup")),
+        ),
         "--return-connect" | "--return-connect-install" if argv.len() == 3 => Some(
             argv[2]
                 .to_str()
                 .context("invalid return target")
-                .and_then(|target| connect(target, argv[1] == "--return-connect-install")),
+                .and_then(|target| {
+                    connect(
+                        target,
+                        argv[1] == "--return-connect-install",
+                        "--return-receiver",
+                    )
+                }),
         ),
         _ => None,
     }
