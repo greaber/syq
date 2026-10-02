@@ -265,8 +265,8 @@ its own connection. Workers with measurements already use their own size.
 Connection-delay checks help requests grow again when competing traffic changes
 the delay. A worker skips periodic checks while it reaches the request-size
 ceiling without any slow replies; after a slow reply, checks remain enabled.
-Already-issued requests must still finish or fail. Local requests, streaming blocks, and comparison blocks keep
-their existing sizes. Explicit `request-size`, `comparison-block-size`,
+Already-issued requests must still finish or fail. Local requests, streaming
+blocks, and comparison blocks keep their existing sizes. Explicit `request-size`, `comparison-block-size`,
 `--block-size`, `pipeline-depth`, or `split-min-size` settings disable ordinary
 request adaptation for controlled comparisons.
 
