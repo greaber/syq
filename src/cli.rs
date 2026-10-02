@@ -138,6 +138,8 @@ pub struct Args {
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]
     pub(crate) auth_from: AuthFrom,
+    #[arg(skip)]
+    pub(crate) auth_from_explicit: bool,
     /// Which public command produced this execution request.
     #[arg(skip)]
     pub interface: Interface,
@@ -1284,7 +1286,7 @@ struct NativeRemoteHelperArgs {
     no_bootstrap: bool,
 }
 
-/// A process-local choice of authority; no credentials or durable preferences.
+/// A choice of authority; it contains no credentials.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AuthFrom {
     #[default]
@@ -1303,7 +1305,7 @@ impl AuthFrom {
     }
 }
 
-fn parse_auth_from(value: &str) -> Result<AuthFrom> {
+pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
     match value {
         "auto" => Ok(AuthFrom::Auto),
         "ssh" => Ok(AuthFrom::Ssh),
@@ -1313,7 +1315,7 @@ fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Use local SSH first, then an available receiving machine for credential, host-key, hostname, or refused-connection errors (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies)
+    /// Override saved authorization: try local SSH first (auto), require local SSH (ssh), or authorize through @NAME (also S3 copies). Auto falls back for credential, host-key, hostname, or refused-connection errors
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
@@ -2683,6 +2685,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     }
     args.s3 = s3;
     args.s3_remove = parsed.s3_remove;
+    args.auth_from_explicit = parsed.auth_from.is_some();
     args.auth_from = parsed.auth_from.unwrap_or_default();
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
@@ -2989,6 +2992,7 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
             "--detach cannot be combined with --peer-auth broker or full-agent; a brokered or forwarded agent exists only while syq stays attached"
         );
     }
+    args.auth_from_explicit = remote.auth_from.is_some();
     args.auth_from = remote.auth_from.unwrap_or_default();
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;

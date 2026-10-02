@@ -1574,6 +1574,10 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
+    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "ss"], &["ssh"]);
+    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "@lap"], &["@laptop"]);
+    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "au"], &["auto"]);
+    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "--r"], &["--reset"]);
     assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-f"], &["--auth-from"]);
     assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-from", "ss"], &["ssh"]);
     assert_completion_candidates(
