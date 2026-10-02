@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
 mod foreground;
+pub(crate) mod persistent;
 
 #[derive(Parser)]
 #[command(
@@ -87,6 +88,9 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let request = parse(argv)?;
     crate::fsops::reserve_startup_descriptors();
+    if let Some(mut command) = persistent::command(&request)? {
+        return foreground::run(&mut command, || false);
+    }
     let session = super::ssh_auth::authorize(&request)?;
     let mut command = std::process::Command::new("ssh");
     command

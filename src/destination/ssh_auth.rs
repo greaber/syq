@@ -5,9 +5,18 @@ use crate::cli::NativeEndpoint;
 
 const HOST_ALIAS: &str = "syq-approved-peer";
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum Mode {
+    #[default]
+    Once,
+    Persistent,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Request {
+    #[serde(default)]
+    mode: Mode,
     target: NativeEndpoint,
     command: Vec<Vec<u8>>,
     cwd: String,
@@ -72,14 +81,40 @@ impl Drop for Session {
 }
 
 pub(crate) fn authorize(request: &ssh::SessionRequest) -> Result<Session> {
+    authorize_mode(request, Mode::Once)
+}
+
+pub(crate) fn prepare_persistent(request: &ssh::SessionRequest) -> Result<()> {
+    let selection = handoff::Selection::new(
+        request.authorizer.clone(),
+        load_registration(&request.authorizer)?,
+        handoff::Kind::SshPersistent,
+        None,
+    );
+    handoff::maybe_exec(&selection)
+}
+
+pub(crate) fn authorize_persistent(request: &ssh::SessionRequest) -> Result<Session> {
+    authorize_mode(request, Mode::Persistent)
+}
+
+fn authorize_mode(request: &ssh::SessionRequest, mode: Mode) -> Result<Session> {
     crate::conn::require_constrained_openssh("ssh", "on this machine")?;
     let selection = handoff::Selection::new(
         request.authorizer.clone(),
         load_registration(&request.authorizer)?,
-        handoff::Kind::Ssh,
+        if mode == Mode::Once {
+            handoff::Kind::Ssh
+        } else {
+            handoff::Kind::SshPersistent
+        },
         None,
     );
-    handoff::maybe_exec(&selection)?;
+    if mode == Mode::Once {
+        handoff::maybe_exec(&selection)?;
+    } else if selection.registration.identity != crate::identity::build() {
+        bail!("receiving connection changed while starting the persistent SSH login; retry persist connect");
+    }
     crate::output::diagnostic!(
         "syq: requesting SSH account access from @{}; approve on that machine",
         request.authorizer
@@ -87,6 +122,7 @@ pub(crate) fn authorize(request: &ssh::SessionRequest) -> Result<Session> {
     let (mut stream, reply) = exchange(
         &selection.registration,
         Message::Ssh(Request {
+            mode,
             target: request.destination.clone(),
             command: crate::approval_command::current()?,
             cwd: crate::approval_command::current_directory(),
@@ -210,10 +246,15 @@ impl Receiver {
             .cloned()
             .map(OsString::from_vec)
             .collect();
-        if command.first().is_none_or(|value| value != "ssh") {
-            bail!("SSH approval needs the requesting syq ssh command");
-        }
-        let parsed = ssh::parse(&command)?;
+        let parsed = match request.mode {
+            Mode::Once => {
+                if command.first().is_none_or(|arg| arg != "ssh") {
+                    bail!("SSH approval needs the requesting syq ssh command");
+                }
+                ssh::parse(&command)?
+            }
+            Mode::Persistent => crate::persistence::parse_account_connect(&command, &self.name)?,
+        };
         if parsed.destination != request.target || parsed.authorizer != self.name {
             bail!("SSH destination or authorizer does not match the shown command");
         }
@@ -261,6 +302,7 @@ impl Receiver {
             &request.command,
             &request.cwd,
             &endpoint,
+            request.mode == Mode::Persistent,
             self.notifications,
             cancelled,
         )?;

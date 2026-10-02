@@ -40,6 +40,7 @@ pub(super) enum Kind {
     Forward,
     Command,
     Ssh,
+    SshPersistent,
 }
 
 #[derive(Clone)]
@@ -137,8 +138,12 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
         (Kind::Copy | Kind::Forward, Some("cp"))
             | (Kind::Command, Some("exec"))
             | (Kind::Ssh, Some("ssh"))
+            | (Kind::SshPersistent, Some("persist"))
     ) {
         bail!("invalid return handoff command");
+    }
+    if guard.kind == Kind::SshPersistent && argv.get(4).is_none_or(|arg| arg != "connect") {
+        bail!("invalid persistent SSH handoff command");
     }
     if matches!(guard.kind, Kind::Copy | Kind::Forward) {
         if let Some(start) = inherited_start.and_then(|value| value.parse().ok()) {
@@ -192,7 +197,7 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
         return Ok(());
     }
     let program = std::ffi::OsStr::from_bytes(&selection.registration.program);
-    if selection.kind == Kind::Ssh {
+    if matches!(selection.kind, Kind::Ssh | Kind::SshPersistent) {
         // Help is a read-only capability probe. Older helpers do not know the
         // new guard kind; give a recovery step before handing them this argv.
         let supported = Command::new(program)
