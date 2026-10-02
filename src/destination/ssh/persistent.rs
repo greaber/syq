@@ -1,6 +1,6 @@
 //! A reusable approved SSH login, owned by a keeper while its laptop is connected.
 use super::{foreground, SessionRequest, Tty};
-use crate::cli::NativeEndpoint;
+use crate::cli::{AuthFrom, NativeEndpoint};
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,7 @@ fn index_path(authorizer: &str, destination: &NativeEndpoint) -> Result<PathBuf>
 fn read_record(path: &Path) -> Result<Option<Record>> {
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -151,6 +151,10 @@ pub(crate) fn cached(authorizer: &str, requested: &NativeEndpoint) -> Result<Opt
     if record.authorizer != authorizer || record.requested != *requested {
         bail!("SSH authority record does not match the requested login");
     }
+    active_record(record)
+}
+
+fn active_record(record: Record) -> Result<Option<Cached>> {
     // A crashed keeper can leave an expired index. Never reconnect through it.
     if !record.control.exists() {
         return Ok(None);
@@ -167,6 +171,43 @@ pub(crate) fn cached(authorizer: &str, requested: &NativeEndpoint) -> Result<Opt
         return Ok(None);
     }
     Ok(Some(Cached(record)))
+}
+
+/// Reuse existing account authority before opening another connection. An
+/// explicit authorizer never selects another laptop's approval; native-only
+/// mode never consults the authority index. Automatic selection must be unique.
+pub(crate) fn select_cached(requested: &NativeEndpoint, mode: &AuthFrom) -> Result<Option<Cached>> {
+    match mode {
+        AuthFrom::Ssh => return Ok(None),
+        AuthFrom::Return(authorizer) => return cached(authorizer, requested),
+        AuthFrom::Auto => {}
+    }
+    let index = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+    if !index.exists() || !crate::persistence::global_enabled()? {
+        return Ok(None);
+    }
+    // Validate the existing directory before looking at any of its records.
+    let index = directory()?;
+    let mut selected = None;
+    for entry in fs::read_dir(index)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(record) = read_record(&path)? else {
+            continue;
+        };
+        if record.requested != *requested {
+            continue;
+        }
+        if let Some(active) = active_record(record)? {
+            anyhow::ensure!(selected.is_none(),
+                "more than one laptop has approved this SSH endpoint; select one with --auth-from @NAME or syq persist auth-from @NAME --for {}",
+                requested.host);
+            selected = Some(active);
+        }
+    }
+    Ok(selected)
 }
 
 #[derive(Serialize)]
@@ -259,8 +300,8 @@ fn live(record: &Record) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-pub(super) fn command(request: &SessionRequest) -> Result<Option<Command>> {
-    let Some(cached) = cached(&request.authorizer, &request.destination)? else {
+pub(super) fn command(request: &SessionRequest, mode: &AuthFrom) -> Result<Option<Command>> {
+    let Some(cached) = select_cached(&request.destination, mode)? else {
         return Ok(None);
     };
     let mut command = Command::new("ssh");

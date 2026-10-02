@@ -1,6 +1,6 @@
 //! Copies may reuse a separately approved account login. A copy never creates
 //! this broader authority; without a live master it follows per-copy approval.
-use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
+use crate::cli::{Args, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
 use anyhow::Result;
 
 pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
@@ -37,9 +37,6 @@ pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
 }
 
 pub(super) fn select(args: &mut Args) -> Result<bool> {
-    let AuthFrom::Return(authorizer) = &args.auth_from else {
-        return Ok(false);
-    };
     let Some((location, pull)) = remote(args) else {
         return Ok(false);
     };
@@ -48,7 +45,7 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
         host: location.host.clone().unwrap(),
         port: location.port,
     };
-    let Some(cached) = super::ssh::persistent::cached(authorizer, &requested)? else {
+    let Some(cached) = super::ssh::persistent::select_cached(&requested, &args.auth_from)? else {
         return Ok(false);
     };
     let spec = connection(args, location, cached.endpoint(), cached.options())?;

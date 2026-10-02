@@ -111,6 +111,9 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let (mut request, explicit) = parse_command(argv)?;
     let mode = crate::auth_from::resolve(&request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
+    if let Some(mut command) = persistent::command(&request, &mode)? {
+        return foreground::run(&mut command, || false);
+    }
     let AuthFrom::Return(authorizer) = mode else {
         let mut command = std::process::Command::new("ssh");
         if let Some(scope) = crate::persistence::scope_for_implicit_ssh(None)? {
@@ -130,9 +133,6 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         return foreground::run(&mut command, || false);
     };
     request.authorizer = authorizer;
-    if let Some(mut command) = persistent::command(&request)? {
-        return foreground::run(&mut command, || false);
-    }
     let session = super::ssh_auth::authorize(&request)?;
     let mut command = std::process::Command::new("ssh");
     command
