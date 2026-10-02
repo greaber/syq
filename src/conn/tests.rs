@@ -152,6 +152,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
         })]))
         .unwrap();
     writer.write_msg(&Response::Ok).unwrap();
+    writer.write_msg(&Response::Ok).unwrap();
     drop(writer);
     next_read();
     send.send(Vec::new()).unwrap(); // Interrupted before the next frame.
@@ -185,9 +186,13 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
         multiplexed_ssh: false,
         detached: false,
     };
+    let consumed_after = std::time::Instant::now();
     let (reply, waited) = conn.recv_with_wait().unwrap();
     assert!(matches!(reply, Response::Ok));
     assert_eq!(waited, std::time::Duration::ZERO);
+    let (reply, arrived) = conn.recv_with_arrival().unwrap();
+    assert!(matches!(reply, Response::Ok));
+    assert!(arrived <= consumed_after, "queued ACK uses receipt time");
     assert!(
         conn.recv_with_wait().is_err(),
         "EOF remains a transport error"

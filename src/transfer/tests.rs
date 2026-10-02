@@ -3686,7 +3686,7 @@ fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
 #[test]
 fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
     let block = 4 << 20;
-    let size = 8 << 20;
+    let size = 16 << 20;
     let sched = Arc::new(Sched::new(block, 32 << 20));
     let idx = sched.push_file(pipeline_job(b"file", size));
     sched.scan_done();
@@ -3793,5 +3793,62 @@ fn explicit_range_controls_preserve_fixed_requests() {
             .requests
             .iter()
             .all(|r| matches!(r, Request::ReadRange { len, .. } if u64::from(*len)==block)));
+    }
+}
+
+#[test]
+fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
+    for abort in [false, true] {
+        let block = 4 << 20;
+        let sched = Arc::new(Sched::new(block, 32 << 20));
+        let idx = sched.push_file(pipeline_job(b"file", 8 << 20));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(_)));
+        let range = sched.ranges_ready(idx, vec![(0, 8 << 20)]).unwrap();
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        opts.tuning = Default::default();
+        if abort {
+            src.lock().unwrap().abort_on_receive = Some(sched.clone());
+        } else {
+            src.lock()
+                .unwrap()
+                .gate_changes
+                .push((1, worker.gate.clone(), 0));
+        }
+        worker.transfer_range(&range, &mut 0).unwrap();
+        let source = src.lock().unwrap();
+        let destination = dst.lock().unwrap();
+        assert_eq!(
+            source.requests.len(),
+            4,
+            "stop refilling after cancellation"
+        );
+        assert_eq!(source.received, source.requests.len());
+        assert_eq!(destination.received, destination.requests.len());
+        drop(destination);
+        drop(source);
+        assert!(
+            !sched.range_done(&range),
+            "cancelled/returned work cannot publish"
+        );
+        if abort {
+            assert!(matches!(sched.next(), Item::Exit));
+        } else {
+            let Item::Range(tail) = sched.next() else {
+                panic!("unread tail returned")
+            };
+            assert_eq!(tail.lock().unwrap().pos, 4 * (1 << 20));
+            assert!(sched.range_done(&tail));
+        }
     }
 }

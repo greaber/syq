@@ -46,13 +46,13 @@ impl WorkBudget {
     pub fn ranges(max_bytes: u64, target: Duration) -> Self {
         Self {
             limit: WorkSize {
-                bytes: (64 << 10).min(max_bytes),
+                bytes: (1 << 20).min(max_bytes),
                 files: 0,
             },
             max_bytes,
             target,
             limit_at_check: WorkSize {
-                bytes: (64 << 10).min(max_bytes),
+                bytes: (1 << 20).min(max_bytes),
                 files: 0,
             },
             ..Self::default()
