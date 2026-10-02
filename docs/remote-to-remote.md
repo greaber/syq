@@ -1,6 +1,6 @@
 # Copy between servers
 
-Copy directly between servers without putting private keys on either server
+Copy directly between servers without copying your private keys to either server
 or giving one server unrestricted access to your SSH agent. Your machine
 authorizes the copy and shows the results; the file data bypasses it.
 
@@ -73,6 +73,26 @@ You can also start a copy in the source server's shell and use your laptop's
 SSH credentials to authorize it. This uses a receiving connection from your
 laptop; see [Authorize copies between servers](receive.md#authorize-copies-between-servers)
 for setup, approval, and connectivity requirements.
+
+From a third server, first request reusable account access to both endpoints:
+
+```sh
+syq persist connect hostB --auth-from @laptop
+syq persist connect hostC --auth-from @laptop
+syq cp --from hostB --srcs-in data --to hostC --into /archive
+```
+
+Approve each account on the laptop. The requesting server has full access to
+those accounts while the approvals remain open. HostB receives only permission
+for the current copy to hostC; file data goes directly from hostB to hostC,
+using TCP when reachable or SSH otherwise. `--no-tcp` selects SSH directly.
+Keep the copy and laptop receiving connection open until it finishes.
+
+HostB's SSH server must allow remote Unix-socket forwarding for the copy's
+control connection. This does not forward an SSH agent. SSH data workers need
+writable `~/.ssh/authorized_keys` on hostC for a temporary restricted key.
+See [Approved account copies](remote-reference.md#approved-account-copies)
+for option support.
 
 ## Mirror a directory
 

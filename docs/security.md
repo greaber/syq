@@ -368,6 +368,13 @@ including ordinary SSH tools configured by `persist ssh-config`. The export
 uses only the selected account connection and fails when it closes.
 A one-time SSH invocation does not create this reusable permission.
 
+When a requesting server uses approved connections to copy between two other
+servers, the source gets only that copy's restricted destination access. The
+requesting server still has the broader account authority that was approved.
+Control and encrypted receipts pass through it; file contents travel directly
+between the source and destination. Losing the copy's control connection closes
+its worker authority. Closing account access does not roll back completed writes.
+
 The laptop supplies a signing service restricted to the destination's trusted
 host key and login account. It does not expose your ordinary SSH agent or
 private keys, and the requesting server cannot use this permission to sign

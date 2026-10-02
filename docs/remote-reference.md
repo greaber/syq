@@ -182,6 +182,32 @@ directory. Use `./~/archive` for a literal directory called `~`. Avoid
 `~//archive`: explicit receiving authorization keeps it under the home directory,
 but automatic selection uses ordinary SSH, where it resolves to `/archive`.
 
+## Approved account copies
+
+A direct copy between two other servers can reuse existing
+[approved account connections](persistence-reference.md#approved-account-connections)
+to both endpoints. Each endpoint uses its saved authorization choice unless
+`--auth-from` overrides it. `auto` selects existing approvals first;
+`--auth-from @NAME` requires both connections to have been approved through
+that name. The copy itself never requests full account access. Prepare it with
+`syq persist connect ENDPOINT --auth-from @NAME` for each endpoint.
+
+This route uses the default source coordinator or `--coordinate-at src`, with
+`--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,
+and receiver receipts. Custom `--rsh`, explicit `--pscope`, detached copies,
+destination coordination, and other peer-auth modes keep their separate
+connection requirements. `--coordinate-at local` can reuse approved access to
+each endpoint and explicitly relays file data through the invoking machine.
+
+The source's SSH server must permit remote Unix-socket forwarding. The socket
+carries control, metadata, and worker setup; payload goes directly between the
+source and destination. Disabled forwarding is an error and never selects a
+payload relay. Syq creates a receiver for this copy over the destination's
+approved account connection; durable receiver enrollment is unnecessary.
+The destination's [restricted-copy limits](#limits-and-unsupported-options)
+and [signed results](#signed-results) still apply. Helpers must match the
+invoking build; normal bootstrap installs them unless disabled.
+
 ## Verification
 
 For comparisons between two servers, use `--dry-run --hash --coordinate-at local`.

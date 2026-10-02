@@ -129,8 +129,8 @@ for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility)
 for executable selection.
 
-Typed SSH-to-SSH copies require an enrolled receiver or
-`coordinate_at="local"`. With `dry_run=True`, they require
+Typed SSH-to-SSH copies use an enrolled receiver, existing approved account
+connections to both endpoints, or `coordinate_at="local"`. With `dry_run=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,

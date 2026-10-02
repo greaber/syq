@@ -37,8 +37,8 @@ wins over both saved settings.
 `auto` while keeping host overrides. Omit the value to show saved choices, or
 add `--for HOST` to show that host's effective choice.
 
-Defaults apply to `syq ssh`, copies to or from one SSH server, and the SSH
-endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
+Defaults apply to `syq ssh`, copies using approved account connections, and the
+SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
 using `--coordinate-at local` selects access separately for each endpoint.
 Creating reusable account access with `persist connect` always requires an
 explicit `--auth-from @NAME`. Custom `--rsh` routes, explicit persistence
@@ -64,11 +64,14 @@ A dead master detected before command execution requires fresh approval; a
 failure after execution starts ends that command without a retry.
 
 Copies can reuse the login with `auto` or the matching `@NAME`, including SSH
-data in either direction with `--no-tcp`. They do not request a per-copy
-grant. Custom shell routes, explicit persistence scopes, detached copies,
-and copies requesting a receiver receipt do not select it. Direct copies
-between two other servers keep their existing authorization path; an explicit
-`--coordinate-at local` can reuse local account connections for both endpoints.
+data in either direction with `--no-tcp`. Copies between this machine and one
+server use full account access without a per-copy grant; asking for a receiver
+receipt selects per-copy authorization instead. Direct copies between two other
+servers can use approved connections to both endpoints and give the source only
+[this copy's destination access](remote-reference.md#approved-account-copies).
+An explicit `--coordinate-at local` can also reuse account connections for both
+endpoints. Custom shell routes, explicit persistence scopes, and detached copies
+keep their separate connection requirements.
 Without an approved login, eligible native copies use the usual per-copy
 authorization path and its restrictions.
 
@@ -97,6 +100,10 @@ index under syq's runtime directory. Existing persistence settings and endpoint
 records retain their formats. Older syq versions ignore the new index in
 `persist status`. Their `persist off` still ends these connections because
 the process keeping each connection open observes the disabled setting.
+Copies between two other servers also need the trusted host information saved
+with the approved connection. A connection opened by a build that did not save
+this information still works for ordinary commands; reconnect it to use this
+copy route.
 
 ## Names and profiles
 
