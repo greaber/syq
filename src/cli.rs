@@ -321,6 +321,8 @@ pub struct Args {
     /// Comparison and reuse block size (64K through 64M)
     #[arg(short = 'B', long, default_value = "4M", value_name = "SIZE", value_parser = parse_rsync_block_size)]
     pub block_size: u64,
+    #[arg(skip)]
+    pub block_size_explicit: bool,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -893,6 +895,8 @@ impl Args {
 
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
     args.apply_advanced()?;
+    args.block_size_explicit =
+        matches.value_source("block_size") == Some(clap::parser::ValueSource::CommandLine);
     if matches.value_source("block_size") == Some(clap::parser::ValueSource::CommandLine)
         && args
             .tuning_options

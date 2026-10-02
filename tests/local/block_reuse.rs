@@ -181,7 +181,12 @@ fn off_remote_update_uses_full_ranges_with_payload_checks() {
     .unwrap();
     assert_output_ok(&out);
     assert_eq!(read(&t.path("dst")), source);
-    assert_eq!(tuning_observed(&out)["range_requests"], 2);
+    let observed = tuning_observed(&out);
+    // Automatic payloads can be smaller than the 4 MiB request ceiling.
+    // Still use ordinary ranges for all bytes, without block comparison.
+    assert!(observed["range_requests"].as_u64().unwrap() >= 2);
+    assert!((512..=4 << 20).contains(&observed["max_request_bytes"].as_u64().unwrap()));
+    assert_eq!(observed["streaming_ranges"], 0);
 }
 
 #[test]

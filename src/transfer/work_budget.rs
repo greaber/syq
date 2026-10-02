@@ -16,6 +16,7 @@ impl WorkSize {
 
 pub(super) struct WorkBudget {
     limit: WorkSize,
+    max_bytes: u64,
     target: Duration,
     recheck_latency: bool,
     next_latency_check: Instant,
@@ -29,6 +30,7 @@ impl Default for WorkBudget {
                 bytes: 64 << 10,
                 files: 64,
             },
+            max_bytes: 1 << 20,
             target: Duration::from_millis(250),
             recheck_latency: false,
             next_latency_check: Instant::now() + Duration::from_secs(30),
@@ -41,6 +43,33 @@ impl Default for WorkBudget {
     }
 }
 impl WorkBudget {
+    pub fn ranges(max_bytes: u64, target: Duration) -> Self {
+        Self {
+            limit: WorkSize {
+                bytes: (1 << 20).min(max_bytes),
+                files: 0,
+            },
+            max_bytes,
+            target,
+            limit_at_check: WorkSize {
+                bytes: (1 << 20).min(max_bytes),
+                files: 0,
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn request_bytes(&self) -> u64 {
+        // Quantize updates so ordinary timing variation does not require a
+        // scheduler notification after every block. Never exceed the caller's
+        // configured request/receiver ceiling.
+        self.limit
+            .bytes
+            .max(512)
+            .next_power_of_two()
+            .min(self.max_bytes)
+    }
+
     /// Configuration RPCs supply a latency allowance on SSH too. Include both
     /// endpoints, but not connection startup, authentication or helper setup.
     pub fn set_latency(&mut self, round_trip: Duration) {
@@ -130,7 +159,8 @@ impl WorkBudget {
                 estimate.min(current)
             }
         }
-        self.limit.bytes = resized(self.limit.bytes, work.bytes, elapsed, target).min(1 << 20);
+        self.limit.bytes =
+            resized(self.limit.bytes, work.bytes, elapsed, target).min(self.max_bytes);
         self.limit.files =
             resized(self.limit.files as u64, work.files as u64, elapsed, target).min(2048) as usize;
     }
@@ -139,6 +169,39 @@ impl WorkBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_requests_shrink_and_recover_within_the_payload_ceiling() {
+        for max in [512, 4096, 3 << 20, 4 << 20] {
+            let mut budget = WorkBudget::ranges(max, Duration::from_millis(250));
+            assert_eq!(budget.request_bytes(), max.min(1 << 20));
+            for _ in 0..4 {
+                budget.observe(
+                    WorkSize {
+                        bytes: budget.request_bytes(),
+                        files: 0,
+                    },
+                    Duration::from_secs(4),
+                );
+            }
+            let reduced = budget.request_bytes();
+            assert!(reduced >= 512 && reduced <= max);
+            if max > 512 {
+                assert!(reduced < max);
+            }
+            for _ in 0..16 {
+                budget.observe(
+                    WorkSize {
+                        bytes: budget.request_bytes(),
+                        files: 0,
+                    },
+                    Duration::from_millis(20),
+                );
+            }
+            assert_eq!(budget.request_bytes(), max);
+            assert_eq!(budget.limit().files, 0);
+        }
+    }
 
     #[test]
     fn budgets_follow_each_workers_service_and_recover_after_a_slowdown() {

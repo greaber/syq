@@ -236,6 +236,7 @@ fn comparison_block_size_is_a_native_advanced_control() {
     )
     .unwrap();
     assert_eq!(args.block_size, 64 << 10);
+    assert!(!args.block_size_explicit);
     assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
     let error = parse_native_copy(
         &[
@@ -258,6 +259,7 @@ fn comparison_block_size_is_a_native_advanced_control() {
             Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
                 .unwrap();
         assert_eq!(args.block_size, 128 << 10);
+        assert!(args.block_size_explicit);
         let error = Args::parse_rsync(
             &[
                 "source",

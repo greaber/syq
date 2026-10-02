@@ -135,6 +135,7 @@ pub struct Opts {
     hardlink_expected_hashes:
         std::sync::OnceLock<std::collections::HashMap<PathBytes, crate::hashing::ExpectedHashes>>,
     pub block: u64,
+    pub block_explicit: bool,
     pub tuning: crate::transfer_tuning::TransferTuning,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
     /// Settled before sharing these options; clone claims must fit preflight.
@@ -191,6 +192,15 @@ pub struct Opts {
 }
 
 impl Opts {
+    fn adaptive_ranges(&self) -> bool {
+        !self.same_host
+            && !self.block_explicit
+            && self.tuning.request_size.is_none()
+            && self.tuning.comparison_block_size.is_none()
+            && self.tuning.pipeline_depth.is_none()
+            && self.tuning.split_min_size.is_none()
+    }
+
     fn metadata_for(&self, path: &[u8], source: &Entry) -> Meta {
         let mut meta = source.meta();
         if let Some(metadata) = self.mapping_metadata.get(path) {
@@ -1944,6 +1954,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             })
             .unwrap_or_default(),
         block,
+        block_explicit: args.block_size_explicit,
         tuning: args.tuning_options.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
             && !args.quiet
@@ -2000,8 +2011,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection (sender pacing keeps unshrunk requests): request-size={} bytes (ordinary, after logical pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            opts.adaptive_ranges(),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
@@ -2364,6 +2376,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         benchmark: Default::default(),
                         fast_batch_files,
                         batch_budget: WorkBudget::default(),
+                        range_budget: None,
                         setup_elapsed: t0.elapsed(),
                     };
                     #[cfg(debug_assertions)]
