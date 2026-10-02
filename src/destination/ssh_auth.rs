@@ -300,7 +300,7 @@ mod tests {
         local.read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"reply");
         assert!(!disconnected(&local));
-        drop(remote);
+        remote.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(disconnected(&local));
     }
 
