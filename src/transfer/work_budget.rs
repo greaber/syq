@@ -171,6 +171,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn range_requests_shrink_and_recover_within_the_payload_ceiling() {
+        for max in [512, 4096, 3 << 20, 4 << 20] {
+            let mut budget = WorkBudget::ranges(max, Duration::from_millis(250));
+            assert_eq!(budget.request_bytes(), max.min(1 << 20));
+            for _ in 0..4 {
+                budget.observe(
+                    WorkSize {
+                        bytes: budget.request_bytes(),
+                        files: 0,
+                    },
+                    Duration::from_secs(4),
+                );
+            }
+            let reduced = budget.request_bytes();
+            assert!(reduced >= 512 && reduced <= max);
+            if max > 512 {
+                assert!(reduced < max);
+            }
+            for _ in 0..16 {
+                budget.observe(
+                    WorkSize {
+                        bytes: budget.request_bytes(),
+                        files: 0,
+                    },
+                    Duration::from_millis(20),
+                );
+            }
+            assert_eq!(budget.request_bytes(), max);
+            assert_eq!(budget.limit().files, 0);
+        }
+    }
+
+    #[test]
     fn budgets_follow_each_workers_service_and_recover_after_a_slowdown() {
         let mut fast = WorkBudget::default();
         let mut slow = WorkBudget::default();

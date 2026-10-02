@@ -192,6 +192,15 @@ pub struct Opts {
 }
 
 impl Opts {
+    fn adaptive_ranges(&self) -> bool {
+        !self.same_host
+            && !self.block_explicit
+            && self.tuning.request_size.is_none()
+            && self.tuning.comparison_block_size.is_none()
+            && self.tuning.pipeline_depth.is_none()
+            && self.tuning.split_min_size.is_none()
+    }
+
     fn metadata_for(&self, path: &[u8], source: &Entry) -> Meta {
         let mut meta = source.meta();
         if let Some(metadata) = self.mapping_metadata.get(path) {
@@ -2002,8 +2011,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection (sender pacing keeps unshrunk requests): request-size={} bytes (ordinary, after logical pacing and receiver limits), streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
+            opts.adaptive_ranges(),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),

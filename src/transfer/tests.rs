@@ -87,6 +87,7 @@ struct PipelineState {
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
     arrival_delay: Option<std::time::Duration>,
+    early_range_acks: bool,
     steal_range_at: Option<(usize, Arc<Sched>)>,
     stolen_range: Option<RangeHandle>,
     auto_small_size: Option<u64>,
@@ -108,6 +109,17 @@ impl Conn for PipelineConn {
             .as_ref()
             .map(|receipts| receipts.begin(progress))
             .transpose()
+    }
+    fn try_recv_with_arrival(&mut self) -> Option<Result<(Response, std::time::Instant)>> {
+        let state = self.0.lock().unwrap();
+        let ready = state.early_range_acks
+            && !state.replies.is_empty()
+            && state
+                .ready
+                .front()
+                .is_none_or(|ready| *ready <= std::time::Instant::now());
+        drop(state);
+        ready.then(|| self.recv_with_arrival())
     }
     fn supports_request_pipelining(&self) -> bool {
         {
@@ -183,6 +195,14 @@ impl Conn for PipelineConn {
         }
         if state.auto_ranges {
             match &request {
+                Request::ConfigureHashing(_) => {
+                    assert_eq!(
+                        state.requests.len(),
+                        state.received,
+                        "range latency check requires drained requests"
+                    );
+                    state.replies.push_back(Response::Ok);
+                }
                 Request::ReadRange { off, len, .. }
                 | Request::ReadComparedRange { off, len, .. } => {
                     let data = vec![42; *len as usize];
@@ -3851,4 +3871,127 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
             assert!(sched.range_done(&tail));
         }
     }
+}
+
+#[test]
+fn ordinary_range_latency_rechecks_preserve_ownership_on_stop() {
+    use std::time::{Duration, Instant};
+    for stop in ["none", "abort", "retire"] {
+        let block = 4 << 20;
+        let size = 16 << 20;
+        let sched = Arc::new(Sched::new(block, 32 << 20));
+        let idx = sched.push_file(pipeline_job(b"file", size));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(_)));
+        let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        opts.tuning = Default::default();
+        let mut budget = WorkBudget::ranges(block, Duration::from_millis(600));
+        budget.refreshed_latency(
+            Duration::from_millis(150),
+            Instant::now() - Duration::from_secs(60),
+        );
+        worker.range_budget = Some(budget);
+        if stop == "abort" {
+            src.lock().unwrap().abort_on_receive = Some(sched.clone());
+        } else if stop == "retire" {
+            src.lock()
+                .unwrap()
+                .gate_changes
+                .push((1, worker.gate.clone(), 0));
+        }
+        let mut credited = 0;
+        worker.transfer_range(&range, &mut credited).unwrap();
+        let source = src.lock().unwrap();
+        let destination = dst.lock().unwrap();
+        assert!(matches!(
+            source.requests.first(),
+            Some(Request::ConfigureHashing(_))
+        ));
+        assert_eq!(source.requests.len(), source.received);
+        assert_eq!(destination.requests.len(), destination.received);
+        if stop == "none" {
+            assert_eq!(credited, size);
+            assert!(matches!(
+                destination.requests.first(),
+                Some(Request::ConfigureHashing(_))
+            ));
+            assert!(sched.range_done(&range));
+        } else {
+            assert_eq!(credited, 0);
+            assert_eq!(
+                source.requests.len(),
+                1,
+                "no reads after stop during recheck"
+            );
+            assert!(
+                destination.requests.is_empty(),
+                "no second configuration after stop"
+            );
+            assert!(!sched.range_done(&range));
+            if stop == "retire" {
+                let Item::Range(tail) = sched.next() else {
+                    panic!("unread range returned")
+                };
+                assert_eq!(tail.lock().unwrap().pos, 0);
+                assert!(sched.range_done(&tail));
+            }
+        }
+        assert!(matches!(sched.next(), Item::Exit));
+    }
+}
+
+#[test]
+fn arrived_range_writes_update_progress_before_the_next_source_reply() {
+    let block = 4 << 20;
+    let size = 8 << 20;
+    let sched = Arc::new(Sched::new(block, 32 << 20));
+    let idx = sched.push_file(pipeline_job(b"file", size));
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(_)));
+    let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        early_range_acks: true,
+        arrival_delay: Some(std::time::Duration::from_secs(2)),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = block;
+    opts.tuning = Default::default();
+    src.lock().unwrap().progress = Some(worker.progress.clone());
+    let mut credited = 0;
+    worker.transfer_range(&range, &mut credited).unwrap();
+    let source = src.lock().unwrap();
+    assert_eq!(
+        source.progress_at_receive[1].0,
+        1 << 20,
+        "ACK credited before receiving the second block"
+    );
+    assert!(
+        matches!(&source.requests[4], Request::ReadRange { len, .. } if *len < 1 << 20),
+        "slow ACK sizes the next read immediately"
+    );
+    assert_eq!(credited, size);
+    assert_eq!(
+        dst.lock().unwrap().max_pending,
+        1,
+        "arrived writes need not wait for the window to fill"
+    );
+    assert!(sched.range_done(&range));
 }

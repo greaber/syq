@@ -2035,9 +2035,10 @@ impl Worker {
         (slot, n, started): (usize, u64, std::time::Instant),
         budget: &mut WorkBudget,
         adaptive: bool,
+        received: Option<Result<(Response, std::time::Instant)>>,
     ) -> Result<bool> {
         let slow = if adaptive {
-            let (response, arrived) = self.dst.recv_with_arrival()?;
+            let (response, arrived) = received.unwrap_or_else(|| self.dst.recv_with_arrival())?;
             ok(response, "write")?;
             let elapsed = arrived.saturating_duration_since(started);
             let slow = elapsed > budget.latency_target();
@@ -2049,16 +2050,6 @@ impl Worker {
         };
         Self::acknowledge_range_write(&self.sched, &self.progress, job, flights, slot, n);
         Ok(slow)
-    }
-
-    fn adaptive_ranges(&self) -> bool {
-        let tuning = self.opts.tuning;
-        !self.opts.same_host
-            && !self.opts.block_explicit
-            && tuning.request_size.is_none()
-            && tuning.comparison_block_size.is_none()
-            && tuning.pipeline_depth.is_none()
-            && tuning.split_min_size.is_none()
     }
 
     pub(super) fn transfer_range_pipeline(
@@ -2081,7 +2072,7 @@ impl Worker {
             .opts
             .tuning
             .ordinary_range_limit(self.opts.same_host, block);
-        let adaptive = self.adaptive_ranges();
+        let adaptive = self.opts.adaptive_ranges();
         let mut budget = self
             .range_budget
             .take()
@@ -2091,6 +2082,25 @@ impl Worker {
         let mut released = false;
         let result = (|| -> Result<()> {
             loop {
+                if adaptive {
+                    // A fast destination may have acknowledged the previous
+                    // write while we waited for the source. Apply that feedback
+                    // before refilling, without waiting for a full write window.
+                    while !pending_writes.is_empty() {
+                        let Some(reply) = self.dst.try_recv_with_arrival() else {
+                            break;
+                        };
+                        let write = pending_writes.pop_front().expect("arrived write");
+                        slow |= self.receive_range_write(
+                            job,
+                            &mut flights,
+                            write,
+                            &mut budget,
+                            true,
+                            Some(reply),
+                        )?;
+                    }
+                }
                 released |= !self.gate.allowed(self.id);
                 // Check cancellation and optionally claim work with one scheduler
                 // lock, including while the last read replies are draining.
@@ -2190,6 +2200,7 @@ impl Worker {
                             write,
                             &mut budget,
                             adaptive,
+                            None,
                         )?;
                         continue;
                     }
@@ -2230,8 +2241,14 @@ impl Worker {
                 pending_writes.push_back((slot, n, started));
                 if pending_writes.len() >= write_window {
                     let write = pending_writes.pop_front().expect("pending write");
-                    slow |=
-                        self.receive_range_write(job, &mut flights, write, &mut budget, adaptive)?;
+                    slow |= self.receive_range_write(
+                        job,
+                        &mut flights,
+                        write,
+                        &mut budget,
+                        adaptive,
+                        None,
+                    )?;
                 }
             }
             Ok(())

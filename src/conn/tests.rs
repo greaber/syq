@@ -186,11 +186,19 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
         multiplexed_ssh: false,
         detached: false,
     };
+    let (keep_open, empty) = std::sync::mpsc::channel();
+    let queued = conn.rx.replace(empty);
+    assert!(
+        conn.try_recv_with_arrival().is_none(),
+        "empty reader must not block"
+    );
+    conn.rx = queued;
+    drop(keep_open);
     let consumed_after = std::time::Instant::now();
     let (reply, waited) = conn.recv_with_wait().unwrap();
     assert!(matches!(reply, Response::Ok));
     assert_eq!(waited, std::time::Duration::ZERO);
-    let (reply, arrived) = conn.recv_with_arrival().unwrap();
+    let (reply, arrived) = conn.try_recv_with_arrival().expect("arrived ACK").unwrap();
     assert!(matches!(reply, Response::Ok));
     assert!(arrived <= consumed_after, "queued ACK uses receipt time");
     assert!(

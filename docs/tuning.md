@@ -26,7 +26,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
 | `block-reuse` | `auto` | `auto`, `on` or `off`; filesystem copies only |
 | `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
-| `request-size` | Hash block size (normally 4 MiB) for ordinary requests; at most 2 MiB for streaming | 512 bytes through 64 MiB |
+| `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
 | `batch-files` | Up to 2048, sharing queued files across active workers | 1 through 4096 files per worker batch |
@@ -251,10 +251,20 @@ Do not combine it with `comparison-block-size`.
 
 Syq normally streams remote ranges larger than four ordinary requests
 (16 MiB with default settings), with stream blocks of at most 2 MiB. The
-threshold follows the effective request size, including bandwidth limits.
+threshold follows the request-size ceiling, including logical-byte bandwidth
+limits, rather than the smaller requests chosen during a copy.
 `copy-path=streaming` forces streaming and disables whole-file and small-file
 shortcuts. `copy-path=auto-streaming` keeps those shortcuts and streams the
 remaining ranges.
+
+Ordinary remote requests adapt to each worker's observed completion times.
+Slow workers issue smaller requests and allow idle workers to take smaller
+unread parts of their files. Connection-delay checks help requests grow again
+when competing traffic changes the delay. Already-issued requests must still
+finish or fail. Local requests, streaming blocks, and comparison blocks keep
+their existing sizes. Explicit `request-size`, `comparison-block-size`,
+`--block-size`, `pipeline-depth`, or `split-min-size` settings disable ordinary
+request adaptation for controlled comparisons.
 
 Staged block reuse and partial resume use bounded comparison requests in every
 copy-path mode, including `streaming`.
@@ -316,7 +326,9 @@ size, `batch-bytes`, and `request-size`.
 
 `split-min-size` controls how small a region an idle worker can take from another
 worker. Lower values allow finer sharing; higher values reduce assignments.
-Splits align to comparison blocks and need twice the minimum remaining size.
+Explicit splits align to comparison blocks and need twice the minimum remaining
+size. With automatic ordinary remote requests, slow workers can share smaller
+unread regions without changing comparison blocks.
 
 Capped SSH and TCP copies tune from continuous transport-byte activity so waiting for a
 large batch acknowledgment does not look like an idle link. Completion counters
