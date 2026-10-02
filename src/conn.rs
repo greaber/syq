@@ -1213,6 +1213,8 @@ pub(crate) struct PendingTcpSetup {
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteDiagnostics {
+    pub tcp_probe_time: Option<(std::time::Instant, std::time::Instant)>,
+    pub helper_installation: Option<(std::time::Instant, std::time::Instant)>,
     pub peer: Option<PeerInfo>,
     pub tcp_probe: Option<TcpProbe>,
     pub tcp_setup_error: Option<String>,
@@ -2033,7 +2035,13 @@ impl RemoteSpec {
         };
         validate_advertised_tcp_port(port, ports)?;
         let spec = self.clone();
-        let probe = std::thread::spawn(move || spec.probe_tcp_addresses(advertised, port));
+        let probe = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let result = spec.probe_tcp_addresses(advertised, port);
+            spec.diagnostics.lock().unwrap().tcp_probe_time =
+                Some((start, std::time::Instant::now()));
+            result
+        });
         Ok(PendingTcpSetup {
             pacing,
             reverse: None,

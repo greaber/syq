@@ -361,6 +361,22 @@ class RunEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class Timings:
+    """Wall-clock milliseconds; work measurements may overlap.
+
+    Total includes helper installation. None means a measurement is unavailable,
+    while zero means no work or less than a millisecond.
+    """
+
+    total_ms: int
+    setup_ms: int | None = None
+    planning_ms: int | None = None
+    transfer_ms: int | None = None
+    finalization_ms: int | None = None
+    helper_install_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ProgressEvent:
     protocol: ProtocolMetadata
     bytes_done: int
@@ -372,7 +388,7 @@ class ProgressEvent:
     files_excluded: int
     scanned: int
     scan_done: bool
-    elapsed_ms: int
+    timings: Timings
     activity: dict[str, Any] | None = None
     rate_bytes_per_second: int | None = None
     eta_ms: int | None = None
@@ -526,7 +542,7 @@ class OperationSummary:
     exit_code: int
     dry_run: bool
     errors: int
-    elapsed_ms: int
+    timings: Timings
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,7 +560,7 @@ class CpResult(OperationSummary):
     errors: int
     bytes_transferred: int
     bytes_unchanged: int
-    elapsed_ms: int
+    timings: Timings
     deletions_planned: int | None
     deletions_completed: int | None
     deletions_blocked: int | None
@@ -566,7 +582,7 @@ class RmResult(OperationSummary):
     entries_already_absent: int
     entries_failed: int
     errors: int
-    elapsed_ms: int
+    timings: Timings
     mode: str = "rm"
 
 

@@ -13,6 +13,13 @@ import syq
 from syq._streams import _Process
 
 
+def current_copy_fixture():
+    fixture = Path(__file__).resolve().parents[3] / "tests/fixtures/automation/success.ndjson"
+    records = [json.loads(line) for line in fixture.read_bytes().splitlines()]
+    records[0]["mapping"] = False
+    return records
+
+
 class CleanupDeadlineTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -20,7 +27,7 @@ class CleanupDeadlineTests(unittest.TestCase):
         root = Path(self.temporary.name)
         self.pid = root / 'leader'
         self.fake = root / 'syq'
-        fixture = (Path(__file__).parent / 'fixtures/automation-v2-progress.ndjson').read_bytes()
+        fixture = ''.join(json.dumps(record) + '\n' for record in current_copy_fixture()).encode()
         self.fake.write_text(f'''#!{sys.executable}
 import os, sys, time
 from pathlib import Path
@@ -68,9 +75,8 @@ os._exit(0)
                     process.abort()
 
     def test_reader_deadline_covers_payload_after_leader_exits(self):
-        records = [json.loads(line) for line in
-                   (Path(__file__).parent / 'fixtures/automation-v2-progress.ndjson').read_bytes().splitlines()]
-        records.insert(1, dict(type='stream_ready', schema='syq.automation', schema_version=2))
+        records = current_copy_fixture()
+        records.insert(1, dict(type='stream_ready', schema='syq.automation', schema_version=4))
         for seq, record in enumerate(records):
             record['seq'] = seq
         fixture = ''.join(json.dumps(record) + '\n' for record in records).encode()

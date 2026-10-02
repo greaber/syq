@@ -332,7 +332,7 @@ fn encrypted_stream_round_trips_and_binds_all_frames() {
     assert_eq!(result["status"], "refused");
     assert_eq!(result["receipt_status"], "clean");
     assert_eq!(result["exit_code"], 25);
-    assert_eq!(result["elapsed_ms"], 7);
+    assert_eq!(result["timings"]["total_ms"], 7);
     assert_eq!(result["errors"], 0);
     assert_eq!(result["deletions_completed"], 0);
     assert_eq!(result["operations"], 1);

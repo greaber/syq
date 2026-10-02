@@ -100,7 +100,7 @@ def run(directory, upload, options, payloads, *, abort=False, skipped=False):
         assert len(started) == (0 if skipped else len(payloads)), started
         results.seek(0)
         records = [json.loads(line) for line in results]
-        assert all(r['schema_version'] == 3 and r['seq'] == i for i, r in enumerate(records))
+        assert all(r['schema_version'] == 5 and r['seq'] == i for i, r in enumerate(records))
         assert records[-1]['type'] == 'result' and records[-1]['exit_code'] == code
         streams = [r for r in records if r['type'] == 'stream_result']
         assert len(streams) == len(payloads)

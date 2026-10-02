@@ -1010,7 +1010,7 @@ pub(crate) fn emit_automation_records(
         "errors": errors,
         "bytes_transferred": terminal.summary.transferred_bytes,
         "bytes_unchanged": 0,
-        "elapsed_ms": elapsed_ms,
+        "timings": {"total_ms": elapsed_ms},
         // The one deletion fact a receipt can attest: settled deletions.
         // Planning and --max-delete blocking are coordinator concepts, so
         // deletions_planned and deletions_blocked never appear here.

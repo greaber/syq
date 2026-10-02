@@ -107,7 +107,7 @@ automatically retried: the caller must regenerate the entry.
 
 ## Results and applicable options
 
-Use [automation schema version 3](automation.md). Each stream entry has one
+Use [automation schema version 5](automation.md). Each stream entry has one
 `stream_result` with its index and outcome. Successful completion requires the
 terminal result and process status to agree, and all expected entry results to
 be present. Entry errors can yield a partial result and exit 23. Setup errors

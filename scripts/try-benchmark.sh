@@ -366,12 +366,13 @@ copying_interval() {
         }
         die "Missing successful result\n" unless
             $result && ($result->{status} // "") eq "success";
-        if (!defined($result->{copying_elapsed_ms}) && $required ne "required") {
+        my $transfer_ms = $result->{timings}->{transfer_ms} // $result->{copying_elapsed_ms};
+        if (!defined($transfer_ms) && $required ne "required") {
             print "n/a\n"; exit;
         }
         die "Missing or invalid copying timing\n" unless
-            defined($result->{copying_elapsed_ms}) && $result->{copying_elapsed_ms} =~ /^\d+$/;
-        print $result->{copying_elapsed_ms}, "\n";
+            defined($transfer_ms) && $transfer_ms =~ /^\d+$/;
+        print $transfer_ms, "\n";
     ' "${2:-optional}" "$1"
 }
 
@@ -401,7 +402,7 @@ activity_summary() {
                 next if defined($previous{$label}) && $previous{$label} eq $current{$label};
                 print "Activity changes (interval dominant states; not proven causes):\n" unless $header++;
                 my $state=$current{$label}; $state =~ s/_/ /g;
-                printf "  %7.2fs  %s: %s\n", ($record->{elapsed_ms} // 0)/1000, $label, $state;
+                printf "  %7.2fs  %s: %s\n", ($record->{timings}->{total_ms} // $record->{elapsed_ms} // 0)/1000, $label, $state;
                 $previous{$label}=$current{$label};
             }
         }

@@ -206,14 +206,17 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     ))
 }
 
-pub(crate) fn copy(args: &mut crate::cli::Args) -> Result<()> {
+pub(crate) fn copy(
+    args: &mut crate::cli::Args,
+    progress: &crate::progress::Progress,
+) -> Result<()> {
     if args.interface != crate::cli::Interface::NativeCp {
         return Ok(());
     }
     if let Some(guard) = ACCEPTED.get() {
         guard.validate()?;
     }
-    let selection = select_copy(args)?;
+    let selection = select_copy(args, Some(progress))?;
     if let Some(selection) = &selection {
         if args.hardlinks
             || args.acls

@@ -68,9 +68,9 @@ if '--results' in args:
             copy_ms=2500 if os.environ.get('BENCH_TEST_GROW') and len(list(src.iterdir())) == 1024 else 5000
         if dst.name == 'warmup':
             copy_ms=1000 if os.environ.get('BENCH_TEST_SHORT_WARMUP') else int(os.environ.get('BENCH_TEST_WARMUP_MS', '60000'))
-        result['copying_elapsed_ms']=copy_ms
+        result['timings']={'transfer_ms':copy_ms}
     if os.environ.get('BENCH_TEST_BAD_TIMING'):
-        result['copying_elapsed_ms']=999999999
+        result['timings']={'transfer_ms':999999999}
     progress={'type':'progress','activity':{'summary':'Observed worker time: source response 100% (test fixture)'}}
     lines=[] if os.environ.get('BENCH_TEST_OLD') or '--stats' not in args else [json.dumps(progress)]
     pathlib.Path(args[args.index('--results')+1]).write_text('\n'.join(lines+[json.dumps(result)])+'\n')
@@ -249,7 +249,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_activity_timeline_reports_changes_without_repeating_stable_states(self):
         records = self.root / 'timeline.ndjson'
         def sample(ms, worker, operation):
-            return {'type':'progress', 'elapsed_ms':ms, 'activity': {
+            return {'type':'progress', 'timings':{'total_ms':ms}, 'activity': {
                 'summary':'final summary', 'workers':{'fractions':{worker:1}},
                 'endpoints':[{'label':'destination worker 0', 'actors':[
                     {'role':'filesystem', 'fractions':{operation:1}}]}]}}
@@ -378,6 +378,24 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertTrue(copies)
                 self.assertTrue(all(option in args for args in copies), copies)
                 self.assert_clean()
+
+    def test_copying_interval_reads_released_and_current_results(self):
+        definitions = SCRIPT.read_text().removesuffix('main "$@"\n')
+        records = self.root / 'timings.json'
+        for milliseconds in [0, 5321]:
+            for version, timing in [(2, {'copying_elapsed_ms': milliseconds}),
+                                    (4, {'timings': {'transfer_ms': milliseconds}})]:
+                with self.subTest(version=version, milliseconds=milliseconds):
+                    records.write_text(json.dumps(dict(
+                        type='result', status='success', schema_version=version,
+                        **timing)) + '\n')
+                    for required in ['', 'required']:
+                        result = subprocess.run(
+                            ['/bin/bash', '-c', definitions + '\ncopying_interval "$1" "$2"',
+                             'timing-test', str(records), required],
+                            env=self.env, capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, f'{milliseconds}\n')
 
     def test_invalid_timing_is_rejected(self):
         definitions = SCRIPT.read_text().removesuffix('main "$@"\n')

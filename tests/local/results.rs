@@ -142,7 +142,7 @@ fn followed_results_referent_stays_pinned_when_the_link_is_replaced() {
 fn hash_policy_automation_digest_schema_checks_algorithm_and_width() {
     let validator = automation_validator();
     let mut record = serde_json::json!({
-        "schema": "syq.automation", "schema_version": 2, "seq": 1,
+        "schema": "syq.automation", "schema_version": 4, "seq": 1,
         "type": "operation_result", "action": "transfer_file", "kind": "file",
         "dst": {"encoding": "utf-8", "value": "file"}, "disposition": "failed",
     });
@@ -356,7 +356,7 @@ fn native_detach_rejects_an_unattached_results_stream() {
 }
 
 #[test]
-fn native_cp_results_copying_interval_covers_paced_content_but_not_unchanged_files() {
+fn native_cp_results_transfer_timing_covers_paced_content_but_not_unchanged_files() {
     let t = Tmp::new();
     write(&t.path("src/data"), &vec![42; 2 * 1024 * 1024]);
     for (result, moved) in [("first.ndjson", true), ("second.ndjson", false)] {
@@ -381,14 +381,14 @@ fn native_cp_results_copying_interval_covers_paced_content_but_not_unchanged_fil
         let terminal: serde_json::Value =
             serde_json::from_str(contents.lines().last().unwrap()).unwrap();
         if moved {
-            let interval = terminal["copying_elapsed_ms"]
+            let interval = terminal["timings"]["transfer_ms"]
                 .as_u64()
                 .expect("copy timing");
             assert!(interval >= 1_000, "paced copy interval: {interval}ms");
-            assert!(interval <= terminal["elapsed_ms"].as_u64().unwrap());
-            assert!(String::from_utf8_lossy(&out.stdout).contains("copying interval:"));
+            assert!(interval <= terminal["timings"]["total_ms"].as_u64().unwrap());
+            assert!(String::from_utf8_lossy(&out.stdout).contains("timing: setup"));
         } else {
-            assert!(terminal.get("copying_elapsed_ms").is_none());
+            assert_eq!(terminal["timings"]["transfer_ms"], 0);
         }
         assert_eq!(read(&t.path("src/data")), read(&t.path("dst/data")));
     }
@@ -429,7 +429,7 @@ fn native_cp_results_stream_success_and_partial() {
     // Envelope: schema v1, strictly increasing seq, run first, result last.
     for (i, v) in lines.iter().enumerate() {
         assert_eq!(v["schema"], "syq.automation");
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 4);
         assert_eq!(v["seq"], i as u64);
     }
     assert_eq!(lines[0]["type"], "run");
@@ -1004,7 +1004,7 @@ fn automation_fixtures_validate_against_schema() {
     assert!(
         validator
             .validate(&serde_json::json!({
-                "schema": "syq.automation", "schema_version": 2, "seq": 0, "type": "run"
+                "schema": "syq.automation", "schema_version": 4, "seq": 0, "type": "run"
             }))
             .is_err(),
         "missing required fields must fail validation"
@@ -1429,4 +1429,75 @@ fn removed_progress_json_options_are_rejected() {
         assert!(stderr_of(&out).contains(flag));
         assert_eq!(read(&t.path("src")), b"keep");
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn finalization_time_does_not_dilute_transfer_time() {
+    let t = Tmp::new();
+    write(&t.path("src/data"), b"payload");
+    let ready = t.path("finalizing");
+    let continuation = t.path("continue");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--results",
+            &t.s("results"),
+            "--stats",
+            "--no-progress",
+        ])
+        .env("SYQ_TEST_FINALIZATION_READY_FILE", &ready)
+        .env("SYQ_TEST_FINALIZATION_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "copy finalization");
+    // The payload has settled before finalization starts.
+    assert_eq!(read(&t.path("dst/data")), b"payload");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let timings = &records.last().unwrap()["timings"];
+    let total = timings["total_ms"].as_u64().unwrap();
+    let transfer = timings["transfer_ms"].as_u64().unwrap();
+    assert!(
+        timings["finalization_ms"].as_u64().unwrap() >= 1000,
+        "{timings}"
+    );
+    assert!(total >= transfer + 1000, "{timings}");
+    assert_eq!(timings["helper_install_ms"], 0);
+    let final_progress = records
+        .iter()
+        .rev()
+        .find(|r| r["type"] == "progress")
+        .unwrap();
+    assert_eq!(&final_progress["timings"], timings);
+    // The emitted rate uses the same frozen interval, including while the
+    // finalization barrier holds. Allow for transfer_ms rounding down.
+    for record in records.iter().filter(|r| {
+        r["type"] == "progress" && r["timings"]["finalization_ms"].as_u64().unwrap() >= 1000
+    }) {
+        let rate = record["rate_bytes_per_second"].as_u64().unwrap();
+        let bytes = record["bytes_done"].as_u64().unwrap();
+        assert!(rate >= bytes * 1000 / (transfer + 1), "{record}");
+        if transfer > 0 {
+            assert!(rate <= (bytes * 1000).div_ceil(transfer), "{record}");
+        }
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("transfer {:.3}s", transfer as f64 / 1000.0)),
+        "{stdout}"
+    );
 }

@@ -90,7 +90,7 @@ Every record carries:
 | Field | Value |
 |---|---|
 | `schema` | `"syq.automation"` |
-| `schema_version` | `2`; Stream mappings use `3` |
+| `schema_version` | `4`; Stream mappings use `5` |
 | `seq` | Integer starting at 0, strictly increasing |
 | `type` | Record type |
 
@@ -196,7 +196,7 @@ file. The normal terminal `result` still establishes completion. Its optional
 `bytes_total_known` field is false when the source length is unknown; preview
 byte totals then count only known bytes, rather than asserting an empty input.
 
-Stream mappings use version 3 and emit one `stream_result` for each
+Stream mappings use version 5 and emit one `stream_result` for each
 callback entry, with an additional zero-based `entry` index. Each endpoint is
 `{"path": <tagged path>}` or `{"entry": N, "callback": true}`. Failed entries
 include `message`. These records identify callbacks within this invocation;
@@ -262,15 +262,42 @@ This observes destination state; it does not attest source completeness.
 ### `result`
 
 Exactly one terminal record, always last when the stream completes. Common
-fields are `status`, `exit_code`, `dry_run`, `errors`, and `elapsed_ms`.
+fields are `status`, `exit_code`, `dry_run`, `errors`, and `timings`.
 
-Copy terminals may also include `copying_elapsed_ms`: the wall-clock span from
-first file work to last completed file work across workers, including per-file
-checks, finalization and gaps. Initial setup before file work is excluded;
-planning and connections can overlap this interval. It is not a sum of worker
-times or pure network time. The field is absent when no bytes moved or the
-coordinator does not supply it, including older releases and attested terminals.
-Use `elapsed_ms` for end-to-end throughput comparisons.
+`timings` contains wall-clock measurements in milliseconds. Progress records
+carry the same object, with measurements advancing while that work runs:
+
+| Field | What it measures |
+|---|---|
+| `total_ms` | The coordinator's measured run, including helper installation, setup, planning, transfer, and finalization |
+| `setup_ms` | Preparing endpoints, establishing control and worker connections (including connections added during copying), and choosing the data transport; excludes helper installation |
+| `planning_ms` | Discovering source entries, inspecting destinations, deciding what to copy, and preparing the work, including directories created during planning |
+| `transfer_ms` | From the first selected file operation to the last completed file operation, including reads, hashing, writes, per-file metadata, waits, and retries |
+| `finalization_ms` | Work after file workers finish: remaining hardlinks, pruning, directory metadata, and receipts |
+| `helper_install_ms` | Installing matching helpers and remote syq commands, including the installation's platform probe |
+
+Setup and planning count the time spent in those activities, counting concurrent
+work of the same kind once. Transfer is one span across workers, including gaps.
+Total also includes coordinator bookkeeping between measured activities.
+These measurements can overlap; they are not numbers to add together. For example,
+copying can begin while planning continues. Installation on two hosts also counts
+once where it overlaps.
+
+Filesystem copy coordinators report all six fields, including zero for work that
+was not needed or took less than a millisecond. S3 copies also report `transfer_ms` once file work starts. Other engines,
+removal, and receiver-attested results report `total_ms` and omit unavailable
+measurements. Total starts with the executing
+coordinator's run clock, before SSH authorization selection for a filesystem copy,
+and continues across a local helper handoff;
+it is not the entire process lifetime. Use an external timer to include process
+startup, input handling, and shutdown. For an attached receiver-attested result,
+total covers the invoking machine's coordination and settlement instead.
+
+The filesystem progress bar and summary use `transfer_ms` for elapsed time.
+While copying, progress estimates the recent transfer rate; once file work
+finishes, it reports the average over the completed transfer, as the summary
+does. Initial setup and finalization do not dilute the transfer rate.
+A copy with no selected file work reports zero transfer time.
 
 Copy totals include transferred/unchanged files, excluded entries, created directories,
 symlinks and specials, transferred/unchanged bytes, and on pruning runs
@@ -354,7 +381,7 @@ In those cases, rerun the original copy instead.
 ```bash
 set -o pipefail
 syq cp --mapping big.ndjson -C src --to nas --into /data --results r.ndjson
-jq -cs 'if any(.[]; .schema != "syq.automation" or .schema_version != 2)
+jq -cs 'if any(.[]; .schema != "syq.automation" or .schema_version != 4)
         then "unsupported results schema for pathname retry" | halt_error
         elif (.[-1].type? // "") != "result"
         then "incomplete results stream (no terminal record)" | halt_error

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 pub const SCHEMA: &str = "syq.automation";
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 4;
 
 pub struct ResultsWriter {
     schema_version: u64,
@@ -103,7 +103,7 @@ pub struct ProgressRecord<'a> {
     pub files_excluded: u64,
     pub scanned: u64,
     pub scan_done: bool,
-    pub elapsed_ms: u64,
+    pub timings: crate::progress::Timings,
     pub rate_bytes_per_second: u64,
     pub eta_ms: Option<u64>,
 }
@@ -149,8 +149,7 @@ pub struct ResultRecord {
     pub errors: u64,
     pub bytes_transferred: u64,
     pub bytes_unchanged: u64,
-    pub copying_elapsed_ms: Option<u64>,
-    pub elapsed_ms: u64,
+    pub timings: crate::progress::Timings,
     /// `--prune` runs only; None keeps the fields out of the record.
     pub deletions_planned: Option<u64>,
     pub deletions_completed: Option<u64>,
@@ -235,7 +234,7 @@ pub fn start(args: &Args, mode: RunMode) -> Result<Option<Arc<ResultsWriter>>> {
     };
     let mut writer = ResultsWriter::new(out);
     if args.stream_mapping_fd.is_some() {
-        writer.schema_version = 3;
+        writer.schema_version = 5;
     }
     let writer = Arc::new(writer);
     let run_id = {
@@ -406,7 +405,7 @@ impl ResultsWriter {
             "files_excluded": progress.files_excluded,
             "scanned": progress.scanned,
             "scan_done": progress.scan_done,
-            "elapsed_ms": progress.elapsed_ms,
+            "timings": progress.timings,
             "rate_bytes_per_second": progress.rate_bytes_per_second,
         });
         if let Some(eta_ms) = progress.eta_ms {
@@ -636,14 +635,11 @@ impl ResultsWriter {
             "errors": result.errors,
             "bytes_transferred": result.bytes_transferred,
             "bytes_unchanged": result.bytes_unchanged,
-            "elapsed_ms": result.elapsed_ms,
+            "timings": result.timings,
         });
         let object = record.as_object_mut().expect("record is an object");
         if let Some(known) = known {
             object.insert("bytes_total_known".into(), known.into());
-        }
-        if let Some(ms) = result.copying_elapsed_ms {
-            object.insert("copying_elapsed_ms".into(), ms.into());
         }
         if let Some(planned) = result.deletions_planned {
             object.insert("deletions_planned".into(), planned.into());
@@ -673,7 +669,7 @@ impl ResultsWriter {
                 "entries_already_absent": result.entries_already_absent,
                 "entries_failed": result.entries_failed,
                 "errors": result.errors,
-                "elapsed_ms": result.elapsed_ms,
+                "timings": {"total_ms": result.elapsed_ms},
             }),
             true,
         );
@@ -816,8 +812,7 @@ mod tests {
             errors: 1,
             bytes_transferred: 0,
             bytes_unchanged: 0,
-            copying_elapsed_ms: None,
-            elapsed_ms: 0,
+            timings: Default::default(),
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,
@@ -835,7 +830,7 @@ mod tests {
             files_excluded: 0,
             scanned: 1,
             scan_done: true,
-            elapsed_ms: 1,
+            timings: Default::default(),
             rate_bytes_per_second: 0,
             eta_ms: None,
         });
@@ -852,8 +847,7 @@ mod tests {
             errors: 0,
             bytes_transferred: 0,
             bytes_unchanged: 0,
-            copying_elapsed_ms: None,
-            elapsed_ms: 0,
+            timings: Default::default(),
             deletions_planned: None,
             deletions_completed: None,
             deletions_blocked: None,

@@ -416,7 +416,7 @@ pub(crate) struct Observations {
 pub(crate) struct Interval {
     pub summary: String,
     /// Interval length on the coordinator's monotonic clock.
-    pub elapsed_ms: u64,
+    pub sample_duration_ms: u64,
     pub workers: WorkerInterval,
     /// Each process appears once; helper thread CPU is a subset of these totals.
     pub processes: Vec<ProcessInterval>,
@@ -444,7 +444,7 @@ pub(crate) struct ProcessInterval {
     pub process: String,
     pub local: bool,
     pub sample_age_ms: u64,
-    pub elapsed_ms: Option<u64>,
+    pub sample_duration_ms: Option<u64>,
     /// Null on the first remote sample or when no newer sample arrived.
     pub cpu: Option<CpuTimes>,
     pub cumulative_cpu: Option<CpuTimes>,
@@ -455,7 +455,7 @@ pub(crate) struct EndpointInterval {
     pub sample_age_ms: Option<u64>,
     pub process: Option<String>,
     /// Null when remote evidence has not advanced since the preceding record.
-    pub elapsed_ms: Option<u64>,
+    pub sample_duration_ms: Option<u64>,
     pub actors: Vec<OperationInterval>,
     pub cumulative_actors: Vec<OperationInterval>,
     /// Current local-side TCP_INFO, or the last reading after socket retirement.
@@ -628,7 +628,7 @@ impl Observations {
             cumulative_observed_ns,
             cumulative_fractions,
         };
-        let elapsed_ms = previous
+        let sample_duration_ms = previous
             .as_ref()
             .map_or(0, |p| current.at_ns.saturating_sub(p.at_ns) / 1_000_000);
         let mut process_samples = BTreeMap::new();
@@ -696,7 +696,7 @@ impl Observations {
                     label: endpoint.label.clone(),
                     sample_age_ms: age,
                     process: sample.as_ref().map(|s| s.process.clone()),
-                    elapsed_ms: None,
+                    sample_duration_ms: None,
                     actors: Vec::new(),
                     cumulative_actors: Vec::new(),
                     tcp: endpoint.previous_tcp.clone(),
@@ -747,7 +747,7 @@ impl Observations {
                                             b.send_buffer_limited_us,
                                         ),
                                     });
-                            row.elapsed_ms =
+                            row.sample_duration_ms =
                                 Some(sample.at_ns.saturating_sub(old.at_ns) / 1_000_000);
                             row.actors = operations(&sample, old);
                         }
@@ -773,7 +773,7 @@ impl Observations {
                     local: process == process_identity(),
                     process: process.clone(),
                     sample_age_ms,
-                    elapsed_ms: old
+                    sample_duration_ms: old
                         .filter(|_| newer)
                         .map(|(then, _)| at.saturating_sub(then) / 1_000_000),
                     cpu: if newer {
@@ -792,7 +792,7 @@ impl Observations {
             .collect();
         let mut interval = Interval {
             summary: String::new(),
-            elapsed_ms,
+            sample_duration_ms,
             workers,
             processes,
             endpoints,
@@ -1003,7 +1003,7 @@ mod tests {
         remote.update(first.clone());
         observations.remote("source".into(), remote.clone(), None);
         let first_interval = observations.sample();
-        assert!(first_interval.endpoints[0].elapsed_ms.is_none());
+        assert!(first_interval.endpoints[0].sample_duration_ms.is_none());
         actor.transition(Stage::SourceRead as u64, 0);
         let mut next = first;
         next.at_ns = 1_000_100;
@@ -1050,7 +1050,7 @@ mod tests {
             .summary()
             .contains("filesystem: source read 100% (0.001000s observed)"));
         assert!(stale.summary().contains("Process remote-process CPU:"));
-        assert!(stale.endpoints[0].elapsed_ms.is_none());
+        assert!(stale.endpoints[0].sample_duration_ms.is_none());
         assert!(stale
             .processes
             .iter()
