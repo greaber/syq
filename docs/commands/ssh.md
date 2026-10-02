@@ -14,6 +14,32 @@ asks you to approve access to that account. The SSH connection and all
 session traffic go directly between the two servers.
 
 <!-- CLI: ssh -->
+```text
+syq ssh [OPTIONS] --auth-from <@NAME> <HOST> [-- [COMMAND]...]
+```
+
+## Arguments
+
+| Argument / option | Meaning |
+|---|---|
+| `<HOST>` | SSH endpoint: [USER@]HOST[:PORT]; enclose IPv6 addresses in brackets |
+| `[COMMAND]...` | Remote shell command and arguments, interpreted as with ssh |
+
+## Options
+
+| Argument / option | Meaning |
+|---|---|
+| `--auth-from <@NAME>` | Receiving machine that authorizes access to the destination |
+| `-t` | Request a terminal, including when running a command |
+| `-T` | Disable terminal allocation |
+
+## Help and version
+
+| Argument / option | Meaning |
+|---|---|
+| `-h, --help` | Show common usage and options |
+| `--help-all` | Show all options and details |
+
 <!-- /CLI -->
 
 ## Account access requires approval
@@ -29,7 +55,7 @@ host and login account. Keep its receiving connection open while using the
 session. Stopping receiving, changing the profile, or losing that connection
 stops the local SSH client. Commands are never retried automatically.
 
-The destination must already be trusted by the laptop. This mode requires
+The destination must already be trusted by the laptop. This mode runs the native OpenSSH client and requires
 OpenSSH 8.9 or newer and an exact plain host key in the laptop's known-hosts
 files; host certificates are unsupported. The requesting server must be able
 to reach the destination's SSH port directly.
