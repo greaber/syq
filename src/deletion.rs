@@ -135,14 +135,20 @@ pub(crate) struct Batch {
 
 impl Default for Batch {
     fn default() -> Self {
-        Self {
-            control: Control::new(Concurrency::filesystem(0)),
-            pool: None,
-        }
+        Self::new(FILESYSTEM_START)
     }
 }
 
 impl Batch {
+    pub fn new(initial: usize) -> Self {
+        let mut concurrency = Concurrency::filesystem(0);
+        concurrency.initial = initial.clamp(1, concurrency.maximum);
+        Self {
+            control: Control::new(concurrency),
+            pool: None,
+        }
+    }
+
     pub fn run<T: Sync, R: Send>(
         &mut self,
         items: &[T],

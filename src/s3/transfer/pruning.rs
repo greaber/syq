@@ -63,7 +63,10 @@ impl Engine {
                 let mut found = found;
                 let depth = |c: &Candidate| c.path.iter().filter(|&&b| b == b'/').count();
                 found.sort_by_key(|c| std::cmp::Reverse(depth(c)));
-                let mut deletion = crate::deletion::Batch::default();
+                // This path previously deleted serially. Start with a small
+                // pool: many threads contend in a flat local directory, while
+                // slower destinations have time to earn more parallelism.
+                let mut deletion = crate::deletion::Batch::new(8);
                 // Equal-depth entries are independent; finish children before
                 // admitting their parents and never remove a tree recursively.
                 for level in found.chunk_by(|a, b| depth(a) == depth(b)) {
