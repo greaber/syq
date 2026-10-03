@@ -58,13 +58,7 @@ fn checksum_repairs_silent_corruption() {
         "without -c the file must be left alone"
     );
 
-    let out = run_ok(&[
-        "-ac",
-        "-B1M",
-        "--performance-tuning=block-reuse=on",
-        &t.s("src/"),
-        &t.s("dst/"),
-    ]);
+    let out = run_ok(&["-ac", "-B1M", "--no-whole-file", &t.s("src/"), &t.s("dst/")]);
     assert_eq!(transferred(&out), 1, "{out}");
     assert!(read(&t.path("dst/f.bin")) == data, "-c should repair");
     assert!(
@@ -129,7 +123,8 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
             &t.s("src/source"),
             "--as",
             &t.s("destination"),
-            "--performance-tuning=workers=1,copy-path=ranges,block-reuse=on",
+            "--transfer-strategy=aligned-block",
+            "--performance-tuning=workers=1,copy-path=ranges",
             &format!("--integrity-checking=compare={compare},transfer={transfer}"),
             "--results",
             &results,

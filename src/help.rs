@@ -230,7 +230,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 }
                 "resource_limits_arg" => "Resource limits",
                 "integrity_checking_arg" | "hash" => "Integrity checking",
-                "performance_tuning" | "block_size" => "Performance tuning",
+                "performance_tuning" | "block_size" | "whole_file" | "no_whole_file" => {
+                    "Performance tuning"
+                }
                 "auth_from" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "no_tcp_encryption" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
                 | "no_compress" => "SSH and transport",
@@ -314,7 +316,9 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_write_header" => {
             ("S3 connection settings", 6)
         }
-        "performance_tuning" | "resource_limits_arg" => ("Performance and resource limits", 7),
+        "performance_tuning" | "resource_limits_arg" | "transfer_strategy" => {
+            ("Performance and resource limits", 7)
+        }
         "dry_run" | "verbose" | "quiet" | "results" | "results_fd" | "progress" | "no_progress"
         | "stats" => ("Preview, progress, and results", 8),
         "help" | "version" => ("Help and version", 9),

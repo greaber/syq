@@ -237,6 +237,7 @@ impl Options {
         }
         for id in [
             "inplace",
+            "transfer_strategy",
             "via",
             "coordinate_at",
             "rsh",
@@ -303,7 +304,6 @@ impl Options {
             );
         }
         if tuning.comparison_block_size.is_some()
-            || tuning.block_reuse.is_some()
             || tuning.workers.is_some()
             || tuning.request_size.is_some()
             || tuning.pipeline_depth.is_some()

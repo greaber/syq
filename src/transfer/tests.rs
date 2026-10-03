@@ -405,6 +405,7 @@ fn pipeline_worker(
         hardlink_expected_hashes: Default::default(),
         block: 512,
         block_explicit: false,
+        transfer_strategy: Default::default(),
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
             pipeline_depth: (!streaming).then_some(4),
@@ -2578,7 +2579,7 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             opts.dst_remote = relay;
             opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
             if basis == "candidate-reuse-off" {
-                opts.tuning.block_reuse = Some(crate::transfer_tuning::BlockReuse::Off);
+                opts.transfer_strategy = crate::cli::TransferStrategy::WholeFile;
             }
             worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
             worker.progress.bytes_total.store(1536, Relaxed);
