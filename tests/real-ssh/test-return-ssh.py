@@ -55,6 +55,7 @@ def pending(allow=True, reusable=True, remember=False, target="syq@destination:2
 
 
 root = run("ssh", "source", "mktemp -d /tmp/syq-return-ssh.XXXXXX").strip()
+destination_root = run("ssh", "destination", "mktemp -d /tmp/syq-return-ssh.XXXXXX").strip()
 # Test the native OpenSSH child itself. The lab's tracing shell wrapper forks
 # another client and does not implement the native client's signal lifecycle.
 native_path = "PATH=/usr/bin:/bin:/usr/local/bin"
@@ -432,8 +433,27 @@ assert 'does not match' in reply['Error'], reply
 
     for mode in ("interrupt", "stop"):
         print("case: direct SSH ends after", mode, flush=True)
-        execute(["printf READY; exec sleep 60"], status=130 if mode == "interrupt" else 255, cancel=mode)
-        if mode == "stop":
+        controls = {row["control"] for row in json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]}
+        pidfile = destination_root + "/sleep-pid"
+        try:
+            execute(["echo $$ > " + shlex.quote(pidfile) + "; printf READY; exec sleep 60"],
+                    status=130 if mode == "interrupt" else 255, cancel=mode)
+        finally:
+            # Native mux interruption ends the local command but can leave the
+            # remote sleep occupying MaxSessions=1. Clean up only after the
+            # interrupt assertion, so cleanup cannot hide a local exit hang.
+            run("ssh", "destination", "if test -f " + shlex.quote(pidfile)
+                + "; then kill -TERM $(cat " + shlex.quote(pidfile) + ") 2>/dev/null || true; fi")
+        if mode == "interrupt":
+            rows = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+            assert {row["control"] for row in rows} == controls and all(row["connected"] for row in rows), rows
+            def reused():
+                result = subprocess.run(["ssh", "source", source_command(["hostname"])],
+                                        input=b"", capture_output=True, timeout=5)
+                return result.returncode == 0 and result.stdout == expected
+            wait_for("same master available after interrupted command", reused)
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+        else:
             run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
             ready()
     assert execute(["hostname"], ask=True)[0] == expected
@@ -444,3 +464,4 @@ assert 'does not match' in reply['Error'], reply
 finally:
     source_run(["persist", "off"])
     run("ssh", "source", "rm -rf -- " + shlex.quote(root))
+    run("ssh", "destination", "rm -rf -- " + shlex.quote(destination_root))

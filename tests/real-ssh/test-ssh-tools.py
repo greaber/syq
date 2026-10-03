@@ -24,20 +24,22 @@ def no_pending():
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 
 
-def connect():
+def connect(*, ask=True):
     args = ["env", NATIVE_PATH, "syq", "persist", "connect", "destination", "--auth-from", "@laptop"]
     process = subprocess.Popen(["ssh", "source", shlex.join(args)], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, start_new_session=True)
     try:
-        requests = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
-        assert len(requests) == 1, requests
-        request = requests[0]
-        assert request["kind"] == "ssh" and request["reusable"], request
-        assert request["destination"] == "syq@destination:22", request
-        assert "commands and copies" in request["permission"], request
-        run("syq", "persist", "receive", "approve", request["id"])
+        if ask:
+            requests = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
+            assert len(requests) == 1, requests
+            request = requests[0]
+            assert request["kind"] == "ssh" and request["reusable"], request
+            assert request["destination"] == "syq@destination:22", request
+            assert "commands and copies" in request["permission"], request
+            run("syq", "persist", "receive", "approve", request["id"])
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode == 0, (stdout, stderr)
+        no_pending()
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGTERM)
@@ -135,7 +137,7 @@ try:
     source("ssh", "-F", config, "destination", "true", success=False)
     source("syq", "persist", "ssh-config", "destination", success=False)
     no_pending()
-    connect()
+    connect(ask=False)
     source("ssh", "-F", config, "destination", "true", success=False)
     export(config)
     source("ssh", "-F", config, "destination", "true")

@@ -250,20 +250,21 @@ def no_pending():
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 
 
-def approve_account(host, allow=True):
+def approve_account(host, allow=True, *, ask=True):
     # Native ssh implements keeper termination directly; the lab tracing shell
     # wrapper deliberately remains outside this signal/lifetime test.
     command = shlex.join(["env", "PATH=/usr/bin:/bin:/usr/local/bin", "syq", "persist",
                           "connect", host, "--auth-from", "@laptop"])
     with running(command) as (process, output):
-        pending = json.loads(run("syq", "persist", "receive", "pending", "--json",
-                                 "--wait", "--timeout", "15"))
-        assert len(pending) == 1, pending
-        request = pending[0]
-        assert request["kind"] == "ssh" and request["reusable"], request
-        assert request["destination"] == "syq@" + host + ":22", request
-        assert "full authority" in request["permission"], request
-        run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
+        if ask:
+            pending = json.loads(run("syq", "persist", "receive", "pending", "--json",
+                                     "--wait", "--timeout", "15"))
+            assert len(pending) == 1, pending
+            request = pending[0]
+            assert request["kind"] == "ssh" and request["reusable"], request
+            assert request["destination"] == "syq@" + host + ":22", request
+            assert "full authority" in request["permission"], request
+            run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
         finish(process, output, success=allow)
     no_pending()
 
@@ -475,7 +476,7 @@ def main():
         assert len(rows) == 1 and rows[0]["connected"] and rows[0]["control"] == accounts["source"]["control"], rows
         assert requester("ssh", "--auth-from", "@laptop", "source", "--", "id -un").strip() == "syq"
         no_pending()
-        approve_account("destination")
+        approve_account("destination", ask=False)
         with copying("peer-loss", ("--no-tcp",), source="crash-data") as (process, output):
             finish(process, output)
         assert_results("peer-loss", crash_digest)
