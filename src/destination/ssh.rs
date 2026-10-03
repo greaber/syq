@@ -5,7 +5,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
-mod foreground;
+pub(super) mod foreground;
 mod master_lifetime;
 pub(crate) mod persistent;
 
@@ -112,7 +112,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let mode = crate::auth_from::resolve(&request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
     if let Some(mut command) = persistent::command(&request, &mode)? {
-        return foreground::run(&mut command, || false);
+        return foreground::run_cached(&mut command, || false);
     }
     anyhow::ensure!(
         !matches!(mode, AuthFrom::Return(_)),

@@ -96,6 +96,36 @@ for p in Path("/proc").iterdir():
         pass
 print(json.dumps(workers))
 ''',
+    "copy_processes": r'''
+from pathlib import Path
+import base64
+operand = base64.b64encode(v["destination"].encode()).decode().rstrip("=")
+processes = {}
+for p in Path("/proc").iterdir():
+    if not p.name.isdigit():
+        continue
+    try:
+        args = p.joinpath("cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+        stat = p.joinpath("stat").read_text().rsplit(") ", 1)[1].split()
+        processes[int(p.name)] = (args, int(stat[1]), stat[19])
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+copies = [pid for pid, (args, _, _) in processes.items()
+          if args and Path(args[0]).name == "syq" and "--delegated-operands-b64" in args
+          and operand in args]
+assert len(copies) == 1, "expected one delegated source copy"
+owned = []
+pid = copies[0]
+for _ in range(8):
+    args, parent, started = processes[pid]
+    owned.append([pid, started])
+    if args[-1:] == ["--peer-coordinator"]:
+        break
+    pid = parent
+else:
+    raise AssertionError("source copy has no peer coordinator parent")
+print(json.dumps(owned))
+''',
     "workers_exited": r'''
 from pathlib import Path
 active = []
@@ -141,8 +171,8 @@ def remote(host, command, **kwargs):
     return run("ssh", host, command, **kwargs)
 
 
-def probe(host, name, **values):
-    script = "import json, sys\nv = json.load(sys.stdin)\n" + PROBES[name]
+def probe(host, selector, **values):
+    script = "import json, sys\nv = json.load(sys.stdin)\n" + PROBES[selector]
     return json.loads(remote(host, "python3 -c " + shlex.quote(script), stdin=json.dumps(values)))
 
 
@@ -291,6 +321,9 @@ def main():
         assert len(rows) == 2 and all(row["connected"] for row in rows), rows
         assert requester("ssh", "--auth-from", "@laptop", "source", "--", "id -un").strip() == "syq"
         no_pending()
+        # A focused run may begin without this file; worker-key cleanup leaves
+        # an empty file, so establish the same baseline as the full suite.
+        remote("destination", "mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys")
         b_keys, c_keys = fingerprint("source"), fingerprint("destination")
         remote("source", "dd if=/dev/urandom of=" + shlex.quote(b + "/data")
                + " bs=1M count=8 status=none && chmod 444 " + shlex.quote(b + "/data"))
@@ -299,10 +332,13 @@ def main():
                         + " bs=1M count=1 status=none | sha256sum").split()[0]
         outside = c + "/outside-copy"
 
+        attempts = {}
+
         def copy_command(name, extra=(), auth=("--auth-from", "@laptop"), source="data"):
+            attempts[name] = attempts.get(name, 0) + 1
             argv = ["syq", "cp", "--from", "source", b + "/" + source, "--to", "destination",
                     "--as", c + "/" + name, *auth, "--performance-tuning", "workers=2",
-                    "--no-progress", "--results", a + "/" + name + ".ndjson", *extra]
+                    "--no-progress", "--results", f"{a}/{name}.{attempts[name]}.ndjson", *extra]
             command = ("test -z \"${SSH_AUTH_SOCK:-}\" && echo $$ > " + shlex.quote(a + "/pid")
                        + " && exec env PATH=/usr/bin:/bin:/usr/local/bin " + shlex.join(argv))
             # The recorded PID becomes syq itself. Killing timeout or a tracing
@@ -317,7 +353,7 @@ def main():
 
         def assert_results(name, expected_digest=expected):
             records = [json.loads(line) for line in remote("requester", "cat "
-                       + shlex.quote(a + "/" + name + ".ndjson")).splitlines()]
+                       + shlex.quote(f"{a}/{name}.{attempts[name]}.ndjson")).splitlines()]
             terminal = records[-1]
             assert terminal["type"] == "result" and terminal["status"] == "success", terminal
             assert terminal["provenance"] == "receiver_attested", terminal
@@ -400,8 +436,9 @@ def main():
             assert ticket
             workers = probe("source", "workers")
             assert workers, "crash copy has no direct B-to-C SSH worker"
+            owned = probe("source", "copy_processes", destination=c + "/crashed")
             assert probe("requester", "kill_requester", pidfile=a + "/pid", destination=c + "/crashed")
-            wait_for("direct workers after requester crash", lambda: probe("source", "workers_exited", workers=workers))
+            wait_for("copy and workers after requester crash", lambda: probe("source", "workers_exited", workers=workers + owned), timeout=5)
             wait_for("destination key cleanup after requester crash", lambda: fingerprint("destination") == c_keys)
             assert probe("destination", "late_worker", ticket=ticket)
             finish(process, output, success=False)
@@ -426,10 +463,11 @@ def main():
             wait_for("copy before destination connection loss", lambda: partial("peer-loss", crash_prefix))
             workers = probe("source", "workers")
             assert workers
+            owned = probe("source", "copy_processes", destination=c + "/peer-loss")
             remote("requester", shlex.join(["/usr/bin/ssh", "-F", "/dev/null", "-S", destination_account["control"],
                    "-o", "ControlMaster=no", "-o", "ProxyCommand=false", "-o", "BatchMode=yes",
                    "-l", endpoint["user"], "-p", str(endpoint["port"]), "-O", "exit", "--", endpoint["host"]]))
-            wait_for("direct workers after destination connection loss", lambda: probe("source", "workers_exited", workers=workers))
+            wait_for("copy and workers after destination connection loss", lambda: probe("source", "workers_exited", workers=workers + owned), timeout=5)
             finish(process, output, success=False)
         wait_for("destination key cleanup after connection loss", lambda: fingerprint("destination") == c_keys)
         remote("destination", "test ! -e " + shlex.quote(c + "/peer-loss"))
