@@ -99,7 +99,7 @@ For `rm`, `--performance-tuning workers=N` fixes the filesystem worker count;
 `--performance-tuning s3-requests=N` fixes the S3 deletion request count. For
 copies, the S3 request override and ceiling also apply during S3 pruning.
 Filesystem copy-worker settings apply to copying; filesystem pruning tunes its
-own workers. Deletion always finishes children before removing their parent
+own workers. Filesystem deletion finishes children before removing their parent
 directories.
 
 <a id="s3-streams"></a>
