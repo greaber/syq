@@ -919,14 +919,9 @@ fn attempt_small_copy(
         {
             continue;
         }
-        // This shortcut sends whole-file payloads. Multiple comparison blocks
-        // need the range engine to avoid retransmitting matching parts.
-        if entry.size > SMALL_COPY_MAX_FILE_BYTES
-            || (opts
-                .transfer_strategy
-                .reuse_destination_blocks(opts.same_host)
-                && entry.size > opts.block)
-        {
+        // The receiver decides whether an existing destination needs block
+        // reuse. New files can use this shortcut at any comparison block size.
+        if entry.size > SMALL_COPY_MAX_FILE_BYTES {
             return Ok(SmallCopy::Declined);
         }
         selected_sources.push(source.clone());
@@ -1006,10 +1001,10 @@ fn attempt_small_copy(
         })
         .collect();
     let request = SmallCopyRequest {
-        compare_contents: opts
+        reuse_block_size: opts
             .transfer_strategy
             .reuse_destination_blocks(opts.same_host)
-            || opts.protects_existing_contents(),
+            .then_some(opts.block),
         if_exists: args.if_exists.unwrap_or(crate::cli::IfExists::Update),
         matching_flags: opts.matching_flags,
         hash_policy: opts.hash_policy,
@@ -1155,6 +1150,17 @@ fn attempt_small_copy(
             if debug() {
                 crate::output::diagnostic!(
                     "syq: small copy: a destination is not a regular file; using the ordinary engine"
+                );
+            }
+            return Ok(SmallCopy::Declined);
+        }
+        Response::SmallFilesCopied(SmallCopyResponse {
+            outcome: SmallCopyOutcome::NeedsBlockReuse,
+            ..
+        }) if !prepared => {
+            if debug() {
+                crate::output::diagnostic!(
+                    "syq: small copy: an existing file needs block reuse; using the ordinary engine"
                 );
             }
             return Ok(SmallCopy::Declined);

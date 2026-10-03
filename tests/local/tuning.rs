@@ -88,6 +88,103 @@ fn small_remote_transfer_strategies_honor_replacement_and_reuse() {
 }
 
 #[test]
+fn small_remote_multiblock_files_keep_shortcut_when_no_reuse_is_needed() {
+    for strategy in [
+        None,
+        Some("whole-file"),
+        Some("aligned-block"),
+        Some("locality"),
+    ] {
+        for case in ["new", "unchanged", "mixed-unchanged", "mixed-changed"] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            t.expose_remote_syq();
+            fs::create_dir(t.path("destination")).unwrap();
+            let data = prng(200 << 10, 489);
+            for name in ["one", "two"] {
+                write(&t.path(&format!("source/{name}")), &data);
+                set_mtime(&t.path(&format!("source/{name}")), 1_700_000_001);
+                if case == "unchanged" || (case.starts_with("mixed") && name == "two") {
+                    let mut previous = data.clone();
+                    if case == "mixed-changed" {
+                        *previous.last_mut().unwrap() ^= 1;
+                    }
+                    write(&t.path(&format!("destination/{name}")), &previous);
+                    set_mtime(
+                        &t.path(&format!("destination/{name}")),
+                        if case == "mixed-changed" {
+                            1_700_000_000
+                        } else {
+                            1_700_000_001
+                        },
+                    );
+                }
+            }
+            let result = t.path("result.ndjson");
+            let connections = t.path("connections");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args([
+                    "cp",
+                    "--no-progress",
+                    "--performance-tuning=comparison-block-size=64K",
+                ])
+                .arg(t.path("source/one"))
+                .arg(t.path("source/two"))
+                .args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"])
+                .arg(&rsh)
+                .arg("--into")
+                .arg(t.path("destination"))
+                .arg("--results")
+                .arg(&result)
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", &connections)
+                .env("XDG_CACHE_HOME", t.path("cache"))
+                .env("SYQ_DEBUG", "1");
+            if let Some(strategy) = strategy {
+                command.args(["--transfer-strategy", strategy]);
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            for name in ["one", "two"] {
+                assert_eq!(read(&t.path(&format!("destination/{name}"))), data);
+            }
+            let shortcut = case != "mixed-changed" || strategy == Some("whole-file");
+            assert_eq!(
+                tuning_observed(&output)["native_small_copies"],
+                u64::from(shortcut),
+                "{strategy:?} {case}: {output:?}"
+            );
+            if shortcut {
+                assert_eq!(
+                    fs::read_to_string(&connections).unwrap().lines().count(),
+                    1,
+                    "{strategy:?} {case}: {output:?}"
+                );
+            }
+            let records = fs::read_to_string(&result).unwrap();
+            let summary: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            let transferred = match case {
+                "new" => 400 << 10,
+                "unchanged" => 0,
+                "mixed-unchanged" => 200 << 10,
+                "mixed-changed" if strategy == Some("whole-file") => 400 << 10,
+                "mixed-changed" => (200 + 8) << 10,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                summary["bytes_transferred"], transferred,
+                "{strategy:?} {case}: {summary}"
+            );
+            assert_eq!(summary["bytes_unchanged"], (400 << 10) - transferred);
+            assert!(partial_files(&t.path("destination")).is_empty());
+        }
+    }
+}
+
+#[test]
 fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
     for native in [false, true] {
         for remote in [false, true] {
