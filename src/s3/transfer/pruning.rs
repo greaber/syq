@@ -63,15 +63,26 @@ impl Engine {
                 let mut found = found;
                 let depth = |c: &Candidate| c.path.iter().filter(|&&b| b == b'/').count();
                 found.sort_by_key(|c| std::cmp::Reverse(depth(c)));
-                // This path previously deleted serially. Start with a small
-                // pool: many threads contend in a flat local directory, while
-                // slower destinations have time to earn more parallelism.
-                let mut deletion = crate::deletion::Batch::new(4);
+                // A flat directory starts serially to avoid local directory
+                // lock contention. Independent directories start with useful
+                // parallelism; measured throughput can grow either starting pool.
+                let parent = |c: &Candidate| c.path.iter().rposition(|&b| b == b'/');
+                let independent = found.first().is_some_and(|first| {
+                    let first_parent = &first.path[..parent(first).unwrap_or(0)];
+                    found
+                        .iter()
+                        .any(|c| &c.path[..parent(c).unwrap_or(0)] != first_parent)
+                });
+                let mut deletion = crate::deletion::Batch::new(if independent { 8 } else { 1 });
                 // Equal-depth entries are independent; finish children before
                 // admitting their parents and never remove a tree recursively.
                 for level in found.chunk_by(|a, b| depth(a) == depth(b)) {
-                    for chunk in level.chunks(1000) {
+                    let mut remaining = level;
+                    while !remaining.is_empty() {
                         engine.check_cancelled()?;
+                        let (chunk, rest) =
+                            remaining.split_at(remaining.len().min(deletion.chunk_size()));
+                        remaining = rest;
                         let results = deletion.run(
                             chunk,
                             |candidate| {

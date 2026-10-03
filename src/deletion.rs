@@ -149,6 +149,11 @@ impl Batch {
         }
     }
 
+    /// Keep the first samples bounded when starting with little parallelism.
+    pub fn chunk_size(&self) -> usize {
+        (self.control.limit() * 32).min(1000)
+    }
+
     pub fn run<T: Sync, R: Send>(
         &mut self,
         items: &[T],
@@ -162,6 +167,16 @@ impl Batch {
             return Ok(items.iter().map(work).collect());
         }
         let workers = self.control.limit().min(items.len());
+        if workers == 1 {
+            let start = Instant::now();
+            let results: Vec<_> = items.iter().map(work).collect();
+            self.control.observe(
+                results.iter().filter(|r| succeeded(r)).count() as u64,
+                start.elapsed(),
+                true,
+            );
+            return Ok(results);
+        }
         if self
             .pool
             .as_ref()
