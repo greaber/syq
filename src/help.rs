@@ -246,7 +246,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
             }
         };
         let mut arg = arg
-            .hide_short_help(!common && id != "exchange_strategy")
+            .hide_short_help(!common && id != "transfer_strategy")
             .help_heading(heading);
         // Keep detailed rsync semantics in the full reference.
         if rsync && matches!(id, "ignore" | "delete") {
@@ -292,7 +292,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
         | "as_fd" | "mapping" => ("Destination and mapping", 1),
         "if_exists" | "ignore_existing" | "existing" | "update" | "copy_if" | "inplace"
-        | "prune" | "max_delete" | "exchange_strategy" => ("Updates and deletion", 2),
+        | "prune" | "max_delete" | "transfer_strategy" => ("Updates and deletion", 2),
         "copy_metadata" | "sparse" | "open_noatime" | "follow" | "follow_src" | "follow_dst" => {
             ("Metadata and symlinks", 3)
         }

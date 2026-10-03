@@ -3270,7 +3270,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}{}",
                     opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
                     args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type,
-                    args.exchange_strategy.map(|strategy| format!(";exchange-strategy={}", strategy.as_str())).unwrap_or_default()
+                    args.transfer_strategy.map(|strategy| format!(";transfer-strategy={}", strategy.as_str())).unwrap_or_default()
                 ), transport_activity),
             );
             history.context(&key);

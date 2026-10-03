@@ -1045,38 +1045,54 @@ fn block_reuse_is_a_native_filesystem_control() {
 }
 
 #[test]
-fn exchange_strategy_preserves_automatic_tuning_and_existing_defaults() {
-    for (strategy, reuse) in [("whole-file", false), ("fixed-block", true)] {
-        let args = parse_native_copy(&argv(&[
-            "source",
-            "--as",
-            "destination",
-            "--exchange-strategy",
-            strategy,
-        ]))
-        .unwrap();
-        assert!(args.tuning_options.is_none());
-        assert!(args.connections_default);
-        for local in [false, true] {
-            assert_eq!(
-                args.transfer_tuning().reuse_destination_blocks(local),
-                reuse
-            );
+fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
+    for strategy in [
+        None,
+        Some("whole-file"),
+        Some("aligned-block"),
+        Some("locality"),
+    ] {
+        for native in [false, true] {
+            let mut command = if native {
+                argv(&["source", "--as", "destination"])
+            } else {
+                argv(&["source", "destination"])
+            };
+            if let Some(strategy) = strategy {
+                command.extend(argv(&["--transfer-strategy", strategy]));
+            }
+            let args = if native {
+                parse_native_copy(&command)
+            } else {
+                Args::parse_rsync(&command)
+            }
+            .unwrap();
+            assert!(args.tuning_options.is_none());
+            assert!(args.connections_default);
+            for local in [false, true] {
+                let reuse = match strategy {
+                    Some("whole-file") => false,
+                    Some("aligned-block") => true,
+                    _ => !local,
+                };
+                assert_eq!(
+                    args.transfer_tuning().reuse_destination_blocks(local),
+                    reuse,
+                    "{strategy:?} native={native} local={local}"
+                );
+            }
         }
     }
-    let args = parse_native_copy(&argv(&["source", "--as", "destination"])).unwrap();
-    assert!(args.transfer_tuning().reuse_destination_blocks(false));
-    assert!(!args.transfer_tuning().reuse_destination_blocks(true));
 }
 
 #[test]
-fn exchange_strategy_rejects_conflicting_and_nonfilesystem_controls() {
+fn transfer_strategy_rejects_conflicting_and_nonfilesystem_controls() {
     for legacy in ["auto", "on", "off"] {
         let error = parse_native_copy(&argv(&[
             "source",
             "--as",
             "destination",
-            "--exchange-strategy=whole-file",
+            "--transfer-strategy=whole-file",
             &format!("--performance-tuning=block-reuse={legacy}"),
         ]))
         .unwrap_err();
@@ -1087,8 +1103,8 @@ fn exchange_strategy_rejects_conflicting_and_nonfilesystem_controls() {
         vec!["--src-fd", "0", "--as", "destination"],
     ] {
         let mut command = extra;
-        command.push("--exchange-strategy=fixed-block");
+        command.push("--transfer-strategy=aligned-block");
         let error = parse_native_copy(&argv(&command)).unwrap_err();
-        assert!(error.to_string().contains("--exchange-strategy"), "{error}");
+        assert!(error.to_string().contains("--transfer-strategy"), "{error}");
     }
 }

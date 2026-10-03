@@ -97,7 +97,7 @@ In addition to the shared arguments above, it accepts:
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
-| `exchange_strategy` | `"whole-file"` or `"fixed-block"`; filesystem copies only; see [exchange strategies](https://greaber.github.io/syq/reference.html#choose-an-exchange-strategy) |
+| `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/reference.html#choose-a-transfer-strategy) |
 | `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8,s3-requests=16"`; omitted means automatic |
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |

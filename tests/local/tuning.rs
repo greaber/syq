@@ -1,11 +1,16 @@
 use super::*;
 
 #[test]
-fn exchange_strategies_select_payloads_for_local_and_remote_replacements() {
+fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
     for remote in [false, true] {
         for (strategy, transferred, unchanged) in [
             ("whole-file", 12 << 20, 0),
-            ("fixed-block", 4 << 20, 8 << 20),
+            ("aligned-block", 4 << 20, 8 << 20),
+            (
+                "locality",
+                if remote { 4 << 20 } else { 12 << 20 },
+                if remote { 8 << 20 } else { 0 },
+            ),
         ] {
             let t = Tmp::new();
             let rsh = fake_rsh(&t);
@@ -21,7 +26,7 @@ fn exchange_strategies_select_payloads_for_local_and_remote_replacements() {
                 for repeat in [false, true] {
                     let result = t.path(&format!("result-{hash}-{repeat}.ndjson"));
                     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-                    command.args(["cp", "--no-progress", "--exchange-strategy", strategy]);
+                    command.args(["cp", "--no-progress", "--transfer-strategy", strategy]);
                     command.arg(t.path("source"));
                     if remote {
                         command.args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"]);

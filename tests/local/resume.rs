@@ -336,7 +336,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     drop(f);
     let out = run_ok(&[
         "-a",
-        "--exchange-strategy=whole-file",
+        "--transfer-strategy=whole-file",
         "--block-size=1M",
         "--resource-limits=bandwidth=1G",
         "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",

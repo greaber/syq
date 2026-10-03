@@ -22,25 +22,28 @@ pub enum Placement {
     As,
 }
 
-/// How a filesystem copy exchanges the contents of selected files.
+/// How a filesystem copy transfers the contents of selected files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum ExchangeStrategy {
+pub enum TransferStrategy {
     /// Copy selected files without comparing blocks in the final destination.
     WholeFile,
-    /// Compare fixed-offset blocks and reuse matches from the final destination.
-    FixedBlock,
+    /// Reuse matching blocks at the same offsets in the corresponding destination file.
+    AlignedBlock,
+    /// Use whole-file locally and aligned-block with a remote syq endpoint.
+    Locality,
 }
 
-impl ExchangeStrategy {
+impl TransferStrategy {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::WholeFile => "whole-file",
-            Self::FixedBlock => "fixed-block",
+            Self::AlignedBlock => "aligned-block",
+            Self::Locality => "locality",
         }
     }
 }
 
-const EXCHANGE_STRATEGY_HELP: &str = "Choose how filesystem copies exchange file contents: whole-file copies selected files without reusing blocks from the final destination; fixed-block compares fixed-offset blocks and reuses matches. By default, local copies use whole-file and copies with a remote syq endpoint use fixed-block. Size/time skips, explicit content checks, and partial-file resume apply to both. Conflicts with performance-tuning block-reuse.";
+const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies. Conflicts with performance-tuning block-reuse.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
@@ -343,9 +346,9 @@ pub struct Args {
     pub block_size: u64,
     #[arg(skip)]
     pub block_size_explicit: bool,
-    /// Choose whole-file copying or reuse of matching fixed-offset blocks
-    #[arg(long, value_enum, value_name = "STRATEGY", long_help = EXCHANGE_STRATEGY_HELP)]
-    pub exchange_strategy: Option<ExchangeStrategy>,
+    /// Choose a file transfer strategy (default: locality)
+    #[arg(long, value_enum, value_name = "STRATEGY", long_help = TRANSFER_STRATEGY_HELP)]
+    pub transfer_strategy: Option<TransferStrategy>,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -779,14 +782,14 @@ impl Args {
             );
         }
 
-        if self.exchange_strategy.is_some() {
+        if self.transfer_strategy.is_some() {
             anyhow::ensure!(
                 !self.tuning_options.is_some_and(|t| t.block_reuse.is_some()),
-                "--exchange-strategy conflicts with performance-tuning block-reuse"
+                "--transfer-strategy conflicts with performance-tuning block-reuse"
             );
             anyhow::ensure!(
                 !self.rm && self.s3.is_none() && self.descriptor_copy.is_none(),
-                "--exchange-strategy requires a filesystem copy"
+                "--transfer-strategy requires a filesystem copy"
             );
         }
 
@@ -846,10 +849,11 @@ impl Args {
 
     pub(crate) fn transfer_tuning(&self) -> crate::transfer_tuning::TransferTuning {
         let mut tuning = self.tuning_options.unwrap_or_default();
-        if let Some(strategy) = self.exchange_strategy {
+        if let Some(strategy) = self.transfer_strategy {
             tuning.block_reuse = Some(match strategy {
-                ExchangeStrategy::WholeFile => crate::transfer_tuning::BlockReuse::Off,
-                ExchangeStrategy::FixedBlock => crate::transfer_tuning::BlockReuse::On,
+                TransferStrategy::WholeFile => crate::transfer_tuning::BlockReuse::Off,
+                TransferStrategy::AlignedBlock => crate::transfer_tuning::BlockReuse::On,
+                TransferStrategy::Locality => crate::transfer_tuning::BlockReuse::Auto,
             });
         }
         tuning
@@ -1230,9 +1234,9 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Choose whole-file copying or reuse of matching fixed-offset blocks
-    #[arg(long, value_enum, value_name = "STRATEGY", long_help = EXCHANGE_STRATEGY_HELP)]
-    exchange_strategy: Option<ExchangeStrategy>,
+    /// Choose a file transfer strategy (default: locality)
+    #[arg(long, value_enum, value_name = "STRATEGY", long_help = TRANSFER_STRATEGY_HELP)]
+    transfer_strategy: Option<TransferStrategy>,
     /// How to handle existing destination files; directories remain containers
     #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::Update)]
     if_exists: IfExists,
@@ -2922,7 +2926,7 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
-        exchange_strategy,
+        transfer_strategy,
         where_expression,
         copy_if,
         if_exists,
@@ -2949,7 +2953,7 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
-    args.exchange_strategy = exchange_strategy;
+    args.transfer_strategy = transfer_strategy;
     args.if_exists = Some(if_exists);
     args.ignore_existing = if_exists == IfExists::Keep;
     anyhow::ensure!(

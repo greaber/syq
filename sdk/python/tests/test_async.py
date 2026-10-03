@@ -265,10 +265,10 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(stream.cwd, home / "selected")
 
-    async def test_cp_forwards_exchange_strategy(self) -> None:
-        await self.client.cp("source", into="destination", exchange_strategy="fixed-block")
+    async def test_cp_forwards_transfer_strategy(self) -> None:
+        await self.client.cp("source", into="destination", transfer_strategy="aligned-block")
         argv = self.argv()
-        self.assertEqual(argv[argv.index("--exchange-strategy") + 1], "fixed-block")
+        self.assertEqual(argv[argv.index("--transfer-strategy") + 1], "aligned-block")
         self.assertNotIn("--performance-tuning", argv)
 
     async def test_s3_to_s3_dry_run_needs_no_coordinator_override(self) -> None:

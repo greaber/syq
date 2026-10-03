@@ -175,26 +175,26 @@ applies to individual selected entries.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
-## Choose an exchange strategy
+## Choose a transfer strategy
 
-`--exchange-strategy` chooses how filesystem copies exchange the contents of
+`--transfer-strategy` chooses how filesystem copies transfer the contents of
 files selected for copying. It is available in `syq cp` and `syq rsync`.
 
 | Strategy | Behavior |
 |---|---|
 | `whole-file` | Copy the selected file without comparing or reusing blocks from the final destination |
-| `fixed-block` | Compare fixed-offset blocks and reuse matching destination blocks; shifted blocks are not matched |
+| `aligned-block` | Reuse matching blocks at the same offsets in the corresponding destination file; shifted blocks and blocks from other files are not matched |
+| `locality` (default) | Use `whole-file` for local copies and `aligned-block` when a syq endpoint is remote |
 
-By default, local copies use `whole-file`, including copies through mounted
-network filesystems. Copies with a remote syq endpoint use `fixed-block`.
-To choose explicitly:
+`locality` treats paths on mounted network filesystems as local. It chooses by
+endpoint location, without measuring link or filesystem speed. To choose explicitly:
 
 ```sh
 syq cp --srcs-in source --to server --into destination \
-  --exchange-strategy whole-file
+  --transfer-strategy whole-file
 ```
 
-Both strategies keep size/time skips, explicit `--hash` comparisons, integrity
+All strategies keep size/time skips, explicit `--hash` comparisons, integrity
 checks, and partial-file resume. Changed files use atomic replacement unless
 `--inplace` is selected. The strategy does not fix worker counts or request
 sizes; automatic tuning remains enabled.

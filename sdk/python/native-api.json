@@ -60,7 +60,7 @@
         "integrity-checking",
         "where",
         "copy-if",
-        "exchange-strategy"
+        "transfer-strategy"
       ],
       "internal": [
         "delegated-operands-b64",

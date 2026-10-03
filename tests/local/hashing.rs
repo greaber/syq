@@ -129,7 +129,7 @@ fn hash_policy_independent_hashes_reuse_unchanged_blocks() {
             &t.s("src/source"),
             "--as",
             &t.s("destination"),
-            "--exchange-strategy=fixed-block",
+            "--transfer-strategy=aligned-block",
             "--performance-tuning=workers=1,copy-path=ranges",
             &format!("--integrity-checking=compare={compare},transfer={transfer}"),
             "--results",

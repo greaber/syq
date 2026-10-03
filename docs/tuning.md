@@ -24,7 +24,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
-| `block-reuse` | `auto` | Legacy strategy override: `auto`, `on` or `off`; prefer `--exchange-strategy` |
+| `block-reuse` | `auto` | Legacy strategy override: `auto`, `on` or `off`; prefer `--transfer-strategy` |
 | `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
@@ -177,15 +177,15 @@ and whole-file shortcuts, including local kernel copying and APFS cloning.
 
 ### Compare block reuse with full replacement
 
-Choose `--exchange-strategy=fixed-block` or `whole-file` to compare block reuse
-with full replacement. See [exchange strategies](reference.md#choose-an-exchange-strategy)
+Choose `--transfer-strategy=aligned-block` or `whole-file` to compare block reuse
+with full replacement. See [transfer strategies](reference.md#choose-a-transfer-strategy)
 for defaults and interactions. The older `block-reuse=on` and `off` tuning
-values select the same behavior; `auto` keeps the placement-based default.
-Do not combine that tuning key with `--exchange-strategy`.
+values select the same behavior; `auto` selects the `locality` strategy.
+Do not combine that tuning key with `--transfer-strategy`.
 
 ```sh
 syq cp --srcs-in source --into destination \
-  --exchange-strategy fixed-block
+  --transfer-strategy aligned-block
 ```
 
 Size/time quick checks still skip completed files. Explicit `--hash` (or rsync
@@ -211,8 +211,8 @@ count increases this memory cost.
 
 This setting does not select a sequential writer. To isolate comparison and
 reuse costs while keeping range transfers, compare
-`--performance-tuning=copy-path=ranges --exchange-strategy=fixed-block`
-with `--performance-tuning=copy-path=ranges --exchange-strategy=whole-file`.
+`--performance-tuning=copy-path=ranges --transfer-strategy=aligned-block`
+with `--performance-tuning=copy-path=ranges --transfer-strategy=whole-file`.
 Restore the same initial destination before each run and keep worker counts,
 request sizes and cache preparation identical. Leave `--inplace` unchanged too:
 normal staging must populate a new file, whereas in-place updates can leave
