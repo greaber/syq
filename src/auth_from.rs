@@ -122,12 +122,15 @@ fn read(path: &Path) -> Result<Config> {
     Ok(config)
 }
 fn load() -> Result<Config> {
-    path()
-        .map(|path| read(&path))
-        .unwrap_or_else(|| Ok(Config::default()))
-        .context(
-            "read saved authorization choice; repair auth-from.json or pass --auth-from explicitly",
-        )
+    let Some(path) = path() else {
+        return Ok(Config::default());
+    };
+    read(&path).with_context(|| {
+        format!(
+        "read saved authorization choice from {}; repair this file or pass --auth-from explicitly",
+        path.display(),
+    )
+    })
 }
 
 /// Explicit flags bypass disk reads, including `auto`. Preference lookup uses
@@ -167,7 +170,7 @@ fn update(path: &Path, host: Option<&str>, value: Option<&AuthFrom>) -> Result<C
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent)?;
+        .open(parent).with_context(|| format!("open authorization configuration directory {}; use a real directory, not a symlink", parent.display()))?;
     // A read-modify-write changes one override while preserving concurrent
     // changes made by another `persist auth-from` command.
     loop {

@@ -44,6 +44,11 @@ runner() {
     test -r /run/lab/id_ed25519
     install -d -m 0700 -o syq -g syq /home/syq/.ssh
     install -m 0600 -o syq -g syq /run/lab/id_ed25519 /home/syq/.ssh/id_ed25519
+    # Bind-mounted ownership comes from the runner host and may match another
+    # container account. Only root may traverse the original private-key mount;
+    # the laptop account uses its correctly owned installed copy above.
+    chown root:root /run/lab
+    chmod 0700 /run/lab
     if [ "${SYQ_REAL_SSH_SUITE:-core}" = core ]; then
         # A separate unprivileged requester on the runner gives bridge tests
         # four roles without another container or access to the laptop's key.

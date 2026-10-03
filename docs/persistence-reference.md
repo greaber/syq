@@ -40,8 +40,8 @@ add `--for HOST` to show that host's effective choice.
 Defaults apply to `syq ssh`, copies using approved account connections, and the
 SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
 using `--coordinate-at local` selects access separately for each endpoint.
-Creating reusable account access with `persist connect` always requires an
-explicit `--auth-from @NAME`. Custom `--rsh` routes, explicit persistence
+Selecting `@NAME` lets a command request account access when it has no approved
+connection. `persist connect --auth-from @NAME` can prepare that access in advance. Custom `--rsh` routes, explicit persistence
 scopes, copies to receiving names, and object storage keep their own
 authentication. The setting works independently of `persist on`
 and `off`. It is saved in `auth-from.json` alongside `persistence.json`; older
@@ -50,18 +50,20 @@ file or pass `--auth-from` explicitly for that command.
 
 ## Approved account connections
 
-`syq persist connect HOST --auth-from @NAME` enables persistence and requests
-reusable SSH account access. It does not install a syq helper or enable
-receiving on `HOST`. Helper and `--pscope` overrides do not apply to this mode.
-Readiness means the approved SSH master accepts sessions. A failed or denied
-connection leaves persistence enabled; use `syq persist off` to disable it.
+Commands selecting `@NAME` request an approved account connection when needed.
+`syq persist connect HOST --auth-from @NAME` prepares the same connection in
+advance. Neither operation enables ordinary persistence or receiving on `HOST`.
+Helper and `--pscope` overrides do not apply to `persist connect` in this mode;
+`--timeout` is for native receiving setup and is rejected with `--auth-from`.
+Readiness means the approved SSH connection accepts sessions.
 
 `persist status --json` adds an `authorized_ssh` array alongside the usual
 `connections`. Each entry contains the authorizer name, requested and resolved
 endpoints, `control` socket path, and `connected` state. A matching receiving
 name, login, typed host/alias, and port selects the same approved login.
-A dead master detected before command execution requires fresh approval; a
-failure after execution starts ends that command without a retry.
+A closed connection can request another login under the current session or
+remembered permission. A failure after execution starts ends that command
+without retrying it.
 
 Copies can reuse the login with `auto` or the matching `@NAME`, including SSH
 data in either direction with `--no-tcp`. Copies between this machine and one
@@ -72,14 +74,14 @@ servers can use approved connections to both endpoints and give the source only
 An explicit `--coordinate-at local` can also reuse account connections for both
 endpoints. Custom shell routes, explicit persistence scopes, and detached copies
 keep their separate connection requirements.
-Without an approved login, eligible native copies use the usual per-copy
-authorization path and its restrictions.
+Without an approved login, `@NAME` requests account access. With `auto`,
+eligible native copies can use restricted per-copy approval after a native SSH
+failure.
 
-`rsync`, `rm`, `map`, `clean-partials`, and descriptor copies also reuse account access. Selecting
-`@NAME` for these commands requires an existing login from
-`persist connect HOST --auth-from @NAME`; it never requests broader account
-permission on behalf of a file operation. Remote path completion follows the
-same choice, but only uses existing approval and never prompts for access.
+`rsync`, `rm`, `map`, `clean-partials`, and descriptor copies also request or
+reuse account access selected through `@NAME`. The laptop prompt grants the
+account's authority, not permission for only the displayed operation. Remote
+path completion uses existing approval and never prompts for access.
 
 SSH data through one approved account connection shares the server's session
 limit with its control connection and any other tools using that login. Leave
@@ -92,8 +94,8 @@ SSH login when the session limit is reached.
 `syq persist ssh-config HOST [--auth-from auto|ssh|@NAME]` prints a standalone
 OpenSSH configuration for one existing approved login. Use it with `ssh`,
 `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.
-The endpoint must match the user, host spelling, and port used by
-`persist connect`; the configuration then supplies the laptop-resolved host,
+The endpoint must match the user, host spelling, and port used to open
+the approved connection; the configuration then supplies the laptop-resolved host,
 account, and port. It never requests approval or opens a login. Native-only
 `ssh` selection cannot export approved account access.
 
@@ -103,15 +105,47 @@ socket. Missing or closed connections fail without attempting other
 authentication. Export again after reconnecting. The output contains no private
 key; syq writes only a temporary socket alias inside the connection's scope.
 
-These connections have separate temporary scopes and an `authorized-ssh-v1`
-index under syq's runtime directory. Existing persistence settings and endpoint
-records retain their formats. Older syq versions ignore the new index in
-`persist status`. Their `persist off` still ends these connections because
-the process keeping each connection open observes the disabled setting.
-Copies between two other servers also need the trusted host information saved
-with the approved connection. A connection opened by a build that did not save
-this information still works for ordinary commands; reconnect it to use this
-copy route.
+Connection records live in syq's temporary runtime directory, separately from
+ordinary SSH connections. Existing records remain readable; new session state
+does not change saved persistence settings. Use a current syq client to close
+these connections: older clients may not manage account connections opened
+while ordinary persistence is off.
+
+Copies between two other servers need the trusted host information saved with
+the approved connection. A connection opened by a build that did not save it
+still works for ordinary commands; reconnect it to use this copy route.
+
+## Account permissions
+
+The laptop asks before granting access from a source server account to a
+destination account. **Allow** lasts for its current receiving connection to
+the source. **Remember** saves that permission for later connections through
+the same profile. Both accounts, resolved endpoints, and trusted host keys are
+part of the permission; changing them requires approval again. Permission is
+shared by processes running as the requesting account.
+
+For a pending account request, use the desktop controls or decide locally:
+
+```sh
+syq persist receive approve REQUEST_ID
+syq persist receive approve REQUEST_ID --remember
+syq persist receive deny REQUEST_ID
+syq persist receive permissions list
+syq persist receive permissions list --json
+syq persist receive permissions remove PERMISSION_ID
+```
+
+`--remember` is accepted only for account-access requests. Removing a remembered
+permission makes future authentication requests ask again. Existing authenticated
+connections may continue. Session permission ends when the laptop's receiving
+connection closes. Stopping receiving prevents further authorization through
+that connection; [account access](security.md#ssh-account-access) explains its limits.
+
+Remembered permissions are stored on the laptop separately from receiving and
+persistence settings. Older versions leave them untouched and do not use them.
+An unreadable or unknown permission format reports its path and requires repair
+or a matching version. New account requests need a receiving helper that
+supports account approval; update syq on the laptop and reconnect if necessary.
 
 ## Names and profiles
 

@@ -1,4 +1,4 @@
-//! Direct server-to-server copies using already approved account connections.
+//! Direct server-to-server copies using approved account connections.
 //! The coordinator receives only one copy's peer control and worker admission.
 use super::*;
 use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
@@ -37,8 +37,8 @@ fn requested(location: &Location) -> NativeEndpoint {
     }
 }
 
-/// This path never creates account authority. Missing automatic selections
-/// leave the ordinary native route unchanged; an explicit authorizer fails closed.
+/// An explicitly selected authorizer may approve each endpoint account. Auto
+/// only reuses existing sessions; it never creates account authority here.
 pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     let Some((destination, sources)) = args.locations.split_last() else {
         return Ok(None);
@@ -48,6 +48,7 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     };
     if args.interface != Interface::NativeCp
         || args.restricted_grant.is_some()
+        || args.receiver_receipt.is_some()
         || args.coordinate_at == CoordinateAt::Local
         || !source.is_remote()
         || !destination.is_remote()
@@ -86,8 +87,8 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
         anyhow::ensure!(!named, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh, --pscope, and --detach are not supported");
         return Ok(None);
     }
-    let coordinator = ssh::persistent::select_cached(&requested(source), &source_mode)?;
-    let peer = ssh::persistent::select_cached(&requested(destination), &destination_mode)?;
+    let coordinator = ssh::persistent::select_or_connect(&requested(source), &source_mode)?;
+    let peer = ssh::persistent::select_or_connect(&requested(destination), &destination_mode)?;
     match (coordinator, peer) {
         (Some(coordinator), Some(peer)) => Ok(Some(Selection {
             coordinator: Arc::new(coordinator),
@@ -96,7 +97,7 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
         _ if matches!(source_mode, AuthFrom::Return(_))
             || matches!(destination_mode, AuthFrom::Return(_)) =>
         {
-            bail!("direct server-to-server copying needs approved account connections for both endpoints; run syq persist connect ENDPOINT --auth-from @NAME for each endpoint first")
+            bail!("direct server-to-server copying through a laptop needs account access for both endpoints; select --auth-from @NAME for both, or save an authorizer for each endpoint")
         }
         _ => Ok(None),
     }

@@ -4,6 +4,12 @@ use std::sync::OnceLock;
 
 const HANDOFF: &str = "--return-handoff-v1";
 static ACCEPTED: OnceLock<Guard> = OnceLock::new();
+static ACCOUNT_PREFLIGHT_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn finish_account_preflight() {
+    ACCOUNT_PREFLIGHT_DONE.store(true, std::sync::atomic::Ordering::Release);
+}
 // Process-local timing only: keep the released argv guard and registration
 // formats unchanged. CLOCK_MONOTONIC has the same origin across a local exec.
 const COPY_START_ENV: &str = "SYQ_RETURN_COPY_START_NS";
@@ -42,6 +48,7 @@ pub(super) enum Kind {
     Command,
     Ssh,
     SshPersistent,
+    Account,
 }
 
 #[derive(Clone)]
@@ -134,19 +141,17 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     }
     let guard: Guard = serde_json::from_slice(encoded.as_bytes())?;
     let command = argv.get(3).and_then(|arg| arg.to_str());
-    if !matches!(
-        (guard.kind, command),
-        (Kind::Copy | Kind::Forward | Kind::Pull, Some("cp"))
-            | (Kind::Command, Some("exec"))
-            | (Kind::Ssh, Some("ssh"))
-            | (Kind::SshPersistent, Some("persist"))
+    if !accepts_command(
+        guard.kind,
+        command,
+        argv.get(4).and_then(|arg| arg.to_str()),
     ) {
         bail!("invalid return handoff command");
     }
-    if guard.kind == Kind::SshPersistent && argv.get(4).is_none_or(|arg| arg != "connect") {
-        bail!("invalid persistent SSH handoff command");
-    }
-    if matches!(guard.kind, Kind::Copy | Kind::Forward | Kind::Pull) {
+    if matches!(
+        guard.kind,
+        Kind::Copy | Kind::Forward | Kind::Pull | Kind::Account
+    ) {
         if let Some(start) = inherited_start.and_then(|value| value.parse().ok()) {
             let _ = COPY_START.set(start);
         }
@@ -156,6 +161,29 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
         .map_err(|_| anyhow::anyhow!("return handoff already accepted"))?;
     argv.drain(1..3);
     Ok(argv)
+}
+
+fn accepts_command(kind: Kind, command: Option<&str>, subcommand: Option<&str>) -> bool {
+    match (kind, command) {
+        (Kind::Copy | Kind::Forward | Kind::Pull, Some("cp"))
+        | (Kind::Command, Some("exec"))
+        | (Kind::Ssh, Some("ssh"))
+        | (Kind::Account, Some("ssh" | "cp" | "rm" | "rsync" | "map" | "clean-partials")) => true,
+        (Kind::SshPersistent | Kind::Account, Some("persist")) => subcommand == Some("connect"),
+        _ => false,
+    }
+}
+
+pub(crate) fn validate_account_selection(mode: &crate::cli::AuthFrom) -> Result<()> {
+    let Some(guard) = ACCEPTED.get().filter(|guard| guard.kind == Kind::Account) else {
+        return Ok(());
+    };
+    guard.validate()?;
+    anyhow::ensure!(
+        matches!(mode, crate::cli::AuthFrom::Return(name) if *name == guard.name),
+        "account authorizer changed during handoff; retry the command"
+    );
+    Ok(())
 }
 
 pub(super) fn selected_name(kind: Kind) -> Option<&'static str> {
@@ -206,6 +234,18 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
             .is_ok_and(|output| output.status.success());
         if !supported {
             bail!("the registered helper for @{} does not support source authorization; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+        }
+    }
+    if selection.kind == Kind::Account {
+        anyhow::ensure!(!ACCOUNT_PREFLIGHT_DONE.load(std::sync::atomic::Ordering::Acquire),
+            "receiving connection changed after account preflight; retry the command to use its matching helper");
+        let supported = Command::new(program)
+            .arg("--account-ssh-probe")
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .capture_output()
+            .is_ok_and(|output| output.status.success());
+        if !supported {
+            bail!("the registered helper for @{} does not support account authorization; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
         }
     }
     if matches!(selection.kind, Kind::Ssh | Kind::SshPersistent) {
@@ -261,18 +301,48 @@ pub(crate) fn copy(
             bail!("hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by named or receiving destinations");
         }
         maybe_exec(selection)?;
-    } else if ACCEPTED.get().is_some() {
+    } else if ACCEPTED
+        .get()
+        .is_some_and(|guard| guard.kind != Kind::Account)
+    {
         bail!("return route disappeared during handoff; retry the command");
     }
     // Some(None) records ordinary SSH/local copying; prepare must not discover
     // a different authorizer after output files or stdin have been consumed.
     args.return_selection = Some(selection);
+    finish_account_preflight();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_handoff_accepts_operations_but_never_other_persistence_actions() {
+        for command in ["ssh", "cp", "rm", "rsync", "map", "clean-partials"] {
+            assert!(accepts_command(Kind::Account, Some(command), None));
+        }
+        assert!(accepts_command(
+            Kind::Account,
+            Some("persist"),
+            Some("connect")
+        ));
+        for command in ["exec", "completion", "--self-update", "unknown"] {
+            assert!(!accepts_command(Kind::Account, Some(command), None));
+        }
+        for action in [
+            None,
+            Some("off"),
+            Some("receive"),
+            Some("auth-from"),
+            Some("ssh-config"),
+        ] {
+            assert!(!accepts_command(Kind::Account, Some("persist"), action));
+        }
+        assert!(!accepts_command(Kind::Copy, Some("rm"), None));
+        assert!(!accepts_command(Kind::Command, Some("ssh"), None));
+    }
 
     #[test]
     fn existing_handoff_guard_json_remains_readable_and_unchanged() {

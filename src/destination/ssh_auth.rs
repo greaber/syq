@@ -10,6 +10,8 @@ pub(super) enum Mode {
     #[default]
     Once,
     Persistent,
+    /// Reusable destination-account approval; the shown command is context only.
+    Account,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,25 +87,21 @@ impl Drop for Session {
     }
 }
 
-pub(crate) fn authorize(request: &ssh::SessionRequest) -> Result<Session> {
-    authorize_mode(request, Mode::Once, None)
-}
-
-pub(crate) fn prepare_persistent(request: &ssh::SessionRequest) -> Result<()> {
+pub(crate) fn prepare_account(request: &ssh::SessionRequest) -> Result<()> {
     let selection = handoff::Selection::new(
         request.authorizer.clone(),
         load_registration(&request.authorizer)?,
-        handoff::Kind::SshPersistent,
+        handoff::Kind::Account,
         None,
     );
     handoff::maybe_exec(&selection)
 }
 
-pub(crate) fn authorize_persistent(
+pub(crate) fn authorize_account(
     request: &ssh::SessionRequest,
     command: Vec<Vec<u8>>,
 ) -> Result<Session> {
-    authorize_mode(request, Mode::Persistent, Some(command))
+    authorize_mode(request, Mode::Account, Some(command))
 }
 
 fn authorize_mode(
@@ -115,17 +113,17 @@ fn authorize_mode(
     let selection = handoff::Selection::new(
         request.authorizer.clone(),
         load_registration(&request.authorizer)?,
-        if mode == Mode::Once {
-            handoff::Kind::Ssh
-        } else {
-            handoff::Kind::SshPersistent
+        match mode {
+            Mode::Once => handoff::Kind::Ssh,
+            Mode::Persistent => handoff::Kind::SshPersistent,
+            Mode::Account => handoff::Kind::Account,
         },
         None,
     );
     if mode == Mode::Once {
         handoff::maybe_exec(&selection)?;
     } else if selection.registration.identity != crate::identity::build() {
-        bail!("receiving connection changed while starting the persistent SSH login; retry persist connect");
+        bail!("receiving connection changed while starting the SSH login; retry the command");
     }
     crate::output::diagnostic!(
         "syq: requesting SSH account access from @{}; approve on that machine",
@@ -273,6 +271,18 @@ impl Receiver {
                 ssh::parse_for_approval(&command, &self.name)?
             }
             Mode::Persistent => crate::persistence::parse_account_connect(&command, &self.name)?,
+            Mode::Account => {
+                // Full account authority is approved against the resolved endpoint below.
+                // Remote command text describes intent; it cannot constrain an SSH login.
+                let parsed = ssh::SessionRequest {
+                    authorizer: self.name.clone(),
+                    destination: request.target.clone(),
+                    tty: ssh::Tty::Disabled,
+                    command: Vec::new(),
+                };
+                ssh::validate_endpoint(&request.target)?;
+                parsed
+            }
         };
         if parsed.destination != request.target || parsed.authorizer != self.name {
             bail!("SSH destination or authorizer does not match the shown command");
@@ -281,16 +291,16 @@ impl Receiver {
             .request_lock
             .try_lock()
             .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))?;
-        let count = self.exec_count.fetch_add(1, Ordering::AcqRel);
+        let count = self.ssh_count.fetch_add(1, Ordering::AcqRel);
         struct Slot<'a>(&'a AtomicU64);
         impl Drop for Slot<'_> {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        let _slot = Slot(&self.exec_count);
-        if count >= 8 {
-            bail!("too many active SSH sessions or commands");
+        let _slot = Slot(&self.ssh_count);
+        if count >= 64 {
+            bail!("too many active approved SSH connections");
         }
         let (generation, _tracked) = {
             let _sessions = self.sessions.lock().unwrap();
@@ -305,26 +315,73 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        let policy = crate::agent_broker::resolve_host_policy_at(
+        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
             "ssh",
             request.target.user.as_deref(),
             &request.target.host,
             request.target.port,
+            Instant::now() + Duration::from_secs(30),
+            &cancelled,
         )?;
         let endpoint = NativeEndpoint {
             user: Some(policy.login_user.clone()),
             host: policy.connection_host().into(),
             port: Some(policy.port()),
         };
-        self.approvals.request_ssh(
-            &self.requester,
-            &request.command,
-            &request.cwd,
-            &endpoint,
-            request.mode == Mode::Persistent,
-            self.notifications,
-            cancelled,
-        )?;
+        if request.mode == Mode::Account {
+            let source = self
+                .account_source
+                .lock()
+                .unwrap()
+                .clone()
+                .map_err(anyhow::Error::msg)?;
+            let destination = crate::receive_approval::AccountIdentity::new(
+                endpoint.clone(),
+                policy.pinned_host_key_fingerprints(),
+            )?;
+            let permission = crate::receive_approval::AccountPermission::new(
+                self.name.clone(),
+                source,
+                destination,
+            )?;
+            let key = permission.id();
+            let session_approved = self
+                .account_sessions
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|approved_generation| *approved_generation == generation);
+            if !session_approved && !crate::receive_approval::accounts::remembered(&permission)? {
+                let decision = self.approvals.request_account(
+                    &self.requester,
+                    &request.command,
+                    &request.cwd,
+                    &permission,
+                    self.notifications,
+                    cancelled,
+                )?;
+                if cancelled() {
+                    bail!("SSH request disconnected before authorization");
+                }
+                if decision == crate::receive_approval::AccountDecision::Session {
+                    self.account_sessions
+                        .lock()
+                        .unwrap()
+                        .insert(key, generation);
+                }
+            }
+        } else {
+            // Older account invocations keep their explicit one-login approval.
+            self.approvals.request_ssh(
+                &self.requester,
+                &request.command,
+                &request.cwd,
+                &endpoint,
+                request.mode == Mode::Persistent,
+                self.notifications,
+                cancelled,
+            )?;
+        }
         if cancelled() {
             bail!("SSH request disconnected before authorization");
         }

@@ -1,0 +1,389 @@
+//! Remembered account permissions are local policy, separate from receiving
+//! settings and account connection indexes used by older syq versions.
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+
+const VERSION: u16 = 1;
+const MAX_STATE: usize = 512 * 1024;
+
+/// Construct only from the laptop's resolved SSH policy. A requesting server
+/// cannot choose the endpoint or trusted host keys used for this identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AccountIdentity {
+    pub endpoint: crate::cli::NativeEndpoint,
+    pub host_keys: Vec<String>,
+}
+impl AccountIdentity {
+    pub(crate) fn new(
+        endpoint: crate::cli::NativeEndpoint,
+        mut host_keys: Vec<String>,
+    ) -> Result<Self> {
+        host_keys.sort();
+        host_keys.dedup();
+        let identity = Self {
+            endpoint,
+            host_keys,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+    fn validate(&self) -> Result<()> {
+        crate::destination::ssh::validate_endpoint(&self.endpoint)?;
+        anyhow::ensure!(
+            self.endpoint
+                .user
+                .as_ref()
+                .is_some_and(|user| !user.is_empty())
+                && self.endpoint.port.is_some(),
+            "account permission requires a resolved SSH login and port"
+        );
+        anyhow::ensure!(
+            !self.host_keys.is_empty() && self.host_keys.len() <= 128,
+            "account permission requires bounded trusted host-key identities"
+        );
+        for key in &self.host_keys {
+            anyhow::ensure!(
+                key.len() <= 128 && key.starts_with("SHA256:"),
+                "invalid trusted host-key fingerprint"
+            );
+            key.parse::<ssh_key::Fingerprint>()
+                .context("invalid trusted host-key fingerprint")?;
+        }
+        anyhow::ensure!(
+            self.host_keys.windows(2).all(|keys| keys[0] < keys[1]),
+            "account permission host-key identities are not canonical"
+        );
+        Ok(())
+    }
+    pub(crate) fn label(&self) -> String {
+        let host = if self.endpoint.host.contains(':') {
+            format!("[{}]", self.endpoint.host)
+        } else {
+            self.endpoint.host.clone()
+        };
+        format!(
+            "{}@{host}:{}",
+            self.endpoint.user.as_deref().unwrap_or(""),
+            self.endpoint.port.unwrap_or(22)
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AccountPermission {
+    pub profile: String,
+    pub source: AccountIdentity,
+    pub destination: AccountIdentity,
+}
+impl AccountPermission {
+    pub(crate) fn new(
+        profile: String,
+        source: AccountIdentity,
+        destination: AccountIdentity,
+    ) -> Result<Self> {
+        let permission = Self {
+            profile,
+            source,
+            destination,
+        };
+        permission.validate()?;
+        Ok(permission)
+    }
+    fn validate(&self) -> Result<()> {
+        crate::destination::validate_name(&self.profile)?;
+        self.source.validate()?;
+        self.destination.validate()
+    }
+    pub(crate) fn id(&self) -> String {
+        // The canonical v1 identity includes every authority-bearing field.
+        blake3::hash(&serde_json::to_vec(self).expect("account identity serializes"))
+            .to_hex()
+            .to_string()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RememberedPermission {
+    pub id: String,
+    pub permission: AccountPermission,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct State {
+    version: u16,
+    permissions: Vec<RememberedPermission>,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            permissions: Vec::new(),
+        }
+    }
+}
+fn path() -> Result<PathBuf> {
+    Ok(crate::receive_service::config_path()?.with_file_name("account-permissions-v1.json"))
+}
+fn read(path: &Path) -> Result<State> {
+    let bytes = match crate::delegation::read_private_regular(path, "remembered account permissions", MAX_STATE) {
+        Ok(bytes) => bytes,
+        Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => return Ok(State::default()),
+        Err(error) => return Err(error).with_context(|| format!("read remembered account permissions {}; repair the file before authorizing accounts", path.display())),
+    };
+    let state: State = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse remembered account permissions {}; repair the file before authorizing accounts",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        state.version == VERSION,
+        "unsupported remembered account permissions version {} in {}; use a matching syq version",
+        state.version,
+        path.display()
+    );
+    let mut ids = std::collections::BTreeSet::new();
+    for item in &state.permissions {
+        item.permission.validate().with_context(|| {
+            format!("invalid remembered account permission in {}; repair the file before authorizing accounts", path.display())
+        })?;
+        anyhow::ensure!(
+            item.id == item.permission.id() && ids.insert(&item.id),
+            "invalid or duplicate remembered account permission in {}",
+            path.display()
+        );
+    }
+    Ok(state)
+}
+
+pub(crate) fn remembered(permission: &AccountPermission) -> Result<bool> {
+    permission.validate()?;
+    Ok(read(&path()?)?
+        .permissions
+        .iter()
+        .any(|item| item.permission == *permission))
+}
+pub(crate) fn list() -> Result<Vec<RememberedPermission>> {
+    Ok(read(&path()?)?.permissions)
+}
+pub(crate) fn remember(permission: &AccountPermission) -> Result<()> {
+    update(&path()?, Some(permission), None)
+}
+pub(crate) fn remove(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "use the complete permission ID from syq persist receive permissions list"
+    );
+    update(&path()?, None, Some(id))
+}
+fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) -> Result<()> {
+    if let Some(permission) = add {
+        permission.validate()?;
+    }
+    let parent = path
+        .parent()
+        .context("account permission directory missing")?;
+    fs::create_dir_all(parent)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path.with_extension("lock"))?;
+    let metadata = lock.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "account permission lock must be owned and private"
+    );
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("account permissions are being changed; retry shortly");
+    }
+    let mut state = read(path)?;
+    if let Some(id) = remove {
+        let count = state.permissions.len();
+        state.permissions.retain(|item| item.id != id);
+        anyhow::ensure!(
+            state.permissions.len() != count,
+            "remembered account permission not found"
+        );
+    }
+    if let Some(permission) = add {
+        if !state
+            .permissions
+            .iter()
+            .any(|item| item.permission == *permission)
+        {
+            state.permissions.push(RememberedPermission {
+                id: permission.id(),
+                permission: permission.clone(),
+            });
+            state.permissions.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&state)?;
+    anyhow::ensure!(
+        bytes.len() < MAX_STATE,
+        "remembered account permissions exceed the state-file size limit"
+    );
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&bytes)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn permission() -> AccountPermission {
+        let identity = |host: &str, key: u8| {
+            AccountIdentity::new(
+                crate::cli::NativeEndpoint {
+                    user: Some("alice".into()),
+                    host: host.into(),
+                    port: Some(22),
+                },
+                vec![ssh_key::Fingerprint::Sha256([key; 32]).to_string()],
+            )
+            .unwrap()
+        };
+        AccountPermission::new(
+            "laptop".into(),
+            identity("source", 1),
+            identity("destination", 2),
+        )
+        .unwrap()
+    }
+    fn write(path: &Path, data: &[u8]) {
+        fs::write(path, data).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn remembered_permission_matches_the_complete_trusted_pair_and_profile() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("account-permissions-v1.json");
+        let permission = permission();
+        assert!(read(&path).unwrap().permissions.is_empty());
+        update(&path, Some(&permission), None).unwrap();
+        update(&path, Some(&permission), None).unwrap();
+        let saved = read(&path).unwrap();
+        assert_eq!(saved.permissions.len(), 1);
+        assert_eq!(saved.permissions[0].permission, permission);
+        assert_eq!(saved.permissions[0].id, permission.id());
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        for field in 0..7 {
+            let mut changed = permission.clone();
+            match field {
+                0 => changed.profile = "other".into(),
+                1 => changed.source.endpoint.user = Some("bob".into()),
+                2 => changed.source.endpoint.host = "other-source".into(),
+                3 => changed.source.endpoint.port = Some(2222),
+                4 => {
+                    changed.source.host_keys =
+                        vec![ssh_key::Fingerprint::Sha256([3; 32]).to_string()]
+                }
+                5 => changed.destination.endpoint.user = Some("bob".into()),
+                _ => {
+                    changed.destination.host_keys =
+                        vec![ssh_key::Fingerprint::Sha256([4; 32]).to_string()]
+                }
+            }
+            assert_ne!(changed.id(), permission.id());
+            assert!(!saved
+                .permissions
+                .iter()
+                .any(|item| item.permission == changed));
+        }
+        update(&path, None, Some(&permission.id())).unwrap();
+        assert!(read(&path).unwrap().permissions.is_empty());
+    }
+
+    #[test]
+    fn invalid_or_newer_remembered_state_is_preserved_and_blocks_authorization() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("account-permissions-v1.json");
+        let permission = permission();
+        let item = RememberedPermission {
+            id: permission.id(),
+            permission: permission.clone(),
+        };
+        let mut wrong_id = item.clone();
+        wrong_id.id = "0".repeat(64);
+        let invalid = [
+            b"broken".to_vec(),
+            br#"{"version":2,"permissions":[]}"#.to_vec(),
+            br#"{"version":1,"permissions":[],"new_authority":true}"#.to_vec(),
+            serde_json::to_vec(&State {
+                version: VERSION,
+                permissions: vec![item.clone(), item],
+            })
+            .unwrap(),
+            serde_json::to_vec(&State {
+                version: VERSION,
+                permissions: vec![wrong_id],
+            })
+            .unwrap(),
+        ];
+        for bytes in invalid {
+            write(&path, &bytes);
+            assert!(read(&path).is_err());
+            assert!(update(&path, Some(&permission), None).is_err());
+            assert!(update(&path, None, Some(&permission.id())).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn remembered_state_rejects_public_files_and_symlinks() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("account-permissions-v1.json");
+        let target = temp.path().join("other");
+        let bytes = serde_json::to_vec(&State::default()).unwrap();
+        write(&target, &bytes);
+        symlink(&target, &path).unwrap();
+        assert!(read(&path).is_err());
+        assert!(update(&path, Some(&permission()), None).is_err());
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        fs::remove_file(&path).unwrap();
+        write(&path, &bytes);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read(&path).is_err());
+    }
+
+    #[test]
+    fn identities_require_explicit_accounts_and_trusted_sha256_keys() {
+        let identity = permission().source;
+        let mut alias = identity.endpoint.clone();
+        alias.user = None;
+        assert!(AccountIdentity::new(alias, identity.host_keys.clone()).is_err());
+        assert!(AccountIdentity::new(identity.endpoint.clone(), vec![]).is_err());
+        assert!(
+            AccountIdentity::new(identity.endpoint.clone(), vec!["SHA256:invalid".into()]).is_err()
+        );
+        let second = ssh_key::Fingerprint::Sha256([2; 32]).to_string();
+        let canonical = AccountIdentity::new(
+            identity.endpoint,
+            vec![second.clone(), identity.host_keys[0].clone(), second],
+        )
+        .unwrap();
+        assert_eq!(canonical.host_keys.len(), 2);
+        assert!(canonical.host_keys[0] < canonical.host_keys[1]);
+    }
+}

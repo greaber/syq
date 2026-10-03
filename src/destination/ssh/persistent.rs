@@ -8,7 +8,6 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -18,15 +17,15 @@ use std::time::{Duration, Instant};
 
 const INTERNAL: &str = "--approved-ssh-master";
 const POLL: Duration = Duration::from_millis(100);
+const GENERATION: &str = "account-generation";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Startup {
     command: Vec<Vec<u8>>,
     authorizer: String,
-    scope: PathBuf,
-    scope_device: u64,
-    scope_inode: u64,
+    requested: NativeEndpoint,
+    generation: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,18 +45,87 @@ fn directory() -> Result<PathBuf> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    let metadata = path.symlink_metadata()?;
+    existing_directory()?.context("SSH authority directory disappeared")
+}
+fn existing_directory() -> Result<Option<PathBuf>> {
+    let path = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0
     {
         bail!("SSH authority index must be an owner-only directory");
     }
-    Ok(path)
+    Ok(Some(path))
 }
+// Separate from ordinary persistence: account authorization follows its return
+// connection even when global persistence/automatic receiving is disabled.
+fn read_generation(path: &Path) -> Result<Option<String>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0
+            && metadata.len() == 64,
+        "SSH account generation must be a bounded owner-only file"
+    );
+    use std::io::Read as _;
+    let mut generation = String::new();
+    file.take(65).read_to_string(&mut generation)?;
+    anyhow::ensure!(
+        generation.len() == 64 && generation.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid SSH account generation"
+    );
+    Ok(Some(generation))
+}
+fn generation_path() -> PathBuf {
+    crate::persistence::runtime_parent_path()
+        .join("authorized-ssh-v1")
+        .join(GENERATION)
+}
+fn ensure_generation() -> Result<String> {
+    ensure_generation_at(&directory()?)
+}
+fn ensure_generation_at(directory: &Path) -> Result<String> {
+    let path = directory.join(GENERATION);
+    if let Some(generation) = read_generation(&path)? {
+        return Ok(generation);
+    }
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random)?;
+    let generation = blake3::hash(&random).to_hex().to_string();
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(generation.as_bytes())?;
+    match file.persist_noclobber(&path) {
+        Ok(_) => Ok(generation),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_generation(&path)?.context("SSH account generation changed during startup; retry")
+        }
+        Err(error) => Err(error.error.into()),
+    }
+}
+fn generation_open(generation: &str) -> Result<bool> {
+    Ok(read_generation(&generation_path())?.as_deref() == Some(generation))
+}
+
 fn index_path(authorizer: &str, destination: &NativeEndpoint) -> Result<PathBuf> {
     let identity = serde_json::to_vec(&(authorizer, destination))?;
-    Ok(directory()?.join(format!("{}.json", blake3::hash(&identity).to_hex())))
+    Ok(crate::persistence::runtime_parent_path()
+        .join("authorized-ssh-v1")
+        .join(format!("{}.json", blake3::hash(&identity).to_hex())))
 }
 fn read_record(path: &Path) -> Result<Option<Record>> {
     let file = match OpenOptions::new()
@@ -171,7 +239,7 @@ fn read_peer(record: &Record) -> Result<super::super::forward::ssh::Peer> {
 }
 
 pub(crate) fn cached(authorizer: &str, requested: &NativeEndpoint) -> Result<Option<Cached>> {
-    if !crate::persistence::global_enabled()? {
+    if existing_directory()?.is_none() {
         return Ok(None);
     }
     let Some(record) = read_record(&index_path(authorizer, requested)?)? else {
@@ -189,6 +257,12 @@ fn active_record(record: Record) -> Result<Option<Cached>> {
         return Ok(None);
     }
     validate_record(&record)?;
+    // Older v1 records have no sidecar and retain their original keeper rules.
+    if let Some(generation) = read_generation(&record.control.with_extension("generation"))? {
+        if !generation_open(&generation)? {
+            return Ok(None);
+        }
+    }
     if record
         .control
         .parent()
@@ -226,14 +300,41 @@ pub(crate) fn select_cached(requested: &NativeEndpoint, mode: &AuthFrom) -> Resu
     Ok(matches.pop())
 }
 
+/// Actual operations may establish account authority. Completion and config
+/// export call select_cached instead and can never cause an approval prompt.
+pub(crate) fn select_or_connect(
+    requested: &NativeEndpoint,
+    mode: &AuthFrom,
+) -> Result<Option<Cached>> {
+    super::super::handoff::validate_account_selection(mode)?;
+    if let Some(cached) = select_cached(requested, mode)? {
+        return Ok(Some(cached));
+    }
+    let AuthFrom::Return(authorizer) = mode else {
+        return Ok(None);
+    };
+    let request = SessionRequest {
+        authorizer: authorizer.clone(),
+        destination: requested.clone(),
+        tty: Tty::Disabled,
+        command: Vec::new(),
+    };
+    start(request)?;
+    cached(authorizer, requested)?
+        .context("approved SSH account connection ended before use")
+        .map(Some)
+}
+
 fn automatic_matches(requested: &NativeEndpoint) -> Result<Vec<Cached>> {
     let index = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
     let mut matches = Vec::new();
-    if !index.exists() || !crate::persistence::global_enabled()? {
+    if !index.exists() {
         return Ok(matches);
     }
     // Validate the existing directory before looking at any of its records.
-    let index = directory()?;
+    let Some(index) = existing_directory()? else {
+        return Ok(matches);
+    };
     for entry in fs::read_dir(index)? {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -307,31 +408,95 @@ pub(crate) fn print_status(rows: &[Status]) {
     }
 }
 pub(crate) fn stop_all() -> Result<()> {
-    let rows = status()?;
-    for row in &rows {
-        let record = Record {
-            version: 1,
-            authorizer: row.authorizer.clone(),
-            requested: row.requested.clone(),
-            endpoint: row.endpoint.clone(),
-            control: row.control.clone(),
-        };
-        let _ = master_command(&record)
-            .args(["-O", "exit", "--", &record.endpoint.host])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status_guarded();
+    let index = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+    if !index.exists() {
+        return Ok(());
+    }
+    let index = directory()?;
+    let mut errors = Vec::new();
+    // Invalidates both live keepers and approval requests that have not yet
+    // published a control socket. A later operation gets a fresh generation.
+    if let Err(error) = fs::remove_file(index.join(GENERATION)) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            errors.push(format!("cancel SSH account generation: {error}"));
+        }
+    }
+    let mut controls = Vec::new();
+    for entry in fs::read_dir(index)? {
+        let result: Result<()> = (|| {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                return Ok(());
+            }
+            let Some(record) = read_record(&path)? else {
+                return Ok(());
+            };
+            if !record.control.exists() {
+                return Ok(());
+            }
+            validate_record(&record)?;
+            // Mark each scope before asking native SSH to close. Other entries
+            // are still attempted if this record or process fails.
+            let closing = record
+                .control
+                .parent()
+                .unwrap()
+                .join(crate::receive_service::CLOSING);
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(closing)?;
+            controls.push(record.control.clone());
+            let status = master_command(&record)
+                .args(["-O", "exit", "--", &record.endpoint.host])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status_guarded()?;
+            // A keeper may already have reacted to generation cancellation.
+            anyhow::ensure!(
+                status.success() || !record.control.exists(),
+                "SSH account connection {} refused shutdown ({status})",
+                record.endpoint.host
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(format!("{error:#}"));
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while rows.iter().any(|row| row.control.exists()) {
+    let mut progress = Instant::now();
+    loop {
+        let remaining = controls.iter().filter(|control| control.exists()).count();
+        if remaining == 0 {
+            break;
+        }
         if Instant::now() >= deadline {
-            bail!("approved SSH connection did not close within 5 seconds");
+            errors.push(format!(
+                "{remaining} approved SSH connections did not close within 5 seconds"
+            ));
+            break;
+        }
+        if progress.elapsed() >= Duration::from_secs(1) {
+            crate::output::diagnostic!(
+                "syq: waiting for {remaining} approved SSH connections to close"
+            );
+            progress = Instant::now();
         }
         std::thread::sleep(POLL);
     }
+    anyhow::ensure!(
+        errors.is_empty(),
+        "could not close every approved SSH account connection: {}",
+        errors.join("; ")
+    );
     Ok(())
 }
+
 fn live(record: &Record) -> bool {
     master_command(record)
         .args(["-O", "check", "--", &record.endpoint.host])
@@ -343,7 +508,7 @@ fn live(record: &Record) -> bool {
 }
 
 pub(super) fn command(request: &SessionRequest, mode: &AuthFrom) -> Result<Option<Command>> {
-    let Some(cached) = select_cached(&request.destination, mode)? else {
+    let Some(cached) = select_or_connect(&request.destination, mode)? else {
         return Ok(None);
     };
     let mut command = Command::new("ssh");
@@ -364,25 +529,65 @@ impl Drop for Starting {
 }
 
 pub(crate) fn connect(request: SessionRequest) -> Result<()> {
-    super::super::ssh_auth::prepare_persistent(&request)?;
-    let scope = crate::persistence::enable_global_scope()?;
-    if command(&request, &AuthFrom::Return(request.authorizer.clone()))?.is_some() {
-        crate::output::human_stdout!(
-            "SSH account connection ready through @{}",
-            request.authorizer
-        );
-        return Ok(());
+    let authorizer = request.authorizer.clone();
+    let cached = select_or_connect(&request.destination, &AuthFrom::Return(authorizer.clone()))?
+        .context("SSH account connection missing after approval")?;
+    crate::output::human_stdout!(
+        "{} ready through @{}; account access remains available while the laptop is connected\nSSH control socket: {}",
+        cached.endpoint().host, authorizer, cached.control().display()
+    );
+    Ok(())
+}
+
+fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let directory = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let directory = "/dev/fd";
+    let descriptors = fs::read_dir(directory)?
+        .map(|entry| {
+            Ok(entry?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok()))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .filter(|fd| *fd > 2)
+        .collect::<Vec<_>>();
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: fcntl is async-signal-safe. The descriptor list is prepared before
+    // fork; changing flags in the child leaves caller-owned pipes untouched.
+    // Rust has already duplicated the startup socket onto fd 0/1 at this point.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &descriptors {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EBADF) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if libc::fcntl(*fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
     }
-    let metadata = scope.symlink_metadata()?;
+    Ok(())
+}
+
+fn start(request: SessionRequest) -> Result<()> {
+    super::super::ssh_auth::prepare_account(&request)?;
     let startup = Startup {
-        command: super::super::handoff::command_line()?
-            .iter()
-            .map(|arg| arg.as_bytes().to_vec())
-            .collect(),
+        command: crate::approval_command::current()?,
         authorizer: request.authorizer,
-        scope,
-        scope_device: metadata.dev(),
-        scope_inode: metadata.ino(),
+        requested: request.destination,
+        generation: ensure_generation()?,
     };
     let signals = foreground::Signals::new()?;
     let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
@@ -394,6 +599,7 @@ pub(crate) fn connect(request: SessionRequest) -> Result<()> {
         .stdin(Stdio::from(File::from(OwnedFd::from(child.try_clone()?))))
         .stdout(Stdio::from(File::from(OwnedFd::from(child))))
         .stderr(Stdio::null());
+    protect_keeper_inheritance(&mut process)?;
     let mut process = Starting(Some(process.spawn_guarded()?));
     super::super::write_message(&mut parent, &startup)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -424,7 +630,7 @@ pub(crate) fn connect(request: SessionRequest) -> Result<()> {
         }
         if progress.elapsed() >= Duration::from_secs(5) {
             crate::output::diagnostic!(
-                "syq: waiting for persistent SSH approval and connection readiness"
+                "syq: waiting for account approval and SSH connection readiness"
             );
             progress = Instant::now();
         }
@@ -437,12 +643,7 @@ pub(crate) fn connect(request: SessionRequest) -> Result<()> {
     }
     drop(process);
     let _ = reader.join();
-    let endpoint = result?.map_err(anyhow::Error::msg)?;
-    crate::output::human_stdout!(
-        "{} ready through @{}; account login remains available while the laptop is connected",
-        endpoint,
-        startup.authorizer
-    );
+    result?.map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -453,39 +654,17 @@ impl Drop for Index {
     }
 }
 
-fn global_still_open(startup: &Startup) -> Result<bool> {
-    if !crate::persistence::global_enabled()?
-        || startup.scope.join(crate::receive_service::CLOSING).exists()
-    {
-        return Ok(false);
-    }
-    match startup.scope.symlink_metadata() {
-        Ok(metadata) => {
-            Ok(metadata.dev() == startup.scope_device && metadata.ino() == startup.scope_inode)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn keeper(startup: Startup) -> Result<()> {
-    let command: Vec<OsString> = startup
-        .command
-        .iter()
-        .cloned()
-        .map(OsString::from_vec)
-        .collect();
-    let request = crate::persistence::parse_account_connect(
-        command
-            .get(1..)
-            .context("persistent SSH startup command missing")?,
-        &startup.authorizer,
-    )?;
-
-    if !crate::persistence::is_global_scope(&startup.scope)? || !global_still_open(&startup)? {
-        bail!("persistent SSH scope was disabled before setup");
+    let request = SessionRequest {
+        authorizer: startup.authorizer.clone(),
+        destination: startup.requested.clone(),
+        tty: Tty::Disabled,
+        command: Vec::new(),
+    };
+    super::validate_endpoint(&request.destination)?;
+    if !generation_open(&startup.generation)? {
+        bail!("SSH account setup was cancelled before startup");
     }
-    crate::persistence::validate_scope(&startup.scope)?;
     let path = index_path(&request.authorizer, &request.destination)?;
     let lock = OpenOptions::new()
         .read(true)
@@ -502,30 +681,46 @@ fn keeper(startup: Startup) -> Result<()> {
     {
         bail!("SSH authority lock must be an owner-only file");
     }
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("this approved SSH connection is already starting or open; retry after it is ready");
-    }
     let signals = foreground::Signals::new()?;
+    let deadline = Instant::now() + Duration::from_secs(330);
+    loop {
+        if !generation_open(&startup.generation)? || signals.received.load(Ordering::Acquire) != 0 {
+            bail!("SSH account setup cancelled while waiting for another request");
+        }
+        if let Some(cached) = cached(&request.authorizer, &request.destination)? {
+            return super::super::write_message(
+                &mut std::io::stdout(),
+                &Ok::<_, String>(cached.endpoint().host.clone()),
+            );
+        }
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            bail!("another SSH account request did not become ready within 330 seconds");
+        }
+        signals.wait(POLL)?;
+    }
     let approval_request = request.clone();
-    let shown_command = command
-        .iter()
-        .skip(1)
-        .map(|arg| arg.as_bytes().to_vec())
-        .collect();
+    let shown_command = startup.command.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     // The keeper is a dedicated child process. If setup is cancelled, it exits
     // and closes the pending return request even while approval is blocked.
     std::thread::Builder::new()
         .name("syq-ssh-approve".into())
         .spawn(move || {
-            let _ = sender.send(super::super::ssh_auth::authorize_persistent(
+            let _ = sender.send(super::super::ssh_auth::authorize_account(
                 &approval_request,
                 shown_command,
             ));
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
     let session = loop {
-        if signals.received.load(Ordering::Acquire) != 0 || !global_still_open(&startup)? {
+        if signals.received.load(Ordering::Acquire) != 0 || !generation_open(&startup.generation)? {
             bail!("persistent SSH setup cancelled before approval");
         }
         match receiver.recv_timeout(POLL) {
@@ -593,7 +788,7 @@ fn keeper(startup: Startup) -> Result<()> {
     loop {
         if signals.received.load(Ordering::Acquire) != 0
             || session.cancelled()
-            || !global_still_open(&startup)?
+            || !generation_open(&startup.generation)?
         {
             bail!("persistent SSH authorization ended during connection setup");
         }
@@ -617,6 +812,12 @@ fn keeper(startup: Startup) -> Result<()> {
         .open(peer_path(&record))?;
     serde_json::to_writer(&mut peer_file, session.peer())?;
     peer_file.write_all(b"\n")?;
+    let mut generation_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(record.control.with_extension("generation"))?;
+    generation_file.write_all(startup.generation.as_bytes())?;
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     serde_json::to_writer(&mut temporary, &record)?;
     temporary.write_all(b"\n")?;
@@ -646,7 +847,7 @@ fn keeper(startup: Startup) -> Result<()> {
     while master.poll()?.is_none() {
         if signals.received.load(Ordering::Acquire) != 0
             || session.cancelled()
-            || !global_still_open(&startup)?
+            || !generation_open(&startup.generation)?
             || scope.path().join(crate::receive_service::CLOSING).exists()
         {
             break;
@@ -658,6 +859,9 @@ fn keeper(startup: Startup) -> Result<()> {
 }
 
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if argv.len() == 2 && argv[1] == "--account-ssh-probe" {
+        return Some(Ok(0));
+    }
     if argv.len() != 2 || argv[1] != INTERNAL {
         return None;
     }
@@ -678,6 +882,84 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn keeper_does_not_inherit_caller_payload_descriptors() {
+        use std::os::fd::FromRawFd;
+        let root = crate::test_support::tempdir().unwrap();
+        let file = File::create(root.path().join("caller-output")).unwrap();
+        // F_DUPFD deliberately creates a caller-style inheritable descriptor.
+        let descriptor = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 100) };
+        assert!(descriptor >= 100);
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!("test ! -e /dev/fd/{}", descriptor.as_raw_fd()),
+        ]);
+        protect_keeper_inheritance(&mut command).unwrap();
+        assert!(command.status_guarded().unwrap().success());
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+    }
+
+    #[test]
+    fn account_generation_is_shared_until_off_and_never_resurrects_old_sessions() {
+        let root = crate::test_support::tempdir().unwrap();
+        let first = ensure_generation_at(root.path()).unwrap();
+        assert_eq!(ensure_generation_at(root.path()).unwrap(), first);
+        let path = root.path().join(GENERATION);
+        fs::remove_file(&path).unwrap();
+        assert!(read_generation(&path).unwrap().is_none());
+        let second = ensure_generation_at(root.path()).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            read_generation(&path).unwrap().as_deref(),
+            Some(second.as_str())
+        );
+        // Generation state is temporary, independent of a global persistence
+        // configuration file or an ordinary receiving scope.
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_account_starts_use_the_same_generation() {
+        let root = crate::test_support::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    threads.spawn(|| {
+                        barrier.wait();
+                        ensure_generation_at(root.path()).unwrap()
+                    })
+                })
+                .collect();
+            let generations: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert!(generations.iter().all(|value| *value == generations[0]));
+        });
+    }
+
+    #[test]
+    fn account_generation_rejects_symlinks_public_files_and_unbounded_contents() {
+        let root = crate::test_support::tempdir().unwrap();
+        ensure_generation_at(root.path()).unwrap();
+        let path = root.path().join(GENERATION);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_generation(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, vec![b'a'; 65]).unwrap();
+        assert!(read_generation(&path).is_err());
+        let saved = root.path().join("saved");
+        fs::rename(&path, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &path).unwrap();
+        assert!(ensure_generation_at(root.path()).is_err());
+    }
 
     #[test]
     fn authority_index_rejects_links_public_files_and_unknown_versions() {

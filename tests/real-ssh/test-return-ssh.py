@@ -39,17 +39,18 @@ def wait_for(description, predicate, timeout=10):
     raise AssertionError(("Timed out", description, "last state", state))
 
 
-def pending(allow=True, reusable=False):
+def pending(allow=True, reusable=True, remember=False, target="syq@destination:22"):
     items = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
     assert len(items) == 1, items
     request = items[0]
     assert request["kind"] == "ssh", request
-    assert "syq@destination:22" == request["destination"], request
+    assert target == request["destination"], request
     assert "full authority" in request["permission"], request
     assert request["reusable"] == reusable, request
     if reusable:
         assert "commands and copies" in request["permission"], request
-    run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
+    run("syq", "persist", "receive", "approve" if allow else "deny", request["id"],
+        *(["--remember"] if remember else []))
     run("syq", "persist", "receive", "approve", request["id"], success=False)
 
 
@@ -59,25 +60,27 @@ root = run("ssh", "source", "mktemp -d /tmp/syq-return-ssh.XXXXXX").strip()
 native_path = "PATH=/usr/bin:/bin:/usr/local/bin"
 
 
-def source_command(command=(), *, tty=False, binary="/usr/local/bin/syq"):
+def source_command(command=(), *, tty=False, binary="/usr/local/bin/syq", target="destination"):
     args = [binary, "ssh", "--auth-from", "@laptop"]
     if tty:
         args.append("-t")
-    args.append("destination")
+    args.append(target)
     if command:
         args.extend(["--", *command])
     return ('test -z "${SSH_AUTH_SOCK:-}" && test ! -e ~/.ssh/id_ed25519 && '
             'echo $$ > ' + shlex.quote(root + "/client") + ' && exec env ' + native_path + ' ' + shlex.join(args))
 
 
-def execute(command, *, allow=True, status=0, data=b"", cancel=None, binary="/usr/local/bin/syq"):
+def execute(command, *, allow=True, status=0, data=b"", cancel=None, binary="/usr/local/bin/syq",
+            ask=False, remember=False, target="destination"):
     with tempfile.TemporaryFile() as input_file, tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         input_file.write(data)
         input_file.seek(0)
-        process = subprocess.Popen(["ssh", "source", source_command(command, binary=binary)],
+        process = subprocess.Popen(["ssh", "source", source_command(command, binary=binary, target=target)],
                                    stdin=input_file, stdout=stdout, stderr=stderr, start_new_session=True)
         try:
-            pending(allow)
+            if ask:
+                pending(allow, remember=remember, target=target if "@" in target else "syq@" + target + ":22")
             if cancel:
                 wait_for("SSH command output", lambda: b"READY" in os.pread(stdout.fileno(), 4096, 0))
                 if cancel == "interrupt":
@@ -134,7 +137,6 @@ def interactive_shell():
                 progress += 3
     try:
         fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-        pending()
         os.write(terminal, b"printf '\\n__READY_SHELL__\\n'\n")
         read_until(b"\r\n__READY_SHELL__\r\n")
         fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 37, 103, 0, 0))
@@ -160,12 +162,13 @@ def source_run(args, success=True, *, stdin=None, tcp=False):
                success=success, stdin=stdin)
 
 
-def persistent_connect(allow=True):
+def persistent_connect(allow=True, ask=False):
     args = ["persist", "connect", "destination", "--auth-from", "@laptop"]
     process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(["syq", *args])],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        pending(allow, reusable=True)
+        if ask:
+            pending(allow, reusable=True)
         out, err = process.communicate(timeout=30)
         assert (process.returncode == 0) == allow, (process.returncode, out, err)
     finally:
@@ -175,7 +178,8 @@ def persistent_connect(allow=True):
 
 
 def persistent_cases(expected):
-    print("case: reusable account access has separate explicit approval", flush=True)
+    print("case: account connection setup can be cancelled before approval", flush=True)
+    reset_session()
     # Turning persistence off while approval is pending closes that request too.
     args = ["syq", "persist", "connect", "destination", "--auth-from", "@laptop"]
     process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(args)],
@@ -190,8 +194,8 @@ def persistent_cases(expected):
     finally:
         if process.poll() is None:
             process.kill(); process.wait(timeout=5)
-    persistent_connect(False)
-    persistent_connect()
+    persistent_connect(False, ask=True)
+    persistent_connect(ask=True)
     rows = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
     assert len(rows) == 1 and rows[0]["connected"], rows
     control = rows[0]["control"]
@@ -249,13 +253,10 @@ def persistent_cases(expected):
     source_run(["persist", "off"])
     run("ssh", "source", "test ! -S " + shlex.quote(control))
     assert json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"] == []
-    # Operations never broaden a missing copy permission into account access.
-    for words in [
-        ["rm", "--on", "destination", root + "/absent", "--auth-from", "@laptop"],
-        ["map", "--from", "destination", "absent", "--auth-from", "@laptop"],
-        ["rsync", "--syq-auth-from", "@laptop", "destination:/absent", root + "/absent"],
-    ]:
-        source_run(words, success=False)
+    # The laptop's session approval still permits a fresh login after closing
+    # the local master, without another prompt or enabling ordinary persistence.
+    assert source_run(["ssh", "destination", "--auth-from", "@laptop", "--", "hostname"]).encode() == expected
+    source_run(["persist", "off"])
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
     run("ssh", "source", shlex.join(["env", native_path, "ssh", "-F", "/dev/null", "-S", control,
                  "-o", "ProxyCommand=false", "-o", "BatchMode=yes", "destination", "hostname"]), success=False)
@@ -278,7 +279,7 @@ def persistent_cases(expected):
     run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
     ready()
     assert json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"] == []
-    assert execute(["hostname"])[0] == expected
+    assert execute(["hostname"], ask=True)[0] == expected
     source_run(["persist", "off"])
 
 
@@ -326,15 +327,76 @@ while pathlib.Path(control).exists():
     source_run(["persist", "off"])
 
 
+def reset_session():
+    source_run(["persist", "off"])
+    run("syq", "persist", "receive", "off", "--name", "laptop")
+    run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
+    ready()
+
+
+def cold_copy_and_remembered_cases(expected):
+    print("case: cold copy requests account access without persist connect", flush=True)
+    reset_session()
+    source_run(["persist", "off"])
+    source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
+    remote_root = run("ssh", "destination", "mktemp -d /tmp/syq-cold-account.XXXXXX").strip()
+    try:
+        data = "cold account copy\n"
+        run("ssh", "source", "cat > " + shlex.quote(root + "/cold"), stdin=data)
+        transport = [] if os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1" else ["--no-tcp"]
+        args = ["syq", "cp", root + "/cold", "--to", "destination", "--as", remote_root + "/data",
+                "--inplace", "--syq-path", "/usr/local/bin/syq", *transport]
+        process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(args)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            pending()
+            out, err = process.communicate(timeout=30)
+            assert process.returncode == 0, (out, err)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+        source_run(["cp", "--from", "destination", remote_root + "/data", "--as", root + "/cold-back",
+                    "--no-bootstrap", *transport])
+        assert run("ssh", "source", "cat " + shlex.quote(root + "/cold-back")) == data
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+    finally:
+        source_run(["persist", "auth-from", "--for", "destination", "--reset"])
+        run("ssh", "destination", "rm -rf -- " + shlex.quote(remote_root))
+
+    print("case: remembered permission survives reconnect and removal asks again", flush=True)
+    reset_session()
+    assert execute(["hostname"], ask=True, remember=True)[0] == expected
+    rows = json.loads(run("syq", "persist", "receive", "permissions", "list", "--json"))
+    assert len(rows) == 1, rows
+    permission_id = rows[0]["id"]
+    assert rows[0]["permission"]["source"]["endpoint"]["user"] == "syq", rows
+    assert rows[0]["permission"]["destination"]["endpoint"]["user"] == "syq", rows
+    assert rows[0]["permission"]["source"]["host_keys"] and rows[0]["permission"]["destination"]["host_keys"], rows
+    try:
+        reset_session()
+        assert execute(["hostname"])[0] == expected
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+        # A destination login change never inherits the remembered account grant.
+        execute(["hostname"], target="root@destination:22", ask=True, allow=False, status=255)
+        run("syq", "persist", "receive", "permissions", "remove", permission_id)
+        source_run(["persist", "off"])
+        execute(["hostname"], ask=True, allow=False, status=255)
+        assert json.loads(run("syq", "persist", "receive", "permissions", "list", "--json")) == []
+    finally:
+        for row in json.loads(run("syq", "persist", "receive", "permissions", "list", "--json")):
+            run("syq", "persist", "receive", "permissions", "remove", row["id"])
+
+
 try:
-    print("case: direct SSH always asks for account approval", flush=True)
+    print("case: first direct SSH asks for account approval", flush=True)
     Path("/tmp/syq-real-ssh-receive").mkdir(exist_ok=True)
     run("syq", "persist", "receive", "on", "--name", "laptop", "--auto-approve-root", "/tmp/syq-real-ssh-receive", "--notify", "off")
     run("syq", "persist", "connect", "source")
     ready()
-    execute(["hostname"], allow=False, status=1)
+    execute(["hostname"], allow=False, status=255, ask=True)
     expected = run("ssh", "destination", "hostname").encode()
-    assert execute(["hostname"])[0] == expected
+    assert execute(["hostname"], ask=True)[0] == expected
     assert execute(["hostname"], binary="/usr/local/bin/syq-other-build")[0] == expected
 
     print("case: direct SSH preserves binary stdin, EOF, output and exit status", flush=True)
@@ -370,13 +432,14 @@ assert 'does not match' in reply['Error'], reply
 
     for mode in ("interrupt", "stop"):
         print("case: direct SSH ends after", mode, flush=True)
-        execute(["printf READY; exec sleep 60"], status=130 if mode == "interrupt" else 1, cancel=mode)
+        execute(["printf READY; exec sleep 60"], status=130 if mode == "interrupt" else 255, cancel=mode)
         if mode == "stop":
             run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
             ready()
-    assert execute(["hostname"])[0] == expected
+    assert execute(["hostname"], ask=True)[0] == expected
     persistent_cases(expected)
     persistent_crash()
+    cold_copy_and_remembered_cases(expected)
     print("Direct laptop-authorized SSH passed", flush=True)
 finally:
     source_run(["persist", "off"])

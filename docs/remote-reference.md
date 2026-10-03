@@ -150,7 +150,10 @@ For object-storage copies and removal, explicit `--auth-from @NAME` uses
 For SSH copies, `--auth-from @NAME` selects that receiving machine.
 An existing [approved account connection](persistence-reference.md#approved-account-connections)
 for the same authorizer and endpoint supplies full account access without
-another prompt. Otherwise an eligible copy asks for per-copy authorization.
+another prompt. Otherwise an ordinary copy requests account access on the
+laptop. Allow covers the current receiving connection; Remember also permits
+future logins for that source and destination account pair. Explicit receiver
+receipt requests keep per-copy authorization.
 `--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
@@ -167,7 +170,7 @@ receives no laptop credentials or general SSH access. Remote path completion
 can reuse existing account approval, but never requests approval itself. Without
 an approved connection, `auto` and `ssh` completion use native SSH.
 
-For downloads (`--from HOST` to this machine), approval grants read access
+For restricted per-copy downloads (`--from HOST` to this machine), approval grants read access
 to the displayed source files and directory trees. `--src-non-dir` grants only
 that entry; directory selectors grant their trees. An untyped source grants
 the entry or tree according to its type on the source. Filters narrow the copy,
@@ -175,7 +178,7 @@ but do not narrow the approved tree. Symlinks follow the command's selection
 rules; the source helper enforces them and refuses writes. File data requires
 encrypted direct TCP, with no SSH fallback or relay through the laptop.
 `--no-tcp` and descriptor streams are unsupported on this per-copy route.
-A separately approved account connection supports SSH-only downloads.
+Account approval supports SSH-only downloads without this TCP requirement.
 
 For per-copy uploads, quoted `~` and `~/archive` select the destination account's home
 directory. Use `./~/archive` for a literal directory called `~`. Avoid
@@ -184,13 +187,13 @@ but automatic selection uses ordinary SSH, where it resolves to `/archive`.
 
 ## Approved account copies
 
-A direct copy between two other servers can reuse existing
+A direct copy between two other servers can request or reuse
 [approved account connections](persistence-reference.md#approved-account-connections)
 to both endpoints. Each endpoint uses its saved authorization choice unless
 `--auth-from` overrides it. `auto` selects existing approvals first;
-`--auth-from @NAME` requires both connections to have been approved through
-that name. The copy itself never requests full account access. Prepare it with
-`syq persist connect ENDPOINT --auth-from @NAME` for each endpoint.
+`--auth-from @NAME` requests access to both accounts through that name as
+needed. Each laptop prompt grants the named account's authority. To prepare
+connections in advance, use `syq persist connect ENDPOINT --auth-from @NAME`.
 
 This route uses the default source coordinator or `--coordinate-at src`, with
 `--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,

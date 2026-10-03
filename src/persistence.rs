@@ -30,7 +30,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from @NAME, explicitly approve a reusable account login instead; it closes when the receiving connection ends. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. An ephemeral scope only reuses forward SSH logins, with a five-minute idle timeout. Select it by passing its printed path back with --pscope."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from @NAME, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. An ephemeral scope only reuses forward SSH logins, with a five-minute idle timeout. Select it by passing its printed path back with --pscope."
 )]
 struct PersistCommand {
     #[command(subcommand)]
@@ -61,7 +61,7 @@ enum PersistAction {
         #[arg(long)]
         no_bootstrap: bool,
         /// Wait this many seconds for receiving after SSH/helper setup
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(long, default_value_t = 30, conflicts_with = "auth_from", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
         /// Reuse forward SSH in an existing ephemeral scope, without enabling receiving
         #[arg(long, value_name = "PATH")]
@@ -252,15 +252,22 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             // Disable first so a later command cannot intentionally join the
             // global scope while its existing masters are being closed.
             write_global_config(false)?;
-            crate::destination::ssh::persistent::stop_all()?;
-            let scope = global_scope_path()?;
-            match scope.symlink_metadata() {
-                Ok(_) => close_scope(&scope)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("inspect global scope {}", scope.display()));
+            let accounts = crate::destination::ssh::persistent::stop_all();
+            let ordinary = (|| -> Result<()> {
+                let scope = global_scope_path()?;
+                match scope.symlink_metadata() {
+                    Ok(_) => close_scope(&scope),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error)
+                        .with_context(|| format!("inspect global scope {}", scope.display())),
                 }
+            })();
+            match (accounts, ordinary) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                (Err(accounts), Err(ordinary)) => bail!(
+                    "approved SSH cleanup: {accounts:#}; ordinary connection cleanup: {ordinary:#}"
+                ),
             }
             crate::output::human_stdout!("SSH connection persistence is off");
         }
@@ -346,12 +353,6 @@ pub(crate) fn parse_account_connect(
         selected.into(),
         host.into(),
     ])
-}
-
-pub(crate) fn enable_global_scope() -> Result<PathBuf> {
-    let scope = ensure_global_scope()?;
-    write_global_config(true)?;
-    Ok(scope)
 }
 
 fn connect(

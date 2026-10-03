@@ -1,7 +1,59 @@
-//! Copies may reuse a separately approved account login. A copy never creates
-//! this broader authority; without a live master it follows per-copy approval.
+//! Ordinary operations use account access selected by their authorizer.
+//! Narrow grants and explicit receipt requests keep their own authority.
 use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
 use anyhow::{bail, Result};
+
+/// Resolve a matching helper before commands consume stdin or open results.
+/// Ordinary native cp already performs this in its transfer handoff.
+pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
+    if args.interface == Interface::NativeCp
+        && args.descriptor_copy.is_none()
+        && args.stream_mapping_fd.is_none()
+        && args.coordinate_at != CoordinateAt::Local
+    {
+        return Ok(());
+    }
+    if args.s3.is_none()
+        && !args.delegated
+        && args.restricted_grant.is_none()
+        && args.receiver_receipt.is_none()
+        && args.rsh.is_none()
+        && !args.pscope_explicit
+    {
+        let locations = if args.locations.is_empty() {
+            args.paths
+                .iter()
+                .map(|path| Location::parse(path))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            args.locations.clone()
+        };
+        for location in locations {
+            let Some(host) = location.host.filter(|host| !host.starts_with('@')) else {
+                continue;
+            };
+            let mode = crate::auth_from::resolve(
+                &host,
+                args.auth_from_explicit.then(|| args.auth_from.clone()),
+            )?;
+            super::handoff::validate_account_selection(&mode)?;
+            if let AuthFrom::Return(authorizer) = mode {
+                super::ssh_auth::prepare_account(&super::ssh::SessionRequest {
+                    authorizer,
+                    destination: NativeEndpoint {
+                        user: location.user,
+                        host,
+                        port: location.port,
+                    },
+                    tty: super::ssh::Tty::Disabled,
+                    command: Vec::new(),
+                })?;
+            }
+        }
+    }
+    super::handoff::finish_account_preflight();
+    Ok(())
+}
 
 pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
     if args.interface != Interface::NativeCp
@@ -45,7 +97,8 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
         host: location.host.clone().unwrap(),
         port: location.port,
     };
-    let Some(cached) = super::ssh::persistent::select_cached(&requested, &args.auth_from)? else {
+    let Some(cached) = super::ssh::persistent::select_or_connect(&requested, &args.auth_from)?
+    else {
         return Ok(false);
     };
     let spec = connection(args, location, cached.endpoint(), cached.options())?;
@@ -57,8 +110,8 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
     Ok(true)
 }
 
-/// Non-copy operations may use full account access that was approved separately.
-/// Per-copy authorization remains selected once, before the transfer starts.
+/// Select account authority before opening an operation's transport. Copies
+/// with a narrower grant remain selected separately before transfer starts.
 pub(crate) fn operation(
     location: &Location,
     args: &Args,
@@ -81,6 +134,7 @@ pub(crate) fn approved_operation(
         || args.restricted_grant.is_some()
         || args.return_source.is_some()
         || args.named_receipt.is_some()
+        || args.receiver_receipt.is_some()
     {
         return Ok(None);
     }
@@ -102,11 +156,8 @@ pub(crate) fn approved_operation(
         host: host.clone(),
         port: location.port,
     };
-    if let Some(cached) = super::ssh::persistent::select_cached(&requested, &mode)? {
+    if let Some(cached) = super::ssh::persistent::select_or_connect(&requested, &mode)? {
         return connection(args, location, cached.endpoint(), cached.options()).map(Some);
-    }
-    if let AuthFrom::Return(name) = mode {
-        bail!("no approved SSH account connection for this endpoint through @{name}; first run `syq persist connect ENDPOINT --auth-from @{name}` with the same user, host and port, and approve account access on the laptop");
     }
     Ok(None)
 }
@@ -186,6 +237,47 @@ mod tests {
         pull.pscope_explicit = true;
         assert!(remote(&pull).is_none());
     }
+    #[test]
+    fn ordinary_account_copies_keep_native_copy_features_and_explicit_receipts_stay_narrow() {
+        for words in [
+            vec![
+                "cp",
+                "file",
+                "--to",
+                "alias",
+                "--as",
+                "out",
+                "--auth-from",
+                "@laptop",
+                "--inplace",
+                "--no-tcp",
+                "--syq-path",
+                "/opt/syq",
+            ],
+            vec![
+                "cp",
+                "--from",
+                "alias",
+                "file",
+                "--as",
+                "out",
+                "--auth-from",
+                "@laptop",
+                "--inplace",
+                "--no-tcp",
+                "--no-bootstrap",
+            ],
+        ] {
+            let mut args = args(&words);
+            assert!(remote(&args).is_some());
+            args.receiver_receipt = Some(crate::cli::ReceiptDetail::Hashes);
+            assert!(remote(&args).is_none());
+            args.receiver_receipt = None;
+            args.restricted_grant = Some("narrow-grant".into());
+            assert!(remote(&args).is_none());
+        }
+    }
+
     #[test]
     fn account_route_preserves_paths_and_does_not_add_a_second_master() {
         let args = args(&[

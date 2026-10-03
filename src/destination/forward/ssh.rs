@@ -331,13 +331,15 @@ impl Peer {
         Ok(())
     }
 
-    fn resolve(target: &str) -> Result<Self> {
+    fn resolve(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<Self> {
         let endpoint = target_endpoint(target)?;
-        let policy = crate::agent_broker::resolve_host_policy_at(
+        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
             "ssh",
             endpoint.user.as_deref(),
             &endpoint.host,
             endpoint.port,
+            deadline,
+            cancelled,
         )?;
         Ok(Self {
             host: policy.connection_host().into(),
@@ -353,8 +355,31 @@ pub(crate) struct Session {
     target: String,
     ticket: String,
     generation: u64,
-    setup: Mutex<()>,
+    setup: Mutex<SetupMemo>,
 }
+
+#[derive(Default)]
+struct SetupMemo {
+    completed: Option<(String, std::result::Result<Peer, String>)>,
+}
+impl SetupMemo {
+    fn resolve(
+        &mut self,
+        public_key: &str,
+        setup: impl FnOnce() -> Result<std::result::Result<Peer, String>>,
+    ) -> Result<Peer> {
+        if self.completed.is_none() {
+            // Transport errors may hide an already-installed key, so they
+            // remain retryable with that same key. A destination's explicit
+            // refusal is definitive for this copy and never repeats a login.
+            self.completed = Some((public_key.into(), setup()?));
+        }
+        let (selected, result) = self.completed.as_ref().unwrap();
+        anyhow::ensure!(selected == public_key, "copy SSH key was already selected");
+        result.clone().map_err(anyhow::Error::msg)
+    }
+}
+
 pub(super) struct SessionGuard<'a> {
     receiver: &'a Receiver,
     token: String,
@@ -373,7 +398,7 @@ impl<'a> SessionGuard<'a> {
                 target,
                 ticket,
                 generation,
-                setup: Mutex::new(()),
+                setup: Mutex::new(SetupMemo::default()),
             }),
         );
         Ok(Self { receiver, token })
@@ -406,7 +431,7 @@ impl Receiver {
             .get(&token)
             .cloned()
             .context("copy SSH authorization has closed or is unknown")?;
-        let _setup = session
+        let mut setup = session
             .setup
             .try_lock()
             .map_err(|_| anyhow::anyhow!("copy SSH setup is already running"))?;
@@ -419,40 +444,44 @@ impl Receiver {
                 || !self.forward_sessions.lock().unwrap().contains_key(&token)
         };
         anyhow::ensure!(!cancelled(), "copy SSH authorization has closed");
-        let peer = Peer::resolve(&session.target)?;
-        let encoded =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session.target.as_bytes());
-        let mut command = Command::new(std::env::current_exe()?);
-        command.args(["--return-ssh-connect", &encoded]);
-        let mut child = ForwardChild::spawn_command(command)?;
         let deadline = Instant::now() + SETUP_TIMEOUT;
-        let result = (|| {
-            write_message(
-                &mut DeadlineIo {
-                    inner: child.child.stdin.as_mut().unwrap(),
+        let peer = setup.resolve(&public_key, || {
+            let peer = Peer::resolve(&session.target, deadline, &cancelled)?;
+            let encoded =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session.target.as_bytes());
+            let mut command = Command::new(std::env::current_exe()?);
+            command.args(["--return-ssh-connect", &encoded]);
+            let mut child = ForwardChild::spawn_command(command)?;
+            let result = (|| {
+                write_message(
+                    &mut DeadlineIo {
+                        inner: child.child.stdin.as_mut().unwrap(),
+                        deadline,
+                        cancelled: Some(&cancelled),
+                    },
+                    &SetupRequest {
+                        identity: crate::identity::build().into(),
+                        ticket: session.ticket.clone(),
+                        public_key: public_key.clone(),
+                    },
+                )?;
+                let reply: Reply = read_message(&mut DeadlineIo {
+                    inner: child.child.stdout.as_mut().unwrap(),
                     deadline,
                     cancelled: Some(&cancelled),
-                },
-                &SetupRequest {
-                    identity: crate::identity::build().into(),
-                    ticket: session.ticket.clone(),
-                    public_key,
-                },
-            )?;
-            let reply: Reply = read_message(&mut DeadlineIo {
-                inner: child.child.stdout.as_mut().unwrap(),
-                deadline,
-                cancelled: Some(&cancelled),
-            })?;
-            match reply {
-                Reply::Ready => {}
-                Reply::Error(error) => bail!("destination refused SSH data transport: {error}"),
-                _ => bail!("invalid copy SSH setup response"),
-            }
-            anyhow::ensure!(!cancelled(), "copy SSH authorization has closed");
-            write_message(&mut stream, &Reply::ForwardSsh(peer))
-        })();
-        result.with_context(|| format!("copy SSH setup failed: {}", child.errors()))
+                })?;
+                match reply {
+                    Reply::Ready => Ok(Ok(peer)),
+                    Reply::Error(error) => Ok(Err(format!(
+                        "destination refused SSH data transport: {error}"
+                    ))),
+                    _ => bail!("invalid copy SSH setup response"),
+                }
+            })();
+            result.with_context(|| format!("copy SSH setup failed: {}", child.errors()))
+        })?;
+        anyhow::ensure!(!cancelled(), "copy SSH authorization has closed");
+        write_message(&mut stream, &Reply::ForwardSsh(peer))
     }
 }
 
@@ -760,6 +789,45 @@ mod tests {
         assert!(!command
             .get_args()
             .any(|arg| arg.to_string_lossy().starts_with("RequiredRSASize=")));
+    }
+
+    #[test]
+    fn setup_memo_caches_refusal_but_retries_lost_replies() {
+        let mut memo = SetupMemo::default();
+        assert!(memo.resolve("key", || bail!("reply lost")).is_err());
+        assert!(memo.completed.is_none());
+        let error = memo
+            .resolve("key", || Ok(Err("destination home is unwritable".into())))
+            .unwrap_err();
+        assert!(error.to_string().contains("unwritable"));
+        let error = memo
+            .resolve("key", || panic!("definitive refusal repeated SSH setup"))
+            .unwrap_err();
+        assert!(error.to_string().contains("unwritable"));
+    }
+
+    #[test]
+    fn setup_memo_reuses_ready_peer_only_for_selected_key() {
+        let mut memo = SetupMemo::default();
+        memo.resolve("key", || {
+            Ok(Ok(Peer {
+                host: "backup".into(),
+                user: "copy".into(),
+                port: 22,
+                known_hosts: "pinned".into(),
+                algorithms: "ssh-ed25519".into(),
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            memo.resolve("key", || panic!("ready setup repeated login"))
+                .unwrap()
+                .host,
+            "backup"
+        );
+        assert!(memo
+            .resolve("different", || panic!("different key started setup"))
+            .is_err());
     }
 
     #[test]

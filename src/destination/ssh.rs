@@ -108,38 +108,32 @@ pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<Se
 }
 
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
-    let (mut request, explicit) = parse_command(argv)?;
+    let (request, explicit) = parse_command(argv)?;
     let mode = crate::auth_from::resolve(&request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
     if let Some(mut command) = persistent::command(&request, &mode)? {
         return foreground::run(&mut command, || false);
     }
-    let AuthFrom::Return(authorizer) = mode else {
-        let mut command = std::process::Command::new("ssh");
-        if let Some(scope) = crate::persistence::scope_for_implicit_ssh(None)? {
-            let control = crate::persistence::prepare_endpoint(
-                &scope,
-                request.destination.user.as_deref(),
-                &request.destination.host,
-                request.destination.port,
-                None,
-            )?;
-            command
-                .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=yes", "-S"])
-                .arg(crate::persistence::openssh_control_path(&control));
-        }
-        command.args(request.ssh_arguments(&request.destination)?);
-        // Native auth executes once: a failing command must never run again through a laptop.
-        return foreground::run(&mut command, || false);
-    };
-    request.authorizer = authorizer;
-    let session = super::ssh_auth::authorize(&request)?;
+    anyhow::ensure!(
+        !matches!(mode, AuthFrom::Return(_)),
+        "laptop account authorization did not produce an SSH connection"
+    );
     let mut command = std::process::Command::new("ssh");
-    command
-        .args(session.options())
-        .args(request.ssh_arguments(session.endpoint())?);
-    // OpenSSH owns terminal I/O; authorization lives until this one child exits.
-    foreground::run(&mut command, || session.cancelled())
+    if let Some(scope) = crate::persistence::scope_for_implicit_ssh(None)? {
+        let control = crate::persistence::prepare_endpoint(
+            &scope,
+            request.destination.user.as_deref(),
+            &request.destination.host,
+            request.destination.port,
+            None,
+        )?;
+        command
+            .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=yes", "-S"])
+            .arg(crate::persistence::openssh_control_path(&control));
+    }
+    command.args(request.ssh_arguments(&request.destination)?);
+    // Native auth executes once: a failing command must never run again through a laptop.
+    foreground::run(&mut command, || false)
 }
 
 pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {

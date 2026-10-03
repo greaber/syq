@@ -1123,3 +1123,36 @@ fn account_auth_selection_is_explicit_for_each_ssh_operation() {
         assert!(Args::parse_args(&argv(&words)).is_err(), "{words:?}");
     }
 }
+
+#[test]
+fn rsync_defers_file_lists_and_ignore_inputs_until_after_account_handoff() {
+    let root = crate::test_support::tempdir().unwrap();
+    let files = root.path().join("files");
+    let ignore = root.path().join("ignore");
+    let words = vec![
+        OsString::from("source/"),
+        OsString::from("host:destination"),
+        OsString::from("--files-from"),
+        files.clone().into_os_string(),
+        OsString::from("--syq-ignore"),
+        OsString::from("first"),
+        OsString::from("--syq-ignore-from"),
+        ignore.clone().into_os_string(),
+        OsString::from("--syq-ignore"),
+        OsString::from("last"),
+    ];
+    let mut args = Args::parse_rsync(&words).unwrap();
+    assert!(args.files_from_lines.is_empty());
+    assert!(args.ignore_lines.is_empty());
+    std::fs::write(&files, b"file-one\nfile-two\n").unwrap();
+    std::fs::write(&ignore, b"middle\n").unwrap();
+    args.read_copy_inputs().unwrap();
+    assert_eq!(
+        args.files_from_lines,
+        [b"file-one".to_vec(), b"file-two".to_vec()]
+    );
+    assert_eq!(args.ignore_lines, ["first", "middle", "last"]);
+    std::fs::remove_file(files).unwrap();
+    std::fs::remove_file(ignore).unwrap();
+    args.read_copy_inputs().unwrap();
+}

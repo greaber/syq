@@ -140,7 +140,17 @@ enum Action {
         timeout: u64,
     },
     /// Allow one pending request using the ID from persist receive pending
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// Remember this SSH account permission for future receiving connections
+        #[arg(long)]
+        remember: bool,
+    },
+    /// List or remove account permissions remembered on this machine
+    Permissions {
+        #[command(subcommand)]
+        action: PermissionAction,
+    },
     /// Deny one pending request using the ID from persist receive pending
     Deny { id: String },
     /// Enable or configure a receiving profile (without --name, use the first profile)
@@ -170,6 +180,17 @@ enum Action {
         timeout: u64,
     },
 }
+#[derive(Subcommand, Debug)]
+enum PermissionAction {
+    /// Show remembered source-to-destination SSH account permissions
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop future authentications; already authenticated sessions may continue
+    Remove { id: String },
+}
+
 #[derive(Args, Default, Debug)]
 struct Configure {
     /// Automatically approve downloads confined to this directory
@@ -519,6 +540,8 @@ struct Decision {
         skip_serializing_if = "crate::receive_approval::Kind::is_copy"
     )]
     kind: crate::receive_approval::Kind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    remember: bool,
 }
 fn status(control: &Path, stop: bool) -> Result<Status> {
     query(control, stop, None)
@@ -1055,10 +1078,11 @@ fn run(control: &Path) -> Result<()> {
                                     })
                                     .context("approval is unknown, expired, or already answered")
                                     .and_then(|w| {
-                                        w.approvals.decide(
+                                        w.approvals.decide_with_remember(
                                             &decision.id,
                                             decision.allow,
                                             decision.kind,
+                                            decision.remember,
                                         )
                                     })
                                     .err()
@@ -1261,7 +1285,7 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
-fn decide(id: &str, allow: bool) -> Result<()> {
+fn decide(id: &str, allow: bool, remember: bool) -> Result<()> {
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("use the complete request ID from syq persist receive pending");
     }
@@ -1270,6 +1294,8 @@ fn decide(id: &str, allow: bool) -> Result<()> {
             continue;
         };
         if let Some(request) = state.pending.iter().find(|request| request.id == id) {
+            anyhow::ensure!(!remember || (allow && request.kind() == crate::receive_approval::Kind::Ssh
+                && request.account().is_some()), "--remember applies only to SSH account requests that support remembering; update syq and reconnect receiving if needed");
             let response = query(
                 &control,
                 false,
@@ -1277,12 +1303,22 @@ fn decide(id: &str, allow: bool) -> Result<()> {
                     id: id.into(),
                     allow,
                     kind: request.kind(),
+                    remember,
                 }),
             )?;
             if let Some(error) = response.decision_error {
                 bail!("{error}");
             }
-            crate::output::human_stdout!("{} {id}", if allow { "Approved" } else { "Denied" });
+            crate::output::human_stdout!(
+                "{} {id}",
+                if remember {
+                    "Approved and remembered"
+                } else if allow {
+                    "Approved"
+                } else {
+                    "Denied"
+                }
+            );
             return Ok(());
         }
     }
@@ -1311,8 +1347,32 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             wait,
             timeout,
         } => pending(json, wait, timeout)?,
-        Action::Approve { id } => decide(&id, true)?,
-        Action::Deny { id } => decide(&id, false)?,
+        Action::Approve { id, remember } => decide(&id, true, remember)?,
+        Action::Deny { id } => decide(&id, false, false)?,
+        Action::Permissions { action } => match action {
+            PermissionAction::List { json } => {
+                let permissions = crate::receive_approval::accounts::list()?;
+                if json {
+                    println!("{}", serde_json::to_string(&permissions)?);
+                } else if permissions.is_empty() {
+                    crate::output::human_stdout!("No remembered account permissions");
+                } else {
+                    for item in permissions {
+                        crate::output::human_stdout!(
+                            "{}  {} -> {} (receiving profile @{})",
+                            item.id,
+                            item.permission.source.label(),
+                            item.permission.destination.label(),
+                            item.permission.profile
+                        );
+                    }
+                }
+            }
+            PermissionAction::Remove { id } => {
+                crate::receive_approval::accounts::remove(&id)?;
+                crate::output::human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
+            }
+        },
         Action::Off { name } => {
             let _lock = settings_lock()?;
             let mut config = preferences()?;
@@ -1568,6 +1628,58 @@ mod tests {
             crate::receive_approval::Kind::Copy
         );
         assert_eq!(serde_json::to_string(&request).unwrap(), old);
+    }
+
+    #[test]
+    fn ordinary_ssh_decision_bytes_are_unchanged_and_remember_is_explicit() {
+        let old =
+            r#"{"version":2,"stop":false,"decision":{"id":"fixture","allow":true,"kind":"ssh"}}"#;
+        let mut request: LocalRequest = serde_json::from_str(old).unwrap();
+        assert!(!request.decision.as_ref().unwrap().remember);
+        assert_eq!(serde_json::to_string(&request).unwrap(), old);
+        request.decision.as_mut().unwrap().remember = true;
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["decision"]["remember"],
+            true
+        );
+    }
+
+    #[test]
+    fn remembered_permissions_have_local_cli_management() {
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "approve", "request"])
+                .unwrap()
+                .action,
+            Action::Approve {
+                remember: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "approve", "request", "--remember"])
+                .unwrap()
+                .action,
+            Action::Approve { remember: true, .. }
+        ));
+        assert!(
+            ReceiveCommand::try_parse_from(["receive", "deny", "request", "--remember"]).is_err()
+        );
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "permissions", "list", "--json"])
+                .unwrap()
+                .action,
+            Action::Permissions {
+                action: PermissionAction::List { json: true }
+            }
+        ));
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "permissions", "remove", "id"])
+                .unwrap()
+                .action,
+            Action::Permissions {
+                action: PermissionAction::Remove { .. }
+            }
+        ));
     }
 
     #[test]

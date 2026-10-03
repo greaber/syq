@@ -340,6 +340,53 @@ fn host_key_algorithms_and_required_rsa_size_are_enforced() {
 }
 
 #[test]
+fn exported_host_algorithms_only_name_admitted_keys_and_preserve_rsa_policy() {
+    use ssh_agent_lib::ssh_key::{public::RsaPublicKey, Mpint};
+
+    let (_, ed25519) = key(80);
+    let mut policy = host_policy("backup", "vault", ed25519);
+    policy.host_key_algorithms = [
+        "ssh-ed25519-cert-v01@openssh.com",
+        "sk-ssh-ed25519@openssh.com",
+        "ecdsa-sha2-nistp256",
+        "rsa-sha2-512",
+        "ssh-ed25519",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    assert_eq!(policy.host_key_algorithms(), "ssh-ed25519");
+    policy.host_keys.push(KeyData::Rsa(RsaPublicKey {
+        e: Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+        n: Mpint::from_positive_bytes(&[0x80; 256]).unwrap(),
+    }));
+    assert_eq!(policy.host_key_algorithms(), "rsa-sha2-512,ssh-ed25519");
+    assert!(!policy.host_key_algorithms().contains("rsa-sha2-256"));
+}
+
+#[test]
+fn pinned_host_fingerprints_are_sorted_unique_and_use_actual_keys() {
+    let (_, first) = key(81);
+    let (_, second) = key(82);
+    let mut policy = host_policy("backup", "vault", first.clone());
+    policy.host_keys.extend([second.clone(), first.clone()]);
+    let fingerprints = policy.pinned_host_key_fingerprints();
+    let mut expected = [first, second]
+        .map(|key| {
+            PublicKey::new(key, "")
+                .fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256)
+                .to_string()
+        })
+        .to_vec();
+    expected.sort_unstable();
+    assert_eq!(fingerprints, expected);
+    assert!(fingerprints
+        .iter()
+        .all(|value| value.starts_with("SHA256:")));
+    policy.host_keys.reverse();
+    assert_eq!(policy.pinned_host_key_fingerprints(), fingerprints);
+}
+
+#[test]
 fn unsupported_opaque_algorithms_are_not_trusted() {
     use ssh_agent_lib::ssh_key::public::{OpaquePublicKey, SkEd25519};
 
@@ -431,6 +478,83 @@ fn openssh_defaults_and_hashed_known_hosts_lookup_are_exercised() {
     .unwrap();
     assert_eq!(trusted, [host_key]);
     assert!(!saw_ca);
+}
+
+#[test]
+fn policy_deadline_interrupts_real_openssh_match_exec() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let config = temp.path().join("ssh_config");
+    let ssh = temp.path().join("ssh");
+    let marker = temp.path().join("match-started");
+    std::fs::write(
+        &config,
+        format!(
+            "Match exec \"touch {}; sleep 30\"\n  User backup\n",
+            shell_words::quote(marker.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nexec ssh -F {} \"$@\"\n",
+            shell_words::quote(config.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = Instant::now();
+    let error = resolve_host_policy_at_bounded(
+        ssh.to_str().unwrap(),
+        None,
+        "unused.example",
+        None,
+        started + Duration::from_millis(300),
+        &|| false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(marker.exists(), "OpenSSH did not reach Match exec");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn known_host_search_obeys_deadline_and_cancellation() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let keygen = temp.path().join("ssh-keygen");
+    std::fs::write(&known_hosts, "").unwrap();
+    std::fs::write(&keygen, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&keygen, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = Instant::now();
+    let error = read_known_host_keys_bounded(
+        &keygen.clone().into_os_string(),
+        "vault",
+        std::slice::from_ref(&known_hosts),
+        started + Duration::from_millis(100),
+        &|| false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    let error = read_known_host_keys_bounded(
+        &keygen.into_os_string(),
+        "vault",
+        &[known_hosts],
+        Instant::now() + Duration::from_secs(5),
+        &|| true,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 #[test]

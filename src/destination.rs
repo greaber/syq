@@ -1093,6 +1093,9 @@ struct Receiver {
     sessions: Mutex<HashMap<String, Session>>,
     active_streams: Arc<crate::private_broker::ConnectionRegistry>,
     exec_count: AtomicU64,
+    ssh_count: AtomicU64,
+    account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
+    account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
     forward_sessions: Mutex<HashMap<String, Arc<forward::ssh::Session>>>,
     request_lock: Mutex<()>,
@@ -1144,6 +1147,7 @@ impl Receiver {
     fn revoke_all(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.account_sessions.lock().unwrap().clear();
         self.active_streams.shutdown_all();
         for (_, session) in sessions.drain() {
             session.authority.close_control();
@@ -1450,6 +1454,9 @@ pub(crate) fn serve_background(
             Duration::from_secs(10),
         )),
         exec_count: AtomicU64::new(0),
+        ssh_count: AtomicU64::new(0),
+        account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
+        account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
         forward_sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
@@ -1485,6 +1492,62 @@ pub(crate) fn serve_background(
                 receiver.secret.clone(),
             ];
             let mut command = ssh_command(&spec.endpoint);
+            // Remembered permissions identify the actual locally selected source
+            // account and its trusted host keys. Freeze that policy for this SSH
+            // connection; reconnecting takes a new snapshot and clears session grants.
+            // Unsupported policy does not prevent ordinary receiving.
+            let source_identity = (|| -> Result<crate::receive_approval::AccountIdentity> {
+                let policy = crate::agent_broker::resolve_host_policy_at_bounded(
+                    "ssh",
+                    spec.endpoint.user.as_deref(),
+                    &spec.endpoint.host,
+                    spec.endpoint.port,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| stop.load(Ordering::Acquire),
+                )?;
+                let identity = crate::receive_approval::AccountIdentity::new(
+                    crate::cli::NativeEndpoint {
+                        user: Some(policy.login_user.clone()),
+                        host: policy.connection_host().into(),
+                        port: Some(policy.port()),
+                    },
+                    policy.pinned_host_key_fingerprints(),
+                )?;
+                let hosts = broker.socket_path().with_file_name("source-known-hosts");
+                anyhow::ensure!(hosts.as_os_str().as_bytes().iter().all(|byte|
+                    byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(byte)),
+                    "account approval requires a temporary path without SSH expansion tokens or whitespace");
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&hosts)?;
+                file.write_all(policy.known_hosts("syq-approved-source")?.as_bytes())?;
+                // Command-line settings take precedence over the user's config.
+                command.args(["-l", &policy.login_user, "-p", &policy.port().to_string()]);
+                for option in [
+                    format!("Hostname={}", policy.connection_host()),
+                    "StrictHostKeyChecking=yes".into(),
+                    "VerifyHostKeyDNS=no".into(),
+                    "KnownHostsCommand=none".into(),
+                    "HostKeyAlias=syq-approved-source".into(),
+                    format!("UserKnownHostsFile={}", hosts.display()),
+                    "GlobalKnownHostsFile=/dev/null".into(),
+                    "UpdateHostKeys=no".into(),
+                    "CheckHostIP=no".into(),
+                    format!("HostKeyAlgorithms={}", policy.host_key_algorithms()),
+                ] {
+                    command.args(["-o", &option]);
+                }
+                Ok(identity)
+            })();
+            *receiver.account_source.lock().unwrap() = source_identity.map_err(|error|
+                format!("cannot identify the requesting SSH account for account approval: {error:#}; trust this source's plain SSH host key on the laptop and reconnect"));
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             command
                 .args([
                     "-o",

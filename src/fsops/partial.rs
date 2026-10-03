@@ -1727,6 +1727,13 @@ impl FsOps {
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file =
                     open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
+                // A partial block describes only the source's actual EOF
+                // tail, not an arbitrary prefix that could be queried byte
+                // by byte. Full-block windows need no extra metadata lookup.
+                anyhow::ensure!(
+                    len.is_multiple_of(block) || off + len == file.metadata()?.len(),
+                    "short source hash block must end at the file's current EOF"
+                );
                 file.seek(SeekFrom::Start(off))?;
                 return hash_reader_observed(
                     &mut file,

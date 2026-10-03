@@ -876,7 +876,7 @@ fn management_candidates(
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
         ("persist", "auth-from") => Ok(auth_from_candidates(current)),
-        ("persist", "connect") => Ok(endpoint_candidates(
+        ("persist", "connect" | "ssh-config") => Ok(endpoint_candidates(
             current,
             EndpointSyntax::Native,
             pscope_from_args(command, args),
@@ -888,6 +888,18 @@ fn management_candidates(
                 .into_iter()
                 .map(String::into_bytes)
                 .filter(|name| name.starts_with(current))
+                .map(Candidate::text)
+                .collect())
+        }
+        ("persist", "remove")
+            if args.first().is_some_and(|arg| arg == b"receive")
+                && args.get(1).is_some_and(|arg| arg == b"permissions") =>
+        {
+            Ok(crate::receive_approval::accounts::list()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.id.into_bytes())
+                .filter(|id| id.starts_with(current))
                 .map(Candidate::text)
                 .collect())
         }
@@ -1336,6 +1348,7 @@ fn value_completion(
             _ => None,
         },
         "persist" => match option {
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--name" => Some(ValueCompletion::ReceivingProfile),
             b"--pscope" | b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
                 directories_only: true,

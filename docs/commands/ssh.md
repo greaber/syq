@@ -44,28 +44,36 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 ## Account access requires approval
 
-A new laptop-authorized login requires approval. This grants access to the
-**destination account**, including permission to run arbitrary commands;
-it does not restrict access to the command shown in the request. Copy approval
-and automatic download approval do not approve SSH account access.
-See [SSH account access](../security.md#ssh-account-access).
+The first laptop-authorized login asks permission for the source account to use
+**the destination account**, including arbitrary commands and file access. The
+shown command describes the requester's intent; it is not a restriction on that
+permission. Copy roots and byte limits do not apply.
 
-The laptop keeps its private keys and limits authentication to the approved
-host and login account. Keep its receiving connection open while using the
-session. An explicitly approved [persistent account login](../persistence.md#reuse-laptop-authorized-account-access) can serve later commands without another prompt. Stopping receiving, changing the profile, or losing that connection
-stops the local SSH client. Commands are never retried automatically.
+Choose **Allow** to permit logins between those accounts while the laptop's
+current receiving connection to the source remains open. Commands and copies
+reuse the approved SSH connection without another prompt. **Remember** permits
+future logins between the same accounts through that profile while the laptop
+is available. Different accounts or changed trusted host keys require new
+approval. See [account permission controls](../persistence-reference.md#account-permissions).
 
-The destination must already be trusted by the laptop. This mode runs the native OpenSSH client and requires
-OpenSSH 8.9 or newer and an exact plain host key in the laptop's known-hosts
-files; host certificates are unsupported. The laptop's key must be loaded in its local SSH agent. That agent is not forwarded to the requesting server. The requesting server must be able
-to reach the destination's SSH port directly.
+The laptop's ordinary SSH agent is not forwarded. Syq limits its authentication
+requests to the approved destination host keys and login account. The requesting
+SSH client and destination SSH server need OpenSSH 8.9 or newer. Both servers
+must have exact plain host keys trusted by the laptop; host-certificate-only
+trust is unsupported. The laptop's key must be loaded in its local agent, and
+the requesting server must reach the destination's SSH port directly.
+
+Stopping receiving prevents new laptop-authorized logins. Syq also cleans up
+its owned connections, but already authenticated sessions and commands are not
+guaranteed to end. See [SSH account access](../security.md#ssh-account-access).
 
 ## Commands and terminals
 
 Without a command, OpenSSH opens a shell and uses its normal terminal selection.
 Use `-t` to request a terminal for a command or `-T` to disable terminal
 allocation. OpenSSH handles input, output, resizing, and terminal restoration.
-Syq returns its exit status; SSH connection errors normally return 255.
+Syq returns the remote exit status. Its own connection, authorization, and
+setup failures return 255; invalid arguments use the argument parser's status.
 
 Put `--` before a remote command. As with `ssh`, the destination's shell
 interprets the command arguments joined with spaces. Preserve quoting needed
@@ -91,5 +99,5 @@ configuration and syq's native persistent connections when enabled. Explicit
 `ssh` selection always uses native authentication.
 A failed login or command is never retried through a receiving machine.
 Use `--auth-from @NAME` or save that preference to ask your laptop directly.
-An ordinary laptop-authorized invocation opens one login; it does not create
-reusable account access by itself.
+A laptop-authorized invocation opens or reuses an approved account connection.
+You do not need to run `persist connect` first.

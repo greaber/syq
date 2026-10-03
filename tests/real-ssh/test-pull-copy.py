@@ -1,4 +1,7 @@
-"""Server-started, laptop-approved source reads in disposable directories."""
+"""Automatic fallback grants restricted source reads in disposable directories.
+
+Explicit @NAME now requests account access; test-return-ssh covers that route.
+"""
 import json
 import os
 from pathlib import Path
@@ -39,7 +42,7 @@ destination = remote("source", "mktemp -d /tmp/syq-pull-destination.XXXXXX").str
 
 def argv(name, extra=(), binary="syq"):
     return [binary, "cp", "--from", "destination", source + "/data",
-            "--as", destination + "/" + name, "--auth-from", "@laptop",
+            "--as", destination + "/" + name, "--auth-from", "auto",
             "--performance-tuning", "workers=2", *extra]
 
 

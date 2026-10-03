@@ -10,6 +10,7 @@
 use crate::private_broker::{
     ConnectionRegistry, PrivateBroker, PrivateBrokerConfig, TrackedStream,
 };
+#[cfg(test)]
 use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
 use signature::{Signer, Verifier};
@@ -31,7 +32,7 @@ use std::process::Command;
 use std::sync::Arc;
 #[cfg(test)]
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Agent messages are normally only a few KiB. This accommodates large
 /// identity lists without allowing a peer to force an unbounded allocation.
@@ -40,6 +41,8 @@ const MAX_AGENT_FRAME: usize = 256 * 1024;
 const BROKER_IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSH_CONFIG_FILES: usize = 256;
 const MAX_SSH_CONFIG_BYTES: usize = 1024 * 1024;
+const POLICY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_POLICY_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const SSH_AGENT_FAILURE: &[u8] = &[5];
 const SSH_AGENT_SUCCESS: &[u8] = &[6];
 const SSH_AGENT_EXTENSION_FAILURE: &[u8] = &[28];
@@ -65,7 +68,38 @@ impl HostPolicy {
     }
 
     pub(crate) fn host_key_algorithms(&self) -> String {
-        self.host_key_algorithms.join(",")
+        // ssh rejects an entire explicit list when one name is unknown. Do
+        // not export certificate/newer key algorithms unrelated to the keys
+        // actually admitted here, or relax the laptop's RSA signature policy.
+        self.host_key_algorithms
+            .iter()
+            .filter(|allowed| {
+                self.host_keys.iter().any(|key| {
+                    if key.rsa().is_some() {
+                        matches!(allowed.as_str(), "rsa-sha2-256" | "rsa-sha2-512")
+                    } else {
+                        allowed.as_str() == key.algorithm().as_str()
+                    }
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub(crate) fn pinned_host_key_fingerprints(&self) -> Vec<String> {
+        let mut fingerprints = self
+            .host_keys
+            .iter()
+            .map(|key| {
+                PublicKey::new(key.clone(), "")
+                    .fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256)
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        fingerprints
     }
 
     // Policy construction already excludes keys below RequiredRSASize and
@@ -148,10 +182,44 @@ pub fn resolve_host_policy_at(
     host: &str,
     explicit_port: Option<u16>,
 ) -> Result<HostPolicy> {
-    let inspection =
-        inspect_ssh_configuration_at(ssh_program, explicit_user, host, explicit_port, false)?;
-    let defaults =
-        inspect_ssh_configuration_at(ssh_program, explicit_user, host, explicit_port, true)?;
+    resolve_host_policy_at_bounded(
+        ssh_program,
+        explicit_user,
+        host,
+        explicit_port,
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
+    )
+}
+
+/// One budget covers configuration expansion, Match exec descendants, and
+/// every known-host search. The caller can withdraw pending authorization.
+pub(crate) fn resolve_host_policy_at_bounded(
+    ssh_program: &str,
+    explicit_user: Option<&str>,
+    host: &str,
+    explicit_port: Option<u16>,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<HostPolicy> {
+    let inspection = inspect_ssh_configuration_at(
+        ssh_program,
+        explicit_user,
+        host,
+        explicit_port,
+        false,
+        deadline,
+        cancelled,
+    )?;
+    let defaults = inspect_ssh_configuration_at(
+        ssh_program,
+        explicit_user,
+        host,
+        explicit_port,
+        true,
+        deadline,
+        cancelled,
+    )?;
     let defaults = KnownHostsDefaults::from_openssh(&defaults.output)?;
     let config = parse_ssh_config_with_defaults(
         &inspection.output,
@@ -160,7 +228,8 @@ pub fn resolve_host_policy_at(
     )
     .with_context(|| format!("parse `ssh -G` output for {host}"))?;
     let keygen = ssh_keygen_for(ssh_program);
-    let (mut host_keys, saw_ca) = read_known_host_keys(&keygen, &config.lookup, &config.files)?;
+    let (mut host_keys, saw_ca) =
+        read_known_host_keys_bounded(&keygen, &config.lookup, &config.files, deadline, cancelled)?;
     host_keys.retain(|key| configured_host_key_allowed(&config, key));
     if host_keys.is_empty() {
         if saw_ca {
@@ -202,6 +271,8 @@ fn inspect_ssh_configuration(
         host,
         None,
         compiled_defaults_only,
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
     )
 }
 
@@ -211,6 +282,8 @@ fn inspect_ssh_configuration_at(
     host: &str,
     explicit_port: Option<u16>,
     compiled_defaults_only: bool,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<SshConfigurationInspection> {
     let mut command = Command::new(ssh_program);
     command.args(["-G", "-vvv"]);
@@ -224,9 +297,13 @@ fn inspect_ssh_configuration_at(
         command.args(["-p", &port.to_string()]);
     }
     command.args(["--", host]).env("LC_ALL", "C");
-    let output = command
-        .capture_output()
-        .with_context(|| format!("inspect SSH configuration for {host}"))?;
+    let output = crate::process::capture_output_bounded(
+        &mut command,
+        deadline,
+        cancelled,
+        MAX_POLICY_OUTPUT_BYTES,
+    )
+    .with_context(|| format!("inspect SSH configuration for {host}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!(
@@ -679,10 +756,27 @@ fn ssh_keygen_for(ssh_program: &str) -> OsString {
     }
 }
 
+#[cfg(test)]
 fn read_known_host_keys(
     keygen: &OsString,
     lookup: &str,
     files: &[PathBuf],
+) -> Result<(Vec<KeyData>, bool)> {
+    read_known_host_keys_bounded(
+        keygen,
+        lookup,
+        files,
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
+    )
+}
+
+fn read_known_host_keys_bounded(
+    keygen: &OsString,
+    lookup: &str,
+    files: &[PathBuf],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(Vec<KeyData>, bool)> {
     let mut trusted = Vec::new();
     let mut revoked = Vec::new();
@@ -691,12 +785,16 @@ fn read_known_host_keys(
         if !file.exists() {
             continue;
         }
-        let output = Command::new(keygen)
-            .args(["-F", lookup, "-f"])
-            .arg(file)
-            .env("LC_ALL", "C")
-            .capture_output()
-            .with_context(|| format!("search {} for {lookup}", file.display()))?;
+        let output = crate::process::capture_output_bounded(
+            Command::new(keygen)
+                .args(["-F", lookup, "-f"])
+                .arg(file)
+                .env("LC_ALL", "C"),
+            deadline,
+            cancelled,
+            MAX_POLICY_OUTPUT_BYTES,
+        )
+        .with_context(|| format!("search {} for {lookup}", file.display()))?;
         if !output.status.success() {
             if output.status.code() == Some(1)
                 && output.stdout.is_empty()

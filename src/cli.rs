@@ -468,9 +468,11 @@ pub struct Args {
     pub copy_if: Option<String>,
     #[arg(skip)]
     pub expressions: crate::expression::Policy,
-    /// Native copy inputs are read only after selecting the executing build.
+    /// Copy inputs are read only after selecting the executing build.
     #[arg(skip)]
     pending_ignore_inputs: Vec<IgnoreInput>,
+    #[arg(skip)]
+    pending_files_from: bool,
 
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
@@ -702,16 +704,32 @@ impl Args {
     }
 
     pub(crate) fn read_copy_inputs(&mut self) -> Result<()> {
-        if !self.pending_ignore_inputs.is_empty() {
-            self.ignore_lines = read_ignore_inputs(
-                std::mem::take(&mut self.pending_ignore_inputs),
+        let (policy, option) = if self.interface == Interface::Rsync {
+            (
+                rsync_operator_symlink_policy(self.insecure_links),
+                "--syq-ignore-from",
+            )
+        } else {
+            (
                 if self.native_follow {
                     OperatorSymlinkPolicy::FollowAll
                 } else {
                     OperatorSymlinkPolicy::Refuse
                 },
                 "--ignore-from",
+            )
+        };
+        if !self.pending_ignore_inputs.is_empty() {
+            self.ignore_lines = read_ignore_inputs(
+                std::mem::take(&mut self.pending_ignore_inputs),
+                policy,
+                option,
             )?;
+        }
+        if self.pending_files_from {
+            self.files_from_lines =
+                read_files_from(self.files_from.as_ref().unwrap(), self.from0, policy)?;
+            self.pending_files_from = false;
         }
         Ok(())
     }
@@ -924,17 +942,8 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
-    let symlink_policy = rsync_operator_symlink_policy(args.insecure_links);
-    args.ignore_lines = ordered_ignore_lines(
-        &args.ignore,
-        &args.ignore_from,
-        matches,
-        symlink_policy,
-        "--syq-ignore-from",
-    )?;
-    if let Some(f) = &args.files_from {
-        args.files_from_lines = read_files_from(f, args.from0, symlink_policy)?;
-    }
+    args.pending_ignore_inputs = ordered_ignore_inputs(&args.ignore, &args.ignore_from, matches);
+    args.pending_files_from = args.files_from.is_some();
     Ok(args)
 }
 
@@ -993,20 +1002,6 @@ fn ordered_ignore_inputs(
     }
     items.sort_by_key(|(index, _)| *index);
     items.into_iter().map(|(_, item)| item).collect()
-}
-
-fn ordered_ignore_lines(
-    ignore: &[String],
-    ignore_from: &[OsString],
-    matches: &clap::ArgMatches,
-    symlink_policy: OperatorSymlinkPolicy,
-    ignore_from_name: &str,
-) -> Result<Vec<String>> {
-    read_ignore_inputs(
-        ordered_ignore_inputs(ignore, ignore_from, matches),
-        symlink_policy,
-        ignore_from_name,
-    )
 }
 
 fn read_ignore_inputs(

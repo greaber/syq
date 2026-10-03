@@ -92,6 +92,7 @@ syq persist receive <COMMAND>
 |---|---|
 | [`persist receive pending`](#syq-persist-receive-pending) | Show incoming copy and command requests awaiting approval on this machine |
 | [`persist receive approve`](#syq-persist-receive-approve) | Allow one pending request using the ID from persist receive pending |
+| [`persist receive permissions`](#syq-persist-receive-permissions) | List or remove account permissions remembered on this machine |
 | [`persist receive deny`](#syq-persist-receive-deny) | Deny one pending request using the ID from persist receive pending |
 | [`persist receive on`](#syq-persist-receive-on) | Enable or configure a receiving profile (without --name, use the first profile) |
 | [`persist receive off`](#syq-persist-receive-off) | Disable receiving and stop its background connections; keep ordinary persistence |
@@ -126,7 +127,7 @@ syq persist receive pending [OPTIONS]
 
 <!-- CLI: persist receive approve -->
 ```text
-syq persist receive approve <ID>
+syq persist receive approve [OPTIONS] <ID>
 ```
 
 **Arguments**
@@ -134,6 +135,12 @@ syq persist receive approve <ID>
 | Argument / option | Meaning |
 |---|---|
 | `<ID>` | See the command description above. |
+
+**Options**
+
+| Argument / option | Meaning |
+|---|---|
+| `--remember` | Remember this SSH account permission for future receiving connections |
 
 <!-- /CLI -->
 
@@ -144,6 +151,59 @@ syq persist receive approve <ID>
 <!-- CLI: persist receive deny -->
 ```text
 syq persist receive deny <ID>
+```
+
+**Arguments**
+
+| Argument / option | Meaning |
+|---|---|
+| `<ID>` | See the command description above. |
+
+<!-- /CLI -->
+
+## syq persist receive permissions
+
+Manage [remembered account permissions](../persistence-reference.md#account-permissions)
+on the laptop. These commands do not need a running receiving service.
+
+<!-- CLI: persist receive permissions -->
+```text
+syq persist receive permissions <COMMAND>
+```
+
+| Command | Purpose |
+|---|---|
+| [`persist receive permissions list`](#syq-persist-receive-permissions-list) | Show remembered source-to-destination SSH account permissions |
+| [`persist receive permissions remove`](#syq-persist-receive-permissions-remove) | Stop future authentications; already authenticated sessions may continue |
+
+<!-- /CLI -->
+
+## syq persist receive permissions list
+
+Show remembered source-account and destination-account pairs. Use `--json` for
+structured output, including each permission's ID.
+
+<!-- CLI: persist receive permissions list -->
+```text
+syq persist receive permissions list [OPTIONS]
+```
+
+**Options**
+
+| Argument / option | Meaning |
+|---|---|
+| `--json` | See the command description above. |
+
+<!-- /CLI -->
+
+## syq persist receive permissions remove
+
+Remove the listed permission ID. Future login requests ask again; already
+authenticated connections may continue.
+
+<!-- CLI: persist receive permissions remove -->
+```text
+syq persist receive permissions remove <ID>
 ```
 
 **Arguments**

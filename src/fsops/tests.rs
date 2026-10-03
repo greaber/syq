@@ -4770,6 +4770,61 @@ fn source_content_uses_registered_directory_after_name_replacement() {
 }
 
 #[test]
+fn registered_source_hash_rejects_short_prefixes_but_accepts_eof_tails() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let selected = temporary.path().join("selected");
+    let block = MIN_HASH_BLOCK_BYTES;
+    let original = vec![b'x'; block as usize + 7];
+    fs::write(&selected, &original).unwrap();
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let request = |off, len| Request::HashBlocks {
+        off,
+        path: selected.as_os_str().as_bytes().to_vec(),
+        source: Some(selections[0].clone()),
+        which: Which::Final,
+        copy_id: [0; 16],
+        block,
+        len,
+        attempt: 0,
+        guard: None,
+    };
+    for (off, len) in [(0, 1), (0, block + 1), (block, 1)] {
+        let response = worker.handle(&request(off, len));
+        assert!(matches!(response, Response::EndpointError(error)
+            if error.message.contains("current EOF")));
+    }
+    for (off, len, expected) in [
+        (0, block, vec![content_digest(&original[..block as usize])]),
+        (block, 7, vec![content_digest(&original[block as usize..])]),
+        (
+            0,
+            block + 7,
+            vec![
+                content_digest(&original[..block as usize]),
+                content_digest(&original[block as usize..]),
+            ],
+        ),
+    ] {
+        assert!(
+            matches!(worker.handle(&request(off, len)), Response::Hashes(hashes) if hashes == expected)
+        );
+    }
+    // Re-evaluate the opened file: a former tail cannot remain a short-prefix
+    // oracle after this same inode grows between scanning and hashing.
+    let mut grown = original;
+    grown.push(b'y');
+    fs::write(&selected, &grown).unwrap();
+    assert!(
+        matches!(worker.handle(&request(0, block + 7)), Response::EndpointError(error)
+        if error.message.contains("current EOF"))
+    );
+    assert!(
+        matches!(worker.handle(&request(block, 8)), Response::Hashes(hashes)
+        if hashes == vec![content_digest(&grown[block as usize..])])
+    );
+}
+
+#[test]
 fn source_content_rejects_a_replaced_exact_leaf() {
     let temporary = crate::test_support::tempdir().unwrap();
     let selected = temporary.path().join("selected");

@@ -285,7 +285,7 @@ fn main() {
                     error.exit();
                 }
                 crate::output::diagnostic!("syq ssh: {error:#}");
-                std::process::exit(1);
+                std::process::exit(255);
             }
         }
     }
@@ -394,6 +394,10 @@ fn main() {
         return;
     }
     if let Err(error) = persistence::mark_explicit_scope(&mut args) {
+        crate::output::diagnostic!("syq: {error:#}");
+        std::process::exit(2);
+    }
+    if let Err(error) = destination::account_copy::prepare_handoff(&args) {
         crate::output::diagnostic!("syq: {error:#}");
         std::process::exit(2);
     }

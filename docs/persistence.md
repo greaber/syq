@@ -48,23 +48,28 @@ rerun to resume. After rebooting, run `syq persist connect server` again.
 
 ## Reuse laptop-authorized account access
 
-On a server connected to your laptop, explicitly keep an approved login open:
+On a server connected to your laptop, select it for authorization and start work:
 
 ```sh
-syq persist connect hostB --auth-from @laptop
+syq persist auth-from @laptop
 syq ssh hostB -- hostname
 syq cp report --to hostB --as report
 syq ssh hostB
 syq persist off
 ```
 
-The laptop asks for **reusable account access**: commands and copies may use
-that account's full authority while the laptop connection remains open.
-This is broader than approving one copy. Later commands using the same typed
-endpoint reuse the login without another approval. This includes `syq ssh`,
-`cp`, `rsync`, `rm`, `map`, and `clean-partials`, and remote path completion.
-An ordinary `syq ssh` invocation never creates a reusable login automatically.
-The laptop needs the [SSH account authorization requirements](commands/ssh.md#account-access-requires-approval).
+The first command asks for access to the destination account. **Allow** covers
+later commands and copies while the laptop's receiving connection to this
+server stays open. **Remember** also permits future logins for these accounts;
+the laptop must still be available to authorize them. See
+[account permission controls](persistence-reference.md#account-permissions).
+
+The approved connection is reused by `ssh`, `cp`, `rsync`, `rm`, `map`, and
+`clean-partials`. Completion uses existing connections without requesting
+approval. This reuse works independently of ordinary persistence and does not
+enable receiving on the server. To prepare a connection before using it, run
+`syq persist connect hostB --auth-from @laptop`.
+See the [SSH authorization requirements](commands/ssh.md#account-access-requires-approval).
 
 For ordinary SSH tools, export a configuration on the server:
 
@@ -83,11 +88,12 @@ port changes. Export again after approving a replacement connection. Use the
 configuration's absolute path when a tool runs from a different directory.
 Syq does not edit your SSH configuration.
 
-`syq persist off`, stopping the laptop's receiving profile, or losing its
-connection closes this login and its active sessions. Reconnecting the laptop
-does not reopen it: run `persist connect --auth-from @NAME` again to approve
-another reusable login. See [SSH account access](security.md#ssh-account-access)
-for the authority this grants.
+`syq persist off` closes the server's approved connections. It does not remove
+permissions on the laptop: a later command can request another login under the
+same session or remembered permission. Ending the laptop's receiving connection
+ends its session permissions; reconnecting asks again unless you chose Remember.
+See [SSH account access](security.md#ssh-account-access) for the authority granted
+and the limits of stopping access.
 
 See [Persistence details](persistence-reference.md) for troubleshooting,
 upgrading, and isolated connections for scripts, or [`syq persist`](commands/persist.md)

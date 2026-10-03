@@ -1,4 +1,4 @@
-//! Local, one-use approval decisions. Remote requests cannot submit decisions;
+//! Local approval decisions. Remote requests cannot submit decisions;
 //! only the receiving user's private control socket and owned desktop UI can.
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -12,6 +12,22 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub(crate) mod accounts;
+pub(crate) use accounts::{AccountIdentity, AccountPermission};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountDecision {
+    Session,
+    Remember,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    Deny,
+    Allow,
+    Remember,
+}
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(300);
 /// Desktop prompts show about this much of a requesting command;
@@ -124,6 +140,8 @@ pub(crate) enum Details {
         reusable: bool,
         destination: String,
         permission: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountPermission>,
     },
     Storage {
         kind: StorageKind,
@@ -285,6 +303,12 @@ impl Summary {
             Details::Storage { .. } => Kind::Storage,
         }
     }
+    pub(crate) fn account(&self) -> Option<&AccountPermission> {
+        match &self.details {
+            Details::Ssh { account, .. } => account.as_ref(),
+            _ => None,
+        }
+    }
     /// The requesting command. `server_input` styles arguments naming files that
     /// the server reads and this machine cannot check.
     fn command_text(
@@ -379,8 +403,16 @@ impl Summary {
             Kind::Ssh => "Allow access to this SSH account?",
             Kind::Storage => "Authorize this storage access?",
         };
+        let remember = if self.account().is_some() {
+            format!(
+                "\nRemember this account permission: syq persist receive approve {} --remember",
+                self.id
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{}\n\n{question}\nLocal command: syq persist receive approve {}",
+            "{}\n\n{question}\nLocal command: syq persist receive approve {}{remember}",
             self.details_description(server_input),
             self.id
         )
@@ -576,7 +608,7 @@ fn storage_request(
 struct Pending {
     summary: Summary,
     deadline: Instant,
-    decision: Option<bool>,
+    decision: Option<Answer>,
 }
 #[derive(Default)]
 pub(crate) struct Queue {
@@ -592,7 +624,27 @@ impl Queue {
             .map(|p| p.summary.clone())
             .collect()
     }
+    #[cfg(test)]
     pub(crate) fn decide(&self, id: &str, allow: bool, kind: Kind) -> Result<()> {
+        self.decide_with_remember(id, allow, kind, false)
+    }
+    pub(crate) fn decide_with_remember(
+        &self,
+        id: &str,
+        allow: bool,
+        kind: Kind,
+        remember: bool,
+    ) -> Result<()> {
+        self.decide_using(id, allow, kind, remember, accounts::remember)
+    }
+    fn decide_using(
+        &self,
+        id: &str,
+        allow: bool,
+        kind: Kind,
+        remember: bool,
+        save: impl FnOnce(&AccountPermission) -> Result<()>,
+    ) -> Result<()> {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending
             .get_mut(id)
@@ -605,7 +657,22 @@ impl Queue {
                 "approval request kind differs; use a matching syq client to inspect and decide it"
             );
         }
-        entry.decision = Some(allow);
+        if remember {
+            anyhow::ensure!(
+                allow && kind == Kind::Ssh,
+                "--remember applies only to SSH account approval"
+            );
+            let account = entry.summary.account().context("this SSH request does not support remembered permissions; update syq and reconnect receiving")?;
+            save(account)
+                .context("remember account permission; the request is still awaiting approval")?;
+        }
+        entry.decision = Some(if !allow {
+            Answer::Deny
+        } else if remember {
+            Answer::Remember
+        } else {
+            Answer::Allow
+        });
         Ok(())
     }
     fn notification_status(&self, id: &str, status: String) {
@@ -724,12 +791,48 @@ impl Queue {
             details: Details::Ssh {
                 kind: SshKind::Ssh,
                 reusable: persistent,
+                account: None,
                 destination: target,
                 permission: if persistent {
                     "May reuse this account's full authority for repeated SSH commands and copies while the laptop stays connected. Copy roots and limits do not apply. Close this login with syq persist off.".into()
                 } else {
                     "May use this account's full authority for this SSH login. Copy roots and limits do not apply. Session traffic travels directly between the servers.".into()
                 },
+            },
+        }, notifications, TIMEOUT, cancelled)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_account(
+        &self,
+        from: &Requester,
+        command: &[Vec<u8>],
+        cwd: &str,
+        account: &AccountPermission,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<AccountDecision> {
+        anyhow::ensure!(
+            account.profile == from.profile,
+            "account permission differs from the receiving profile"
+        );
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        let target = account.destination.label();
+        self.wait_decision(Summary {
+            id: id.iter().map(|b| format!("{b:02x}")).collect(),
+            from: format!("{:?}", from.to_string()), server: from.server.clone(),
+            expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
+            notification: "starting".into(), command: crate::approval_command::display(command),
+            server_cwd: shown_directory(cwd), verb: "wants SSH account access", sources: vec![account.source.label()],
+            preposition: "to", target: target.clone(),
+            notes: vec![
+                "Allow grants account access until this laptop's receiving connection to the source ends. It is not limited to the displayed command.".into(),
+                "Remember also permits future authentications for these accounts through this receiving profile while the laptop is available. Remove it with syq persist receive permissions remove ID; already authenticated sessions may continue.".into(),
+            ],
+            details: Details::Ssh { kind: SshKind::Ssh, reusable: true, destination: target,
+                permission: format!("{} may use this destination account's full authority for commands and copies. Allow lasts until this laptop's receiving connection to the source ends. Remember also permits future authentications for these accounts through profile @{} while the laptop is available. Removing a remembered permission stops future authentications; already authenticated sessions may continue. Copy roots and limits do not apply. Session traffic travels directly between the servers.", account.source.label(), account.profile),
+                account: Some(account.clone()),
             },
         }, notifications, TIMEOUT, cancelled)
     }
@@ -899,6 +1002,16 @@ impl Queue {
         lifetime: Duration,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
+        self.wait_decision(summary, notifications, lifetime, cancelled)
+            .map(|_| ())
+    }
+    fn wait_decision(
+        &self,
+        summary: Summary,
+        notifications: Notifications,
+        lifetime: Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<AccountDecision> {
         if cancelled() {
             bail!("request disconnected before approval");
         }
@@ -964,21 +1077,25 @@ impl Queue {
                     lifetime.as_secs()
                 );
             }
-            if let Some(allow) = self
+            if let Some(answer) = self
                 .pending
                 .lock()
                 .unwrap()
                 .get(&id)
                 .and_then(|p| p.decision)
             {
-                if !allow {
+                if answer == Answer::Deny {
                     bail!("request denied on the receiving machine");
                 }
                 // An answer that races disconnect/expiry cannot survive it.
                 if cancelled() || Instant::now() >= deadline {
                     bail!("request approval expired or was cancelled");
                 }
-                return Ok(());
+                return Ok(if answer == Answer::Remember {
+                    AccountDecision::Remember
+                } else {
+                    AccountDecision::Session
+                });
             }
             if let Some(process) = notification.as_mut() {
                 // Some notify-send versions keep waiting after reporting a
@@ -994,8 +1111,11 @@ impl Queue {
                 if let Some(result) = process.poll() {
                     notification.take();
                     match result {
-                        Ok(Some(allow)) => {
-                            let _ = self.decide(&id, allow, summary.kind());
+                        Ok(Some(answer)) => {
+                            if let Err(error) = self.decide_with_remember(&id, answer != Answer::Deny,
+                                summary.kind(), answer == Answer::Remember) {
+                                self.notification_status(&id, format!("decision failed: {error:#}; use local syq persist receive approve/deny"));
+                            }
                         }
                         Ok(None) => self.notification_status(
                             &id,
@@ -1025,8 +1145,14 @@ fn escape_markup(text: &str) -> String {
 const APPLESCRIPT: &str = r#"on run argv
     try
         set remainingSeconds to item 2 of argv as integer
-        set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Allow once", "Deny"} default button "Deny" cancel button "Deny" giving up after remainingSeconds
+        if (item 4 of argv) is "account" then
+            set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Remember", "Allow", "Deny"} default button "Deny" cancel button "Deny" giving up after remainingSeconds
+        else
+            set answer to display dialog (item 1 of argv) with title (item 3 of argv) buttons {"Allow once", "Deny"} default button "Deny" cancel button "Deny" giving up after remainingSeconds
+        end if
         if gave up of answer then return "expired"
+        if button returned of answer is "Remember" then return "remember"
+        if button returned of answer is "Allow" then return "allow"
         if button returned of answer is "Allow once" then return "allow"
         return "deny"
     on error number -128
@@ -1046,22 +1172,28 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
             &description,
             &lifetime.as_secs().max(1).to_string(),
             &title,
+            if summary.account().is_some() {
+                "account"
+            } else {
+                "once"
+            },
         ]);
         cmd
     }
     #[cfg(not(target_os = "macos"))]
     {
         let mut cmd = Command::new("/usr/bin/notify-send");
-        cmd.args([
-            "--app-name=syq",
-            "--wait",
-            "--action=allow=Allow once",
-            "--action=deny=Deny",
-        ])
-        .arg(format!("--expire-time={}", lifetime.as_millis()))
-        .arg("--")
-        .arg(&title)
-        .arg(description);
+        cmd.args(["--app-name=syq", "--wait"]);
+        if summary.account().is_some() {
+            cmd.args(["--action=allow=Allow", "--action=remember=Remember"]);
+        } else {
+            cmd.arg("--action=allow=Allow once");
+        }
+        cmd.arg("--action=deny=Deny")
+            .arg(format!("--expire-time={}", lifetime.as_millis()))
+            .arg("--")
+            .arg(&title)
+            .arg(description);
         cmd
     }
 }
@@ -1118,7 +1250,7 @@ impl Notification {
     fn close(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.close()
     }
-    fn poll(&mut self) -> Option<Result<Option<bool>>> {
+    fn poll(&mut self) -> Option<Result<Option<Answer>>> {
         let status = match self.child.poll() {
             Ok(None) => return None,
             Ok(Some(status)) => status,
@@ -1133,8 +1265,9 @@ impl Notification {
             ))
         } else {
             match output.as_slice() {
-                b"allow\n" => Ok(Some(true)),
-                b"deny\n" => Ok(Some(false)),
+                b"allow\n" => Ok(Some(Answer::Allow)),
+                b"deny\n" => Ok(Some(Answer::Deny)),
+                b"remember\n" => Ok(Some(Answer::Remember)),
                 _ => Ok(None),
             }
         })
@@ -1713,6 +1846,152 @@ mod tests {
         assert!(task.join().unwrap().is_err());
     }
 
+    fn account_permission() -> AccountPermission {
+        let identity = |host: &str| {
+            AccountIdentity::new(
+                crate::cli::NativeEndpoint {
+                    user: Some("alice".into()),
+                    host: host.into(),
+                    port: Some(22),
+                },
+                vec![ssh_key::Fingerprint::Sha256([1; 32]).to_string()],
+            )
+            .unwrap()
+        };
+        AccountPermission::new("laptop".into(), identity("source"), identity("destination"))
+            .unwrap()
+    }
+
+    #[test]
+    fn account_approval_distinguishes_session_and_remembered_authority() {
+        for remember in [false, true] {
+            let queue = Arc::new(Queue::default());
+            let waiter = queue.clone();
+            let task = std::thread::spawn(move || {
+                waiter.request_account(
+                    &requester(),
+                    &[b"ssh".to_vec(), b"destination".to_vec()],
+                    "/tmp/project",
+                    &account_permission(),
+                    Notifications::Off,
+                    || false,
+                )
+            });
+            wait_pending(&queue);
+            let pending = queue.snapshots().pop().unwrap();
+            assert_eq!(pending.kind(), Kind::Ssh);
+            assert_eq!(pending.account(), Some(&account_permission()));
+            let desktop = pending.desktop_description(false);
+            assert!(desktop.contains("alice@source:22"));
+            assert!(desktop.contains("alice@destination:22"));
+            assert!(desktop.contains("receiving connection to the source ends"));
+            assert!(desktop.contains("Remember also permits future authentications"));
+            let decoded: Summary =
+                serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
+            let details = decoded.description(str::to_owned);
+            assert!(details.contains("commands and copies"));
+            assert!(details.contains("Remember also permits future authentications"));
+            assert!(details.contains("already authenticated sessions may continue"));
+            assert!(details.contains("--remember"));
+            let notification = notification_command(&pending, TIMEOUT);
+            let args: Vec<_> = notification
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            #[cfg(not(target_os = "macos"))]
+            assert!(args.iter().any(|arg| arg == "--action=remember=Remember"));
+            #[cfg(target_os = "macos")]
+            assert_eq!(args.last().unwrap(), "account");
+            let mut saved = false;
+            queue
+                .decide_using(&pending.id, true, Kind::Ssh, remember, |permission| {
+                    assert_eq!(permission, &account_permission());
+                    saved = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(saved, remember);
+            assert_eq!(
+                task.join().unwrap().unwrap(),
+                if remember {
+                    AccountDecision::Remember
+                } else {
+                    AccountDecision::Session
+                }
+            );
+            assert!(queue
+                .decide_with_remember(&pending.id, true, Kind::Ssh, true)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn failed_remember_does_not_answer_the_pending_account_request() {
+        let queue = Arc::new(Queue::default());
+        let waiter = queue.clone();
+        let task = std::thread::spawn(move || {
+            waiter.request_account(
+                &requester(),
+                &[],
+                "~",
+                &account_permission(),
+                Notifications::Off,
+                || false,
+            )
+        });
+        wait_pending(&queue);
+        let pending = queue.snapshots().pop().unwrap();
+        let error = queue
+            .decide_using(&pending.id, true, Kind::Ssh, true, |_| {
+                bail!("unsupported saved permission version")
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("still awaiting approval"));
+        assert_eq!(queue.snapshots().len(), 1);
+        queue.decide(&pending.id, false, Kind::Ssh).unwrap();
+        assert!(task.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn remember_is_unavailable_for_old_ssh_and_non_account_approvals() {
+        // Unchanged PR #711 one-login SSH pending envelope. Its ordinary local
+        // decision keeps the old one-use meaning and does not gain Remember.
+        let old = r#"{"id":"fixture","from":"server","expires_at":123,"notification":"off","kind":"ssh","reusable":false,"destination":"alice@destination:22","permission":"May use this account's full authority for this SSH login."}"#;
+        let legacy: Summary = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::from_str::<serde_json::Value>(old).unwrap()
+        );
+        for pending in [legacy, summary()] {
+            let id = pending.id.clone();
+            let kind = pending.kind();
+            let command = notification_command(&pending, TIMEOUT);
+            assert!(!command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().contains("--action=remember")));
+            let queue = Queue::default();
+            queue.pending.lock().unwrap().insert(
+                id.clone(),
+                Pending {
+                    summary: pending,
+                    deadline: Instant::now() + TIMEOUT,
+                    decision: None,
+                },
+            );
+            assert!(queue
+                .decide_using(&id, true, kind, true, |_| panic!(
+                    "must not save non-account approval"
+                ))
+                .is_err());
+            assert_eq!(queue.snapshots().len(), 1);
+            queue.decide(&id, true, kind).unwrap();
+            assert_eq!(
+                queue.pending.lock().unwrap().get(&id).unwrap().decision,
+                Some(Answer::Allow)
+            );
+        }
+    }
+
     #[test]
     fn command_prompts_show_the_program_and_its_directory() {
         let mut summary = summary();
@@ -1752,7 +2031,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(result) = prompt.poll() {
-                assert_eq!(result.unwrap(), Some(true));
+                assert_eq!(result.unwrap(), Some(Answer::Allow));
                 break;
             }
             assert!(Instant::now() < deadline, "prompt did not exit");

@@ -276,7 +276,7 @@ Requests from a server are subject to local approval:
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Authorize one copy to or from another server | Always required |
 | Run a command on your machine | Always required |
-| Authorize an SSH login to another server account | Always required; grants that account's authority, optionally for a reusable connection |
+| Authorize an SSH login to another server account | Required unless this source and destination account pair has a session or remembered permission |
 | Use your storage credentials for a transfer | Always required |
 
 The prompt shows the server account and the requested command. For copies and
@@ -320,15 +320,17 @@ described in [Copies between servers](#copies-between-servers). File data goes
 directly between the servers over encrypted TCP or SSH. When SSH data is needed,
 syq gives the source a temporary key whose destination authorization forces it
 into this copy's live worker connection, with terminal access, forwarding and
-user startup scripts disabled. The destination still enforces the approved
+`~/.ssh/rc` disabled (the account's shell may still read its startup files). The destination still enforces the approved
 copy scope. Closing the copy invalidates its worker connections and removes
 the key entry; an entry left by an interrupted cleanup cannot join another
 copy. Your laptop's credentials and signing agent remain on the laptop.
 
 A server can also request source-read approval to download files from another
 server. The source helper confines reads to the approved files and directory
-trees, checks the selected symlink behavior, and enforces the copy's byte,
-entry, and connection limits. It accepts no writes or removal operations.
+trees, checks the selected symlink behavior, and limits returned file data,
+entries, and connections. Hashing approved files for comparison and verification
+is permitted separately; the data limit is not a limit on information that can
+be inferred from those hashes. It accepts no writes or removal operations.
 File data uses authenticated encrypted TCP directly between the servers;
 metadata and control use the laptop connection. If direct TCP is unavailable,
 the copy fails. Closing the approval connection stops further reads.
@@ -355,36 +357,36 @@ signed receipts do not apply.
 
 ## SSH account access
 
-`syq ssh --auth-from @laptop` asks your laptop to authorize an SSH login to
-another server. Approval grants the destination account's authority, including
-arbitrary commands and access to its files. The displayed command describes
-what the requester intends to run; syq does not restrict the approved account
-to that command. Copy paths, download roots, and copy limits do not constrain
-this permission. `syq persist connect HOST --auth-from @NAME` separately asks
-for reusable account access: later commands and copies may use that login
-without another approval while the laptop remains connected. Any process
-running as the requesting account can use its owner-only SSH control socket,
-including ordinary SSH tools configured by `persist ssh-config`. The export
-uses only the selected account connection and fails when it closes.
-A one-time SSH invocation does not create this reusable permission.
+Selecting `--auth-from @laptop` for an SSH command or an ordinary remote file
+operation requests access to the destination account. Approval grants that
+account's authority, including arbitrary commands and access to its files.
+The displayed command is requester-supplied context; it is not an enforced
+command restriction. Copy paths, download roots, and byte limits do not constrain
+account permission. Explicit restricted-copy grants retain their own scope.
 
-When a requesting server uses approved connections to copy between two other
-servers, the source gets only that copy's restricted destination access. The
-requesting server still has the broader account authority that was approved.
-Control and encrypted receipts pass through it; file contents travel directly
-between the source and destination. Losing the copy's control connection closes
-its worker authority. Closing account access does not roll back completed writes.
+**Allow** approves the source-account/destination-account pair for the current
+laptop-to-source receiving connection. **Remember** permits future authentications
+through the same profile while the laptop is available. The permission binds
+resolved accounts and endpoints to the laptop's trusted plain SSH host keys;
+changed identities require fresh approval. The source connection is pinned to
+that identity when it starts. Unsupported source identity lookup does not affect
+ordinary receiving, but account authorization requires a supported trusted identity.
 
-The laptop supplies a signing service restricted to the destination's trusted
-host key and login account. It does not expose your ordinary SSH agent or
-private keys, and the requesting server cannot use this permission to sign
-arbitrary messages or authenticate to a different host or account. As with
-other receiving requests, trust extends to every process under the requesting
-server account, not just the shell that requested permission.
+Commands and copies reuse the approved SSH connection. Any process running as
+the requesting account can use its owner-only control socket. Trust therefore
+extends to that account's processes, not just the shell asking for permission.
+The laptop restricts authentication signatures to the approved destination host
+keys and login account. Its ordinary agent is not forwarded, and this permission
+cannot authenticate to a different destination account or sign arbitrary messages.
 
-Stopping receiving or losing the return connection closes the signing service
-and stops the requesting syq process's SSH client. This prevents further use of
-that signing service. It cannot undo changes already made on the destination,
-stop detached remote processes, or revoke independent access that the approved
-account created. SSH account approval is therefore broader than a
-command-restricted copy grant.
+A laptop agent key constrained with `ssh-add -h hostB` can authorize this login:
+the agent sees the real direct binding to hostB. Syq separately approves the
+requesting source account; an agent constraint describing a forwarded A-to-B
+hop is not implied by that approval.
+
+Stopping receiving ends further authorization through that connection. Removing
+a remembered permission requires new approval for future authentications. Syq
+cleans up its owned connections, but already authenticated sessions may continue,
+including additional commands within them. These actions cannot undo remote
+changes, stop detached processes, or revoke independent access already created
+with the approved account. See [account permission controls](persistence-reference.md#account-permissions).

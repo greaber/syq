@@ -132,8 +132,9 @@ Automatic approval trusts all processes running as the connected server accounts
 including for overwrites inside that directory. You can
 [limit a profile to particular servers](persistence-reference.md#choose-allowed-servers).
 
-Commands on your laptop, new SSH account access, authorization for individual
-copies between servers, and storage authorization always require approval. See
+Commands on your laptop, restricted copies between servers, and storage
+authorization require their own approval. SSH account access can use a current
+session permission or an explicitly remembered permission. See
 [Receivers](security.md#receivers) for the trust boundary.
 
 To require approval for every download again:
@@ -199,23 +200,21 @@ syq cp results --to hostB --into /archive --auth-from @laptop
 syq cp --from hostB /archive/results --into . --auth-from @laptop
 ```
 
-Your laptop asks for approval for each copy and uses its SSH access to hostB.
-Trust hostB's SSH host key on the laptop beforehand. Approval names the
-files or directories hostA may write or read; your laptop's receiving root
-does not contain this copy, but its transfer limits still apply.
+Selecting `@laptop` asks for access to hostB's account on first use. The prompt
+permits arbitrary commands and file access as that account. **Allow** covers
+later copies and commands while the laptop's receiving connection to hostA
+remains open; **Remember** permits future logins for the same accounts.
+[Manage those permissions on the laptop](persistence-reference.md#account-permissions).
 
-Uploads send data directly between the servers over encrypted TCP, with SSH
-as a fallback. `--no-tcp` chooses SSH directly and needs writable
-`~/.ssh/authorized_keys` on hostB for a temporary key restricted to this copy.
-Downloads with source-read approval require a direct TCP data port on hostB;
-they fail if it is unavailable and do not write SSH authorization on hostB.
-Keep the laptop connection and copying command running until completion.
+Uploads and downloads reuse the approved login and support `--no-tcp`, helper
+overrides, and `--inplace`. File data travels directly between the servers.
+You do not need to run `persist connect` first or forward your agent.
 
-For repeated work, you can instead [approve reusable account access](persistence.md#reuse-laptop-authorized-account-access).
-Copies then use that existing SSH login without another prompt, including
-uploads and downloads with `--no-tcp`. This grants the account's full access
-rather than restricting each copy to approved paths.
-See [Authorization selection](remote-reference.md#authorization-selection)
-for automatic selection, other authorizers, and supported options.
-
-See [Multiple profiles and server-specific settings](persistence-reference.md#names-and-profiles).
+With `auto`, eligible copies can instead ask for restricted per-copy approval
+after native SSH fails. That approval names permitted paths and applies transfer
+limits. Restricted uploads use direct TCP or SSH; both explicit `--no-tcp` and
+automatic TCP-to-SSH fallback temporarily add a copy-restricted key to hostB's
+`authorized_keys`. Restricted source-read downloads require direct TCP and do
+not write SSH authorization on the source. Account-approved downloads can use
+SSH in either direction. See [authorization selection](remote-reference.md#authorization-selection)
+for routing details.
