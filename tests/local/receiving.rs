@@ -1337,6 +1337,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
     let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
