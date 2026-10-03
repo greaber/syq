@@ -53,7 +53,6 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     if args.rsh.is_some()
         || args.syq_path.is_some()
         || args.no_bootstrap
-        || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
         || args.no_tcp
@@ -61,7 +60,7 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("source authorization owns its SSH control connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --no-tcp-encryption, --peer-auth, or --coordinate-at");
+        bail!("source authorization owns its SSH control connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
     anyhow::ensure!(args.descriptor_copy.is_none(), "source authorization requires pathname file selections; descriptor streams are not supported");
     let target = crate::remote_to_remote::endpoint_arg(source, None, None);

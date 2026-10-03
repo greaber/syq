@@ -61,15 +61,17 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
         return Ok(None);
     }
     // A custom native route bypasses optional saved authorizer choices.
-    if args.rsh.is_some() || args.pscope_explicit {
+    if args.rsh.is_some() {
         anyhow::ensure!(
             !(args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_))),
-            "--auth-from @NAME cannot be combined with --rsh or --pscope"
+            "--auth-from @NAME cannot be combined with --rsh"
         );
         return Ok(None);
     }
+    let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
     let mode = |location: &Location| {
         crate::auth_from::resolve(
+            &domain,
             location.host.as_deref().unwrap(),
             args.auth_from_explicit.then(|| args.auth_from.clone()),
         )
@@ -84,11 +86,13 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
         || source.same_host(destination)
         || sources.iter().any(|s| !s.same_host(source))
     {
-        anyhow::ensure!(!named, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh, --pscope, and --detach are not supported");
+        anyhow::ensure!(!named, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh and --detach are not supported");
         return Ok(None);
     }
-    let coordinator = ssh::persistent::select_or_connect(&requested(source), &source_mode)?;
-    let peer = ssh::persistent::select_or_connect(&requested(destination), &destination_mode)?;
+    let coordinator =
+        ssh::persistent::select_or_connect(&domain, &requested(source), &source_mode)?;
+    let peer =
+        ssh::persistent::select_or_connect(&domain, &requested(destination), &destination_mode)?;
     match (coordinator, peer) {
         (Some(coordinator), Some(peer)) => Ok(Some(Selection {
             coordinator: Arc::new(coordinator),
@@ -894,22 +898,16 @@ mod tests {
     }
     #[test]
     fn custom_routes_bypass_saved_choices_but_reject_explicit_authorizers() {
-        for use_rsh in [false, true] {
-            let mut args = args();
-            args.auth_from = AuthFrom::Return("laptop".into());
-            if use_rsh {
-                args.rsh = Some("ssh -i /custom/key".into());
-            } else {
-                args.pscope_explicit = true;
-            }
-            args.auth_from_explicit = false;
-            assert!(select(&args).unwrap().is_none());
-            args.auth_from_explicit = true;
-            assert!(select(&args)
-                .unwrap_err()
-                .to_string()
-                .contains("cannot be combined"));
-        }
+        let mut args = args();
+        args.auth_from = AuthFrom::Return("laptop".into());
+        args.rsh = Some("ssh -i /custom/key".into());
+        args.auth_from_explicit = false;
+        assert!(select(&args).unwrap().is_none());
+        args.auth_from_explicit = true;
+        assert!(select(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be combined"));
     }
     #[test]
     fn unsupported_explicit_peer_modes_cannot_fall_back_to_native_credentials() {

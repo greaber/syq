@@ -545,16 +545,19 @@ class NativeClientTests(unittest.TestCase):
     def test_ssh_account_authorization_for_removal_and_mapping(self) -> None:
         self.client.rm("file", on="server", auth_from="@laptop")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
-        with self.client.map("file", from_="server", auth_from="@laptop") as stream:
+        with self.client.map("file", from_="server", auth_from="@laptop", pscope="scope") as stream:
             list(stream)
         self.assertEqual(self.argv()[0], "map")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
-        with self.client.map("file", from_="server", auth_from="@laptop") as stream:
+        with self.client.map("file", from_="server", auth_from="@laptop", pscope="scope") as stream:
             transformed = stream.transform(lambda entry: entry)
             with self.assertRaisesRegex(syq.SyqInvocationError, "auth_from"):
                 self.client.cp(mapping=transformed, into="output", auth_from="@other")
+            with self.assertRaisesRegex(syq.SyqInvocationError, "pscope"):
+                self.client.cp(mapping=transformed, into="output", pscope="other")
             self.client.cp(mapping=transformed, into="output")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        self.assertEqual(self.argv()[self.argv().index("--pscope") + 1], "scope")
         for endpoint in (None, "s3://bucket"):
             with self.assertRaisesRegex(syq.SyqInvocationError, "SSH source"):
                 self.client.map("file", from_=endpoint, auth_from="@laptop")

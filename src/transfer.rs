@@ -1763,11 +1763,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "--detach and --peer-auth apply only to a direct copy between two different remote endpoints"
         );
     }
-    if args.pscope_explicit && coordinator_is_remote {
-        bail!(
-            "--pscope is not supported with a remote transfer coordinator; use --coordinate-at local to keep the reusable connections on this machine"
-        );
-    }
     if args.restricted_grant.is_some()
         && (args.no_tcp_encryption || original_srcs[0].is_remote() || !dst.is_remote())
     {
@@ -1823,9 +1818,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    // A remote coordinator owns both SSH edges. Hand off before constructing
-    // local endpoints so the invoking machine neither reads its persistence
-    // policy nor creates records for connections it will never open.
+    // A remote coordinator owns the data route. Its launcher selects persistence
+    // only for the invoking machine's connection to that coordinator.
     if coordinator_is_remote {
         // The remote coordinator parses its own immutable input. Release this
         // process's preflight entries before waiting for the remote copy.

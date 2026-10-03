@@ -18,7 +18,6 @@ pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
         && args.restricted_grant.is_none()
         && args.receiver_receipt.is_none()
         && args.rsh.is_none()
-        && !args.pscope_explicit
     {
         let locations = if args.locations.is_empty() {
             args.paths
@@ -32,7 +31,9 @@ pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
             let Some(host) = location.host.filter(|host| !host.starts_with('@')) else {
                 continue;
             };
+            let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
             let mode = crate::auth_from::resolve(
+                &domain,
                 &host,
                 args.auth_from_explicit.then(|| args.auth_from.clone()),
             )?;
@@ -59,7 +60,6 @@ pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
     if args.interface != Interface::NativeCp
         || args.s3.is_some()
         || args.rsh.is_some()
-        || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
         || args.receiver_receipt.is_some()
@@ -97,7 +97,9 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
         host: location.host.clone().unwrap(),
         port: location.port,
     };
-    let Some(cached) = super::ssh::persistent::select_or_connect(&requested, &args.auth_from)?
+    let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
+    let Some(cached) =
+        super::ssh::persistent::select_or_connect(&domain, &requested, &args.auth_from)?
     else {
         return Ok(false);
     };
@@ -141,13 +143,15 @@ pub(crate) fn approved_operation(
     if host.starts_with('@') {
         bail!("named receiving machines support syq cp and syq exec; use an SSH endpoint for this operation");
     }
-    if args.rsh.is_some() || args.pscope_explicit {
+    if args.rsh.is_some() {
         if args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_)) {
-            bail!("--auth-from @NAME cannot be combined with --rsh or --pscope");
+            bail!("--auth-from @NAME cannot be combined with --rsh");
         }
         return Ok(None);
     }
+    let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
     let mode = crate::auth_from::resolve(
+        &domain,
         host,
         args.auth_from_explicit.then(|| args.auth_from.clone()),
     )?;
@@ -156,7 +160,7 @@ pub(crate) fn approved_operation(
         host: host.clone(),
         port: location.port,
     };
-    if let Some(cached) = super::ssh::persistent::select_or_connect(&requested, &mode)? {
+    if let Some(cached) = super::ssh::persistent::select_or_connect(&domain, &requested, &mode)? {
         return connection(args, location, cached.endpoint(), cached.options()).map(Some);
     }
     Ok(None)
@@ -235,7 +239,7 @@ mod tests {
         assert!(remote(&pull).is_none());
         pull.rsh = None;
         pull.pscope_explicit = true;
-        assert!(remote(&pull).is_none());
+        assert!(remote(&pull).is_some());
     }
     #[test]
     fn ordinary_account_copies_keep_native_copy_features_and_explicit_receipts_stay_narrow() {

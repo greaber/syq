@@ -145,6 +145,7 @@
         "where",
         "auth-from",
         "rsh",
+        "pscope",
         "syq-path",
         "no-bootstrap",
         "s3-endpoint",
@@ -181,7 +182,8 @@
         "no-bootstrap",
         "results",
         "performance-tuning",
-        "auth-from"
+        "auth-from",
+        "pscope"
       ],
       "follow_up": []
     }

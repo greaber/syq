@@ -896,13 +896,12 @@ fn select_copy(
     }
     if args.syq_path.is_some()
         || args.rsh.is_some()
-        || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
         || args.no_tcp_encryption
         || args.peer_auth != crate::cli::PeerAuth::Restricted
     {
-        bail!("named destinations own their connection; --syq-path, --rsh, --pscope, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
+        bail!("named destinations own their connection; --syq-path, --rsh, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
     }
     if args.connections_opt.is_some()
         && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)

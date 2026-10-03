@@ -895,22 +895,28 @@ fn management_candidates(
             if args.first().is_some_and(|arg| arg == b"receive")
                 && args.get(1).is_some_and(|arg| arg == b"permissions") =>
         {
-            Ok(crate::receive_approval::accounts::list()
+            Ok(
+                crate::receive_approval::accounts::list(&crate::persistence::Domain::select(
+                    pscope_from_args(command, args).map(Path::new),
+                )?)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|item| item.id.into_bytes())
                 .filter(|id| id.starts_with(current))
                 .map(Candidate::text)
-                .collect())
+                .collect(),
+            )
         }
-        ("persist", "remove") if args.first().is_some_and(|arg| arg == b"receive") => {
-            Ok(crate::receive_service::profile_names()
-                .into_iter()
-                .map(String::into_bytes)
-                .filter(|name| name.starts_with(current))
-                .map(Candidate::text)
-                .collect())
-        }
+        ("persist", "remove") if args.first().is_some_and(|arg| arg == b"receive") => Ok(
+            crate::receive_service::profile_names(&crate::persistence::Domain::select(
+                pscope_from_args(command, args).map(Path::new),
+            )?)
+            .into_iter()
+            .map(String::into_bytes)
+            .filter(|name| name.starts_with(current))
+            .map(Candidate::text)
+            .collect(),
+        ),
         ("receiver", "enroll") => Ok(endpoint_candidates(current, EndpointSyntax::Rsync, None)),
         _ => Ok(Vec::new()),
     }
@@ -1292,6 +1298,9 @@ fn value_completion(
 ) -> Option<ValueCompletion> {
     let known = match command {
         "ssh" => match option {
+            b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             _ => None,
         },
@@ -1335,6 +1344,9 @@ fn value_completion(
             _ => None,
         },
         "map" => match option {
+            b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
@@ -1403,12 +1415,14 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
-        ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names()
-            .into_iter()
-            .map(String::into_bytes)
-            .filter(|name| name.starts_with(current))
-            .map(Candidate::text)
-            .collect()),
+        ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names(
+            &crate::persistence::Domain::select(pscope_from_args(command, args).map(Path::new))?,
+        )
+        .into_iter()
+        .map(String::into_bytes)
+        .filter(|name| name.starts_with(current))
+        .map(Candidate::text)
+        .collect()),
         ValueCompletion::AuthFrom => Ok(auth_from_candidates(current)),
         ValueCompletion::ReturnName => Ok(return_name_candidates(current).collect()),
         ValueCompletion::NamedOrSshDestination => {
@@ -1696,17 +1710,8 @@ fn remote_path_candidates(
     .transpose()?
     .map(crate::cli::parse_auth_from)
     .transpose()?;
-    // An explicit scope owns its native connection selection. It bypasses
-    // saved preferences, but cannot override an explicitly named authorizer.
-    let auth_from = if pscope.is_some() {
-        anyhow::ensure!(
-            !matches!(explicit, Some(AuthFrom::Return(_))),
-            "an explicit authorizer cannot be combined with an explicit persistence scope"
-        );
-        None
-    } else {
-        Some(crate::auth_from::resolve(&endpoint.host, explicit)?)
-    };
+    let domain = crate::persistence::Domain::select(pscope.as_deref())?;
+    let auth_from = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
     let endpoint_for_thread = endpoint.clone();
     let directory_for_thread = directory.path;
     let root_for_thread = directory.confined_root;
@@ -1715,7 +1720,7 @@ fn remote_path_candidates(
     std::thread::spawn(move || {
         let connection = connect_completion_endpoint(
             endpoint_for_thread,
-            pscope.as_deref(),
+            &domain,
             auth_from,
             syq_path,
             no_bootstrap,
@@ -1770,16 +1775,12 @@ fn remote_path_candidates(
 
 fn connect_completion_endpoint(
     mut endpoint: NativeEndpoint,
-    pscope: Option<&Path>,
-    auth_from: Option<AuthFrom>,
+    domain: &crate::persistence::Domain,
+    auth_from: AuthFrom,
     syq_path: Option<String>,
     no_bootstrap: bool,
 ) -> Result<RemoteConn> {
-    let cached = auth_from
-        .as_ref()
-        .map(|mode| crate::destination::ssh::persistent::select_cached(&endpoint, mode))
-        .transpose()?
-        .flatten();
+    let cached = crate::destination::ssh::persistent::select_cached(domain, &endpoint, &auth_from)?;
     let mut rsh = vec!["ssh".into()];
     let ssh_multiplexer = if let Some(cached) = cached {
         endpoint = cached.endpoint().clone();
@@ -1798,25 +1799,26 @@ fn connect_completion_endpoint(
         // completion helper nor a disappearing socket may start a new login.
         None
     } else {
-        if let Some(AuthFrom::Return(name)) = auth_from {
+        if let AuthFrom::Return(name) = auth_from {
             bail!("no live approved account connection for {} through @{name}; connect first with syq persist connect {} --auth-from @{name}", endpoint_label(&endpoint), endpoint_label(&endpoint));
         }
-        let persistent = crate::persistence::scope_for_implicit_ssh(pscope).and_then(|scope| {
-            scope
-                .map(|scope| {
-                    SshMultiplexer::persistent(
-                        &scope,
-                        endpoint.user.as_deref(),
-                        &endpoint.host,
-                        endpoint.port,
-                        None,
-                    )
-                })
-                .transpose()
-        });
+        let persistent = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())
+            .and_then(|scope| {
+                scope
+                    .map(|scope| {
+                        SshMultiplexer::persistent(
+                            &scope,
+                            endpoint.user.as_deref(),
+                            &endpoint.host,
+                            endpoint.port,
+                            None,
+                        )
+                    })
+                    .transpose()
+            });
         let persistent = match persistent {
             Ok(multiplexer) => multiplexer,
-            Err(error) if pscope.is_none() => {
+            Err(error) if domain.is_default() => {
                 crate::output::diagnostic!("syq: warning: cannot use persistent SSH connections ({error:#}); continuing without persistence");
                 None
             }

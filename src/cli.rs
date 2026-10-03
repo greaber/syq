@@ -428,7 +428,7 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command
+    /// Syq extension: use an isolated persistence domain created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command
     #[arg(long = "syq-pscope", value_name = "PATH")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
@@ -1491,7 +1491,7 @@ struct NativeCopyCommand {
     copy: NativeCopyFields,
     #[command(flatten)]
     remote: NativeRemoteArgs,
-    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// After copying, remove target-only objects in mapped directory scopes;
@@ -1583,6 +1583,9 @@ struct NativeMapCommand {
     /// Use an approved SSH account connection, or native SSH authentication
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     #[command(flatten)]
     s3: crate::s3::Flags,
     #[command(flatten)]
@@ -1617,7 +1620,7 @@ struct NativeRmCommand {
     helper: NativeRemoteHelperArgs,
     #[command(flatten)]
     results_output: NativeResultsArgs,
-    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
 }
@@ -1650,6 +1653,9 @@ struct CleanPartialsCommand {
     /// Use an approved SSH account connection, or native SSH authentication
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     #[command(flatten)]
     results_output: NativeResultsArgs,
 }
@@ -1679,6 +1685,7 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         parsed.results_output,
     )?;
     args.clean_partials = true;
+    args.pscope = parsed.pscope;
     args.auth_from_explicit = parsed.auth_from.is_some();
     args.auth_from = parsed.auth_from.unwrap_or_default();
     args.locations = parsed
@@ -2579,6 +2586,7 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
 
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeMap;
+    args.pscope = parsed.pscope;
     args.auth_from_explicit = parsed.auth_from.is_some();
     args.auth_from = parsed.auth_from.unwrap_or_default();
     args.placement = placement;

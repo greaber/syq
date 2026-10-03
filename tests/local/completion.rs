@@ -1933,14 +1933,28 @@ fn completion_cache_skips_repeated_hosts_and_replaces_damaged_files() {
 // A recorded approved master with a fake SSH liveness check. The serialized
 // format stays independent of completion: it is the existing version-1 index.
 fn approved_completion_master(t: &Tmp, authorizer: &str) -> PathBuf {
+    approved_completion_master_in(t, authorizer, None)
+}
+
+fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path>) -> PathBuf {
     let scope = ephemeral_scope(t);
-    let parent = scope.parent().unwrap();
+    let parent = domain.unwrap_or_else(|| scope.parent().unwrap());
     let approved = parent.join(format!("approved-{authorizer}"));
     let index = parent.join("authorized-ssh-v1");
     fs::rename(&scope, &approved).unwrap();
     fs::create_dir_all(&index).unwrap();
     fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
     let control = approved.join("s");
+    if domain.is_some() {
+        let generation = "c".repeat(64);
+        for path in [
+            index.join("account-generation"),
+            control.with_extension("generation"),
+        ] {
+            write(&path, generation.as_bytes());
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
     let _listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
     let requested = r#"{"user":null,"host":"backup","port":null}"#;
     let identity = format!(
@@ -2235,8 +2249,8 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
                 assert!(!log.contains("ProxyCommand=false"), "{log}");
                 assert!(log.contains(scope.to_str().unwrap()), "{log}");
                 fs::remove_file(t.path("rsh.log")).unwrap();
-                // An explicit authorizer is stronger than the saved choice:
-                // the unsupported combination must not try a native login.
+                // A global approved connection cannot satisfy an explicit
+                // authorizer in a fresh scope, and must not trigger native login.
                 let mut explicit = words.clone();
                 explicit.splice(
                     explicit.len() - 1..explicit.len() - 1,
@@ -2245,6 +2259,11 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
                 let output = approved_completion_command(&t, &explicit).run().unwrap();
                 assert_output_ok(&output);
                 assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("no live approved account connection"),
+                    "{output:?}"
+                );
                 assert!(!t.path("rsh.log").exists());
             } else {
                 assert!(output.stdout.is_empty(), "{output:?}");
@@ -2252,6 +2271,88 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
             }
         }
     }
+}
+
+#[test]
+fn approved_completion_uses_only_selected_domain_preferences_and_accounts() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    let global = approved_completion_master(&t, "laptop");
+    let scope = ephemeral_scope(&t);
+    let scoped = approved_completion_master_in(&t, "laptop", Some(&scope));
+    write(
+        &t.path("config/syq/auth-from.json"),
+        br#"{"default":"@missing"}"#,
+    );
+    write(&scope.join("auth-from.json"), br#"{"default":"@laptop"}"#);
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let remote_path = format!("backup:{path}");
+    for (command, endpoint_flag) in [
+        ("cp", "--from"),
+        ("cp", "--to"),
+        ("map", "--from"),
+        ("rm", "--on"),
+        ("clean-partials", "--on"),
+        ("rsync", ""),
+    ] {
+        let rsync = command == "rsync";
+        let mut words = vec![
+            "syq",
+            command,
+            if rsync { "--rsync-path" } else { "--syq-path" },
+            env!("CARGO_BIN_EXE_syq"),
+            if rsync { "--syq-pscope" } else { "--pscope" },
+            scope.to_str().unwrap(),
+        ];
+        if endpoint_flag == "--to" {
+            words.push("file");
+        }
+        if !rsync {
+            words.extend([endpoint_flag, "backup"]);
+        }
+        if endpoint_flag == "--to" {
+            words.push("--into");
+        }
+        words.push(if rsync { &remote_path } else { &path });
+        let output = approved_completion_command(&t, &words).run().unwrap();
+        assert_output_ok(&output);
+        assert!(!output.stdout.is_empty(), "{command}: {output:?}");
+        assert!(output.stderr.is_empty(), "{command}: {output:?}");
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        assert!(
+            log.contains(&format!("-S {}", scoped.display())),
+            "{command}: {log}"
+        );
+        assert!(!log.contains(global.to_str().unwrap()), "{command}: {log}");
+        assert!(
+            log.lines().all(|line| line.contains("ProxyCommand=false")),
+            "{command}: {log}"
+        );
+        fs::remove_file(t.path("rsh.log")).unwrap();
+    }
+    // Explicit native choice overrides the scope's named default and master.
+    let output = approved_completion_command(
+        &t,
+        &[
+            "syq",
+            "cp",
+            "--pscope",
+            scope.to_str().unwrap(),
+            "--auth-from",
+            "ssh",
+            "--from",
+            "backup",
+            &path,
+        ],
+    )
+    .env("FAKE_SSH_SESSION_STATUS", "55")
+    .run()
+    .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(!log.contains("ProxyCommand=false"), "{log}");
+    assert!(log.contains(scope.to_str().unwrap()), "{log}");
 }
 
 #[test]

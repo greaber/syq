@@ -565,7 +565,7 @@ def _positive_integer(value: int | None, *, option: str) -> int | None:
 
 def _map_options(argv: list[Argument], *, include: Iterable[str] | None,
                  rsh: str | None, syq_path: str | os.PathLike[str] | None,
-                 no_bootstrap: bool) -> None:
+                 no_bootstrap: bool, pscope: PathArgument | None) -> None:
     if include is not None:
         if isinstance(include, (str, bytes)):
             raise SyqInvocationError("include must be an iterable of field names")
@@ -577,6 +577,8 @@ def _map_options(argv: list[Argument], *, include: Iterable[str] | None,
         argv.append("--rsh=" + _text_arg(rsh, label="rsh"))
     if syq_path is not None:
         argv.append("--syq-path=" + _text_arg(syq_path, label="syq_path"))
+    if pscope is not None:
+        _append_path_option(argv, "--pscope", _argument(pscope, label="pscope"))
     if no_bootstrap:
         argv.append("--no-bootstrap")
 
@@ -1295,7 +1297,7 @@ class Client:
         check: bool = True,
     ) -> CpResult:
         connection = _connection_options(mapping, _Connection(
-            rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header, auth_from,
+            rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header, auth_from, pscope,
         ))
         from_, cwd, root, follow_src = _source_options(
             mapping, from_=from_, cwd=cwd, root=root, follow_src=follow_src,
@@ -1367,7 +1369,7 @@ class Client:
             argv,
             coordinate_at=coordinate_at,
             rsh=connection.rsh,
-            pscope=pscope,
+            pscope=connection.pscope,
             syq_path=connection.syq_path,
             no_bootstrap=connection.no_bootstrap,
             no_tcp_encryption=no_tcp_encryption,
@@ -1524,6 +1526,7 @@ class Client:
         where: str | None = None,
         auth_from: str | None = None,
         rsh: str | None = None,
+        pscope: PathArgument | None = None,
         syq_path: str | os.PathLike[str] | None = None,
         no_bootstrap: bool = False,
         s3_endpoint: str | None = None,
@@ -1584,9 +1587,9 @@ class Client:
             where=where,
         )
         connection = _Connection(rsh, syq_path, no_bootstrap,
-                                 s3_endpoint, s3_region, s3_profile, s3_header, auth_from)
+                                 s3_endpoint, s3_region, s3_profile, s3_header, auth_from, pscope)
         _map_options(argv, include=include, rsh=connection.rsh, syq_path=connection.syq_path,
-                     no_bootstrap=connection.no_bootstrap)
+                     no_bootstrap=connection.no_bootstrap, pscope=connection.pscope)
         if connection.auth_from is not None:
             if from_ is None or from_.startswith("s3://"):
                 raise SyqInvocationError("auth_from requires an SSH source for map")

@@ -216,17 +216,20 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_ssh_account_authorization_for_removal_and_mapping(self) -> None:
         await self.client.rm("file", on="server", auth_from="@laptop")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
-        async with self.client.map("file", from_="server", auth_from="@laptop") as stream:
+        async with self.client.map("file", from_="server", auth_from="@laptop", pscope="scope") as stream:
             [entry async for entry in stream]
         self.assertEqual(self.argv()[0], "map")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
-        stream = self.client.map("file", from_="server", auth_from="@laptop")
+        stream = self.client.map("file", from_="server", auth_from="@laptop", pscope="scope")
         async with stream:
             transformed = stream.transform(lambda entry: entry)
             with self.assertRaisesRegex(syq.SyqInvocationError, "auth_from"):
                 await self.client.cp(mapping=transformed, into="output", auth_from="@other")
+            with self.assertRaisesRegex(syq.SyqInvocationError, "pscope"):
+                await self.client.cp(mapping=transformed, into="output", pscope="other")
             await self.client.cp(mapping=transformed, into="output")
         self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        self.assertEqual(self.argv()[self.argv().index("--pscope") + 1], "scope")
         for endpoint in (None, "s3://bucket"):
             with self.assertRaisesRegex(syq.SyqInvocationError, "SSH source"):
                 self.client.map("file", from_=endpoint, auth_from="@laptop")

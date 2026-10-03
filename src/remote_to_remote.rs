@@ -913,6 +913,19 @@ fn run_remote(
     let coordinator_target = endpoint_display(coordinator);
     let spec = if let Some(bridge) = &peer_bridge {
         bridge.coordinator.clone()
+    } else if matches!(
+        default_ssh_agent_policy,
+        None | Some(AgentForwarding::Disabled)
+    ) {
+        // Only this machine selects a persistence domain. A native coordinator
+        // can reuse its local master; credential-bound forwarding below remains
+        // private to this copy. Never send the scope path to the coordinator.
+        let crate::conn::Endpoint::Remote(mut spec) = crate::transfer::endpoint(coordinator, args)?
+        else {
+            unreachable!()
+        };
+        spec.rsh = source_setup_rsh(&rsh, args.rsh.is_some());
+        spec
     } else {
         crate::conn::RemoteSpec {
             local_process: false,
@@ -1233,6 +1246,9 @@ fn run_remote(
     };
 
     let make_command = || {
+        if spec.ssh_multiplexer.is_some() {
+            return spec.coordinator_command(&remote_cmd);
+        }
         direct_command(
             &rsh,
             coordinator.user.as_deref(),
