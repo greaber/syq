@@ -204,7 +204,9 @@ fn ssh_options(agent: &Path, known_hosts: &Path, algorithms: &str) -> Result<Vec
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@,=".contains(&b))
         {
-            bail!("SSH authorization requires a temporary-directory path without whitespace or SSH expansion tokens");
+            bail!(
+                "SSH authorization requires a temporary-directory path without whitespace or SSH expansion tokens"
+            );
         }
     }
     if algorithms.is_empty()
@@ -351,7 +353,7 @@ impl Receiver {
                 .unwrap()
                 .get(&key)
                 .is_some_and(|approved_generation| *approved_generation == generation);
-            if !session_approved && !crate::receive_approval::accounts::remembered(&permission)? {
+            if !session_approved && !self.approvals.account_remembered(&permission)? {
                 let decision = self.approvals.request_account(
                     &self.requester,
                     &request.command,

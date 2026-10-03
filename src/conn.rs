@@ -7,7 +7,7 @@ use crate::proto::SizeHint;
 use crate::proto::*;
 use crate::remote_helper::{self, Target};
 use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -773,7 +773,7 @@ impl RemoteConn {
                     Ok(value) => break Ok(value),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        break Err(std::sync::mpsc::RecvError)
+                        break Err(std::sync::mpsc::RecvError);
                     }
                 }
             }
@@ -1547,7 +1547,9 @@ impl RemoteSpec {
                 }
                 self.record_peer(&conn);
                 if multiplexer.automatic_receiving {
-                    crate::receive_service::ensure(&multiplexer.path, self);
+                    if let Some(domain) = &multiplexer.domain {
+                        crate::receive_service::ensure(domain, &multiplexer.path, self);
+                    }
                 }
                 Some(conn)
             }
@@ -1580,6 +1582,14 @@ impl RemoteSpec {
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
         let mut command = self.ssh_command(SshConnection::Independent, false);
         command.arg(self.program_command(args));
+        command
+    }
+
+    /// Launch a coordinator on this local connection's selected master. Its
+    /// rebuilt remote command does not inherit the local persistence domain.
+    pub(crate) fn coordinator_command(&self, remote_command: &str) -> Command {
+        let mut command = self.ssh_command(SshConnection::Control, false);
+        command.arg(remote_command);
         command
     }
 
@@ -1762,7 +1772,7 @@ impl RemoteSpec {
                 // Don't retry what won't change: a missing binary or an
                 // incompatible protocol/build identity.
                 Err(e) if attempt + 1 == attempts || is_non_retryable_connect_error(&e) => {
-                    return Err(e)
+                    return Err(e);
                 }
                 Err(e) => {
                     let limit = if limited {
@@ -2000,7 +2010,9 @@ impl RemoteSpec {
                 if multiplexer.persistent && multiplexer.session_pool {
                     crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
                     if multiplexer.automatic_receiving {
-                        crate::receive_service::ensure(&multiplexer.path, self);
+                        if let Some(domain) = &multiplexer.domain {
+                            crate::receive_service::ensure(domain, &multiplexer.path, self);
+                        }
                     }
                 }
             }
@@ -2434,7 +2446,9 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         };
         resolved[i] = addrs;
         if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
-            bail!("TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})");
+            bail!(
+                "TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})"
+            );
         }
     }
 
@@ -2615,7 +2629,7 @@ impl TcpInfo {
                     Err(error) if is_tcp_congestion_error(&error) => {
                         return Err(error).with_context(|| {
                             format!("could not configure the connecting data socket to {sa}")
-                        })
+                        });
                     }
                     Err(e) => last = anyhow!("{}: {e}", data_address(addr, self.port)),
                 }
@@ -2689,23 +2703,21 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
             )
         }
         Ok(Response::Err(error)) if worker => {
-            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into())
+            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into());
         }
         Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
-        Ok(other) if worker => {
-            return Err(WorkerInitializationError(format!(
+        Ok(other) if worker => return Err(WorkerInitializationError(format!(
             "{}: unexpected handshake response {other:?}; remote syq may be a different version",
             conn.label
         ))
-            .into())
-        }
+        .into()),
         Ok(other) => bail!(
             "{}: unexpected handshake response {other:?}; remote syq may be a different version",
             conn.label
         ),
         Err(e) => {
             return Err(e)
-                .with_context(|| format!("could not start the remote syq on {}", conn.label))
+                .with_context(|| format!("could not start the remote syq on {}", conn.label));
         }
     }
     Ok(conn)
@@ -2832,7 +2844,7 @@ impl Endpoint {
                             if is_tcp_congestion_error(&e)
                                 || is_worker_initialization_error(&e) =>
                         {
-                            return Err(e)
+                            return Err(e);
                         }
                         Err(e) => {
                             #[cfg(debug_assertions)]
@@ -2849,7 +2861,11 @@ impl Endpoint {
                                         let congestion_note = tcp_congestion_fallback_note(
                                             info.congestion_control.as_deref(),
                                         );
-                                        warning = Some(format!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port));
+                                        warning = Some(format!(
+                                            "syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})",
+                                            spec.label(),
+                                            info.port
+                                        ));
                                     }
                                 }
                             }

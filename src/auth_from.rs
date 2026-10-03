@@ -1,7 +1,8 @@
 //! User-selected authorization defaults. This file is independent of SSH
 //! persistence state so older binaries can keep using their existing settings.
 use crate::cli::AuthFrom;
-use anyhow::{bail, Context, Result};
+use crate::persistence::Domain;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -86,8 +87,8 @@ fn host_key(value: &str) -> Result<String> {
     Ok(endpoint.host)
 }
 
-fn path() -> Option<PathBuf> {
-    crate::persistence::config_path().map(|path| path.with_file_name("auth-from.json"))
+fn path(domain: &Domain) -> Result<PathBuf> {
+    domain.config_file("auth-from.json")
 }
 
 fn read(path: &Path) -> Result<Config> {
@@ -101,13 +102,17 @@ fn read(path: &Path) -> Result<Config> {
             if error.kind() == std::io::ErrorKind::NotFound
                 || error.raw_os_error() == Some(libc::ENOTDIR) =>
         {
-            return Ok(Config::default())
+            return Ok(Config::default());
         }
         Err(error) => return Err(error).context("open authorization preferences"),
     };
     let metadata = file.metadata()?;
-    anyhow::ensure!(metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() }
-        && metadata.mode() & 0o022 == 0, "authorization preferences must be a regular file owned by this user and not writable by others");
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0,
+        "authorization preferences must be a regular file owned by this user and not writable by others"
+    );
     let mut contents = Vec::new();
     Read::by_ref(&mut file)
         .take(MAX_CONFIG_BYTES + 1)
@@ -121,10 +126,11 @@ fn read(path: &Path) -> Result<Config> {
     config.validate()?;
     Ok(config)
 }
-fn load() -> Result<Config> {
-    let Some(path) = path() else {
+fn load(domain: &Domain) -> Result<Config> {
+    if domain.is_default() && crate::persistence::config_path().is_none() {
         return Ok(Config::default());
-    };
+    }
+    let path = path(domain)?;
     read(&path).with_context(|| {
         format!(
         "read saved authorization choice from {}; repair this file or pass --auth-from explicitly",
@@ -135,11 +141,11 @@ fn load() -> Result<Config> {
 
 /// Explicit flags bypass disk reads, including `auto`. Preference lookup uses
 /// the typed hostname/alias, without an SSH connection or config expansion.
-pub(crate) fn resolve(host: &str, explicit: Option<AuthFrom>) -> Result<AuthFrom> {
+pub(crate) fn resolve(domain: &Domain, host: &str, explicit: Option<AuthFrom>) -> Result<AuthFrom> {
     if let Some(choice) = explicit {
         return Ok(choice);
     }
-    load()?.selected(host)
+    load(domain)?.selected(host)
 }
 
 pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
@@ -158,7 +164,8 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     let host = location
         .and_then(|location| location.host.as_deref())
         .context("authorization endpoint missing")?;
-    args.auth_from = resolve(host, None)?;
+    let domain = Domain::select(args.pscope.as_deref())?;
+    args.auth_from = resolve(&domain, host, None)?;
     Ok(())
 }
 
@@ -203,17 +210,15 @@ fn update(path: &Path, host: Option<&str>, value: Option<&AuthFrom>) -> Result<C
     Ok(config)
 }
 
-pub(crate) fn run(command: PreferenceCommand) -> Result<i32> {
+pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
     let config = if command.reset || command.value.is_some() {
         update(
-            &path().context(
-                "cannot save authorization preferences: XDG_CONFIG_HOME and HOME are unset",
-            )?,
+            &path(domain)?,
             command.host.as_deref(),
             command.value.as_ref(),
         )?
     } else {
-        load()?
+        load(domain)?
     };
     if let Some(host) = &command.host {
         crate::output::human_stdout!(

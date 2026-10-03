@@ -7,6 +7,7 @@ pub(crate) struct SshMultiplexer {
     /// deliberately outlives this process.
     pub(super) _directory: Option<tempfile::TempDir>,
     pub(super) path: PathBuf,
+    pub(super) domain: Option<crate::persistence::Domain>,
     /// A managed persistence scope keeps its control master alive, so later
     /// syq runs in that scope skip the SSH handshake.
     pub(super) persistent: bool,
@@ -312,6 +313,7 @@ impl SshMultiplexer {
         Ok(Self {
             _directory: Some(directory),
             path,
+            domain: None,
             persistent: false,
             idle_timeout: "no",
             automatic_receiving: false,
@@ -333,13 +335,15 @@ impl SshMultiplexer {
         ssh: Option<&crate::persistence::SshOptions>,
     ) -> Result<Self> {
         let path = crate::persistence::prepare_endpoint(scope, user, host, port, ssh)?;
-        let global = crate::persistence::is_global_scope(scope)?;
+        let domain = crate::persistence::Domain::select(Some(scope))?;
+        let global = domain.is_default();
         Ok(Self {
             _directory: None,
             path,
+            domain: Some(domain),
             persistent: true,
             idle_timeout: if global { "yes" } else { "300" },
-            automatic_receiving: global && ssh.is_none(),
+            automatic_receiving: ssh.is_none(),
             session_pool: ssh.is_none(),
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),

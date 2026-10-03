@@ -531,6 +531,71 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     assert!(String::from_utf8_lossy(&status.stdout).contains("is off"));
 }
 
+#[test]
+fn persistence_domains_isolate_preferences_receiving_and_cleanup() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let first = ephemeral_scope(&t);
+    let second = ephemeral_scope(&t);
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .env("HOME", t.path(""))
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["auth-from", "@global-provider"]));
+    let original_global = read(&t.path("config/syq/auth-from.json"));
+    assert_output_ok(&run(&[
+        "--pscope",
+        first.to_str().unwrap(),
+        "auth-from",
+        "@job-provider",
+    ]));
+    let fresh = run(&["auth-from", "--pscope", second.to_str().unwrap()]);
+    assert_output_ok(&fresh);
+    assert_eq!(fresh.stdout, b"default: auto\n");
+    let selected = run(&["auth-from", "--pscope", first.to_str().unwrap()]);
+    assert_output_ok(&selected);
+    assert_eq!(selected.stdout, b"default: @job-provider\n");
+    let inactive = run(&[
+        "--pscope",
+        second.to_str().unwrap(),
+        "receive",
+        "status",
+        "--json",
+    ]);
+    assert_output_ok(&inactive);
+    let inactive: serde_json::Value = serde_json::from_slice(&inactive.stdout).unwrap();
+    assert_eq!(inactive["settings"]["enabled"], false);
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--pscope",
+        first.to_str().unwrap(),
+        "--name",
+        "job",
+        "--notify",
+        "off",
+    ]));
+    assert!(first.join("receive.json").is_file());
+    assert!(!second.join("receive.json").exists());
+    assert!(!t.path("config/syq/receive.json").exists());
+    assert_eq!(read(&t.path("config/syq/auth-from.json")), original_global);
+    // A default-domain shutdown must not find or remove either explicit domain.
+    assert_output_ok(&run(&["off"]));
+    assert!(first.exists());
+    assert!(second.exists());
+    assert_output_ok(&run(&["--pscope", first.to_str().unwrap(), "off"]));
+    assert!(!first.exists());
+    assert!(second.exists());
+    assert_eq!(read(&t.path("config/syq/auth-from.json")), original_global);
+    let closed = run(&["--pscope", first.to_str().unwrap(), "auth-from"]);
+    assert!(!closed.status.success());
+    assert!(!stderr_of(&closed).contains("global-provider"));
+    assert_output_ok(&run(&["off", "--pscope", second.to_str().unwrap()]));
+    assert!(!second.exists());
+}
+
 /// The session pool's own ssh invocations, as the fake logs them: a master
 /// check, or a spare opened with every authentication method disabled.
 fn pool_lines(log: &str) -> (Vec<&str>, Vec<&str>) {
@@ -1166,9 +1231,11 @@ fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state()
     );
     assert!(!t.path("ssh-used").exists());
     assert_output_ok(&run(&["persist", "auth-from", "ssh", "--for", "backup"]));
-    assert!(!run(&["cp", "source", "--to", "user@backup:2222"])
-        .status
-        .success());
+    assert!(
+        !run(&["cp", "source", "--to", "user@backup:2222"])
+            .status
+            .success()
+    );
     assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
     fs::remove_file(t.path("ssh-used")).unwrap();
     write(&t.path("config/syq/auth-from.json"), b"future schema");

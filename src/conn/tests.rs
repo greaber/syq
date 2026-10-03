@@ -63,10 +63,12 @@ fn tcp_connection_ids_fail_at_nonce_space_exhaustion() {
     let next = std::sync::atomic::AtomicU32::new(crate::tcp_records::CONNECTION_ID_MAX);
     assert_eq!(super::next_tcp_connection_id(&next).unwrap(), 0x00ff_ffff);
     for _ in 0..3 {
-        assert!(super::next_tcp_connection_id(&next)
-            .unwrap_err()
-            .to_string()
-            .contains("restart the copy"));
+        assert!(
+            super::next_tcp_connection_id(&next)
+                .unwrap_err()
+                .to_string()
+                .contains("restart the copy")
+        );
     }
     assert_eq!(next.load(std::sync::atomic::Ordering::Relaxed), 0x0100_0000);
 }
@@ -281,12 +283,13 @@ fn client_handshake_limit_also_bounds_compressed_output() {
     wire.push(1);
     wire.extend_from_slice(&body);
     let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
-    assert!(rx
-        .recv()
-        .unwrap()
-        .unwrap_err()
-        .to_string()
-        .contains("decompressed frame exceeds limit"));
+    assert!(
+        rx.recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("decompressed frame exceeds limit")
+    );
     thread.join().unwrap();
 }
 
@@ -381,10 +384,12 @@ fn excessive_probe_candidates_fail_before_resolution() {
             selected: false,
         })
         .collect();
-    assert!(probe_reachable(&mut candidates, 1)
-        .unwrap_err()
-        .to_string()
-        .contains("too many"));
+    assert!(
+        probe_reachable(&mut candidates, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("too many")
+    );
 }
 
 struct ExitObserved<R> {
@@ -677,13 +682,15 @@ fn range_drain_reports_acknowledgements_before_a_receive_failure() {
     let mut acknowledged = Vec::new();
     // The third receive fails with no pending response. LocalConn does not
     // mark itself dead; draining must still stop at that transport error.
-    assert!(drain_range_replies_with(
-        &mut conn,
-        ["first", "second", "third", "fourth"],
-        "write",
-        |item| acknowledged.push(item),
-    )
-    .is_err());
+    assert!(
+        drain_range_replies_with(
+            &mut conn,
+            ["first", "second", "third", "fourth"],
+            "write",
+            |item| acknowledged.push(item),
+        )
+        .is_err()
+    );
     assert_eq!(acknowledged, ["second"]);
     assert!(!conn.is_dead());
     assert!(conn.pending.is_empty());
@@ -691,8 +698,8 @@ fn range_drain_reports_acknowledgements_before_a_receive_failure() {
 
 #[test]
 fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountWrites(Arc<AtomicUsize>);
     impl Write for CountWrites {
@@ -863,8 +870,11 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
         .expect_err("unregistered congestion control should fail locally");
     let message = format!("{error:#}");
     assert!(is_tcp_congestion_error(&error));
-    assert!(message
-        .contains("coordinator could not configure the connecting data socket to remote.example"));
+    assert!(
+        message.contains(
+            "coordinator could not configure the connecting data socket to remote.example"
+        )
+    );
 }
 
 #[test]
@@ -1480,8 +1490,8 @@ fn captured_commands_bound_both_streams_and_feed_input() {
 fn remote_download_report_frames_manifest_and_digest() {
     let digest = "a".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
+    );
     let report = read_remote_download_report(&mut bytes.as_bytes())
         .unwrap()
         .unwrap();
@@ -1503,28 +1513,32 @@ fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
     let spoofed = "a".repeat(64);
     let actual = "b".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
+    );
     let report = read_remote_download_report(&mut bytes.as_bytes())
         .unwrap()
         .unwrap();
     assert_eq!(report.sha256, actual);
-    assert!(report
-        .manifest
-        .windows(b"syq-helper-manifest-end".len())
-        .any(|window| window == b"syq-helper-manifest-end"));
-    assert!(report
-        .manifest
-        .windows(spoofed.len())
-        .any(|window| { window == spoofed.as_bytes() }));
+    assert!(
+        report
+            .manifest
+            .windows(b"syq-helper-manifest-end".len())
+            .any(|window| window == b"syq-helper-manifest-end")
+    );
+    assert!(
+        report
+            .manifest
+            .windows(spoofed.len())
+            .any(|window| { window == spoofed.as_bytes() })
+    );
 }
 
 #[test]
 fn remote_download_report_rejects_data_after_the_digest() {
     let digest = "a".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
+    );
     let error = read_remote_download_report(&mut bytes.as_bytes()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -1551,9 +1565,11 @@ fn ssh_inherits_host_key_policy() {
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let command = spec.ssh_command(SshConnection::Independent, false);
-    assert!(!command
-        .get_args()
-        .any(|arg| arg.to_string_lossy().starts_with("StrictHostKeyChecking=")));
+    assert!(
+        !command
+            .get_args()
+            .any(|arg| arg.to_string_lossy().starts_with("StrictHostKeyChecking="))
+    );
 
     let mut configured = spec;
     configured.rsh = vec![
@@ -1561,10 +1577,12 @@ fn ssh_inherits_host_key_policy() {
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
     ];
-    assert!(configured
-        .ssh_command(SshConnection::Independent, false)
-        .get_args()
-        .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes")));
+    assert!(
+        configured
+            .ssh_command(SshConnection::Independent, false)
+            .get_args()
+            .any(|arg| arg == OsStr::new("StrictHostKeyChecking=yes"))
+    );
 }
 
 #[test]
@@ -1616,16 +1634,18 @@ fn worker_tcp_fallback_survives_broken_stderr() {
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     };
     let endpoint = Endpoint::Remote(spec.clone());
-    assert!(endpoint
-        .connect_with_role(
-            false,
-            ConnectionRole::SourceWorker {
-                roots: Vec::new(),
-                send_budget: None
-            },
-            false
-        )
-        .is_err());
+    assert!(
+        endpoint
+            .connect_with_role(
+                false,
+                ConnectionRole::SourceWorker {
+                    roots: Vec::new(),
+                    send_budget: None
+                },
+                false
+            )
+            .is_err()
+    );
     assert!(marker.exists(), "worker never attempted SSH fallback");
     assert!(spec.tcp.lock().unwrap().as_ref().unwrap().failed);
 }
@@ -1662,9 +1682,11 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
 
     let control = args(SshConnection::Control);
     assert!(control.iter().any(|arg| arg == "ControlMaster=yes"));
-    assert!(control
-        .windows(2)
-        .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+    assert!(
+        control
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path)
+    );
     assert!(control.iter().any(|arg| arg == "ControlPersist=no"));
 
     let worker = args(spec.ssh_connection(true, false));
@@ -1672,9 +1694,11 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
     assert!(worker.iter().any(|arg| arg == "ControlPath=none"));
 
     let first = args(spec.ssh_connection(true, true));
-    assert!(first
-        .windows(2)
-        .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+    assert!(
+        first
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path)
+    );
     assert!(!first.iter().any(|arg| arg == "ControlPath=none"));
     assert_eq!(spec.ssh_connection(false, true), SshConnection::Control);
     // The first worker's preference is per call, not an opt-in for peers.
@@ -1689,9 +1713,11 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
     spec.set_ssh_multiplexing(true);
     let worker = args(spec.ssh_connection(true, false));
     assert!(worker.iter().any(|arg| arg == "ControlMaster=no"));
-    assert!(worker
-        .windows(2)
-        .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+    assert!(
+        worker
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path)
+    );
     assert!(!worker.iter().any(|arg| arg == "ControlPath=none"));
 
     let independent = args(SshConnection::Independent);
@@ -1813,9 +1839,11 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     };
     let control = args(SshConnection::Control);
     assert!(control.iter().any(|arg| arg == "ControlMaster=auto"));
-    assert!(control
-        .windows(2)
-        .any(|pair| pair[0] == "-S" && pair[1] == control_path));
+    assert!(
+        control
+            .windows(2)
+            .any(|pair| pair[0] == "-S" && pair[1] == control_path)
+    );
     assert!(control.iter().any(|arg| arg == "ControlPersist=300"));
     // Worker data channels never ride a cross-run master, even when the
     // small-file path asks for in-run multiplexing.
@@ -1841,6 +1869,7 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
     assert!(!verbose(&spec, true));
     spec.restricted_grant = None;
     spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer {
+        domain: None,
         _directory: None,
         path: PathBuf::from("/tmp/syq-test-socket"),
         persistent: true,
@@ -1851,10 +1880,12 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
         workers_rejected: AtomicBool::new(false),
     }));
     assert!(!verbose(&spec, true));
-    assert!(!spec
-        .ssh_command(SshConnection::Independent, true)
-        .get_args()
-        .any(|arg| arg == "-v"));
+    assert!(
+        !spec
+            .ssh_command(SshConnection::Independent, true)
+            .get_args()
+            .any(|arg| arg == "-v")
+    );
 }
 
 #[test]
@@ -1865,6 +1896,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         b"/tmp/scope with space/%h/non-utf8-\xff/socket".to_vec(),
     ));
     let multiplexer = SshMultiplexer {
+        domain: None,
         _directory: None,
         path,
         persistent: true,
@@ -2156,9 +2188,11 @@ fn fragmented_metadata_replies_preserve_counts_and_errors() {
     assert!(
         matches!(conn.call(request()).unwrap(), Response::Err(error) if error == "read ACL failed")
     );
-    assert!(connection_replaying(&[Response::StatsMore(vec![None])])
-        .call(Request::Shutdown)
-        .is_err());
+    assert!(
+        connection_replaying(&[Response::StatsMore(vec![None])])
+            .call(Request::Shutdown)
+            .is_err()
+    );
 }
 
 /// Later sessions of a run skip `uname`, but the session pool's key must not

@@ -6,7 +6,7 @@
 
 use crate::cli::Args;
 use crate::process::CommandExt as _;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
@@ -20,6 +20,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod domain;
+pub(crate) use domain::Domain;
 mod ssh_config;
 
 const CONFIG_FILE: &str = "persistence.json";
@@ -30,9 +32,12 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from @NAME, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. An ephemeral scope only reuses forward SSH logins, with a five-minute idle timeout. Select it by passing its printed path back with --pscope."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from @NAME, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. Explicit scopes isolate connections, receiving profiles, authorization preferences, and permissions. Create one with on --ephemeral and select it for any persistence operation with --pscope. Idle SSH connections in ephemeral scopes expire; closing a scope stops its services and removes its settings."
 )]
 struct PersistCommand {
+    /// Select an isolated persistence domain instead of the default domain
+    #[arg(long, global = true, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     #[command(subcommand)]
     action: PersistAction,
 }
@@ -52,7 +57,7 @@ enum PersistAction {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
         /// Authorize a reusable destination-account login through a receiving machine
-        #[arg(long, value_name = "@NAME", conflicts_with_all = ["syq_path", "no_bootstrap", "pscope"])]
+        #[arg(long, value_name = "@NAME", conflicts_with_all = ["syq_path", "no_bootstrap"])]
         auth_from: Option<String>,
         /// Use this remote syq executable instead of installing a matching helper
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
@@ -63,30 +68,20 @@ enum PersistAction {
         /// Wait this many seconds for receiving after SSH/helper setup
         #[arg(long, default_value_t = 30, conflicts_with = "auth_from", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
-        /// Reuse forward SSH in an existing ephemeral scope, without enabling receiving
-        #[arg(long, value_name = "PATH")]
-        pscope: Option<PathBuf>,
     },
     /// Enable persistent connections for later syq commands
     On {
         /// Create an ephemeral scope and print its path instead of changing the user setting
-        #[arg(long)]
+        #[arg(long, conflicts_with = "pscope")]
         ephemeral: bool,
     },
     /// Disable persistence and close its live SSH control connections
-    Off {
-        /// Operate on this ephemeral persistence scope instead of the user setting
-        #[arg(long, value_name = "PATH")]
-        pscope: Option<PathBuf>,
-    },
+    Off {},
     /// Show connection readiness and any receiving problem
     Status {
         /// Print structured connection state
         #[arg(long)]
         json: bool,
-        /// Inspect this ephemeral persistence scope instead of the user setting
-        #[arg(long, value_name = "PATH")]
-        pscope: Option<PathBuf>,
     },
 }
 
@@ -192,10 +187,13 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         .unwrap_or_else(|error| error.exit());
     let command = PersistCommand::from_arg_matches(&matches)?;
     crate::fsops::reserve_startup_descriptors();
+    let domain = Domain::select(command.pscope.as_deref())?;
     match command.action {
-        PersistAction::AuthFrom(command) => return crate::auth_from::run(command),
-        PersistAction::SshConfig(command) => return ssh_config::run(command),
-        PersistAction::Receive(command) => return crate::receive_service::run_command(command),
+        PersistAction::AuthFrom(command) => return crate::auth_from::run(&domain, command),
+        PersistAction::SshConfig(command) => return ssh_config::run(&domain, command),
+        PersistAction::Receive(command) => {
+            return crate::receive_service::run_command(&domain, command);
+        }
         PersistAction::Destinations(command) => return crate::destination::run_command(command),
         PersistAction::Connect {
             host,
@@ -203,65 +201,68 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             syq_path,
             no_bootstrap,
             timeout,
-            pscope,
         } => {
-            if let Some(authorizer) = auth_from {
+            let endpoint =
+                crate::cli::parse_native_endpoint(Some(&host))?.context("SSH endpoint missing")?;
+            let explicit = auth_from
+                .as_deref()
+                .map(crate::cli::parse_auth_from)
+                .transpose()?;
+            let authorizer = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
+            if let crate::cli::AuthFrom::Return(authorizer) = authorizer {
+                anyhow::ensure!(
+                    syq_path.is_none() && !no_bootstrap,
+                    "approved account connections do not accept helper overrides"
+                );
                 let request = crate::destination::ssh::parse(&[
                     "ssh".into(),
                     "--auth-from".into(),
-                    authorizer.into(),
+                    format!("@{authorizer}").into(),
                     host.into(),
                 ])?;
-                crate::destination::ssh::persistent::connect(request)?;
-                return Ok(0);
+                crate::destination::ssh::persistent::connect(&domain, request)?;
+            } else {
+                connect_domain(
+                    &domain,
+                    &host,
+                    syq_path,
+                    no_bootstrap,
+                    Duration::from_secs(timeout),
+                )?;
             }
-            connect(
-                &host,
-                syq_path,
-                no_bootstrap,
-                Duration::from_secs(timeout),
-                pscope.as_deref(),
-            )?;
         }
         PersistAction::On { ephemeral: true } => {
             let scope = create_ephemeral_scope()?;
-            // This is a scripting contract: stdout is exactly the native path
-            // followed by one newline, with no diagnostic prose mixed in.
+            // stdout is exactly a native path and newline for scripts.
             let mut stdout = std::io::stdout().lock();
             stdout.write_all(scope.as_os_str().as_bytes())?;
             stdout.write_all(b"\n")?;
         }
         PersistAction::On { ephemeral: false } => {
-            let scope = ensure_global_scope()?;
-            write_global_config(true)?;
+            let scope = domain.enable()?;
             crate::output::human_stdout!("SSH connection persistence is on");
             crate::output::human_stdout!("scope: {}", scope.display());
         }
-        PersistAction::Off {
-            pscope: Some(scope),
-        } => {
-            if is_global_scope(&scope)? {
-                bail!(
-                    "the global persistence scope is controlled by `syq persist off` without --pscope"
-                );
+        PersistAction::Off {} => {
+            if domain.is_default() {
+                write_global_config(false)?;
             }
-            close_scope(&scope)?;
-            crate::output::human_stdout!("persistence scope closed: {}", scope.display());
-        }
-        PersistAction::Off { pscope: None } => {
-            // Disable first so a later command cannot intentionally join the
-            // global scope while its existing masters are being closed.
-            write_global_config(false)?;
-            let accounts = crate::destination::ssh::persistent::stop_all();
-            let ordinary = (|| -> Result<()> {
-                let scope = global_scope_path()?;
-                match scope.symlink_metadata() {
-                    Ok(_) => close_scope(&scope),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(error)
-                        .with_context(|| format!("inspect global scope {}", scope.display())),
+            let scope = domain.runtime_path();
+            // Close admission before invalidating approved connections. Both
+            // cleanup paths run even when one reports a damaged record.
+            if scope.exists() {
+                validate_scope(&scope)?;
+                mark_closing(&scope)?;
+            }
+            let accounts = crate::destination::ssh::persistent::stop_all(&domain)
+                .and_then(|()| crate::destination::ssh::persistent::cleanup_domain(&domain));
+            let ordinary = match scope.symlink_metadata() {
+                Ok(_) => close_scope(&scope),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("inspect scope {}", scope.display()))
                 }
-            })();
+            };
             match (accounts, ordinary) {
                 (Ok(()), Ok(())) => {}
                 (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
@@ -271,44 +272,31 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             }
             crate::output::human_stdout!("SSH connection persistence is off");
         }
-        PersistAction::Status {
-            pscope: Some(scope),
-            json,
-        } => {
-            let kind = if is_global_scope(&scope)? {
-                "global"
-            } else {
-                "ephemeral"
-            };
-            print_scope_status(&scope, kind, json)?;
-        }
-        PersistAction::Status { pscope: None, json } => {
-            let enabled = global_enabled()?;
+        PersistAction::Status { json } => {
+            let enabled = domain.enabled()?;
             if !json {
                 crate::output::human_stdout!(
                     "SSH connection persistence is {}",
                     if enabled { "on" } else { "off" }
                 );
             }
-            let scope = global_scope_path()?;
+            let scope = domain.runtime_path();
             match scope.symlink_metadata() {
-                Ok(_) => print_scope_status(&scope, "global", json)?,
+                Ok(_) => print_scope_status(&domain, json)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let authorized = crate::destination::ssh::persistent::status(&domain)?;
                     if json {
                         println!(
                             "{}",
-                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": [], "authorized_ssh": crate::destination::ssh::persistent::status()?})
+                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": [], "authorized_ssh": authorized})
                         );
                     } else {
                         crate::output::human_stdout!("connections: 0");
-                        crate::destination::ssh::persistent::print_status(
-                            &crate::destination::ssh::persistent::status()?,
-                        );
+                        crate::destination::ssh::persistent::print_status(&authorized);
                     }
                 }
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("inspect global scope {}", scope.display()));
+                    return Err(error).with_context(|| format!("inspect scope {}", scope.display()));
                 }
             }
         }
@@ -334,14 +322,13 @@ pub(crate) fn parse_account_connect(
         auth_from,
         syq_path,
         no_bootstrap,
-        pscope,
         ..
     } = command.action
     else {
         bail!("persistent SSH approval needs a syq persist connect command");
     };
-    if syq_path.is_some() || no_bootstrap || pscope.is_some() {
-        bail!("laptop-authorized SSH persistence does not take helper or scope overrides");
+    if syq_path.is_some() || no_bootstrap {
+        bail!("laptop-authorized SSH persistence does not take helper overrides");
     }
     let selected = auth_from.context("persistent SSH approval requires --auth-from @NAME")?;
     if selected != format!("@{authorizer}") {
@@ -355,36 +342,25 @@ pub(crate) fn parse_account_connect(
     ])
 }
 
-fn connect(
+pub(crate) fn connect_domain(
+    domain: &Domain,
     host: &str,
     syq_path: Option<String>,
     no_bootstrap: bool,
     timeout: Duration,
-    scope: Option<&Path>,
 ) -> Result<()> {
     let endpoint =
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
     if endpoint.host.starts_with('@') {
         bail!("persist connect needs an SSH server, not a receiving name");
     }
-    let ephemeral = scope.is_some();
-    let scope = match scope {
-        Some(scope) => {
-            validate_scope(scope)?;
-            if is_global_scope(scope)? {
-                bail!("the global persistence scope is controlled by `syq persist connect HOST` without --pscope");
-            }
-            scope.to_path_buf()
-        }
-        None => {
-            let scope = ensure_global_scope()?;
-            if !global_enabled()? {
-                write_global_config(true)?;
-                crate::output::human_stdout!("SSH connection persistence is on (kept on if connecting fails; disable with syq persist off)");
-            }
-            scope
-        }
-    };
+    let was_enabled = domain.enabled()?;
+    let scope = domain.enable()?;
+    if !was_enabled {
+        crate::output::human_stdout!(
+            "SSH connection persistence is on (kept on if connecting fails; disable with syq persist off)"
+        );
+    }
     let mut multiplexer = crate::conn::SshMultiplexer::persistent(
         &scope,
         endpoint.user.as_deref(),
@@ -418,7 +394,7 @@ fn connect(
     // No source roots, data workers or filesystem operations are requested.
     let connection = remote.connect_with(true, false)?;
     let receiving =
-        crate::receive_service::ensure_ready(multiplexer.control_path(), &remote, timeout)?;
+        crate::receive_service::ensure_ready(domain, multiplexer.control_path(), &remote, timeout)?;
     drop(connection);
     match receiving {
         Some(names) => {
@@ -428,10 +404,6 @@ fn connect(
                 names.join(", @")
             )
         }
-        None if ephemeral => crate::output::human_stdout!(
-            "{} ready; ephemeral scopes do not support receiving",
-            remote.label()
-        ),
         None => crate::output::human_stdout!("{} ready; receiving is disabled", remote.label()),
     }
     Ok(())
@@ -448,7 +420,9 @@ pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
             .as_deref()
             .is_some_and(|rsh| !crate::conn::rsh_persists_connections(rsh))
     {
-        bail!("--pscope requires the default ssh or an --rsh ssh command without its own connection-sharing options or debug logging");
+        bail!(
+            "--pscope requires the default ssh or an --rsh ssh command without its own connection-sharing options or debug logging"
+        );
     }
     Ok(())
 }
@@ -458,13 +432,11 @@ pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
 /// custom remote shells, remote coordinators, and restricted receivers do not
 /// acquire an unrelated filesystem dependency.
 pub(crate) fn scope_for_implicit_ssh(explicit_scope: Option<&Path>) -> Result<Option<PathBuf>> {
-    match explicit_scope {
-        Some(scope) => {
-            validate_scope(scope)?;
-            Ok(Some(scope.to_path_buf()))
-        }
-        None if global_enabled()? => Ok(Some(ensure_global_scope()?)),
-        None => Ok(None),
+    let domain = Domain::select(explicit_scope)?;
+    if domain.enabled()? {
+        Ok(Some(domain.ensure_runtime()?))
+    } else {
+        Ok(None)
     }
 }
 
@@ -702,7 +674,7 @@ fn ensure_global_scope() -> Result<PathBuf> {
 fn create_ephemeral_scope() -> Result<PathBuf> {
     let parent = ensure_runtime_parent()?;
     let temporary = tempfile::Builder::new()
-        .prefix("scope-")
+        .prefix("domain-")
         .tempdir_in(&parent)
         .with_context(|| format!("create persistence scope in {}", parent.display()))?;
     // Validate while TempDir still owns cleanup of a rejected scope.
@@ -917,26 +889,16 @@ fn scope_records(scope: &Path) -> Result<Vec<(String, EndpointRecord)>> {
 }
 
 /// Inspect only existing, owned scopes; status must not enable persistence.
-pub(crate) fn receiving_controls() -> Result<Vec<PathBuf>> {
-    let parent = runtime_parent_path();
-    let entries = match std::fs::read_dir(&parent) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    secure_directory(&parent, false, true)?;
-    let mut controls = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == "global" || name.to_str().is_some_and(|name| name.starts_with("scope-")) {
-            let scope = entry.path();
-            for (key, _) in scope_records(&scope)? {
-                controls.push(scope.join(key));
-            }
-        }
+pub(crate) fn receiving_controls(domain: &Domain) -> Result<Vec<PathBuf>> {
+    let scope = domain.runtime_path();
+    match scope.symlink_metadata() {
+        Ok(_) => Ok(scope_records(&scope)?
+            .into_iter()
+            .map(|(key, _)| scope.join(key))
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
     }
-    Ok(controls)
 }
 
 fn socket_is_live(path: &Path) -> bool {
@@ -961,13 +923,16 @@ struct ConnectionStatus {
     session_pool: bool,
 }
 
-fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
-    let records = scope_records(scope)?;
-    let receiving_setting = if kind == "global" {
-        crate::receive_service::enabled_servers()
+fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
+    let scope_path = domain.runtime_path();
+    let scope = scope_path.as_path();
+    let kind = if domain.is_default() {
+        "global"
     } else {
-        Ok(Vec::new())
+        "ephemeral"
     };
+    let records = scope_records(scope)?;
+    let receiving_setting = crate::receive_service::enabled_servers(domain);
     let receiving_error = receiving_setting
         .as_ref()
         .err()
@@ -1014,16 +979,12 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
             session_pool: crate::session_pool::is_running(&control),
         });
     }
-    let authorized_ssh = if kind == "global" {
-        crate::destination::ssh::persistent::status()?
-    } else {
-        Vec::new()
-    };
+    let authorized_ssh = crate::destination::ssh::persistent::status(domain)?;
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "enabled": if kind == "global" { global_enabled()? } else { true },
+                "enabled": domain.enabled()?,
                 "scope": scope, "connections": connections, "receiving_error": receiving_error,
                 "authorized_ssh": authorized_ssh,
             })
@@ -1091,16 +1052,29 @@ fn print_scope_status(scope: &Path, kind: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn close_scope(scope: &Path) -> Result<()> {
-    let records = scope_records(scope)?;
-    let closing = scope.join(crate::receive_service::CLOSING);
+fn mark_closing(scope: &Path) -> Result<()> {
     OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&closing)?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(scope.join(crate::receive_service::CLOSING))?;
+    Ok(())
+}
+
+const DOMAIN_SETTINGS: &[&str] = &[
+    "auth-from.json",
+    "receive.json",
+    "receive.lock",
+    "account-permissions-v1.json",
+    "account-permissions-v1.lock",
+];
+
+fn close_scope(scope: &Path) -> Result<()> {
+    let records = scope_records(scope)?;
+    let closing = scope.join(crate::receive_service::CLOSING);
+    mark_closing(scope)?;
     let record_keys: std::collections::HashSet<&str> =
         records.iter().map(|(key, _)| key.as_str()).collect();
     for entry in std::fs::read_dir(scope)? {
@@ -1109,6 +1083,9 @@ fn close_scope(scope: &Path) -> Result<()> {
         if name == OsStr::new(SCOPE_MARKER)
             || name == OsStr::new(crate::receive_service::CLOSING)
             || record_key(&name).is_some()
+            || DOMAIN_SETTINGS
+                .iter()
+                .any(|setting| name == OsStr::new(setting))
         {
             continue;
         }
@@ -1153,6 +1130,15 @@ fn close_scope(scope: &Path) -> Result<()> {
         let record_path = scope.join(format!("{key}.json"));
         std::fs::remove_file(&record_path)
             .with_context(|| format!("remove endpoint record {}", record_path.display()))?;
+    }
+    for name in DOMAIN_SETTINGS {
+        match std::fs::remove_file(scope.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("remove scope setting {name}"));
+            }
+        }
     }
     std::fs::remove_file(closing)?;
     std::fs::remove_file(scope.join(SCOPE_MARKER))
@@ -1205,7 +1191,9 @@ mod tests {
 
     #[test]
     fn control_socket_budget_includes_openssh_temporary_suffix() {
-        let reported = Path::new("/var/folders/bb/zjydfp6x4zsbx55jb_zqhksr0000gn/T/syq-persist-501/global/cm-0123456789abcdef");
+        let reported = Path::new(
+            "/var/folders/bb/zjydfp6x4zsbx55jb_zqhksr0000gn/T/syq-persist-501/global/cm-0123456789abcdef",
+        );
         assert_eq!(reported.as_os_str().len(), 91);
         for capacity in [104, 108] {
             assert!(validate_openssh_socket_capacity(reported, capacity).is_err());
@@ -1299,7 +1287,7 @@ mod tests {
         let long = temporary.path().join("x".repeat(100));
         std::fs::rename(scope, &long).unwrap();
         assert!(validate_scope(&long).is_ok());
-        assert!(print_scope_status(&long, "ephemeral", false).is_ok());
+        assert!(print_scope_status(&Domain::select(Some(&long)).unwrap(), false).is_ok());
         assert!(prepare_endpoint(&long, None, "example", None, None).is_err());
         close_scope(&long).unwrap();
         assert!(!long.exists());
