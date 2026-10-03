@@ -612,9 +612,19 @@ struct Pending {
 }
 #[derive(Default)]
 pub(crate) struct Queue {
+    domain: crate::persistence::Domain,
     pending: Mutex<BTreeMap<String, Pending>>,
 }
 impl Queue {
+    pub(crate) fn new(domain: crate::persistence::Domain) -> Self {
+        Self {
+            domain,
+            pending: Mutex::default(),
+        }
+    }
+    pub(crate) fn account_remembered(&self, permission: &AccountPermission) -> Result<bool> {
+        accounts::remembered(&self.domain, permission)
+    }
     pub(crate) fn snapshots(&self) -> Vec<Summary> {
         self.pending
             .lock()
@@ -635,7 +645,9 @@ impl Queue {
         kind: Kind,
         remember: bool,
     ) -> Result<()> {
-        self.decide_using(id, allow, kind, remember, accounts::remember)
+        self.decide_using(id, allow, kind, remember, |permission| {
+            accounts::remember(&self.domain, permission)
+        })
     }
     fn decide_using(
         &self,

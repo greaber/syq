@@ -1,5 +1,6 @@
 //! Remembered account permissions are local policy, separate from receiving
 //! settings and account connection indexes used by older syq versions.
+use crate::persistence::Domain;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -129,8 +130,8 @@ impl Default for State {
         }
     }
 }
-fn path() -> Result<PathBuf> {
-    Ok(crate::receive_service::config_path()?.with_file_name("account-permissions-v1.json"))
+fn path(domain: &Domain) -> Result<PathBuf> {
+    domain.config_file("account-permissions-v1.json")
 }
 fn read(path: &Path) -> Result<State> {
     let bytes = match crate::delegation::read_private_regular(path, "remembered account permissions", MAX_STATE) {
@@ -165,25 +166,25 @@ fn read(path: &Path) -> Result<State> {
     Ok(state)
 }
 
-pub(crate) fn remembered(permission: &AccountPermission) -> Result<bool> {
+pub(crate) fn remembered(domain: &Domain, permission: &AccountPermission) -> Result<bool> {
     permission.validate()?;
-    Ok(read(&path()?)?
+    Ok(read(&path(domain)?)?
         .permissions
         .iter()
         .any(|item| item.permission == *permission))
 }
-pub(crate) fn list() -> Result<Vec<RememberedPermission>> {
-    Ok(read(&path()?)?.permissions)
+pub(crate) fn list(domain: &Domain) -> Result<Vec<RememberedPermission>> {
+    Ok(read(&path(domain)?)?.permissions)
 }
-pub(crate) fn remember(permission: &AccountPermission) -> Result<()> {
-    update(&path()?, Some(permission), None)
+pub(crate) fn remember(domain: &Domain, permission: &AccountPermission) -> Result<()> {
+    update(&path(domain)?, Some(permission), None)
 }
-pub(crate) fn remove(id: &str) -> Result<()> {
+pub(crate) fn remove(domain: &Domain, id: &str) -> Result<()> {
     anyhow::ensure!(
         id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "use the complete permission ID from syq persist receive permissions list"
     );
-    update(&path()?, None, Some(id))
+    update(&path(domain)?, None, Some(id))
 }
 struct PermissionLock(std::fs::File);
 impl Drop for PermissionLock {
@@ -322,6 +323,33 @@ mod tests {
         }
         update(&path, None, Some(&permission.id())).unwrap();
         assert!(read(&path).unwrap().permissions.is_empty());
+    }
+
+    #[test]
+    fn remembered_permissions_belong_only_to_the_authorizing_domain() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let first_path = temporary.path().join("first");
+        let second_path = temporary.path().join("second");
+        for path in [&first_path, &second_path] {
+            crate::persistence::initialize_scope(path).unwrap();
+        }
+        let first = Domain::select(Some(&first_path)).unwrap();
+        let second = Domain::select(Some(&second_path)).unwrap();
+        let permission = permission();
+        remember(&first, &permission).unwrap();
+        let first_queue = super::super::Queue::new(first.clone());
+        let second_queue = super::super::Queue::new(second.clone());
+        assert!(first_queue.account_remembered(&permission).unwrap());
+        assert!(!second_queue.account_remembered(&permission).unwrap());
+        assert!(list(&second).unwrap().is_empty());
+        remember(&second, &permission).unwrap();
+        assert_eq!(
+            fs::read(path(&first).unwrap()).unwrap(),
+            fs::read(path(&second).unwrap()).unwrap()
+        );
+        remove(&first, &permission.id()).unwrap();
+        assert!(!first_queue.account_remembered(&permission).unwrap());
+        assert!(second_queue.account_remembered(&permission).unwrap());
     }
 
     #[test]

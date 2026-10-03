@@ -1,5 +1,6 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
+use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -234,13 +235,15 @@ struct Configure {
     max_delete: Option<u64>,
 }
 
-pub(crate) fn config_path() -> Result<PathBuf> {
-    Ok(crate::persistence::config_path()
-        .context("HOME and XDG_CONFIG_HOME are unset")?
-        .with_file_name("receive.json"))
+pub(crate) fn config_path(domain: &Domain) -> Result<PathBuf> {
+    domain.config_file("receive.json")
 }
-fn default_settings() -> Result<Settings> {
-    let cwd = fs::canonicalize(std::env::var_os("HOME").context("HOME is unset")?)?;
+fn default_settings(domain: &Domain) -> Result<Settings> {
+    let cwd = match std::env::var_os("HOME") {
+        Some(home) => fs::canonicalize(home)?,
+        None if !domain.is_default() => std::env::current_dir()?,
+        None => bail!("HOME is unset"),
+    };
     let mut hostname = [0u8; 256];
     if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -262,7 +265,7 @@ fn default_settings() -> Result<Settings> {
     Ok(Settings {
         version: SETTINGS_VERSION,
         revision: 0,
-        enabled: true,
+        enabled: domain.is_default(),
         name,
         cwd,
         cwd_explicit: false,
@@ -276,8 +279,8 @@ fn default_settings() -> Result<Settings> {
         notifications: Default::default(),
     })
 }
-fn preferences() -> Result<Preferences> {
-    let path = config_path()?;
+fn preferences(domain: &Domain) -> Result<Preferences> {
+    let path = config_path(domain)?;
     let bytes =
         match crate::delegation::read_private_regular(&path, "receive preferences", 512 * 1024) {
             Ok(bytes) => bytes,
@@ -289,7 +292,7 @@ fn preferences() -> Result<Preferences> {
             {
                 return Ok(Preferences {
                     version: PREFERENCES_VERSION,
-                    profiles: vec![default_settings()?],
+                    profiles: vec![default_settings(domain)?],
                 });
             }
             Err(error) => return Err(error),
@@ -347,8 +350,8 @@ fn validate_preferences(preferences: &Preferences) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn enabled_servers() -> Result<Vec<Vec<String>>> {
-    Ok(preferences()?
+pub(crate) fn enabled_servers(domain: &Domain) -> Result<Vec<Vec<String>>> {
+    Ok(preferences(domain)?
         .profiles
         .into_iter()
         .filter(|p| p.enabled)
@@ -399,14 +402,14 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     }
     Ok(())
 }
-fn save_settings(settings: &Preferences) -> Result<()> {
+fn save_settings(domain: &Domain, settings: &Preferences) -> Result<()> {
     validate_preferences(settings)?;
-    let path = config_path()?;
+    let path = config_path(domain)?;
     fs::create_dir_all(path.parent().unwrap())?;
     atomic_json(&path, settings)
 }
-fn settings_lock() -> Result<File> {
-    let path = config_path()?.with_file_name("receive.lock");
+fn settings_lock(domain: &Domain) -> Result<File> {
+    let path = config_path(domain)?.with_file_name("receive.lock");
     fs::create_dir_all(path.parent().unwrap())?;
     let file = OpenOptions::new()
         .read(true)
@@ -425,8 +428,8 @@ fn settings_lock() -> Result<File> {
     }
     Ok(file)
 }
-fn current_settings_exist() -> Result<bool> {
-    let path = config_path()?;
+fn current_settings_exist(domain: &Domain) -> Result<bool> {
+    let path = config_path(domain)?;
     match crate::delegation::read_private_regular(&path, "receive preferences", 512 * 1024) {
         Ok(bytes) => Ok(
             serde_json::from_slice::<serde_json::Value>(&bytes)?["version"] == PREFERENCES_VERSION,
@@ -442,16 +445,16 @@ fn current_settings_exist() -> Result<bool> {
         Err(error) => Err(error),
     }
 }
-fn ensure_current_settings() -> Result<Preferences> {
-    if current_settings_exist()? {
-        return preferences();
+fn ensure_current_settings(domain: &Domain) -> Result<Preferences> {
+    if current_settings_exist(domain)? {
+        return preferences(domain);
     }
-    let _lock = settings_lock()?;
+    let _lock = settings_lock(domain)?;
     // Re-read under the writer lock. A concurrent receiving command may have already
     // changed policy; initialization must never overwrite that newer choice.
-    let config = preferences()?;
-    if !current_settings_exist()? {
-        atomic_json(&config_path()?, &config)?;
+    let config = preferences(domain)?;
+    if !current_settings_exist(domain)? {
+        atomic_json(&config_path(domain)?, &config)?;
     }
     Ok(config)
 }
@@ -623,8 +626,8 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
 
 /// Called after a successful ordinary persistent SSH control connection. A
 /// failed return setup is visible but does not invalidate that ordinary copy.
-pub(crate) fn ensure(control: &Path, remote: &crate::conn::RemoteSpec) {
-    if let Err(error) = ensure_inner(control, remote) {
+pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) {
+    if let Err(error) = ensure_inner(domain, control, remote) {
         crate::output::diagnostic!(
             "syq: background receiving through {}: {error:#}",
             remote.label()
@@ -633,11 +636,12 @@ pub(crate) fn ensure(control: &Path, remote: &crate::conn::RemoteSpec) {
 }
 /// Return readiness for one owned endpoint; do not restart a healthy service.
 pub(crate) fn ensure_ready(
+    domain: &Domain,
     control: &Path,
     remote: &crate::conn::RemoteSpec,
     timeout: Duration,
 ) -> Result<Option<Vec<String>>> {
-    if !ensure_inner(control, remote)? {
+    if !ensure_inner(domain, control, remote)? {
         return Ok(None);
     }
     let deadline = Instant::now() + timeout;
@@ -707,25 +711,27 @@ pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
             .collect(),
     })
 }
-pub(crate) fn profile_names() -> Vec<String> {
-    preferences()
+pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
+    preferences(domain)
         .map(|p| p.profiles.into_iter().map(|p| p.name).collect())
         .unwrap_or_default()
 }
 
-fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
+fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
-    // Ephemeral scopes only reuse forward SSH connections. Do not read or
-    // create receiving preferences for them.
-    if !crate::persistence::is_global_scope(scope)? || !crate::persistence::global_enabled()? {
+    anyhow::ensure!(
+        Domain::select(Some(scope))? == *domain,
+        "receiving control belongs to a different persistence domain"
+    );
+    if !domain.enabled()? {
         return Ok(false);
     }
     if scope.join(CLOSING).exists() {
         bail!("persistence scope is closing");
     }
     // Persist current preferences before reuse so older binaries cannot weaken policy.
-    let config = ensure_current_settings()?;
+    let config = ensure_current_settings(domain)?;
     let allowed = config
         .profiles
         .iter()
@@ -858,9 +864,9 @@ struct ProfileWorker {
     _worker: Worker,
 }
 impl ProfileWorker {
-    fn new(config: Settings, spec: ServiceSpec) -> Self {
+    fn new(domain: &Domain, config: Settings, spec: ServiceSpec) -> Self {
         let state = Arc::new(Mutex::new(ConnectionState::default()));
-        let approvals = Arc::new(crate::receive_approval::Queue::default());
+        let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_state, thread_approvals, thread_stop, thread_config) = (
             state.clone(),
@@ -911,6 +917,7 @@ impl ProfileWorker {
     }
 }
 fn reconcile(
+    domain: &Domain,
     workers: &mut Vec<ProfileWorker>,
     config: &Preferences,
     spec: &ServiceSpec,
@@ -929,7 +936,7 @@ fn reconcile(
         .filter(|p| p.allows_server(&spec.endpoint.label()))
     {
         if !workers.iter().any(|w| w.config.name == profile.name) {
-            workers.push(ProfileWorker::new(profile.clone(), spec.clone()));
+            workers.push(ProfileWorker::new(domain, profile.clone(), spec.clone()));
         }
     }
 }
@@ -953,8 +960,8 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
 }
 // Wait until each live supervisor has revoked changed/removed profiles. Healthy
 // workers remain in the same process, preserving streams and pending approvals.
-fn apply_preferences(config: &Preferences) -> Result<()> {
-    for control in all_controls()? {
+fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
+    for control in all_controls(domain)? {
         if !config.enabled() {
             stop_inner(&control, false)?;
             continue;
@@ -967,7 +974,7 @@ fn apply_preferences(config: &Preferences) -> Result<()> {
         }
         if !is_running(&control)
             && config.enabled()
-            && crate::persistence::global_enabled()?
+            && domain.enabled()?
             && read_spec(&control).is_ok()
         {
             spawn(&control)?;
@@ -1009,16 +1016,20 @@ fn read_control_request(client: &mut UnixStream) -> Result<LocalRequest> {
     crate::destination::read_socket_message(client, Duration::from_millis(200))
 }
 
-fn run(control: &Path) -> Result<()> {
+fn run(domain: &Domain, control: &Path) -> Result<()> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
-    if scope.join(CLOSING).exists() || !crate::persistence::is_global_scope(scope)? {
+    anyhow::ensure!(
+        Domain::select(Some(scope))? == *domain,
+        "receiving control belongs to a different persistence domain"
+    );
+    if scope.join(CLOSING).exists() || !domain.enabled()? {
         return Ok(());
     }
     let Some(_lock) = try_lock(control, true)? else {
         return Ok(());
     };
-    if scope.join(CLOSING).exists() || !preferences()?.enabled() {
+    if scope.join(CLOSING).exists() || !preferences(domain)?.enabled() {
         return Ok(());
     }
     let spec = read_spec(control)?;
@@ -1044,18 +1055,18 @@ fn run(control: &Path) -> Result<()> {
     let sigterm = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())?;
     let result = (|| {
         let mut workers = Vec::<ProfileWorker>::new();
-        let mut config = preferences()?;
+        let mut config = preferences(domain)?;
         let mut last_check = Instant::now() - Duration::from_secs(1);
         while !shutdown.load(Ordering::Acquire) {
             if !fs::metadata(scope).is_ok_and(|m| (m.dev(), m.ino()) == scope_identity)
                 || scope.join(CLOSING).exists()
-                || !crate::persistence::global_enabled()?
+                || !domain.enabled()?
             {
                 break;
             }
             if last_check.elapsed() >= Duration::from_millis(200) {
-                config = preferences()?;
-                reconcile(&mut workers, &config, &spec, false);
+                config = preferences(domain)?;
+                reconcile(domain, &mut workers, &config, &spec, false);
                 last_check = Instant::now();
             }
             match listener.accept() {
@@ -1068,7 +1079,7 @@ fn run(control: &Path) -> Result<()> {
                                 shutdown.store(true, Ordering::Release);
                             }
                             if request.retry {
-                                reconcile(&mut workers, &config, &spec, true);
+                                reconcile(domain, &mut workers, &config, &spec, true);
                             }
                             let decision_error = request.decision.and_then(|decision| {
                                 workers
@@ -1120,11 +1131,11 @@ fn run(control: &Path) -> Result<()> {
     result
 }
 
-fn all_controls() -> Result<Vec<PathBuf>> {
-    crate::persistence::receiving_controls()
+fn all_controls(domain: &Domain) -> Result<Vec<PathBuf>> {
+    crate::persistence::receiving_controls(domain)
 }
-fn statuses() -> Result<Vec<Status>> {
-    Ok(all_controls()?
+fn statuses(domain: &Domain) -> Result<Vec<Status>> {
+    Ok(all_controls(domain)?
         .into_iter()
         .filter_map(|control| {
             status(&control, false).ok().or_else(|| {
@@ -1148,16 +1159,16 @@ fn statuses() -> Result<Vec<Status>> {
         })
         .collect())
 }
-fn configure(options: Configure) -> Result<()> {
-    let _lock = settings_lock()?;
-    let existed = config_path()?.exists();
-    let mut preferences = preferences()?;
+fn configure(domain: &Domain, options: Configure) -> Result<()> {
+    let _lock = settings_lock(domain)?;
+    let existed = config_path(domain)?.exists();
+    let mut preferences = preferences(domain)?;
     let index = if let Some(name) = options.name.as_deref() {
         crate::destination::validate_name(name)?;
         match preferences.profiles.iter().position(|p| p.name == name) {
             Some(index) => index,
             None => {
-                let mut profile = default_settings()?;
+                let mut profile = default_settings(domain)?;
                 profile.name = name.into();
                 if !existed {
                     preferences.profiles.clear();
@@ -1231,23 +1242,40 @@ fn configure(options: Configure) -> Result<()> {
         config.max_delete = deletions;
     }
     let config = config.clone();
-    save_settings(&preferences)?;
-    apply_preferences(&preferences)?;
+    save_settings(domain, &preferences)?;
+    drop(_lock);
+    domain.enable()?;
+    apply_preferences(domain, &preferences)?;
+    let mut failures = Vec::new();
+    for endpoint in &config.servers {
+        if let Err(error) = crate::persistence::connect_domain(
+            domain,
+            endpoint,
+            None,
+            false,
+            Duration::from_secs(30),
+        ) {
+            failures.push(format!("{endpoint}: {error:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "receiving settings saved, but some connections are not ready: {}",
+            failures.join("; ")
+        );
+    }
     crate::output::human_stdout!("Receiving is on: {}", config.name);
     config.print_paths();
-    crate::output::human_stdout!(
-        "Applies to persistent syq SSH connections; use syq persist on to enable persistence."
-    );
     Ok(())
 }
-fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
+fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> {
     if timeout == 0 || timeout > 3600 {
         bail!("timeout must be between 1 and 3600 seconds");
     }
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut progress = Instant::now();
     loop {
-        let requests: Vec<_> = statuses()?
+        let requests: Vec<_> = statuses(domain)?
             .into_iter()
             .flat_map(|status| status.pending)
             .collect();
@@ -1285,11 +1313,11 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
-fn decide(id: &str, allow: bool, remember: bool) -> Result<()> {
+fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> {
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("use the complete request ID from syq persist receive pending");
     }
-    for control in all_controls()? {
+    for control in all_controls(domain)? {
         let Ok(state) = status(&control, false) else {
             continue;
         };
@@ -1332,26 +1360,29 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
                 bail!("receive service needs its control path");
             }
             crate::fsops::reserve_startup_descriptors();
-            run(Path::new(&argv[2]))?;
+            let control = Path::new(&argv[2]);
+            let domain =
+                Domain::select(Some(control.parent().context("persistence scope missing")?))?;
+            run(&domain, control)?;
             Ok(0)
         })()),
         _ => None,
     }
 }
 
-pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
+pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i32> {
     match command.action {
-        Action::On(options) => configure(options)?,
+        Action::On(options) => configure(domain, options)?,
         Action::Pending {
             json,
             wait,
             timeout,
-        } => pending(json, wait, timeout)?,
-        Action::Approve { id, remember } => decide(&id, true, remember)?,
-        Action::Deny { id } => decide(&id, false, false)?,
+        } => pending(domain, json, wait, timeout)?,
+        Action::Approve { id, remember } => decide(domain, &id, true, remember)?,
+        Action::Deny { id } => decide(domain, &id, false, false)?,
         Action::Permissions { action } => match action {
             PermissionAction::List { json } => {
-                let permissions = crate::receive_approval::accounts::list()?;
+                let permissions = crate::receive_approval::accounts::list(domain)?;
                 if json {
                     println!("{}", serde_json::to_string(&permissions)?);
                 } else if permissions.is_empty() {
@@ -1369,13 +1400,13 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                 }
             }
             PermissionAction::Remove { id } => {
-                crate::receive_approval::accounts::remove(&id)?;
+                crate::receive_approval::accounts::remove(domain, &id)?;
                 crate::output::human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
             }
         },
         Action::Off { name } => {
-            let _lock = settings_lock()?;
-            let mut config = preferences()?;
+            let _lock = settings_lock(domain)?;
+            let mut config = preferences(domain)?;
             if let Some(name) = name {
                 let index = config.selected(Some(&name))?;
                 config.profiles[index].enabled = false;
@@ -1384,15 +1415,15 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                     profile.enabled = false;
                 }
             }
-            save_settings(&config)?;
-            apply_preferences(&config)?;
+            save_settings(domain, &config)?;
+            apply_preferences(domain, &config)?;
             crate::output::human_stdout!(
                 "Selected receiving profiles are off; ordinary SSH persistence is unchanged"
             );
         }
         Action::Remove { name } => {
-            let _lock = settings_lock()?;
-            let mut config = preferences()?;
+            let _lock = settings_lock(domain)?;
+            let mut config = preferences(domain)?;
             let index = config.selected(Some(&name))?;
             if config.profiles.len() == 1 {
                 bail!(
@@ -1400,16 +1431,16 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                 );
             }
             config.profiles.remove(index);
-            save_settings(&config)?;
-            apply_preferences(&config)?;
+            save_settings(domain, &config)?;
+            apply_preferences(domain, &config)?;
             crate::output::human_stdout!("Removed receiving profile {name}");
         }
         Action::Status { json, name } => {
-            let config = preferences()?;
+            let config = preferences(domain)?;
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;
             }
-            let mut connections = statuses()?;
+            let mut connections = statuses(domain)?;
             if let Some(name) = name.as_ref() {
                 connections.retain_mut(|s| {
                     if s.profiles.is_empty() {
@@ -1487,7 +1518,7 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             name,
             timeout,
         } => {
-            let config = preferences()?;
+            let config = preferences(domain)?;
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;
             }
@@ -1506,7 +1537,7 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             let deadline = Instant::now() + Duration::from_secs(timeout);
             let mut progress = Instant::now();
             loop {
-                let states: Vec<_> = statuses()?
+                let states: Vec<_> = statuses(domain)?
                     .into_iter()
                     .filter(|s| s.endpoint == host)
                     .collect();
@@ -1555,7 +1586,7 @@ mod tests {
 
     #[test]
     fn profile_server_scope_matches_only_the_locally_selected_endpoint() {
-        let mut settings = default_settings().unwrap();
+        let mut settings = default_settings(&Domain::default()).unwrap();
         assert!(settings.allows_server("work"));
         settings.servers = vec!["work".into(), "alice@lab:2222".into()];
         assert!(settings.allows_server("work"));
@@ -1565,6 +1596,56 @@ mod tests {
         }
         settings.enabled = false;
         assert!(!settings.allows_server("work"));
+    }
+
+    #[test]
+    fn receiving_domains_have_fresh_disabled_and_independent_profiles() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let first_path = temporary.path().join("first");
+        let second_path = temporary.path().join("second");
+        for path in [&first_path, &second_path] {
+            crate::persistence::initialize_scope(path).unwrap();
+        }
+        let first = Domain::select(Some(&first_path)).unwrap();
+        let second = Domain::select(Some(&second_path)).unwrap();
+        assert!(!preferences(&first).unwrap().enabled());
+        assert!(!preferences(&second).unwrap().enabled());
+        assert!(!config_path(&first).unwrap().exists());
+        assert!(!config_path(&second).unwrap().exists());
+        assert!(default_settings(&Domain::default()).unwrap().enabled);
+
+        configure(
+            &first,
+            Configure {
+                name: Some("first-inbox".into()),
+                cwd: Some(temporary.path().to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(profile_names(&first), vec!["first-inbox"]);
+        assert!(preferences(&first).unwrap().enabled());
+        assert!(!preferences(&second).unwrap().enabled());
+        let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
+        configure(
+            &second,
+            Configure {
+                name: Some("second-inbox".into()),
+                cwd: Some(temporary.path().to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        run_command(
+            &second,
+            ReceiveCommand {
+                action: Action::Off { name: None },
+            },
+        )
+        .unwrap();
+        assert!(!preferences(&second).unwrap().enabled());
+        assert_eq!(fs::read(config_path(&first).unwrap()).unwrap(), first_bytes);
+        assert_eq!(profile_names(&second), vec!["second-inbox"]);
     }
 
     #[test]
