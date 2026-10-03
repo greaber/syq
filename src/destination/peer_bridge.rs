@@ -140,6 +140,7 @@ pub(super) struct Ticket {
 #[serde(deny_unknown_fields)]
 enum Action {
     Control,
+    Lifetime,
     Ssh { public_key: String },
 }
 #[derive(Serialize, Deserialize)]
@@ -154,6 +155,7 @@ struct AdmissionRequest {
 #[serde(deny_unknown_fields)]
 enum AdmissionReply {
     Control,
+    Lifetime,
     Ssh(forward::ssh::Peer),
     Error(String),
 }
@@ -194,6 +196,14 @@ impl Ticket {
         );
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
+        Ok(stream)
+    }
+    fn lifetime(&self) -> Result<UnixStream> {
+        let (stream, reply) = self.connect(Action::Lifetime)?;
+        anyhow::ensure!(
+            matches!(reply, AdmissionReply::Lifetime),
+            "invalid peer lifetime reply"
+        );
         Ok(stream)
     }
     pub(super) fn ssh(&self, public_key: &str) -> Result<forward::ssh::Peer> {
@@ -285,6 +295,7 @@ impl Selection {
         let stop_coordinator = Arc::new(AtomicBool::new(false));
         let stop_owned_coordinator = stop_coordinator.clone();
         let control_started = Arc::new(AtomicBool::new(false));
+        let lifetime_started = AtomicBool::new(false);
         let secret_token = random_token()?;
         let admission_secret = secret_token.clone();
         let setup_ticket = approved.token.clone();
@@ -295,7 +306,9 @@ impl Selection {
                 socket_name: "s",
                 listener_thread: "peer-bridge",
                 client_thread: "peer-control",
-                max_connections: 3,
+                // Keep the existing control/setup headroom in addition to
+                // the coordinator's one long-lived lifetime connection.
+                max_connections: 4,
                 io_timeout: ADMISSION,
             },
             move |mut stream, _| {
@@ -315,6 +328,13 @@ impl Selection {
                     );
                     anyhow::ensure!(!stopped.load(Ordering::Acquire), "peer copy is closed");
                     match request.action {
+                        Action::Lifetime => {
+                            anyhow::ensure!(
+                                !lifetime_started.swap(true, Ordering::AcqRel),
+                                "peer coordinator lifetime was already opened"
+                            );
+                            hold_coordinator_lifetime(&mut stream, &stop_owned_coordinator)
+                        }
                         Action::Control => {
                             let mut child = remaining
                                 .lock()
@@ -385,6 +405,19 @@ impl Selection {
             forwarding: Mutex::new(None),
         })
     }
+}
+
+fn hold_coordinator_lifetime(stream: &mut TrackedStream, stopped: &AtomicBool) -> Result<()> {
+    let socket = stream.try_clone()?;
+    write_message(stream, &AdmissionReply::Lifetime)?;
+    // This socket belongs to the requester process, independently of its SSH
+    // mux slave. Broker shutdown/process exit closes it even if that slave's
+    // channel remains open. Only unexpected peer loss ends it early: normal
+    // control completion still permits the coordinator's final output flush.
+    while !stopped.load(Ordering::Acquire) && !requester_closed(&socket) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 impl Prepared {
@@ -630,7 +663,7 @@ fn coordinator() -> Result<i32> {
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&start.context)?);
     let signals = ssh::foreground::Signals::new().context("watch peer coordinator interruption")?;
-    let output = fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    let lifetime = start.context.ticket.lifetime()?;
     let mut command = Command::new("sh");
     command
         .args(["-c", &start.command])
@@ -640,20 +673,24 @@ fn coordinator() -> Result<i32> {
         } else {
             Stdio::null()
         });
-    run_owned_coordinator(&mut command, &output, &signals)
+    run_owned_coordinator(&mut command, &lifetime, &signals)
 }
 
 fn run_owned_coordinator(
     command: &mut Command,
-    output: &impl AsRawFd,
+    lifetime: &UnixStream,
     signals: &ssh::foreground::Signals,
 ) -> Result<i32> {
     let interrupted = || signals.received.load(Ordering::Acquire) as i32;
     if interrupted() != 0 {
         return Ok(128 + interrupted());
     }
+    anyhow::ensure!(
+        !requester_closed(lifetime),
+        "requesting copy ended before its coordinator started"
+    );
     // Own the copy shell and its same-group descendants. Normal completion,
-    // SSH channel closure, and HUP/TERM/INT clean up the group before its
+    // requester lifetime closure, and HUP/TERM/INT clean up the group before its
     // leader is reaped. A terminated wrapper must not orphan its copy.
     let mut child = crate::process_group::ProcessGroup::spawn(command)?;
     loop {
@@ -663,22 +700,13 @@ fn run_owned_coordinator(
         if interrupted() != 0 {
             return Ok(128 + interrupted());
         }
-        // sshd closes its output reader when the requesting channel ends.
-        // Observe that closure without reading stdin: mapping input must
-        // still reach the copy unchanged, and its normal EOF is not a cancel.
-        let mut descriptor = libc::pollfd {
-            fd: output.as_raw_fd(),
-            events: 0,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error.into());
-            }
-        } else if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            bail!("requesting SSH channel closed while the peer copy was running");
+        // Mapping stdin retains its normal EOF semantics. This separate
+        // per-copy channel closes with A even if a shared SSH master keeps
+        // the coordinator's standard streams open after its client exits.
+        if requester_closed(lifetime) {
+            bail!(
+                "requesting copy or approved peer control ended while the coordinator was running"
+            );
         }
         signals.wait(Duration::from_millis(20))?;
     }
@@ -695,13 +723,14 @@ mod tests {
         send.write_all(&data).unwrap();
         drop(send);
         let signals = ssh::foreground::Signals::new().unwrap();
+        let (lifetime, _owner) = UnixStream::pair().unwrap();
         let mut command = Command::new("sh");
         command
             .args(["-c", "cat; exit 23"])
             .stdin(input)
-            .stdout(output.try_clone().unwrap());
+            .stdout(output);
         let completed =
-            std::thread::spawn(move || run_owned_coordinator(&mut command, &output, &signals));
+            std::thread::spawn(move || run_owned_coordinator(&mut command, &lifetime, &signals));
         let mut received = Vec::new();
         receive.read_to_end(&mut received).unwrap();
         assert_eq!(completed.join().unwrap().unwrap(), 23);
@@ -712,14 +741,15 @@ mod tests {
         let (mut receive, output) = crate::process::with_inheritance_guard(std::io::pipe).unwrap();
         let signals = ssh::foreground::Signals::new().unwrap();
         let interrupted = signals.received.clone();
+        let (lifetime, owner) = UnixStream::pair().unwrap();
         let mut command = Command::new("sh");
         command
             .args(["-c", "sleep 30 & printf '%s %s\\n' \"$$\" \"$!\"; wait"])
             .stdin(Stdio::null())
-            .stdout(output.try_clone().unwrap());
+            .stdout(output);
         let (finished, result) = std::sync::mpsc::channel();
         let completed = std::thread::spawn(move || {
-            let result = run_owned_coordinator(&mut command, &output, &signals);
+            let result = run_owned_coordinator(&mut command, &lifetime, &signals);
             finished.send(result).unwrap();
         });
         let mut line = Vec::new();
@@ -745,7 +775,7 @@ mod tests {
         if interrupt {
             interrupted.store(libc::SIGHUP as usize, Ordering::Release);
         } else {
-            drop(receive);
+            drop(owner);
         }
         let outcome = result.recv_timeout(Duration::from_secs(3));
         // A failing regression still wakes the owner and cleans its processes.
@@ -755,7 +785,7 @@ mod tests {
         if interrupt {
             assert_eq!(outcome.unwrap(), 128 + libc::SIGHUP);
         } else {
-            assert!(outcome.unwrap_err().to_string().contains("channel closed"));
+            assert!(outcome.unwrap_err().to_string().contains("requesting copy"));
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         for pid in pids {
@@ -780,13 +810,54 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_output_close_kills_copy_and_descendants() {
+    fn coordinator_owner_loss_kills_copy_and_descendants_with_stdout_still_open() {
         coordinator_cleanup(false);
     }
 
     #[test]
     fn coordinator_interruption_kills_copy_and_descendants() {
         coordinator_cleanup(true);
+    }
+
+    #[test]
+    fn lifetime_channel_closes_on_broker_drop_and_unexpected_peer_loss() {
+        for drop_broker in [false, true] {
+            let stopped = Arc::new(AtomicBool::new(false));
+            let shared = stopped.clone();
+            let broker = PrivateBroker::start_managed(
+                PrivateBrokerConfig {
+                    directory_prefix: "syq-peer-life-test-",
+                    socket_name: "s",
+                    listener_thread: "peer-life-test",
+                    client_thread: "peer-life-client",
+                    max_connections: 1,
+                    io_timeout: ADMISSION,
+                },
+                move |mut stream, _| hold_coordinator_lifetime(&mut stream, &shared).unwrap(),
+            )
+            .unwrap();
+            let mut lifetime = UnixStream::connect(broker.socket_path()).unwrap();
+            let reply: AdmissionReply =
+                read_socket_message(&mut lifetime, Duration::from_secs(3)).unwrap();
+            assert!(matches!(reply, AdmissionReply::Lifetime));
+            assert!(!requester_closed(&lifetime));
+            let broker = if drop_broker {
+                drop(broker);
+                None
+            } else {
+                stopped.store(true, Ordering::Release);
+                Some(broker)
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !requester_closed(&lifetime) {
+                assert!(
+                    Instant::now() < deadline,
+                    "copy lifetime survived its owner"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(broker);
+        }
     }
 
     fn args() -> Args {
