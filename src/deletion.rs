@@ -174,7 +174,14 @@ impl Batch {
             .pool
             .as_ref()
             .unwrap()
-            .install(|| items.par_iter().map(&work).collect());
+            // Keep coarse shares as in the existing metadata pool. Splitting
+            // a cheap unlink into many Rayon jobs costs throughput on XFS.
+            .install(|| {
+                items
+                    .par_chunks(items.len().div_ceil(workers))
+                    .flat_map_iter(|chunk| chunk.iter().map(&work))
+                    .collect()
+            });
         self.control.observe(
             results.iter().filter(|r| succeeded(r)).count() as u64,
             start.elapsed(),
@@ -190,21 +197,23 @@ mod tests {
 
     #[test]
     fn deletion_control_finds_parallelism_and_rejects_contention() {
-        let mut control = Control::new(Concurrency {
-            initial: 4,
-            maximum: 64,
-            automatic: true,
-            startup_doubling: true,
-        });
-        let mut highest = 0;
-        for _ in 0..120 {
-            let n = control.limit();
-            highest = highest.max(n);
-            let rate = if n <= 16 { n * 100 } else { 1600 * 16 / n };
-            control.observe(rate as u64, Duration::from_secs(1), true);
+        for startup_doubling in [false, true] {
+            let mut control = Control::new(Concurrency {
+                initial: 4,
+                maximum: 64,
+                automatic: true,
+                startup_doubling,
+            });
+            let mut highest = 0;
+            for _ in 0..120 {
+                let n = control.limit();
+                highest = highest.max(n);
+                let rate = if n <= 16 { n * 100 } else { 1600 * 16 / n };
+                control.observe(rate as u64, Duration::from_secs(1), true);
+            }
+            assert!(highest > 16, "must test higher concurrency");
+            assert!((8..=16).contains(&control.limit()), "{}", control.limit());
         }
-        assert!(highest > 16, "must test higher concurrency");
-        assert!((8..=16).contains(&control.limit()), "{}", control.limit());
     }
 
     #[test]

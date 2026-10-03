@@ -499,7 +499,7 @@ impl Pool {
 
     fn backlogged(&self) -> bool {
         let limit = self.limit.load(Ordering::Relaxed);
-        *self.pending.lock().unwrap() >= limit * 2
+        *self.pending.lock().unwrap() >= limit + limit.min(16)
             && !self.active[limit..]
                 .iter()
                 .any(|active| active.load(Ordering::Relaxed))
@@ -657,13 +657,11 @@ pub(crate) fn remove(
     // remains available to flush results and detect connection failure.
     let concurrency = crate::deletion::Concurrency::filesystem(workers);
     let mut tuning = crate::deletion::Control::new(concurrency);
-    let queue_capacity = if concurrency.automatic {
-        concurrency.maximum.saturating_mul(2)
-    } else {
-        workers.saturating_mul(4)
-    }
-    .max(resolved.len())
-    .max(1);
+    let queue_capacity = concurrency
+        .initial
+        .saturating_mul(4)
+        .max(resolved.len())
+        .max(1);
     let (task_tx, task_rx) = mpsc::sync_channel(queue_capacity);
     let (event_tx, event_rx) = mpsc::channel();
     let pool = Arc::new(Pool {
