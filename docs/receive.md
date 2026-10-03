@@ -130,7 +130,7 @@ Downloads confined to that directory need no approval; downloads elsewhere ask.
 `--root`, if configured, remains a hard boundary even with approval.
 Automatic approval trusts all processes running as the connected server accounts,
 including for overwrites inside that directory. You can
-[limit a profile to particular servers](persistence-reference.md#choose-allowed-servers).
+[limit a profile to particular servers](persistence-reference.md#choose-allowed-connections).
 
 Commands on your laptop, restricted copies between servers, and storage
 authorization require their own approval. SSH account access can use a current
