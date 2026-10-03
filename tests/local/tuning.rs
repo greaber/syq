@@ -150,11 +150,14 @@ fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
                             }
                         }
                         if hash {
-                            command.arg("--hash");
+                            command.arg(if native { "--hash" } else { "--checksum" });
+                        }
+                        if native {
+                            command.arg("--results").arg(&result);
+                        } else {
+                            command.arg("--stats");
                         }
                         let output = command
-                            .arg("--results")
-                            .arg(&result)
                             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                             .env("XDG_CACHE_HOME", t.path("cache"))
@@ -162,18 +165,35 @@ fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
                             .unwrap();
                         assert_output_ok(&output);
                         assert_eq!(read(&t.path("destination")), data);
-                        let records = fs::read_to_string(&result).unwrap();
-                        let summary: serde_json::Value =
-                            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                        let actual = if native {
+                            let records = fs::read_to_string(&result).unwrap();
+                            let summary: serde_json::Value =
+                                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                            (
+                                summary["bytes_transferred"].as_u64().unwrap(),
+                                summary["bytes_unchanged"].as_u64().unwrap(),
+                            )
+                        } else {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stat = |prefix: &str| -> u64 {
+                                stdout
+                                    .lines()
+                                    .find_map(|line| line.trim().strip_prefix(prefix))
+                                    .unwrap()
+                                    .replace(',', "")
+                                    .parse()
+                                    .unwrap()
+                            };
+                            (stat("bytes transferred: "), stat("bytes unchanged: "))
+                        };
                         assert_eq!(
-                            summary["bytes_transferred"],
-                            if repeat { 0 } else { transferred },
-                            "native={native} remote={remote} {strategy} hash={hash}: {summary}"
-                        );
-                        assert_eq!(
-                            summary["bytes_unchanged"],
-                            if repeat { 12 << 20 } else { unchanged },
-                            "native={native} remote={remote} {strategy} hash={hash}: {summary}"
+                            actual,
+                            if repeat {
+                                (0, 12 << 20)
+                            } else {
+                                (transferred, unchanged)
+                            },
+                            "native={native} remote={remote} {strategy} hash={hash}: {output:?}"
                         );
                     }
                 }
