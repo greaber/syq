@@ -221,7 +221,7 @@ fn failed_attached_emit_cancels_pending_mutation() {
         dry_run: false,
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(1),
-        active: vec![Activity(AtomicBool::new(false))],
+        active: vec![AtomicBool::new(false)],
         parked: Mutex::new(()),
         wake: Condvar::new(),
     });
@@ -486,7 +486,7 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             dry_run: false,
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
-            active: vec![Activity(AtomicBool::new(false))],
+            active: vec![AtomicBool::new(false)],
             parked: Mutex::new(()),
             wake: Condvar::new(),
         };
@@ -527,7 +527,7 @@ fn parked_removal_workers_wake_for_growth_cancellation_and_completion() {
             dry_run: false,
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
-            active: (0..2).map(|_| Activity(AtomicBool::new(false))).collect(),
+            active: (0..2).map(|_| AtomicBool::new(false)).collect(),
             parked: Mutex::new(()),
             wake: Condvar::new(),
         });

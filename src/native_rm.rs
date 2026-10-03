@@ -422,11 +422,6 @@ enum Task {
     Finish(Arc<DirectoryJob>),
 }
 
-// Workers update these for every task. Separate cache lines avoid bouncing
-// unrelated workers' activity flags between CPUs.
-#[repr(align(128))]
-struct Activity(AtomicBool);
-
 struct Pool {
     sender: Mutex<Option<mpsc::SyncSender<Task>>>,
     pending: Mutex<usize>,
@@ -434,7 +429,7 @@ struct Pool {
     dry_run: bool,
     cancelled: AtomicBool,
     limit: AtomicUsize,
-    active: Vec<Activity>,
+    active: Vec<AtomicBool>,
     parked: Mutex<()>,
     wake: Condvar,
 }
@@ -507,7 +502,7 @@ impl Pool {
         *self.pending.lock().unwrap() >= limit * 2
             && !self.active[limit..]
                 .iter()
-                .any(|active| active.0.load(Ordering::Relaxed))
+                .any(|active| active.load(Ordering::Relaxed))
     }
 
     fn cancel(&self) {
@@ -679,7 +674,7 @@ pub(crate) fn remove(
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(tuning.limit()),
         active: (0..concurrency.maximum)
-            .map(|_| Activity(AtomicBool::new(false)))
+            .map(|_| AtomicBool::new(false))
             .collect(),
         parked: Mutex::new(()),
         wake: Condvar::new(),
@@ -796,14 +791,22 @@ pub(crate) fn remove(
 
 fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>, id: usize) {
     while pool.wait(id) {
-        let task = match receiver.lock().unwrap().recv() {
-            Ok(task) => task,
-            Err(_) => return,
-        };
-        pool.active[id].0.store(true, Ordering::Relaxed);
-        process_task(&pool, task);
-        pool.active[id].0.store(false, Ordering::Relaxed);
-        pool.task_done();
+        // Mark participation for the whole active stretch, not each file.
+        // On a reduction, measurements wait until surplus workers reach this
+        // boundary and park; cancellation lets every worker drain the queue.
+        pool.active[id].store(true, Ordering::Relaxed);
+        while id < pool.limit.load(Ordering::Relaxed) || pool.is_cancelled() {
+            let task = match receiver.lock().unwrap().recv() {
+                Ok(task) => task,
+                Err(_) => {
+                    pool.active[id].store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+            process_task(&pool, task);
+            pool.task_done();
+        }
+        pool.active[id].store(false, Ordering::Relaxed);
     }
 }
 
