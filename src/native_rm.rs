@@ -422,6 +422,11 @@ enum Task {
     Finish(Arc<DirectoryJob>),
 }
 
+// Workers update these for every task. Separate cache lines avoid bouncing
+// unrelated workers' activity flags between CPUs.
+#[repr(align(128))]
+struct Activity(AtomicBool);
+
 struct Pool {
     sender: Mutex<Option<mpsc::SyncSender<Task>>>,
     pending: Mutex<usize>,
@@ -429,7 +434,7 @@ struct Pool {
     dry_run: bool,
     cancelled: AtomicBool,
     limit: AtomicUsize,
-    active: Vec<AtomicBool>,
+    active: Vec<Activity>,
     parked: Mutex<()>,
     wake: Condvar,
 }
@@ -502,7 +507,7 @@ impl Pool {
         *self.pending.lock().unwrap() >= limit * 2
             && !self.active[limit..]
                 .iter()
-                .any(|active| active.load(Ordering::Relaxed))
+                .any(|active| active.0.load(Ordering::Relaxed))
     }
 
     fn cancel(&self) {
@@ -674,7 +679,7 @@ pub(crate) fn remove(
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(tuning.limit()),
         active: (0..concurrency.maximum)
-            .map(|_| AtomicBool::new(false))
+            .map(|_| Activity(AtomicBool::new(false)))
             .collect(),
         parked: Mutex::new(()),
         wake: Condvar::new(),
@@ -741,8 +746,10 @@ pub(crate) fn remove(
         }
         if !dry_run && !pool.is_cancelled() && sampled.elapsed() >= crate::deletion::SAMPLE {
             let limit = tuning.observe(completed, sampled.elapsed(), pool.backlogged());
-            pool.set_limit(limit);
-            spawn_to(limit);
+            if limit != pool.limit.load(Ordering::Relaxed) {
+                pool.set_limit(limit);
+                spawn_to(limit);
+            }
             sampled = Instant::now();
             completed = 0;
         }
@@ -793,9 +800,9 @@ fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>, id: 
             Ok(task) => task,
             Err(_) => return,
         };
-        pool.active[id].store(true, Ordering::Relaxed);
+        pool.active[id].0.store(true, Ordering::Relaxed);
         process_task(&pool, task);
-        pool.active[id].store(false, Ordering::Relaxed);
+        pool.active[id].0.store(false, Ordering::Relaxed);
         pool.task_done();
     }
 }

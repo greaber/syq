@@ -221,7 +221,7 @@ fn failed_attached_emit_cancels_pending_mutation() {
         dry_run: false,
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(1),
-        active: vec![AtomicBool::new(false)],
+        active: vec![Activity(AtomicBool::new(false))],
         parked: Mutex::new(()),
         wake: Condvar::new(),
     });
@@ -486,7 +486,7 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             dry_run: false,
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
-            active: vec![AtomicBool::new(false)],
+            active: vec![Activity(AtomicBool::new(false))],
             parked: Mutex::new(()),
             wake: Condvar::new(),
         };
@@ -512,5 +512,45 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
         pool.task_done();
         assert!(pool.is_done());
         assert!(matches!(event_rx.try_recv(), Ok(None)));
+    }
+}
+
+#[test]
+fn parked_removal_workers_wake_for_growth_cancellation_and_completion() {
+    for reason in ["growth", "cancel", "complete"] {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (events, _event_rx) = mpsc::channel();
+        let pool = Arc::new(Pool {
+            sender: Mutex::new(Some(sender)),
+            pending: Mutex::new(1),
+            events,
+            dry_run: false,
+            cancelled: AtomicBool::new(false),
+            limit: AtomicUsize::new(1),
+            active: (0..2).map(|_| Activity(AtomicBool::new(false))).collect(),
+            parked: Mutex::new(()),
+            wake: Condvar::new(),
+        });
+        let (finished, result) = mpsc::channel();
+        let worker_pool = pool.clone();
+        let thread = std::thread::spawn(move || finished.send(worker_pool.wait(1)).unwrap());
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(10)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        match reason {
+            "growth" => pool.set_limit(2),
+            "cancel" => pool.cancel(),
+            "complete" => {
+                pool.task_done();
+                pool.close();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            reason != "complete"
+        );
+        thread.join().unwrap();
     }
 }
