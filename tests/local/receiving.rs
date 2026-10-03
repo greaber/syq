@@ -1340,7 +1340,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];
@@ -1416,6 +1416,14 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
             let response = if envelope["message"] == "Ping" {
                 assert!(ssh_marker.exists(), "discovery preceded the SSH attempt");
                 serde_json::json!("Ready")
+            } else if let Some(account) = envelope["message"].get("Ssh") {
+                assert_eq!(account["mode"], "Account", "{envelope}");
+                assert_eq!(account["target"]["host"], "backup", "{envelope}");
+                assert!(
+                    !ssh_marker.exists(),
+                    "explicit account selection tried native SSH"
+                );
+                serde_json::json!({"Error": "account denied by fixture"})
             } else {
                 assert!(envelope["message"].get("Forward").is_some(), "{envelope}");
                 serde_json::json!({"Error": "copy denied by fixture"})
@@ -1505,7 +1513,12 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         fs::remove_file(t.path("ssh-used")).unwrap();
     }
     let selected = run(&["cp", "source", "--to", "backup", "--auth-from", "@z-other"]);
-    assert!(stderr_of(&selected).contains("copy denied by fixture"));
+    assert!(!selected.status.success());
+    assert!(
+        stderr_of(&selected).contains("account denied by fixture"),
+        "{}",
+        stderr_of(&selected)
+    );
     assert!(!t.path("ssh-used").exists());
 
     // Captured from the unchanged released v0.4.0 SDK, not this CLI/SDK writer.
@@ -1536,7 +1549,13 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         "--into",
         "out",
     ]);
-    assert!(stderr_of(&explicit).contains("copy denied by fixture"));
+    assert!(!explicit.status.success());
+    assert!(
+        stderr_of(&explicit).contains("account denied by fixture"),
+        "{}",
+        stderr_of(&explicit)
+    );
+    assert!(!t.path("ssh-used").exists());
     let messages = responder.join().unwrap();
     assert_eq!(messages[0]["secret"], "laptop");
     assert_eq!(messages[0]["message"], "Ping");
@@ -1552,6 +1571,9 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     }
     assert_eq!(messages[8]["secret"], "z-other");
     assert_eq!(messages[9]["secret"], "ssh");
+    for request in &messages[8..10] {
+        assert_eq!(request["message"]["Ssh"]["mode"], "Account");
+    }
     // The registry remains, but every socket is now unavailable. Discovery
     // must allow ordinary SSH instead of treating stale names as reservations.
     let offline = run(&["cp", "source", "--to", "backup"]);

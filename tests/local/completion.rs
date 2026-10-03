@@ -230,7 +230,11 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
         &["connect-server"],
     );
     assert_completion_candidates(&t, &["syq", "persist", "r"], &["receive"]);
-    assert_completion_candidates(&t, &["syq", "persist", "receive", "p"], &["pending"]);
+    assert_completion_candidates(
+        &t,
+        &["syq", "persist", "receive", "p"],
+        &["pending", "permissions"],
+    );
     assert_completion_candidates(&t, &["syq", "persist", "destinations", "w"], &["wait"]);
     for action in ["off", "status", "connect"] {
         assert_completion_candidates(
@@ -2280,6 +2284,14 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
             write(&t.path("config/syq/persistence.json"), b"{");
         }
         let path = format!("{}/n", t.s("remote-home/data"));
+        // Approved account authority is independent of ordinary persistence.
+        let cached = damaged == "persistence-with-index";
+        let expected = vec![(
+            b'p',
+            t.path("remote-home/data/nested/")
+                .into_os_string()
+                .into_vec(),
+        )];
         for source in [false, true] {
             let mut words = vec!["syq", "cp", "--syq-path", env!("CARGO_BIN_EXE_syq")];
             if source {
@@ -2288,29 +2300,46 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
                 words.extend(["file", "--to", "backup", "--into"]);
             }
             words.push(&path);
-            // Refuse the mock native login before Hello, avoiding its helper
-            // pool while proving that optional state did not block the route.
-            let output = approved_completion_command(&t, &words)
-                .env("FAKE_SSH_SESSION_STATUS", "55")
-                .run()
-                .unwrap();
+            let mut command = approved_completion_command(&t, &words);
+            if !cached {
+                // Refuse native login before Hello, avoiding its helper pool
+                // while proving unusable optional state did not block the route.
+                command.env("FAKE_SSH_SESSION_STATUS", "55");
+            }
+            let output = command.run().unwrap();
             assert_output_ok(&output);
-            assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("warning:"),
-                "{damaged}: {output:?}"
-            );
+            if cached {
+                assert!(output.stderr.is_empty(), "{damaged}: {output:?}");
+                assert_eq!(completion_values(&output.stdout), expected);
+            } else {
+                assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("warning:"),
+                    "{damaged}: {output:?}"
+                );
+            }
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
             let sessions: Vec<_> = log
                 .lines()
                 .filter(|line| !line.contains("-O check"))
                 .collect();
             assert_eq!(sessions.len(), 1, "{damaged}: {log}");
-            assert!(sessions[0].contains("-- backup"), "{damaged}: {log}");
-            assert!(
-                !sessions[0].contains("ProxyCommand=false"),
-                "{damaged}: {log}"
-            );
+            if cached {
+                assert!(
+                    sessions[0].contains("-l approved -p 2222 -- resolved.example"),
+                    "{damaged}: {log}"
+                );
+                assert!(
+                    sessions[0].contains("ProxyCommand=false"),
+                    "{damaged}: {log}"
+                );
+            } else {
+                assert!(sessions[0].contains("-- backup"), "{damaged}: {log}");
+                assert!(
+                    !sessions[0].contains("ProxyCommand=false"),
+                    "{damaged}: {log}"
+                );
+            }
             fs::remove_file(t.path("rsh.log")).unwrap();
         }
         if damaged == "unrelated-index" {
@@ -2340,9 +2369,23 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
         .run()
         .unwrap();
         assert_output_ok(&output);
-        assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
-        assert!(!output.stderr.is_empty(), "{damaged}: {output:?}");
-        assert!(!t.path("rsh.log").exists(), "{damaged}");
+        if cached {
+            assert!(output.stderr.is_empty(), "{damaged}: {output:?}");
+            assert_eq!(completion_values(&output.stdout), expected);
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            assert!(
+                log.contains("-l approved -p 2222 -- resolved.example"),
+                "{damaged}: {log}"
+            );
+            assert!(
+                log.lines().all(|line| line.contains("ProxyCommand=false")),
+                "{damaged}: {log}"
+            );
+        } else {
+            assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
+            assert!(!output.stderr.is_empty(), "{damaged}: {output:?}");
+            assert!(!t.path("rsh.log").exists(), "{damaged}");
+        }
     }
 }
 
