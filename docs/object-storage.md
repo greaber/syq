@@ -206,11 +206,11 @@ permanent version deletions individually because Tigris's batch API ignores
 version IDs. Both flags can therefore take longer for large version histories.
 This exception applies only to these two flags.
 
-A custom proxy hostname that hides Tigris still uses batches. These requests can
-leave versions intact and add deletion markers that hide current objects; syq
-reports failure. Use a Tigris endpoint for permanent version deletion. To restore
-visibility after a failed attempt, remove the markers it created with
-`--s3-version-id` through a Tigris endpoint.
+A custom proxy hostname that hides Tigris does not receive this exception.
+Batched requests can then leave versions intact and add deletion markers that
+hide current objects; syq reports failure. Use a Tigris endpoint for permanent
+version deletion. To undo the extra deletions after a failed attempt, remove
+only the markers it created with `--s3-version-id` through a Tigris endpoint.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
 prefix trees and accept a trailing `/`. When deleting an exact directory-marker
