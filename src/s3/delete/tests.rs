@@ -21,7 +21,7 @@ struct Delayed(Arc<Counts>, Option<usize>);
 impl HttpConnector for Delayed {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         assert_eq!(request.method(), "DELETE");
-        let url = url::Url::parse(&request.uri().to_string()).unwrap();
+        let url = url::Url::parse(request.uri()).unwrap();
         let version = url
             .query_pairs()
             .find(|(k, _)| k == "versionId")
