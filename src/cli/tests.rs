@@ -1014,37 +1014,6 @@ fn native_mtime_matching_is_explicit_and_has_no_opt_out() {
 }
 
 #[test]
-fn block_reuse_is_a_native_filesystem_control() {
-    let args = parse_native_copy(
-        &[
-            "source",
-            "--as",
-            "destination",
-            "--performance-tuning=block-reuse=off",
-        ]
-        .map(OsString::from),
-    )
-    .unwrap();
-    assert!(!args.tuning_options.unwrap().reuse_destination_blocks(false));
-    let error = parse_native_copy(
-        &[
-            "source",
-            "--to",
-            "s3://bucket",
-            "--as",
-            "object",
-            "--performance-tuning=block-reuse=off",
-        ]
-        .map(OsString::from),
-    )
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("filesystem performance tuning"),
-        "{error}"
-    );
-}
-
-#[test]
 fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
     for strategy in [
         None,
@@ -1059,7 +1028,14 @@ fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
                 argv(&["source", "destination"])
             };
             if let Some(strategy) = strategy {
-                command.extend(argv(&["--transfer-strategy", strategy]));
+                command.extend(argv(&[
+                    if native {
+                        "--transfer-strategy"
+                    } else {
+                        "--syq-transfer-strategy"
+                    },
+                    strategy,
+                ]));
             }
             let args = if native {
                 parse_native_copy(&command)
@@ -1076,7 +1052,9 @@ fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
                     _ => !local,
                 };
                 assert_eq!(
-                    args.transfer_tuning().reuse_destination_blocks(local),
+                    args.transfer_strategy
+                        .unwrap_or_default()
+                        .reuse_destination_blocks(local),
                     reuse,
                     "{strategy:?} native={native} local={local}"
                 );
@@ -1086,7 +1064,7 @@ fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
 }
 
 #[test]
-fn transfer_strategy_rejects_conflicting_and_nonfilesystem_controls() {
+fn transfer_strategy_rejects_removed_tuning_key_and_nonfilesystem_controls() {
     for legacy in ["auto", "on", "off"] {
         let error = parse_native_copy(&argv(&[
             "source",
@@ -1096,7 +1074,10 @@ fn transfer_strategy_rejects_conflicting_and_nonfilesystem_controls() {
             &format!("--performance-tuning=block-reuse={legacy}"),
         ]))
         .unwrap_err();
-        assert!(error.to_string().contains("conflicts"), "{error}");
+        assert!(
+            error.to_string().contains("invalid --performance-tuning"),
+            "{error}"
+        );
     }
     for extra in [
         vec!["source", "--to", "s3://bucket", "--as", "object"],

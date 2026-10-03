@@ -178,7 +178,7 @@ See [Update policies](commands/cp.md#update-policies) for supported combinations
 ## Choose a transfer strategy
 
 `--transfer-strategy` chooses how filesystem copies transfer the contents of
-files selected for copying. It is available in `syq cp` and `syq rsync`.
+files selected for copying. In `syq rsync`, use `--syq-transfer-strategy`.
 
 | Strategy | Behavior |
 |---|---|
@@ -199,8 +199,7 @@ checks, and partial-file resume. Changed files use atomic replacement unless
 `--inplace` is selected. The strategy does not fix worker counts or request
 sizes; automatic tuning remains enabled.
 
-S3 and descriptor copies do not accept this option. It conflicts with
-`--performance-tuning block-reuse=...`. See
+S3 and descriptor copies do not accept this option. See
 [comparison tuning](tuning.md#compare-block-reuse-with-full-replacement)
 for block size and controlled comparisons.
 
@@ -301,7 +300,7 @@ Rerunning a copy can reuse completed files and matching parts of interrupted
 files. Placement conditions and `--if-exists` apply on every run. A `-new`
 placement or `--if-exists=error` can therefore prevent a retry once entries have
 been created. Partial-file resume is independent of
-[`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
+[`--transfer-strategy`](#choose-a-transfer-strategy), which controls
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
 complete. With `--inplace`, interrupted bytes are in the final file itself.
@@ -309,7 +308,7 @@ With `--if-exists=error-if-different`, a retry rejects a differing final file:
 it cannot distinguish incomplete output from a pre-existing file that must remain
 untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts
-follows the block-reuse policy.
+follows the selected transfer strategy.
 
 A copy may temporarily make a newly created directory writable while filling it.
 After interruption, syq cannot distinguish that directory from a pre-existing

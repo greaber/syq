@@ -1167,6 +1167,8 @@ pub struct SmallCopyPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyRequest {
+    /// Compare existing contents for reuse or an explicit protection policy.
+    pub compare_contents: bool,
     pub if_exists: crate::cli::IfExists,
     pub matching_flags: u8,
     pub hash_policy: crate::hashing::HashPolicy,

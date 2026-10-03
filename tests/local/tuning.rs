@@ -1,6 +1,93 @@
 use super::*;
 
 #[test]
+fn small_remote_transfer_strategies_honor_replacement_and_reuse() {
+    use std::os::unix::fs::MetadataExt;
+
+    for strategy in ["whole-file", "aligned-block", "locality"] {
+        for changed in [false, true] {
+            for protected in [false, true] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                t.expose_remote_syq();
+                let data = prng(512 << 10, 487);
+                let mut previous = data.clone();
+                if changed {
+                    *previous.last_mut().unwrap() ^= 1;
+                }
+                write(&t.path("source"), &data);
+                write(&t.path("destination"), &previous);
+                set_mtime(&t.path("source"), 1_700_000_001);
+                set_mtime(&t.path("destination"), 1_700_000_000);
+                let original_inode = fs::metadata(t.path("destination")).unwrap().ino();
+                let result = t.path("result.ndjson");
+                let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+                    .args(["cp", "--no-progress", "--transfer-strategy", strategy])
+                    .arg(t.path("source"))
+                    .args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"])
+                    .arg(&rsh)
+                    .arg("--as")
+                    .arg(t.path("destination"))
+                    .args([
+                        "--performance-tuning=comparison-block-size=64K",
+                        "--if-exists",
+                        if protected {
+                            "error-if-different"
+                        } else {
+                            "update"
+                        },
+                    ])
+                    .arg("--results")
+                    .arg(&result)
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("XDG_CACHE_HOME", t.path("cache"))
+                    .env("SYQ_DEBUG", "1")
+                    .run()
+                    .unwrap();
+                if protected && changed {
+                    assert!(!output.status.success());
+                    assert_eq!(read(&t.path("destination")), previous);
+                    assert_eq!(
+                        fs::metadata(t.path("destination")).unwrap().ino(),
+                        original_inode
+                    );
+                    continue;
+                }
+                assert_output_ok(&output);
+                assert_eq!(read(&t.path("destination")), data);
+                let records = fs::read_to_string(&result).unwrap();
+                let summary: serde_json::Value =
+                    serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                let transferred = if strategy == "whole-file" && !protected {
+                    512 << 10
+                } else if changed {
+                    64 << 10
+                } else {
+                    0
+                };
+                assert_eq!(
+                    summary["bytes_transferred"], transferred,
+                    "{strategy} changed={changed} protected={protected}: {summary}"
+                );
+                assert_eq!(summary["bytes_unchanged"], (512 << 10) - transferred);
+                assert_eq!(
+                    tuning_observed(&output)["native_small_copies"],
+                    u64::from(strategy == "whole-file"),
+                    "{output:?}"
+                );
+                if strategy == "whole-file" && !protected {
+                    assert_ne!(
+                        fs::metadata(t.path("destination")).unwrap().ino(),
+                        original_inode
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
     for remote in [false, true] {
         for (strategy, transferred, unchanged) in [
@@ -1859,7 +1946,10 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
             .unwrap();
         copy(name, controls)
     };
-    assert_output_ok(&copy_with_hint("second", &[]));
+    assert_output_ok(&copy_with_hint(
+        "second",
+        &["--transfer-strategy=whole-file"],
+    ));
     assert!(startup_doubling(2));
     let event: String = db
         .query_row(
@@ -1873,7 +1963,11 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     assert_eq!(event["data"]["hint"]["matched"], "filesystems");
     assert_output_ok(&copy_with_hint(
         "capped",
-        &["--resource-limits", "workers=2"],
+        &[
+            "--resource-limits",
+            "workers=2",
+            "--transfer-strategy=locality",
+        ],
     ));
     assert!(startup_doubling(3));
     let event: String = db
@@ -1921,6 +2015,20 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         &["--resource-limits", "workers=2"],
     ));
     assert!(startup_doubling(6));
+    // A strategy that changes local copying must not inherit the default's hint.
+    assert_output_ok(&copy_with_hint(
+        "aligned",
+        &["--transfer-strategy=aligned-block"],
+    ));
+    let event: String = db
+        .query_row(
+            "SELECT data FROM events WHERE run=7 AND json_extract(data,'$.kind')='starting_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    assert!(event["data"]["hint"].is_null(), "{event}");
 }
 
 #[cfg(debug_assertions)]

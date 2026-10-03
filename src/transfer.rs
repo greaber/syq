@@ -137,6 +137,7 @@ pub struct Opts {
     pub block: u64,
     pub block_explicit: bool,
     pub tuning: crate::transfer_tuning::TransferTuning,
+    pub transfer_strategy: crate::cli::TransferStrategy,
     benchmark: Option<Mutex<crate::transfer_tuning::BenchmarkStats>>,
     /// Settled before sharing these options; clone claims must fit preflight.
     local_copy_fd_budget: bool,
@@ -918,7 +919,12 @@ fn attempt_small_copy(
         {
             continue;
         }
-        if entry.size > SMALL_COPY_MAX_FILE_BYTES {
+        if entry.size > SMALL_COPY_MAX_FILE_BYTES
+            || (opts
+                .transfer_strategy
+                .reuse_destination_blocks(opts.same_host)
+                && entry.size > opts.block)
+        {
             return Ok(SmallCopy::Declined);
         }
         selected_sources.push(source.clone());
@@ -998,6 +1004,10 @@ fn attempt_small_copy(
         })
         .collect();
     let request = SmallCopyRequest {
+        compare_contents: opts
+            .transfer_strategy
+            .reuse_destination_blocks(opts.same_host)
+            || opts.protects_existing_contents(),
         if_exists: args.if_exists.unwrap_or(crate::cli::IfExists::Update),
         matching_flags: opts.matching_flags,
         hash_policy: opts.hash_policy,
@@ -1955,7 +1965,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .unwrap_or_default(),
         block,
         block_explicit: args.block_size_explicit,
-        tuning: args.transfer_tuning(),
+        tuning: args.tuning_options.unwrap_or_default(),
+        transfer_strategy: args.transfer_strategy.unwrap_or_default(),
         benchmark: ((args.tuning_options.is_some() || debug())
             && !args.quiet
             && (args.stats || args.verbose > 0 || debug()))
@@ -2011,14 +2022,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, block-reuse={} (effective {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
             opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.adaptive_ranges(),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.restricted_receiver),
             opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.restricted_receiver)), block,
             opts.tuning.copy_path.unwrap_or_default(),
-            opts.tuning.block_reuse.unwrap_or_default(),
-            if opts.tuning.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
+            opts.transfer_strategy.as_str(),
+            if opts.transfer_strategy.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
             opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
             if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
@@ -3270,7 +3281,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "inplace={};compress={};bandwidth={};checksum={};hash={:?};integrity={};transfer_hash={:?}{}",
                     opts.inplace, args.compress, args.bwlimit_bytes, args.checksum,
                     args.hash_algorithm, args.transfer_integrity, args.transfer_hash_type,
-                    args.transfer_strategy.map(|strategy| format!(";transfer-strategy={}", strategy.as_str())).unwrap_or_default()
+                    opts.transfer_strategy.history_suffix(opts.same_host)
                 ), transport_activity),
             );
             history.context(&key);

@@ -1030,7 +1030,8 @@ impl FsOps {
         let mut matched_content: Vec<Option<(RootedTarget, File)>> =
             (0..request.files.len()).map(|_| None).collect();
         for (i, file) in request.files.iter().enumerate() {
-            if unchanged[i]
+            if !request.compare_contents
+                || unchanged[i]
                 || destinations[i]
                     .as_ref()
                     .is_none_or(|stat| stat.st_size as u64 != file.size)

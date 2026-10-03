@@ -336,7 +336,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
     drop(f);
     let out = run_ok(&[
         "-a",
-        "--transfer-strategy=whole-file",
+        "--syq-transfer-strategy=whole-file",
         "--block-size=1M",
         "--resource-limits=bandwidth=1G",
         "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
@@ -901,7 +901,8 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1,block-reuse=on",
+            "workers=1",
+            "--syq-transfer-strategy=aligned-block",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",
@@ -921,7 +922,8 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     let second = syq(&[
         "-a",
         "--performance-tuning",
-        "workers=1,block-reuse=on",
+        "workers=1",
+        "--syq-transfer-strategy=aligned-block",
         "--resource-limits",
         "bandwidth=1G",
         &t.s("second"),
@@ -953,7 +955,8 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1,block-reuse=on",
+            "workers=1",
+            "--syq-transfer-strategy=aligned-block",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",
@@ -1000,7 +1003,8 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1,block-reuse=on",
+            "workers=1",
+            "--syq-transfer-strategy=aligned-block",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",
@@ -1020,7 +1024,8 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     let second = syq(&[
         "-a",
         "--performance-tuning",
-        "workers=1,block-reuse=on",
+        "workers=1",
+        "--syq-transfer-strategy=aligned-block",
         "--resource-limits",
         "bandwidth=1G",
         &t.s("second"),
@@ -1617,7 +1622,7 @@ fn changed_source_retry_uses_unpublished_partial_as_block_basis() {
         .args([
             "-a",
             "--stats",
-            "--performance-tuning=block-reuse=on",
+            "--syq-transfer-strategy=aligned-block",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",

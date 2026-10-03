@@ -299,7 +299,7 @@ impl Worker {
             || (self.opts.hardlinks && job.entry.nlink > 1)
             || self
                 .opts
-                .tuning
+                .transfer_strategy
                 .reuse_destination_blocks(self.opts.same_host);
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
@@ -989,7 +989,7 @@ impl Worker {
         let inplace = job.inplace;
         let reuse_blocks = self
             .opts
-            .tuning
+            .transfer_strategy
             .reuse_destination_blocks(self.opts.same_host);
         let final_file = job
             .dst_entry

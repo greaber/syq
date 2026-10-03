@@ -61,7 +61,7 @@ fn checksum_repairs_silent_corruption() {
     let out = run_ok(&[
         "-ac",
         "-B1M",
-        "--performance-tuning=block-reuse=on",
+        "--syq-transfer-strategy=aligned-block",
         &t.s("src/"),
         &t.s("dst/"),
     ]);

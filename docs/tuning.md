@@ -24,7 +24,6 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
-| `block-reuse` | `auto` | Legacy strategy override: `auto`, `on` or `off`; prefer `--transfer-strategy` |
 | `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
@@ -179,9 +178,7 @@ and whole-file shortcuts, including local kernel copying and APFS cloning.
 
 Choose `--transfer-strategy=aligned-block` or `whole-file` to compare block reuse
 with full replacement. See [transfer strategies](reference.md#choose-a-transfer-strategy)
-for defaults and interactions. The older `block-reuse=on` and `off` tuning
-values select the same behavior; `auto` selects the `locality` strategy.
-Do not combine that tuning key with `--transfer-strategy`.
+for defaults and interactions.
 
 ```sh
 syq cp --srcs-in source --into destination \
@@ -193,7 +190,7 @@ Size/time quick checks still skip completed files. Explicit `--hash` (or rsync
 is required, the final destination contributes no reusable blocks. Expected
 hashes, payload checks and publication-recovery checks stay in effect. Partial-file resume remains enabled
 in every mode: matching bytes from interrupted copies can still be reused,
-even with `off`. The setting controls reuse of the final destination, not partials.
+even with `whole-file`. The setting controls reuse of the final destination, not partials.
 
 With block reuse enabled, files with identical contents can finish without
 rewriting data even when their metadata differs. A difference near the end can

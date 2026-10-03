@@ -23,17 +23,36 @@ pub enum Placement {
 }
 
 /// How a filesystem copy transfers the contents of selected files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum TransferStrategy {
     /// Copy selected files without comparing blocks in the final destination.
     WholeFile,
     /// Reuse matching blocks at the same offsets in the corresponding destination file.
     AlignedBlock,
     /// Use whole-file locally and aligned-block with a remote syq endpoint.
+    #[default]
     Locality,
 }
 
 impl TransferStrategy {
+    pub(crate) fn reuse_destination_blocks(self, same_host: bool) -> bool {
+        match self {
+            Self::WholeFile => false,
+            Self::AlignedBlock => true,
+            Self::Locality => !same_host,
+        }
+    }
+
+    pub(crate) fn history_suffix(self, same_host: bool) -> String {
+        if self.reuse_destination_blocks(same_host)
+            == Self::default().reuse_destination_blocks(same_host)
+        {
+            String::new()
+        } else {
+            format!(";transfer-strategy={}", self.as_str())
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::WholeFile => "whole-file",
@@ -43,7 +62,7 @@ impl TransferStrategy {
     }
 }
 
-const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies. Conflicts with performance-tuning block-reuse.";
+const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
@@ -346,8 +365,8 @@ pub struct Args {
     pub block_size: u64,
     #[arg(skip)]
     pub block_size_explicit: bool,
-    /// Choose a file transfer strategy (default: locality)
-    #[arg(long, value_enum, value_name = "STRATEGY", long_help = TRANSFER_STRATEGY_HELP)]
+    /// Syq extension: choose a file transfer strategy (default: locality)
+    #[arg(long = "syq-transfer-strategy", value_enum, value_name = "STRATEGY", long_help = format!("Syq extension: {TRANSFER_STRATEGY_HELP}"))]
     pub transfer_strategy: Option<TransferStrategy>,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
@@ -784,10 +803,6 @@ impl Args {
 
         if self.transfer_strategy.is_some() {
             anyhow::ensure!(
-                !self.tuning_options.is_some_and(|t| t.block_reuse.is_some()),
-                "--transfer-strategy conflicts with performance-tuning block-reuse"
-            );
-            anyhow::ensure!(
                 !self.rm && self.s3.is_none() && self.descriptor_copy.is_none(),
                 "--transfer-strategy requires a filesystem copy"
             );
@@ -845,18 +860,6 @@ impl Args {
         self.connections_default = self.connections_opt.is_none();
         self.connections = self.connections_opt.unwrap_or(8);
         Ok(())
-    }
-
-    pub(crate) fn transfer_tuning(&self) -> crate::transfer_tuning::TransferTuning {
-        let mut tuning = self.tuning_options.unwrap_or_default();
-        if let Some(strategy) = self.transfer_strategy {
-            tuning.block_reuse = Some(match strategy {
-                TransferStrategy::WholeFile => crate::transfer_tuning::BlockReuse::Off,
-                TransferStrategy::AlignedBlock => crate::transfer_tuning::BlockReuse::On,
-                TransferStrategy::Locality => crate::transfer_tuning::BlockReuse::Auto,
-            });
-        }
-        tuning
     }
 
     /// Without encryption, TCP data has only TCP's 16-bit checksum. A fast
