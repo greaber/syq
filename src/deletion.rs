@@ -212,7 +212,11 @@ mod tests {
                 control.observe(rate as u64, Duration::from_secs(1), true);
             }
             assert!(highest > 16, "must test higher concurrency");
-            assert!((8..=16).contains(&control.limit()), "{}", control.limit());
+            // Multiplicative probes need not land on exactly 16, and a probe
+            // may still be active. Judge the settled rate near the optimum.
+            let n = control.policy.settled();
+            let rate = if n <= 16 { n * 100 } else { 1600 * 16 / n };
+            assert!(rate >= 1280, "settled count {n}, rate {rate}");
         }
     }
 
