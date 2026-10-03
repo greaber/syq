@@ -185,6 +185,14 @@ pub(crate) fn remove(id: &str) -> Result<()> {
     );
     update(&path()?, None, Some(id))
 }
+struct PermissionLock(std::fs::File);
+impl Drop for PermissionLock {
+    fn drop(&mut self) {
+        // A concurrently forked child can temporarily retain this open file
+        // description before exec closes it. End writer ownership explicitly.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) -> Result<()> {
     if let Some(permission) = add {
         permission.validate()?;
@@ -211,6 +219,7 @@ fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) ->
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("account permissions are being changed; retry shortly");
     }
+    let _lock = PermissionLock(lock);
     let mut state = read(path)?;
     if let Some(id) = remove {
         let count = state.permissions.len();
@@ -365,6 +374,42 @@ mod tests {
         write(&path, &bytes);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read(&path).is_err());
+    }
+
+    #[test]
+    fn writer_unlocks_even_while_a_forked_description_remains_open() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("account-permissions-v1.lock");
+        write(&path, b"");
+        let first = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(first.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // dup and fork both retain the same open file description. Keep one
+        // alive to model the child before it reaches close-on-exec.
+        let inherited = first.try_clone().unwrap();
+        let lock = PermissionLock(first);
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_ne!(
+            unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(lock);
+        assert_eq!(
+            unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        drop(PermissionLock(second));
+        drop(inherited);
     }
 
     #[test]

@@ -794,8 +794,8 @@ fn select_copy(
     args: &mut crate::cli::Args,
     progress: Option<&crate::progress::Progress>,
 ) -> Result<Option<handoff::Selection>> {
-    // These operations use only an independently approved account connection.
-    // They do not turn a copy request into broader account approval.
+    // Other operation interfaces select account authorization at their
+    // transport boundary; native copies select it here before reading inputs.
     if args.interface != crate::cli::Interface::NativeCp
         || args.coordinate_at == crate::cli::CoordinateAt::Local
     {
