@@ -466,6 +466,7 @@ struct PreparedSmallCopy {
 }
 
 pub struct FsOps {
+    deletions: Option<crate::deletion::Batch>,
     prepared_small_copy: Option<PreparedSmallCopy>,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
@@ -665,6 +666,7 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            deletions: Default::default(),
             inode_preservation: Default::default(),
             sparse: false,
             descriptor_copy: Default::default(),
@@ -2637,6 +2639,27 @@ impl FsOps {
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
+        if ops
+            .iter()
+            .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
+        {
+            return self
+                .deletions
+                .get_or_insert_with(Default::default)
+                .run(
+                    ops,
+                    |op| {
+                        apply_one(op, guard, destination_root.clone(), destination_prefix)
+                            .err()
+                            .as_ref()
+                            .map(wire_error)
+                    },
+                    Option::is_none,
+                )
+                .unwrap_or_else(|error| {
+                    (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
+                });
+        }
         let gres = parallel_map(&guarded_idx, |&i| {
             apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
                 .err()

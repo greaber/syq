@@ -455,11 +455,10 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 );
                 Ok(())
             };
-            let tuning = super::tuning::Tuning::new(&options, &args, control);
             let deleter = delete::Deleter {
                 client: &client,
                 bucket: &options.bucket,
-                budget: &tuning.requests,
+                concurrency: crate::deletion::Concurrency::s3(&args),
                 individual: args.s3_remove.individual_deletes(&options, authorization.is_some()),
             };
             let identify = |entry: &Entry| delete::Target {

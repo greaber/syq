@@ -29,7 +29,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const EVENT_BATCH: usize = 200;
@@ -428,6 +428,10 @@ struct Pool {
     events: mpsc::Sender<Option<NativeRemoveOutcome>>,
     dry_run: bool,
     cancelled: AtomicBool,
+    limit: AtomicUsize,
+    active: Vec<AtomicBool>,
+    parked: Mutex<()>,
+    wake: Condvar,
 }
 
 impl Pool {
@@ -469,10 +473,42 @@ impl Pool {
 
     fn close(&self) {
         self.sender.lock().unwrap().take();
+        let _parked = self.parked.lock().unwrap();
+        self.wake.notify_all();
+    }
+
+    fn set_limit(&self, limit: usize) {
+        let _parked = self.parked.lock().unwrap();
+        self.limit.store(limit, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    fn wait(&self, worker: usize) -> bool {
+        if worker < self.limit.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut parked = self.parked.lock().unwrap();
+        while worker >= self.limit.load(Ordering::Relaxed)
+            && !self.is_cancelled()
+            && !self.is_done()
+        {
+            parked = self.wake.wait(parked).unwrap();
+        }
+        !self.is_done()
+    }
+
+    fn backlogged(&self) -> bool {
+        let limit = self.limit.load(Ordering::Relaxed);
+        *self.pending.lock().unwrap() >= limit * 2
+            && !self.active[limit..]
+                .iter()
+                .any(|active| active.load(Ordering::Relaxed))
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        let _parked = self.parked.lock().unwrap();
+        self.wake.notify_all();
     }
 
     fn is_cancelled(&self) -> bool {
@@ -619,7 +655,15 @@ pub(crate) fn remove(
     // Queue every resolved root before starting workers. Once workers run,
     // only they may take the bounded-queue inline fallback; the coordinator
     // remains available to flush results and detect connection failure.
-    let queue_capacity = workers.max(1).saturating_mul(4).max(resolved.len()).max(1);
+    let concurrency = crate::deletion::Concurrency::filesystem(workers);
+    let mut tuning = crate::deletion::Control::new(concurrency);
+    let queue_capacity = if concurrency.automatic {
+        concurrency.maximum.saturating_mul(2)
+    } else {
+        workers.saturating_mul(4)
+    }
+    .max(resolved.len())
+    .max(1);
     let (task_tx, task_rx) = mpsc::sync_channel(queue_capacity);
     let (event_tx, event_rx) = mpsc::channel();
     let pool = Arc::new(Pool {
@@ -628,6 +672,12 @@ pub(crate) fn remove(
         events: event_tx,
         dry_run,
         cancelled: AtomicBool::new(false),
+        limit: AtomicUsize::new(tuning.limit()),
+        active: (0..concurrency.maximum)
+            .map(|_| AtomicBool::new(false))
+            .collect(),
+        parked: Mutex::new(()),
+        wake: Condvar::new(),
     });
     for selected in resolved {
         match selected {
@@ -660,11 +710,17 @@ pub(crate) fn remove(
 
     let task_rx = Arc::new(Mutex::new(task_rx));
     let mut threads = Vec::new();
-    for _ in 0..workers.max(1) {
-        let pool = pool.clone();
-        let task_rx = task_rx.clone();
-        threads.push(std::thread::spawn(move || worker_loop(pool, task_rx)));
-    }
+    let mut spawn_to = |limit: usize| {
+        while threads.len() < limit {
+            let id = threads.len();
+            let pool = pool.clone();
+            let task_rx = task_rx.clone();
+            threads.push(std::thread::spawn(move || worker_loop(pool, task_rx, id)));
+        }
+    };
+    spawn_to(tuning.limit());
+    let mut sampled = Instant::now();
+    let mut completed = 0;
 
     let mut batch = Vec::with_capacity(EVENT_BATCH);
     let mut sink_error = None;
@@ -672,6 +728,9 @@ pub(crate) fn remove(
     while !pool.is_done() {
         match event_rx.recv_timeout(EVENT_POLL) {
             Ok(Some(event)) => {
+                if event.disposition == NativeRemoveDisposition::Removed {
+                    completed += 1;
+                }
                 if sink_error.is_none() {
                     batch.push(event);
                 }
@@ -679,6 +738,13 @@ pub(crate) fn remove(
             Ok(None) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if !dry_run && sampled.elapsed() >= crate::deletion::SAMPLE {
+            let limit = tuning.observe(completed, sampled.elapsed(), pool.backlogged());
+            pool.set_limit(limit);
+            spawn_to(limit);
+            sampled = Instant::now();
+            completed = 0;
         }
         if sink_error.is_none()
             && (batch.len() >= EVENT_BATCH
@@ -721,13 +787,15 @@ pub(crate) fn remove(
     Ok(())
 }
 
-fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>) {
-    loop {
+fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>, id: usize) {
+    while pool.wait(id) {
         let task = match receiver.lock().unwrap().recv() {
             Ok(task) => task,
             Err(_) => return,
         };
+        pool.active[id].store(true, Ordering::Relaxed);
         process_task(&pool, task);
+        pool.active[id].store(false, Ordering::Relaxed);
         pool.task_done();
     }
 }

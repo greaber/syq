@@ -42,7 +42,6 @@ use work_budget::{WorkBudget, WorkSize};
 use worker::*;
 
 const MAX_ATTEMPTS: u32 = 3;
-pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 // Amortize metadata requests across enough files to keep their shared pool
 // busy. The scheduler still divides queued files fairly among active workers,
 // and the byte limit bounds each batch independently of this ceiling.

@@ -5874,7 +5874,7 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
             "parallel-delimiter-policy",
             "parallel-serial",
         ] {
-            // S3 removal has no public tuning option.
+            // S3 removal has no discovery-concurrency override.
             if command == "rm" && fault == "parallel-serial" {
                 continue;
             }

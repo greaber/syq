@@ -150,9 +150,6 @@ fn run_remove(
         }
     }
     let endpoint = endpoint(&locs[0], args)?;
-    if args.connections_default && !endpoint.is_remote() {
-        args.connections = crate::transfer::LOCAL_DEFAULT_CONNECTIONS;
-    }
     let selections = locs
         .iter()
         .map(|location| NativeRemoveSelection {
@@ -182,7 +179,11 @@ fn run_remove(
         &selections,
         args.follows_native_source_paths(),
         args.dry_run,
-        args.connections,
+        if args.connections_default {
+            0
+        } else {
+            args.connections
+        },
         &mut |messages| {
             if trace_resolution {
                 for message in messages {

@@ -67,7 +67,7 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#transfer-controls) |
+| `--performance-tuning <KEY=VALUE,...>` | Fix deletion concurrency: [workers=N for filesystems or s3-requests=N for S3](../tuning.md#deletion) |
 
 ## Progress and results
 
