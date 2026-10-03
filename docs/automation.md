@@ -357,7 +357,7 @@ failure, and each entry's
 `receiving_enabled` is `null`.
 
 `persist receive status --json` reports each profile's `cwd`, `cwd_explicit`,
-`root`, `auto_approve_root`, and `servers`. An empty server list means all
+`root`, `auto_approve_root`, and `servers`. An empty list means all
 connections. A null automatic approval root means every download asks.
 Connection entries list only profiles allowed on that endpoint.
 

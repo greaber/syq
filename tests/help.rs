@@ -237,7 +237,7 @@ fn management_help_separates_everyday_options_from_manual_overrides() {
             vec!["persist", "receive", "on"],
             vec![
                 "--auto-approve-root",
-                "--server",
+                "--connection",
                 "--auto-cwd",
                 "--notify",
                 "--name",

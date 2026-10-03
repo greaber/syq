@@ -194,13 +194,15 @@ removed. `pending`, `approve`, and `deny` work across all profiles, and
 `pending` names the receiving profile of each request. Without `--name`,
 `receive wait` waits for every enabled profile on that server.
 
-### Choose allowed servers
+<a id="choose-allowed-servers"></a>
 
-To give one server an inbox for downloads that do not need approval:
+### Choose allowed connections
+
+To give one server account an inbox for downloads that do not need approval:
 
 ```sh
 mkdir -p ~/Downloads/work
-syq persist receive on --name work-inbox --server work \
+syq persist receive on --name work-inbox --connection work \
   --auto-approve-root ~/Downloads/work
 syq persist connect work
 ```
@@ -209,7 +211,7 @@ On `work`, use `syq cp results --to @work-inbox`. Other connections cannot
 use that profile. Your general profile can still ask for approval on every
 download.
 
-Profiles default to all connected servers. `receive on --name NAME --server HOST`
+Profiles default to all SSH connections. `receive on --name NAME --connection ENDPOINT`
 restricts a profile to the exact SSH destination used on the receiving machine.
 Use the endpoint shown by `persist status`: for example `work`, `alice@work`,
 or `alice@work:2222`. Matching includes an explicitly selected user and port;
@@ -218,8 +220,8 @@ An alias uses the account and host configured for it in your local SSH settings.
 The server cannot select its own identity for this check. Changing your local
 SSH configuration can change which account an allowed alias reaches.
 
-Repeat `--server` to supply several destinations. Each supplied list replaces
-the saved list; `--all-servers` clears the restriction. Changes apply to existing
+Repeat `--connection` to supply several endpoints. Each supplied list replaces
+the saved list; `--all-connections` clears the restriction. Changes apply to existing
 persistent connections too. `receive wait HOST` waits only for profiles allowed
 on HOST.
 

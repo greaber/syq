@@ -54,8 +54,8 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                         arg.get_id().as_str(),
                         "auto_approve_root"
                             | "no_auto_approve_root"
-                            | "servers"
-                            | "all_servers"
+                            | "connection"
+                            | "all_connections"
                             | "notifications"
                             | "name"
                             | "cwd"

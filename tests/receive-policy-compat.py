@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix="syq-policy-compat-") as temporary:
     assert upgraded["max_entries"] == 123
     assert "approval" not in upgraded
     assert path.read_bytes() == original  # Read-only status does not migrate on disk.
-    run(candidate, "on", "--auto-approve-root", str(inbox), "--server", "work")
+    run(candidate, "on", "--auto-approve-root", str(inbox), "--connection", "work")
     saved = path.read_bytes()
     assert json.loads(saved)["version"] == 5
     for args in [("status", "--json"), ("on", "--approve", "always")]:

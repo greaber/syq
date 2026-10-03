@@ -793,9 +793,9 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
         "on",
         "--auto-approve-root",
         "root/inbox",
-        "--server",
+        "--connection",
         "work",
-        "--server",
+        "--connection",
         "alice@lab:2222",
     ]));
     assert_eq!(state()["cwd"], t.s("root/inbox"));
@@ -820,7 +820,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
     assert_eq!(state()["cwd"], t.s("root"));
     assert_output_ok(&run(&["on", "--no-root"]));
     assert_eq!(state()["cwd"], t.s("root/inbox"));
-    assert_output_ok(&run(&["on", "--no-auto-approve-root", "--all-servers"]));
+    assert_output_ok(&run(&["on", "--no-auto-approve-root", "--all-connections"]));
     assert_eq!(
         state()["cwd"],
         fs::canonicalize(t.path("")).unwrap().to_str().unwrap()
@@ -829,7 +829,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
     let before = fs::read(t.path("config/syq/receive.json")).unwrap();
     for args in [
         vec!["on", "--auto-approve-root", "missing"],
-        vec!["on", "--server", ""],
+        vec!["on", "--connection", ""],
         vec!["on", "--cwd", ".", "--root", "root"],
         vec!["on", "--auto-approve-root", "/"],
         vec!["on", "--approve", "always"],
@@ -1801,7 +1801,7 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
         .unwrap();
     // Keep the real supervisor running without starting any SSH workers.
     assert_output_ok(
-        &command(&["persist", "receive", "on", "--server", "other.invalid"])
+        &command(&["persist", "receive", "on", "--connection", "other.invalid"])
             .run()
             .unwrap(),
     );

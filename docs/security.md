@@ -285,7 +285,7 @@ its environment variables; your laptop derives what it enforces from that
 command and rejects a request that does not match. It cannot prove who typed
 the command. Approving a copy does not approve a later
 command. By default, every connected server can use every enabled profile.
-A profile's optional `--server` list limits which locally selected SSH
+A profile's optional `--connection` list limits which locally selected SSH
 connections may use it. Within each allowed server account, all processes
 share this authority; choosing a different profile name does not isolate them.
 

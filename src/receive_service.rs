@@ -83,7 +83,7 @@ impl Settings {
             }
         }
         crate::output::human_stdout!(
-            "servers: {}",
+            "connections: {}",
             if self.servers.is_empty() {
                 "all".into()
             } else {
@@ -199,12 +199,12 @@ struct Configure {
     /// Require approval for every download again
     #[arg(long)]
     no_auto_approve_root: bool,
-    /// Limit this profile to these SSH destinations (repeat to allow several)
-    #[arg(long = "server", conflicts_with = "all_servers")]
-    servers: Vec<String>,
-    /// Make this profile available through every connected server
+    /// Limit this profile to these SSH connections (repeat to allow several)
+    #[arg(long, value_name = "ENDPOINT", conflicts_with = "all_connections")]
+    connection: Vec<String>,
+    /// Make this profile available through every connected SSH account
     #[arg(long)]
-    all_servers: bool,
+    all_connections: bool,
     /// Show desktop prompts, or use only local pending/approve/deny commands
     #[arg(long = "notify", value_enum)]
     notifications: Option<crate::receive_approval::Notifications>,
@@ -387,7 +387,7 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     }
     for server in &settings.servers {
         if server.is_empty() || server.starts_with('-') || server.chars().any(char::is_whitespace) {
-            bail!("--server must name an SSH connection destination");
+            bail!("--connection must name an SSH connection destination");
         }
     }
     if settings.max_bytes == 0
@@ -1209,10 +1209,10 @@ fn configure(options: Configure) -> Result<()> {
     if options.no_auto_approve_root {
         config.auto_approve_root = None;
     }
-    if !options.servers.is_empty() {
-        config.servers = options.servers;
+    if !options.connection.is_empty() {
+        config.servers = options.connection;
     }
-    if options.all_servers {
+    if options.all_connections {
         config.servers.clear();
     }
     if !config.cwd_explicit {

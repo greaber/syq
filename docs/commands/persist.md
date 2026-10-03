@@ -233,8 +233,8 @@ syq persist receive on [OPTIONS]
 |---|---|
 | `--auto-approve-root <AUTO_APPROVE_ROOT>` | Automatically approve downloads confined to this directory |
 | `--no-auto-approve-root` | Require approval for every download again |
-| `--server <SERVERS>` | Limit this profile to these SSH destinations (repeat to allow several) |
-| `--all-servers` | Make this profile available through every connected server |
+| `--connection <ENDPOINT>` | Limit this profile to these SSH connections (repeat to allow several) |
+| `--all-connections` | Make this profile available through every connected SSH account |
 | `--notify <NOTIFICATIONS>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |
 | `-C, --cwd <CWD>` | Default destination directory; absolute paths and .. may select elsewhere |
