@@ -66,7 +66,7 @@ impl Engine {
                 // This path previously deleted serially. Start with a small
                 // pool: many threads contend in a flat local directory, while
                 // slower destinations have time to earn more parallelism.
-                let mut deletion = crate::deletion::Batch::new(8);
+                let mut deletion = crate::deletion::Batch::new(4);
                 // Equal-depth entries are independent; finish children before
                 // admitting their parents and never remove a tree recursively.
                 for level in found.chunk_by(|a, b| depth(a) == depth(b)) {
