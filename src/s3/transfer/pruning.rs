@@ -71,6 +71,7 @@ impl Engine {
                     let first_parent = &first.path[..parent(first).unwrap_or(0)];
                     found
                         .iter()
+                        .take_while(|c| depth(c) == depth(first))
                         .any(|c| &c.path[..parent(c).unwrap_or(0)] != first_parent)
                 });
                 let mut deletion = crate::deletion::Batch::new(if independent { 8 } else { 1 });

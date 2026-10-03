@@ -218,9 +218,9 @@ mod tests {
 
     #[test]
     fn deletion_control_finds_parallelism_and_rejects_contention() {
-        for startup_doubling in [false, true] {
+        for (initial, startup_doubling) in [(1, false), (4, false), (4, true)] {
             let mut control = Control::new(Concurrency {
-                initial: 4,
+                initial,
                 maximum: 64,
                 automatic: true,
                 startup_doubling,
@@ -258,22 +258,24 @@ mod tests {
 
     #[test]
     fn deletion_batch_preserves_outcome_order_and_reports_failures() {
-        let mut batch = Batch::default();
-        let results = batch
-            .run(
-                &(0..1000).collect::<Vec<_>>(),
-                |n| {
-                    if n % 7 == 0 {
-                        Err(*n)
-                    } else {
-                        Ok(*n)
-                    }
-                },
-                Result::is_ok,
-            )
-            .unwrap();
-        for (n, result) in results.into_iter().enumerate() {
-            assert_eq!(result, if n % 7 == 0 { Err(n) } else { Ok(n) });
+        for initial in [1, FILESYSTEM_START] {
+            let mut batch = Batch::new(initial);
+            let results = batch
+                .run(
+                    &(0..1000).collect::<Vec<_>>(),
+                    |n| {
+                        if n % 7 == 0 {
+                            Err(*n)
+                        } else {
+                            Ok(*n)
+                        }
+                    },
+                    Result::is_ok,
+                )
+                .unwrap();
+            for (n, result) in results.into_iter().enumerate() {
+                assert_eq!(result, if n % 7 == 0 { Err(n) } else { Ok(n) });
+            }
         }
     }
 }
