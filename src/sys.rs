@@ -175,13 +175,13 @@ pub(crate) fn directory_is_empty(directory: File) -> io::Result<bool> {
 /// return how many it read. The read itself is the point: on NFS it
 /// refreshes the client's entries and attributes for what it read. The
 /// Linux NFS client fetches attributes with the entries only for a read
-/// that starts at the beginning of the directory, so the limit sizes one
-/// read rather than a series of small ones.
+/// that starts at the beginning of the directory, so this is one read
+/// sized for the limit; with longer names it returns fewer entries.
 #[cfg(target_os = "linux")]
 pub(crate) fn walk_directory_entries(directory: File, limit: usize) -> io::Result<usize> {
-    let step = limit.saturating_mul(32).clamp(8 << 10, 16 << 20);
+    let mut buffer = vec![0u8; limit.saturating_mul(32).clamp(8 << 10, 16 << 20)];
     let mut seen = 0;
-    read_directory_in_steps(&directory, step, |_| {
+    read_directory_step(&directory, &mut buffer, &mut |_| {
         seen += 1;
         seen < limit
     })?;
@@ -200,7 +200,20 @@ fn read_directory_in_steps(
     mut each: impl FnMut(&[u8]) -> bool,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; step];
-    loop {
+    while read_directory_step(directory, &mut buffer, &mut each)? {}
+    Ok(())
+}
+
+/// Read one buffer of entries and call `each` with every entry but `.` and
+/// `..`. Returns whether more may follow: false at the end of the directory
+/// or once `each` returns false.
+#[cfg(target_os = "linux")]
+fn read_directory_step(
+    directory: &File,
+    buffer: &mut [u8],
+    each: &mut impl FnMut(&[u8]) -> bool,
+) -> io::Result<bool> {
+    let read = loop {
         let read = unsafe {
             libc::syscall(
                 libc::SYS_getdents64,
@@ -209,39 +222,39 @@ fn read_directory_in_steps(
                 buffer.len(),
             )
         };
-        if read < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
+        if read >= 0 {
+            break read as usize;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
-        let read = read as usize;
-        if read == 0 {
-            return Ok(());
+    };
+    if read == 0 {
+        return Ok(false);
+    }
+    // Each record holds an 8-byte inode, an 8-byte offset, its 16-bit
+    // length, a type byte, and the NUL-terminated name.
+    let mut offset = 0;
+    while offset + 19 < read {
+        let length = usize::from(u16::from_ne_bytes([
+            buffer[offset + 16],
+            buffer[offset + 17],
+        ]));
+        if length < 20 || offset + length > read {
+            break;
         }
-        // Each record holds an 8-byte inode, an 8-byte offset, its 16-bit
-        // length, a type byte, and the NUL-terminated name.
-        let mut offset = 0;
-        while offset + 19 < read {
-            let length = usize::from(u16::from_ne_bytes([
-                buffer[offset + 16],
-                buffer[offset + 17],
-            ]));
-            if length < 20 || offset + length > read {
-                break;
-            }
-            let field = &buffer[offset + 19..offset + length];
-            let name = &field[..field
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(field.len())];
-            offset += length;
-            if name != b"." && name != b".." && !each(name) {
-                return Ok(());
-            }
+        let field = &buffer[offset + 19..offset + length];
+        let name = &field[..field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len())];
+        offset += length;
+        if name != b"." && name != b".." && !each(name) {
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 /// Call `each` with every entry but `.` and `..`, stopping when it returns
@@ -376,5 +389,14 @@ mod tests {
             .map(|index| format!("f{index:04}").into_bytes())
             .collect();
         assert_eq!(names, expected);
+
+        // The walk is a single read: with long names it returns fewer
+        // entries than the limit rather than reading on.
+        let long = crate::test_support::tempdir().unwrap();
+        for index in 0..300 {
+            File::create(long.path().join(format!("{index:0200}"))).unwrap();
+        }
+        let read = walk_directory_entries(File::open(long.path()).unwrap(), 300).unwrap();
+        assert!((1..300).contains(&read), "{read}");
     }
 }
