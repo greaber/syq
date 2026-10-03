@@ -86,6 +86,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | Argument / option | Meaning |
 |---|---|
 | `-B, --block-size <SIZE>` | Comparison and reuse block size (64K through 64M)<br><br>[default: 4M] |
+| `--syq-transfer-strategy <STRATEGY>` | Syq extension: Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.<br><br>Possible values:<br>- whole-file: Copy selected files without comparing blocks in the final destination<br>- aligned-block: Reuse matching blocks at the same offsets in the corresponding destination file<br>- locality: Use whole-file locally and aligned-block with a remote syq endpoint |
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 
 ## Resource limits

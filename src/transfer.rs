@@ -919,6 +919,8 @@ fn attempt_small_copy(
         {
             continue;
         }
+        // This shortcut sends whole-file payloads. Multiple comparison blocks
+        // need the range engine to avoid retransmitting matching parts.
         if entry.size > SMALL_COPY_MAX_FILE_BYTES
             || (opts
                 .transfer_strategy
