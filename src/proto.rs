@@ -341,6 +341,25 @@ pub struct SmallPut {
     pub replaces: bool,
 }
 
+/// One file of a replacing small-file batch: its whole-file put, and the
+/// metadata flags for keeping an existing destination whose contents
+/// already match.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallReplace {
+    pub put: SmallPut,
+    pub unchanged_flags: u8,
+}
+
+/// The outcome of one file of a replacing small-file batch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmallReplaced {
+    /// The published or kept inode, when the put asked for it.
+    pub identity: Option<(u64, u64)>,
+    /// The destination already held these contents: it was kept, and only
+    /// its metadata was updated.
+    pub unchanged: bool,
+}
+
 /// Contents and integrity hash for one successful `SmallRead`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallBlock {
@@ -1092,6 +1111,10 @@ pub enum WireRequest<Data> {
     CreateSendBudget {
         rate: u64,
     },
+    /// Publish a small-file batch like `PutSmallBatch`, except that an
+    /// existing destination whose contents already match is kept and only
+    /// its metadata is updated.
+    ReplaceSmallBatch(Vec<SmallReplace>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1380,6 +1403,7 @@ pub enum Response {
     SendBudget(crate::descriptor_broker::DescriptorTicket),
     /// Aggregate ignore exclusions, sent once before ScanDone when nonzero.
     ScanIgnoredCount(u64),
+    ReplacedBatch(Vec<std::result::Result<SmallReplaced, WireError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1522,6 +1546,7 @@ impl SizeHint for Request {
             Request::DescriptorCopy(_)
             | Request::WriteRange { .. }
             | Request::PutSmallBatch(_)
+            | Request::ReplaceSmallBatch(_)
             | Request::CopySmallFiles(_)
             | Request::SeedBasis { .. } => MAX_FRAME,
             _ => MAX_METADATA_FRAME,
@@ -1539,6 +1564,16 @@ impl SizeHint for Request {
             Request::PutSmallBatch(puts) => {
                 puts.iter()
                     .map(|put| put.data.len() + put.path.len() + put.meta.size_hint() + 96)
+                    .sum::<usize>()
+                    + 16
+            }
+            Request::ReplaceSmallBatch(entries) => {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        let put = &entry.put;
+                        put.data.len() + put.path.len() + put.meta.size_hint() + 97
+                    })
                     .sum::<usize>()
                     + 16
             }

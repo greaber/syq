@@ -200,8 +200,14 @@ in every mode: matching bytes from interrupted copies can still be reused,
 even with `off`. The setting controls reuse of the final destination, not partials.
 
 With block reuse enabled, files with identical contents can finish without
-rewriting data even when their metadata differs. A difference near the end can
-add almost a full extra read of both files before copying. An output already
+rewriting data even when their metadata differs. Files no larger than one
+comparison block (4 MiB by default) travel in batches with other small files,
+and the receiving side compares each with the file it would replace: one that
+already matches is kept, and only its metadata is updated. Its contents still
+cross the network, but it costs no comparison round trip of its own. Under a
+bandwidth limit, small files are compared before their contents are sent, as
+larger files are. For larger files, a difference near the end can add almost
+a full extra read of both files before copying. An output already
 being written by the current run resumes before that probe.
 Leftover partials from earlier runs do not bypass checking whether the completed
 file already matches.

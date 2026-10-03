@@ -1734,6 +1734,9 @@ impl FsOps {
             | Request::ValidateDigest { guard, .. }
             | Request::Canonicalize { guard, .. } => guard.is_some(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
+            Request::ReplaceSmallBatch(entries) => {
+                entries.iter().any(|entry| entry.put.guard.is_some())
+            }
             _ => false,
         };
         if has_guard {
@@ -1762,6 +1765,9 @@ impl FsOps {
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. } => guard.is_none(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_none()),
+            Request::ReplaceSmallBatch(entries) => {
+                entries.iter().any(|entry| entry.put.guard.is_none())
+            }
             Request::CopyLocal { .. } => true,
             _ => false,
         };
@@ -2083,6 +2089,13 @@ impl FsOps {
                 for put in puts {
                     if put.guard.is_none() {
                         map(&mut put.path)?;
+                    }
+                }
+            }
+            Request::ReplaceSmallBatch(entries) => {
+                for entry in entries {
+                    if entry.put.guard.is_none() {
+                        map(&mut entry.put.path)?;
                     }
                 }
             }

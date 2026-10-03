@@ -23,7 +23,7 @@ struct Active {
 }
 
 /// The caller enters with no outstanding destination requests and issues only
-/// PutSmallBatch until this scope ends. Dropping it retracts receipts the
+/// PutSmallBatch or ReplaceSmallBatch until this scope ends. Dropping it retracts receipts the
 /// worker never consumed; consumed receipts keep the usual file retry rules.
 /// After a failed drain the connection must be discarded, as for other RPCs.
 pub(crate) struct BatchProgress(Arc<BatchReceipts>);
@@ -46,13 +46,18 @@ impl BatchReceipts {
         }
         let mut active = self.active.lock().unwrap();
         if let Some(active) = active.as_mut() {
-            let Request::PutSmallBatch(puts) = request else {
-                anyhow::bail!("only batch writes are valid while batch progress is active");
-            };
             // Register before writing: a fast helper may reply before send returns.
-            active
-                .pending
-                .push_back(puts.iter().map(|put| put.data.len() as u64).collect());
+            let sizes = match request {
+                Request::PutSmallBatch(puts) => {
+                    puts.iter().map(|put| put.data.len() as u64).collect()
+                }
+                Request::ReplaceSmallBatch(entries) => entries
+                    .iter()
+                    .map(|entry| entry.put.data.len() as u64)
+                    .collect(),
+                _ => anyhow::bail!("only batch writes are valid while batch progress is active"),
+            };
+            active.pending.push_back(sizes);
         }
         Ok(())
     }
@@ -75,6 +80,14 @@ impl BatchReceipts {
             Response::Applied(errors) if errors.len() == sizes.len() => {
                 totals(&sizes, errors.iter().map(Option::is_none))
             }
+            // A kept file wrote nothing: its bytes are counted as unchanged
+            // when the worker consumes the reply.
+            Response::ReplacedBatch(results) if results.len() == sizes.len() => totals(
+                &sizes,
+                results
+                    .iter()
+                    .map(|result| result.as_ref().is_ok_and(|replaced| !replaced.unchanged)),
+            ),
             // Invalid or rejected replies are still consumed by the worker,
             // which reports the error. They do not earn any progress credit.
             _ => (0, 0),
@@ -195,6 +208,41 @@ mod tests {
                 "no duplicate credit on consumption"
             );
         }
+    }
+
+    #[test]
+    fn a_replacing_batch_credits_only_the_files_it_wrote() {
+        use crate::proto::{SmallReplace, SmallReplaced};
+        let Request::PutSmallBatch(puts) = test_request(&[16, 32, 8]) else {
+            unreachable!()
+        };
+        let request = Request::ReplaceSmallBatch(
+            puts.into_iter()
+                .map(|put| SmallReplace {
+                    put,
+                    unchanged_flags: 0,
+                })
+                .collect(),
+        );
+        let receipts = Arc::new(BatchReceipts::default());
+        let progress = Progress::new(false, false, None);
+        let scope = receipts.begin(progress.clone()).unwrap();
+        receipts.request(&request).unwrap();
+        let replaced = |unchanged| {
+            Ok(SmallReplaced {
+                identity: None,
+                unchanged,
+            })
+        };
+        receipts.response(&Response::ReplacedBatch(vec![
+            replaced(false),
+            replaced(true),
+            Err("denied".into()),
+        ]));
+        // The kept file's bytes are counted as unchanged by the worker.
+        assert_eq!(progress.bytes_done.load(Relaxed), 16);
+        assert_eq!(Meter::files(&*progress), 1);
+        scope.consume().unwrap();
     }
 
     #[test]

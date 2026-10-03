@@ -12,6 +12,12 @@ pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
 
+/// Bytes read at a time when checking whether a destination already holds a
+/// small file's contents. The incoming contents are already in memory, so the
+/// old file is read in steps into one reused buffer, stopping at the first
+/// difference, rather than into a copy of its own.
+const COMPARE_STEP: usize = 128 << 10;
+
 /// A small file's private sidecar between its creation and publication.
 pub(super) struct SmallStage {
     target: RootedTarget,
@@ -69,14 +75,141 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
 }
 
 impl FsOps {
+    /// A replacing batch keeps each existing destination that already holds
+    /// its put's contents, updating only that file's metadata, and publishes
+    /// the others as an ordinary batch does. A target named more than once
+    /// is always published, in order.
+    pub(super) fn replace_small_batch(
+        &mut self,
+        entries: &[SmallReplace],
+    ) -> Vec<std::result::Result<SmallReplaced, WireError>> {
+        let mut seen = HashSet::new();
+        let repeated: HashSet<&[u8]> = entries
+            .iter()
+            .filter(|entry| !seen.insert(entry.put.path.as_slice()))
+            .map(|entry| entry.put.path.as_slice())
+            .collect();
+        let mut results = Vec::with_capacity(entries.len());
+        let mut puts = Vec::new();
+        let mut buffer = Vec::new();
+        for entry in entries {
+            let kept = if repeated.contains(entry.put.path.as_slice()) {
+                Ok(None)
+            } else {
+                self.keep_unchanged_small(entry, &mut buffer)
+            };
+            results.push(match kept {
+                Ok(Some(identity)) => Ok(SmallReplaced {
+                    identity,
+                    unchanged: true,
+                }),
+                Ok(None) => {
+                    puts.push(&entry.put);
+                    Ok(SmallReplaced {
+                        identity: None,
+                        unchanged: false,
+                    })
+                }
+                Err(error) => Err(wire_error(&error)),
+            });
+        }
+        let mut published = self.put_small_puts(&puts).into_iter();
+        for result in &mut results {
+            if matches!(
+                result,
+                Ok(SmallReplaced {
+                    unchanged: false,
+                    ..
+                })
+            ) {
+                *result = published
+                    .next()
+                    .expect("one publication result per put")
+                    .map(|identity| SmallReplaced {
+                        identity,
+                        unchanged: false,
+                    });
+            }
+        }
+        results
+    }
+
+    /// Keep an existing destination that already holds this put's contents:
+    /// update its metadata through the descriptor its contents were read
+    /// from, as a content-identical per-file finish does. Returns the kept
+    /// file's identity, or None when the put must be published instead.
+    fn keep_unchanged_small(
+        &mut self,
+        entry: &SmallReplace,
+        buffer: &mut Vec<u8>,
+    ) -> Result<Option<Option<(u64, u64)>>> {
+        let put = &entry.put;
+        let target = self.destination_mutation_target(&put.path, put.guard.as_ref())?;
+        let Ok(file) = target.root.open_regular_read(&target.relative) else {
+            return Ok(None);
+        };
+        if require_open_target(&file, &target.label, put.condition).is_err() {
+            return Ok(None);
+        }
+        let len = put.data.len();
+        if file.metadata()?.len() != len as u64 {
+            return Ok(None);
+        }
+        buffer.resize(COMPARE_STEP.min(len), 0);
+        let mut offset = 0;
+        while offset < len {
+            let step = buffer.len().min(len - offset);
+            let read = match file.read_at(&mut buffer[..step], offset as u64) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if read == 0 || buffer[..read] != put.data[offset..offset + read] {
+                return Ok(None);
+            }
+            offset += read;
+        }
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_COMPARED_READY_FILE",
+            "SYQ_TEST_SMALL_COMPARED_CONTINUE_FILE",
+            "small-file comparison",
+        )?;
+        // A writer may have extended the file while it was compared.
+        let current = file.metadata()?;
+        if current.len() != len as u64 {
+            return Ok(None);
+        }
+        if self.hash_policy.transfer_integrity && self.observed_payload_hash(&put.data) != put.hash
+        {
+            bail!("block hash mismatch on receive");
+        }
+        set_meta_file_known(&file, &put.meta, entry.unchanged_flags, &current)
+            .with_context(|| format!("set metadata {}", target.label.display()))?;
+        if put.guard.is_some() || put.condition != TargetCondition::Any {
+            require_rooted_named_identity(
+                &target.root,
+                &target.relative,
+                &target.label,
+                &file,
+                put.condition,
+            )?;
+        }
+        Ok(Some(published_identity(&file, entry.unchanged_flags)?))
+    }
+
     pub(super) fn put_small_batch(&mut self, puts: &[SmallPut]) -> Vec<SmallOutcome> {
+        self.put_small_puts(&puts.iter().collect::<Vec<_>>())
+    }
+
+    fn put_small_puts(&mut self, puts: &[&SmallPut]) -> Vec<SmallOutcome> {
         let mut results: Vec<SmallOutcome> = vec![Ok(None); puts.len()];
         let mut carried = None;
         let mut next = 0;
         while next < puts.len() || carried.is_some() {
             if carried.is_none() && puts[next].inplace {
                 results[next] = self
-                    .put_small(&puts[next])
+                    .put_small(puts[next])
                     .map_err(|error| wire_error(&error));
                 next += 1;
                 continue;
@@ -94,7 +227,7 @@ impl FsOps {
             while run.len() <= reserved.0 && next < puts.len() && !puts[next].inplace {
                 let index = next;
                 next += 1;
-                let target = match self.small_target(&puts[index]) {
+                let target = match self.small_target(puts[index]) {
                     Ok(target) => target,
                     Err(error) => {
                         results[index] = Err(wire_error(&error));
@@ -131,7 +264,7 @@ impl FsOps {
 
     fn put_small_run(
         &mut self,
-        puts: &[SmallPut],
+        puts: &[&SmallPut],
         run: Vec<(usize, RootedTarget)>,
         results: &mut [SmallOutcome],
     ) {
@@ -145,14 +278,14 @@ impl FsOps {
             // themselves report what is wrong with the path.
             let _turn = root.mutation_turn(&directory).ok();
             for (index, target) in run {
-                match self.create_small_stage(&puts[index], target) {
+                match self.create_small_stage(puts[index], target) {
                     Ok(stage) => stages.push((index, stage)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
         }
         stages.retain(
-            |(index, stage)| match self.write_small_stage(&puts[*index], stage) {
+            |(index, stage)| match self.write_small_stage(puts[*index], stage) {
                 Ok(()) => true,
                 Err(error) => {
                     results[*index] = Err(wire_error(&error));
@@ -171,7 +304,7 @@ impl FsOps {
                 .then(|| root.replacement_turn());
             let _turn = root.mutation_turn(&directory).ok();
             for (index, stage) in stages {
-                match self.publish_small_stage(&puts[index], &stage) {
+                match self.publish_small_stage(puts[index], &stage) {
                     Ok(()) => published.push((index, stage)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
@@ -179,7 +312,7 @@ impl FsOps {
         }
         for (index, stage) in published {
             results[index] = self
-                .finish_small_stage(&puts[index], stage)
+                .finish_small_stage(puts[index], stage)
                 .map_err(|error| wire_error(&error));
         }
     }
@@ -321,6 +454,91 @@ mod tests {
 
     fn entries(directory: &Path) -> usize {
         fs::read_dir(directory).unwrap().count()
+    }
+
+    #[test]
+    fn a_replacing_batch_keeps_files_that_already_match_and_publishes_the_rest() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let old = [
+            ("same", &b"same contents"[..]),
+            ("changed", b"old contents!"),
+            ("longer", b"a longer old version"),
+            ("twice", b"repeated"),
+            ("forged", b"forged contents"),
+        ];
+        for (name, data) in old {
+            fs::write(directory.join(name), data).unwrap();
+        }
+        let inode = |name: &str| fs::metadata(directory.join(name)).unwrap().ino();
+        let before: Vec<u64> = old.iter().map(|(name, _)| inode(name)).collect();
+        let replace = |name: &str, data: &[u8]| {
+            let mut put = put(name, data);
+            put.meta.mtime = 1_234_567_890;
+            put.replaces = true;
+            SmallReplace {
+                put,
+                unchanged_flags: flags::TIMES,
+            }
+        };
+        let mut batch = vec![
+            replace("same", b"same contents"),
+            replace("changed", b"new contents!"),
+            replace("longer", b"short"),
+            replace("new", b"brand new"),
+            replace("twice", b"repeated"),
+            replace("twice", b"repeated, then changed"),
+            replace("forged", b"forged contents"),
+        ];
+        // Matching contents must still arrive intact to be kept.
+        batch[6].put.hash = content_digest(b"something else");
+        let results = receiver(directory).replace_small_batch(&batch);
+        let kept = |identity| {
+            Ok(SmallReplaced {
+                identity,
+                unchanged: true,
+            })
+        };
+        let published = Ok(SmallReplaced {
+            identity: None,
+            unchanged: false,
+        });
+        assert_eq!(
+            results[..6],
+            [
+                kept(None),
+                published.clone(),
+                published.clone(),
+                published.clone(),
+                published.clone(),
+                published,
+            ]
+        );
+        assert!(results[6].is_err(), "{:?}", results[6]);
+        // The kept file is the same inode, with the new times.
+        assert_eq!(inode("same"), before[0]);
+        let same = fs::metadata(directory.join("same")).unwrap();
+        assert_eq!(same.mtime(), 1_234_567_890);
+        assert_eq!(fs::read(directory.join("same")).unwrap(), b"same contents");
+        // Published files are new inodes holding the new contents, and a
+        // repeated target ends with its last version.
+        assert_ne!(inode("changed"), before[1]);
+        for (name, data) in [
+            ("changed", &b"new contents!"[..]),
+            ("longer", b"short"),
+            ("new", b"brand new"),
+            ("twice", b"repeated, then changed"),
+            ("forged", b"forged contents"),
+        ] {
+            assert_eq!(fs::read(directory.join(name)).unwrap(), data, "{name}");
+        }
+        assert_eq!(inode("forged"), before[4]);
+        assert_ne!(
+            fs::metadata(directory.join("forged")).unwrap().mtime(),
+            1_234_567_890
+        );
+        // Nothing else was left behind.
+        assert_eq!(entries(directory), 6);
     }
 
     #[test]

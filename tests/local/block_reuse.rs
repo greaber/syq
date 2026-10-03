@@ -309,6 +309,121 @@ fn remote_defaults_reuse_blocks_for_push_and_pull() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
+fn small_replacements_are_batched_and_files_that_already_match_are_kept() {
+    // Local copies with reuse forced on, then remote push and pull, where
+    // reuse is the default.
+    for remote in [None, Some(false), Some(true)] {
+        let t = Tmp::new();
+        write(&t.path("src/changed"), b"new contents");
+        write(&t.path("src/same"), b"same contents");
+        write(&t.path("src/fresh"), b"fresh");
+        write(&t.path("dst/changed"), b"old contents");
+        write(&t.path("dst/same"), b"same contents");
+        set_mtime(&t.path("dst/changed"), 1);
+        set_mtime(&t.path("dst/same"), 1);
+        let inode = |name: &str| fs::metadata(t.path(name)).unwrap().ino();
+        let (same, changed) = (inode("dst/same"), inode("dst/changed"));
+        let out = match remote {
+            None => compat_command()
+                .args([
+                    "-a",
+                    "--no-progress",
+                    "--performance-tuning=workers=1,block-reuse=on",
+                    &t.s("src/"),
+                    &t.s("dst/"),
+                ])
+                .env("SYQ_DEBUG", "1")
+                .run()
+                .unwrap(),
+            Some(pull) => {
+                let rsh = fake_rsh(&t);
+                let (src, dst) = if pull {
+                    (format!("fake:{}", t.s("src/")), t.s("dst/"))
+                } else {
+                    (t.s("src/"), format!("fake:{}", t.s("dst/")))
+                };
+                remote_syq_command(
+                    &t,
+                    &rsh,
+                    &[
+                        "-a",
+                        "--rsync-path",
+                        env!("CARGO_BIN_EXE_syq"),
+                        "--syq-no-bootstrap",
+                        &src,
+                        &dst,
+                    ],
+                )
+                .env("SYQ_DEBUG", "1")
+                .run()
+                .unwrap()
+            }
+        };
+        assert_output_ok(&out);
+        for name in ["changed", "same", "fresh"] {
+            assert_eq!(
+                read(&t.path(&format!("dst/{name}"))),
+                read(&t.path(&format!("src/{name}"))),
+                "{name} {remote:?}"
+            );
+        }
+        // The matching file was kept and given the source's times; the
+        // changed one was replaced by a new file.
+        assert_eq!(inode("dst/same"), same, "{remote:?}");
+        assert_ne!(inode("dst/changed"), changed, "{remote:?}");
+        assert_eq!(
+            fs::metadata(t.path("dst/same")).unwrap().mtime(),
+            fs::metadata(t.path("src/same")).unwrap().mtime(),
+            "{remote:?}"
+        );
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["range_requests"], 0, "{remote:?}");
+        assert!(
+            observed["small_batches"].as_u64().unwrap() > 0,
+            "{remote:?}"
+        );
+        assert!(partial_files(&t.path("dst")).is_empty());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_small_destination_that_grows_while_compared_is_replaced_not_kept() {
+    let t = Tmp::new();
+    let contents = vec![b'a'; 64 << 10];
+    write(&t.path("src"), &contents);
+    write(&t.path("dst"), &contents);
+    set_mtime(&t.path("src"), 1_600_000_001);
+    set_mtime(&t.path("dst"), 1_600_000_000);
+    let ready = t.path("compared");
+    let continuation = t.path("continue");
+    let mut child = compat_command()
+        .args([
+            "-a",
+            "--performance-tuning",
+            "workers=1,block-reuse=on",
+            "--no-progress",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_SMALL_COMPARED_READY_FILE", &ready)
+        .env("SYQ_TEST_SMALL_COMPARED_CONTINUE_FILE", &continuation)
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "small-file comparison");
+    OpenOptions::new()
+        .append(true)
+        .open(t.path("dst"))
+        .unwrap()
+        .write_all(b"trailing data")
+        .unwrap();
+    release_confinement_barrier(&continuation);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(read(&t.path("dst")), contents);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[test]
 fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
     for fallback in [false, true] {
         let t = Tmp::new();

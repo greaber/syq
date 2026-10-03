@@ -2881,6 +2881,9 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
+            Request::ReplaceSmallBatch(entries) => {
+                Ok(Response::ReplacedBatch(self.replace_small_batch(entries)))
+            }
             Request::PutSmallBatch(puts) => {
                 let results = self.put_small_batch(puts);
                 if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {

@@ -666,6 +666,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 blocks += puts.len() as u64;
                 bytes += puts.iter().map(|put| put.data.len() as u64).sum::<u64>();
             }
+            Request::ReplaceSmallBatch(entries) => {
+                blocks += entries.len() as u64;
+                bytes += entries
+                    .iter()
+                    .map(|entry| entry.put.data.len() as u64)
+                    .sum::<u64>();
+            }
             _ => {}
         }
         match req {

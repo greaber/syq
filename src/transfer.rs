@@ -2371,6 +2371,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         } else {
                             bwlimit.clone()
                         },
+                        bandwidth_capped: bwlimit.is_some(),
                         gate: gate.clone(),
                         observation: None,
                         benchmark: Default::default(),

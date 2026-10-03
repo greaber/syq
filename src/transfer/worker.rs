@@ -3,6 +3,8 @@ use super::*;
 #[derive(Debug)]
 pub(super) enum SmallPutResult {
     Published(Option<(u64, u64)>),
+    /// The destination already held these contents and was kept.
+    Unchanged(Option<(u64, u64)>),
     SourceChanged(Box<Option<Entry>>),
 }
 
@@ -35,6 +37,9 @@ pub(super) struct Worker {
     pub(super) progress: Arc<Progress>,
     pub(super) opts: Arc<Opts>,
     pub(super) bwlimit: Option<Arc<BandwidthLimit>>,
+    /// The copy has a bandwidth limit, whether this worker or the transport
+    /// paces it.
+    pub(super) bandwidth_capped: bool,
     pub(super) gate: Arc<Gate>,
     pub(super) observation: Option<Arc<crate::transfer_observations::Actor>>,
     pub(super) benchmark: crate::transfer_tuning::BenchmarkStats,
@@ -283,24 +288,29 @@ impl Worker {
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs
                 .destination(idx)
-                .is_none_or(|existing| self.replaces_without_comparison(j, existing))
+                .is_none_or(|existing| self.replaces_in_batch(j, existing))
             && (!self.opts.inplace || j.inplace)
     }
 
-    /// An existing file whose contents this copy would replace without
-    /// reading them can take the same batch as a new file. Comparison, block
-    /// reuse, protected contents, conditional placement and hardlink
-    /// representatives keep the per-file path, which inspects the destination
-    /// before deciding what to write.
-    fn replaces_without_comparison(&self, job: &FileJobData, existing: &Entry) -> bool {
+    /// An existing file can take the same batch as a new file when this copy
+    /// replaces it whole. With block reuse, a file of at most one comparison
+    /// block also does: it shares no block with a changed version, so the
+    /// receiver compares it whole in the batch and keeps it if it already
+    /// matches. Under a bandwidth limit the bytes are what is scarce, so such
+    /// a file is compared before its contents are sent, like a larger one.
+    /// Explicit comparison, protected contents, conditional placement and
+    /// hardlink representatives keep the per-file path too, which inspects
+    /// the destination before deciding what to write.
+    fn replaces_in_batch(&self, job: &FileJobData, existing: &Entry) -> bool {
         let inspects_destination = self.opts.protects_existing_contents()
             || self.opts.checksum
             || self.opts.restricted_receiver
             || (self.opts.hardlinks && job.entry.nlink > 1)
-            || self
+            || (self
                 .opts
                 .tuning
-                .reuse_destination_blocks(self.opts.same_host);
+                .reuse_destination_blocks(self.opts.same_host)
+                && (job.entry.size > self.opts.block || self.bandwidth_capped));
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
             && !inspects_destination
@@ -325,9 +335,29 @@ impl Worker {
         let applied = ok(response, "put small batch").and_then(|response| match response {
             Response::Applied(applied) if applied.len() == sent.len() => Ok(applied
                 .into_iter()
-                .map(|e| e.map_or(Ok(None), Err))
+                .map(|e| e.map_or(Ok(SmallPutResult::Published(None)), Err))
                 .collect::<Vec<_>>()),
-            Response::PublishedBatch(applied) if applied.len() == sent.len() => Ok(applied),
+            Response::PublishedBatch(applied) if applied.len() == sent.len() => Ok(applied
+                .into_iter()
+                .map(|result| result.map(SmallPutResult::Published))
+                .collect()),
+            Response::ReplacedBatch(replaced) if replaced.len() == sent.len() => Ok(replaced
+                .into_iter()
+                .map(|result| {
+                    result.map(
+                        |SmallReplaced {
+                             identity,
+                             unchanged,
+                         }| {
+                            if unchanged {
+                                SmallPutResult::Unchanged(identity)
+                            } else {
+                                SmallPutResult::Published(identity)
+                            }
+                        },
+                    )
+                })
+                .collect()),
             other => bail!("unexpected response {other:?}"),
         });
         let applied = match applied {
@@ -337,13 +367,8 @@ impl Worker {
                 return false;
             }
         };
-        for (&idx, error) in sent.iter().zip(applied) {
-            results[idx] = Some(
-                error
-                    .map(SmallPutResult::Published)
-                    .map_err(endpoint_error)
-                    .context("put"),
-            );
+        for (&idx, result) in sent.iter().zip(applied) {
+            results[idx] = Some(result.map_err(endpoint_error).context("put"));
         }
         true
     }
@@ -422,6 +447,10 @@ impl Worker {
                 source_rtt_us.saturating_mul(16),
             ));
         let adaptive = self.adaptive_batches();
+        let reuse_blocks = self
+            .opts
+            .tuning
+            .reuse_destination_blocks(self.opts.same_host);
         let mut reads =
             std::collections::VecDeque::<(std::ops::Range<usize>, usize, std::time::Instant)>::new(
             );
@@ -573,6 +602,7 @@ impl Worker {
                 }
                 let mut blocks = blocks.into_iter();
                 let mut puts = Vec::new();
+                let mut unchanged_flags = Vec::new();
                 let mut sent = Vec::new();
                 for idx in group {
                     let job = &jobs[idx];
@@ -607,10 +637,26 @@ impl Worker {
                         guard: job.container_guard.clone(),
                         replaces: job.dst_entry.is_some(),
                     });
+                    unchanged_flags.push(self.unchanged_flags(job));
                     sent.push(idx);
                 }
                 if !puts.is_empty() {
-                    if let Err(error) = self.dst.send(Request::PutSmallBatch(puts)) {
+                    // With block reuse, the receiver keeps a replaced file
+                    // whose contents already match instead of rewriting it.
+                    let request = if reuse_blocks && puts.iter().any(|put| put.replaces) {
+                        Request::ReplaceSmallBatch(
+                            puts.into_iter()
+                                .zip(unchanged_flags)
+                                .map(|(put, unchanged_flags)| SmallReplace {
+                                    put,
+                                    unchanged_flags,
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        Request::PutSmallBatch(puts)
+                    };
+                    if let Err(error) = self.dst.send(request) {
                         Self::fail_small_batch(results, sent, &error);
                         return Err(error);
                     }
@@ -799,6 +845,22 @@ impl Worker {
             let result = res.expect("successful read/publication checked above");
             let published = match result {
                 SmallPutResult::Published(identity) => identity,
+                SmallPutResult::Unchanged(identity) => {
+                    // As for a content-identical file on the per-file path:
+                    // its bytes count as unchanged, and it is no transfer.
+                    if let Err(error) = self.record_hardlink_identity(*idx, j, identity) {
+                        self.file_error(*idx, error)?;
+                        continue;
+                    }
+                    j.done.store(j.entry.size, Relaxed);
+                    self.progress
+                        .bytes_unchanged
+                        .fetch_add(j.entry.size, Relaxed);
+                    self.progress.bytes_total.fetch_sub(j.entry.size, Relaxed);
+                    self.progress.files_total.fetch_sub(1, Relaxed);
+                    self.progress.files_unchanged.fetch_add(1, Relaxed);
+                    continue;
+                }
                 SmallPutResult::SourceChanged(now) => {
                     if let (Some(e), true, true) = (
                         *now,
