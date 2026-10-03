@@ -161,6 +161,18 @@ pub(crate) struct Options {
     pub automatic_part_size: bool,
 }
 impl Options {
+    pub fn is_tigris(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .and_then(|s| url::Url::parse(s).ok())
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host == "t3.storage.dev"
+                    || host == "fly.storage.tigris.dev"
+                    || host.ends_with(".tigris.dev")
+            })
+    }
+
     pub fn headers_for<'a>(
         &self,
         method: &str,
