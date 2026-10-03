@@ -161,6 +161,18 @@ pub(crate) struct Options {
     pub automatic_part_size: bool,
 }
 impl Options {
+    pub fn is_tigris(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .and_then(|s| url::Url::parse(s).ok())
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host == "t3.storage.dev"
+                    || host == "fly.storage.tigris.dev"
+                    || host.ends_with(".tigris.dev")
+            })
+    }
+
     pub fn headers_for<'a>(
         &self,
         method: &str,
@@ -225,6 +237,7 @@ impl Options {
         }
         for id in [
             "inplace",
+            "transfer_strategy",
             "via",
             "coordinate_at",
             "rsh",
@@ -291,7 +304,6 @@ impl Options {
             );
         }
         if tuning.comparison_block_size.is_some()
-            || tuning.block_reuse.is_some()
             || tuning.workers.is_some()
             || tuning.request_size.is_some()
             || tuning.pipeline_depth.is_some()

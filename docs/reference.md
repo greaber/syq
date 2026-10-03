@@ -175,6 +175,39 @@ applies to individual selected entries.
 
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
+## Choose a transfer strategy
+
+`--transfer-strategy` chooses how filesystem copies transfer the contents of
+files selected for copying in `syq cp`.
+
+| Strategy | Behavior |
+|---|---|
+| `whole-file` | Copy the selected file without comparing or reusing blocks from the final destination |
+| `aligned-block` | Reuse matching blocks at the same offsets in the corresponding destination file; shifted blocks and blocks from other files are not matched |
+| `locality` (default) | Use `whole-file` for local copies and `aligned-block` when a syq endpoint is remote |
+
+`locality` treats paths on mounted network filesystems as local. It chooses by
+endpoint location, without measuring link or filesystem speed. To choose explicitly:
+
+```sh
+syq cp --srcs-in source --to server --into destination \
+  --transfer-strategy whole-file
+```
+
+All strategies keep size/time skips, explicit `--hash` comparisons, integrity
+checks, and partial-file resume. Changed files use atomic replacement unless
+`--inplace` is selected. The strategy does not fix worker counts or request
+sizes; automatic tuning remains enabled.
+
+`syq rsync` uses rsync's spellings: `-W` / `--whole-file` selects whole-file
+copying; `--no-W` / `--no-whole-file` selects aligned-block reuse. If both are
+specified, the last one wins. Its default is whole-file for local copies and
+aligned-block for remote copies.
+
+S3 and descriptor copies do not accept `--transfer-strategy`. See
+[comparison tuning](tuning.md#compare-block-reuse-with-full-replacement)
+for block size and controlled comparisons.
+
 ## Preview changes
 
 Add `--dry-run -v` to list planned changes without copying or deleting files.
@@ -272,7 +305,7 @@ Rerunning a copy can reuse completed files and matching parts of interrupted
 files. Placement conditions and `--if-exists` apply on every run. A `-new`
 placement or `--if-exists=error` can therefore prevent a retry once entries have
 been created. Partial-file resume is independent of
-[`block-reuse`](tuning.md#compare-block-reuse-with-full-replacement), which controls
+[`--transfer-strategy`](#choose-a-transfer-strategy), which controls
 comparison against an existing final destination. Unless `--inplace` is selected,
 syq assembles each updated file beside the destination and replaces it when
 complete. With `--inplace`, interrupted bytes are in the final file itself.
@@ -280,7 +313,7 @@ With `--if-exists=error-if-different`, a retry rejects a differing final file:
 it cannot distinguish incomplete output from a pre-existing file that must remain
 untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts
-follows the block-reuse policy.
+follows the selected transfer strategy.
 
 A copy may temporarily make a newly created directory writable while filling it.
 After interruption, syq cannot distinguish that directory from a pre-existing

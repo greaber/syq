@@ -20,7 +20,12 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
                 // Leave time for both workers to consume their pre-split ranges.
                 "--bwlimit=64M",
                 "--performance-tuning",
-                &format!("copy-path=ranges,workers=2,block-reuse={reuse}"),
+                "copy-path=ranges,workers=2",
+                if reuse == "aligned-block" {
+                    "--no-whole-file"
+                } else {
+                    "--whole-file"
+                },
                 &t.s("src"),
                 &t.s("dst"),
             ]);
@@ -34,12 +39,12 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
             command.run().unwrap()
         };
         // Prove the fault hook catches the normal comparison path.
-        let failed = run("on");
+        let failed = run("aligned-block");
         assert!(!failed.status.success());
         assert!(stderr_of(&failed).contains("injected block-comparison failure"));
         assert_eq!(read(&t.path("dst")), old);
         fs::remove_file(t.path("workers")).unwrap();
-        let output = run("off");
+        let output = run("whole-file");
         assert_output_ok(&output);
         assert_eq!(read(&t.path("dst")), source);
         assert_eq!(tuning_observed(&output)["range_requests"], 32);
@@ -71,21 +76,24 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
 #[cfg(debug_assertions)]
 #[test]
 fn local_default_and_off_preserve_partial_resume_without_reusing_final() {
-    for reuse in ["auto", "off"] {
+    for whole_file in [false, true] {
         let t = Tmp::new();
         let source = prng(8 << 20, 832);
         write(&t.path("src"), &source);
-        let tuning = format!("copy-path=ranges,block-reuse={reuse},workers=1");
+        let tuning = "copy-path=ranges,workers=1";
         let src = t.s("src");
         let dst = t.s("dst");
-        let args = [
+        let mut args = vec![
             "-a",
             "--syq-no-tcp",
             "--performance-tuning",
-            &tuning,
+            tuning,
             &src,
             &dst,
         ];
+        if whole_file {
+            args.push("--whole-file");
+        }
         let partial = interrupted_partial(&args, &t.0);
         // The partial matches only the first block; the final matches only
         // the second. Only the partial may contribute bytes with reuse off.
@@ -125,7 +133,8 @@ fn off_keeps_quick_checks_and_explicit_checksum_semantics() {
             cmd.args([
                 "-a",
                 "--no-progress",
-                "--performance-tuning=copy-path=ranges,block-reuse=off",
+                "--performance-tuning=copy-path=ranges",
+                "--whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -169,7 +178,8 @@ fn off_remote_update_uses_full_ranges_with_payload_checks() {
             "--rsync-path",
             env!("CARGO_BIN_EXE_syq"),
             "--syq-no-bootstrap",
-            "--performance-tuning=copy-path=ranges,block-reuse=off",
+            "--performance-tuning=copy-path=ranges",
+            "--whole-file",
             "--integrity-checking=transfer=blake3",
             &t.s("src"),
             &format!("fake:{}", t.s("dst")),
@@ -204,7 +214,8 @@ fn off_preserves_expected_hash_failure_and_old_destination() {
         &t.s("src"),
         "--into",
         &t.s(""),
-        "--performance-tuning=copy-path=ranges,block-reuse=off,workers=2",
+        "--performance-tuning=copy-path=ranges,workers=2",
+        "--transfer-strategy=whole-file",
     ]);
     assert!(!output.status.success());
     assert!(stderr_of(&output).contains("hash"), "{output:?}");
@@ -214,7 +225,7 @@ fn off_preserves_expected_hash_failure_and_old_destination() {
 #[test]
 fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
     for inplace in [false, true] {
-        for reuse in [None, Some("auto"), Some("on"), Some("off")] {
+        for reuse in [None, Some("aligned-block"), Some("whole-file")] {
             let t = Tmp::new();
             let source = prng(8 << 20, 836);
             let mut old = source.clone();
@@ -223,15 +234,12 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             write(&t.path("dst"), &old);
             set_mtime(&t.path("dst"), 1);
             // On must reach comparison even without forcing the range path.
-            let mut tuning = if reuse == Some("on") {
+            let tuning = if reuse == Some("aligned-block") {
                 "workers=1"
             } else {
                 "copy-path=ranges,workers=1"
             }
             .to_string();
-            if let Some(reuse) = reuse {
-                tuning.push_str(&format!(",block-reuse={reuse}"));
-            }
             let mut cmd = compat_command();
             cmd.args([
                 "-a",
@@ -242,6 +250,13 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
                 &t.s("dst"),
             ])
             .env("SYQ_DEBUG", "1");
+            if let Some(reuse) = reuse {
+                cmd.arg(if reuse == "aligned-block" {
+                    "--no-whole-file"
+                } else {
+                    "--whole-file"
+                });
+            }
             if inplace {
                 cmd.arg("--inplace");
             }
@@ -250,13 +265,13 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             assert_eq!(read(&t.path("dst")), source);
             assert_eq!(
                 tuning_observed(&out)["range_requests"],
-                if reuse == Some("on") { 1 } else { 2 }
+                if reuse == Some("aligned-block") { 1 } else { 2 }
             );
             assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
-            assert!(stderr_of(&out).contains(if reuse == Some("on") {
-                "(effective on)"
+            assert!(stderr_of(&out).contains(if reuse == Some("aligned-block") {
+                "(block reuse on)"
             } else {
-                "(effective off)"
+                "(block reuse off)"
             }));
             assert!(partial_files(&t.0).is_empty());
         }
@@ -303,7 +318,7 @@ fn remote_defaults_reuse_blocks_for_push_and_pull() {
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), source);
         assert_eq!(tuning_observed(&out)["range_requests"], 1);
-        assert!(stderr_of(&out).contains("block-reuse=auto (effective on)"));
+        assert!(stderr_of(&out).contains("transfer-strategy=locality (block reuse on)"));
     }
 }
 
@@ -328,7 +343,8 @@ fn small_replacements_are_batched_and_files_that_already_match_are_kept() {
                 .args([
                     "-a",
                     "--no-progress",
-                    "--performance-tuning=workers=1,block-reuse=on",
+                    "--performance-tuning=workers=1",
+                    "--no-whole-file",
                     &t.s("src/"),
                     &t.s("dst/"),
                 ])
@@ -401,7 +417,8 @@ fn a_small_destination_that_grows_while_compared_is_replaced_not_kept() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1,block-reuse=on",
+            "workers=1",
+            "--no-whole-file",
             "--no-progress",
             &t.s("src"),
             &t.s("dst"),
@@ -438,7 +455,8 @@ fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
         cmd.args([
             "-a",
             "--syq-no-tcp",
-            "--performance-tuning=workers=1,block-reuse=on",
+            "--performance-tuning=workers=1",
+            "--no-whole-file",
             &t.s("src/"),
             &t.s("dst/"),
         ])
@@ -479,7 +497,8 @@ fn pipeline_restarts_after_mismatch_and_skips_identical_contents() {
             .args([
                 "-a",
                 "--no-progress",
-                "--performance-tuning=block-reuse=on,workers=1",
+                "--performance-tuning=workers=1",
+                "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -525,7 +544,8 @@ fn pipeline_handles_final_mutation_after_staging() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--performance-tuning=block-reuse=on,workers=1",
+            "--performance-tuning=workers=1",
+            "--no-whole-file",
             &t.s("src"),
             &t.s("dst"),
         ])
@@ -559,7 +579,8 @@ fn pipeline_parallel_copy_ranges_read_each_source_byte_once() {
             "-a",
             "--no-progress",
             "--bwlimit=64M",
-            "--performance-tuning=block-reuse=on,workers=2",
+            "--performance-tuning=workers=2",
+            "--no-whole-file",
             &t.s("src"),
             &t.s("dst"),
         ])
@@ -646,7 +667,8 @@ fn pipeline_handles_growing_shrinking_and_empty_files() {
         let output = compat_command()
             .args([
                 "-a",
-                "--performance-tuning=block-reuse=on,workers=1",
+                "--performance-tuning=workers=1",
+                "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -676,7 +698,8 @@ fn pipeline_equality_probe_spans_windows_and_handles_late_difference() {
             .args([
                 "-a",
                 "--no-progress",
-                "--performance-tuning=block-reuse=on,workers=1",
+                "--performance-tuning=workers=1",
+                "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -728,7 +751,7 @@ fn stale_partial_does_not_replace_an_identical_final_with_different_metadata() {
                             env!("CARGO_BIN_EXE_syq"),
                             "--syq-no-bootstrap",
                             "--bwlimit=64M",
-                            "--performance-tuning=block-reuse=on",
+                            "--no-whole-file",
                             &format!("fake:{}", t.s("src")),
                             &t.s("dst"),
                         ],
@@ -738,7 +761,8 @@ fn stale_partial_does_not_replace_an_identical_final_with_different_metadata() {
                     command.args([
                         "-a",
                         "--no-progress",
-                        "--performance-tuning=block-reuse=on,workers=1",
+                        "--performance-tuning=workers=1",
+                        "--no-whole-file",
                         &t.s("src"),
                         &t.s("dst"),
                     ]);

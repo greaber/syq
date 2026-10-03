@@ -78,7 +78,10 @@ fn server_copy_threshold_tracks_single_request_scheduling() {
 #[test]
 fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
     let mut observed = Vec::new();
-    for endpoint in ["https://t3.storage.dev", "https://storage.example"] {
+    for (endpoint, tigris) in [
+        ("https://t3.storage.dev", true),
+        ("https://storage.example", false),
+    ] {
         for extra in [
             "",
             "s3-requests=1",
@@ -90,6 +93,7 @@ fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
                 flags.extend(["--performance-tuning", extra]);
             }
             let engine = planning_engine(&flags);
+            assert_eq!(engine.options.is_tigris(), tigris);
             assert!(!engine.tuning.tigris());
             engine.tuning.observe_control(Duration::from_millis(100));
             let workers = engine.object_workers([32u64 << 30].into_iter()).unwrap();

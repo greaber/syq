@@ -1784,6 +1784,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     let canonical = dir.path().canonicalize().unwrap();
     let prefix = canonical.as_os_str().as_bytes().to_vec();
     let request = SmallCopyRequest {
+        reuse_block_size: Some(4 << 20),
         if_exists: crate::cli::IfExists::Update,
         matching_flags: flags::TIMES,
         hash_policy: Default::default(),
@@ -1900,6 +1901,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
         let (files, contents) = files.into_iter().unzip();
         (
             SmallCopyRequest {
+                reuse_block_size: Some(4 << 20),
                 if_exists: crate::cli::IfExists::Update,
                 matching_flags: flags::TIMES,
                 hash_policy: Default::default(),
@@ -2025,6 +2027,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
 
 fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
     SmallCopyRequest {
+        reuse_block_size: Some(4 << 20),
         if_exists: crate::cli::IfExists::Update,
         matching_flags: flags::TIMES,
         hash_policy: crate::hashing::HashPolicy {
@@ -2057,6 +2060,44 @@ fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
             })
             .collect(),
     }
+}
+
+#[test]
+fn small_copy_declines_multiblock_reuse_before_preparing_any_output() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let prefix = dir.path().as_os_str().as_bytes();
+    fs::write(dir.path().join("existing"), b"old").unwrap();
+    let mut offer = offered_small_copy(prefix, &[b"new", b"existing"]);
+    offer.reuse_block_size = Some(64 << 10);
+    for file in &mut offer.files {
+        file.size = 200 << 10;
+    }
+    let mut operations = FsOps::new();
+    let response = operations.handle(&Request::PrepareSmallFiles(offer.clone()));
+    assert!(
+        matches!(
+            response,
+            Response::SmallFilesCopied(SmallCopyResponse {
+                outcome: SmallCopyOutcome::NeedsBlockReuse,
+                ..
+            })
+        ),
+        "{response:?}"
+    );
+    assert!(operations.destination_root.is_none());
+    assert!(operations.operator_selection.is_none());
+    assert!(operations.prepared_small_copy.is_none());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(fs::read(dir.path().join("existing")).unwrap(), b"old");
+
+    // Declining leaves the same control session usable, and whole-file
+    // replacement can still request the payloads for the entire offer.
+    offer.reuse_block_size = None;
+    let response = operations.handle(&Request::PrepareSmallFiles(offer));
+    assert!(
+        matches!(response, Response::SmallFilesPrepared(ref needed) if needed == &[true, true]),
+        "{response:?}"
+    );
 }
 
 #[test]

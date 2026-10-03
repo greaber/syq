@@ -308,7 +308,7 @@ impl Worker {
             || (self.opts.hardlinks && job.entry.nlink > 1)
             || (self
                 .opts
-                .tuning
+                .transfer_strategy
                 .reuse_destination_blocks(self.opts.same_host)
                 && (job.entry.size > self.opts.block || self.bandwidth_capped));
         existing.kind == Kind::File
@@ -449,7 +449,7 @@ impl Worker {
         let adaptive = self.adaptive_batches();
         let reuse_blocks = self
             .opts
-            .tuning
+            .transfer_strategy
             .reuse_destination_blocks(self.opts.same_host);
         let mut reads =
             std::collections::VecDeque::<(std::ops::Range<usize>, usize, std::time::Instant)>::new(
@@ -1051,7 +1051,7 @@ impl Worker {
         let inplace = job.inplace;
         let reuse_blocks = self
             .opts
-            .tuning
+            .transfer_strategy
             .reuse_destination_blocks(self.opts.same_host);
         let final_file = job
             .dst_entry
@@ -2114,6 +2114,20 @@ impl Worker {
         Ok(slow)
     }
 
+    fn update_range_split(&self, handle: &RangeHandle, request: u64, ceiling: u64) {
+        self.sched.update_range_split(
+            handle,
+            crate::sched::RangeSplit {
+                block: 512,
+                minimum: if request == ceiling {
+                    self.sched.min_split
+                } else {
+                    request.saturating_mul(2).min(self.sched.min_split)
+                },
+            },
+        );
+    }
+
     pub(super) fn transfer_range_pipeline(
         &mut self,
         job: &WorkerJob,
@@ -2123,9 +2137,9 @@ impl Worker {
         read_window: usize,
         write_window: usize,
     ) -> Result<()> {
-        let (idx, mut current) = {
+        let (idx, mut current, inherited_split) = {
             let range = primary.lock().unwrap();
-            (range.idx, (range.pos < range.end).then_some(0))
+            (range.idx, (range.pos < range.end).then_some(0), range.split)
         };
         let mut flights = vec![Some(RangeFlight::new(primary.clone()))];
         let mut pending_reads = std::collections::VecDeque::new();
@@ -2135,11 +2149,15 @@ impl Worker {
             .tuning
             .ordinary_range_limit(self.opts.same_host, block);
         let adaptive = self.opts.adaptive_ranges();
-        let mut budget = self
-            .range_budget
-            .take()
-            .unwrap_or_else(|| WorkBudget::ranges(block, self.batch_budget.latency_target()));
-        let mut slow = primary.lock().unwrap().split.is_some();
+        let mut budget = self.range_budget.take().unwrap_or_else(|| {
+            // Only a new worker needs its donor's hint. An existing worker
+            // keeps its own measurements, which may describe a faster link.
+            let starting_bytes = inherited_split
+                .filter(|_| adaptive)
+                .map(|split| split.minimum / 2);
+            WorkBudget::ranges(block, self.batch_budget.latency_target(), starting_bytes)
+        });
+        let mut slow = inherited_split.is_some();
         let mut refresh_latency = false;
         let mut released = false;
         let result = (|| -> Result<()> {
@@ -2164,11 +2182,23 @@ impl Worker {
                     }
                 }
                 released |= !self.gate.allowed(self.id);
+                if adaptive && !released {
+                    if let Some(slot) = current {
+                        refresh_latency |=
+                            budget.range_latency_check_due(std::time::Instant::now());
+                        if refresh_latency && slow {
+                            // Keep peers informed as replies reveal slower
+                            // service during the drain, before the next read.
+                            self.update_range_split(
+                                &flights[slot].as_ref().expect("readable range").handle,
+                                budget.request_bytes(),
+                                block,
+                            );
+                        }
+                    }
+                }
                 // Check cancellation and optionally claim work with one scheduler
                 // lock, including while the last read replies are draining.
-                if adaptive && current.is_some() {
-                    refresh_latency |= budget.latency_check_due(std::time::Instant::now());
-                }
                 let claim = (!released
                     && !refresh_latency
                     && current.is_none()
@@ -2214,17 +2244,7 @@ impl Worker {
                         block
                     };
                     if adaptive && slow {
-                        self.sched.update_range_split(
-                            &flight.handle,
-                            crate::sched::RangeSplit {
-                                block: 512,
-                                minimum: if request == block {
-                                    self.sched.min_split
-                                } else {
-                                    request.saturating_mul(2).min(self.sched.min_split)
-                                },
-                            },
-                        );
+                        self.update_range_split(&flight.handle, request, block);
                     }
                     let (off, n) = {
                         let mut range = flight.handle.lock().unwrap();

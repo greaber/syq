@@ -27,19 +27,10 @@ impl Tuning {
             upload: options.route == Route::Upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
-            // These measured seeds describe provider request behavior; they do
-            // not change the data route, integrity policy, or explicit overrides.
-            tigris: !options.route.is_server_copy()
-                && options
-                    .endpoint
-                    .as_deref()
-                    .and_then(|s| url::Url::parse(s).ok())
-                    .and_then(|u| u.host_str().map(str::to_owned))
-                    .is_some_and(|host| {
-                        host == "t3.storage.dev"
-                            || host == "fly.storage.tigris.dev"
-                            || host.ends_with(".tigris.dev")
-                    }),
+            // Provider-specific transfer seeds do not change the data route,
+            // integrity policy, or explicit overrides. Server copies use the
+            // same seeds for all providers.
+            tigris: !options.route.is_server_copy() && options.is_tigris(),
             requests: Arc::new(Budget::with_ceiling(
                 args.tuning_options
                     .and_then(|t| t.s3_requests)

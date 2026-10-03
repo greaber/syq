@@ -221,10 +221,12 @@ fn native_comparison_blocks_reuse_only_verified_matching_bytes() {
     write(&t.path("dst"), &original);
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args([
-            "cp", "--if-exists=update",
+            "cp",
+            "--if-exists=update",
             "--hash",
             "--stats",
-            "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges,block-reuse=on",
+            "--performance-tuning=comparison-block-size=64K,request-size=4M,copy-path=ranges",
+            "--transfer-strategy=aligned-block",
             &t.s("src"),
             "--as",
             &t.s("dst"),

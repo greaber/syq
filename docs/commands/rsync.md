@@ -86,6 +86,8 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | Argument / option | Meaning |
 |---|---|
 | `-B, --block-size <SIZE>` | Comparison and reuse block size (64K through 64M)<br><br>[default: 4M] |
+| `-W, --whole-file` | Copy selected files whole; the default for local copies |
+| `--no-whole-file` | Reuse matching blocks at the same offsets in the destination file; the default for remote copies<br><br>[alias: --no-W] |
 | `--performance-tuning <KEY=VALUE,...>` | [Workers, request sizes, and copy methods](../tuning.md) |
 
 ## Resource limits
