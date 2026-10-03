@@ -178,7 +178,7 @@ See [Update policies](commands/cp.md#update-policies) for supported combinations
 ## Choose a transfer strategy
 
 `--transfer-strategy` chooses how filesystem copies transfer the contents of
-files selected for copying. In `syq rsync`, use `--syq-transfer-strategy`.
+files selected for copying in `syq cp`.
 
 | Strategy | Behavior |
 |---|---|
@@ -199,7 +199,12 @@ checks, and partial-file resume. Changed files use atomic replacement unless
 `--inplace` is selected. The strategy does not fix worker counts or request
 sizes; automatic tuning remains enabled.
 
-S3 and descriptor copies do not accept this option. See
+`syq rsync` uses rsync's spellings: `-W` / `--whole-file` selects whole-file
+copying; `--no-W` / `--no-whole-file` selects aligned-block reuse. If both are
+specified, the last one wins. Its default is whole-file for local copies and
+aligned-block for remote copies.
+
+S3 and descriptor copies do not accept `--transfer-strategy`. See
 [comparison tuning](tuning.md#compare-block-reuse-with-full-replacement)
 for block size and controlled comparisons.
 

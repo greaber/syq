@@ -230,7 +230,9 @@ pub(crate) fn filesystem(command: Command) -> Command {
                 }
                 "resource_limits_arg" => "Resource limits",
                 "integrity_checking_arg" | "hash" => "Integrity checking",
-                "performance_tuning" | "block_size" | "transfer_strategy" => "Performance tuning",
+                "performance_tuning" | "block_size" | "whole_file" | "no_whole_file" => {
+                    "Performance tuning"
+                }
                 "auth_from" | "rsh" | "syq_path" | "no_bootstrap" | "no_tcp"
                 | "no_tcp_encryption" | "tcp_ports" | "tcp_congestion" | "pscope" | "compress"
                 | "no_compress" => "SSH and transport",

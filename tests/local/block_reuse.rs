@@ -21,8 +21,11 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
                 "--bwlimit=64M",
                 "--performance-tuning",
                 "copy-path=ranges,workers=2",
-                "--syq-transfer-strategy",
-                reuse,
+                if reuse == "aligned-block" {
+                    "--no-whole-file"
+                } else {
+                    "--whole-file"
+                },
                 &t.s("src"),
                 &t.s("dst"),
             ]);
@@ -73,23 +76,24 @@ fn off_skips_comparison_but_keeps_parallel_ranges() {
 #[cfg(debug_assertions)]
 #[test]
 fn local_default_and_off_preserve_partial_resume_without_reusing_final() {
-    for reuse in ["locality", "whole-file"] {
+    for whole_file in [false, true] {
         let t = Tmp::new();
         let source = prng(8 << 20, 832);
         write(&t.path("src"), &source);
         let tuning = "copy-path=ranges,workers=1";
         let src = t.s("src");
         let dst = t.s("dst");
-        let args = [
+        let mut args = vec![
             "-a",
             "--syq-no-tcp",
             "--performance-tuning",
             tuning,
-            "--syq-transfer-strategy",
-            reuse,
             &src,
             &dst,
         ];
+        if whole_file {
+            args.push("--whole-file");
+        }
         let partial = interrupted_partial(&args, &t.0);
         // The partial matches only the first block; the final matches only
         // the second. Only the partial may contribute bytes with reuse off.
@@ -130,7 +134,7 @@ fn off_keeps_quick_checks_and_explicit_checksum_semantics() {
                 "-a",
                 "--no-progress",
                 "--performance-tuning=copy-path=ranges",
-                "--syq-transfer-strategy=whole-file",
+                "--whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -175,7 +179,7 @@ fn off_remote_update_uses_full_ranges_with_payload_checks() {
             env!("CARGO_BIN_EXE_syq"),
             "--syq-no-bootstrap",
             "--performance-tuning=copy-path=ranges",
-            "--syq-transfer-strategy=whole-file",
+            "--whole-file",
             "--integrity-checking=transfer=blake3",
             &t.s("src"),
             &format!("fake:{}", t.s("dst")),
@@ -221,12 +225,7 @@ fn off_preserves_expected_hash_failure_and_old_destination() {
 #[test]
 fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
     for inplace in [false, true] {
-        for reuse in [
-            None,
-            Some("locality"),
-            Some("aligned-block"),
-            Some("whole-file"),
-        ] {
+        for reuse in [None, Some("aligned-block"), Some("whole-file")] {
             let t = Tmp::new();
             let source = prng(8 << 20, 836);
             let mut old = source.clone();
@@ -252,7 +251,11 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             ])
             .env("SYQ_DEBUG", "1");
             if let Some(reuse) = reuse {
-                cmd.args(["--syq-transfer-strategy", reuse]);
+                cmd.arg(if reuse == "aligned-block" {
+                    "--no-whole-file"
+                } else {
+                    "--whole-file"
+                });
             }
             if inplace {
                 cmd.arg("--inplace");
@@ -336,7 +339,7 @@ fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
             "-a",
             "--syq-no-tcp",
             "--performance-tuning=workers=1",
-            "--syq-transfer-strategy=aligned-block",
+            "--no-whole-file",
             &t.s("src/"),
             &t.s("dst/"),
         ])
@@ -378,7 +381,7 @@ fn pipeline_restarts_after_mismatch_and_skips_identical_contents() {
                 "-a",
                 "--no-progress",
                 "--performance-tuning=workers=1",
-                "--syq-transfer-strategy=aligned-block",
+                "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -425,7 +428,7 @@ fn pipeline_handles_final_mutation_after_staging() {
         .args([
             "-a",
             "--performance-tuning=workers=1",
-            "--syq-transfer-strategy=aligned-block",
+            "--no-whole-file",
             &t.s("src"),
             &t.s("dst"),
         ])
@@ -460,7 +463,7 @@ fn pipeline_parallel_copy_ranges_read_each_source_byte_once() {
             "--no-progress",
             "--bwlimit=64M",
             "--performance-tuning=workers=2",
-            "--syq-transfer-strategy=aligned-block",
+            "--no-whole-file",
             &t.s("src"),
             &t.s("dst"),
         ])
@@ -548,7 +551,7 @@ fn pipeline_handles_growing_shrinking_and_empty_files() {
             .args([
                 "-a",
                 "--performance-tuning=workers=1",
-                "--syq-transfer-strategy=aligned-block",
+                "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -579,7 +582,7 @@ fn pipeline_equality_probe_spans_windows_and_handles_late_difference() {
                 "-a",
                 "--no-progress",
                 "--performance-tuning=workers=1",
-                "--syq-transfer-strategy=aligned-block",
+                "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
             ])
@@ -631,7 +634,7 @@ fn stale_partial_does_not_replace_an_identical_final_with_different_metadata() {
                             env!("CARGO_BIN_EXE_syq"),
                             "--syq-no-bootstrap",
                             "--bwlimit=64M",
-                            "--syq-transfer-strategy=aligned-block",
+                            "--no-whole-file",
                             &format!("fake:{}", t.s("src")),
                             &t.s("dst"),
                         ],
@@ -642,7 +645,7 @@ fn stale_partial_does_not_replace_an_identical_final_with_different_metadata() {
                         "-a",
                         "--no-progress",
                         "--performance-tuning=workers=1",
-                        "--syq-transfer-strategy=aligned-block",
+                        "--no-whole-file",
                         &t.s("src"),
                         &t.s("dst"),
                     ]);

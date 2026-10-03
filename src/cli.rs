@@ -365,9 +365,15 @@ pub struct Args {
     pub block_size: u64,
     #[arg(skip)]
     pub block_size_explicit: bool,
-    /// Syq extension: choose a file transfer strategy (default: locality)
-    #[arg(long = "syq-transfer-strategy", value_enum, value_name = "STRATEGY", long_help = format!("Syq extension: {TRANSFER_STRATEGY_HELP}"))]
+    /// Normalized strategy, shared with native copies.
+    #[arg(skip)]
     pub transfer_strategy: Option<TransferStrategy>,
+    /// Copy selected files whole; the default for local copies
+    #[arg(short = 'W', long, overrides_with_all = ["whole_file", "no_whole_file"])]
+    pub whole_file: bool,
+    /// Reuse matching blocks at the same offsets in the destination file; the default for remote copies
+    #[arg(long, visible_alias = "no-W", overrides_with_all = ["whole_file", "no_whole_file"])]
+    pub no_whole_file: bool,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -776,6 +782,11 @@ impl Args {
     }
 
     fn apply_advanced(&mut self) -> Result<()> {
+        if self.whole_file {
+            self.transfer_strategy = Some(TransferStrategy::WholeFile);
+        } else if self.no_whole_file {
+            self.transfer_strategy = Some(TransferStrategy::AlignedBlock);
+        }
         if !self.performance_tuning.is_empty() {
             self.tuning_options = Some(
                 self.performance_tuning

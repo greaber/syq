@@ -1028,14 +1028,17 @@ fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
                 argv(&["source", "destination"])
             };
             if let Some(strategy) = strategy {
-                command.extend(argv(&[
-                    if native {
-                        "--transfer-strategy"
-                    } else {
-                        "--syq-transfer-strategy"
-                    },
-                    strategy,
-                ]));
+                if native {
+                    command.extend(argv(&["--transfer-strategy", strategy]));
+                } else {
+                    match strategy {
+                        "whole-file" => command.extend(argv(&["--whole-file"])),
+                        "aligned-block" => command.extend(argv(&["--no-whole-file"])),
+                        // The placement rule is implicit in the rsync interface.
+                        "locality" => continue,
+                        _ => unreachable!(),
+                    }
+                }
             }
             let args = if native {
                 parse_native_copy(&command)
@@ -1088,4 +1091,35 @@ fn transfer_strategy_rejects_removed_tuning_key_and_nonfilesystem_controls() {
         let error = parse_native_copy(&argv(&command)).unwrap_err();
         assert!(error.to_string().contains("--transfer-strategy"), "{error}");
     }
+}
+
+#[test]
+fn rsync_whole_file_spellings_follow_last_option_and_keep_native_defaults_separate() {
+    use super::TransferStrategy::{AlignedBlock, WholeFile};
+    for (flags, expected) in [
+        (vec!["-W"], WholeFile),
+        (vec!["--whole-file"], WholeFile),
+        (vec!["--no-W"], AlignedBlock),
+        (vec!["--no-whole-file"], AlignedBlock),
+        (vec!["-aW", "--no-W"], AlignedBlock),
+        (vec!["--no-whole-file", "-aW"], WholeFile),
+        (vec!["-W", "--whole-file"], WholeFile),
+        (vec!["--no-W", "--no-whole-file"], AlignedBlock),
+    ] {
+        let mut command = argv(&flags);
+        command.extend(argv(&["source", "destination"]));
+        let args = Args::parse_rsync(&command).unwrap();
+        assert_eq!(args.transfer_strategy, Some(expected), "{flags:?}");
+        assert!(args.tuning_options.is_none());
+        assert!(args.connections_default);
+    }
+    for flag in [
+        "--transfer-strategy=whole-file",
+        "--syq-transfer-strategy=whole-file",
+    ] {
+        assert!(Args::try_parse_from(["syq rsync", flag, "source", "destination"]).is_err());
+    }
+    assert!(
+        NativeCopyCommand::try_parse_from(["cp", "-W", "source", "--as", "destination"]).is_err()
+    );
 }

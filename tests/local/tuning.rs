@@ -89,63 +89,93 @@ fn small_remote_transfer_strategies_honor_replacement_and_reuse() {
 
 #[test]
 fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
-    for remote in [false, true] {
-        for (strategy, transferred, unchanged) in [
-            ("whole-file", 12 << 20, 0),
-            ("aligned-block", 4 << 20, 8 << 20),
-            (
-                "locality",
-                if remote { 4 << 20 } else { 12 << 20 },
-                if remote { 8 << 20 } else { 0 },
-            ),
-        ] {
-            let t = Tmp::new();
-            let rsh = fake_rsh(&t);
-            t.expose_remote_syq();
-            let data = prng(12 << 20, 482);
-            write(&t.path("source"), &data);
-            set_mtime(&t.path("source"), 1_700_000_001);
-            for hash in [false, true] {
-                let mut previous = data.clone();
-                *previous.last_mut().unwrap() ^= 1;
-                write(&t.path("destination"), &previous);
-                set_mtime(&t.path("destination"), 1_700_000_000);
-                for repeat in [false, true] {
-                    let result = t.path(&format!("result-{hash}-{repeat}.ndjson"));
-                    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-                    command.args(["cp", "--no-progress", "--transfer-strategy", strategy]);
-                    command.arg(t.path("source"));
-                    if remote {
-                        command.args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"]);
-                        command.arg(&rsh);
+    for native in [false, true] {
+        for remote in [false, true] {
+            for (strategy, transferred, unchanged) in [
+                ("whole-file", 12 << 20, 0),
+                ("aligned-block", 4 << 20, 8 << 20),
+                (
+                    "locality",
+                    if remote { 4 << 20 } else { 12 << 20 },
+                    if remote { 8 << 20 } else { 0 },
+                ),
+            ] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                t.expose_remote_syq();
+                let data = prng(12 << 20, 482);
+                write(&t.path("source"), &data);
+                set_mtime(&t.path("source"), 1_700_000_001);
+                for hash in [false, true] {
+                    let mut previous = data.clone();
+                    *previous.last_mut().unwrap() ^= 1;
+                    write(&t.path("destination"), &previous);
+                    set_mtime(&t.path("destination"), 1_700_000_000);
+                    for repeat in [false, true] {
+                        let result = t.path(&format!("result-{hash}-{repeat}.ndjson"));
+                        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                        if native {
+                            command.args(["cp", "--no-progress", "--transfer-strategy", strategy]);
+                            command.arg(t.path("source"));
+                            if remote {
+                                command.args([
+                                    "--to",
+                                    "fake",
+                                    "--no-tcp",
+                                    "--no-bootstrap",
+                                    "--rsh",
+                                ]);
+                                command.arg(&rsh);
+                            }
+                            command.arg("--as").arg(t.path("destination"));
+                        } else {
+                            command.args(["rsync", "-a", "--no-progress"]);
+                            match strategy {
+                                "whole-file" => {
+                                    command.arg("-W");
+                                }
+                                "aligned-block" => {
+                                    command.arg("--no-W");
+                                }
+                                "locality" => {} // rsync's local/remote defaults
+                                _ => unreachable!(),
+                            }
+                            command.arg(t.path("source"));
+                            if remote {
+                                command.args(["--syq-no-tcp", "--syq-no-bootstrap", "--rsh"]);
+                                command.arg(&rsh);
+                                command.arg(format!("fake:{}", t.s("destination")));
+                            } else {
+                                command.arg(t.path("destination"));
+                            }
+                        }
+                        if hash {
+                            command.arg("--hash");
+                        }
+                        let output = command
+                            .arg("--results")
+                            .arg(&result)
+                            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                            .env("XDG_CACHE_HOME", t.path("cache"))
+                            .run()
+                            .unwrap();
+                        assert_output_ok(&output);
+                        assert_eq!(read(&t.path("destination")), data);
+                        let records = fs::read_to_string(&result).unwrap();
+                        let summary: serde_json::Value =
+                            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                        assert_eq!(
+                            summary["bytes_transferred"],
+                            if repeat { 0 } else { transferred },
+                            "native={native} remote={remote} {strategy} hash={hash}: {summary}"
+                        );
+                        assert_eq!(
+                            summary["bytes_unchanged"],
+                            if repeat { 12 << 20 } else { unchanged },
+                            "native={native} remote={remote} {strategy} hash={hash}: {summary}"
+                        );
                     }
-                    command.arg("--as").arg(t.path("destination"));
-                    if hash {
-                        command.arg("--hash");
-                    }
-                    let output = command
-                        .arg("--results")
-                        .arg(&result)
-                        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-                        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-                        .env("XDG_CACHE_HOME", t.path("cache"))
-                        .run()
-                        .unwrap();
-                    assert_output_ok(&output);
-                    assert_eq!(read(&t.path("destination")), data);
-                    let records = fs::read_to_string(&result).unwrap();
-                    let summary: serde_json::Value =
-                        serde_json::from_str(records.lines().last().unwrap()).unwrap();
-                    assert_eq!(
-                        summary["bytes_transferred"],
-                        if repeat { 0 } else { transferred },
-                        "{remote} {strategy} {hash}: {summary}"
-                    );
-                    assert_eq!(
-                        summary["bytes_unchanged"],
-                        if repeat { 12 << 20 } else { unchanged },
-                        "{remote} {strategy} {hash}: {summary}"
-                    );
                 }
             }
         }
