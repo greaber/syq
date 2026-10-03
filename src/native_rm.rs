@@ -739,7 +739,7 @@ pub(crate) fn remove(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        if !dry_run && sampled.elapsed() >= crate::deletion::SAMPLE {
+        if !dry_run && !pool.is_cancelled() && sampled.elapsed() >= crate::deletion::SAMPLE {
             let limit = tuning.observe(completed, sampled.elapsed(), pool.backlogged());
             pool.set_limit(limit);
             spawn_to(limit);
