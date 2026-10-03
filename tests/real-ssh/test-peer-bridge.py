@@ -98,6 +98,8 @@ print(json.dumps(workers))
 ''',
     "copy_processes": r'''
 from pathlib import Path
+import base64
+operand = base64.b64encode(v["destination"].encode()).decode().rstrip("=")
 processes = {}
 for p in Path("/proc").iterdir():
     if not p.name.isdigit():
@@ -109,8 +111,8 @@ for p in Path("/proc").iterdir():
     except (FileNotFoundError, PermissionError, ProcessLookupError):
         pass
 copies = [pid for pid, (args, _, _) in processes.items()
-          if args and Path(args[0]).name == "syq" and "--delegated" in args
-          and v["destination"] in args]
+          if args and Path(args[0]).name == "syq" and "--delegated-operands-b64" in args
+          and operand in args]
 assert len(copies) == 1, "expected one delegated source copy"
 owned = []
 pid = copies[0]
