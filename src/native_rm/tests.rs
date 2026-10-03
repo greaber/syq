@@ -220,6 +220,10 @@ fn failed_attached_emit_cancels_pending_mutation() {
         events: event_tx,
         dry_run: false,
         cancelled: AtomicBool::new(false),
+        limit: AtomicUsize::new(1),
+        active: vec![AtomicBool::new(false)],
+        parked: Mutex::new(()),
+        wake: Condvar::new(),
     });
 
     let mut heartbeat = Vec::new();
@@ -481,6 +485,10 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             events: event_tx,
             dry_run: false,
             cancelled: AtomicBool::new(false),
+            limit: AtomicUsize::new(1),
+            active: vec![AtomicBool::new(false)],
+            parked: Mutex::new(()),
+            wake: Condvar::new(),
         };
         pool.task_done();
         assert!(matches!(

@@ -279,3 +279,6 @@ impl Deleter<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

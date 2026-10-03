@@ -276,7 +276,10 @@ enabled.
 arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
-reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
+reject removal. `performance_tuning="workers=N"` fixes filesystem deletion
+concurrency; `performance_tuning="s3-requests=N"` fixes S3 deletion concurrency.
+Omitting it lets syq tune deletion separately from copying. See
+[Remove files](https://greaber.github.io/syq/remove.html).
 
 S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
 `s3_region`, `s3_profile`, `s3_header`, and `auth_from="@NAME"`. `s3_all_versions=True` permanently

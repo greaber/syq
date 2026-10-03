@@ -87,8 +87,6 @@ requests; selectors still name literal keys and prefixes. For copies,
 discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
 pagination at the original prefix.
 
-<a id="s3-streams"></a>
-
 ## Deletion
 
 `syq rm` and pruning after a copy adjust deletion concurrency using completed
@@ -103,6 +101,8 @@ copies, the S3 request override and ceiling also apply during S3 pruning.
 Filesystem copy-worker settings apply to copying; filesystem pruning tunes its
 own workers. Deletion always finishes children before removing their parent
 directories.
+
+<a id="s3-streams"></a>
 
 ## Remembered connection counts
 
