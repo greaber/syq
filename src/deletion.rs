@@ -10,6 +10,7 @@ pub(crate) struct Concurrency {
     pub initial: usize,
     pub maximum: usize,
     pub automatic: bool,
+    pub startup_doubling: bool,
 }
 
 impl Concurrency {
@@ -19,6 +20,7 @@ impl Concurrency {
                 initial: workers,
                 maximum: workers,
                 automatic: false,
+                startup_doubling: false,
             };
         }
         // Recursive removal pins directory handles in its bounded queue. Leave
@@ -33,6 +35,9 @@ impl Concurrency {
             initial: FILESYSTEM_START.min(maximum),
             maximum,
             automatic: true,
+            // The existing filesystem pool already starts with useful parallelism.
+            // Refine it gradually; doubling briefly hurts contended directories.
+            startup_doubling: false,
         }
     }
 
@@ -48,6 +53,7 @@ impl Concurrency {
             initial: fixed.unwrap_or(10).min(maximum),
             maximum,
             automatic: fixed.is_none(),
+            startup_doubling: true,
         }
     }
 }
@@ -65,7 +71,11 @@ impl Control {
         let mut sampler = Sampler::default();
         sampler.reset();
         Self {
-            policy: Policy::new(concurrency.initial, 1, concurrency.maximum),
+            policy: if concurrency.startup_doubling {
+                Policy::new(concurrency.initial, 1, concurrency.maximum)
+            } else {
+                Policy::refine(concurrency.initial, 1, concurrency.maximum)
+            },
             automatic: concurrency.automatic,
             sampler,
             completed: 0,
@@ -184,6 +194,7 @@ mod tests {
             initial: 4,
             maximum: 64,
             automatic: true,
+            startup_doubling: true,
         });
         let mut highest = 0;
         for _ in 0..120 {
@@ -203,6 +214,7 @@ mod tests {
                 initial: 8,
                 maximum: 64,
                 automatic,
+                startup_doubling: true,
             });
             for _ in 0..100 {
                 assert_eq!(control.observe(1000, Duration::from_secs(1), !automatic), 8);

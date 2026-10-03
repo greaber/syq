@@ -90,6 +90,7 @@ async fn deletion_adapts_to_latency_without_losing_or_duplicating_outcomes() {
                 initial: 10,
                 maximum: 64,
                 automatic,
+                startup_doubling: true,
             },
         };
         let items: Vec<_> = (0..4000).collect();
@@ -138,6 +139,7 @@ async fn cancellation_drains_started_deletions_without_admitting_more() {
             initial: 8,
             maximum: 8,
             automatic: false,
+            startup_doubling: true,
         },
     };
     let checked = AtomicUsize::new(0);
@@ -178,6 +180,7 @@ async fn deletion_backoff_recovers_from_request_contention() {
                 initial: 32,
                 maximum: 128,
                 automatic,
+                startup_doubling: true,
             },
         };
         let started = tokio::time::Instant::now();
