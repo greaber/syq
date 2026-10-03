@@ -1,11 +1,11 @@
 //! Keep a foreground OpenSSH child and its authorization alive together.
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
-use std::io::Read;
-use std::os::fd::AsRawFd;
+use std::io::{IsTerminal, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_millis(20);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(super) struct Signals {
-    pub(super) received: Arc<AtomicUsize>,
+pub(in crate::destination) struct Signals {
+    pub(in crate::destination) received: Arc<AtomicUsize>,
     registrations: Vec<signal_hook::SigId>,
     wake: UnixStream,
 }
 impl Signals {
-    pub(super) fn new() -> std::io::Result<Self> {
+    pub(in crate::destination) fn new() -> std::io::Result<Self> {
         let (wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
         wake.set_nonblocking(true)?;
         let mut guard = Self {
@@ -47,13 +47,24 @@ impl Signals {
         Ok(guard)
     }
 
-    pub(super) fn wait(&self, timeout: Duration) -> std::io::Result<()> {
-        let mut descriptor = libc::pollfd {
-            fd: self.wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout.as_millis() as i32) };
+    pub(in crate::destination) fn wait(&self, timeout: Duration) -> std::io::Result<()> {
+        self.wait_readable(timeout, None)
+    }
+
+    fn wait_readable(&self, timeout: Duration, stderr: Option<RawFd>) -> std::io::Result<()> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout.as_millis() as i32) };
         if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(std::io::Error::last_os_error());
         }
@@ -128,6 +139,66 @@ impl Drop for ForegroundChild<'_> {
 }
 
 pub(super) fn run(command: &mut Command, cancelled: impl Fn() -> bool) -> Result<i32> {
+    run_inner(command, cancelled, None)
+}
+
+pub(super) fn run_cached(command: &mut Command, cancelled: impl Fn() -> bool) -> Result<i32> {
+    let mut stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        return run(command, cancelled);
+    }
+    run_inner(command, cancelled, Some(&mut stderr))
+}
+
+struct StderrRelay(ChildStderr);
+impl StderrRelay {
+    fn new(stderr: ChildStderr) -> std::io::Result<Self> {
+        let flags = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(stderr))
+    }
+
+    fn drain(&mut self, output: &mut dyn Write, mut limit: usize) -> std::io::Result<bool> {
+        let mut buffer = [0; 16 * 1024];
+        while limit != 0 {
+            let count = limit.min(buffer.len());
+            match self.0.read(&mut buffer[..count]) {
+                Ok(0) => return Ok(true),
+                Ok(count) => {
+                    output.write_all(&buffer[..count])?;
+                    limit -= count;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    fn finish(&mut self, output: &mut dyn Write) -> std::io::Result<()> {
+        // A mux master can retain stderr after its client exits, including
+        // after interruption. Flush bytes already queued without waiting for
+        // that independent process to close its descriptor or finish writing.
+        let mut queued: libc::c_int = 0;
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), libc::FIONREAD, &mut queued) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.drain(output, queued.max(0) as usize)?;
+        Ok(())
+    }
+}
+
+fn run_inner(
+    command: &mut Command,
+    cancelled: impl Fn() -> bool,
+    mut stderr: Option<&mut dyn Write>,
+) -> Result<i32> {
     let signals = Signals::new().context("watch SSH session interruption")?;
     if cancelled() {
         bail!("SSH authorization ended before the session started");
@@ -136,8 +207,33 @@ pub(super) fn run(command: &mut Command, cancelled: impl Fn() -> bool) -> Result
     if signal != 0 {
         return Ok(128 + signal);
     }
+    // OpenSSH passes these descriptors to its persistent master. Keep a
+    // redirected caller's stderr private so an interrupted mux session cannot
+    // hold an outer SSH command or pipeline open. Terminal descriptors remain
+    // inherited, preserving OpenSSH's terminal behavior.
+    if stderr.is_some() {
+        command.stderr(Stdio::piped());
+    }
     let mut child = ForegroundChild::spawn(command, &signals).context("start SSH session")?;
-    loop {
+    let mut relay = if stderr.is_some() {
+        child
+            .child
+            .stderr
+            .take()
+            .map(StderrRelay::new)
+            .transpose()?
+    } else {
+        None
+    };
+    let result = (|| loop {
+        if let (Some(pipe), Some(output)) = (&mut relay, &mut stderr) {
+            if pipe
+                .drain(*output, 16 * 1024)
+                .context("forward SSH stderr")?
+            {
+                relay = None;
+            }
+        }
         if let Some(status) = child.poll().context("wait for SSH session")? {
             return Ok(status
                 .code()
@@ -156,8 +252,14 @@ pub(super) fn run(command: &mut Command, cancelled: impl Fn() -> bool) -> Result
         }
         // SIGCHLD wakes completed commands immediately; only return-channel
         // revocation relies on the bounded timeout.
-        signals.wait(POLL).context("wait for SSH session state")?;
+        signals
+            .wait_readable(POLL, relay.as_ref().map(|relay| relay.0.as_raw_fd()))
+            .context("wait for SSH session state")?;
+    })();
+    if let (Some(relay), Some(output)) = (&mut relay, &mut stderr) {
+        relay.finish(*output).context("finish SSH stderr")?;
     }
+    result
 }
 
 #[cfg(test)]
@@ -183,6 +285,54 @@ mod tests {
         assert_eq!(run(&mut command, || false).unwrap(), 23);
         assert_eq!(fs::read(stdout).unwrap(), bytes);
         assert_eq!(fs::read(stderr).unwrap(), b"error");
+    }
+
+    #[test]
+    fn cached_stderr_preserves_large_binary_output_and_exit_status() {
+        let root = crate::test_support::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..1024 * 1024).map(|index| index as u8).collect();
+        fs::write(root.path().join("input"), &bytes).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat input >&2; exit 17"])
+            .current_dir(root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        let mut output = Vec::new();
+        assert_eq!(
+            run_inner(&mut command, || false, Some(&mut output)).unwrap(),
+            17
+        );
+        assert_eq!(output, bytes);
+    }
+
+    #[test]
+    fn cached_stderr_does_not_wait_for_an_independent_writer_after_child_exit() {
+        let root = crate::test_support::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 30 >&2 & echo $! > writer; printf error >&2; exit 17",
+            ])
+            .current_dir(root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        let mut output = Vec::new();
+        let started = Instant::now();
+        let result = run_inner(&mut command, || false, Some(&mut output));
+        let elapsed = started.elapsed();
+        let writer: i32 = fs::read_to_string(root.path().join("writer"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The independent writer models the mux master retaining stderr.
+        // Dispose of it even when one of the assertions below fails.
+        unsafe { libc::kill(writer, libc::SIGKILL) };
+        assert_eq!(result.unwrap(), 17);
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(output, b"error");
     }
 
     #[test]

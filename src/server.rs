@@ -333,17 +333,64 @@ impl Drop for ControlLifetime {
 }
 
 fn file_payload_request(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::WriteRange { .. }
-            | Request::PutSmallBatch(_)
-            | Request::CopySmallFiles(_)
-            | Request::DescriptorCopy(_)
-            | Request::ReadRange { .. }
-            | Request::ReadComparedRange { .. }
-            | Request::ReadSmallBatch(_)
-            | Request::ReadStream(_)
-    )
+    // Keep this exhaustive: every new protocol operation must explicitly
+    // choose whether it can carry file data over the relayed control channel.
+    match request {
+        Request::ReadRange { .. }
+        | Request::ReadSmallBatch(_)
+        | Request::WriteRange { .. }
+        | Request::PutSmallBatch(_)
+        | Request::CopySmallFiles(_)
+        | Request::ReadStream(_)
+        | Request::DescriptorCopy(_)
+        | Request::ReadComparedRange { .. } => true,
+        Request::Hello { .. }
+        | Request::TcpListen { .. }
+        | Request::Scan { .. }
+        | Request::ListDir { .. }
+        | Request::NativeRemove { .. }
+        | Request::StatMany { .. }
+        | Request::CheckOperatorDirectory { .. }
+        | Request::CheckOperatorDirectoryAncestry { .. }
+        | Request::RegisterSourceRoots { .. }
+        | Request::CreateOperatorDirectory { .. }
+        | Request::AnchorDestination { .. }
+        | Request::DestinationFilesystemInfo { .. }
+        | Request::PartialPaths { .. }
+        | Request::Apply { .. }
+        | Request::PlanBatch { .. }
+        | Request::ProbePartial { .. }
+        | Request::Prepare { .. }
+        | Request::HashAndHold { .. }
+        | Request::FinishBasis { .. }
+        | Request::SeedBasis { .. }
+        | Request::CopyLocal { .. }
+        | Request::HashBlocks { .. }
+        | Request::Finalize { .. }
+        | Request::FileHash { .. }
+        | Request::Canonicalize { .. }
+        | Request::TransportStats
+        | Request::Receipt
+        | Request::Shutdown
+        | Request::ListDirDetails { .. }
+        | Request::StopReadStream
+        | Request::WriteStreamFence
+        | Request::ShrinkReadStream { .. }
+        | Request::ListDirNoFollowFinal { .. }
+        | Request::MappingChunk { .. }
+        | Request::PruneLookup { .. }
+        | Request::ConfigureHashing(_)
+        | Request::ValidateDigest { .. }
+        | Request::BindStream(_)
+        | Request::ConfigurePreservation { .. }
+        | Request::DefaultPermissions { .. }
+        | Request::NativeMap(_)
+        | Request::PrepareSmallFiles(_)
+        | Request::StageBasis { .. }
+        | Request::HashWindow { .. }
+        | Request::ReuseComparedRange { .. }
+        | Request::CreateSendBudget { .. } => false,
+    }
 }
 
 /// An authenticated named-destination channel. Worker admission and path

@@ -468,7 +468,9 @@ impl Prepared {
             mapping.map(|mapping| std::thread::spawn(move || input.write_all(&mapping.contents)));
         let output = child.child.stdout.take().unwrap();
         let output = std::thread::spawn(move || receive(output));
-        let status = child.wait_until_exit(None, &|| self.stop_coordinator.load(Ordering::Acquire));
+        let status = child
+            .wait_until_exit(None, &|| self.stop_coordinator.load(Ordering::Acquire))
+            .context("approved peer control connection or copy coordinator ended unexpectedly");
         // Even an unexpected wait error must close stdout before joining its reader.
         drop(child);
         let result = output
@@ -627,21 +629,166 @@ fn coordinator() -> Result<i32> {
     );
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&start.context)?);
-    let status = Command::new("sh")
+    let signals = ssh::foreground::Signals::new().context("watch peer coordinator interruption")?;
+    let output = fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    let mut command = Command::new("sh");
+    command
         .args(["-c", &start.command])
         .env(ENV, encoded)
         .stdin(if start.mapping {
             Stdio::inherit()
         } else {
             Stdio::null()
-        })
-        .status_guarded()?;
-    Ok(status.code().unwrap_or(1))
+        });
+    run_owned_coordinator(&mut command, &output, &signals)
+}
+
+fn run_owned_coordinator(
+    command: &mut Command,
+    output: &impl AsRawFd,
+    signals: &ssh::foreground::Signals,
+) -> Result<i32> {
+    let interrupted = || signals.received.load(Ordering::Acquire) as i32;
+    if interrupted() != 0 {
+        return Ok(128 + interrupted());
+    }
+    // Own the copy shell and its same-group descendants. Normal completion,
+    // SSH channel closure, and HUP/TERM/INT clean up the group before its
+    // leader is reaped. A terminated wrapper must not orphan its copy.
+    let mut child = crate::process_group::ProcessGroup::spawn(command)?;
+    loop {
+        if let Some(status) = child.poll()? {
+            return Ok(status.code().unwrap_or(1));
+        }
+        if interrupted() != 0 {
+            return Ok(128 + interrupted());
+        }
+        // sshd closes its output reader when the requesting channel ends.
+        // Observe that closure without reading stdin: mapping input must
+        // still reach the copy unchanged, and its normal EOF is not a cancel.
+        let mut descriptor = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        } else if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            bail!("requesting SSH channel closed while the peer copy was running");
+        }
+        signals.wait(Duration::from_millis(20))?;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn coordinator_mapping_eof_preserves_binary_input_and_exit_status() {
+        let (input, mut send) = crate::process::with_inheritance_guard(std::io::pipe).unwrap();
+        let (mut receive, output) = crate::process::with_inheritance_guard(std::io::pipe).unwrap();
+        let data = [b'm', 0, 255, b'\n'];
+        send.write_all(&data).unwrap();
+        drop(send);
+        let signals = ssh::foreground::Signals::new().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat; exit 23"])
+            .stdin(input)
+            .stdout(output.try_clone().unwrap());
+        let completed =
+            std::thread::spawn(move || run_owned_coordinator(&mut command, &output, &signals));
+        let mut received = Vec::new();
+        receive.read_to_end(&mut received).unwrap();
+        assert_eq!(completed.join().unwrap().unwrap(), 23);
+        assert_eq!(received, data);
+    }
+
+    fn coordinator_cleanup(interrupt: bool) {
+        let (mut receive, output) = crate::process::with_inheritance_guard(std::io::pipe).unwrap();
+        let signals = ssh::foreground::Signals::new().unwrap();
+        let interrupted = signals.received.clone();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & printf '%s %s\\n' \"$$\" \"$!\"; wait"])
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().unwrap());
+        let (finished, result) = std::sync::mpsc::channel();
+        let completed = std::thread::spawn(move || {
+            let result = run_owned_coordinator(&mut command, &output, &signals);
+            finished.send(result).unwrap();
+        });
+        let mut line = Vec::new();
+        let mut input = forward::DeadlineIo {
+            inner: &mut receive,
+            deadline: Instant::now() + Duration::from_secs(3),
+            cancelled: None,
+        };
+        loop {
+            let mut byte = [0];
+            input.read_exact(&mut byte).unwrap();
+            if byte == [b'\n'] {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        let pids: Vec<i32> = std::str::from_utf8(&line)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2);
+        if interrupt {
+            interrupted.store(libc::SIGHUP as usize, Ordering::Release);
+        } else {
+            drop(receive);
+        }
+        let outcome = result.recv_timeout(Duration::from_secs(3));
+        // A failing regression still wakes the owner and cleans its processes.
+        interrupted.store(libc::SIGTERM as usize, Ordering::Release);
+        completed.join().unwrap();
+        let outcome = outcome.expect("peer coordinator did not react promptly");
+        if interrupt {
+            assert_eq!(outcome.unwrap(), 128 + libc::SIGHUP);
+        } else {
+            assert!(outcome.unwrap_err().to_string().contains("channel closed"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for pid in pids {
+            loop {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    break;
+                }
+                #[cfg(target_os = "linux")]
+                if fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, fields)| fields.starts_with("Z "))
+                }) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "copy process {pid} survived coordinator cleanup"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn coordinator_output_close_kills_copy_and_descendants() {
+        coordinator_cleanup(false);
+    }
+
+    #[test]
+    fn coordinator_interruption_kills_copy_and_descendants() {
+        coordinator_cleanup(true);
+    }
+
     fn args() -> Args {
         crate::approval_command::parse(
             &[

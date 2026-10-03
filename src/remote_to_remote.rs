@@ -1348,6 +1348,9 @@ fn run_remote(
         Some(c @ (1 | 23 | 25)) => Ok(c),
         // These arms build Err values rather than bailing: every failure
         // must pass through the held-terminal settlement below.
+        Some(c) if peer_bridge.is_some() => Err(anyhow::anyhow!(
+            "approved server-to-server copy on {coordinator_host} failed (exit {c}); check the preceding SSH error and reconnect the approved account connection if it closed"
+        )),
         Some(c) => {
             if peer_bridge.is_none()
                 && args.rsh.is_none()
