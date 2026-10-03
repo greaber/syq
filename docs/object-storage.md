@@ -204,8 +204,13 @@ an older version. Preview version deletions with `--dry-run -v`.
 For Tigris endpoints at `t3.storage.dev` or under `tigris.dev`, syq sends
 permanent version deletions individually because Tigris's batch API ignores
 version IDs. Both flags can therefore take longer for large version histories.
-This exception applies only to these two flags. A custom proxy hostname that
-hides Tigris is not detected; use a Tigris endpoint for permanent version deletion.
+This exception applies only to these two flags.
+
+A custom proxy hostname that hides Tigris still uses batches. These requests can
+leave versions intact and add deletion markers that hide current objects; syq
+reports failure. Use a Tigris endpoint for permanent version deletion. To restore
+visibility after a failed attempt, remove the markers it created with
+`--s3-version-id` through a Tigris endpoint.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
 prefix trees and accept a trailing `/`. When deleting an exact directory-marker

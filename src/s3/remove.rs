@@ -24,10 +24,11 @@ pub(crate) struct RemoveFlags {
     pub s3_version_id: Option<String>,
 }
 impl RemoveFlags {
-    fn individual_deletes(&self, tuning: &super::tuning::Tuning, authorized: bool) -> bool {
+    fn individual_deletes(&self, options: &super::Options, authorized: bool) -> bool {
         // Tigris supports version IDs on DeleteObject, but ignores them on
         // DeleteObjects. Ordinary deletion can still use batches there.
-        authorized || (tuning.tigris() && (self.s3_all_versions || self.s3_version_id.is_some()))
+        authorized
+            || ((self.s3_all_versions || self.s3_version_id.is_some()) && options.is_tigris())
     }
 
     pub fn validate(&self, s3: bool, count: usize, kinds: &[SourceSelection]) -> Result<()> {
@@ -459,7 +460,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 client: &client,
                 bucket: &options.bucket,
                 budget: &tuning.requests,
-                individual: args.s3_remove.individual_deletes(&tuning, authorization.is_some()),
+                individual: args.s3_remove.individual_deletes(&options, authorization.is_some()),
             };
             let identify = |entry: &Entry| delete::Target {
                 key: entry.key.clone(),

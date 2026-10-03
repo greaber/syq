@@ -121,7 +121,9 @@ async fn tigris_version_deletion_uses_individual_requests_and_other_deletion_sta
                     client: &client,
                     bucket: "bucket",
                     budget: &tuning.requests,
-                    individual: args.s3_remove.individual_deletes(&tuning, authorized),
+                    individual: args
+                        .s3_remove
+                        .individual_deletes(args.s3.as_ref().unwrap(), authorized),
                 };
                 let mut completed = 0;
                 deleter
