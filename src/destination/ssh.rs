@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 
 pub(super) mod foreground;
 mod master_lifetime;
@@ -19,6 +20,9 @@ struct SshCommand {
     /// Authorization source; omitted uses the saved preference, then an approved account connection or native SSH
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
+    /// Use connections and authorization preferences from this persistence scope
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     /// Request a terminal, including when running a command
     #[arg(short = 't', conflicts_with = "no_tty")]
     tty: bool,
@@ -56,7 +60,7 @@ pub(crate) fn command_for_help() -> clap::Command {
         .mut_arg("no_tty", |arg| arg.hide_short_help(false))
 }
 
-fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>)> {
+fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>, Option<PathBuf>)> {
     let matches = command_for_help().try_get_matches_from(argv)?;
     let parsed = SshCommand::from_arg_matches(&matches)?;
     if parsed.destination.len() > 512 {
@@ -82,12 +86,13 @@ fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>)
             command: parsed.command,
         },
         parsed.auth_from,
+        parsed.pscope,
     ))
 }
 
 /// An explicit receiving name, used for persistent account requests.
 pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
-    let (mut request, mode) = parse_command(argv)?;
+    let (mut request, mode, _) = parse_command(argv)?;
     let Some(AuthFrom::Return(name)) = mode else {
         bail!("SSH authorization requires a receiving machine named @NAME");
     };
@@ -97,7 +102,7 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
 
 /// Validate the displayed command without reading the laptop's preferences.
 pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<SessionRequest> {
-    let (mut request, mode) = parse_command(argv)?;
+    let (mut request, mode, _) = parse_command(argv)?;
     match mode {
         None => {}
         Some(AuthFrom::Return(name)) if name == expected => {}
@@ -108,10 +113,11 @@ pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<Se
 }
 
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
-    let (request, explicit) = parse_command(argv)?;
-    let mode = crate::auth_from::resolve(&request.destination.host, explicit)?;
+    let (request, explicit, scope) = parse_command(argv)?;
+    let domain = crate::persistence::Domain::select(scope.as_deref())?;
+    let mode = crate::auth_from::resolve(&domain, &request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
-    if let Some(mut command) = persistent::command(&request, &mode)? {
+    if let Some(mut command) = persistent::command(&domain, &request, &mode)? {
         return foreground::run_cached(&mut command, || false);
     }
     anyhow::ensure!(
@@ -119,7 +125,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         "laptop account authorization did not produce an SSH connection"
     );
     let mut command = std::process::Command::new("ssh");
-    if let Some(scope) = crate::persistence::scope_for_implicit_ssh(None)? {
+    if let Some(scope) = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())? {
         let control = crate::persistence::prepare_endpoint(
             &scope,
             request.destination.user.as_deref(),
@@ -127,8 +133,13 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
             request.destination.port,
             None,
         )?;
+        let persist = if domain.is_default() {
+            "ControlPersist=yes"
+        } else {
+            "ControlPersist=300"
+        };
         command
-            .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=yes", "-S"])
+            .args(["-o", "ControlMaster=auto", "-o", persist, "-S"])
             .arg(crate::persistence::openssh_control_path(&control));
     }
     command.args(request.ssh_arguments(&request.destination)?);
@@ -240,6 +251,38 @@ mod tests {
             .map(Into::into)
             .collect();
         assert!(parse_for_approval(&mismatch, "laptop").is_err());
+    }
+
+    #[test]
+    fn source_scope_is_local_metadata_and_not_a_remote_approval_dependency() {
+        let argv: Vec<OsString> = [
+            "ssh",
+            "--pscope",
+            "/does/not/exist/on/provider",
+            "--auth-from",
+            "@laptop",
+            "hostB",
+            "--",
+            "exit 17",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let (request, _, scope) = parse_command(&argv).unwrap();
+        assert_eq!(
+            scope.as_deref(),
+            Some(std::path::Path::new("/does/not/exist/on/provider"))
+        );
+        let approved = parse_for_approval(&argv, "laptop").unwrap();
+        assert_eq!(approved.destination, request.destination);
+        assert_eq!(
+            approved.ssh_arguments(&approved.destination).unwrap(),
+            [
+                OsString::from("--"),
+                OsString::from("hostB"),
+                OsString::from("exit 17")
+            ]
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! A reusable approved SSH login, owned by a keeper while its laptop is connected.
 use super::{foreground, SessionRequest, Tty};
 use crate::cli::{AuthFrom, NativeEndpoint};
+use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+mod cleanup;
+pub(crate) use cleanup::cleanup_domain;
+
 const INTERNAL: &str = "--approved-ssh-master";
 const POLL: Duration = Duration::from_millis(100);
 const GENERATION: &str = "account-generation";
@@ -26,6 +30,10 @@ struct Startup {
     authorizer: String,
     requested: NativeEndpoint,
     generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_identity: Option<(u64, u64)>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,18 +45,32 @@ struct Record {
     control: PathBuf,
 }
 
-fn directory() -> Result<PathBuf> {
-    let parent = crate::persistence::ensure_runtime_parent()?;
-    let path = parent.join("authorized-ssh-v1");
+fn master_parent(domain: &Domain) -> PathBuf {
+    if domain.is_default() {
+        crate::persistence::runtime_parent_path()
+    } else {
+        domain.runtime_path()
+    }
+}
+fn ensure_master_parent(domain: &Domain) -> Result<PathBuf> {
+    if domain.is_default() {
+        crate::persistence::ensure_runtime_parent()
+    } else {
+        domain.ensure_runtime()
+    }
+}
+fn directory(domain: &Domain) -> Result<PathBuf> {
+    ensure_master_parent(domain)?;
+    let path = domain.approved_index_path();
     match fs::DirBuilder::new().mode(0o700).create(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    existing_directory()?.context("SSH authority directory disappeared")
+    existing_directory(domain)?.context("SSH authority directory disappeared")
 }
-fn existing_directory() -> Result<Option<PathBuf>> {
-    let path = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+fn existing_directory(domain: &Domain) -> Result<Option<PathBuf>> {
+    let path = domain.approved_index_path();
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -91,13 +113,11 @@ fn read_generation(path: &Path) -> Result<Option<String>> {
     );
     Ok(Some(generation))
 }
-fn generation_path() -> PathBuf {
-    crate::persistence::runtime_parent_path()
-        .join("authorized-ssh-v1")
-        .join(GENERATION)
+fn generation_path(domain: &Domain) -> PathBuf {
+    domain.approved_index_path().join(GENERATION)
 }
-fn ensure_generation() -> Result<String> {
-    ensure_generation_at(&directory()?)
+fn ensure_generation(domain: &Domain) -> Result<String> {
+    ensure_generation_at(&directory(domain)?)
 }
 fn ensure_generation_at(directory: &Path) -> Result<String> {
     let path = directory.join(GENERATION);
@@ -117,14 +137,25 @@ fn ensure_generation_at(directory: &Path) -> Result<String> {
         Err(error) => Err(error.error.into()),
     }
 }
-fn generation_open(generation: &str) -> Result<bool> {
-    Ok(read_generation(&generation_path())?.as_deref() == Some(generation))
+fn generation_open(domain: &Domain, generation: &str) -> Result<bool> {
+    if !domain.is_default() && !domain.enabled()? {
+        return Ok(false);
+    }
+    Ok(read_generation(&generation_path(domain))?.as_deref() == Some(generation))
+}
+fn startup_open(domain: &Domain, startup: &Startup) -> Result<bool> {
+    if let Some(identity) = startup.scope_identity {
+        if !domain.is_current(identity) {
+            return Ok(false);
+        }
+    }
+    generation_open(domain, &startup.generation)
 }
 
-fn index_path(authorizer: &str, destination: &NativeEndpoint) -> Result<PathBuf> {
+fn index_path(domain: &Domain, authorizer: &str, destination: &NativeEndpoint) -> Result<PathBuf> {
     let identity = serde_json::to_vec(&(authorizer, destination))?;
-    Ok(crate::persistence::runtime_parent_path()
-        .join("authorized-ssh-v1")
+    Ok(domain
+        .approved_index_path()
         .join(format!("{}.json", blake3::hash(&identity).to_hex())))
 }
 fn read_record(path: &Path) -> Result<Option<Record>> {
@@ -181,12 +212,12 @@ fn master_command(record: &Record) -> Command {
     command.args(master_options(record));
     command
 }
-fn validate_record(record: &Record) -> Result<()> {
+fn validate_record(domain: &Domain, record: &Record) -> Result<()> {
     let scope = record
         .control
         .parent()
         .context("SSH authority control path has no scope")?;
-    if scope.parent() != Some(crate::persistence::runtime_parent_path().as_path())
+    if scope.parent() != Some(master_parent(domain).as_path())
         || !scope
             .file_name()
             .and_then(|name| name.to_str())
@@ -238,30 +269,34 @@ fn read_peer(record: &Record) -> Result<super::super::forward::ssh::Peer> {
     Ok(peer)
 }
 
-pub(crate) fn cached(authorizer: &str, requested: &NativeEndpoint) -> Result<Option<Cached>> {
-    if existing_directory()?.is_none() {
+pub(crate) fn cached(
+    domain: &Domain,
+    authorizer: &str,
+    requested: &NativeEndpoint,
+) -> Result<Option<Cached>> {
+    if existing_directory(domain)?.is_none() {
         return Ok(None);
     }
-    let Some(record) = read_record(&index_path(authorizer, requested)?)? else {
+    let Some(record) = read_record(&index_path(domain, authorizer, requested)?)? else {
         return Ok(None);
     };
     if record.authorizer != authorizer || record.requested != *requested {
         bail!("SSH authority record does not match the requested login");
     }
-    active_record(record)
+    active_record(domain, record)
 }
 
-fn active_record(record: Record) -> Result<Option<Cached>> {
+fn active_record(domain: &Domain, record: Record) -> Result<Option<Cached>> {
     // A crashed keeper can leave an expired index. Never reconnect through it.
     if !record.control.exists() {
         return Ok(None);
     }
-    validate_record(&record)?;
+    validate_record(domain, &record)?;
     // Older v1 records have no sidecar and retain their original keeper rules.
-    if let Some(generation) = read_generation(&record.control.with_extension("generation"))? {
-        if !generation_open(&generation)? {
-            return Ok(None);
-        }
+    match read_generation(&record.control.with_extension("generation"))? {
+        Some(generation) if !generation_open(domain, &generation)? => return Ok(None),
+        None if !domain.is_default() => return Ok(None),
+        _ => {}
     }
     if record
         .control
@@ -279,13 +314,17 @@ fn active_record(record: Record) -> Result<Option<Cached>> {
 /// Reuse existing account authority before opening another connection. An
 /// explicit authorizer never selects another laptop's approval; native-only
 /// mode never consults the authority index. Automatic selection must be unique.
-pub(crate) fn select_cached(requested: &NativeEndpoint, mode: &AuthFrom) -> Result<Option<Cached>> {
+pub(crate) fn select_cached(
+    domain: &Domain,
+    requested: &NativeEndpoint,
+    mode: &AuthFrom,
+) -> Result<Option<Cached>> {
     match mode {
         AuthFrom::Ssh => return Ok(None),
-        AuthFrom::Return(authorizer) => return cached(authorizer, requested),
+        AuthFrom::Return(authorizer) => return cached(domain, authorizer, requested),
         AuthFrom::Auto => {}
     }
-    let mut matches = match automatic_matches(requested) {
+    let mut matches = match automatic_matches(domain, requested) {
         Ok(matches) => matches,
         Err(error) => {
             // This is optional cached authority. Discard the entire scan on
@@ -303,11 +342,12 @@ pub(crate) fn select_cached(requested: &NativeEndpoint, mode: &AuthFrom) -> Resu
 /// Actual operations may establish account authority. Completion and config
 /// export call select_cached instead and can never cause an approval prompt.
 pub(crate) fn select_or_connect(
+    domain: &Domain,
     requested: &NativeEndpoint,
     mode: &AuthFrom,
 ) -> Result<Option<Cached>> {
     super::super::handoff::validate_account_selection(mode)?;
-    if let Some(cached) = select_cached(requested, mode)? {
+    if let Some(cached) = select_cached(domain, requested, mode)? {
         return Ok(Some(cached));
     }
     let AuthFrom::Return(authorizer) = mode else {
@@ -319,20 +359,20 @@ pub(crate) fn select_or_connect(
         tty: Tty::Disabled,
         command: Vec::new(),
     };
-    start(request)?;
-    cached(authorizer, requested)?
+    start(domain, request)?;
+    cached(domain, authorizer, requested)?
         .context("approved SSH account connection ended before use")
         .map(Some)
 }
 
-fn automatic_matches(requested: &NativeEndpoint) -> Result<Vec<Cached>> {
-    let index = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+fn automatic_matches(domain: &Domain, requested: &NativeEndpoint) -> Result<Vec<Cached>> {
+    let index = domain.approved_index_path();
     let mut matches = Vec::new();
     if !index.exists() {
         return Ok(matches);
     }
     // Validate the existing directory before looking at any of its records.
-    let Some(index) = existing_directory()? else {
+    let Some(index) = existing_directory(domain)? else {
         return Ok(matches);
     };
     for entry in fs::read_dir(index)? {
@@ -346,7 +386,7 @@ fn automatic_matches(requested: &NativeEndpoint) -> Result<Vec<Cached>> {
         if record.requested != *requested {
             continue;
         }
-        if let Some(active) = active_record(record)? {
+        if let Some(active) = active_record(domain, record)? {
             matches.push(active);
         }
     }
@@ -361,14 +401,13 @@ pub(crate) struct Status {
     control: PathBuf,
     connected: bool,
 }
-pub(crate) fn status() -> Result<Vec<Status>> {
-    if !crate::persistence::runtime_parent_path()
-        .join("authorized-ssh-v1")
-        .exists()
-    {
+pub(crate) fn status(domain: &Domain) -> Result<Vec<Status>> {
+    if !domain.approved_index_path().exists() {
         return Ok(Vec::new());
     }
-    let directory = directory()?;
+    let Some(directory) = existing_directory(domain)? else {
+        return Ok(Vec::new());
+    };
     let mut rows = Vec::new();
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
@@ -381,7 +420,7 @@ pub(crate) fn status() -> Result<Vec<Status>> {
         if !record.control.exists() {
             continue;
         }
-        validate_record(&record)?;
+        validate_record(domain, &record)?;
         let connected = live(&record);
         rows.push(Status {
             authorizer: record.authorizer,
@@ -407,12 +446,14 @@ pub(crate) fn print_status(rows: &[Status]) {
         );
     }
 }
-pub(crate) fn stop_all() -> Result<()> {
-    let index = crate::persistence::runtime_parent_path().join("authorized-ssh-v1");
+pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
+    let index = domain.approved_index_path();
     if !index.exists() {
         return Ok(());
     }
-    let index = directory()?;
+    let Some(index) = existing_directory(domain)? else {
+        return Ok(());
+    };
     let mut errors = Vec::new();
     // Invalidates both live keepers and approval requests that have not yet
     // published a control socket. A later operation gets a fresh generation.
@@ -434,7 +475,7 @@ pub(crate) fn stop_all() -> Result<()> {
             if !record.control.exists() {
                 return Ok(());
             }
-            validate_record(&record)?;
+            validate_record(domain, &record)?;
             // Mark each scope before asking native SSH to close. Other entries
             // are still attempted if this record or process fails.
             let closing = record
@@ -450,18 +491,7 @@ pub(crate) fn stop_all() -> Result<()> {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(closing)?;
             controls.push(record.control.clone());
-            let status = master_command(&record)
-                .args(["-O", "exit", "--", &record.endpoint.host])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status_guarded()?;
-            // A keeper may already have reacted to generation cancellation.
-            anyhow::ensure!(
-                status.success() || !record.control.exists(),
-                "SSH account connection {} refused shutdown ({status})",
-                record.endpoint.host
-            );
+            close_master(&record)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -489,6 +519,11 @@ pub(crate) fn stop_all() -> Result<()> {
         }
         std::thread::sleep(POLL);
     }
+    if !domain.is_default() {
+        if let Err(error) = cleanup::wait_for_keepers(domain) {
+            errors.push(format!("{error:#}"));
+        }
+    }
     anyhow::ensure!(
         errors.is_empty(),
         "could not close every approved SSH account connection: {}",
@@ -507,8 +542,12 @@ fn live(record: &Record) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-pub(super) fn command(request: &SessionRequest, mode: &AuthFrom) -> Result<Option<Command>> {
-    let Some(cached) = select_or_connect(&request.destination, mode)? else {
+pub(super) fn command(
+    domain: &Domain,
+    request: &SessionRequest,
+    mode: &AuthFrom,
+) -> Result<Option<Command>> {
+    let Some(cached) = select_or_connect(domain, &request.destination, mode)? else {
         return Ok(None);
     };
     let mut command = Command::new("ssh");
@@ -528,10 +567,14 @@ impl Drop for Starting {
     }
 }
 
-pub(crate) fn connect(request: SessionRequest) -> Result<()> {
+pub(crate) fn connect(domain: &Domain, request: SessionRequest) -> Result<()> {
     let authorizer = request.authorizer.clone();
-    let cached = select_or_connect(&request.destination, &AuthFrom::Return(authorizer.clone()))?
-        .context("SSH account connection missing after approval")?;
+    let cached = select_or_connect(
+        domain,
+        &request.destination,
+        &AuthFrom::Return(authorizer.clone()),
+    )?
+    .context("SSH account connection missing after approval")?;
     crate::output::human_stdout!(
         "{} ready through @{}; account access remains available while the laptop is connected\nSSH control socket: {}",
         cached.endpoint().host, authorizer, cached.control().display()
@@ -581,13 +624,19 @@ fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn start(request: SessionRequest) -> Result<()> {
+fn start(domain: &Domain, request: SessionRequest) -> Result<()> {
     super::super::ssh_auth::prepare_account(&request)?;
     let startup = Startup {
         command: crate::approval_command::current()?,
         authorizer: request.authorizer,
         requested: request.destination,
-        generation: ensure_generation()?,
+        generation: ensure_generation(domain)?,
+        scope: domain.explicit_path().map(Path::to_path_buf),
+        scope_identity: if domain.is_default() {
+            None
+        } else {
+            Some(domain.identity()?)
+        },
     };
     let signals = foreground::Signals::new()?;
     let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
@@ -655,6 +704,11 @@ impl Drop for Index {
 }
 
 fn keeper(startup: Startup) -> Result<()> {
+    let domain = Domain::select(startup.scope.as_deref())?;
+    anyhow::ensure!(
+        domain.is_default() == startup.scope_identity.is_none(),
+        "SSH account startup is missing its persistence scope identity"
+    );
     let request = SessionRequest {
         authorizer: startup.authorizer.clone(),
         destination: startup.requested.clone(),
@@ -662,10 +716,10 @@ fn keeper(startup: Startup) -> Result<()> {
         command: Vec::new(),
     };
     super::validate_endpoint(&request.destination)?;
-    if !generation_open(&startup.generation)? {
+    if !startup_open(&domain, &startup)? {
         bail!("SSH account setup was cancelled before startup");
     }
-    let path = index_path(&request.authorizer, &request.destination)?;
+    let path = index_path(&domain, &request.authorizer, &request.destination)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -684,10 +738,10 @@ fn keeper(startup: Startup) -> Result<()> {
     let signals = foreground::Signals::new()?;
     let deadline = Instant::now() + Duration::from_secs(330);
     loop {
-        if !generation_open(&startup.generation)? || signals.received.load(Ordering::Acquire) != 0 {
+        if !startup_open(&domain, &startup)? || signals.received.load(Ordering::Acquire) != 0 {
             bail!("SSH account setup cancelled while waiting for another request");
         }
-        if let Some(cached) = cached(&request.authorizer, &request.destination)? {
+        if let Some(cached) = cached(&domain, &request.authorizer, &request.destination)? {
             return super::super::write_message(
                 &mut std::io::stdout(),
                 &Ok::<_, String>(cached.endpoint().host.clone()),
@@ -720,7 +774,7 @@ fn keeper(startup: Startup) -> Result<()> {
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
     let session = loop {
-        if signals.received.load(Ordering::Acquire) != 0 || !generation_open(&startup.generation)? {
+        if signals.received.load(Ordering::Acquire) != 0 || !startup_open(&domain, &startup)? {
             bail!("persistent SSH setup cancelled before approval");
         }
         match receiver.recv_timeout(POLL) {
@@ -738,7 +792,7 @@ fn keeper(startup: Startup) -> Result<()> {
     // Keep released endpoint records byte-compatible and separate from native masters.
     let scope = tempfile::Builder::new()
         .prefix("approved-")
-        .tempdir_in(crate::persistence::ensure_runtime_parent()?)?;
+        .tempdir_in(ensure_master_parent(&domain)?)?;
     crate::persistence::initialize_scope(scope.path())?;
     let endpoint = session.endpoint();
     let control = crate::persistence::prepare_endpoint(
@@ -761,10 +815,15 @@ fn keeper(startup: Startup) -> Result<()> {
             master.arg(option);
         }
     }
+    let persist = if domain.is_default() {
+        "ControlPersist=no"
+    } else {
+        "ControlPersist=300"
+    };
     master
         .args(["-M", "-N", "-S"])
         .arg(crate::persistence::openssh_control_path(&control))
-        .args(["-o", "ControlPersist=no"])
+        .args(["-o", persist])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -775,8 +834,6 @@ fn keeper(startup: Startup) -> Result<()> {
         command: Vec::new(),
     };
     master.args(connect_request.ssh_arguments(endpoint)?);
-    let _lifetime = super::master_lifetime::attach(&mut master)?;
-    let mut master = foreground::ForegroundChild::spawn(&mut master, &signals)?;
     let record = Record {
         version: 1,
         authorizer: request.authorizer,
@@ -784,18 +841,33 @@ fn keeper(startup: Startup) -> Result<()> {
         endpoint: endpoint.clone(),
         control,
     };
+    // Default account masters keep their existing foreground PTY ownership.
+    // Scoped masters use OpenSSH's native active-channel-aware idle timer;
+    // ControlPersist forks after authentication, so cleanup uses its socket.
+    let _lifetime = if domain.is_default() {
+        Some(super::master_lifetime::attach(&mut master)?)
+    } else {
+        None
+    };
+    let mut daemon = (!domain.is_default()).then(|| DaemonMaster {
+        record: &record,
+        active: true,
+    });
+    let mut master = foreground::ForegroundChild::spawn(&mut master, &signals)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if signals.received.load(Ordering::Acquire) != 0
             || session.cancelled()
-            || !generation_open(&startup.generation)?
+            || !startup_open(&domain, &startup)?
         {
             bail!("persistent SSH authorization ended during connection setup");
         }
         if let Some(status) = master.poll()? {
-            bail!("persistent SSH client exited before readiness ({status})");
+            if domain.is_default() || !status.success() {
+                bail!("persistent SSH client exited before readiness ({status})");
+            }
         }
-        if live(&record) {
+        if record.control.exists() && live(&record) {
             break;
         }
         if Instant::now() >= deadline {
@@ -844,10 +916,27 @@ fn keeper(startup: Startup) -> Result<()> {
                 .context("detach persistent SSH startup channel");
         }
     }
-    while master.poll()?.is_none() {
+    loop {
+        if domain.is_default() {
+            if master.poll()?.is_some() {
+                break;
+            }
+        } else {
+            if let Some(status) = master.poll()? {
+                anyhow::ensure!(
+                    status.success(),
+                    "persistent SSH launcher exited ({status})"
+                );
+            }
+            // Polling with -O check would itself create mux channels and reset
+            // OpenSSH's idle timer. Normal exit unlinks the control socket.
+            if !record.control.exists() {
+                break;
+            }
+        }
         if signals.received.load(Ordering::Acquire) != 0
             || session.cancelled()
-            || !generation_open(&startup.generation)?
+            || !startup_open(&domain, &startup)?
             || scope.path().join(crate::receive_service::CLOSING).exists()
         {
             break;
@@ -855,6 +944,90 @@ fn keeper(startup: Startup) -> Result<()> {
         signals.wait(POLL)?;
     }
     master.stop(libc::SIGTERM)?;
+    if let Some(daemon) = &mut daemon {
+        daemon.stop()?;
+    }
+    Ok(())
+}
+
+/// An explicit-domain master daemonizes so OpenSSH can count idle channels.
+/// Graceful keeper exit closes it; a killed keeper has the same native idle
+/// expiry as other explicit-domain SSH masters.
+struct DaemonMaster<'a> {
+    record: &'a Record,
+    active: bool,
+}
+impl DaemonMaster<'_> {
+    fn stop(&mut self) -> Result<()> {
+        if self.active {
+            close_master(self.record)?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for DaemonMaster<'_> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn close_master(record: &Record) -> Result<()> {
+    if !record.control.exists() {
+        return Ok(());
+    }
+    use std::os::unix::fs::FileTypeExt as _;
+    let metadata = match record.control.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
+        "SSH account control path is not an owned socket"
+    );
+    let mut child = master_command(record)
+        .args(["-O", "exit", "--", &record.endpoint.host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn_guarded()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() && record.control.exists() {
+                anyhow::ensure!(
+                    !live(record),
+                    "SSH account connection {} refused shutdown ({status})",
+                    record.endpoint.host
+                );
+                match fs::remove_file(&record.control) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "SSH account connection {} shutdown timed out",
+                record.endpoint.host
+            );
+        }
+        std::thread::sleep(POLL);
+    }
+    while record.control.exists() {
+        if Instant::now() >= deadline {
+            bail!(
+                "SSH account connection {} did not close within 5 seconds",
+                record.endpoint.host
+            );
+        }
+        std::thread::sleep(POLL);
+    }
     Ok(())
 }
 
@@ -877,6 +1050,9 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
         Ok(0)
     })())
 }
+
+#[cfg(test)]
+mod scope_tests;
 
 #[cfg(test)]
 mod tests {
