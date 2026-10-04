@@ -603,6 +603,69 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
     assert!(partial_files(&t.0).is_empty());
 }
 
+/// A copy of `src` into the existing `dst` whose first worker needs no new
+/// login: over TCP data, or over SSH data as a channel on the copy's own
+/// connection. Both ends create their private directories in `temporary`,
+/// which is short enough for the sockets inside them.
+#[cfg(debug_assertions)]
+fn existing_destination_copy(t: &Tmp, tcp: bool, temporary: &Path) -> Command {
+    let mut command = if tcp {
+        let mut command = compat_command();
+        command
+            .arg("-e")
+            .arg(fake_rsh(t))
+            .arg("--rsync-path")
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "--syq-tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "-a",
+                "--no-progress",
+            ])
+            .arg(format!("{}/", t.s("src")))
+            .arg(format!("127.0.0.1:{}/", t.s("dst")));
+        command
+    } else {
+        let ssh = fake_ssh(t);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp"])
+            .args(["-q", "--copy-metadata=permissions", "--srcs-in"])
+            .arg(t.path("src"))
+            .args(["--to", "fake.example", "--into"])
+            .arg(t.path("dst"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            );
+        command
+    };
+    command
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("TMPDIR", temporary);
+    command
+}
+
+/// Files a, b and c in both `src` and `dst`, with b changed when `changed`.
+#[cfg(debug_assertions)]
+fn existing_destination_tree(t: &Tmp, changed: bool) {
+    for name in ["a", "b", "c"] {
+        for side in ["src", "dst"] {
+            let path = t.path(&format!("{side}/{name}"));
+            write(&path, name.as_bytes());
+            set_mtime(&path, 1_600_000_000);
+        }
+    }
+    if changed {
+        write(&t.path("src/b"), b"changed");
+        set_mtime(&t.path("src/b"), 1_600_000_000);
+    }
+}
+
 /// For an existing destination, the worker that connects during planning
 /// waits until planning queues a file to send, so an unchanged copy opens no
 /// worker connection. No copy leaves private temporary directories behind.
@@ -612,63 +675,12 @@ fn an_early_worker_connects_only_for_a_file_to_send() {
     for (tcp, changed) in [(true, false), (true, true), (false, false), (false, true)] {
         let case = format!("tcp={tcp} changed={changed}");
         let t = Tmp::new();
-        for name in ["a", "b", "c"] {
-            for side in ["src", "dst"] {
-                let path = t.path(&format!("{side}/{name}"));
-                write(&path, name.as_bytes());
-                set_mtime(&path, 1_600_000_000);
-            }
-        }
-        if changed {
-            write(&t.path("src/b"), b"changed");
-            set_mtime(&t.path("src/b"), 1_600_000_000);
-        }
-        // Both ends create their private directories here. It is short
-        // enough for the sockets inside them.
+        existing_destination_tree(&t, changed);
         let temporary = t.runtime();
         fs::create_dir(&temporary).unwrap();
-        let mut command = if tcp {
-            let mut command = compat_command();
-            command
-                .arg("-e")
-                .arg(fake_rsh(&t))
-                .arg("--rsync-path")
-                .arg(env!("CARGO_BIN_EXE_syq"))
-                .args([
-                    "--syq-tcp-ports",
-                    EPHEMERAL_TCP_PORTS,
-                    "-a",
-                    "--no-progress",
-                ])
-                .arg(format!("{}/", t.s("src")))
-                .arg(format!("127.0.0.1:{}/", t.s("dst")));
-            command
-        } else {
-            // Over SSH, the first worker is a channel on the copy's own
-            // connection, so it too connects early.
-            let ssh = fake_ssh(&t);
-            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-            command
-                .args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp"])
-                .args(["-q", "--srcs-in"])
-                .arg(t.path("src"))
-                .args(["--to", "fake.example", "--into"])
-                .arg(t.path("dst"))
-                .env(
-                    "PATH",
-                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
-                );
-            command
-        };
         let started = t.path("worker-started");
         let events = t.path("worker-events");
-        let out = command
-            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-            .env("FAKE_RSH_LOG", t.path("rsh.log"))
-            .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_CACHE_HOME", t.path("cache"))
-            .env("TMPDIR", &temporary)
+        let out = existing_destination_copy(&t, tcp, &temporary)
             .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
             .env("SYQ_TEST_WORKER_EVENTS", &events)
             .run()
@@ -697,6 +709,51 @@ fn an_early_worker_connects_only_for_a_file_to_send() {
             left = leftovers();
         }
         assert!(left.is_empty(), "{case}: left {left:?}: {out:?}");
+    }
+}
+
+/// The early worker connects while planning goes on. Planning queues the
+/// changed b, then repairs c's permissions itself; the repair waits here
+/// until the worker has connected.
+#[cfg(debug_assertions)]
+#[test]
+fn an_early_worker_connects_before_planning_finishes() {
+    for tcp in [true, false] {
+        let t = Tmp::new();
+        existing_destination_tree(&t, true);
+        fs::set_permissions(t.path("src/c"), fs::Permissions::from_mode(0o600)).unwrap();
+        let temporary = t.runtime();
+        fs::create_dir(&temporary).unwrap();
+        let held = t.path("planning-held");
+        let release = t.path("planning-release");
+        let events = t.path("worker-events");
+        let mut child = existing_destination_copy(&t, tcp, &temporary)
+            .env("SYQ_TEST_QUICK_META_READY_FILE", &held)
+            .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &release)
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &held, "planning's permission repair");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fs::read_to_string(&events)
+            .unwrap_or_default()
+            .contains("connected ")
+        {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                panic!("tcp={tcp}: no worker connected while planning waited");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        release_confinement_barrier(&release);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/b")), b"changed", "tcp={tcp}");
+        let mode = fs::metadata(t.path("dst/c")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "tcp={tcp}");
     }
 }
 
