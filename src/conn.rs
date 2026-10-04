@@ -412,6 +412,12 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<WorkerInitializationError>())
 }
 
+/// A worker handshake rejection that tests inject.
+#[cfg(debug_assertions)]
+pub(crate) fn injected_worker_initialization_error() -> anyhow::Error {
+    WorkerInitializationError("injected worker handshake rejection".into()).into()
+}
+
 /// OpenSSH could not establish the initial helper session (exit 255).
 /// Kept distinct from helper/bootstrap errors and failures after HelloOk so
 /// automatic authorization can fall back before a transfer has begun.

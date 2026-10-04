@@ -700,6 +700,46 @@ fn an_early_worker_connects_only_for_a_file_to_send() {
     }
 }
 
+/// A worker connection that fails once every file is finished cannot fail
+/// the copy, even when the receiver rejects its handshake.
+#[cfg(debug_assertions)]
+#[test]
+fn a_worker_rejected_after_the_last_file_does_not_fail_the_copy() {
+    let t = Tmp::new();
+    write(&t.path("src/large"), b"larger than the size limit");
+    fs::create_dir(t.path("dst")).unwrap();
+    let started = t.path("worker-started");
+    // An empty destination starts a worker as soon as planning sees a
+    // regular file; the size limit then leaves nothing to send.
+    let out = compat_command()
+        .arg("-e")
+        .arg(fake_rsh(&t))
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--syq-tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "-a",
+            "--no-progress",
+            "--max-size=1",
+        ])
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("127.0.0.1:{}/", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
+        .env("SYQ_TEST_FAIL_WORKER_AFTER_COPY", "reject")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(started.exists(), "no worker started: {out:?}");
+    assert!(!stderr_of(&out).contains("injected"), "{out:?}");
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();

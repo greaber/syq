@@ -2338,8 +2338,36 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 )?,
                             ))
                         });
+                    // Tests fail the first worker's connection once every file
+                    // is finished: "reject" as a receiver rejecting its
+                    // handshake, anything else as an ordinary failure.
+                    #[cfg(debug_assertions)]
+                    let conns = match std::env::var("SYQ_TEST_FAIL_WORKER_AFTER_COPY") {
+                        Ok(failure) if id == 0 => {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(60);
+                            while !sched.finished() && std::time::Instant::now() < deadline {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            conns.and_then(|_| {
+                                Err(if failure == "reject" {
+                                    crate::conn::injected_worker_initialization_error()
+                                } else {
+                                    anyhow::anyhow!("injected worker connection failure")
+                                })
+                            })
+                        }
+                        _ => conns,
+                    };
                     let (mut src, mut dst) = match conns {
                         Ok(conns) => conns,
+                        // The copy no longer needs this connection, so its
+                        // failure cannot fail the copy, and a retry would
+                        // only delay its end.
+                        Err(_) if sched.finished() => {
+                            gate.mark_absent(id);
+                            return Ok(());
+                        }
                         Err(error)
                             if crate::conn::is_tcp_congestion_error(&error)
                                 || crate::conn::is_worker_initialization_error(&error) =>
@@ -2351,12 +2379,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 );
                             }
                             return if gate.allowed(id) { Err(error) } else { Ok(()) };
-                        }
-                        // The copy no longer needs this connection: a retry
-                        // would only delay its end.
-                        Err(_) if sched.finished() => {
-                            gate.mark_absent(id);
-                            return Ok(());
                         }
                         Err(error) => {
                             failures += 1;
