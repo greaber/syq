@@ -111,27 +111,10 @@ impl Header {
             bail!("receiver unlocking key path must be absolute");
         }
         let socket = ensure_agent_key(agent, &self.protector.path, &public, None)?;
-        let temporary = crate::private_broker::private_temp_dir("syq-unlock-")?;
-        atomic_write(
-            temporary.path(),
-            "key.pub",
-            self.protector.public_key.as_bytes(),
-            0o600,
-        )?;
-        let encoded = agent_signature(
-            &public,
-            &temporary.path().join("key.pub"),
-            &socket,
-            NAMESPACE,
-            &self.challenge,
-        )?;
-        let signature = ssh_key::SshSig::from_pem(&encoded)?;
-        let mut bytes = Zeroizing::new(signature.signature_bytes().to_vec());
-        match signature.algorithm() {
+        let mut bytes = agent::wrapping_signature(&socket, &public, NAMESPACE, &self.challenge)?;
+        match public.algorithm() {
             Algorithm::Ed25519 => {}
-            Algorithm::Rsa {
-                hash: Some(ssh_key::HashAlg::Sha512),
-            } => {
+            Algorithm::Rsa { .. } => {
                 // Some agents omit leading zero bytes in an RSA signature.
                 // Normalize to the modulus length before deriving the key.
                 let length = public
@@ -218,6 +201,29 @@ mod tests {
                 assert!(PrivateKey::from_openssh(&encoded).is_err());
                 assert_eq!(load_enrollment_public_key(&directory).unwrap(), public);
                 let wrapped = WrappedKey::decode(&encoded).unwrap().unwrap();
+                // The previous implementation delegated SSHSIG signing to
+                // OpenSSH. Its signature must derive the same key for both
+                // algorithms, or existing encrypted enrollments become unreadable.
+                let legacy = agent_signature(
+                    private.public_key(),
+                    &path.with_extension("pub"),
+                    &socket,
+                    NAMESPACE,
+                    &wrapped.header.challenge,
+                )
+                .unwrap();
+                let legacy = ssh_key::SshSig::from_pem(&legacy).unwrap();
+                let direct = agent::wrapping_signature(
+                    &socket,
+                    private.public_key(),
+                    NAMESPACE,
+                    &wrapped.header.challenge,
+                )
+                .unwrap();
+                assert_eq!(&*direct, legacy.signature_bytes());
+                let legacy_key =
+                    derive_key(&wrapped.header.challenge, legacy.signature_bytes()).unwrap();
+                assert_eq!(wrapped.open(&legacy_key).unwrap().public_key(), &public);
                 let key = wrapped.header.agent_wrapping_key(Some(&socket)).unwrap();
                 let mut tampered: WrappedKey =
                     serde_json::from_slice(&serde_json::to_vec(&wrapped).unwrap()).unwrap();

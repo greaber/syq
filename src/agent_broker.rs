@@ -1794,7 +1794,7 @@ fn encode_identities_response(identities: &[Identity]) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let mut length = [0u8; 4];
     let first = stream.read(&mut length[..1])?;
     if first == 0 {
@@ -1813,7 +1813,7 @@ fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(frame))
 }
 
-fn write_frame(stream: &mut impl Write, frame: &[u8]) -> io::Result<()> {
+pub(crate) fn write_frame(stream: &mut impl Write, frame: &[u8]) -> io::Result<()> {
     let length = u32::try_from(frame.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SSH agent frame too large"))?;
     stream.write_all(&length.to_be_bytes())?;
