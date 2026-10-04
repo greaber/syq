@@ -1,7 +1,9 @@
 //! Explicit destination-account authorization over an authenticated return channel.
 use super::*;
 use crate::agent_broker::{BrokerPolicy, ConstrainedAgentBroker, HostPolicy};
+use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
+use crate::persistence::Domain;
 use crate::receive_approval::provider_accounts::{ProviderIdentity, ProviderLoginPermission};
 use crate::receive_approval::{AccountDecision, AccountIdentity, AccountPermission, Queue};
 
@@ -77,7 +79,9 @@ impl Request {
             Mode::Persistent => crate::persistence::parse_account_connect(&command, profile)?,
             Mode::Account => unreachable!(),
         };
-        if parsed.destination != self.target || parsed.authorizer != *profile {
+        if parsed.destination != self.target
+            || parsed.provider != Provider::Return((*profile).into())
+        {
             bail!("SSH destination or authorizer does not match the shown command");
         }
         Ok(())
@@ -248,39 +252,22 @@ impl Drop for Session {
     }
 }
 
-pub(crate) fn prepare_account(request: &ssh::SessionRequest) -> Result<()> {
-    let registration = read_registration(&request.authorizer)?;
-    // Same-build commands need no handoff or provider round trip. The later
-    // metadata/authorization exchange verifies identity before trusting it;
-    // maybe_exec also checks any guard inherited from a genuine handoff.
+pub(crate) fn prepare(request: &ssh::SessionRequest) -> Result<()> {
+    request.provider.validate()?;
+    let Provider::Return(name) = &request.provider else {
+        return Ok(());
+    };
+    let registration = read_registration(name)?;
+    // The fast path reads only local state. Resolve and authorization still
+    // authenticate the provider before trusting metadata or signing.
     let registration = if registration.identity == crate::identity::build() {
         registration
     } else {
-        load_registration(&request.authorizer)?
+        load_registration(name)?
     };
-    let selection = handoff::Selection::new(
-        request.authorizer.clone(),
-        registration,
-        handoff::Kind::Account,
-        None,
-    );
+    let selection =
+        handoff::Selection::new(name.clone(), registration, handoff::Kind::Account, None);
     handoff::maybe_exec(&selection)
-}
-
-pub(crate) fn authorize_account_expected_from(
-    request: &ssh::SessionRequest,
-    command: Vec<Vec<u8>>,
-    expected: &ResolvedPolicy,
-    provider_binding: &str,
-) -> Result<Session> {
-    expected.validate()?;
-    authorize_mode(
-        request,
-        Mode::Account,
-        Some(command),
-        Some(expected.clone()),
-        Some(provider_binding),
-    )
 }
 
 pub(in crate::destination) fn registration_binding(registration: &Registration) -> Result<String> {
@@ -289,86 +276,129 @@ pub(in crate::destination) fn registration_binding(registration: &Registration) 
         .to_string())
 }
 
-/// Resolve using the authenticated provider's configuration without asking
-/// for account access, opening a destination connection, or starting an agent.
-pub(crate) fn resolve(request: &ssh::SessionRequest) -> Result<ResolvedPolicy> {
+pub(crate) fn local_binding(domain: &Domain, provider: &Provider) -> Result<Option<String>> {
+    provider.validate()?;
+    match provider {
+        Provider::Return(name) => read_existing_registration(name)?
+            .map(|registration| registration_binding(&registration))
+            .transpose(),
+        Provider::Ssh { .. } => ssh::provider::local_binding(domain, provider),
+    }
+}
+
+pub(crate) struct Resolved {
+    pub(crate) binding: String,
+    pub(crate) policy: ResolvedPolicy,
+}
+
+/// Metadata is returned together with the authenticated connection that
+/// resolved it. Neither operation grants destination account access.
+pub(crate) fn resolve(domain: &Domain, request: &ssh::SessionRequest) -> Result<Resolved> {
+    request.provider.validate()?;
     ssh::validate_endpoint(&request.destination)?;
-    let registration = load_registration(&request.authorizer)?;
-    let deadline = Instant::now() + RESOLVE_TIMEOUT;
-    let (mut stream, reply) = exchange(
-        &registration,
-        Message::ResolveSsh(request.destination.clone()),
-        RESOLVE_TIMEOUT,
-        Some(RESOLVE_TIMEOUT),
-    )?;
-    if !matches!(reply, Reply::Ready) {
-        bail!("unexpected SSH resolution response");
+    let (binding, mut stream, reply) = match &request.provider {
+        Provider::Return(name) => {
+            let registration = load_registration(name)?;
+            let binding = registration_binding(&registration)?;
+            let (stream, reply) = exchange(
+                &registration,
+                Message::ResolveSsh(request.destination.clone()),
+                RESOLVE_TIMEOUT,
+                Some(RESOLVE_TIMEOUT),
+            )?;
+            (binding, stream, reply)
+        }
+        Provider::Ssh { .. } => {
+            let binding = ssh::provider::resolve_connection(domain, &request.provider)?;
+            let mut stream = ssh::provider::open(
+                domain,
+                &request.provider,
+                &binding,
+                crate::receive_service::provider::SessionRequest::Resolve(
+                    request.destination.clone(),
+                ),
+            )?;
+            let reply = read_message(&mut DeadlineSocket {
+                socket: &mut stream,
+                deadline: Instant::now() + RESOLVE_TIMEOUT,
+            })?;
+            (binding, stream, reply)
+        }
+    };
+    match reply {
+        Reply::Ready => {}
+        Reply::Error(message) => bail!(message),
+        _ => bail!("unexpected SSH resolution response"),
     }
     let resolved: ResolvedPolicy = read_message(&mut DeadlineSocket {
         socket: &mut stream,
-        deadline,
+        deadline: Instant::now() + RESOLVE_TIMEOUT,
     })?;
-    ResolvedPolicy::new(
-        resolved.endpoint,
-        &resolved.known_hosts,
-        &resolved.host_algorithms,
-    )
+    Ok(Resolved {
+        binding,
+        policy: ResolvedPolicy::new(
+            resolved.endpoint,
+            &resolved.known_hosts,
+            &resolved.host_algorithms,
+        )?,
+    })
 }
 
-fn authorize_mode(
+pub(crate) fn authorize_expected(
+    domain: &Domain,
     request: &ssh::SessionRequest,
-    mode: Mode,
-    command: Option<Vec<Vec<u8>>>,
-    expected: Option<ResolvedPolicy>,
-    expected_provider: Option<&str>,
+    command: Vec<Vec<u8>>,
+    provider_binding: &str,
+    expected: &ResolvedPolicy,
 ) -> Result<Session> {
+    request.provider.validate()?;
+    expected.validate()?;
     crate::conn::require_constrained_openssh("ssh", "on this machine")?;
-    let registration = load_registration(&request.authorizer)?;
-    if let Some(expected) = expected_provider {
-        anyhow::ensure!(
-            registration_binding(&registration)? == expected,
-            "SSH authorization provider changed since this destination was resolved; retry the command"
-        );
-    }
-    let selection = handoff::Selection::new(
-        request.authorizer.clone(),
-        registration,
-        match mode {
-            Mode::Once => handoff::Kind::Ssh,
-            Mode::Persistent => handoff::Kind::SshPersistent,
-            Mode::Account => handoff::Kind::Account,
-        },
-        None,
+    let operation = Request::account(
+        request.destination.clone(),
+        command,
+        crate::approval_command::current_directory(),
+        Some(expected.clone()),
     );
-    if mode == Mode::Once {
-        handoff::maybe_exec(&selection)?;
-    } else if selection.registration.identity != crate::identity::build() {
-        bail!("receiving connection changed while starting the SSH login; retry the command");
-    }
     crate::output::diagnostic!(
-        "syq: requesting SSH account access from @{}; approve on that machine",
-        request.authorizer
+        "syq: requesting SSH account access from {}; approve on that machine",
+        request.provider.label()
     );
-    let (mut stream, reply) = exchange(
-        &selection.registration,
-        Message::Ssh(Request {
-            mode,
-            target: request.destination.clone(),
-            command: command
-                .map(Ok)
-                .unwrap_or_else(crate::approval_command::current)?,
-            cwd: crate::approval_command::current_directory(),
-            expected: expected.clone(),
-        }),
-        REQUEST_TIMEOUT + Duration::from_secs(30),
-        Some(Duration::from_secs(120)),
-    )?;
-    if !matches!(reply, Reply::Ready) {
-        bail!("unexpected SSH approval response");
+    let (mut stream, reply) = match &request.provider {
+        Provider::Return(name) => {
+            let registration = load_registration(name)?;
+            anyhow::ensure!(registration_binding(&registration)? == provider_binding,
+                "SSH authorization provider changed since this destination was resolved; retry the command");
+            anyhow::ensure!(
+                registration.identity == crate::identity::build(),
+                "receiving connection changed while starting the SSH login; retry the command"
+            );
+            exchange(
+                &registration,
+                Message::Ssh(operation),
+                REQUEST_TIMEOUT + Duration::from_secs(30),
+                Some(Duration::from_secs(120)),
+            )?
+        }
+        Provider::Ssh { .. } => {
+            let mut stream = ssh::provider::open(
+                domain,
+                &request.provider,
+                provider_binding,
+                crate::receive_service::provider::SessionRequest::Account(operation),
+            )?;
+            let reply = read_message(&mut stream)?;
+            (stream, reply)
+        }
+    };
+    match reply {
+        Reply::Ready => {}
+        Reply::Error(message) => bail!(message),
+        _ => bail!("unexpected SSH approval response"),
     }
     let approved: ResolvedPolicy = read_message(&mut stream)?;
     approved.validate()?;
-    approved.check_expected(expected.as_ref())?;
+    approved.check_expected(Some(expected))?;
     request.ssh_arguments(&approved.endpoint)?;
     let channel = Mutex::new(Some(stream.try_clone()?));
     let broker = PrivateBroker::start_managed(

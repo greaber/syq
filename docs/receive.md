@@ -191,6 +191,37 @@ Session traffic goes directly between the servers, and your ordinary SSH
 agent is not forwarded. Keep the laptop connection open during the session.
 See [`syq ssh`](commands/ssh.md) for commands, terminals, and requirements.
 
+## Use an SSH authorization provider
+
+An ordinary SSH server can supply authorization instead of a connected laptop.
+On the provider, load the destination keys into its local SSH agent and enable
+receiving from that environment:
+
+```sh
+syq persist receive on --notify off
+```
+
+On the machine where you work, save the provider's SSH endpoint:
+
+```sh
+syq persist auth-from alice@provider:2222
+syq ssh hostB -- hostname
+syq cp results --to hostB
+```
+
+The first operation connects to the provider using your machine's native SSH
+credentials. The provider resolves `hostB` through its own SSH configuration and
+asks for destination-account approval. Inspect and approve requests there with
+`syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
+Later commands reuse both connections; `persist connect` is optional.
+Your agent is not forwarded, and commands and file data travel directly to hostB.
+The provider's SSH server must allow Unix-socket forwarding.
+
+This uses a full SSH login to the provider account. Anyone who can log in to
+that account can use its credentials independently of syq's approval controls.
+It centralizes credentials but does not make that account a restricted shared
+authorization service. See [provider trust](security.md#ordinary-ssh-authorization-providers).
+
 ## Authorize copies between servers
 
 Use your laptop's SSH access while working in hostA's shell:

@@ -1,4 +1,5 @@
 //! SSH session arguments. Authorization and process lifetime belong to the caller.
+use crate::auth_from::Provider;
 use crate::cli::{AuthFrom, NativeEndpoint};
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 pub(super) mod foreground;
 mod master_lifetime;
 pub(crate) mod persistent;
+pub(crate) mod provider;
 pub(crate) mod resolution;
 
 #[derive(Parser)]
@@ -19,7 +21,7 @@ pub(crate) mod resolution;
 )]
 struct SshCommand {
     /// Authorization source; omitted uses the saved preference, then native SSH
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = crate::cli::parse_auth_from)]
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Use connections and authorization preferences from this persistence scope
     #[arg(long, value_name = "PATH")]
@@ -48,10 +50,32 @@ pub(crate) enum Tty {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SessionRequest {
-    pub(crate) authorizer: String,
+    pub(crate) provider: Provider,
     pub(crate) destination: NativeEndpoint,
     pub(crate) tty: Tty,
     pub(crate) command: Vec<OsString>,
+}
+
+/// A parsed SSH invocation has no authorization provider until command policy
+/// selects one. Native SSH therefore needs no fabricated receiving identity.
+#[derive(Clone, Debug)]
+pub(crate) struct Invocation {
+    pub(crate) destination: NativeEndpoint,
+    pub(crate) tty: Tty,
+    pub(crate) command: Vec<OsString>,
+}
+impl Invocation {
+    pub(crate) fn with_provider(self, provider: Provider) -> SessionRequest {
+        SessionRequest {
+            provider,
+            destination: self.destination,
+            tty: self.tty,
+            command: self.command,
+        }
+    }
+    pub(crate) fn ssh_arguments(&self, endpoint: &NativeEndpoint) -> Result<Vec<OsString>> {
+        ssh_arguments(self.tty, &self.command, endpoint)
+    }
 }
 
 pub(crate) fn command_for_help() -> clap::Command {
@@ -61,7 +85,7 @@ pub(crate) fn command_for_help() -> clap::Command {
         .mut_arg("no_tty", |arg| arg.hide_short_help(false))
 }
 
-fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>, Option<PathBuf>)> {
+fn parse_command(argv: &[OsString]) -> Result<(Invocation, Option<AuthFrom>, Option<PathBuf>)> {
     let matches = command_for_help().try_get_matches_from(argv)?;
     let parsed = SshCommand::from_arg_matches(&matches)?;
     if parsed.destination.len() > 512 {
@@ -74,8 +98,7 @@ fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>,
         bail!("SSH command arguments must not contain NUL");
     }
     Ok((
-        SessionRequest {
-            authorizer: String::new(),
+        Invocation {
             destination,
             tty: if parsed.tty {
                 Tty::Request
@@ -91,26 +114,24 @@ fn parse_command(argv: &[OsString]) -> Result<(SessionRequest, Option<AuthFrom>,
     ))
 }
 
-/// An explicit receiving name, used for persistent account requests.
+/// An explicit provider, used for persistent account requests.
 pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
-    let (mut request, mode, _) = parse_command(argv)?;
-    let Some(AuthFrom::Return(name)) = mode else {
-        bail!("SSH authorization requires a receiving machine named @NAME");
+    let (request, mode, _) = parse_command(argv)?;
+    let Some(AuthFrom::Provider(provider)) = mode else {
+        bail!("SSH account authorization requires @NAME or an SSH provider host");
     };
-    request.authorizer = name;
-    Ok(request)
+    Ok(request.with_provider(provider))
 }
 
 /// Validate the displayed command without reading the laptop's preferences.
 pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<SessionRequest> {
-    let (mut request, mode, _) = parse_command(argv)?;
+    let (request, mode, _) = parse_command(argv)?;
     match mode {
         None => {}
-        Some(AuthFrom::Return(name)) if name == expected => {}
+        Some(AuthFrom::Provider(Provider::Return(name))) if name == expected => {}
         _ => bail!("SSH authorizer does not match the shown command"),
     }
-    request.authorizer = expected.to_owned();
-    Ok(request)
+    Ok(request.with_provider(Provider::Return(expected.to_owned())))
 }
 
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
@@ -122,8 +143,8 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         return foreground::run_cached(&mut command, || false);
     }
     anyhow::ensure!(
-        !matches!(mode, AuthFrom::Return(_)),
-        "laptop account authorization did not produce an SSH connection"
+        !matches!(mode, AuthFrom::Provider(_)),
+        "provider account authorization did not produce an SSH connection"
     );
     let persistent =
         crate::persistence::scope_for_implicit_ssh(domain.explicit_path()).and_then(|scope| {
@@ -200,23 +221,31 @@ impl SessionRequest {
         &self,
         authorized_endpoint: &NativeEndpoint,
     ) -> Result<Vec<OsString>> {
-        validate_endpoint(authorized_endpoint)?;
-        let mut args = Vec::new();
-        match self.tty {
-            Tty::Default => {}
-            Tty::Request => args.push("-t".into()),
-            Tty::Disabled => args.push("-T".into()),
-        }
-        if let Some(user) = &authorized_endpoint.user {
-            args.extend(["-l".into(), user.into()]);
-        }
-        if let Some(port) = authorized_endpoint.port {
-            args.extend(["-p".into(), port.to_string().into()]);
-        }
-        args.extend(["--".into(), authorized_endpoint.host.clone().into()]);
-        args.extend(self.command.iter().cloned());
-        Ok(args)
+        ssh_arguments(self.tty, &self.command, authorized_endpoint)
     }
+}
+
+fn ssh_arguments(
+    tty: Tty,
+    command: &[OsString],
+    authorized_endpoint: &NativeEndpoint,
+) -> Result<Vec<OsString>> {
+    validate_endpoint(authorized_endpoint)?;
+    let mut args = Vec::new();
+    match tty {
+        Tty::Default => {}
+        Tty::Request => args.push("-t".into()),
+        Tty::Disabled => args.push("-T".into()),
+    }
+    if let Some(user) = &authorized_endpoint.user {
+        args.extend(["-l".into(), user.into()]);
+    }
+    if let Some(port) = authorized_endpoint.port {
+        args.extend(["-p".into(), port.to_string().into()]);
+    }
+    args.extend(["--".into(), authorized_endpoint.host.clone().into()]);
+    args.extend(command.iter().cloned());
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -231,7 +260,7 @@ mod tests {
     #[test]
     fn a_shell_uses_only_the_explicit_authorizer_and_normal_ssh_terminal_selection() {
         let parsed = request(&["ssh", "hostB", "--auth-from", "@laptop"]).unwrap();
-        assert_eq!(parsed.authorizer, "laptop");
+        assert_eq!(parsed.provider, Provider::Return("laptop".into()));
         assert_eq!(parsed.destination.host, "hostB");
         assert_eq!(parsed.tty, Tty::Default);
         assert!(parsed.command.is_empty());
@@ -243,7 +272,6 @@ mod tests {
             vec!["ssh", "hostB"],
             vec!["ssh", "--auth-from", "auto", "hostB"],
             vec!["ssh", "--auth-from", "ssh", "hostB"],
-            vec!["ssh", "--auth-from", "laptop", "hostB"],
             vec!["ssh", "--auth-from", "@", "hostB"],
             vec!["ssh", "--auth-from", "@bad/name", "hostB"],
         ] {
@@ -266,13 +294,41 @@ mod tests {
             .map(Into::into)
             .collect();
         let approved = parse_for_approval(&argv, "laptop").unwrap();
-        assert_eq!(approved.authorizer, "laptop");
+        assert_eq!(approved.provider, Provider::Return("laptop".into()));
         assert_eq!(approved.command, [OsString::from("exit 17")]);
         let mismatch: Vec<OsString> = ["ssh", "--auth-from", "@other", "hostB"]
             .into_iter()
             .map(Into::into)
             .collect();
         assert!(parse_for_approval(&mismatch, "laptop").is_err());
+    }
+
+    #[test]
+    fn ordinary_provider_and_destination_are_separate_endpoints() {
+        let argv = [
+            "ssh",
+            "--auth-from",
+            "alice@provider:2222",
+            "bob@destination:2200",
+            "--",
+            "hostname",
+        ]
+        .map(OsString::from);
+        let parsed = parse(&argv).unwrap();
+        assert_eq!(
+            parsed.provider,
+            Provider::Ssh {
+                endpoint: NativeEndpoint {
+                    user: Some("alice".into()),
+                    host: "provider".into(),
+                    port: Some(2222)
+                }
+            }
+        );
+        assert_eq!(parsed.destination.user.as_deref(), Some("bob"));
+        assert_eq!(parsed.destination.host, "destination");
+        assert_eq!(parsed.destination.port, Some(2200));
+        assert!(parse_for_approval(&argv, "laptop").is_err());
     }
 
     #[test]

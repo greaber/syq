@@ -100,7 +100,12 @@ pub(super) fn select(
     progress: Option<&crate::progress::Progress>,
 ) -> Result<Option<handoff::Selection>> {
     let explicit = match &args.auth_from {
-        crate::cli::AuthFrom::Return(name) => Some(name.clone()),
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) => {
+            Some(name.clone())
+        }
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. }) => {
+            bail!("this copy cannot use account authorization from an SSH provider; use a supported direct SSH copy or --auth-from @NAME for per-copy authorization");
+        }
         _ => handoff::selected_name(handoff::Kind::Forward).map(str::to_owned),
     };
     let target = match eligible_target(args) {
@@ -202,7 +207,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         bail!("unexpected remote copy approval response");
     };
     args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.auth_from = crate::cli::AuthFrom::Return(name);
+    args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     // The actual authority never leaves the destination helper. This internal
     // marker selects its restricted executor and per-copy worker admission.
     args.restricted_grant = Some("return-control-v1".into());

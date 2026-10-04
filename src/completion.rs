@@ -875,7 +875,10 @@ fn management_candidates(
     }
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
-        ("persist", "auth-from") => Ok(auth_from_candidates(current)),
+        ("persist", "auth-from") => Ok(auth_from_candidates(
+            current,
+            pscope_from_args(command, args),
+        )),
         ("persist", "connect" | "ssh-config") => Ok(endpoint_candidates(
             current,
             EndpointSyntax::Native,
@@ -895,17 +898,22 @@ fn management_candidates(
             if args.first().is_some_and(|arg| arg == b"receive")
                 && args.get(1).is_some_and(|arg| arg == b"permissions") =>
         {
-            Ok(
-                crate::receive_approval::accounts::list(&crate::persistence::Domain::select(
-                    pscope_from_args(command, args).map(Path::new),
-                )?)
+            let domain =
+                crate::persistence::Domain::select(pscope_from_args(command, args).map(Path::new))?;
+            let accounts = crate::receive_approval::accounts::list(&domain)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|item| item.id.into_bytes())
+                .map(|item| item.id);
+            let providers = crate::receive_approval::provider_accounts::list(&domain)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.id);
+            Ok(accounts
+                .chain(providers)
+                .map(String::into_bytes)
                 .filter(|id| id.starts_with(current))
                 .map(Candidate::text)
-                .collect(),
-            )
+                .collect())
         }
         ("persist", "remove") if args.first().is_some_and(|arg| arg == b"receive") => Ok(
             crate::receive_service::profile_names(&crate::persistence::Domain::select(
@@ -1423,7 +1431,10 @@ fn complete_value(
         .filter(|name| name.starts_with(current))
         .map(Candidate::text)
         .collect()),
-        ValueCompletion::AuthFrom => Ok(auth_from_candidates(current)),
+        ValueCompletion::AuthFrom => Ok(auth_from_candidates(
+            current,
+            pscope_from_args(command, args),
+        )),
         ValueCompletion::ReturnName => Ok(return_name_candidates(current).collect()),
         ValueCompletion::NamedOrSshDestination => {
             let mut candidates = endpoint_candidates(
@@ -1799,8 +1810,8 @@ fn connect_completion_endpoint(
         // completion helper nor a disappearing socket may start a new login.
         None
     } else {
-        if let AuthFrom::Return(name) = auth_from {
-            bail!("no live approved account connection for {} through @{name}; connect first with syq persist connect {} --auth-from @{name}", endpoint_label(&endpoint), endpoint_label(&endpoint));
+        if let AuthFrom::Provider(provider) = auth_from {
+            bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint_label(&endpoint), endpoint_label(&endpoint));
         }
         let persistent = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())
             .and_then(|scope| {
@@ -2134,12 +2145,17 @@ fn path_candidates_from_entries(
     candidates
 }
 
-fn auth_from_candidates(current: &[u8]) -> Vec<Candidate> {
+fn auth_from_candidates(current: &[u8], explicit_scope: Option<&str>) -> Vec<Candidate> {
     [b"auto".to_vec(), b"ssh".to_vec()]
         .into_iter()
         .filter(|value| value.starts_with(current))
         .map(Candidate::text)
         .chain(return_name_candidates(current))
+        .chain(endpoint_candidates(
+            current,
+            EndpointSyntax::Native,
+            explicit_scope,
+        ))
         .collect()
 }
 

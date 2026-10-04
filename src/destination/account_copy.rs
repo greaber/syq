@@ -38,9 +38,9 @@ pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
                 args.auth_from_explicit.then(|| args.auth_from.clone()),
             )?;
             super::handoff::validate_account_selection(&mode)?;
-            if let AuthFrom::Return(authorizer) = mode {
-                super::ssh_auth::prepare_account(&super::ssh::SessionRequest {
-                    authorizer,
+            if let AuthFrom::Provider(authorizer) = mode {
+                super::ssh_auth::prepare(&super::ssh::SessionRequest {
+                    provider: authorizer,
                     destination: NativeEndpoint {
                         user: location.user,
                         host,
@@ -144,8 +144,8 @@ pub(crate) fn approved_operation(
         bail!("named receiving machines support syq cp and syq exec; use an SSH endpoint for this operation");
     }
     if args.rsh.is_some() {
-        if args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_)) {
-            bail!("--auth-from @NAME cannot be combined with --rsh");
+        if args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Provider(_)) {
+            bail!("--auth-from with an authorization provider cannot be combined with --rsh");
         }
         return Ok(None);
     }

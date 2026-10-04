@@ -399,7 +399,7 @@ pub struct Args {
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
     /// Override saved authorization with auto, native SSH (ssh), or an approved account connection (@NAME). When omitted, use the saved choice, then auto
-    #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME", value_parser = parse_auth_from, default_value = "auto", hide_default_value = true)]
+    #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from, default_value = "auto", hide_default_value = true)]
     pub(crate) auth_from: AuthFrom,
     /// Use this exact syq executable on the remote instead of the managed helper
     #[arg(long = "rsync-path", value_name = "PATH")]
@@ -1299,31 +1299,21 @@ pub(crate) enum AuthFrom {
     #[default]
     Auto,
     Ssh,
-    Return(String),
-}
-
-impl AuthFrom {
-    fn receiving(value: &str) -> Result<Self> {
-        let name = value
-            .strip_prefix('@')
-            .ok_or_else(|| anyhow::anyhow!("receiver references require @NAME"))?;
-        crate::destination::validate_name(name)?;
-        Ok(Self::Return(name.to_owned()))
-    }
+    Provider(crate::auth_from::Provider),
 }
 
 pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
     match value {
         "auto" => Ok(AuthFrom::Auto),
         "ssh" => Ok(AuthFrom::Ssh),
-        _ => AuthFrom::receiving(value),
+        _ => crate::auth_from::Provider::parse(value).map(AuthFrom::Provider),
     }
 }
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME (also S3 copies). Eligible native copies can request laptop authorization after SSH failure
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    /// Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
@@ -1581,7 +1571,7 @@ struct NativeMapCommand {
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
     /// Use an approved SSH account connection, or native SSH authentication
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
@@ -1606,7 +1596,7 @@ struct NativeMapCommand {
 )]
 struct NativeRmCommand {
     /// Use approved SSH account access, or request S3 authorization from a receiving machine
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     #[command(flatten)]
     s3: crate::s3::Flags,
@@ -1651,7 +1641,7 @@ struct CleanPartialsCommand {
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
     /// Use an approved SSH account connection, or native SSH authentication
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]

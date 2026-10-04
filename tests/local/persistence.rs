@@ -1355,3 +1355,41 @@ fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state()
     assert!(t.path("ssh-used").exists());
     assert!(!stderr_of(&output).contains("authorization choice"));
 }
+
+#[test]
+fn scoped_off_closes_native_connections_despite_damaged_account_state() {
+    let t = Tmp::new();
+    let scope = ephemeral_scope(&t);
+    let key = "cm-4adf1f61aa19aead";
+    write(
+        &scope.join(format!("{key}.json")),
+        br#"{"user":"alice","host":"example","port":2222}"#,
+    );
+    let _master = std::os::unix::net::UnixListener::bind(scope.join(key)).unwrap();
+    let index = scope.join("authorized-ssh-v1");
+    fs::create_dir(&index).unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+    let damaged = index.join(format!("{}.json", "a".repeat(64)));
+    write(&damaged, b"not valid JSON");
+    fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600)).unwrap();
+    executable(
+        &t.path("close-bin/ssh"),
+        br#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_CLOSE_LOG"
+exit 0
+"#,
+    );
+    let output = persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("close-bin")))
+        .env("FAKE_CLOSE_LOG", t.path("close.log"))
+        .run()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "damaged state must remain visible"
+    );
+    let log = fs::read_to_string(t.path("close.log")).unwrap();
+    assert!(log.contains("-O exit"), "{log}");
+    assert!(log.contains("-- example"), "{log}");
+    assert_eq!(read(&damaged), b"not valid JSON");
+}

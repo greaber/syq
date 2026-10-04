@@ -1,5 +1,7 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
+pub(crate) mod provider;
+
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
@@ -143,7 +145,7 @@ enum Action {
     /// Allow one pending request using the ID from persist receive pending
     Approve {
         id: String,
-        /// Remember this SSH account permission for future receiving connections
+        /// Remember this SSH account permission for future receiving connections or provider logins
         #[arg(long)]
         remember: bool,
     },
@@ -183,7 +185,7 @@ enum Action {
 }
 #[derive(Subcommand, Debug)]
 enum PermissionAction {
-    /// Show remembered source-to-destination SSH account permissions
+    /// Show remembered SSH account permissions
     List {
         #[arg(long)]
         json: bool,
@@ -965,6 +967,11 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
 // Wait until each live supervisor has revoked changed/removed profiles. Healthy
 // workers remain in the same process, preserving streams and pending approvals.
 fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
+    if config.enabled() {
+        provider::refresh(domain)?;
+    } else {
+        provider::stop(domain)?;
+    }
     for control in all_controls(domain)? {
         if !config.enabled() {
             stop_inner(&control, false)?;
@@ -1163,7 +1170,7 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
         })
         .collect())
 }
-fn configure(domain: &Domain, options: Configure) -> Result<()> {
+fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     let _lock = settings_lock(domain)?;
     let existed = config_path(domain)?.exists();
     let mut preferences = preferences(domain)?;
@@ -1250,6 +1257,11 @@ fn configure(domain: &Domain, options: Configure) -> Result<()> {
     drop(_lock);
     domain.enable()?;
     apply_preferences(domain, &preferences)?;
+    Ok(config)
+}
+fn configure(domain: &Domain, options: Configure) -> Result<()> {
+    let config = configure_profile(domain, options)?;
+    provider::ensure(domain)?;
     let mut failures = Vec::new();
     for endpoint in &config.servers {
         if let Err(error) = crate::persistence::connect_domain(
@@ -1279,10 +1291,18 @@ fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> 
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut progress = Instant::now();
     loop {
-        let requests: Vec<_> = statuses(domain)?
+        let mut requests: Vec<_> = statuses(domain)?
             .into_iter()
             .flat_map(|status| status.pending)
             .collect();
+        if let Some(provider) = provider::snapshot(domain)? {
+            requests.extend(
+                provider
+                    .profiles
+                    .into_iter()
+                    .flat_map(|profile| profile.pending),
+            );
+        }
         if !wait || !requests.is_empty() {
             if json {
                 println!("{}", serde_json::to_string(&requests)?);
@@ -1326,8 +1346,7 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
             continue;
         };
         if let Some(request) = state.pending.iter().find(|request| request.id == id) {
-            anyhow::ensure!(!remember || (allow && request.kind() == crate::receive_approval::Kind::Ssh
-                && request.account().is_some()), "--remember applies only to SSH account requests that support remembering; update syq and reconnect receiving if needed");
+            anyhow::ensure!(!remember || (allow && request.can_remember()), "--remember applies only to SSH account requests that support remembering; update syq and reconnect receiving if needed");
             let response = query(
                 &control,
                 false,
@@ -1354,10 +1373,46 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
             return Ok(());
         }
     }
+    if let Some(provider) = provider::snapshot(domain)? {
+        if let Some(request) = provider
+            .profiles
+            .iter()
+            .flat_map(|profile| &profile.pending)
+            .find(|request| request.id == id)
+        {
+            anyhow::ensure!(
+                !remember || (allow && request.can_remember()),
+                "--remember applies only to SSH account requests that support remembering"
+            );
+            provider::decide(
+                domain,
+                Decision {
+                    id: id.into(),
+                    allow,
+                    kind: request.kind(),
+                    remember,
+                },
+            )?;
+            crate::output::human_stdout!(
+                "{} {id}",
+                if remember {
+                    "Approved and remembered"
+                } else if allow {
+                    "Approved"
+                } else {
+                    "Denied"
+                }
+            );
+            return Ok(());
+        }
+    }
     bail!("approval is unknown, expired, or already answered")
 }
 
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if let Some(result) = provider::dispatch(argv) {
+        return Some(result);
+    }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--receive-service" => Some((|| {
             if argv.len() != 3 {
@@ -1387,9 +1442,22 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
         Action::Permissions { action } => match action {
             PermissionAction::List { json } => {
                 let permissions = crate::receive_approval::accounts::list(domain)?;
+                let provider_permissions =
+                    crate::receive_approval::provider_accounts::list(domain)?;
                 if json {
-                    println!("{}", serde_json::to_string(&permissions)?);
-                } else if permissions.is_empty() {
+                    // Existing return-permission rows retain their exact shape.
+                    let mut rows: Vec<_> = permissions
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<std::result::Result<_, _>>()?;
+                    rows.extend(
+                        provider_permissions
+                            .iter()
+                            .map(serde_json::to_value)
+                            .collect::<std::result::Result<Vec<_>, _>>()?,
+                    );
+                    println!("{}", serde_json::to_string(&rows)?);
+                } else if permissions.is_empty() && provider_permissions.is_empty() {
                     crate::output::human_stdout!("No remembered account permissions");
                 } else {
                     for item in permissions {
@@ -1401,10 +1469,28 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                             item.permission.profile
                         );
                     }
+                    for item in provider_permissions {
+                        crate::output::human_stdout!(
+                            "{}  {} -> {} (provider profile {})",
+                            item.id,
+                            item.permission.provider.label(),
+                            item.permission.destination.label(),
+                            item.permission.profile
+                        );
+                    }
                 }
             }
             PermissionAction::Remove { id } => {
-                crate::receive_approval::accounts::remove(domain, &id)?;
+                // Validate both stores; never hide corrupt authority state while removing a grant.
+                crate::receive_approval::accounts::list(domain)?;
+                let provider_permissions =
+                    crate::receive_approval::provider_accounts::list(domain)?;
+                if provider_permissions.iter().any(|item| item.id == id) {
+                    crate::receive_approval::provider_accounts::remove(domain, &id)?;
+                } else {
+                    // Keep the original store's ID validation and not-found diagnostic.
+                    crate::receive_approval::accounts::remove(domain, &id)?;
+                }
                 crate::output::human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
             }
         },
@@ -1445,6 +1531,12 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 config.selected(Some(name))?;
             }
             let mut connections = statuses(domain)?;
+            let mut local_provider = provider::snapshot(domain)?;
+            if let (Some(provider), Some(name)) = (&mut local_provider, &name) {
+                provider
+                    .profiles
+                    .retain(|profile| &profile.settings.name == name);
+            }
             if let Some(name) = name.as_ref() {
                 connections.retain_mut(|s| {
                     if s.profiles.is_empty() {
@@ -1469,7 +1561,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                 println!(
                     "{}",
                     serde_json::to_string(
-                        &serde_json::json!({ "settings": selected[0], "profiles": selected, "connections": connections })
+                        &serde_json::json!({ "settings": selected[0], "profiles": selected, "connections": connections, "provider": local_provider })
                     )?
                 );
             } else {
@@ -1480,6 +1572,16 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         config.name
                     );
                     config.print_paths();
+                }
+                if let Some(provider) = local_provider {
+                    for profile in provider.profiles {
+                        crate::output::human_stdout!(
+                            "  local SSH provider {}: {} sessions ({} pending)",
+                            profile.settings.name,
+                            profile.sessions,
+                            profile.pending.len()
+                        );
+                    }
                 }
                 for state in connections {
                     if state.profiles.is_empty() {
@@ -1620,7 +1722,7 @@ mod tests {
         assert!(!config_path(&second).unwrap().exists());
         assert!(default_settings(&Domain::default()).unwrap().enabled);
 
-        configure(
+        configure_profile(
             &first,
             Configure {
                 name: Some("first-inbox".into()),
@@ -1633,7 +1735,7 @@ mod tests {
         assert!(preferences(&first).unwrap().enabled());
         assert!(!preferences(&second).unwrap().enabled());
         let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
-        configure(
+        configure_profile(
             &second,
             Configure {
                 name: Some("second-inbox".into()),

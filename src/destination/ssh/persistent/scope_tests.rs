@@ -28,7 +28,7 @@ fn new_record(domain: &Domain) -> Record {
     .unwrap();
     Record {
         version: 1,
-        authorizer: "laptop".into(),
+        authorizer: Provider::Return("laptop".into()),
         requested: endpoint.clone(),
         endpoint,
         control,
@@ -110,7 +110,7 @@ fn startup_retains_default_encoding_and_does_not_survive_scoped_recreation() {
     let domain = domain(root.path(), "a");
     let startup = Startup {
         command: Vec::new(),
-        authorizer: "laptop".into(),
+        authorizer: Provider::Return("laptop".into()),
         requested: endpoint(),
         generation: ensure_generation(&domain).unwrap(),
         selected: None,

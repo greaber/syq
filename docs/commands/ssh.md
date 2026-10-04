@@ -100,5 +100,7 @@ connections do not change the selected authorization or endpoint.
 Explicit `ssh` selection also uses native authentication.
 A failed login or command is never retried through a receiving machine.
 Use `--auth-from @NAME` or save that preference to ask your laptop directly.
+An ordinary SSH endpoint, such as `--auth-from alice@provider:2222`, instead
+opens a connection to an [SSH authorization provider](../receive.md#use-an-ssh-authorization-provider).
 A laptop-authorized invocation opens or reuses an approved account connection.
 You do not need to run `persist connect` first.

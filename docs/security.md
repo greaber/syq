@@ -401,3 +401,21 @@ cleans up its owned connections, but already authenticated sessions may continue
 including additional commands within them. These actions cannot undo remote
 changes, stop detached processes, or revoke independent access already created
 with the approved account. See [account permission controls](persistence-reference.md#account-permissions).
+
+### Ordinary SSH authorization providers
+
+`--auth-from [USER@]HOST[:PORT]` opens a native SSH login to the provider account.
+That account's local receiving service holds the agent environment and asks for
+access to each destination account. It does not learn or verify which source
+machine initiated the login. The prompt therefore identifies access through the
+provider account, rather than asserting a source-server identity. **Allow** lasts
+for the current provider connection; **Remember** covers later logins to that
+provider account through the same profile and authorizing domain.
+
+The provider login has full account access. A caller with that access can run
+programs there and use its credentials outside syq. Syq's prompts are useful
+controls for its own operations, not an enforcement boundary against someone
+who controls the provider account. Use a receiving connection from a laptop when
+the requesting server must not have a full SSH login to the credential holder.
+Stopping receiving prevents further syq authorizations but does not revoke the
+caller's independent SSH access to the provider.

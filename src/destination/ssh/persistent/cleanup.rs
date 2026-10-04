@@ -92,7 +92,7 @@ fn cleanup_master(scope: &Path) -> Result<()> {
             );
             let record = Record {
                 version: 1,
-                authorizer: String::new(),
+                authorizer: Provider::Return("cleanup".into()),
                 requested: NativeEndpoint {
                     user: None,
                     host: "syq-control".into(),

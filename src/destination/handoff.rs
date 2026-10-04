@@ -180,7 +180,7 @@ pub(crate) fn validate_account_selection(mode: &crate::cli::AuthFrom) -> Result<
     };
     guard.validate()?;
     anyhow::ensure!(
-        matches!(mode, crate::cli::AuthFrom::Return(name) if *name == guard.name),
+        matches!(mode, crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) if *name == guard.name),
         "account authorizer changed during handoff; retry the command"
     );
     Ok(())

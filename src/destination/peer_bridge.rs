@@ -63,8 +63,8 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     // A custom native route bypasses optional saved authorizer choices.
     if args.rsh.is_some() {
         anyhow::ensure!(
-            !(args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Return(_))),
-            "--auth-from @NAME cannot be combined with --rsh"
+            !(args.auth_from_explicit && matches!(args.auth_from, AuthFrom::Provider(_))),
+            "--auth-from with an authorization provider cannot be combined with --rsh"
         );
         return Ok(None);
     }
@@ -78,15 +78,15 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     };
     let source_mode = mode(source)?;
     let destination_mode = mode(destination)?;
-    let named = matches!(source_mode, AuthFrom::Return(_))
-        || matches!(destination_mode, AuthFrom::Return(_));
+    let authorized = matches!(source_mode, AuthFrom::Provider(_))
+        || matches!(destination_mode, AuthFrom::Provider(_));
     if args.detach
         || args.peer_auth != PeerAuth::Restricted
         || !matches!(args.coordinate_at, CoordinateAt::Auto | CoordinateAt::Src)
         || source.same_host(destination)
         || sources.iter().any(|s| !s.same_host(source))
     {
-        anyhow::ensure!(!named, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh and --detach are not supported");
+        anyhow::ensure!(!authorized, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh and --detach are not supported");
         return Ok(None);
     }
     let coordinator =
@@ -98,10 +98,10 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
             coordinator: Arc::new(coordinator),
             peer: Arc::new(peer),
         })),
-        _ if matches!(source_mode, AuthFrom::Return(_))
-            || matches!(destination_mode, AuthFrom::Return(_)) =>
+        _ if matches!(source_mode, AuthFrom::Provider(_))
+            || matches!(destination_mode, AuthFrom::Provider(_)) =>
         {
-            bail!("direct server-to-server copying through a laptop needs account access for both endpoints; select --auth-from @NAME for both, or save an authorizer for each endpoint")
+            bail!("direct server-to-server copying through authorization providers needs account access for both endpoints; select --auth-from for both, or save a provider for each endpoint")
         }
         _ => Ok(None),
     }
@@ -901,22 +901,26 @@ mod tests {
     }
     #[test]
     fn custom_routes_bypass_saved_choices_but_reject_explicit_authorizers() {
-        let mut args = args();
-        args.auth_from = AuthFrom::Return("laptop".into());
-        args.rsh = Some("ssh -i /custom/key".into());
-        args.auth_from_explicit = false;
-        assert!(select(&args).unwrap().is_none());
-        args.auth_from_explicit = true;
-        assert!(select(&args)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be combined"));
+        for provider in ["@laptop", "helper@provider.example:2222"] {
+            let mut args = args();
+            args.auth_from = crate::cli::parse_auth_from(provider).unwrap();
+            args.rsh = Some("ssh -i /custom/key".into());
+            args.auth_from_explicit = false;
+            assert!(select(&args).unwrap().is_none());
+            args.auth_from_explicit = true;
+            assert!(select(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined"));
+        }
     }
     #[test]
     fn unsupported_explicit_peer_modes_cannot_fall_back_to_native_credentials() {
-        for mode in 0..3 {
+        for (mode, provider) in (0..3).flat_map(|mode| {
+            ["@laptop", "helper@provider.example:2222"].map(|provider| (mode, provider))
+        }) {
             let mut args = args();
-            args.auth_from = AuthFrom::Return("laptop".into());
+            args.auth_from = crate::cli::parse_auth_from(provider).unwrap();
             args.auth_from_explicit = true;
             match mode {
                 0 => args.coordinate_at = CoordinateAt::Dst,

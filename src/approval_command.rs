@@ -93,7 +93,7 @@ pub(crate) fn check_authorizer(command: &[Vec<u8>], receiver: &str) -> Result<()
     let args = parse(command)?;
     anyhow::ensure!(
         matches!(args.auth_from, crate::cli::AuthFrom::Auto)
-            || matches!(&args.auth_from, crate::cli::AuthFrom::Return(name) if name == receiver),
+            || matches!(&args.auth_from, crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) if name == receiver),
         "the requesting command authorizes from a different machine"
     );
     Ok(())
@@ -129,7 +129,7 @@ fn check_storage_as(
         .as_ref()
         .context("storage requests must name s3://")?;
     anyhow::ensure!(
-        matches!(&args.auth_from, crate::cli::AuthFrom::Return(name) if name == receiver),
+        matches!(&args.auth_from, crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) if name == receiver),
         "the requesting command authorizes from a different machine"
     );
     let mut derived = match &args.descriptor_copy {

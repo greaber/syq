@@ -13,10 +13,73 @@ use std::path::{Path, PathBuf};
 
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
 
+/// The selected authority, independent of any reusable connection. Existing
+/// return records keep their bare name strings; native SSH providers have a
+/// distinct representation which older readers cannot mistake for a name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum Provider {
+    Return(String),
+    Ssh {
+        #[serde(rename = "ssh")]
+        endpoint: crate::cli::NativeEndpoint,
+    },
+}
+impl Provider {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let provider = if let Some(name) = value.strip_prefix('@') {
+            Self::Return(name.into())
+        } else {
+            Self::Ssh {
+                endpoint: crate::cli::parse_native_endpoint(Some(value))?
+                    .context("SSH authorization provider is missing")?,
+            }
+        };
+        provider.validate()?;
+        Ok(provider)
+    }
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Return(name) => crate::destination::validate_name(name),
+            Self::Ssh { endpoint } => crate::destination::ssh::validate_endpoint(endpoint),
+        }
+    }
+    pub(crate) fn receiving_name(&self) -> Option<&str> {
+        match self {
+            Self::Return(name) => Some(name),
+            Self::Ssh { .. } => None,
+        }
+    }
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Return(name) => format!("@{name}"),
+            Self::Ssh { endpoint } => {
+                let mut label = if endpoint.host.contains(':') {
+                    format!("[{}]", endpoint.host)
+                } else {
+                    endpoint.host.clone()
+                };
+                if let Some(user) = &endpoint.user {
+                    label = format!("{user}@{label}");
+                }
+                if let Some(port) = endpoint.port {
+                    label.push_str(&format!(":{port}"));
+                }
+                label
+            }
+        }
+    }
+}
+impl std::fmt::Display for Provider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label())
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub(crate) struct PreferenceCommand {
     /// Authorization for later commands; omit to show saved defaults
-    #[arg(value_name = "auto|ssh|@NAME", value_parser = crate::cli::parse_auth_from)]
+    #[arg(value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     value: Option<AuthFrom>,
     /// Apply to this exact destination hostname or SSH alias, for any login/port
     #[arg(long = "for", value_name = "HOST", value_parser = host_key)]
@@ -84,7 +147,7 @@ fn spelling(value: &AuthFrom) -> String {
     match value {
         AuthFrom::Auto => "auto".into(),
         AuthFrom::Ssh => "ssh".into(),
-        AuthFrom::Return(name) => format!("@{name}"),
+        AuthFrom::Provider(provider) => provider.label(),
     }
 }
 
@@ -285,6 +348,50 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
 mod tests {
     use super::*;
     #[test]
+    fn provider_values_preserve_return_state_and_distinguish_native_hosts() {
+        let returning = Provider::parse("@laptop").unwrap();
+        assert_eq!(serde_json::to_string(&returning).unwrap(), r#""laptop""#);
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""laptop""#).unwrap(),
+            returning
+        );
+        for value in [
+            "provider",
+            "alice@provider:2222",
+            "alice@[2001:db8::1]:2222",
+        ] {
+            let provider = Provider::parse(value).unwrap();
+            assert_eq!(provider.label(), value);
+            let encoded = serde_json::to_string(&provider).unwrap();
+            assert!(encoded.starts_with(r#"{"ssh":{"#), "{encoded}");
+            assert_eq!(
+                serde_json::from_str::<Provider>(&encoded).unwrap(),
+                provider
+            );
+            assert!(serde_json::from_str::<String>(&encoded).is_err());
+        }
+        for value in ["", "@", "bad/name", "-oProxyCommand=x", "alice@host:0"] {
+            assert!(Provider::parse(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn ordinary_provider_preferences_round_trip_without_changing_return_defaults() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("auth-from.json");
+        std::fs::write(&path, br#"{"default":"@laptop","hosts":{"other":"ssh"}}"#).unwrap();
+        let provider = crate::cli::parse_auth_from("alice@provider:2222").unwrap();
+        update(&path, Some("backup"), Some(&provider), true).unwrap();
+        let config = read(&path).unwrap();
+        assert_eq!(config.selected("backup").unwrap(), provider);
+        assert_eq!(config.selected("other").unwrap(), AuthFrom::Ssh);
+        assert_eq!(
+            config.selected("unchanged").unwrap(),
+            AuthFrom::Provider(Provider::Return("laptop".into()))
+        );
+    }
+
+    #[test]
     fn host_override_and_reset_preserve_other_preferences() {
         let root = crate::test_support::tempdir().unwrap();
         let path = root.path().join("auth-from.json");
@@ -292,19 +399,25 @@ mod tests {
             read(&path).unwrap().selected("backup").unwrap(),
             AuthFrom::Auto
         );
-        update(&path, None, Some(&AuthFrom::Return("laptop".into())), true).unwrap();
+        update(
+            &path,
+            None,
+            Some(&AuthFrom::Provider(Provider::Return("laptop".into()))),
+            true,
+        )
+        .unwrap();
         let config = update(&path, Some("backup"), Some(&AuthFrom::Ssh), true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Ssh);
         assert_eq!(
             config.selected("Backup").unwrap(),
-            AuthFrom::Return("laptop".into())
+            AuthFrom::Provider(Provider::Return("laptop".into()))
         );
         let config = update(&path, Some("backup"), Some(&AuthFrom::Auto), true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Auto);
         let config = update(&path, Some("backup"), None, true).unwrap();
         assert_eq!(
             config.selected("backup").unwrap(),
-            AuthFrom::Return("laptop".into())
+            AuthFrom::Provider(Provider::Return("laptop".into()))
         );
         let config = update(&path, None, None, true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Auto);
@@ -333,7 +446,7 @@ mod tests {
         let path = root.path().join("auth-from.json");
         for data in [
             "{",
-            r#"{"default":"laptop"}"#,
+            r#"{"default":"bad/name"}"#,
             r#"{"hosts":{"user@host":"ssh"}}"#,
             r#"{"version":2,"default":"@laptop","hosts":{"backup":"ssh"}}"#,
             r#"{"version":0}"#,
@@ -370,7 +483,7 @@ mod tests {
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Ssh);
         assert_eq!(
             config.selected("other").unwrap(),
-            AuthFrom::Return("laptop".into())
+            AuthFrom::Provider(Provider::Return("laptop".into()))
         );
         update(&path, None, None, true).unwrap();
         let saved: serde_json::Value =
@@ -389,7 +502,10 @@ mod tests {
             std::fs::write(&path, original).unwrap();
             let original: serde_json::Value = serde_json::from_str(original).unwrap();
             for (host, value) in [
-                (None, Some(AuthFrom::Return("laptop".into()))),
+                (
+                    None,
+                    Some(AuthFrom::Provider(Provider::Return("laptop".into()))),
+                ),
                 (Some("backup"), Some(AuthFrom::Ssh)),
                 (None, None),
                 (Some("backup"), None),

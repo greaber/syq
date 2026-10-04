@@ -1673,6 +1673,20 @@ fn ssh_completion_offers_auth_modes_without_probing_destinations() {
         &["syq", "ssh", "--auth-from", "@laptop", "host", "--", "--he"],
         &[],
     );
+    write(
+        &t.path("home/.ssh/config"),
+        b"Host provider-alias\n  HostName provider.invalid\n",
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "ssh", "--auth-from", "provider-"],
+        &["provider-alias"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "persist", "auth-from", "provider-"],
+        &["provider-alias"],
+    );
     assert!(!t.path("home/ssh-used").exists());
 }
 
@@ -2290,6 +2304,70 @@ fn approved_completion_keeps_stale_resolution_read_only_and_provider_bound() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert!(!t.path("rsh.log").exists());
     assert_eq!(fs::read(&cache_path).unwrap(), b"{");
+}
+
+#[test]
+fn ordinary_provider_completion_never_establishes_a_provider_or_native_fallback() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    approved_completion_master(&t, "laptop");
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let remote_path = format!("backup:{path}");
+    for saved in [false, true] {
+        if saved {
+            write(
+                &t.path("config/syq/auth-from.json"),
+                br#"{"default":"helper@provider.example:2222"}"#,
+            );
+        }
+        for (command, endpoint_flag) in [
+            ("cp", "--from"),
+            ("cp", "--to"),
+            ("map", "--from"),
+            ("rm", "--on"),
+            ("clean-partials", "--on"),
+            ("rsync", ""),
+        ] {
+            let rsync = command == "rsync";
+            let mut words = vec![
+                "syq",
+                command,
+                if rsync { "--rsync-path" } else { "--syq-path" },
+                env!("CARGO_BIN_EXE_syq"),
+            ];
+            if !saved {
+                words.extend([
+                    if rsync {
+                        "--syq-auth-from"
+                    } else {
+                        "--auth-from"
+                    },
+                    "helper@provider.example:2222",
+                ]);
+            }
+            if endpoint_flag == "--to" {
+                words.push("file");
+            }
+            if !rsync {
+                words.extend([endpoint_flag, "backup"]);
+            }
+            if endpoint_flag == "--to" {
+                words.push("--into");
+            }
+            words.push(if rsync { &remote_path } else { &path });
+            let output = approved_completion_command(&t, &words)
+                .env_remove("SYQ_COMPLETION_DEBUG")
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            assert!(output.stdout.is_empty(), "{command}: {output:?}");
+            assert!(output.stderr.is_empty(), "{command}: {output:?}");
+            assert!(
+                !t.path("rsh.log").exists(),
+                "{command} unexpectedly ran SSH"
+            );
+        }
+    }
 }
 
 #[test]

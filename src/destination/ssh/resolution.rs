@@ -1,5 +1,6 @@
 //! Provider-selected connection metadata, independent of approved SSH sockets.
 use super::{persistent, SessionRequest, Tty};
+use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::ssh_auth::{self, ResolvedPolicy};
 use crate::persistence::Domain;
@@ -35,7 +36,7 @@ pub(super) struct Plan {
 #[serde(deny_unknown_fields)]
 struct Entry {
     version: u16,
-    authorizer: String,
+    authorizer: Provider,
     requested: NativeEndpoint,
     selected: Selection,
     checked: u64,
@@ -44,7 +45,7 @@ struct Entry {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Refresh {
-    authorizer: String,
+    authorizer: Provider,
     requested: NativeEndpoint,
     provider: String,
     generation: String,
@@ -52,17 +53,10 @@ struct Refresh {
     scope_identity: Option<(u64, u64)>,
 }
 
-pub(super) fn provider_binding(authorizer: &str) -> Result<String> {
-    // load_registration also sends an identity challenge. Warm lookups must
-    // remain local: fresh resolve/authorization authenticates the provider.
-    ssh_auth::registration_binding(&crate::destination::read_existing_registration(authorizer)?
-        .with_context(|| format!("receiving machine @{authorizer} is not connected; reconnect it before resolving SSH"))?)
-}
-
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
-fn key(authorizer: &str, requested: &NativeEndpoint, provider: &str) -> Result<String> {
+fn key(authorizer: &Provider, requested: &NativeEndpoint, provider: &str) -> Result<String> {
     Ok(
         blake3::hash(&serde_json::to_vec(&(authorizer, requested, provider))?)
             .to_hex()
@@ -71,7 +65,7 @@ fn key(authorizer: &str, requested: &NativeEndpoint, provider: &str) -> Result<S
 }
 fn path(
     domain: &Domain,
-    authorizer: &str,
+    authorizer: &Provider,
     requested: &NativeEndpoint,
     provider: &str,
 ) -> Result<PathBuf> {
@@ -130,7 +124,7 @@ fn directory(domain: &Domain) -> Result<PathBuf> {
 }
 fn read_at(
     path: &Path,
-    authorizer: &str,
+    authorizer: &Provider,
     requested: &NativeEndpoint,
     provider: &str,
 ) -> Result<Option<Entry>> {
@@ -140,12 +134,13 @@ fn read_at(
     let entry: Entry =
         serde_json::from_reader(file.take(MAX_FILE + 1)).context("read SSH resolution metadata")?;
     anyhow::ensure!(
-        entry.version == 1
-            && entry.authorizer == authorizer
+        entry.version == persistent::provider_state_version(authorizer)
+            && entry.authorizer == *authorizer
             && entry.requested == *requested
             && entry.selected.provider == provider,
         "SSH resolution metadata does not match the selected provider and endpoint"
     );
+    entry.authorizer.validate()?;
     entry.selected.policy.validate()?;
     Ok(Some(entry))
 }
@@ -170,10 +165,12 @@ pub(super) fn cached(domain: &Domain, request: &SessionRequest) -> Result<Option
         if existing_directory(domain)?.is_none() {
             return Ok(None);
         }
-        let provider = provider_binding(&request.authorizer)?;
+        let Some(provider) = ssh_auth::local_binding(domain, &request.provider)? else {
+            return Ok(None);
+        };
         Ok(read_at(
-            &path(domain, &request.authorizer, &request.destination, &provider)?,
-            &request.authorizer,
+            &path(domain, &request.provider, &request.destination, &provider)?,
+            &request.provider,
             &request.destination,
             &provider,
         )?
@@ -186,11 +183,11 @@ pub(super) fn cached(domain: &Domain, request: &SessionRequest) -> Result<Option
 /// only a later invocation can observe a completed background refresh.
 pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> {
     let generation = persistent::ensure_generation(domain)?;
-    let provider = provider_binding(&request.authorizer)?;
-    let cache_path = path(domain, &request.authorizer, &request.destination, &provider)?;
     let entry = (|| -> Result<Option<Entry>> {
+        let Some(binding) = ssh_auth::local_binding(domain, &request.provider)? else { return Ok(None); };
         if existing_directory(domain)?.is_none() { return Ok(None); }
-        read_at(&cache_path, &request.authorizer, &request.destination, &provider)
+        read_at(&path(domain, &request.provider, &request.destination, &binding)?,
+            &request.provider, &request.destination, &binding)
     })().unwrap_or_else(|error| {
         crate::output::diagnostic!("syq: warning: cannot read SSH resolution cache ({error:#}); resolving the selected provider again");
         None
@@ -201,6 +198,12 @@ pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> 
             .checked_sub(entry.attempted)
             .is_none_or(|age| age >= FRESH)
         {
+            let cache_path = path(
+                domain,
+                &request.provider,
+                &request.destination,
+                &selected.provider,
+            )?;
             if let Err(error) = refresh(domain, &cache_path, entry, &generation) {
                 crate::output::diagnostic!("syq: warning: cannot refresh SSH resolution ({error:#}); using the selected cached endpoint");
             }
@@ -210,18 +213,28 @@ pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> 
             generation,
         });
     }
-    let policy = ssh_auth::resolve(request)?;
+    let resolved = ssh_auth::resolve(domain, request)?;
     anyhow::ensure!(
-        provider_binding(&request.authorizer)? == provider,
+        ssh_auth::local_binding(domain, &request.provider)?.as_deref()
+            == Some(resolved.binding.as_str()),
         "SSH provider connection changed during resolution; retry the command"
     );
-    let selected = Selection { provider, policy };
+    let selected = Selection {
+        provider: resolved.binding,
+        policy: resolved.policy,
+    };
     anyhow::ensure!(
         persistent::generation_open(domain, &generation)?,
         "SSH resolution was cancelled while inspecting the provider"
     );
     let saved = (|| -> Result<()> {
         directory(domain)?;
+        let cache_path = path(
+            domain,
+            &request.provider,
+            &request.destination,
+            &selected.provider,
+        )?;
         let Some(_lock) = try_lock(&cache_path)? else {
             return Ok(());
         };
@@ -233,8 +246,8 @@ pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> 
         store_at(
             &cache_path,
             &Entry {
-                version: 1,
-                authorizer: request.authorizer.clone(),
+                version: persistent::provider_state_version(&request.provider),
+                authorizer: request.provider.clone(),
                 requested: request.destination.clone(),
                 selected: selected.clone(),
                 checked: timestamp,
@@ -260,13 +273,13 @@ pub(super) fn invalidate(
 ) -> Result<()> {
     let path = path(
         domain,
-        &request.authorizer,
+        &request.provider,
         &request.destination,
         &selected.provider,
     )?;
     if read_at(
         &path,
-        &request.authorizer,
+        &request.provider,
         &request.destination,
         &selected.provider,
     )?
@@ -383,7 +396,7 @@ fn run_refresh(startup: Refresh) -> Result<()> {
         "SSH resolution refresh is missing its scope identity"
     );
     let request = SessionRequest {
-        authorizer: startup.authorizer.clone(),
+        provider: startup.authorizer.clone(),
         destination: startup.requested.clone(),
         tty: Tty::Disabled,
         command: Vec::new(),
@@ -394,7 +407,8 @@ fn run_refresh(startup: Refresh) -> Result<()> {
         "SSH resolution refresh was cancelled"
     );
     anyhow::ensure!(
-        provider_binding(&request.authorizer)? == startup.provider,
+        ssh_auth::local_binding(&domain, &request.provider)?.as_deref()
+            == Some(startup.provider.as_str()),
         "SSH provider connection changed before refresh"
     );
     // The parent acquired this lock before spawning; fd 0 keeps it held until
@@ -416,10 +430,11 @@ fn run_refresh(startup: Refresh) -> Result<()> {
         "SSH resolution refresh did not inherit its lock"
     );
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let resolve_domain = domain.clone();
     std::thread::spawn(move || {
-        let _ = sender.send(ssh_auth::resolve(&request));
+        let _ = sender.send(ssh_auth::resolve(&resolve_domain, &request));
     });
-    let Some(policy) = await_resolution(
+    let Some(resolved) = await_resolution(
         &domain,
         &startup,
         &receiver,
@@ -429,7 +444,8 @@ fn run_refresh(startup: Refresh) -> Result<()> {
         return Ok(());
     };
     if !refresh_open(&domain, &startup)
-        || provider_binding(&startup.authorizer)? != startup.provider
+        || ssh_auth::local_binding(&domain, &startup.authorizer)?.as_deref()
+            != Some(resolved.binding.as_str())
     {
         return Ok(());
     }
@@ -439,15 +455,15 @@ fn run_refresh(startup: Refresh) -> Result<()> {
             &domain,
             &startup.authorizer,
             &startup.requested,
-            &startup.provider,
+            &resolved.binding,
         )?,
         &Entry {
-            version: 1,
+            version: persistent::provider_state_version(&startup.authorizer),
             authorizer: startup.authorizer,
             requested: startup.requested,
             selected: Selection {
-                provider: startup.provider,
-                policy,
+                provider: resolved.binding,
+                policy: resolved.policy,
             },
             checked: timestamp,
             attempted: timestamp,
@@ -458,9 +474,9 @@ fn run_refresh(startup: Refresh) -> Result<()> {
 fn await_resolution(
     domain: &Domain,
     startup: &Refresh,
-    receiver: &std::sync::mpsc::Receiver<Result<ResolvedPolicy>>,
+    receiver: &std::sync::mpsc::Receiver<Result<ssh_auth::Resolved>>,
     deadline: Instant,
-) -> Result<Option<ResolvedPolicy>> {
+) -> Result<Option<ssh_auth::Resolved>> {
     loop {
         if !refresh_open(domain, startup) || Instant::now() >= deadline {
             return Ok(None);
@@ -598,7 +614,7 @@ mod tests {
         .unwrap();
         let entry = Entry {
             version: 1,
-            authorizer: "laptop".into(),
+            authorizer: Provider::Return("laptop".into()),
             requested: NativeEndpoint {
                 user: None,
                 host: "alias".into(),
@@ -647,7 +663,13 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(frozen.selected, entry.selected);
-        assert!(read_at(&path, "other", &entry.requested, &entry.selected.provider).is_err());
+        assert!(read_at(
+            &path,
+            &Provider::Return("other".into()),
+            &entry.requested,
+            &entry.selected.provider
+        )
+        .is_err());
         assert!(read_at(&path, &entry.authorizer, &entry.requested, &"b".repeat(64)).is_err());
         let mut other = entry.requested.clone();
         other.port = Some(2222);
@@ -670,6 +692,66 @@ mod tests {
             .selected,
             changed.selected
         );
+    }
+
+    #[test]
+    fn native_provider_metadata_has_distinct_keys_and_version() {
+        let (_root, domain, mut entry) = fixture();
+        let old_path = entry_path(&domain, &entry);
+        store_at(&old_path, &entry).unwrap();
+        // Keep the existing Return encoding and cache key, including the
+        // original bare authorizer string used before typed providers.
+        assert_eq!(
+            key(
+                &entry.authorizer,
+                &entry.requested,
+                &entry.selected.provider
+            )
+            .unwrap(),
+            blake3::hash(
+                &serde_json::to_vec(&("laptop", &entry.requested, &entry.selected.provider))
+                    .unwrap()
+            )
+            .to_hex()
+            .to_string()
+        );
+        let old_json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(old_json["authorizer"], "laptop");
+        entry.authorizer = Provider::parse("laptop").unwrap();
+        let new_path = entry_path(&domain, &entry);
+        assert_ne!(new_path, old_path);
+        entry.version = persistent::provider_state_version(&entry.authorizer);
+        assert_eq!(entry.version, 2);
+        store_at(&new_path, &entry).unwrap();
+        assert_eq!(
+            read_at(
+                &new_path,
+                &entry.authorizer,
+                &entry.requested,
+                &entry.selected.provider
+            )
+            .unwrap()
+            .unwrap()
+            .authorizer,
+            entry.authorizer
+        );
+        assert!(read_at(
+            &new_path,
+            &Provider::Return("laptop".into()),
+            &entry.requested,
+            &entry.selected.provider
+        )
+        .is_err());
+        entry.version = 1;
+        store_at(&new_path, &entry).unwrap();
+        assert!(read_at(
+            &new_path,
+            &entry.authorizer,
+            &entry.requested,
+            &entry.selected.provider
+        )
+        .is_err());
+        assert!(old_path.exists());
     }
 
     #[test]
@@ -713,7 +795,7 @@ mod tests {
         let (_root, domain, entry) = fixture();
         let path = entry_path(&domain, &entry);
         let request = SessionRequest {
-            authorizer: entry.authorizer.clone(),
+            provider: entry.authorizer.clone(),
             destination: entry.requested.clone(),
             tty: Tty::Disabled,
             command: Vec::new(),

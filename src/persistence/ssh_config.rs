@@ -14,7 +14,7 @@ pub(crate) struct ExportCommand {
     /// Approved SSH endpoint: [USER@]HOST[:PORT]
     host: String,
     /// Select existing approval; omitted uses the saved preference, then auto
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = crate::cli::parse_auth_from)]
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
 }
 
@@ -24,9 +24,9 @@ pub(crate) fn run(domain: &super::Domain, command: ExportCommand) -> Result<i32>
     crate::destination::ssh::validate_endpoint(&requested)?;
     let mode = crate::auth_from::resolve(domain, &requested.host, command.auth_from)?;
     ensure!(mode != AuthFrom::Ssh,
-        "ssh-config exports approved account connections; use --auth-from auto or @NAME instead of native SSH authorization");
+        "ssh-config exports approved account connections; select an authorization provider instead of native SSH authorization");
     let cached = crate::destination::ssh::persistent::select_export(domain, &requested, &mode)?
-        .context("no approved account connection matches; first run syq persist connect HOST --auth-from @NAME (ssh-config never opens a connection)")?;
+        .context("no approved account connection matches; first run syq ssh HOST --auth-from PROVIDER (ssh-config never opens a connection)")?;
     let config = export(&requested, cached.endpoint(), cached.control())?;
     std::io::stdout().lock().write_all(config.as_bytes())?;
     Ok(0)

@@ -349,7 +349,12 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             let forwarded = args.return_source.clone().or_else(|| {
                 args.named_receipt
                     .as_ref()
-                    .filter(|_| matches!(args.auth_from, crate::cli::AuthFrom::Return(_)))
+                    .filter(|_| {
+                        matches!(
+                            args.auth_from,
+                            crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(_))
+                        )
+                    })
                     .and_then(|receipt| receipt.connection.clone())
             });
             let rsh = parse_rsh(&args.rsh)?;

@@ -211,7 +211,12 @@ pub(super) fn select(
         return Ok(None);
     }
     let explicit = match &args.auth_from {
-        crate::cli::AuthFrom::Return(name) => Some(name.clone()),
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) => {
+            Some(name.clone())
+        }
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. }) => {
+            bail!("this copy cannot use account authorization from an SSH provider; use a supported direct SSH copy or --auth-from @NAME for per-copy authorization");
+        }
         _ => handoff::selected_name(handoff::Kind::Pull).map(str::to_owned),
     };
     let target = match eligible_target(args) {
@@ -291,7 +296,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     else {
         bail!("source approval did not provide its resolved data hostname");
     };
-    args.auth_from = crate::cli::AuthFrom::Return(name);
+    args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     args.return_source = Some(ReturnConnection::source(stream, data_hostname)?);
     Ok(())
 }

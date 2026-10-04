@@ -352,7 +352,8 @@ fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
     // Account-authorized copies use a primed ordinary RemoteSpec instead of
     // the per-copy source-authority control channel.
     args.return_source = None;
-    args.auth_from = crate::cli::AuthFrom::Return("laptop".into());
+    args.auth_from =
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return("laptop".into()));
     args.direct_source = Some(Box::new(crate::conn::RemoteSpec::local_receiver(true)));
     assert_eq!(args.automatic_worker_limit(), 1000);
     args.resource_limits = None;
@@ -900,10 +901,12 @@ fn storage_authorization_is_explicit_and_preserves_provider_options() {
             "storage",
         ]);
         let args = parse_native_copy(&argv(&command)).unwrap();
-        assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
+        assert!(
+            matches!(args.auth_from, super::AuthFrom::Provider(crate::auth_from::Provider::Return(ref name)) if name == "laptop")
+        );
         assert_eq!(args.s3.unwrap().profile.as_deref(), Some("storage"));
     }
-    for mode in ["auto", "ssh"] {
+    for mode in ["auto", "ssh", "alice@provider:2222"] {
         let error = parse_native_copy(&argv(&[
             "source",
             "--to",
@@ -939,7 +942,9 @@ fn storage_callbacks_preserve_an_explicit_authorizer() {
     ]))
     .unwrap();
     assert_eq!(args.stream_mapping_fd, Some(4));
-    assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
+    assert!(
+        matches!(args.auth_from, super::AuthFrom::Provider(crate::auth_from::Provider::Return(ref name)) if name == "laptop")
+    );
 }
 
 #[test]
@@ -1109,9 +1114,15 @@ fn account_auth_selection_is_explicit_for_each_ssh_operation() {
             "@laptop",
         ],
     ] {
-        let args = Args::parse_args(&argv(&words)).unwrap();
-        assert!(args.auth_from_explicit, "{words:?}");
-        assert_eq!(args.auth_from, super::AuthFrom::Return("laptop".into()));
+        for provider in ["@laptop", "alice@provider:2222"] {
+            let words: Vec<_> = words
+                .iter()
+                .map(|word| if *word == "@laptop" { provider } else { *word })
+                .collect();
+            let args = Args::parse_args(&argv(&words)).unwrap();
+            assert!(args.auth_from_explicit, "{words:?}");
+            assert_eq!(args.auth_from, super::parse_auth_from(provider).unwrap());
+        }
     }
     for words in [
         vec!["map", "file"],

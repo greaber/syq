@@ -481,6 +481,9 @@ python3 /usr/local/libexec/syq-test-return-ssh.py
 printf 'case: native tools reuse laptop-approved account connections\n'
 python3 /usr/local/libexec/syq-test-ssh-tools.py
 
+printf 'case: ordinary SSH provider account access without agent forwarding\n'
+python3 /usr/local/libexec/syq-test-provider-ssh.py
+
 printf 'case: direct three-server copies use approved account connections\n'
 python3 /usr/local/libexec/syq-test-peer-bridge.py
 

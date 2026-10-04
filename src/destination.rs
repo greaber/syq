@@ -856,7 +856,8 @@ fn select_copy(
     if let Some(name) = handoff::selected_name(handoff::Kind::Forward)
         .or_else(|| handoff::selected_name(handoff::Kind::Pull))
     {
-        args.auth_from = crate::cli::AuthFrom::Return(name.to_owned());
+        args.auth_from =
+            crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name.to_owned()));
     } else {
         crate::auth_from::apply_copy(args)?;
         if let Some(selection) = peer_bridge::select(args)? {
@@ -877,7 +878,7 @@ fn select_copy(
         return pull::select(args, progress);
     }
     match &args.auth_from {
-        crate::cli::AuthFrom::Return(_) => return forward::select(args, progress),
+        crate::cli::AuthFrom::Provider(_) => return forward::select(args, progress),
         crate::cli::AuthFrom::Ssh => {
             if args
                 .locations
@@ -1938,6 +1939,9 @@ fn destinations(action: DestinationAction) -> Result<i32> {
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     if let Some(result) = peer_bridge::dispatch(argv) {
+        return Some(result);
+    }
+    if let Some(result) = ssh::provider::dispatch(argv) {
         return Some(result);
     }
     if let Some(result) = ssh::persistent::dispatch(argv) {

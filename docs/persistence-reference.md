@@ -13,10 +13,12 @@ for creation, lifetime, and cleanup.
 
 ## Authorization defaults
 
-On a server, choose the receiving machine for later SSH access:
+On a server, choose the authorization provider for later SSH access:
 
 ```sh
 syq persist auth-from @laptop
+# Or use an ordinary SSH provider:
+syq persist auth-from alice@provider:2222
 syq persist auth-from ssh --for backup
 syq persist auth-from
 syq persist auth-from --reset --for backup
@@ -46,7 +48,7 @@ add `--for HOST` to show that host's effective choice.
 Defaults apply to `syq ssh`, copies using approved account connections, and the
 SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
 using `--coordinate-at local` selects access separately for each endpoint.
-Selecting `@NAME` lets a command request account access when it has no approved
+Selecting `@NAME` or an ordinary provider endpoint lets a command request account access when it has no approved
 connection. `persist connect --auth-from @NAME` can prepare that access in
 advance. Custom `--rsh` routes, copies to receiving names, and object storage
 keep their own authentication. An explicit scope uses its own saved choices.
@@ -62,7 +64,8 @@ file. To discard all saved choices, remove that file yourself.
 
 ## Approved account connections
 
-Commands selecting `@NAME` request an approved account connection when needed.
+Commands selecting `@NAME` or an ordinary SSH provider request an approved
+account connection when needed.
 `syq persist connect HOST --auth-from @NAME` prepares the same connection in
 advance. Neither operation enables ordinary persistence or receiving on `HOST`.
 `--pscope` selects the domain that owns the connection. Helper overrides do not
@@ -106,7 +109,7 @@ eligible native copies can use restricted per-copy approval after a native SSH
 failure.
 
 `rsync`, `rm`, `map`, `clean-partials`, and descriptor copies also request or
-reuse account access selected through `@NAME`. The laptop prompt grants the
+reuse account access selected through an authorization provider. Its prompt grants the
 account's authority, not permission for only the displayed operation. Remote
 path completion uses existing approval and never prompts for access.
 
@@ -118,7 +121,7 @@ TCP data, but cannot open the concurrent SSH data workers needed by larger
 copies or byte streams. Syq does not bypass the selected approval with another
 SSH login when the session limit is reached.
 
-`syq persist ssh-config HOST [--auth-from auto|ssh|@NAME]` prints a standalone
+`syq persist ssh-config HOST [--auth-from auto|ssh|@NAME|HOST]` prints a standalone
 OpenSSH configuration for one existing approved login. Use it with `ssh`,
 `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.
 The endpoint must match the user, host spelling, and port used to open

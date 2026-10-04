@@ -32,7 +32,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from @NAME, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. Explicit scopes isolate connections, receiving profiles, authorization preferences, and permissions. Create one with on --ephemeral and select it for any persistence operation with --pscope. Idle SSH connections in ephemeral scopes expire; closing a scope stops its services and removes its settings."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from PROVIDER, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. Explicit scopes isolate connections, receiving profiles, authorization preferences, and permissions. Create one with on --ephemeral and select it for any persistence operation with --pscope. Idle SSH connections in ephemeral scopes expire; closing a scope stops its services and removes its settings."
 )]
 struct PersistCommand {
     /// Select an isolated persistence domain instead of the default domain
@@ -52,12 +52,12 @@ enum PersistAction {
     Receive(crate::receive_service::ReceiveCommand),
     /// Inspect named return destinations available to this server account
     Destinations(crate::destination::Destinations),
-    /// Connect with native SSH, or request reusable account access with --auth-from @NAME
+    /// Connect with native SSH, or request reusable account access through an authorization provider
     Connect {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
-        /// Authorize a reusable destination-account login through a receiving machine
-        #[arg(long, value_name = "auto|ssh|@NAME", conflicts_with_all = ["syq_path", "no_bootstrap"])]
+        /// Authorize a reusable destination-account login through @NAME or an SSH provider
+        #[arg(long, value_name = "auto|ssh|@NAME|HOST", conflicts_with_all = ["syq_path", "no_bootstrap"])]
         auth_from: Option<String>,
         /// Use this remote syq executable instead of installing a matching helper
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
@@ -209,13 +209,13 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 .map(crate::cli::parse_auth_from)
                 .transpose()?;
             let authorizer = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
-            if let crate::cli::AuthFrom::Return(authorizer) = authorizer {
+            if let crate::cli::AuthFrom::Provider(authorizer) = authorizer {
                 let explicit_timeout = matches.subcommand_matches("connect").is_some_and(|args| {
                     args.value_source("timeout") == Some(clap::parser::ValueSource::CommandLine)
                 });
                 anyhow::ensure!(
                     !explicit_timeout,
-                    "--timeout applies only to native SSH receiving setup; saved authorization selects @{authorizer}"
+                    "--timeout applies only to native SSH receiving setup; selected authorization uses {authorizer}"
                 );
                 anyhow::ensure!(
                     syq_path.is_none() && !no_bootstrap,
@@ -224,7 +224,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 let request = crate::destination::ssh::parse(&[
                     "ssh".into(),
                     "--auth-from".into(),
-                    format!("@{authorizer}").into(),
+                    authorizer.label().into(),
                     host.into(),
                 ])?;
                 crate::destination::ssh::persistent::connect(&domain, request)?;
@@ -255,12 +255,15 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 write_global_config(false)?;
             }
             let scope = domain.runtime_path();
-            // Close admission before invalidating approved connections. Both
-            // cleanup paths run even when one reports a damaged record.
+            // Close admission before invalidating approved connections. Every
+            // cleanup path runs even when another reports damaged state.
             if scope.exists() {
                 validate_scope(&scope)?;
                 mark_closing(&scope)?;
             }
+            let provider = crate::receive_service::provider::stop(&domain);
+            let provider_links = crate::destination::ssh::provider::stop_all(&domain)
+                .and_then(|()| crate::destination::ssh::provider::cleanup_domain(&domain));
             let accounts = crate::destination::ssh::persistent::stop_all(&domain)
                 .and_then(|()| crate::destination::ssh::persistent::cleanup_domain(&domain));
             let ordinary = match scope.symlink_metadata() {
@@ -270,13 +273,16 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     Err(error).with_context(|| format!("inspect scope {}", scope.display()))
                 }
             };
-            match (accounts, ordinary) {
-                (Ok(()), Ok(())) => {}
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-                (Err(accounts), Err(ordinary)) => bail!(
-                    "approved SSH cleanup: {accounts:#}; ordinary connection cleanup: {ordinary:#}"
-                ),
-            }
+            let failures: Vec<_> = [
+                ("authorization provider cleanup", provider),
+                ("provider connection cleanup", provider_links),
+                ("approved SSH cleanup", accounts),
+                ("ordinary connection cleanup", ordinary),
+            ]
+            .into_iter()
+            .filter_map(|(step, result)| result.err().map(|error| format!("{step}: {error:#}")))
+            .collect();
+            anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
             crate::output::human_stdout!("SSH connection persistence is off");
         }
         PersistAction::Status { json } => {
@@ -1071,12 +1077,35 @@ const DOMAIN_SETTINGS: &[&str] = &[
     "account-permissions-v1.lock",
     crate::receive_approval::provider_accounts::STATE_FILE,
     crate::receive_approval::provider_accounts::LOCK_FILE,
+    crate::receive_service::provider::SOCKET_FILE,
+    crate::receive_service::provider::LOCK_FILE,
 ];
 
 fn close_scope(scope: &Path) -> Result<()> {
     let records = scope_records(scope)?;
     let closing = scope.join(crate::receive_service::CLOSING);
     mark_closing(scope)?;
+    // Unknown or damaged auxiliary state must not keep known connections alive.
+    // Validate all entries before deleting anything, but stop every known owner
+    // first even if one service has already failed.
+    let mut failures = Vec::new();
+    for (key, record) in &records {
+        let socket = scope.join(key);
+        for result in [
+            crate::receive_service::stop(&socket),
+            crate::session_pool::stop(&socket),
+        ] {
+            if let Err(error) = result {
+                failures.push(format!("{}: {error:#}", record.label()));
+            }
+        }
+        if socket_is_live(&socket) {
+            if let Err(error) = close_master(&socket, record) {
+                failures.push(format!("{}: {error:#}", record.label()));
+            }
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     let record_keys: std::collections::HashSet<&str> =
         records.iter().map(|(key, _)| key.as_str()).collect();
     for entry in std::fs::read_dir(scope)? {
@@ -1111,14 +1140,8 @@ fn close_scope(scope: &Path) -> Result<()> {
         );
     }
 
-    for (key, record) in records {
+    for (key, _) in records {
         let socket = scope.join(&key);
-        crate::receive_service::stop(&socket)?;
-        // The pool holds live sessions on the master, so it goes first.
-        crate::session_pool::stop(&socket)?;
-        if socket_is_live(&socket) {
-            close_master(&socket, &record)?;
-        }
         if let Ok(metadata) = socket.symlink_metadata() {
             if metadata.is_dir() {
                 bail!(
