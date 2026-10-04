@@ -603,15 +603,17 @@ fn spawn_reader(
     let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default()).unwrap();
     (rx, reader)
 }
+type ObservedReader = (
+    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<batch_progress::BatchReceipts>,
+);
+
 fn spawn_observed_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
-) -> std::io::Result<(
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
-    std::thread::JoinHandle<()>,
-    std::sync::Arc<batch_progress::BatchReceipts>,
-)> {
+) -> std::io::Result<ObservedReader> {
     // Control requests also pipeline up to the default depth. Keeping that
     // capacity prevents a sequential helper blocking on replies while its
     // coordinator is still sending requests (including large path batches).
