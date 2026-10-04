@@ -270,11 +270,6 @@ impl Selection {
             !args.no_tcp_encryption,
             "restricted peer copies require encrypted TCP or SSH"
         );
-        // Bridge controls need their own helper sessions. Release only idle
-        // spares; handed-off sessions and their approved masters stay alive.
-        for control in [self.coordinator.control(), self.peer.control()] {
-            crate::session_pool::stop(control).context("release idle helpers for peer copy")?;
-        }
         let peer_policy = self.peer.peer()?;
         let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
         let coordinator = super::account_copy::approved_connection(
@@ -459,11 +454,9 @@ impl Prepared {
         receive: impl FnOnce(ChildStdout) -> Result<T> + Send + 'static,
     ) -> Result<(ExitStatus, T)> {
         let deadline = Instant::now() + SETUP;
-        let mut ready_child = None;
-        for install in [false, true] {
-            if install {
-                self.coordinator.install_helper()?;
-            }
+        let mut installed = false;
+        let mut reclaimed = false;
+        let (mut child, ready) = loop {
             let mut child = forward::ForwardChild::spawn_streaming_command(
                 self.coordinator
                     .helper_command(&["--peer-coordinator".into()]),
@@ -474,26 +467,37 @@ impl Prepared {
                 cancelled: Some(&|| self.closed.load(Ordering::Acquire)),
             });
             match ready {
-                Ok(ready) => {
-                    ready_child = Some((child, ready));
-                    break;
-                }
+                Ok(ready) => break (child, ready),
                 Err(error) => {
                     let status =
                         child.wait_for_exit(deadline, &|| self.closed.load(Ordering::Acquire));
-                    if !install
+                    if !reclaimed
+                        && status
+                            .as_ref()
+                            .is_ok_and(|status| status.code() == Some(255))
+                        && self
+                            .coordinator
+                            .release_idle_helpers_after_startup_failure(status.as_ref().unwrap())?
+                    {
+                        // No CoordinatorStart (and therefore no copy command)
+                        // has been sent. Retry only this failed SSH startup.
+                        reclaimed = true;
+                        continue;
+                    }
+                    if !installed
                         && self.coordinator.bootstrap_helper
                         && status
                             .as_ref()
                             .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
                     {
+                        self.coordinator.install_helper()?;
+                        installed = true;
                         continue;
                     }
                     return Err(error).context("start approved peer coordinator");
                 }
             }
-        }
-        let (mut child, ready) = ready_child.context("peer coordinator did not become ready")?;
+        };
         anyhow::ensure!(
             ready.version == VERSION && ready.identity == crate::identity::build(),
             "peer coordinator build mismatch"

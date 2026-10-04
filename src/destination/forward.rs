@@ -432,14 +432,13 @@ impl ForwardChild {
         deadline: Instant,
         cancelled: &impl Fn() -> bool,
     ) -> Result<(Self, Reply)> {
-        for install in [false, true] {
+        let mut installed = false;
+        let mut reclaimed = false;
+        loop {
             anyhow::ensure!(
                 !cancelled() && Instant::now() < deadline,
                 "copy setup stopped"
             );
-            if install {
-                spec.install_helper()?;
-            }
             let mut child = Self::spawn_command(spec.helper_command(&[operation.into()]))?;
             let reply = (|| {
                 write_message(
@@ -469,12 +468,26 @@ impl ForwardChild {
                 Ok(reply) => return Ok((child, reply)),
                 Err(error) => {
                     let status = child.wait_for_exit(deadline, cancelled);
-                    if !install
+                    if !reclaimed
+                        && status
+                            .as_ref()
+                            .is_ok_and(|status| status.code() == Some(255))
+                        && spec
+                            .release_idle_helpers_after_startup_failure(status.as_ref().unwrap())?
+                    {
+                        // The failed child has been closed. No copy data has
+                        // been admitted before this setup reply and Hello.
+                        reclaimed = true;
+                        continue;
+                    }
+                    if !installed
                         && spec.bootstrap_helper
                         && status
                             .as_ref()
                             .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
                     {
+                        spec.install_helper()?;
+                        installed = true;
                         continue;
                     }
                     return Err(error).with_context(|| {
@@ -483,7 +496,6 @@ impl ForwardChild {
                 }
             }
         }
-        unreachable!()
     }
 
     pub(super) fn spawn_streaming_command(mut command: Command) -> Result<Self> {

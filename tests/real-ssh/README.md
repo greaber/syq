@@ -91,7 +91,10 @@ Approved-account uploads and downloads also run in this profile, with larger
 files and overlapping independent SSH data connections. The requester-config
 fixture disables idle helper prewarming only for its completion calls in this
 profile: a ready helper would occupy the sole session needed by its later shell
-commands. The default profile keeps prewarming enabled. Workflows that require
+commands. The peer-copy case prewarms both approved connections in both profiles:
+a TCP copy can reclaim idle helpers after a session refusal, while the default
+profile checks that TCP and SSH copies preserve the same helpers for completion.
+Workflows that require
 concurrent sessions on one connection, including approved three-server SSH
 setup, run in the default profile and are listed in `max-sessions-1.skip`.
 

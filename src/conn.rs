@@ -1597,6 +1597,27 @@ impl RemoteSpec {
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
     }
 
+    /// Only a failed SSH startup may reclaim idle slots from an approved
+    /// master. Successful helper launches never inspect or change the pool.
+    /// Callers retry at most once, before starting the copy or its command.
+    pub(crate) fn release_idle_helpers_after_startup_failure(
+        &self,
+        status: &std::process::ExitStatus,
+    ) -> Result<bool> {
+        if status.code() != Some(255) {
+            return Ok(false);
+        }
+        let Some(multiplexer) = &self.ssh_multiplexer else {
+            return Ok(false);
+        };
+        if !multiplexer.existing_only || !crate::session_pool::is_running(&multiplexer.path) {
+            return Ok(false);
+        }
+        crate::session_pool::stop(&multiplexer.path)
+            .context("release idle helpers after SSH session setup failed")?;
+        Ok(true)
+    }
+
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
         let mut command = self.ssh_command(SshConnection::Independent, false);
         command.arg(self.program_command(args));
