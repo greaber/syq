@@ -442,7 +442,7 @@ impl FsOps {
         }
         for (position, result) in positions
             .into_iter()
-            .zip(self.put_small_sources(&puts, &sources))
+            .zip(self.put_small_sources(&puts, &sources, true))
         {
             results[position] = result
                 .map(|identity| SmallPatched {
@@ -551,11 +551,13 @@ impl FsOps {
         {
             bail!("block hash mismatch on receive");
         }
-        let put = |data: Vec<u8>, hash| SmallPut {
+        // The patch's new data was checked above, and its put is published
+        // without another check, so it carries no payload hash.
+        let put = |data: Vec<u8>| SmallPut {
             path: patch.path.clone(),
             copy_id: patch.copy_id,
             data,
-            hash,
+            hash: [0; 32],
             meta: patch.meta.clone(),
             flags: patch.flags,
             inplace: false,
@@ -578,26 +580,16 @@ impl FsOps {
                     (index as u64 * patch.block + patch.block).min(patch.len) <= basis.len
                 });
             if within && fingerprint(&old.metadata()?) == basis {
-                let hash = if self.hash_policy.transfer_integrity {
-                    self.observed_payload_hash(&[])
-                } else {
-                    [0; 32]
-                };
                 let source = PatchSource {
                     old: old.try_clone()?,
                     basis,
                     patch,
                 };
-                return Ok((put(Vec::new(), hash), Some(source)));
+                return Ok((put(Vec::new()), Some(source)));
             }
         }
         let data = assemble(old.as_ref(), self.hash_policy.algorithm, patch)?;
-        let hash = if self.hash_policy.transfer_integrity {
-            self.observed_payload_hash(&data)
-        } else {
-            [0; 32]
-        };
-        Ok((put(data, hash), None))
+        Ok((put(data), None))
     }
 
     /// Write a cloning patch's stage: the file it replaces, cloned, with the
@@ -665,15 +657,17 @@ impl FsOps {
     }
 
     pub(super) fn put_small_batch(&mut self, puts: &[SmallPut]) -> Vec<SmallOutcome> {
-        self.put_small_sources(puts, &[])
+        self.put_small_sources(puts, &[], false)
     }
 
     /// Publish `puts`, writing those with a patch source from the file it
-    /// patches rather than from their data.
+    /// patches rather than from their data. Puts `built` from patches,
+    /// whose data was checked as it arrived, carry no payload hash to check.
     fn put_small_sources(
         &mut self,
         puts: &[SmallPut],
         sources: &[Option<PatchSource<'_>>],
+        built: bool,
     ) -> Vec<SmallOutcome> {
         let mut results: Vec<SmallOutcome> = vec![Ok(None); puts.len()];
         let mut carried = None;
@@ -699,7 +693,12 @@ impl FsOps {
             while run.len() <= reserved.0 && next < puts.len() && !puts[next].inplace {
                 let index = next;
                 next += 1;
-                let target = match self.small_target(&puts[index]) {
+                let target = if built {
+                    self.destination_mutation_target(&puts[index].path, puts[index].guard.as_ref())
+                } else {
+                    self.small_target(&puts[index])
+                };
+                let target = match target {
                     Ok(target) => target,
                     Err(error) => {
                         results[index] = Err(wire_error(&error));

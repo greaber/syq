@@ -501,6 +501,63 @@ fn by_default_only_replaced_files_of_unchanged_size_are_compared() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_patch_whose_payload_fails_its_check_is_copied_whole() {
+    // With transfer integrity, the receiver checks the differing blocks a
+    // patch carries against the payload hash the source sent. Here one
+    // payload check fails, as for data corrupted in transit: the patch is
+    // refused and the file is copied whole instead.
+    for (remote, cloning) in [(false, true), (false, false), (true, true)] {
+        let t = Tmp::new();
+        let source = prng(8 << 20, 874);
+        let mut old = source.clone();
+        old[4 << 20] ^= 1;
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        set_mtime(&t.path("dst/file"), 1);
+        let marker = t.path("corrupted-once");
+        let (source_dir, destination_dir) = (t.s("src/"), t.s("dst/"));
+        let remote_destination = format!("fake:{destination_dir}");
+        let mut args = vec![
+            "-a",
+            "--no-whole-file",
+            "--integrity-checking=transfer=blake3",
+        ];
+        let mut command = if remote {
+            let rsh = fake_rsh(&t);
+            args.extend([
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--syq-no-bootstrap",
+                source_dir.as_str(),
+                remote_destination.as_str(),
+            ]);
+            remote_syq_command(&t, &rsh, &args)
+        } else {
+            args.extend([source_dir.as_str(), destination_dir.as_str()]);
+            let mut command = compat_command();
+            command.args(&args).arg("--no-progress");
+            command
+        };
+        command
+            .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_CORRUPT_PAYLOAD_ONCE", &marker);
+        if !cloning {
+            command.env("SYQ_TEST_BASIS_CLONE_UNSUPPORTED", "1");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        let case = format!("remote={remote} cloning={cloning}");
+        assert!(marker.exists(), "{case}: the payload check never ran");
+        assert_eq!(read(&t.path("dst/file")), source, "{case}");
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], 1, "{case}");
+        assert_eq!(observed["patched_files"], 0, "{case}");
+        assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+    }
+}
+
 #[test]
 fn a_leftover_partial_sends_a_replaced_file_to_the_resuming_path() {
     let t = Tmp::new();
