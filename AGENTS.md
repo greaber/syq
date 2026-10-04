@@ -517,7 +517,9 @@ from `tests/support/temp.rs` (re-exported by `src/test_support.rs` for unit
 tests). These resolve the ambient temporary root before creating fixtures,
 so macOS `/var` and other host symlinks do not become paths under test.
 Create intentional symlinks inside that root; do not canonicalize product
-arguments or add follow flags merely to make a fixture pass.
+arguments or add follow flags merely to make a fixture pass. For fixtures that
+must fit Unix socket path limits, use `test_support::short_tempdir()`; it
+centralizes the canonical short-root exception without changing `TMPDIR`.
 
 Testing happens in three places, each running more than the one before:
 before merge, after merge (post-merge CI, which selects checks by changed

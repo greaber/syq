@@ -337,7 +337,18 @@ fn inspect_ssh_configuration_at(
     )
     .with_context(|| format!("inspect SSH configuration for {host}"))?;
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // Keep the raw debug stream for successful provenance checks below;
+        // users need the SSH error, not the configuration traversal trace.
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| {
+                !["debug1:", "debug2:", "debug3:"]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = detail.trim();
         bail!(
             "could not inspect SSH configuration for {host}{}",
             if detail.is_empty() {

@@ -3,7 +3,7 @@
 use crate::process::CommandExt as _;
 #[path = "../tests/support/temp.rs"]
 mod temporary;
-pub(crate) use temporary::{temp_dir, tempdir};
+pub(crate) use temporary::{short_tempdir, temp_dir, tempdir};
 
 /// Run a unit test in a separate process whose stderr reader has gone away.
 /// Keep stdout available for the test harness and assertion diagnostics.

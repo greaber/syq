@@ -357,17 +357,51 @@ cannot be read, SSH entries are still listed, `receiving_error` explains the
 failure, and each entry's
 `receiving_enabled` is `null`.
 
-`persist receive status --json` reports each profile's `cwd`, `cwd_explicit`,
-`root`, `auto_approve_root`, and `servers`. An empty list means all
-connections in that domain. A null automatic approval root means every download asks.
-Connection entries list only profiles allowed on that endpoint.
+Approved account connections appear separately in `authorized_ssh`. Each entry
+has `authorizer`, `requested`, `endpoint`, `control`, and `connected` fields.
+The two endpoint objects contain `user`, `host`, and `port`; `requested` is the
+original selection and `endpoint` is the resolved account and address. A return
+authorizer is its name as a string; an ordinary SSH provider is an object with
+an `ssh` field containing the provider endpoint. `authorized_ssh_errors` contains
+diagnostics for account records that could not be read. Valid entries are still printed, but the command exits
+nonzero when this array is nonempty.
 
-Command approvals in `syq persist receive pending --json` use `kind: "command"`
-and include `argv`, `cwd`, and `permission`. Copy and storage approvals include
-`command`, the syq command the server ran, one argument per element. Argument
-and directory strings in this summary are escaped for display. Use an
-up-to-date syq binary to inspect and approve commands; clients that only
-support copy requests omit them.
+`persist receive status --json` reports profile settings in `profiles` and the
+first selected profile in `settings`. Each profile includes `cwd`,
+`cwd_explicit`, `root`, `auto_approve_root`, and `servers`. `servers` remains the
+JSON name for the endpoint restriction configured with `--connection`; an empty
+list means all connections in that domain. A null automatic approval root means
+every download asks. `connections` lists the profiles allowed on each endpoint.
+The `provider` object reports the local SSH authorization service, or is null
+when it is not running. Its `profiles` contain `settings`, `sessions`, and
+`pending` requests; `decision_error` reports a failed local approval action.
+
+`syq persist receive pending --json` prints an array of requests from receiving
+connections and the local SSH provider. Each entry has `id`, `from`,
+`expires_at` (Unix seconds), and `notification`. When present, `command` contains
+the requesting syq command, one displayed argument per element. Request-specific
+fields are:
+
+| `kind` | Request | Fields |
+| --- | --- | --- |
+| Absent | Copy to this machine or an approved destination | `destination`, `permission`, `max_bytes`, `max_entries`, `max_delete`, `preserve_permissions` |
+| `command` | Command on this machine | `argv`, `cwd`, `permission` |
+| `ssh` | SSH account access through a receiving connection | `destination`, `permission`, `reusable`, optional `account` |
+| `provider_ssh` | SSH account access through an ordinary SSH provider login | `destination`, `permission`, `provider_account` |
+| `source` | Read selected source paths for a copy | `source`, `scopes`, `permission`, `max_bytes`, `max_entries` |
+| `storage` | Storage access | `description` |
+
+`account` contains `profile`, `source`, and `destination`. Each account identity
+has an `endpoint`, trusted SHA256 fingerprints in `host_keys`, and an optional
+`trusted_host` lookup name. `provider_account` instead contains `profile`,
+`provider`, and `destination`: its provider identity has `user` and
+`receiver_identity`. That fingerprint identifies the provider's receiving
+identity, not an SSH host key or a verified requesting machine.
+
+The `command`, `argv`, and `cwd` strings are escaped for display; do not execute
+them as shell input. The displayed command does not restrict an SSH account
+approval. Use an up-to-date syq binary to inspect and approve
+requests, and handle unknown kinds without treating them as copy requests.
 
 ## Retry failed mapping entries
 

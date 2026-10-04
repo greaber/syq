@@ -53,10 +53,9 @@ impl Domain {
                 path.clone()
             }
         };
-        anyhow::ensure!(
-            !path.join(crate::receive_service::CLOSING).exists(),
-            "persistence scope is closing"
-        );
+        if path.join(crate::receive_service::CLOSING).exists() {
+            return Err(super::closing_scope_error(&path));
+        }
         Ok(path)
     }
 
@@ -108,5 +107,47 @@ impl Domain {
         let path = self.runtime_path();
         !path.join(crate::receive_service::CLOSING).exists()
             && self.identity().is_ok_and(|current| current == identity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_utf8_closing_scope_hint_preserves_the_original_argument() {
+        use std::os::unix::ffi::OsStrExt;
+        let scope = Path::new(std::ffi::OsStr::from_bytes(b"/scope-\xff"));
+        let error = super::super::closing_scope_error(scope).to_string();
+        // Do not turn display replacement characters into a command.
+        assert!(error.contains("repeating `syq persist off` with the original `--pscope` argument"));
+        assert!(!error.contains("`syq persist --pscope"));
+    }
+
+    #[test]
+    fn closing_scope_errors_name_the_selected_cleanup_command() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("scope with spaces");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        let closing = scope.join(crate::receive_service::CLOSING);
+        std::fs::write(&closing, b"").unwrap();
+        let error = domain.ensure_runtime().unwrap_err().to_string();
+        assert!(
+            error.contains(&format!(
+                "`syq persist --pscope {} off`",
+                shell_words::quote(&scope.to_string_lossy())
+            )),
+            "{error}"
+        );
+        assert_eq!(
+            crate::persistence::prepare_endpoint(&scope, None, "host.invalid", None, None)
+                .unwrap_err()
+                .to_string(),
+            error
+        );
+        // The diagnostic does not reopen or complete a partially closed scope.
+        assert!(closing.exists());
+        assert!(!domain.enabled().unwrap());
     }
 }

@@ -221,6 +221,77 @@ def persistent_connect(allow=True, ask=False):
             process.wait(timeout=5)
 
 
+def approved_login_during_pending_approval(expected):
+    print("case: pending new approval does not block another login to an approved account", flush=True)
+    default = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+    assert len(default) == 1 and default[0]["connected"], default
+    scope = source_run(["persist", "on", "--ephemeral"]).strip()
+    processes = []
+    try:
+        with tempfile.TemporaryFile() as blocked_out, tempfile.TemporaryFile() as blocked_err, \
+                tempfile.TemporaryFile() as fresh_out, tempfile.TemporaryFile() as fresh_err:
+            def start(target, stdout, stderr):
+                args = ["syq", "ssh", "--pscope", scope, "--auth-from", "@laptop", target,
+                        "--", "hostname"]
+                process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(args)],
+                                           stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                           start_new_session=True)
+                processes.append(process)
+                return process
+
+            blocked = start("root@destination", blocked_out, blocked_err)
+            items = json.loads(run("syq", "persist", "receive", "pending", "--json",
+                                   "--wait", "--timeout", "15"))
+            assert len(items) == 1, items
+            request = items[0]
+            assert request["kind"] == "ssh" and request["destination"] == "root@destination", request
+            assert request["account"]["destination"]["trusted_host"] == "destination", request
+            assert request["account"]["destination"]["endpoint"] == {
+                "user": "root", "host": "destination", "port": 22}, request
+            assert blocked.poll() is None, "unapproved login exited before a decision"
+            assert json.loads(source_run(["persist", "status", "--pscope", scope, "--json"]))["authorized_ssh"] == []
+
+            # This scope has no master. Success therefore requires a new SSH
+            # authentication using the existing laptop-session account grant.
+            fresh = start("syq@destination", fresh_out, fresh_err)
+            wait_for("fresh login while another approval is pending", lambda: fresh.poll() is not None, timeout=20)
+            fresh_out.seek(0); fresh_err.seek(0)
+            output, error = fresh_out.read(), fresh_err.read()
+            assert fresh.returncode == 0 and output == expected, (fresh.returncode, output, error)
+            remaining = json.loads(run("syq", "persist", "receive", "pending", "--json"))
+            assert len(remaining) == 1 and remaining[0]["id"] == request["id"], remaining
+            assert blocked.poll() is None, "fresh login resolved the unrelated approval"
+            scoped = json.loads(source_run(["persist", "status", "--pscope", scope, "--json"]))["authorized_ssh"]
+            assert len(scoped) == 1 and scoped[0]["connected"], scoped
+            assert scoped[0]["endpoint"] == {"user": "syq", "host": "destination", "port": 22}, scoped
+            assert Path(scoped[0]["control"]).parent.parent == Path(scope), scoped
+            assert scoped[0]["control"] != default[0]["control"], (scoped, default)
+
+            run("syq", "persist", "receive", "deny", request["id"])
+            wait_for("denied pending login to finish", lambda: blocked.poll() is not None)
+            blocked_out.seek(0); blocked_err.seek(0)
+            assert blocked.returncode == 255, (blocked.returncode, blocked_out.read(), blocked_err.read())
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+    finally:
+        try:
+            # Also cancels a still-pending request if an assertion above fails.
+            source_run(["persist", "off", "--pscope", scope])
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=3)
+        wait_for("parallel approval fixture cleanup", lambda: not json.loads(
+            run("syq", "persist", "receive", "pending", "--json")))
+
+
 def persistent_cases(expected):
     print("case: account connection setup can be cancelled before approval", flush=True)
     reset_session()
@@ -637,6 +708,7 @@ try:
     expected = run("ssh", "destination", "hostname").encode()
     assert execute(["hostname"], ask=True)[0] == expected
     assert execute(["hostname"], binary="/usr/local/bin/syq-other-build")[0] == expected
+    approved_login_during_pending_approval(expected)
 
     print("case: direct SSH preserves binary stdin, EOF, output and exit status", flush=True)
     program = "import sys; data=sys.stdin.buffer.read(); sys.stdout.buffer.write(data); sys.stderr.buffer.write(b'error\\x00\\xff'); sys.exit(17)"

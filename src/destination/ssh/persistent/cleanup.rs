@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn closing_waits_for_unpublished_keeper_ownership_before_removing_its_directory() {
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let scope = temporary.path().join("scope");
         crate::persistence::initialize_scope(&scope).unwrap();
         let domain = Domain::select(Some(&scope)).unwrap();

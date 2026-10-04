@@ -233,6 +233,37 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
 }
 
 #[test]
+fn configuration_failure_keeps_ssh_error_without_debug_trace() {
+    let root = crate::test_support::tempdir().unwrap();
+    let ssh = root.path().join("ssh");
+    // Write in a child so parallel test forks cannot inherit an executable's
+    // writable descriptor and cause ETXTBSY when this fixture is launched.
+    let written = Command::new("sh")
+        .args([
+            "-c",
+            "printf '%s' \"$1\" > \"$2\"",
+            "write-ssh",
+            "#!/bin/sh\nprintf '%s\n' 'debug1: Reading configuration data /private/config' 'debug2: checking match' '/private/config line 7: Bad configuration option: misspelled' 'debug3: final pass' >&2\nexit 255\n",
+        ])
+        .arg(&ssh)
+        .capture_output()
+        .unwrap();
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = inspect_ssh_configuration(ssh.to_str().unwrap(), None, "host.invalid", false)
+        .err()
+        .expect("configuration failure");
+    assert_eq!(
+        error.to_string(),
+        "could not inspect SSH configuration for host.invalid: /private/config line 7: Bad configuration option: misspelled"
+    );
+}
+
+#[test]
 fn configured_known_hosts_provenance_uses_files_openssh_read() {
     let temp = crate::test_support::tempdir().unwrap();
     let config = temp.path().join("ssh_config");

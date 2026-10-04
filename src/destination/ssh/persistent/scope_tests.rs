@@ -41,7 +41,7 @@ fn private_write(path: &Path, contents: &[u8]) {
 
 #[test]
 fn selected_domains_have_independent_account_generations_and_indices() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let first = domain(root.path(), "a");
     let second = domain(root.path(), "b");
     let first_generation = ensure_generation(&first).unwrap();
@@ -65,7 +65,7 @@ fn selected_domains_have_independent_account_generations_and_indices() {
 
 #[test]
 fn scoped_records_cannot_borrow_another_scope_or_legacy_generation() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let first = domain(root.path(), "a");
     let second = domain(root.path(), "b");
     let record = new_record(&first);
@@ -90,7 +90,7 @@ fn scoped_records_cannot_borrow_another_scope_or_legacy_generation() {
 fn warm_account_lookup_checks_local_socket_readiness() {
     // Nested scopes and OpenSSH's socket suffix exceed Darwin's ambient
     // TMPDIR path budget; use the same short root as other scoped socket tests.
-    let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let domain = domain(root.path(), "a");
     let record = new_record(&domain);
     let control = record.control.clone();
@@ -208,7 +208,7 @@ fn warm_account_lookup_checks_local_socket_readiness() {
 
 #[test]
 fn scoped_index_refuses_links_to_another_domain() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let first = domain(root.path(), "a");
     let second = domain(root.path(), "b");
     let destination = directory(&first).unwrap();
@@ -226,7 +226,7 @@ fn startup_retains_default_encoding_and_does_not_survive_scoped_recreation() {
     let encoded = serde_json::to_value(old).unwrap();
     assert!(encoded.get("scope").is_none());
     assert!(encoded.get("scope_identity").is_none());
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let domain = domain(root.path(), "a");
     let startup = Startup {
         command: Vec::new(),
@@ -254,7 +254,7 @@ fn startup_retains_default_encoding_and_does_not_survive_scoped_recreation() {
 
 #[test]
 fn off_cleans_only_selected_stale_account_state_and_keeps_other_domains() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let first = domain(root.path(), "a");
     let second = domain(root.path(), "b");
     ensure_generation(&first).unwrap();
@@ -291,7 +291,7 @@ fn off_cleans_only_selected_stale_account_state_and_keeps_other_domains() {
 #[test]
 fn status_keeps_valid_accounts_and_reports_bad_record_paths() {
     // Nested approved scopes need a short root for OpenSSH's control suffix.
-    let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let domain = domain(root.path(), "a");
     let record = new_record(&domain);
     drop(UnixListener::bind(&record.control).unwrap());
@@ -318,7 +318,7 @@ fn status_keeps_valid_accounts_and_reports_bad_record_paths() {
 
 #[test]
 fn cleanup_refuses_unrecognized_files_without_recursive_removal() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let domain = domain(root.path(), "a");
     ensure_generation(&domain).unwrap();
     let record = new_record(&domain);
@@ -334,7 +334,7 @@ fn cleanup_refuses_unrecognized_files_without_recursive_removal() {
 
 #[test]
 fn concurrent_keeper_cleanup_is_closed_but_damaged_present_state_still_errors() {
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let root = crate::test_support::short_tempdir().unwrap();
     let domain = domain(root.path(), "scope");
     let record = new_record(&domain);
     let approved = record.control.parent().unwrap();

@@ -851,26 +851,40 @@ fn approve_account(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let key = permission.id();
-    let session_approved = context
-        .session_grants
-        .lock()
-        .unwrap()
-        .get(&key)
-        .is_some_and(|approved_generation| *approved_generation == generation);
-    if !session_approved && !permission.remembered(context.approvals)? {
-        anyhow::ensure!(!existing_account_only,
-                "SSH account permission ended before a data connection could start; retry the command to request account access");
-        let decision = permission.request(context, request, cancelled)?;
-        if cancelled() {
-            bail!("SSH request disconnected before authorization");
-        }
-        if decision == AccountDecision::Session {
-            context
-                .session_grants
-                .lock()
-                .unwrap()
-                .insert(key, generation);
-        }
+    let already_approved = || -> Result<bool> {
+        let session_approved = context
+            .session_grants
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|approved_generation| *approved_generation == generation);
+        Ok(session_approved || permission.remembered(context.approvals)?)
+    };
+    if already_approved()? {
+        return Ok(());
+    }
+    anyhow::ensure!(!existing_account_only,
+        "SSH account permission ended before a data connection could start; retry the command to request account access");
+    // Serialize prompts, not policy lookup or authentications that already have
+    // permission. Recheck after taking the lock: another request may just have
+    // approved this same account while this request was looking it up.
+    let _approval = context
+        .request_lock
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))?;
+    if already_approved()? {
+        return Ok(());
+    }
+    let decision = permission.request(context, request, cancelled)?;
+    if cancelled() {
+        bail!("SSH request disconnected before authorization");
+    }
+    if decision == AccountDecision::Session {
+        context
+            .session_grants
+            .lock()
+            .unwrap()
+            .insert(key, generation);
     }
     Ok(())
 }
@@ -918,16 +932,6 @@ fn authorize_and_relay_inner(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     request.validate(&context.origin)?;
-    // Existing-grant workers cannot open UI and need no approval serialization.
-    // Their independent host-policy checks and agent sessions can run in parallel.
-    let request_lock = (!existing_account_only)
-        .then(|| {
-            context
-                .request_lock
-                .try_lock()
-                .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))
-        })
-        .transpose()?;
     let count = context.active_count.fetch_add(1, Ordering::AcqRel);
     struct Slot<'a>(&'a AtomicU64);
     impl Drop for Slot<'_> {
@@ -973,6 +977,10 @@ fn authorize_and_relay_inner(
         let AuthorizationOrigin::Return { requester, .. } = &context.origin else {
             bail!("SSH providers require an account authorization request");
         };
+        let _approval = context
+            .request_lock
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))?;
         context.approvals.request_ssh(
             requester,
             &request.command,
@@ -986,7 +994,6 @@ fn authorize_and_relay_inner(
     if cancelled() {
         bail!("SSH request disconnected before authorization");
     }
-    drop(request_lock);
     let broker = ConstrainedAgentBroker::start(BrokerPolicy::direct(policy), 1)?;
     let mut upstream = UnixStream::connect(broker.socket_path())?;
     upstream.set_read_timeout(Some(Duration::from_secs(120)))?;
@@ -1288,12 +1295,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_authorization_never_queues_a_missing_or_expired_account_grant() {
+    fn account_permissions_bypass_pending_prompts_without_authorizing_missing_grants() {
         // Persistence scopes must fit OpenSSH's socket-path limit even though
         // this approval test does not itself open an SSH socket.
-        let temporary = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         crate::persistence::initialize_scope(temporary.path()).unwrap();
-        let approvals = Queue::new(Domain::select(Some(temporary.path())).unwrap());
+        let domain = Domain::select(Some(temporary.path())).unwrap();
+        let approvals = Queue::new(domain.clone());
         let identity = provider_identity();
         let lock = Mutex::new(());
         let _other_approval = lock.lock().unwrap();
@@ -1321,17 +1329,42 @@ mod tests {
         )
         .unwrap();
         let request = Request::account(resolved.endpoint, vec![], String::new(), None);
-        for granted in [None, Some(4), Some(5)] {
-            if let Some(generation) = granted {
-                grants.lock().unwrap().insert(permission.id(), generation);
+        for worker_only in [false, true] {
+            for granted in [None, Some(4), Some(5)] {
+                grants.lock().unwrap().clear();
+                if let Some(generation) = granted {
+                    grants.lock().unwrap().insert(permission.id(), generation);
+                }
+                let result =
+                    approve_account(&context, &request, &permission, 5, worker_only, &|| false);
+                assert_eq!(result.is_ok(), granted == Some(5));
+                if let Err(error) = result {
+                    assert!(
+                        error.to_string().contains(if worker_only {
+                            "permission ended"
+                        } else {
+                            "another request is awaiting approval"
+                        }),
+                        "{error:#}"
+                    );
+                }
+                assert!(approvals.snapshots().is_empty());
             }
-            let result = approve_account(&context, &request, &permission, 5, true, &|| false);
-            assert_eq!(result.is_ok(), granted == Some(5));
-            if let Err(error) = result {
-                assert!(error.to_string().contains("permission ended"));
-            }
-            assert!(approvals.snapshots().is_empty());
         }
+        // Remembered account access also needs no UI lock, even after a new
+        // authorization session has discarded its in-memory grants.
+        grants.lock().unwrap().clear();
+        let AccountApproval::Provider(remembered) = &permission else {
+            unreachable!();
+        };
+        crate::receive_approval::provider_accounts::remember(&domain, remembered).unwrap();
+        for worker_only in [false, true] {
+            approve_account(&context, &request, &permission, 6, worker_only, &|| false).unwrap();
+        }
+        assert!(approvals.snapshots().is_empty());
+        crate::receive_approval::provider_accounts::remove(&domain, &permission.id()).unwrap();
+        assert!(approve_account(&context, &request, &permission, 6, false, &|| false).is_err());
+        assert!(approvals.snapshots().is_empty());
     }
 
     #[test]

@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn native_selection_does_not_require_readable_account_records() {
-        let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_support::short_tempdir().unwrap();
         let scope = root.path().join("scope");
         crate::persistence::initialize_scope(&scope).unwrap();
         let domain = Domain::select(Some(&scope)).unwrap();
@@ -1481,7 +1481,7 @@ mod tests {
 
     #[test]
     fn policy_bound_indices_keep_old_authority_separate() {
-        let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_support::short_tempdir().unwrap();
         let scope = root.path().join("scope");
         crate::persistence::initialize_scope(&scope).unwrap();
         let domain = Domain::select(Some(&scope)).unwrap();

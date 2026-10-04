@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn absent_local_binding_creates_no_state_or_provider_connection() {
-        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let root = crate::test_support::short_tempdir().unwrap();
         let path = root.path().join("scope");
         let domain = Domain::Explicit(path.clone());
         assert!(local_binding(&domain, &provider()).unwrap().is_none());
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn local_binding_requires_live_ownership_and_current_domain_generation() {
-        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let root = crate::test_support::short_tempdir().unwrap();
         let scope = root.path().join("scope");
         crate::persistence::initialize_scope(&scope).unwrap();
         let domain = Domain::select(Some(&scope)).unwrap();

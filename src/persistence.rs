@@ -512,6 +512,20 @@ fn validate_openssh_socket_capacity(path: &Path, capacity: usize) -> Result<()> 
     Ok(())
 }
 
+fn closing_scope_error(scope: &Path) -> anyhow::Error {
+    let recovery = match scope.to_str() {
+        Some(path) => format!(
+            "finish its cleanup with `syq persist --pscope {} off`",
+            shell_words::quote(path)
+        ),
+        None => "finish its cleanup by repeating `syq persist off` with the original `--pscope` argument".into(),
+    };
+    anyhow::anyhow!(
+        "persistence scope {} is closing; {recovery}",
+        scope.display()
+    )
+}
+
 /// Return the stable socket path for one endpoint and record enough metadata
 /// for `persist status` and `persist off` to inspect or close it later.
 pub(crate) fn prepare_endpoint(
@@ -523,7 +537,7 @@ pub(crate) fn prepare_endpoint(
 ) -> Result<PathBuf> {
     validate_scope(scope)?;
     if scope.join(crate::receive_service::CLOSING).exists() {
-        bail!("persistence scope is closing");
+        return Err(closing_scope_error(scope));
     }
     let key = endpoint_key(user, host, port, ssh);
     let socket = scope.join(&key);
@@ -1276,7 +1290,7 @@ mod tests {
         // Unchanged released v0.7.1 EndpointRecord representation and key algorithm.
         const FIXTURE: &str = r#"{"user":"alice","host":"example","port":2222}"#;
         const KEY: &str = "cm-4adf1f61aa19aead";
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let scope = temporary.path().join("approved-fixture");
         initialize_scope(&scope).unwrap();
         let path = scope.join(format!("{KEY}.json"));
@@ -1334,7 +1348,7 @@ mod tests {
 
     #[test]
     fn endpoint_records_are_stable_and_inactive_scopes_close_cleanly() {
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         let first = prepare_endpoint(&scope, Some("alice"), "example", None, None).unwrap();
@@ -1350,7 +1364,7 @@ mod tests {
 
     #[test]
     fn over_budget_existing_scope_can_be_inspected_and_closed() {
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         prepare_endpoint(&scope, None, "example", None, None).unwrap();
@@ -1367,7 +1381,7 @@ mod tests {
 
     #[test]
     fn concurrent_endpoint_registration_publishes_one_complete_record() {
-        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let scope = temporary.path().join("scope");
         initialize_scope(&scope).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));

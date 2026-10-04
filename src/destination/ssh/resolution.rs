@@ -384,7 +384,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture() -> (tempfile::TempDir, Domain, Entry) {
-        let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_support::short_tempdir().unwrap();
         let scope = root.path().join("scope");
         crate::persistence::initialize_scope(&scope).unwrap();
         let domain = Domain::select(Some(&scope)).unwrap();
