@@ -301,7 +301,7 @@ impl Service {
             let keep = preferences
                 .profiles
                 .iter()
-                .any(|profile| profile.enabled && profile == &session.profile.settings);
+                .any(|profile| profile.enabled && profile.same_access(&session.profile.settings));
             if !keep {
                 session.close();
             }
@@ -311,14 +311,14 @@ impl Service {
             preferences
                 .profiles
                 .iter()
-                .any(|settings| settings.enabled && settings == &profile.settings)
+                .any(|settings| settings.enabled && settings.same_access(&profile.settings))
         });
         for settings in preferences
             .profiles
             .iter()
             .filter(|settings| settings.enabled)
         {
-            inner
+            let profile = inner
                 .profiles
                 .entry(settings.name.clone())
                 .or_insert_with(|| {
@@ -327,6 +327,7 @@ impl Service {
                         approvals: Arc::new(Queue::new(self.domain.clone())),
                     })
                 });
+            profile.approvals.set_notifications(settings.notifications);
         }
         inner.preferences = preferences;
         Ok(())
@@ -949,6 +950,7 @@ mod tests {
         let mut first = default_settings(&domain).unwrap();
         first.name = "first".into();
         first.enabled = true;
+        first.notifications = crate::receive_approval::Notifications::Off;
         first.cwd = path;
         let mut second = first.clone();
         second.name = "second".into();
@@ -1058,6 +1060,116 @@ mod tests {
         assert!(!other.closed.load(Ordering::Acquire));
         let (_, late) = UnixStream::pair().unwrap();
         assert!(session.track(late).is_err());
+        service.close();
+    }
+
+    #[test]
+    fn notification_refresh_preserves_attachment_grants_and_updates_future_prompts() {
+        use crate::receive_approval::{
+            accounts::AccountIdentity, provider_accounts::ProviderLoginPermission, AccountDecision,
+            Kind, Notifications,
+        };
+        let (_directory, domain, mut config) = fixture();
+        config.profiles[0].notifications = Notifications::Desktop;
+        save_settings(&domain, &config).unwrap();
+        let service = Service::new(domain.clone()).unwrap();
+        let (ticket, session) = service.open_identified(None, identity).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut tracked = session.track(server).unwrap();
+        session
+            .grants
+            .lock()
+            .unwrap()
+            .insert("existing-account".into(), 0);
+        config.profiles[0].notifications = Notifications::Off;
+        save_settings(&domain, &config).unwrap();
+        service.refresh().unwrap();
+        assert!(!session.closed.load(Ordering::Acquire));
+        client.write_all(b"still connected").unwrap();
+        let mut received = [0; 15];
+        tracked.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"still connected");
+        assert!(service
+            .inner
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(&ticket.session));
+        assert_eq!(
+            session.grants.lock().unwrap().get("existing-account"),
+            Some(&0)
+        );
+        assert_eq!(
+            service.snapshot(None).profiles[0].settings.notifications,
+            Notifications::Off
+        );
+
+        // The existing handler still carries its initial Desktop value. The
+        // shared approval queue must apply the updated preference to this request.
+        let permission = ProviderLoginPermission::new(
+            "first".into(),
+            identity().unwrap(),
+            AccountIdentity::new(
+                crate::cli::NativeEndpoint {
+                    user: Some("destination-user".into()),
+                    host: "destination".into(),
+                    port: Some(22),
+                },
+                vec![ssh_key::Fingerprint::Sha256([2; 32]).to_string()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request_session = session.clone();
+        let request = std::thread::spawn(move || {
+            request_session.profile.approvals.request_provider_account(
+                &[b"ssh".to_vec(), b"destination".to_vec()],
+                "/reported",
+                &permission,
+                request_session.profile.settings.notifications,
+                || request_session.closed.load(Ordering::Acquire),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = loop {
+            if let Some(pending) = session
+                .profile
+                .approvals
+                .snapshots()
+                .into_iter()
+                .find(|request| !request.notification.is_empty())
+            {
+                break pending;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider approval did not become pending"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            pending.notification.starts_with("disabled;"),
+            "{}",
+            pending.notification
+        );
+        // A later delivery change also preserves an already pending request.
+        config.profiles[0].notifications = Notifications::Desktop;
+        save_settings(&domain, &config).unwrap();
+        service.refresh().unwrap();
+        assert!(!session.closed.load(Ordering::Acquire));
+        assert_eq!(session.profile.approvals.snapshots()[0].id, pending.id);
+        session
+            .profile
+            .approvals
+            .decide(&pending.id, true, Kind::ProviderSsh)
+            .unwrap();
+        assert_eq!(request.join().unwrap().unwrap(), AccountDecision::Session);
         service.close();
     }
 

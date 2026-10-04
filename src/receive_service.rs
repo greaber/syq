@@ -63,6 +63,14 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 impl Settings {
+    // Notification delivery does not change the authority of a live receiver.
+    // Keep the revision comparison: an intervening access change still revokes
+    // sessions even when the other fields have returned to their old values.
+    fn same_access(&self, other: &Self) -> bool {
+        let mut comparable = self.clone();
+        comparable.notifications = other.notifications;
+        comparable == *other
+    }
     fn allows_server(&self, endpoint: &str) -> bool {
         self.enabled && (self.servers.is_empty() || self.servers.iter().any(|s| s == endpoint))
     }
@@ -202,7 +210,7 @@ struct Configure {
     /// Require approval for every download again
     #[arg(long)]
     no_auto_approve_root: bool,
-    /// Limit this profile to these SSH connections (repeat to allow several)
+    /// Connect these SSH endpoints and limit this profile to them (repeat for several)
     #[arg(long, value_name = "ENDPOINT", conflicts_with = "all_connections")]
     connection: Vec<String>,
     /// Make this profile available through every connected SSH account
@@ -873,6 +881,7 @@ impl ProfileWorker {
     fn new(domain: &Domain, config: Settings, spec: ServiceSpec) -> Self {
         let state = Arc::new(Mutex::new(ConnectionState::default()));
         let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
+        approvals.set_notifications(config.notifications);
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_state, thread_approvals, thread_stop, thread_config) = (
             state.clone(),
@@ -929,12 +938,15 @@ fn reconcile(
     spec: &ServiceSpec,
     retry: bool,
 ) {
-    workers.retain(|worker| {
-        config
-            .profiles
-            .iter()
-            .any(|p| p.allows_server(&spec.endpoint.label()) && p == &worker.config)
-            && !(retry && worker.state.lock().unwrap().phase == "failed")
+    workers.retain_mut(|worker| {
+        let Some(profile) = config.profiles.iter().find(|profile| {
+            profile.allows_server(&spec.endpoint.label()) && profile.same_access(&worker.config)
+        }) else {
+            return false;
+        };
+        worker.approvals.set_notifications(profile.notifications);
+        worker.config = profile.clone();
+        !(retry && worker.state.lock().unwrap().phase == "failed")
     });
     for profile in config
         .profiles
@@ -987,6 +999,10 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             && config.enabled()
             && domain.enabled()?
             && read_spec(&control).is_ok()
+            // A saved endpoint record is not a request to reconnect it. Only
+            // attach receiving to a master that is already running; explicit
+            // --connection endpoints are connected separately by configure.
+            && crate::persistence::socket_is_ready(&control).unwrap_or(false)
         {
             spawn(&control)?;
         }
@@ -1177,6 +1193,7 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     let _lock = settings_lock(domain)?;
     let existed = config_path(domain)?.exists();
     let mut preferences = preferences(domain)?;
+    let previous_preferences = preferences.clone();
     let index = if let Some(name) = options.name.as_deref() {
         crate::destination::validate_name(name)?;
         match preferences.profiles.iter().position(|p| p.name == name) {
@@ -1195,11 +1212,8 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
         0
     };
     let config = &mut preferences.profiles[index];
+    let previous = config.clone();
     config.enabled = true;
-    config.revision = config
-        .revision
-        .checked_add(1)
-        .context("receiving profile revision exhausted")?;
     if let Some(notifications) = options.notifications {
         config.notifications = notifications;
     }
@@ -1255,18 +1269,29 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     if let Some(deletions) = options.max_delete {
         config.max_delete = deletions;
     }
+    if !config.same_access(&previous) {
+        config.revision = config
+            .revision
+            .checked_add(1)
+            .context("receiving profile revision exhausted")?;
+    }
     let config = config.clone();
-    save_settings(domain, &preferences)?;
+    // Repeated on is a no-op for current settings, but an old format must
+    // still migrate before receiving starts (including its approval policy).
+    if preferences != previous_preferences || !current_settings_exist(domain)? {
+        save_settings(domain, &preferences)?;
+    }
     drop(_lock);
     domain.enable()?;
     apply_preferences(domain, &preferences)?;
     Ok(config)
 }
 fn configure(domain: &Domain, options: Configure) -> Result<()> {
+    let connections = options.connection.clone();
     let config = configure_profile(domain, options)?;
     provider::ensure(domain)?;
     let mut failures = Vec::new();
-    for endpoint in &config.servers {
+    for endpoint in &connections {
         if let Err(error) = crate::persistence::connect_domain(
             domain,
             endpoint,
@@ -1708,6 +1733,90 @@ mod tests {
     }
 
     #[test]
+    fn notification_refresh_preserves_worker_and_access_changes_revoke_it() {
+        let mut settings = default_settings(&Domain::default()).unwrap();
+        settings.notifications = crate::receive_approval::Notifications::Desktop;
+        let approvals = Arc::new(crate::receive_approval::Queue::default());
+        approvals.set_notifications(settings.notifications);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = vec![ProfileWorker {
+            config: settings.clone(),
+            state: Arc::new(Mutex::new(ConnectionState {
+                phase: "online".into(),
+                error: None,
+                ssh_pid: Some(42),
+            })),
+            approvals: approvals.clone(),
+            _worker: Worker {
+                stop: stop.clone(),
+                thread: None,
+            },
+        }];
+        let spec = ServiceSpec {
+            version: VERSION,
+            identity: crate::identity::build().into(),
+            endpoint: crate::persistence::EndpointRecord {
+                user: None,
+                host: "work".into(),
+                port: None,
+                ssh_options: Vec::new(),
+                ssh_options_directory: None,
+            },
+            program: "syq".into(),
+        };
+        settings.notifications = crate::receive_approval::Notifications::Off;
+        let mut config = Preferences {
+            version: PREFERENCES_VERSION,
+            profiles: vec![settings],
+        };
+        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        assert_eq!(workers.len(), 1);
+        assert!(Arc::ptr_eq(&workers[0].approvals, &approvals));
+        assert!(!stop.load(Ordering::Acquire));
+        assert_eq!(workers[0].snapshot().connection.ssh_pid, Some(42));
+        assert_eq!(
+            workers[0].snapshot().settings.notifications,
+            crate::receive_approval::Notifications::Off
+        );
+        assert_eq!(
+            approvals.notifications(crate::receive_approval::Notifications::Desktop),
+            crate::receive_approval::Notifications::Off
+        );
+
+        // Access changes still remove the old worker, including its authority.
+        config.profiles[0].servers = vec!["other".into()];
+        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        assert!(workers.is_empty());
+        assert!(stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dormant_master_and_full_queue_do_not_block_preference_changes() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("master");
+        assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        let listener =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        listener
+            .bind(&socket2::SockAddr::unix(&path).unwrap())
+            .unwrap();
+        listener.listen(1).unwrap();
+        assert!(crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // Connects fill this unserviced listener's bounded backlog.
+        for _ in 0..128 {
+            if !crate::persistence::socket_is_ready(&path).unwrap_or(false) {
+                assert!(Instant::now() < deadline);
+                drop(listener);
+                assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+                return;
+            }
+            assert!(Instant::now() < deadline);
+        }
+        panic!("local listen queue did not fill");
+    }
+
+    #[test]
     fn receiving_domains_have_fresh_disabled_and_independent_profiles() {
         // Socket paths must fit even when the platform's ambient TMPDIR is long.
         let root = std::fs::canonicalize("/tmp").unwrap();
@@ -1737,6 +1846,28 @@ mod tests {
         assert_eq!(profile_names(&first), vec!["first-inbox"]);
         assert!(preferences(&first).unwrap().enabled());
         assert!(!preferences(&second).unwrap().enabled());
+        let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
+        let before = preferences(&first).unwrap().profiles.remove(0);
+        configure_profile(&first, Configure::default()).unwrap();
+        assert_eq!(fs::read(config_path(&first).unwrap()).unwrap(), first_bytes);
+        let notified = configure_profile(
+            &first,
+            Configure {
+                notifications: Some(crate::receive_approval::Notifications::Off),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(notified.revision, before.revision);
+        let changed = configure_profile(
+            &first,
+            Configure {
+                max_entries: Some(before.max_entries - 1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(changed.revision, before.revision + 1);
         let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
         configure_profile(
             &second,

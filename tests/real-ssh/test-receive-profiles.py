@@ -93,10 +93,21 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     receive("approve", project_request["id"])
     finish(second)
     assert (project / "project-copy").read_bytes() == b"return\n"
-    # Explicitly configuring the same profile still revokes that profile only.
-    receive("on", "--name", "project", "--notify", "off")
-    receive("wait", "source", "--name", "project", "--timeout", "30")
-    assert profile("laptop")["connection"]["ssh_pid"] == original
+    # Delivery changes and repeated on preserve this connection and its pending
+    # request, as well as the independently configured laptop profile.
+    project_pid = profile("project")["connection"]["ssh_pid"]
+    kept = start_copy("project", "project-kept-pending")
+    processes.append(kept)
+    kept_request = next(r for r in pending(2) if "@project" in r["from"])
+    for notifications in ("desktop", "off", "off"):
+        receive("on", "--name", "project", "--notify", notifications)
+        receive("wait", "source", "--name", "project", "--timeout", "30")
+        assert profile("project")["connection"]["ssh_pid"] == project_pid
+        assert profile("laptop")["connection"]["ssh_pid"] == original
+        assert {r["id"] for r in pending(2)} == {request["id"], kept_request["id"]}
+    receive("approve", kept_request["id"])
+    finish(kept)
+    assert (project / "project-kept-pending").read_bytes() == b"return\n"
     assert pending(1)[0]["id"] == request["id"]
     receive("approve", request["id"])
     finish(first)

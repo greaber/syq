@@ -687,13 +687,23 @@ struct Pending {
 pub(crate) struct Queue {
     domain: crate::persistence::Domain,
     pending: Mutex<BTreeMap<String, Pending>>,
+    // Background profiles update future prompt delivery without replacing the
+    // receiver, its pending approvals, or its authenticated sessions.
+    notifications: Mutex<Option<Notifications>>,
 }
 impl Queue {
     pub(crate) fn new(domain: crate::persistence::Domain) -> Self {
         Self {
             domain,
             pending: Mutex::default(),
+            notifications: Mutex::default(),
         }
+    }
+    pub(crate) fn set_notifications(&self, notifications: Notifications) {
+        *self.notifications.lock().unwrap() = Some(notifications);
+    }
+    pub(crate) fn notifications(&self, fallback: Notifications) -> Notifications {
+        self.notifications.lock().unwrap().unwrap_or(fallback)
     }
     pub(crate) fn account_remembered(&self, permission: &AccountPermission) -> Result<bool> {
         accounts::remembered(&self.domain, permission)
@@ -1202,7 +1212,7 @@ impl Queue {
             queue: self,
             id: id.clone(),
         };
-        let mut notification = if notifications == Notifications::Desktop {
+        let mut notification = if self.notifications(notifications) == Notifications::Desktop {
             match Notification::spawn(&summary, lifetime) {
                 Ok(notification) => {
                     self.notification_status(&id, "desktop prompt requested; use local syq persist receive approve/deny if it is not visible".into());

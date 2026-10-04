@@ -763,7 +763,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
     fs::create_dir(t.runtime()).unwrap();
     fs::create_dir_all(t.path("root/inbox")).unwrap();
     fs::create_dir_all(t.path("root/explicit")).unwrap();
-    write(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho fixture connection unavailable >&2\nexit 42\n");
+    write(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"$SSH_LOG\"\necho fixture connection unavailable >&2\nexit 42\n");
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
@@ -773,6 +773,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SSH_LOG", t.path("ssh.log"))
             .env("PATH", format!("{}:/usr/bin:/bin", t.path("bin").display()))
             .current_dir(t.path(""))
             .capture_output()
@@ -785,7 +786,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
     };
     let configured = |args: &[&str]| {
         let output = run(args);
-        if state()["servers"].as_array().unwrap().is_empty() {
+        if !args.contains(&"--connection") {
             assert_output_ok(&output);
         } else {
             assert!(!output.status.success());
@@ -811,6 +812,70 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
         state()["servers"],
         serde_json::json!(["work", "alice@lab:2222"])
     );
+    // Preserve a genuine endpoint record and a stopped receiving supervisor's
+    // saved spec. Neither is a request to dial the dormant connection again.
+    let scope = t
+        .runtime()
+        .join(format!("syq-persist-{}/global", unsafe { libc::geteuid() }));
+    let record = fs::read_dir(&scope)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let path = entry.path();
+            if path.file_name()?.to_str()?.starts_with("cm-")
+                && path.extension()?.to_str()? == "json"
+            {
+                let endpoint: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+                (endpoint["host"] == "work").then_some((path, endpoint))
+            } else {
+                None
+            }
+        })
+        .expect("failed explicit connect should leave its endpoint record");
+    let build = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--build-identity")
+        .capture_output()
+        .unwrap();
+    assert_output_ok(&build);
+    let spec = record.0.with_extension("recv-json");
+    fs::write(
+        &spec,
+        serde_json::to_vec(&serde_json::json!({
+            "version":2, "identity":String::from_utf8(build.stdout).unwrap().trim(),
+            "endpoint":record.1, "program":env!("CARGO_BIN_EXE_syq")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&spec, fs::Permissions::from_mode(0o600)).unwrap();
+    let connections = fs::read(t.path("ssh.log")).unwrap();
+    assert!(
+        !connections.is_empty(),
+        "explicit connections did not run SSH"
+    );
+    let before = fs::read(t.path("config/syq/receive.json")).unwrap();
+    configured(&["on"]);
+    assert_eq!(fs::read(t.path("config/syq/receive.json")).unwrap(), before);
+    configured(&["on", "--notify", "off"]);
+    assert_eq!(
+        state()["servers"],
+        serde_json::json!(["work", "alice@lab:2222"])
+    );
+    assert_output_ok(&run(&["off"]));
+    configured(&["on"]);
+    assert!(!run(&["wait", "work", "--timeout", "1"]).status.success());
+    let output = run(&["status", "--json"]);
+    assert_output_ok(&output);
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dormant = status["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|state| state["endpoint"] == "work")
+        .unwrap();
+    assert_eq!(dormant["connection"]["phase"], "inactive");
+    assert_eq!(fs::read(t.path("ssh.log")).unwrap(), connections);
     assert!(!run(&["wait", "other", "--timeout", "1"]).status.success());
     configured(&["on", "--root", "root"]);
     assert_eq!(state()["cwd"], t.s("root"));
@@ -828,6 +893,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
         fs::canonicalize(t.path("")).unwrap().to_str().unwrap()
     );
     assert_eq!(state()["servers"], serde_json::json!([]));
+    assert_eq!(fs::read(t.path("ssh.log")).unwrap(), connections);
     let before = fs::read(t.path("config/syq/receive.json")).unwrap();
     for args in [
         vec!["on", "--auto-approve-root", "missing"],
