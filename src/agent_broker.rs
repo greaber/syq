@@ -53,9 +53,14 @@ pub struct HostPolicy {
     known_hosts_name: String,
     host_key_algorithms: Vec<String>,
     required_rsa_size: usize,
+    agent_socket: Option<PathBuf>,
 }
 
 impl HostPolicy {
+    pub(crate) fn agent_socket(&self) -> Option<&Path> {
+        self.agent_socket.as_deref()
+    }
+
     pub(crate) fn connection_host(&self) -> &str {
         &self.connection_host
     }
@@ -154,7 +159,42 @@ pub fn resolve_host_policy_at(
         known_hosts_name: config.lookup,
         host_key_algorithms: config.host_key_algorithms,
         required_rsa_size: config.required_rsa_size,
+        agent_socket: configured_agent_socket(&inspection.output)?,
     })
+}
+
+/// `ssh -G` has already expanded tilde, percent tokens and ${VARIABLE}.
+/// OpenSSH resolves the remaining legacy $VARIABLE and SSH_AUTH_SOCK forms
+/// immediately before authentication; reproduce only that final selection.
+pub(crate) fn configured_agent_socket(config: &[u8]) -> Result<Option<PathBuf>> {
+    agent_socket_from_config(config, |name| std::env::var_os(name))
+}
+
+fn agent_socket_from_config(
+    config: &[u8],
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<PathBuf>> {
+    let config = std::str::from_utf8(config).context("SSH configuration is not UTF-8")?;
+    let selection = config
+        .lines()
+        .find_map(|line| line.strip_prefix("identityagent "));
+    let socket = match selection {
+        Some("none") => None,
+        None | Some("SSH_AUTH_SOCK") => environment("SSH_AUTH_SOCK"),
+        Some(value) if value.starts_with('$') => environment(&value[1..]),
+        Some(value) => Some(OsString::from(value)),
+    }
+    .filter(|value| !value.is_empty());
+    socket
+        .map(|socket| {
+            let path = PathBuf::from(socket);
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()?.join(path)
+            })
+        })
+        .transpose()
 }
 
 struct SshConfigurationInspection {
@@ -760,12 +800,9 @@ impl ConstrainedAgentBroker {
     /// is the native `--peer-auth broker` mode: signatures remain limited to
     /// the validated coordinator-to-peer session and login user.
     pub fn start(policy: BrokerPolicy, max_connections: usize) -> Result<Self> {
-        let ambient = std::env::var_os("SSH_AUTH_SOCK")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .context(
-                "SSH_AUTH_SOCK is not set; constrained direct remote-to-remote authentication needs a local SSH agent",
-            )?;
+        let ambient = policy.coordinator.agent_socket.clone().context(
+            "the source host has no configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
+        )?;
         Self::start_with_backend(
             ambient.clone(),
             SigningBackend::Ambient(ambient),
@@ -804,12 +841,9 @@ impl ConstrainedAgentBroker {
         {
             bail!("enrollment key must be an unlocked software key");
         }
-        let ambient = std::env::var_os("SSH_AUTH_SOCK")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .context(
-                "SSH_AUTH_SOCK is not set; authenticating to the source host still needs the local SSH agent",
-            )?;
+        let ambient = policy.coordinator.agent_socket.clone().context(
+            "authenticating to the source host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
+        )?;
         Self::start_with_backend(
             ambient,
             SigningBackend::Private(Arc::new(private_key)),
@@ -826,9 +860,9 @@ impl ConstrainedAgentBroker {
         socket: PathBuf,
         key: KeyData,
     ) -> Result<Self> {
-        let ambient = std::env::var_os("SSH_AUTH_SOCK")
-            .map(PathBuf::from)
-            .context("SSH_AUTH_SOCK is not set")?;
+        let ambient = policy.coordinator.agent_socket.clone().context(
+            "authenticating to the source host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
+        )?;
         Self::start_with_backend(
             ambient,
             SigningBackend::SelectedAgent { socket, key },

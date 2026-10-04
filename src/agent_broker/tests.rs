@@ -23,6 +23,7 @@ fn host_policy(user: &str, name: &str, key: KeyData) -> HostPolicy {
         known_hosts_name: name.into(),
         host_key_algorithms: vec![algorithm],
         required_rsa_size: 1024,
+        agent_socket: None,
     }
 }
 
@@ -1025,4 +1026,36 @@ fn private_rsa_signing_supports_both_sha2_algorithms() {
     }
     assert!(sign_private_key(&key, b"SHA1 forbidden", 0).is_err());
     assert!(sign_private_key(&key, b"invalid flags", 6).is_err());
+}
+
+#[test]
+fn identity_agent_configuration_overrides_the_ambient_socket() {
+    let environment = |name: &str| match name {
+        "SSH_AUTH_SOCK" => Some(OsString::from("/tmp/ambient-agent")),
+        "FIXTURE_AGENT" => Some(OsString::from("/tmp/selected-agent")),
+        _ => None,
+    };
+    for (config, expected) in [
+        ("user fixture\n", Some("/tmp/ambient-agent")),
+        ("identityagent SSH_AUTH_SOCK\n", Some("/tmp/ambient-agent")),
+        (
+            "identityagent $FIXTURE_AGENT\n",
+            Some("/tmp/selected-agent"),
+        ),
+        (
+            "identityagent /tmp/explicit-agent\n",
+            Some("/tmp/explicit-agent"),
+        ),
+        ("identityagent none\n", None),
+        ("identityagent $MISSING\n", None),
+    ] {
+        assert_eq!(
+            agent_socket_from_config(config.as_bytes(), environment).unwrap(),
+            expected.map(PathBuf::from)
+        );
+    }
+    assert_eq!(
+        agent_socket_from_config(b"identityagent /tmp/explicit-agent\n", |_| None).unwrap(),
+        Some(PathBuf::from("/tmp/explicit-agent"))
+    );
 }

@@ -567,9 +567,7 @@ fn create_over_route(
     let trace =
         fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
     let mut template = key_template(&trace, &authorized)?;
-    if template.security_key_flags.is_some() {
-        template.provider = enrollment_key_provider(target, route)?;
-    }
+    configure_key_agent(&mut template, target, route)?;
     let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
         .context("unsupported receiver platform")?;
     let executable = management_executable(platform)?;

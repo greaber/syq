@@ -310,6 +310,7 @@ pub(crate) fn prepare_transfer(
     destination: &Location,
     source_login: &str,
     destination_login: &str,
+    destination_agent: Option<&Path>,
     allow_enrollment: bool,
 ) -> Result<PreparedTransfer> {
     validate_restricted_args(args)?;
@@ -358,7 +359,7 @@ pub(crate) fn prepare_transfer(
             )?
         }
     };
-    let private_key = load_signing_key(&directory)?;
+    let private_key = load_signing_key(&directory, destination_agent)?;
     let receipt_public_key = metadata.receipt_public_key.clone();
     let grant = grant_for(
         args,

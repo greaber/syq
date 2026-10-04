@@ -69,10 +69,13 @@ impl EnrollmentSigningKey {
     }
 }
 
-pub(super) fn load_signing_key(directory: &Path) -> Result<EnrollmentSigningKey> {
+pub(super) fn load_signing_key(
+    directory: &Path,
+    agent: Option<&Path>,
+) -> Result<EnrollmentSigningKey> {
     let encoded = read_enrollment_key(directory)?;
     let key = if let Some(wrapped) = wrapping::WrappedKey::decode(&encoded)? {
-        wrapped.unlock()?
+        wrapped.unlock(agent)?
     } else {
         PrivateKey::from_openssh(&encoded).context("parse enrollment private key")?
     };
@@ -86,6 +89,7 @@ pub(super) fn load_signing_key(directory: &Path) -> Result<EnrollmentSigningKey>
     }
     let public = key.public_key().clone();
     let socket = ensure_agent_key(
+        agent,
         &directory.join("enrollment-key"),
         &public,
         read_key_provider(directory)?.as_deref(),
@@ -123,13 +127,15 @@ fn read_enrollment_key(directory: &Path) -> Result<Zeroizing<Vec<u8>>> {
     )?))
 }
 
-fn ensure_agent_key(path: &Path, public: &PublicKey, provider: Option<&str>) -> Result<PathBuf> {
-    let socket = std::env::var_os("SSH_AUTH_SOCK")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .context(
-            "an SSH agent is required to unlock this receiver key; start an agent and retry",
-        )?;
+fn ensure_agent_key(
+    agent: Option<&Path>,
+    path: &Path,
+    public: &PublicKey,
+    provider: Option<&str>,
+) -> Result<PathBuf> {
+    let socket = agent.context(
+        "an SSH agent is required to unlock this receiver key; configure IdentityAgent or start an agent and retry",
+    )?.to_path_buf();
     if !agent_has_key(&socket, public)? {
         // ssh-add uses the existing key's normal passphrase/PIN prompt. Syq
         // neither reads that passphrase nor asks for a receiver passphrase.
@@ -201,10 +207,14 @@ fn read_key_provider(directory: &Path) -> Result<Option<String>> {
     }
 }
 
-pub(super) fn enrollment_key_provider(
+pub(super) fn configure_key_agent(
+    template: &mut KeyTemplate,
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
-) -> Result<Option<String>> {
+) -> Result<()> {
+    if template.protector.is_none() && template.security_key_flags.is_none() {
+        return Ok(());
+    }
     let output = Command::new("ssh")
         .arg("-G")
         .args(enrollment::enrollment_ssh_args_raw(target, route, ""))
@@ -213,16 +223,20 @@ pub(super) fn enrollment_key_provider(
     if !output.status.success() {
         bail!("could not inspect enrollment security-key provider");
     }
+    template.agent = crate::agent_broker::configured_agent_socket(&output.stdout)?;
     let config = String::from_utf8(output.stdout)?;
     let provider = config
         .lines()
         .find_map(|line| line.strip_prefix("securitykeyprovider "))
         .context("SSH did not report its security-key provider")?;
-    if provider == "internal" {
-        Ok(std::env::var("SSH_SK_PROVIDER").ok())
+    template.provider = if provider == "internal" {
+        std::env::var("SSH_SK_PROVIDER").ok()
+    } else if let Some(variable) = provider.strip_prefix('$') {
+        std::env::var(variable).ok()
     } else {
-        Ok(Some(provider.to_owned()))
-    }
+        Some(provider.to_owned())
+    };
+    Ok(())
 }
 
 fn agent_has_key(socket: &Path, key: &PublicKey) -> Result<bool> {
@@ -283,6 +297,7 @@ pub(super) struct KeyTemplate {
     pub(super) algorithm: String,
     pub(super) bits: Option<usize>,
     protector: Option<wrapping::Protector>,
+    agent: Option<PathBuf>,
     pub(super) provider: Option<String>,
     pub(super) security_key_flags: Option<u8>,
 }
@@ -338,6 +353,32 @@ fn login_key_from_trace(trace: &str) -> Result<(PathBuf, String)> {
     bail!("SSH did not report a successful public-key login for receiver enrollment")
 }
 
+// Login keys are user-managed input, not syq's mutable state. Read-only
+// owner permissions are as private as mode 0600; retain the same descriptor,
+// ownership, type and no-symlink checks when inspecting the file.
+fn read_login_key(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .context("open SSH login key")?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || !matches!(metadata.permissions().mode() & 0o7777, 0o400 | 0o600)
+    {
+        bail!("SSH login key must be an owner-owned mode-0400 or mode-0600 regular file");
+    }
+    let mut encoded = Zeroizing::new(Vec::new());
+    Read::by_ref(&mut file)
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut encoded)?;
+    if encoded.is_empty() || encoded.len() > 128 * 1024 {
+        bail!("SSH login key size is outside the supported range");
+    }
+    Ok(encoded)
+}
+
 pub(super) fn key_template(trace: &str, authorized: &[u8]) -> Result<KeyTemplate> {
     let (mut path, fingerprint) = login_key_from_trace(trace)?;
     if path.extension().is_some_and(|extension| extension == "pub") {
@@ -346,7 +387,7 @@ pub(super) fn key_template(trace: &str, authorized: &[u8]) -> Result<KeyTemplate
     if !path.is_absolute() {
         bail!("cannot identify the local private-key file for the SSH login; automatic receiver enrollment cannot determine whether this agent key is hardware-backed");
     }
-    let encoded = delegation::read_private_regular(&path, "SSH login key", 128 * 1024)
+    let encoded = read_login_key(&path)
         .context("automatic receiver enrollment needs the login key's local file to preserve its protection; agent-only and PIV/OpenPGP identities are not yet supported")?;
     let private = PrivateKey::from_openssh(&encoded)
         .context("automatic receiver enrollment requires an OpenSSH-format login key")?;
@@ -428,6 +469,7 @@ pub(super) fn key_template(trace: &str, authorized: &[u8]) -> Result<KeyTemplate
         algorithm,
         bits,
         protector,
+        agent: None,
         provider: None,
         security_key_flags: flags,
     })
@@ -594,7 +636,7 @@ pub(super) fn generate_matching_key(
     // Software keys are wrapped before any durable write. Only FIDO handles
     // and software keys matching an unencrypted login are stored as OpenSSH.
     let stored = if let Some(protector) = &template.protector {
-        wrapping::WrappedKey::seal(protector.clone(), &key)?.encode()?
+        wrapping::WrappedKey::seal(protector.clone(), &key, template.agent.as_deref())?.encode()?
     } else {
         key.to_openssh(LineEnding::LF)?.as_bytes().to_vec()
     };
@@ -642,6 +684,26 @@ mod tests {
         ))
         .is_err());
     }
+    #[test]
+    fn login_keys_accept_owner_read_only_permissions() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let key = generate_enrollment_key(EnrollmentId::test_v4(1)).unwrap();
+        let path = dir.path().join("key");
+        fs::write(&path, key.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        for mode in [0o400, 0o600] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(key_template(&trace(&path, key.public_key()), b"").is_ok());
+        }
+        for mode in [0o440, 0o644, 0o700] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(key_template(&trace(&path, key.public_key()), b"").is_err());
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(key_template(&trace(&link, key.public_key()), b"").is_err());
+    }
+
     #[test]
     fn fidokey_template_combines_client_and_server_policy() {
         let dir = crate::test_support::tempdir().unwrap();

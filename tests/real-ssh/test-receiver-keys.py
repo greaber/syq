@@ -20,13 +20,13 @@ def remote(command, **kwargs):
     return run('ssh', 'destination', command, **kwargs)
 
 
-def enroll_interactively(arguments):
+def enroll_interactively(arguments, environment):
     """Exercise OpenSSH's terminal passphrase prompt with an empty agent."""
     pid, terminal = pty.fork()
     if pid == 0:
         for variable in ('SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'DISPLAY'):
-            os.environ.pop(variable, None)
-        os.execvp(arguments[0], arguments)
+            environment.pop(variable, None)
+        os.execvpe(arguments[0], arguments, environment)
     output = bytearray()
     answered = 0
     deadline = time.monotonic() + 45
@@ -70,7 +70,8 @@ def main():
         root = Path(temporary)
         unavailable = root / 'unavailable'
         os.environ.update(SSH_SK_PROVIDER=provider, SYQ_TEST_SK_UNAVAILABLE=str(unavailable),
-                          SSH_AUTH_SOCK=str(root / 'agent.sock'))
+                          SSH_AUTH_SOCK=str(root / 'agent.sock'),
+                          SYQ_TEST_IDENTITY_AGENT=str(root / 'agent.sock'))
         agent = subprocess.Popen(['ssh-agent', '-D', '-P', provider, '-a', os.environ['SSH_AUTH_SOCK']],
                                  start_new_session=True, stdout=subprocess.DEVNULL)
         askpass = root / 'askpass'
@@ -104,6 +105,7 @@ def main():
                     if flags & 4:
                         args += ['-O', 'verify-required']
                 run(*args)
+                key.chmod(0o400)
                 public = key.with_suffix('.pub').read_text().strip()
                 options = []
                 if flags is not None and not flags & 1:
@@ -119,6 +121,7 @@ def main():
     User syq
     IdentitiesOnly yes
     IdentityFile {key}
+    IdentityAgent $SYQ_TEST_IDENTITY_AGENT
     BatchMode yes
     StrictHostKeyChecking yes
     UserKnownHostsFile /home/syq/.ssh/known_hosts
@@ -127,18 +130,26 @@ Host source
     User syq
     IdentitiesOnly yes
     IdentityFile /home/syq/.ssh/id_ed25519
+    IdentityAgent {root / 'agent.sock'}
     BatchMode yes
     StrictHostKeyChecking yes
     UserKnownHostsFile /home/syq/.ssh/known_hosts
     GlobalKnownHostsFile /dev/null
 ''')
                 arguments = ['syq', 'receiver', 'enroll', f'destination:{parent}/copy']
+                # The selected per-host agent must work both without the
+                # environment default and when that default points elsewhere.
+                environment = dict(os.environ)
+                if index % 2:
+                    environment.pop('SSH_AUTH_SOCK', None)
+                else:
+                    environment['SSH_AUTH_SOCK'] = str(root / 'wrong-agent.sock')
                 if kind == 'ed25519' and protected:
                     config.write_text(config.read_text().replace('BatchMode yes', 'BatchMode no'))
-                    enrolled = enroll_interactively(arguments)
+                    enrolled = enroll_interactively(arguments, environment)
                 else:
                     run('ssh-add', '-S', provider, str(key))
-                    enrolled = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+                    enrolled = subprocess.run(arguments, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
                 if kind == 'ecdsa' and protected:
                     assert enrolled.returncode and b'ECDSA is unsupported' in enrolled.stderr, enrolled.stderr
                     continue
@@ -165,14 +176,19 @@ Host source
                     assert size == max(3072, bits), size
                 copy = ['syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-key-source',
                         '--to', 'destination', '--as', parent + '/copy', '--no-tcp', '--no-progress']
-                run(*copy)
+                run(*copy, env=environment)
                 assert remote('cat ' + shlex.quote(parent + '/copy'), stdout=subprocess.PIPE).stdout == b'matching-key-copy\n'
                 if flags is not None:
                     unavailable.touch()
-                    failed = subprocess.run(copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+                    failed = subprocess.run(copy, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
                     assert failed.returncode != 0, 'copy succeeded with the test device unavailable'
                     unavailable.unlink()
                 if protected:
+                    selected_config = config.read_text()
+                    config.write_text(selected_config.replace('IdentityAgent $SYQ_TEST_IDENTITY_AGENT', 'IdentityAgent none'))
+                    disabled = subprocess.run(copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+                    assert disabled.returncode and b'an SSH agent is required' in disabled.stderr, disabled.stderr
+                    config.write_text(selected_config)
                     before = stored
                     run('syq', 'receiver', 'enroll', f'destination:{parent}/another')
                     assert (metadata_path.parent / 'enrollment-key').read_bytes() == before

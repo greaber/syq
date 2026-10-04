@@ -32,11 +32,12 @@ creating that key can still require touching the device.
 For a passphrase-protected Ed25519 or RSA login, the receiver key is encrypted
 using a secret derived through the login key's SSH agent. There is no new
 passphrase. If the login key is not loaded, `ssh-add` asks for its usual
-passphrase. Losing that login key requires revoking and enrolling again through
+passphrase. Syq uses the agent selected by the destination's `IdentityAgent`
+setting, or `SSH_AUTH_SOCK` when that setting is absent. Losing that login key requires revoking and enrolling again through
 another login. Revocation itself does not need the receiver key unlocked.
 
 Automatic matching needs the login's local OpenSSH private-key file or FIDO
-handle. Passphrase-protected ECDSA, encrypted FIDO handles, SSH certificates,
+handle, readable only by its owner (mode 0400 or 0600). Passphrase-protected ECDSA, encrypted FIDO handles, SSH certificates,
 password or multi-factor logins, and agent-only identities (including
 PIV/OpenPGP keys) are unsupported. For FIDO, the login key must have one matching
 entry in `~/.ssh/authorized_keys` so syq can read its server policy. Syq reports

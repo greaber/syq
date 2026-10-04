@@ -822,6 +822,7 @@ fn run_remote(
                     dst,
                     &coordinator_policy.login_user,
                     &peer_policy.login_user,
+                    peer_policy.agent_socket(),
                     !args.dry_run,
                 )
             })

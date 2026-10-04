@@ -46,7 +46,11 @@ impl WrappedKey {
         Ok(encoded)
     }
 
-    pub(super) fn seal(protector: Protector, private: &PrivateKey) -> Result<Self> {
+    pub(super) fn seal(
+        protector: Protector,
+        private: &PrivateKey,
+        agent: Option<&Path>,
+    ) -> Result<Self> {
         let mut challenge = [0; 32];
         let mut nonce = [0; 12];
         getrandom::fill(&mut challenge)?;
@@ -58,7 +62,7 @@ impl WrappedKey {
             challenge,
             nonce,
         };
-        let key = header.agent_wrapping_key()?;
+        let key = header.agent_wrapping_key(agent)?;
         let private = private.to_openssh(LineEnding::LF)?;
         let mut ciphertext = Zeroizing::new(private.as_bytes().to_vec());
         key.seal_in_place_append_tag(
@@ -73,8 +77,8 @@ impl WrappedKey {
         })
     }
 
-    pub(super) fn unlock(&self) -> Result<PrivateKey> {
-        let key = self.header.agent_wrapping_key()?;
+    pub(super) fn unlock(&self, agent: Option<&Path>) -> Result<PrivateKey> {
+        let key = self.header.agent_wrapping_key(agent)?;
         self.open(&key)
     }
 
@@ -95,7 +99,7 @@ impl WrappedKey {
 }
 
 impl Header {
-    fn agent_wrapping_key(&self) -> Result<aead::LessSafeKey> {
+    fn agent_wrapping_key(&self, agent: Option<&Path>) -> Result<aead::LessSafeKey> {
         let public = PublicKey::from_openssh(&self.protector.public_key)?;
         if !matches!(
             public.algorithm(),
@@ -106,7 +110,7 @@ impl Header {
         if !self.protector.path.is_absolute() {
             bail!("receiver unlocking key path must be absolute");
         }
-        let socket = ensure_agent_key(&self.protector.path, &public, None)?;
+        let socket = ensure_agent_key(agent, &self.protector.path, &public, None)?;
         let temporary = crate::private_broker::private_temp_dir("syq-unlock-")?;
         atomic_write(
             temporary.path(),
@@ -176,6 +180,7 @@ mod tests {
         const CHILD: &str = "SYQ_TEST_WRAPPED_KEY_CHILD";
         if let Some(root) = std::env::var_os(CHILD) {
             let root = PathBuf::from(root);
+            let socket = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK").unwrap());
             for algorithm in ["ed25519", "rsa", "ecdsa"] {
                 let path = root.join(algorithm);
                 let mut generate = Command::new("ssh-keygen");
@@ -198,7 +203,8 @@ mod tests {
                         .contains("ECDSA is unsupported"));
                     continue;
                 }
-                let template = template.unwrap();
+                let mut template = template.unwrap();
+                template.agent = Some(socket.clone());
                 if algorithm == "rsa" {
                     assert_eq!(template.bits, Some(3072));
                 }
@@ -212,7 +218,7 @@ mod tests {
                 assert!(PrivateKey::from_openssh(&encoded).is_err());
                 assert_eq!(load_enrollment_public_key(&directory).unwrap(), public);
                 let wrapped = WrappedKey::decode(&encoded).unwrap().unwrap();
-                let key = wrapped.header.agent_wrapping_key().unwrap();
+                let key = wrapped.header.agent_wrapping_key(Some(&socket)).unwrap();
                 let mut tampered: WrappedKey =
                     serde_json::from_slice(&serde_json::to_vec(&wrapped).unwrap()).unwrap();
                 tampered.header.protector.path = root.join("different-key");
@@ -228,13 +234,12 @@ mod tests {
                 );
                 assert!(tampered.open(&key).is_err());
                 // Only the original login identity lives in the ambient agent.
-                let socket = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK").unwrap());
                 assert!(agent_has_key(&socket, private.public_key()).unwrap());
                 assert!(!agent_has_key(&socket, &public).unwrap());
                 // An unlocked agent is sufficient even without the private file.
                 let moved = path.with_extension("hidden");
                 fs::rename(&path, &moved).unwrap();
-                let signer = load_signing_key(&directory).unwrap();
+                let signer = load_signing_key(&directory, Some(&socket)).unwrap();
                 let signature = signer.sign_grant(b"grant fixture").unwrap();
                 public
                     .verify(
@@ -249,9 +254,9 @@ mod tests {
                     .status_guarded()
                     .unwrap()
                     .success());
-                assert!(load_signing_key(&directory).is_err());
+                assert!(load_signing_key(&directory, Some(&socket)).is_err());
                 fs::rename(&moved, &path).unwrap();
-                assert!(load_signing_key(&directory).is_ok());
+                assert!(load_signing_key(&directory, Some(&socket)).is_ok());
             }
             return;
         }
