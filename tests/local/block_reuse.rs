@@ -1013,7 +1013,7 @@ fn staging_recovery_preserves_patch_sources() {
                 &t.s("src/"),
                 &t.s("dst/"),
             ])
-            .env("SYQ_TEST_STAGING_LIMIT", "1")
+            .env("SYQ_TEST_STAGING_LIMIT", "2")
             .env("SYQ_DEBUG", "1");
         if network {
             command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
