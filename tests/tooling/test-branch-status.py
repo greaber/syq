@@ -16,6 +16,7 @@ PR_CHECKS = SCRIPTS / "pr-checks.py"
 FAKE_GH = """#!/bin/sh
 case "$1:$2" in
   api:repos/*/commits/*)
+    printf '%s\\n' "$2" >> "$SYQ_TEST_RUNS_DIR/status-requests"
     file="$SYQ_TEST_RUNS_DIR/statuses.json"
     if [ -f "$file" ]; then cat "$file"; else echo '[[]]'; fi
     ;;
@@ -567,6 +568,22 @@ class BranchStatusTests(unittest.TestCase):
             "context": "dispatched-resolution/8/8800", "state": "success",
             "description": "Mistaken fixture removed"}]]))
         self.assertNotIn("NOTE: #8", self.status())
+
+    def test_merged_prs_share_a_commit_lookup_but_keep_separate_resolutions(self):
+        self.dispatch("focused-check.yml", 88, "2026-02-01T00:00:00Z", {"btrfs": "failure"},
+                      branch="merged-task")
+        self.dispatch("focused-check.yml", 89, "2026-02-01T00:00:00Z", {"btrfs": "failure"},
+                      branch="other-task")
+        self.merged = [{"number": number, "url": f"https://example.invalid/pull/{number}",
+                        "headRefName": branch, "mergedAt": "2026-02-02T00:00:00Z"}
+                       for number, branch in [(8, "merged-task"), (9, "other-task")]]
+        (self.runs / "statuses.json").write_text(json.dumps([[{
+            "context": "dispatched-resolution/8/8800", "state": "success",
+            "description": "Mistaken fixture removed"}]]))
+        report = json.loads(self.status("--json"))
+        self.assertEqual([entry["number"] for entry in report["merged_failures"]], [9])
+        requests = (self.runs / "status-requests").read_text().splitlines()
+        self.assertEqual(len(requests), 1)
 
 
 if __name__ == "__main__":

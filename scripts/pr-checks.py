@@ -23,8 +23,8 @@ import shutil
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
-                               dispatched_runs, fetch_jobs, in_parallel, merged_from_branch,
-                               result_lines, running, unresolved)
+                               dispatched_runs, fetch_jobs, fetch_resolutions, in_parallel,
+                               merged_from_branch, result_lines, running, unresolved)
 from tooling import ToolError, json_output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -43,8 +43,8 @@ def report(number, json_report):
             for workflow in BRANCH_WORKFLOWS])
         runs = branch_runs([run for workflow_runs in found[1:] for run in workflow_runs],
                            branch, found[0], pr.get("mergedAt") or None)
-        results = apply_resolutions(REPOSITORY, pr["number"],
-                                    check_results(runs, fetch_jobs(REPOSITORY, runs)))
+        results = check_results(runs, fetch_jobs(REPOSITORY, runs))
+        results = apply_resolutions(pr["number"], results, fetch_resolutions(REPOSITORY, results))
         active = running(runs)
     exit_status = 1 if any(unresolved(entry) for entry in results) else 0
 

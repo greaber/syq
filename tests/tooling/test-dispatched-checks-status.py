@@ -181,7 +181,7 @@ class DispatchedChecksStatusTests(unittest.TestCase):
         self.prs[0]["state"] = "MERGED"
         self.assertEqual(self.post("7"), [])
 
-    def test_resolve_reopen_and_new_failures(self):
+    def test_resolve_and_new_failures(self):
         self.dispatch(80, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
         replacement = "https://example.invalid/runs/81"
         reason = "Runner cannot create loop devices; replacement passed"
@@ -200,16 +200,14 @@ class DispatchedChecksStatusTests(unittest.TestCase):
         # Other failures remain blocking.
         self.dispatch(81, "2026-02-02T00:00:00Z", {"rust": "failure"})
         self.assertEqual(self.post("7")[0]["description"], "1 failed: ci.yml rust")
-        _, gate = self.post("7", "--reopen-job", "8000", "--reason", "Coverage still needed")
-        self.assertTrue(gate["description"].startswith("2 failed:"))
-        self.post("7", "--resolve-job", "8000", "--reason", reason)
         # A rerun gets a new job ID even on the same SHA and with the same name.
         self.dispatch(82, "2026-02-03T00:00:00Z", {"btrfs": "failure", "rust": "success"})
         self.assertEqual(self.post("7")[0]["description"], "1 failed: ci.yml btrfs")
 
-    def test_resolution_is_scoped_to_pr_and_paginated_newest_wins(self):
+    def test_resolution_without_replacement_is_scoped_to_pr_and_paginated(self):
         self.dispatch(83, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
-        self.post("7", "--resolve-job", "8300", "--reason", "Mistaken fixture removed")
+        _, gate = self.post("7", "--resolve-job", "8300", "--reason", "Mistaken fixture removed")
+        self.assertEqual(gate["state"], "success")
         self.prs[0]["number"] = 8
         self.assertEqual(self.post("8")[0]["state"], "failure")
         self.prs[0]["number"] = 7
@@ -218,8 +216,6 @@ class DispatchedChecksStatusTests(unittest.TestCase):
         noise = [{"context": f"unrelated/{i}", "state": "success"} for i in range(101)]
         path.write_text(json.dumps(noise + statuses))
         self.assertEqual(self.post("7")[0]["state"], "success")
-        self.post("7", "--reopen-job", "8300", "--reason", "Wrong resolution")
-        self.assertEqual(self.post("7")[0]["state"], "failure")
 
     def test_resolution_requires_reason_and_current_failed_job_of_open_pr(self):
         self.dispatch(84, "2026-02-01T00:00:00Z", {"btrfs": "failure", "rust": "success"})
@@ -241,10 +237,26 @@ class DispatchedChecksStatusTests(unittest.TestCase):
         self.assertEqual(self.post("7", "--resolve-job", "8400", "--reason", "closed",
                                    expected=2), [])
 
-    def test_unreadable_resolutions_do_not_post_a_passing_gate(self):
+    def test_unreadable_resolutions_replace_old_success_with_failure(self):
+        [initial] = self.post("7")
+        self.assertEqual(initial["state"], "success")
         self.dispatch(85, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
         (self.data / "fail-status-read").touch()
-        self.assertEqual(self.post("7", expected=1), [])
+        [posted] = self.post("7", expected=1)
+        self.assertEqual(posted["endpoint"], initial["endpoint"])
+        self.assertEqual(posted["context"], "dispatched-checks")
+        self.assertEqual(posted["state"], "failure")
+        self.assertEqual(posted["target_url"], "https://example.invalid/runs/85/btrfs")
+        statuses = json.loads((self.data / f"statuses-{'a' * 40}.json").read_text())
+        self.assertEqual([entry["state"] for entry in statuses], ["failure", "success"])
+
+    def test_unreadable_resolutions_still_honor_the_explicit_override(self):
+        self.dispatch(86, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
+        self.prs[0]["labels"] = [{"name": "merge-despite-failures"}]
+        (self.data / "fail-status-read").touch()
+        [posted] = self.post("7", expected=1)
+        self.assertEqual(posted["state"], "success")
+        self.assertTrue(posted["description"].startswith("Overridden by merge-despite-failures:"))
 
 
 if __name__ == "__main__":

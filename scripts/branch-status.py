@@ -36,9 +36,9 @@ import subprocess
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
-                               dispatched_runs, failed_checks, fetch_jobs, in_parallel,
-                               merged_from_branch, merged_pull_requests, result_lines, run_jobs,
-                               running, undecided, unresolved)
+                               dispatched_runs, failed_checks, fetch_jobs, fetch_resolutions,
+                               in_parallel, merged_from_branch, merged_pull_requests, result_lines,
+                               run_jobs, running, undecided, unresolved)
 from tooling import ToolError, json_output, output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -238,16 +238,19 @@ def report(json_report, check):
     # Every run on this branch is listed; merged branches only need their failures.
     jobs = fetch_jobs(REPOSITORY, own_runs + [run for _, pr_runs in merged_runs
                                               for run in undecided(pr_runs)])
-    branch_results = apply_resolutions(REPOSITORY, pr["number"] if pr else None,
-                                      check_results(own_runs, jobs))
+    branch_results = check_results(own_runs, jobs)
+    merged_results = [(merged_pr, failed_checks(pr_runs, jobs)) for merged_pr, pr_runs in merged_runs]
+    resolutions = fetch_resolutions(REPOSITORY, (branch_results if pr else []) +
+                                   [entry for _, results in merged_results for entry in results])
+    branch_results = apply_resolutions(pr["number"] if pr else None, branch_results, resolutions)
     branch_failed = [entry for entry in branch_results if unresolved(entry)]
     branch_running = running(own_runs)
     for entry in branch_failed:
         warn(f"{entry['workflow']} {entry['job']} {entry['conclusion']} at {entry['head'][:7]} on "
              f"this branch, and no later run passed it {entry['url']}")
     merged_failed = []
-    for merged_pr, pr_runs in merged_runs:
-        for entry in apply_resolutions(REPOSITORY, merged_pr["number"], failed_checks(pr_runs, jobs)):
+    for merged_pr, results in merged_results:
+        for entry in apply_resolutions(merged_pr["number"], results, resolutions):
             if not unresolved(entry):
                 continue
             merged_failed.append(dict(entry, number=merged_pr.get("number"),

@@ -120,13 +120,9 @@ def resolution_context(number, job_id):
     return f"dispatched-resolution/{number}/{job_id}"
 
 
-def apply_resolutions(repository, number, results):
-    """Attach resolutions without changing test conclusions. Commit statuses
-    preserve the reason, author, time, and optional replacement link. The latest
-    status for a PR/job wins; any state other than success reopens the failure.
-    Old tooling ignores these separate contexts and keeps reporting failures.
-    """
-    heads = sorted({entry["head"] for entry in results if number and unresolved(entry)
+def fetch_resolutions(repository, results):
+    """Read each failed commit's statuses once, in parallel across PRs."""
+    heads = sorted({entry["head"] for entry in results if unresolved(entry)
                     and entry.get("job_id")})
 
     def statuses(head):
@@ -139,7 +135,15 @@ def apply_resolutions(repository, number, results):
                 latest.setdefault(entry["context"], entry)
         return latest
 
-    by_head = dict(zip(heads, in_parallel([lambda head=head: statuses(head) for head in heads])))
+    return dict(zip(heads, in_parallel([lambda head=head: statuses(head) for head in heads])))
+
+
+def apply_resolutions(number, results, by_head):
+    """Attach resolutions without changing test conclusions. Commit statuses
+    preserve the reason, author, time, and optional replacement link. Only the
+    latest successful status with a reason resolves that PR's exact failed job.
+    Old tooling ignores these separate contexts and keeps reporting failures.
+    """
     annotated = []
     for entry in results:
         resolution = by_head.get(entry["head"], {}).get(

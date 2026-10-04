@@ -3,14 +3,14 @@
 
 Usage: scripts/dispatched-checks-status.py [PULL_REQUEST...]
        scripts/dispatched-checks-status.py PR --resolve-job JOB_ID --reason TEXT [--replacement URL]
-       scripts/dispatched-checks-status.py PR --reopen-job JOB_ID --reason TEXT
 
 The status fails while a check dispatched on the pull request's branch has
 failed, no later run of that check passed, and the failed job has no explicit
 resolution (see scripts/dispatched_checks.py). Resolutions are separate commit statuses
 on the failed job's SHA, scoped to its PR and job ID. They require status-write
 access, preserve the original failure, and never excuse a later failed job.
-The command records the resolution/reopening and refreshes the PR gate.
+The command records the resolution and refreshes the PR gate. If resolution
+lookups fail, known failures are treated as unresolved and the command exits nonzero.
 Checks still running do not fail it. The `merge-despite-failures` label turns
 a failing status into a success that says it was overridden. Pull requests
 from forks have no dispatched checks here and always succeed.
@@ -30,8 +30,9 @@ import os
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, dispatched_runs,
-                               failed_checks, fetch_jobs, in_parallel, merged_from_branch,
-                               resolution_context, result_lines, running, undecided, unresolved)
+                               failed_checks, fetch_jobs, fetch_resolutions, in_parallel,
+                               merged_from_branch, resolution_context, result_lines, running,
+                               undecided, unresolved)
 from tooling import ToolError, json_output, output, report_errors
 
 CONTEXT = "dispatched-checks"
@@ -82,7 +83,7 @@ def status(pr, failed, active, resolved=()):
     return "success", description, ""
 
 
-def post(repository, pr, *, job_id=None, reason=None, replacement=None, reopen=False):
+def post(repository, pr, *, job_id=None, reason=None, replacement=None):
     failed, active = [], []
     if not pr.get("isCrossRepository"):
         branch = pr.get("headRefName")
@@ -100,11 +101,18 @@ def post(repository, pr, *, job_id=None, reason=None, replacement=None, reopen=F
             raise ToolError(f"job {job_id} is not a current failed dispatched check of PR "
                             f"#{pr['number']}", 2)
         output("gh", "api", "--method", "POST", f"repos/{repository}/statuses/{entry['head']}",
-               "-f", f"state={'failure' if reopen else 'success'}", "-f",
+               "-f", "state=success", "-f",
                f"context={resolution_context(pr['number'], job_id)}", "-f", f"description={reason}",
                *(["-f", f"target_url={replacement}"] if replacement else []), status=2)
-        print(f"{'Reopened' if reopen else 'Resolved'} job {job_id} at {entry['head'][:7]}: {reason}")
-    results = apply_resolutions(repository, pr["number"], failed)
+        print(f"Resolved job {job_id} at {entry['head'][:7]}: {reason}")
+    lookup_error = None
+    try:
+        results = apply_resolutions(pr["number"], failed, fetch_resolutions(repository, failed))
+    except ToolError as error:
+        # A known failure must replace an older successful gate even when we
+        # cannot read its resolution. The explicit override label still applies.
+        lookup_error = error
+        results = failed
     failed = [entry for entry in results if unresolved(entry)]
     resolved = [entry for entry in results if entry.get("resolution")]
     state, description, url = status(pr, failed, active, resolved)
@@ -118,33 +126,33 @@ def post(repository, pr, *, job_id=None, reason=None, replacement=None, reopen=F
     print(f"#{pr.get('number')} {pr.get('headRefOid', '')[:7]}: {state}: {description}")
     if resolved:
         print("\n".join(result_lines(resolved, [])))
+    if lookup_error is not None:
+        raise ToolError(f"resolution lookup failed; posted status with known failures unresolved: "
+                        f"{lookup_error}", 2)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("pull_requests", nargs="*")
-    action = parser.add_mutually_exclusive_group()
-    action.add_argument("--resolve-job", type=int, help="Resolve this exact failed job ID")
-    action.add_argument("--reopen-job", type=int, help="Revoke this failed job's resolution")
-    parser.add_argument("--reason", help="Required resolution/reopening reason (1–140 characters)")
+    parser.add_argument("--resolve-job", type=int, help="Resolve this exact failed job ID")
+    parser.add_argument("--reason", help="Required resolution reason (1–140 characters)")
     parser.add_argument("--replacement", help="Optional HTTPS URL of replacement evidence")
     args = parser.parse_args()
-    job_id = args.resolve_job if args.resolve_job is not None else args.reopen_job
+    job_id = args.resolve_job
     if any(not number.isdigit() or int(number) <= 0 for number in args.pull_requests):
         parser.error("pull request numbers must be positive integers")
     if job_id is not None:
         if len(args.pull_requests) != 1 or job_id <= 0:
-            parser.error("resolving or reopening requires one pull request and a positive job ID")
+            parser.error("resolving requires one pull request and a positive job ID")
         args.reason = (args.reason or "").strip()
         if not 1 <= len(args.reason) <= 140 or any(c in args.reason for c in "\r\n"):
             parser.error("--reason must be one line of 1–140 characters")
-        if args.replacement and (args.reopen_job is not None or
-                                 not args.replacement.startswith("https://") or
+        if args.replacement and (not args.replacement.startswith("https://") or
                                  any(c.isspace() for c in args.replacement)):
             parser.error("--replacement requires --resolve-job and an HTTPS URL")
     elif args.reason is not None or args.replacement is not None:
-        parser.error("--reason and --replacement require --resolve-job or --reopen-job")
+        parser.error("--reason and --replacement require --resolve-job")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if not repository:
         raise ToolError("GITHUB_REPOSITORY must name the repository", 2)
@@ -152,16 +160,15 @@ def main():
     failures = []
     prs = selected_pull_requests(repository, args.pull_requests)
     if job_id is not None and not prs:
-        raise ToolError("resolving or reopening requires an open pull request", 2)
+        raise ToolError("resolving requires an open pull request", 2)
     for pr in prs:
         try:
-            post(repository, pr, job_id=job_id, reason=args.reason, replacement=args.replacement,
-                 reopen=args.reopen_job is not None)
+            post(repository, pr, job_id=job_id, reason=args.reason, replacement=args.replacement)
         except ToolError as error:
             print(f"error: #{pr.get('number')}: {error}", file=sys.stderr)
             failures.append(pr.get("number"))
     if failures:
-        raise ToolError(f"no status set for {', '.join(f'#{number}' for number in failures)}")
+        raise ToolError(f"status evaluation failed for {', '.join(f'#{number}' for number in failures)}")
     return 0
 
 

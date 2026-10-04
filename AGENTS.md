@@ -506,7 +506,7 @@ and variability, and lengthen or repeat the test as needed to support the claim.
 
 ## Verification
 
-**Fix problems, don't skip work**: When a needed check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping. Mistaken or superseded checks can be resolved as described below.
+**Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
 
 `scripts/setup.sh` is that setup. Run it without arguments to install the
 Rust toolchain from `rust-toolchain.toml` and the tools pinned in
@@ -537,13 +537,14 @@ before merge. When CI fails, first distinguish product defects from test,
 fixture, and runner problems; investigate the failure rather than reflexively
 expanding the suite.
 
-Dispatching a check does not create a new product requirement. Agents may
-correct, replace, or remove checks they introduced by mistake when the actual
-requirements remain covered. After investigating, they may resolve an exact
-failed job caused by a mistaken test/setup or superseded by suitable replacement
-evidence. Record why it no longer needs to block; link replacement evidence when
-there is any. Do not resolve an actual product defect or drop agreed coverage
-without the user's decision. No advance designation as an experiment is needed.
+Dispatching a check does not create a new product requirement. An agent may
+correct, replace, or remove a check it introduced by mistake and resolve that
+check's failure without asking, provided the actual requirements remain covered.
+Otherwise, an agent may resolve a failure without asking only when a suitable
+replacement run passed and its link is recorded. Without either basis, report
+the failure and ask the user before resolving it. Record why the failure no
+longer needs to block. Do not excuse an unfixed product defect or drop agreed
+coverage without the user's decision.
 
 Use the job ID at the end of its GitHub job URL:
 
@@ -556,9 +557,7 @@ GITHUB_REPOSITORY=greaber/syq scripts/dispatched-checks-status.py <pr> \
 The reason is one line of at most 140 characters; the replacement URL is optional.
 This records a separate GitHub status with the author and time, then refreshes
 the gate. It covers only that PR and exact failed job, not other or future
-failures. `--reopen-job <job-id> --reason 'Why it still matters'` revokes a
-resolution. Both commands need permission to write commit statuses. Use tooling
-that includes this support; older versions still report resolved jobs as failures.
+failures. The command needs permission to write commit statuses.
 Resolutions do not count as passing tests or release validation.
 
 Weigh cost as well as relevance. For changes to code, tooling, tests, or
