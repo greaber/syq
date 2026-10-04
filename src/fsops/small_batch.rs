@@ -12,6 +12,64 @@ pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
 
+// Filesystem servers may have a much lower limit than this process, and FUSE
+// may translate their exhaustion to EPERM. Learn only for this process. A
+// failed create gets one retry after the staged files have been closed; all
+// checks and atomic publication still run on that retry.
+static STAGING_WIDTH: AtomicUsize = AtomicUsize::new(BURST);
+
+#[derive(Default)]
+struct StagingAdmission {
+    active: usize,
+    reduced: bool,
+}
+static STAGING_ADMISSION: std::sync::Mutex<StagingAdmission> =
+    std::sync::Mutex::new(StagingAdmission {
+        active: 0,
+        reduced: false,
+    });
+static STAGING_DRAINED: std::sync::Condvar = std::sync::Condvar::new();
+struct StagingBurst;
+impl StagingBurst {
+    fn enter() -> Option<Self> {
+        let mut state = STAGING_ADMISSION.lock().unwrap();
+        if state.reduced {
+            while state.active != 0 {
+                state = STAGING_DRAINED.wait(state).unwrap();
+            }
+            None
+        } else {
+            state.active += 1;
+            Some(Self)
+        }
+    }
+    fn reduce() {
+        STAGING_ADMISSION.lock().unwrap().reduced = true;
+        STAGING_WIDTH.store(1, Ordering::Relaxed);
+    }
+}
+impl Drop for StagingBurst {
+    fn drop(&mut self) {
+        let mut state = STAGING_ADMISSION.lock().unwrap();
+        state.active -= 1;
+        if state.active == 0 {
+            STAGING_DRAINED.notify_all();
+        }
+    }
+}
+
+fn retry_stage_open(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| {
+            matches!(
+                error.raw_os_error(),
+                Some(libc::EMFILE | libc::ENFILE | libc::EPERM)
+            )
+        })
+}
+
 /// A small file's private sidecar between its creation and publication.
 pub(super) struct SmallStage {
     target: RootedTarget,
@@ -81,7 +139,7 @@ impl FsOps {
                 next += 1;
                 continue;
             }
-            let reserved = ReservedDescriptors::up_to(BURST - 1);
+            let reserved = ReservedDescriptors::up_to(STAGING_WIDTH.load(Ordering::Relaxed) - 1);
             let mut run: Vec<(usize, RootedTarget)> = Vec::with_capacity(1 + reserved.0);
             // A run stays in one directory and names each target once: a
             // repeated target would share its sidecar with the earlier one.
@@ -138,15 +196,43 @@ impl FsOps {
         let Some((_, first)) = run.first() else {
             return;
         };
+        let Some(burst) = StagingBurst::enter() else {
+            for (index, _) in run {
+                results[index] = self
+                    .put_small(&puts[index])
+                    .map_err(|error| wire_error(&error));
+            }
+            return;
+        };
         let (root, directory) = (first.root.clone(), first.relative.clone());
         let mut stages = Vec::with_capacity(run.len());
+        let mut retry = Vec::new();
         {
             // A turn only schedules. If it cannot be taken, the operations
             // themselves report what is wrong with the path.
             let _turn = root.mutation_turn(&directory).ok();
-            for (index, target) in run {
-                match self.create_small_stage(&puts[index], target) {
+            let mut remaining = run.into_iter();
+            while let Some((index, target)) = remaining.next() {
+                #[cfg(debug_assertions)]
+                let refuse = std::env::var("SYQ_TEST_STAGING_LIMIT")
+                    .ok()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|limit| stages.len() >= limit);
+                #[cfg(not(debug_assertions))]
+                let refuse = false;
+                let created = if refuse {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
+                } else {
+                    self.create_small_stage(&puts[index], target)
+                };
+                match created {
                     Ok(stage) => stages.push((index, stage)),
+                    Err(error) if retry_stage_open(&error) => {
+                        StagingBurst::reduce();
+                        retry.push(index);
+                        retry.extend(remaining.map(|(index, _)| index));
+                        break;
+                    }
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
@@ -180,6 +266,17 @@ impl FsOps {
         for (index, stage) in published {
             results[index] = self
                 .finish_small_stage(&puts[index], stage)
+                .map_err(|error| wire_error(&error));
+        }
+        drop(burst);
+        if !retry.is_empty() {
+            // Other workers must publish and close their existing bursts too.
+            // They never wait while holding a burst or directory turn.
+            drop(StagingBurst::enter());
+        }
+        for index in retry {
+            results[index] = self
+                .put_small(&puts[index])
                 .map_err(|error| wire_error(&error));
         }
     }

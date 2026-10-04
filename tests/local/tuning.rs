@@ -2480,3 +2480,78 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         .unwrap();
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_keeps_copying_with_bounded_parallelism() {
+    let t = Tmp::new();
+    // Enough files to exercise workers instead of the small-copy shortcut.
+    for index in 0..512 {
+        write(
+            &t.path(&format!("source/f{index:04}")),
+            format!("content {index}").as_bytes(),
+        );
+    }
+    for (label, fault, value, nofile) in [
+        ("fds", "", "", Some(96)),
+        ("pools", "SYQ_TEST_NO_OPTIONAL_POOLS", "1", None),
+        ("threads", "SYQ_TEST_WORKER_THREAD_LIMIT", "4", None),
+        ("staging", "SYQ_TEST_STAGING_LIMIT", "3", None),
+    ] {
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--no-progress",
+            &t.s("source/"),
+            &t.s(&format!("{label}/")),
+        ]);
+        command.env("SYQ_TUNING_CACHE", "");
+        if !fault.is_empty() {
+            command.env(fault, value);
+        }
+        if let Some(limit) = nofile {
+            set_child_nofile_limit(&mut command, limit);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output =
+            wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+        assert_output_ok(&output);
+        for index in 0..512 {
+            assert_eq!(
+                read(&t.path(&format!("{label}/f{index:04}"))),
+                format!("content {index}").as_bytes()
+            );
+        }
+        assert!(partial_files(&t.path(label)).is_empty());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_reports_essential_and_fixed_worker_failures() {
+    let t = Tmp::new();
+    for index in 0..512 {
+        write(&t.path(&format!("source/f{index}")), b"content");
+    }
+    for (label, limit, fixed) in [("essential", "0", false), ("fixed", "1", true)] {
+        let mut command = compat_command();
+        command
+            .args([
+                "-a",
+                "--no-progress",
+                &t.s("source/"),
+                &t.s(&format!("{label}/")),
+            ])
+            .env("SYQ_TEST_WORKER_THREAD_LIMIT", limit);
+        if fixed {
+            command.args(["--performance-tuning", "workers=4"]);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output =
+            wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+        assert!(!output.status.success());
+        let error = stderr_of(&output);
+        assert!(error.contains("cannot start copy worker"), "{error}");
+        assert!(!error.contains("panicked"), "{error}");
+    }
+}

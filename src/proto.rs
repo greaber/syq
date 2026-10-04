@@ -1264,6 +1264,7 @@ impl Request {
 pub enum Response {
     HelloOk {
         identity: String,
+        descriptors: Option<crate::resources::Descriptors>,
         platform: String,
         supports_confined_socket_nodes: bool,
         /// One live restricted copy's SSH worker admission, sent only on its control channel.

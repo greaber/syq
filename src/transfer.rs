@@ -2070,7 +2070,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             spec.prime_pooled_control(args.compress);
         }
     }
-    let maximum_workers = if autotune {
+    let mut maximum_workers = if autotune {
         args.automatic_worker_limit()
     } else {
         args.connections
@@ -2102,25 +2102,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let candidates = small_copy_candidate.then(|| srcs.to_vec());
         let source_progress = progress.clone();
         // Local metadata is usually ready before the SSH handshake completes.
-        let t = std::thread::spawn(move || -> Result<_> {
-            if let Some(source) = prepared_source {
-                return source
-                    .control
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .context("prepared source already consumed")?;
-            }
-            connect_source(
-                &a,
-                &b,
-                Some(&source_progress),
-                candidates.as_deref(),
-                source_shared_workers,
-                copy_local_claim_workers,
-                remote_source_handoff_workers,
-            )
-        });
+        let t = std::thread::Builder::new()
+            .spawn(move || -> Result<_> {
+                if let Some(source) = prepared_source {
+                    return source
+                        .control
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .context("prepared source already consumed")?;
+                }
+                connect_source(
+                    &a,
+                    &b,
+                    Some(&source_progress),
+                    candidates.as_deref(),
+                    source_shared_workers,
+                    copy_local_claim_workers,
+                    remote_source_handoff_workers,
+                )
+            })
+            .context("start source connection setup thread")?;
         // The small-copy offer configures hashing and selects entries in the
         // same turn. General copies keep the usual control initialization.
         let destination_setup = progress.clock.setup.begin();
@@ -2208,6 +2210,25 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
     };
+    if autotune {
+        let mut capacity = crate::resources::Descriptors::current()
+            .map(|budget| budget.workers(if src_ep.is_remote() { 0 } else { srcs.len() }))
+            .unwrap_or(usize::MAX);
+        for endpoint in [&src_ep, &dst_ep] {
+            if let Endpoint::Remote(spec) = endpoint {
+                if let Some(budget) = spec.diagnostics().peer.and_then(|peer| peer.descriptors) {
+                    capacity = capacity.min(budget.workers(srcs.len()));
+                }
+            }
+        }
+        maximum_workers = maximum_workers.min(capacity);
+        if args.connections > maximum_workers && !opts.quiet {
+            progress.eprintln(&format!(
+                "syq: open-file limits restrict this copy to {maximum_workers} workers; increasing the endpoint limits may improve performance"
+            ));
+        }
+        args.connections = args.connections.min(maximum_workers);
+    }
     // Admission is complete before worker closures receive shared options.
     let opts = Arc::new(opts);
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
@@ -2283,7 +2304,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 transport_stats.clone(),
                 connect_after_file_plan.clone(),
             );
-            let h = std::thread::spawn(move || -> Result<()> {
+            if !gate.connection_needed(id) {
+                gate.mark_absent(id);
+                return;
+            }
+            let admission = gate.clone();
+            let failed_schedule = sched.clone();
+            let failed_progress = progress.clone();
+            let quiet = opts.quiet;
+            #[cfg(debug_assertions)]
+            let refused = std::env::var("SYQ_TEST_WORKER_THREAD_LIMIT")
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| id >= n);
+            #[cfg(not(debug_assertions))]
+            let refused = false;
+            let work = move || -> Result<()> {
                 if connect_after_file_plan.load(Relaxed) && !sched.wait_for_anticipated_file_work()
                 {
                     gate.mark_absent(id);
@@ -2398,6 +2434,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                         Err(error) => {
                             failures += 1;
+                            if autotune && crate::resources::exhausted(&error) {
+                                let limit = (gate.active() / 2).max(1);
+                                if gate.limit_resources(limit) && !opts.quiet {
+                                    progress.eprintln(&format!("syq: worker setup exhausted resources; continuing with at most {limit} workers ({error:#})"));
+                                }
+                                if !gate.connection_needed(id) {
+                                    gate.mark_absent(id);
+                                    return Ok(());
+                                }
+                            }
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
                                 gate.mark_failed(id);
                                 if !gate.allowed(id) && debug() {
@@ -2502,8 +2548,27 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                     }
                 }
-            });
-            workers.lock().unwrap().push(h);
+            };
+            let spawned = if refused {
+                Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+            } else {
+                std::thread::Builder::new().spawn(work)
+            };
+            match spawned {
+                Ok(thread) => workers.lock().unwrap().push(thread),
+                Err(error) if autotune && id > 0 => {
+                    admission.mark_absent(id);
+                    let limit = (id / 2).max(1);
+                    if admission.limit_resources(limit) && !quiet {
+                        failed_progress.eprintln(&format!("syq: cannot start another worker; continuing with at most {limit} workers ({error})"));
+                    }
+                }
+                Err(error) => {
+                    admission.mark_failed(id);
+                    failed_schedule.abort();
+                    failed_progress.error(&format!("syq: cannot start copy worker: {error}"));
+                }
+            }
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
@@ -2531,9 +2596,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 tune::Policy::new(n0, tune::MIN, maximum_workers)
             };
-            *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
-                tune::run(policy, gate, sched, progress, |id| spawn_worker(id))
-            }));
+            *tuner.lock().unwrap() = std::thread::Builder::new()
+                .spawn(move || tune::run(policy, gate, sched, progress, |id| spawn_worker(id)))
+                .ok();
         }
     };
     let (registered_sources, small_entries) = match early_sources {
@@ -3364,7 +3429,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .is_some_and(|info| !info.failed),
                 });
         if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
-            args.connections = tune::START_TCP.min(args.automatic_worker_limit());
+            args.connections = tune::START_TCP.min(maximum_workers);
             gate.set_active(args.connections);
         }
         let transport_activity = transport_budget.is_some();
@@ -3400,7 +3465,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .then(|| history.starting_count(&key, src_ep.is_remote() || dst_ep.is_remote()))
                 .flatten();
             if let Some(hint) = &hint {
-                args.connections = hint.workers.min(args.automatic_worker_limit());
+                args.connections = hint.workers.min(maximum_workers);
                 gate.set_active(args.connections);
             }
             history.event("starting_count", serde_json::json!({"workers":args.connections,

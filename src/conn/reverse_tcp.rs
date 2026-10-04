@@ -38,12 +38,15 @@ impl RemoteSpec {
         let congestion_control = congestion_control.map(str::to_owned);
         let requested = congestion_control.clone();
         let spec = self.clone();
-        let probe = std::thread::spawn(move || {
-            let start = Instant::now();
-            let result = crate::destination::tcp::probe(&grant, port, ports, advertised, requested);
-            spec.diagnostics.lock().unwrap().tcp_probe_time = Some((start, Instant::now()));
-            result
-        });
+        let probe = std::thread::Builder::new()
+            .spawn(move || {
+                let start = Instant::now();
+                let result =
+                    crate::destination::tcp::probe(&grant, port, ports, advertised, requested);
+                spec.diagnostics.lock().unwrap().tcp_probe_time = Some((start, Instant::now()));
+                result
+            })
+            .context("start reverse TCP probe")?;
         Ok(PendingTcpSetup {
             pacing: None,
             reverse: Some(reverse),
@@ -73,7 +76,7 @@ impl RemoteSpec {
             )),
             self.read_ahead,
             observation.clone(),
-        );
+        )?;
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: None,

@@ -254,7 +254,7 @@ fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
 #[test]
 fn streaming_replies_drain_without_a_block_credit_window() {
     let (tx, rx) = mpsc::sync_channel(1);
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx).unwrap();
     let (finished, done) = mpsc::channel();
     let sender = std::thread::spawn(move || {
         for _ in 0..10_000 {
@@ -280,7 +280,7 @@ fn streaming_replies_drain_without_a_block_credit_window() {
 #[test]
 fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
     let (tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx).unwrap();
     tx.send(queued(Response::Ok)).unwrap();
     tx.send(queued(Response::EndpointError(WireError {
         message: "disk full".into(),
@@ -302,13 +302,13 @@ fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
 #[test]
 fn streaming_replies_eof_is_not_success_and_abort_wakes_a_quiet_collector() {
     let (tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx).unwrap();
     tx.send(queued(Response::Ok)).unwrap();
     drop(tx);
     let (_, state) = replies.finish(false);
     assert!(!state.fenced && matches!(state.error, Some(Failure::Transport(_))));
     let (_tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx);
+    let replies = WriteReplies::spawn(rx).unwrap();
     let start = std::time::Instant::now();
     let _ = replies.finish(true);
     assert!(start.elapsed() < Duration::from_secs(2));

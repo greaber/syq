@@ -241,6 +241,7 @@ pub(crate) fn drain_range_replies_with<T>(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
+    pub(crate) descriptors: Option<crate::resources::Descriptors>,
     pub identity: String,
     pub platform: String,
     pub supports_confined_socket_nodes: bool,
@@ -599,18 +600,18 @@ fn spawn_reader(
     std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
     std::thread::JoinHandle<()>,
 ) {
-    let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default());
+    let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default()).unwrap();
     (rx, reader)
 }
 fn spawn_observed_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
-) -> (
+) -> std::io::Result<(
     std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
     std::thread::JoinHandle<()>,
     std::sync::Arc<batch_progress::BatchReceipts>,
-) {
+)> {
     // Control requests also pipeline up to the default depth. Keeping that
     // capacity prevents a sequential helper blocking on replies while its
     // coordinator is still sending requests (including large path batches).
@@ -619,7 +620,7 @@ fn spawn_observed_reader(
     );
     let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
     let receipts = batch_receipts.clone();
-    let reader = std::thread::spawn(move || {
+    let reader = std::thread::Builder::new().spawn(move || {
         let mut r = FrameReader::new(input);
         r.set_limit(MAX_HANDSHAKE_FRAME);
         let hello = r
@@ -657,8 +658,8 @@ fn spawn_observed_reader(
                 break;
             }
         }
-    });
-    (rx, reader, batch_receipts)
+    })?;
+    Ok((rx, reader, batch_receipts))
 }
 
 fn receive_transport_stats(
@@ -733,19 +734,21 @@ impl RemoteConn {
         session: crate::session_pool::PooledSession,
         compress: bool,
         label: String,
-    ) -> Self {
+    ) -> Result<Self> {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, reader, batch_receipts) = spawn_observed_reader(
             Box::new(session.stdout),
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
             observation.clone(),
-        );
+        )?;
         let mut stderr = session.stderr;
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
-        });
-        RemoteConn {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+            })
+            .context("start pooled stderr reader")?;
+        Ok(RemoteConn {
             batch_receipts,
             transport_stop: None,
             observation,
@@ -764,7 +767,7 @@ impl RemoteConn {
             named_socket: None,
             multiplexed_ssh: false,
             detached: true,
-        }
+        })
     }
 
     fn transport_stats_with_timeout(
@@ -1128,9 +1131,15 @@ impl Conn for RemoteConn {
             "streaming writes already active"
         );
         self.receive_deferred(None)?;
-        self.write_stream = Some(crate::streaming::WriteReplies::spawn(
+        match crate::streaming::WriteReplies::spawn(
             self.rx.take().context("response reader missing")?,
-        ));
+        ) {
+            Ok(stream) => self.write_stream = Some(stream),
+            Err(error) => {
+                self.dead = true;
+                return Err(error).context("start streaming reply reader");
+            }
+        }
         Ok(())
     }
     fn check_streaming_writes(&mut self) -> Result<()> {
@@ -1282,10 +1291,21 @@ impl Drop for RemoteConn {
             // Shutdown or EOF, and waiting for its exit status would cost a
             // round trip. Reap our ssh client, if any, once it exits.
             self.rx.take();
-            if let Some(mut child) = self.child.take() {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+            if let Some(child) = self.child.take() {
+                let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+                let reaper = child.clone();
+                if std::thread::Builder::new()
+                    .spawn(move || {
+                        if let Some(mut child) = reaper.lock().unwrap().take() {
+                            let _ = child.wait();
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(mut child) = child.lock().unwrap().take() {
+                        let _ = child.wait();
+                    }
+                }
             }
             return;
         }
@@ -1746,7 +1766,7 @@ impl RemoteSpec {
         }
         let program = self.program_command(&["--server".into()]);
         let session = crate::session_pool::take(&multiplexer.path, &program)?;
-        let conn = RemoteConn::from_pooled(session, compress, self.label());
+        let conn = RemoteConn::from_pooled(session, compress, self.label()).ok()?;
         match receive_hello(conn, false) {
             Ok(conn) => {
                 if crate::output::debug() {
@@ -2038,7 +2058,7 @@ impl RemoteSpec {
                 Box::new(stream.try_clone()?),
                 self.read_ahead,
                 observation.clone(),
-            );
+            )?;
             let conn = RemoteConn {
                 batch_receipts,
                 transport_stop: None,
@@ -2186,7 +2206,15 @@ impl RemoteSpec {
             handshake_pending: handshake.clone(),
         };
         let (rx, reader, batch_receipts) =
-            spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone());
+            match spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone()) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    drop(writer);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.into());
+                }
+            };
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
@@ -2411,13 +2439,15 @@ impl RemoteSpec {
         };
         validate_advertised_tcp_port(port, ports)?;
         let spec = self.clone();
-        let probe = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            let result = spec.probe_tcp_addresses(advertised, port);
-            spec.diagnostics.lock().unwrap().tcp_probe_time =
-                Some((start, std::time::Instant::now()));
-            result
-        });
+        let probe = std::thread::Builder::new()
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let result = spec.probe_tcp_addresses(advertised, port);
+                spec.diagnostics.lock().unwrap().tcp_probe_time =
+                    Some((start, std::time::Instant::now()));
+                result
+            })
+            .context("start TCP address probe")?;
         Ok(PendingTcpSetup {
             pacing,
             reverse: None,
@@ -2661,7 +2691,7 @@ impl RemoteSpec {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, reader, batch_receipts) =
-            spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
+            spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone())?;
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
@@ -2999,12 +3029,14 @@ fn hello(
 fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
     match conn.recv() {
         Ok(Response::HelloOk {
+            descriptors,
             identity,
             platform,
             supports_confined_socket_nodes,
             ssh_worker_ticket,
         }) if identity == crate::identity::build() => {
             conn.peer = Some(PeerInfo {
+                descriptors,
                 identity,
                 platform,
                 supports_confined_socket_nodes,
@@ -3174,7 +3206,8 @@ impl Endpoint {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e)
                             if is_tcp_congestion_error(&e)
-                                || is_worker_initialization_error(&e) =>
+                                || is_worker_initialization_error(&e)
+                                || crate::resources::exhausted(&e) =>
                         {
                             return Err(e);
                         }

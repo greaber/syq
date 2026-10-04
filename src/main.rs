@@ -48,6 +48,7 @@ mod receive_service;
 mod remote_helper;
 mod remote_to_remote;
 mod remote_user_install;
+mod resources;
 mod restricted;
 mod results;
 mod resume;

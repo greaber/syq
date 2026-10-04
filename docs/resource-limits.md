@@ -50,7 +50,18 @@ for example, a fixed request size with a worker ceiling. Unknown keys,
 duplicate keys, zero counts, and out-of-range values are rejected.
 
 A ceiling does not force syq to use that many slots. Filesystem copies have no
-default tuning ceiling; syq adjusts the count from measured throughput.
+fixed default tuning ceiling; syq adjusts the count from measured throughput.
+Automatic filesystem copies also limit workers using the endpoints' available
+open-file budgets and reduce concurrency when worker setup exhausts local
+resources. Syq reports these reductions; raising an endpoint's operating-system
+limit can allow more concurrency. Fixed worker settings still report failures
+when their requested resources are unavailable.
+
+Metadata processing falls back to sequential work if its thread pool cannot
+start. Small-file staging reduces its open-file burst after an open failure
+that may indicate descriptor exhaustion, then retries once after existing
+bursts finish. Persistent failures remain errors. These measures do not reserve
+memory or disk space, or guarantee success under every resource limit.
 [Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
 still apply. S3 ceilings constrain the route's normal automatic range without
 raising it. They are nested: object and per-object part counts also share the
