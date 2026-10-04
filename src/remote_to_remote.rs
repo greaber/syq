@@ -855,11 +855,7 @@ fn run_remote(
                     prepared.enrollment_id
                 );
             }
-            crate::agent_broker::ConstrainedAgentBroker::start_with_private_key(
-                policy,
-                limit,
-                prepared.private_key,
-            )?
+            prepared.private_key.start_broker(policy, limit)?
         } else {
             crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?
         };

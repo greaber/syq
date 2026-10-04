@@ -308,6 +308,7 @@ fn revoke_validates_all_state_before_rewriting_authorized_keys() {
         fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
 
         let request = RevokeRequest {
+            security_key_flags: None,
             version: CONFIG_VERSION,
             id,
             target_login: account.clone(),
@@ -524,6 +525,7 @@ fn test_authority_with_receipt(
     let identity = opened.identity();
     let id = EnrollmentId::random();
     let config = ReceiverEnrollment {
+        security_key_flags: None,
         version: CONFIG_VERSION,
         id,
         target_login: "receiver".into(),
@@ -665,6 +667,7 @@ fn managed_crlf_and_commented_tombstones_normalize_without_touching_other_conten
 fn enrolled_destinations_accept_any_leaf_bytes() {
     use std::os::unix::ffi::OsStrExt as _;
     let metadata = LocalEnrollment {
+        security_key_flags: None,
         version: 1,
         id: EnrollmentId::random(),
         host: "hostB".into(),
@@ -766,6 +769,7 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
     let directory = temporary.path().join(id.to_string());
     ensure_directory(&directory, 0o700).unwrap();
     let pending = PendingEnrollment {
+        security_key_flags: None,
         version: CONFIG_VERSION,
         id,
         host: "host-b".into(),
@@ -793,6 +797,7 @@ fn pending_enrollment_keeps_its_key_until_active_metadata_is_durable() {
     );
 
     let metadata = LocalEnrollment {
+        security_key_flags: None,
         version: CONFIG_VERSION,
         id,
         host: pending.host,

@@ -12,7 +12,7 @@ use crate::private_broker::{
 };
 use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
-use signature::{Signer, Verifier};
+use signature::{SignatureEncoding, Signer, Verifier};
 use ssh_agent_lib::proto::extension::{MessageExtension, SessionBind};
 use ssh_agent_lib::proto::{Extension, Identity, PublicCredential, Request, Response, SignRequest};
 use ssh_agent_lib::ssh_encoding::{Decode, Encode};
@@ -796,8 +796,13 @@ impl ConstrainedAgentBroker {
         max_connections: usize,
         private_key: PrivateKey,
     ) -> Result<Self> {
-        if private_key.is_encrypted() || private_key.algorithm() != Algorithm::Ed25519 {
-            bail!("enrollment key must be an unencrypted Ed25519 key");
+        if private_key.is_encrypted()
+            || !matches!(
+                private_key.algorithm(),
+                Algorithm::Ed25519 | Algorithm::Rsa { .. } | Algorithm::Ecdsa { .. }
+            )
+        {
+            bail!("enrollment key must be an unlocked software key");
         }
         let ambient = std::env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
@@ -808,6 +813,25 @@ impl ConstrainedAgentBroker {
         Self::start_with_backend(
             ambient,
             SigningBackend::Private(Arc::new(private_key)),
+            policy,
+            max_connections,
+        )
+    }
+
+    /// Expose only this enrollment key from the local agent. The remote
+    /// caller still has to satisfy the same host, account and session checks.
+    pub(crate) fn start_with_agent_key(
+        policy: BrokerPolicy,
+        max_connections: usize,
+        socket: PathBuf,
+        key: KeyData,
+    ) -> Result<Self> {
+        let ambient = std::env::var_os("SSH_AUTH_SOCK")
+            .map(PathBuf::from)
+            .context("SSH_AUTH_SOCK is not set")?;
+        Self::start_with_backend(
+            ambient,
+            SigningBackend::SelectedAgent { socket, key },
             policy,
             max_connections,
         )
@@ -1044,7 +1068,10 @@ fn serve_client(
                 let binding = parse_session_bind(&frame);
                 match binding.and_then(|binding| {
                     state.add(policy, binding)?;
-                    if matches!(backend, SigningBackend::Ambient(_)) {
+                    if matches!(
+                        backend,
+                        SigningBackend::Ambient(_) | SigningBackend::SelectedAgent { .. }
+                    ) {
                         if let Some(stream) = upstream.as_mut() {
                             replay_session_bind(
                                 stream,
@@ -1292,6 +1319,7 @@ fn validate_public_credential_wire(encoded: &[u8]) -> Result<()> {
 enum SigningBackend {
     Ambient(PathBuf),
     Private(Arc<PrivateKey>),
+    SelectedAgent { socket: PathBuf, key: KeyData },
 }
 
 impl SigningBackend {
@@ -1307,6 +1335,10 @@ impl SigningBackend {
                 let response = upstream_request(upstream, socket, connections, bindings, request)?;
                 decode_identities_response(&response)
             }
+            Self::SelectedAgent { key, .. } => Ok(vec![Identity {
+                credential: key.clone().into(),
+                comment: String::new(),
+            }]),
             Self::Private(private) => Ok(vec![Identity {
                 credential: private.public_key().key_data().clone().into(),
                 comment: String::new(),
@@ -1326,21 +1358,68 @@ impl SigningBackend {
             Self::Ambient(socket) => {
                 upstream_request(upstream, socket, connections, bindings, frame)
             }
-            Self::Private(private) => {
-                let expected = PublicCredential::Key(private.public_key().key_data().clone());
-                if request.flags != 0 || !credentials_equal_on_wire(&request.credential, &expected)
-                {
+            Self::SelectedAgent { socket, key } => {
+                if request.credential != PublicCredential::Key(key.clone()) {
                     bail!("sign request did not select the enrollment key");
                 }
-                let signature = private
-                    .try_sign(&request.data)
-                    .context("sign destination authentication with the enrollment key")?;
+                upstream_request(upstream, socket, connections, bindings, frame)
+            }
+            Self::Private(private) => {
+                let expected = PublicCredential::Key(private.public_key().key_data().clone());
+                if !credentials_equal_on_wire(&request.credential, &expected) {
+                    bail!("sign request did not select the enrollment key");
+                }
+                let signature = sign_private_key(private, &request.data, request.flags)?;
                 let mut response = Vec::new();
                 Response::SignResponse(signature).encode(&mut response)?;
                 Ok(response)
             }
         }
     }
+}
+
+pub(crate) fn sign_private_key(
+    private: &PrivateKey,
+    data: &[u8],
+    flags: u32,
+) -> Result<ssh_key::Signature> {
+    use signature::RandomizedSigner;
+    use ssh_agent_lib::proto::signature::{RSA_SHA2_256, RSA_SHA2_512};
+    if let Some(pair) = private.key_data().rsa() {
+        // ssh-key 0.6.7's RSA conversion passes p twice. Construct the
+        // standard RSA key explicitly and use randomized blinding to sign.
+        let rsa = rsa::RsaPrivateKey::from_components(
+            (&pair.public.n).try_into()?,
+            (&pair.public.e).try_into()?,
+            (&pair.private.d).try_into()?,
+            vec![(&pair.private.p).try_into()?, (&pair.private.q).try_into()?],
+        )?;
+        rsa.validate()?;
+        let mut rng = ssh_key::rand_core::OsRng;
+        let (hash, signature) = match flags {
+            RSA_SHA2_256 => (
+                ssh_key::HashAlg::Sha256,
+                rsa::pkcs1v15::SigningKey::<sha2_compat::Sha256>::new(rsa)
+                    .try_sign_with_rng(&mut rng, data)?,
+            ),
+            RSA_SHA2_512 => (
+                ssh_key::HashAlg::Sha512,
+                rsa::pkcs1v15::SigningKey::<sha2_compat::Sha512>::new(rsa)
+                    .try_sign_with_rng(&mut rng, data)?,
+            ),
+            _ => bail!("RSA receiver authentication requires SHA-256 or SHA-512"),
+        };
+        return Ok(ssh_key::Signature::new(
+            Algorithm::Rsa { hash: Some(hash) },
+            signature.to_vec(),
+        )?);
+    }
+    if flags != 0 {
+        bail!("unexpected enrollment signature flags");
+    }
+    private
+        .try_sign(data)
+        .context("sign destination authentication with the enrollment key")
 }
 
 fn upstream_request(

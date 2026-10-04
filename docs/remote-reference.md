@@ -23,9 +23,28 @@ Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
 
+New enrollments match the SSH key that authenticated setup. Ed25519 stays
+Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
+Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
+hardware-backed key with the same effective touch and PIN requirements;
+creating that key can still require touching the device.
+
+For a passphrase-protected Ed25519 or RSA login, the receiver key is encrypted
+using a secret derived through the login key's SSH agent. There is no new
+passphrase. If the login key is not loaded, `ssh-add` asks for its usual
+passphrase. Losing that login key requires revoking and enrolling again through
+another login. Revocation itself does not need the receiver key unlocked.
+
+Automatic matching needs the login's local OpenSSH private-key file or FIDO
+handle. Passphrase-protected ECDSA, encrypted FIDO handles, SSH certificates,
+password or multi-factor logins, and agent-only identities (including
+PIV/OpenPGP keys) are unsupported. For FIDO, the login key must have one matching
+entry in `~/.ssh/authorized_keys` so syq can read its server policy. Syq reports
+an error when it cannot preserve the key's protection.
+
 Repeating `enroll` updates the receiver to match your local build. A pending
-enrollment can be retried or revoked. Revoke and enroll again to rotate its
-receipt key. Revocation stops active receivers before removing their state;
+enrollment can be retried or revoked. Existing keys keep their protection;
+revoke and enroll again to adopt matching protection or rotate either key. Revocation stops active receivers before removing their state;
 see [access management](remote-to-remote.md#first-copy-and-access-management)
 for interruption and retry behavior.
 

@@ -358,7 +358,7 @@ pub(crate) fn prepare_transfer(
             )?
         }
     };
-    let private_key = load_private_key(&directory)?;
+    let private_key = load_signing_key(&directory)?;
     let receipt_public_key = metadata.receipt_public_key.clone();
     let grant = grant_for(
         args,
@@ -397,7 +397,7 @@ pub(crate) fn prepare_transfer(
         max_plaintext_bytes: crate::receipt::DEFAULT_MAX_PLAINTEXT_BYTES,
         delivery: receipt_delivery,
     };
-    let grant = delegation::sign_grant(
+    let grant = delegation::sign_grant_with(
         grant,
         GrantConstraints {
             tcp_congestion: args.tcp_congestion.clone(),
@@ -412,7 +412,7 @@ pub(crate) fn prepare_transfer(
             root_existence: root_existence_for(args.target_existence),
             receipt_policy: receipt_policy.clone(),
         },
-        &private_key,
+        |payload| private_key.sign_grant(payload),
     )?;
     let grant_digest = delegation::signed_grant_digest(&grant)?;
     Ok(PreparedTransfer {
@@ -529,6 +529,7 @@ pub(crate) fn named_authority(
         });
     }
     let config = ReceiverEnrollment {
+        security_key_flags: None,
         version: CONFIG_VERSION,
         id,
         target_login: login,

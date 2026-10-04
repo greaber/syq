@@ -15,6 +15,9 @@ RUN mkdir src \
 
 FROM dependencies AS builder
 
+COPY tests/real-ssh/sk-api.h tests/real-ssh/sk-provider.c /tmp/sk-provider/
+RUN cc -shared -fPIC -Wno-deprecated-declarations /tmp/sk-provider/sk-provider.c -lcrypto -o /tmp/syq-test-sk.so
+
 COPY schemas ./schemas
 COPY src ./src
 # The second PATH fixture has a real distinct identity and return wire version.
@@ -70,6 +73,7 @@ COPY tests/object-storage/check.py /usr/local/libexec/syq-storage-check.py
 COPY tests/real-ssh/test-storage-authorization.py /usr/local/libexec/syq-test-storage-authorization.py
 COPY tests/real-ssh/storage-streams.py /usr/local/libexec/syq-storage-streams.py
 
+COPY --from=builder /tmp/syq-test-sk.so /usr/local/lib/syq-test-sk.so
 COPY --from=builder /tmp/syq /usr/local/bin/syq
 COPY --from=builder /tmp/syq-other-build /usr/local/bin/syq-other-build
 COPY --chmod=0755 tests/real-ssh/ssh-wrapper.sh /usr/local/bin/ssh
@@ -106,3 +110,5 @@ COPY tests/real-ssh/test-stream-mappings.py /usr/local/libexec/syq-test-stream-m
 
 COPY tests/real-ssh/test-map-generation.py /usr/local/libexec/syq-test-map-generation.py
 COPY tests/real-ssh/test-metadata.py /usr/local/libexec/syq-test-metadata.py
+
+COPY tests/real-ssh/test-receiver-keys.py /usr/local/libexec/syq-test-receiver-keys.py

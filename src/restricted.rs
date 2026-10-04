@@ -37,6 +37,7 @@ mod authority;
 mod enroll;
 mod grant;
 mod install;
+mod keys;
 mod receiver;
 mod ssh;
 mod statefs;
@@ -45,14 +46,19 @@ pub(crate) use authority::*;
 use enroll::*;
 pub(crate) use grant::*;
 pub(crate) use install::*;
+use keys::*;
 pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;
 
-// Advance this generation whenever an installed receiver or its signed grant
-// protocol becomes incompatible. Local metadata from another generation is
-// ignored, so the next eligible copy installs a fresh receiver enrollment.
-const CONFIG_VERSION: u16 = 4;
+// Generation 5 adds protected local keys and receiver-enforced FIDO policy.
+// Generation 4 state remains readable without changing keys or replay records;
+// older clients must not interpret generation 5 enrollments as Ed25519-only.
+const CONFIG_VERSION: u16 = 5;
+
+fn supported_config_version(version: u16) -> bool {
+    matches!(version, 4 | CONFIG_VERSION)
+}
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: u64 = 100_000_000;
@@ -74,6 +80,8 @@ pub(crate) struct ReceiverEnrollment {
     pub(crate) root_ino: u64,
     pub(crate) ssh_keygen: String,
     pub(crate) receiver_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_key_flags: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,6 +91,8 @@ struct InstallRequest {
     target_login: String,
     requested_destination: String,
     public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_key_flags: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +117,8 @@ struct RevokeRequest {
     id: EnrollmentId,
     target_login: String,
     public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_key_flags: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +134,8 @@ struct LocalEnrollment {
     canonical_root: String,
     receiver_path: String,
     receipt_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_key_flags: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,10 +147,12 @@ struct PendingEnrollment {
     port: Option<u16>,
     target_login: String,
     requested_destination: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    security_key_flags: Option<u8>,
 }
 
 pub(crate) struct PreparedTransfer {
-    pub(crate) private_key: PrivateKey,
+    pub(crate) private_key: EnrollmentSigningKey,
     pub(crate) canonical_destination: Vec<u8>,
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,

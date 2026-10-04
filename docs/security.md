@@ -187,8 +187,8 @@ The protection has several parts:
 1. **Set up a restricted entry point on hostB.** Your laptop uses its normal
    SSH access to install a receiver and a dedicated public key. That key's
    `authorized_keys` entry permits only the receiver command, with SSH
-   forwarding disabled. The private key stays on your laptop. Later copies
-   reuse this setup.
+   forwarding disabled. The key stays on your laptop or hardware token,
+   matching the setup login's protection. Later copies reuse this setup.
 2. **Authenticate hostA's connection without handing it the key.** A small
    signing service on your laptop answers hostA's SSH authentication requests.
    Before signing, it checks OpenSSH's cryptographic proof of which server
@@ -209,6 +209,14 @@ File data travels directly from hostA to hostB, over encrypted TCP or SSH.
 Your laptop provides authorization and verifies the result without carrying
 the file data. See [Copy between servers](remote-to-remote.md) for setup and
 revoking access.
+
+For passphrase-protected software logins, syq encrypts the receiver key on disk
+and uses the original key's agent to unlock it locally. Anyone able to request
+unrestricted signatures from that agent and read the encrypted file can also
+unlock it. Syq's constrained signing service does not expose that operation.
+The decrypted software key exists in local memory during a copy; a FIDO
+receiver key continues to require its hardware device. See
+[key matching and supported logins](remote-reference.md#enrollment).
 
 Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
