@@ -1,36 +1,33 @@
-//! Provider-selected connection metadata, independent of approved SSH sockets.
-use super::{persistent, SessionRequest, Tty};
+//! Requester-selected SSH policy. Matching warm commands need no provider RPC.
+use super::{local_config::LocalPlan, persistent, SessionRequest};
 use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::ssh_auth::{self, ResolvedPolicy};
 use crate::persistence::Domain;
-use crate::process::CommandExt as _;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DIRECTORY: &str = "resolution-v1";
-const INTERNAL: &str = "--refresh-ssh-resolution";
-const FRESH: u64 = 30;
 const MAX_FILE: u64 = 256 * 1024;
-const MAX_STARTUP: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Selection {
     pub(super) provider: String,
     pub(super) policy: ResolvedPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) local: Option<LocalPlan>,
 }
 pub(super) struct Plan {
     pub(super) selected: Selection,
     pub(super) generation: String,
+    pub(super) proxy: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,17 +39,6 @@ struct Entry {
     checked: u64,
     attempted: u64,
 }
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Refresh {
-    authorizer: Provider,
-    requested: NativeEndpoint,
-    provider: String,
-    generation: String,
-    scope: Option<PathBuf>,
-    scope_identity: Option<(u64, u64)>,
-}
-
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
@@ -142,6 +128,9 @@ fn read_at(
     );
     entry.authorizer.validate()?;
     entry.selected.policy.validate()?;
+    if let Some(local) = &entry.selected.local {
+        local.validate()?;
+    }
     Ok(Some(entry))
 }
 fn store_at(path: &Path, entry: &Entry) -> Result<()> {
@@ -157,10 +146,9 @@ fn store_at(path: &Path, entry: &Entry) -> Result<()> {
     Ok(())
 }
 
-/// Read-only selection for completion/export: no provider exchange or refresh.
+/// Completion/export validates local configuration within a short budget. It
+/// never contacts a provider, requests approval, or refreshes provider metadata.
 pub(super) fn cached(domain: &Domain, request: &SessionRequest) -> Result<Option<Selection>> {
-    // Cache damage is an optional-state miss. Completion must neither create
-    // files nor contact the provider, and stays quiet on these misses.
     Ok((|| -> Result<Option<Selection>> {
         if existing_directory(domain)?.is_none() {
             return Ok(None);
@@ -168,20 +156,40 @@ pub(super) fn cached(domain: &Domain, request: &SessionRequest) -> Result<Option
         let Some(provider) = ssh_auth::local_binding(domain, &request.provider)? else {
             return Ok(None);
         };
-        Ok(read_at(
+        let Some(entry) = read_at(
             &path(domain, &request.provider, &request.destination, &provider)?,
             &request.provider,
             &request.destination,
             &provider,
         )?
-        .map(|entry| entry.selected))
+        else {
+            return Ok(None);
+        };
+        if entry.selected.local.as_ref().is_none_or(|local| {
+            LocalPlan::resolve_bounded(&request.destination, Duration::from_millis(200)).map_or(
+                true,
+                |current| {
+                    current.config_digest != local.config_digest
+                        || current.endpoint != local.endpoint
+                },
+            )
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(entry.selected))
     })()
     .unwrap_or(None))
 }
 
-/// Freeze one plan before any master lookup. Stale metadata remains usable;
-/// only a later invocation can observe a completed background refresh.
-pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> {
+/// Local configuration is resolved before this function and before looking at
+/// any live master. Provider metadata can never choose the destination route.
+pub(super) fn select(
+    domain: &Domain,
+    request: &SessionRequest,
+    local: LocalPlan,
+    proxy: Option<String>,
+) -> Result<Plan> {
+    local.validate()?;
     let generation = persistent::ensure_generation(domain)?;
     let entry = (|| -> Result<Option<Entry>> {
         let Some(binding) = ssh_auth::local_binding(domain, &request.provider)? else { return Ok(None); };
@@ -189,31 +197,34 @@ pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> 
         read_at(&path(domain, &request.provider, &request.destination, &binding)?,
             &request.provider, &request.destination, &binding)
     })().unwrap_or_else(|error| {
-        crate::output::diagnostic!("syq: warning: cannot read SSH resolution cache ({error:#}); resolving the selected provider again");
+        crate::output::diagnostic!("syq: warning: cannot read SSH policy cache ({error:#}); consulting the selected provider again");
         None
     });
-    if let Some(entry) = entry {
-        let selected = entry.selected.clone();
-        if now()?
-            .checked_sub(entry.attempted)
-            .is_none_or(|age| age >= FRESH)
+    if let Some(mut entry) = entry {
+        if entry.selected.local.as_ref().is_some_and(|previous| {
+            previous.config_digest == local.config_digest
+                && previous.endpoint == local.endpoint
+                && previous.requested == local.requested
+                && previous.host_key_alias == local.host_key_alias
+        }) && entry.selected.policy.endpoint == local.endpoint
         {
-            let cache_path = path(
-                domain,
-                &request.provider,
-                &request.destination,
-                &selected.provider,
-            )?;
-            if let Err(error) = refresh(domain, &cache_path, entry, &generation) {
-                crate::output::diagnostic!("syq: warning: cannot refresh SSH resolution ({error:#}); using the selected cached endpoint");
+            // Preserve the exact local plan selected before looking for a master.
+            if entry.selected.local.as_ref() != Some(&local) {
+                entry.selected.local = Some(local);
+                save(domain, &entry);
             }
+            return Ok(Plan {
+                selected: entry.selected,
+                generation,
+                proxy,
+            });
         }
-        return Ok(Plan {
-            selected,
-            generation,
-        });
     }
-    let resolved = ssh_auth::resolve(domain, request)?;
+    let resolved = ssh_auth::resolve(domain, request, &local)?;
+    anyhow::ensure!(
+        resolved.policy.endpoint == local.endpoint,
+        "SSH provider changed the requester-selected endpoint"
+    );
     anyhow::ensure!(
         ssh_auth::local_binding(domain, &request.provider)?.as_deref()
             == Some(resolved.binding.as_str()),
@@ -222,50 +233,50 @@ pub(super) fn select(domain: &Domain, request: &SessionRequest) -> Result<Plan> 
     let selected = Selection {
         provider: resolved.binding,
         policy: resolved.policy,
+        local: Some(local),
     };
     anyhow::ensure!(
         persistent::generation_open(domain, &generation)?,
-        "SSH resolution was cancelled while inspecting the provider"
+        "SSH policy setup was cancelled while inspecting the provider"
     );
-    let saved = (|| -> Result<()> {
-        directory(domain)?;
-        let cache_path = path(
-            domain,
-            &request.provider,
-            &request.destination,
-            &selected.provider,
-        )?;
-        let Some(_lock) = try_lock(&cache_path)? else {
-            return Ok(());
-        };
-        anyhow::ensure!(
-            persistent::generation_open(domain, &generation)?,
-            "SSH resolution was cancelled before saving"
-        );
-        let timestamp = now()?;
-        store_at(
-            &cache_path,
-            &Entry {
-                version: persistent::provider_state_version(&request.provider),
-                authorizer: request.provider.clone(),
-                requested: request.destination.clone(),
-                selected: selected.clone(),
-                checked: timestamp,
-                attempted: timestamp,
-            },
-        )
-    })();
-    if let Err(error) = saved {
-        crate::output::diagnostic!("syq: warning: cannot save SSH resolution cache ({error:#}); continuing with the resolved endpoint");
-    }
+    let timestamp = now()?;
+    save(
+        domain,
+        &Entry {
+            version: persistent::provider_state_version(&request.provider),
+            authorizer: request.provider.clone(),
+            requested: request.destination.clone(),
+            selected: selected.clone(),
+            checked: timestamp,
+            attempted: timestamp,
+        },
+    );
     Ok(Plan {
         selected,
         generation,
+        proxy,
     })
 }
 
-/// A failed new login must not force repeated retries of the same stale plan.
-/// Preserve a refresh which already selected a different policy.
+fn save(domain: &Domain, entry: &Entry) {
+    let result = (|| -> Result<()> {
+        directory(domain)?;
+        store_at(
+            &path(
+                domain,
+                &entry.authorizer,
+                &entry.requested,
+                &entry.selected.provider,
+            )?,
+            entry,
+        )
+    })();
+    if let Err(error) = result {
+        crate::output::diagnostic!("syq: warning: cannot save SSH policy cache ({error:#}); continuing with the selected endpoint");
+    }
+}
+
+/// Keep a later command from repeatedly using metadata whose new login failed.
 pub(super) fn invalidate(
     domain: &Domain,
     request: &SessionRequest,
@@ -292,221 +303,6 @@ pub(super) fn invalidate(
         }
     }
     Ok(())
-}
-
-fn try_lock(cache_path: &Path) -> Result<Option<File>> {
-    let lock_path = cache_path.with_extension("lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&lock_path)?;
-    let metadata = lock.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() == 0,
-        "SSH resolution refresh lock must be an owner-only empty file"
-    );
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(None);
-        }
-        return Err(error.into());
-    }
-    Ok(Some(lock))
-}
-
-fn refresh(domain: &Domain, cache_path: &Path, mut entry: Entry, generation: &str) -> Result<()> {
-    anyhow::ensure!(
-        persistent::generation_open(domain, generation)?,
-        "SSH resolution refresh was cancelled"
-    );
-    let Some(lock) = try_lock(cache_path)? else {
-        return Ok(());
-    };
-    anyhow::ensure!(
-        persistent::generation_open(domain, generation)?,
-        "SSH resolution refresh was cancelled"
-    );
-    // Another command may have refreshed between our initial read and lock.
-    if let Some(current) = read_at(
-        cache_path,
-        &entry.authorizer,
-        &entry.requested,
-        &entry.selected.provider,
-    )? {
-        if now()?
-            .checked_sub(current.attempted)
-            .is_some_and(|age| age < FRESH)
-        {
-            return Ok(());
-        }
-        entry = current;
-    }
-    let startup = Refresh {
-        authorizer: entry.authorizer.clone(),
-        requested: entry.requested.clone(),
-        provider: entry.selected.provider.clone(),
-        generation: generation.to_owned(),
-        scope: domain.explicit_path().map(Path::to_path_buf),
-        scope_identity: if domain.is_default() {
-            None
-        } else {
-            Some(domain.identity()?)
-        },
-    };
-    let encoded = serde_json::to_string(&startup)?;
-    anyhow::ensure!(
-        encoded.len() <= MAX_STARTUP,
-        "SSH resolution refresh startup is too large"
-    );
-    entry.attempted = now()?;
-    store_at(cache_path, &entry)?;
-    let mut command = Command::new(std::env::current_exe()?);
-    use std::os::unix::process::CommandExt as _;
-    command
-        .args([INTERNAL, &encoded])
-        .process_group(0)
-        .stdin(Stdio::from(lock))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    persistent::protect_keeper_inheritance(&mut command)?;
-    let mut child = command.spawn_guarded()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-fn refresh_open(domain: &Domain, startup: &Refresh) -> bool {
-    startup
-        .scope_identity
-        .is_none_or(|identity| domain.is_current(identity))
-        && persistent::generation_open(domain, &startup.generation).unwrap_or(false)
-}
-fn run_refresh(startup: Refresh) -> Result<()> {
-    let domain = Domain::select(startup.scope.as_deref())?;
-    anyhow::ensure!(
-        domain.is_default() == startup.scope_identity.is_none(),
-        "SSH resolution refresh is missing its scope identity"
-    );
-    let request = SessionRequest {
-        provider: startup.authorizer.clone(),
-        destination: startup.requested.clone(),
-        tty: Tty::Disabled,
-        command: Vec::new(),
-    };
-    super::validate_endpoint(&request.destination)?;
-    anyhow::ensure!(
-        refresh_open(&domain, &startup),
-        "SSH resolution refresh was cancelled"
-    );
-    anyhow::ensure!(
-        ssh_auth::local_binding(&domain, &request.provider)?.as_deref()
-            == Some(startup.provider.as_str()),
-        "SSH provider connection changed before refresh"
-    );
-    // The parent acquired this lock before spawning; fd 0 keeps it held until
-    // this bounded process exits, including when its resolver thread is busy.
-    let lock_path = path(
-        &domain,
-        &startup.authorizer,
-        &startup.requested,
-        &startup.provider,
-    )?
-    .with_extension("lock");
-    let lock =
-        private_file(&lock_path, true, 0)?.context("SSH resolution refresh lock disappeared")?;
-    let inherited = File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
-    let expected = lock.metadata()?;
-    let actual = inherited.metadata()?;
-    anyhow::ensure!(
-        expected.dev() == actual.dev() && expected.ino() == actual.ino(),
-        "SSH resolution refresh did not inherit its lock"
-    );
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let resolve_domain = domain.clone();
-    std::thread::spawn(move || {
-        let _ = sender.send(ssh_auth::resolve(&resolve_domain, &request));
-    });
-    let Some(resolved) = await_resolution(
-        &domain,
-        &startup,
-        &receiver,
-        Instant::now() + Duration::from_secs(30),
-    )?
-    else {
-        return Ok(());
-    };
-    if !refresh_open(&domain, &startup)
-        || ssh_auth::local_binding(&domain, &startup.authorizer)?.as_deref()
-            != Some(resolved.binding.as_str())
-    {
-        return Ok(());
-    }
-    let timestamp = now()?;
-    store_at(
-        &path(
-            &domain,
-            &startup.authorizer,
-            &startup.requested,
-            &resolved.binding,
-        )?,
-        &Entry {
-            version: persistent::provider_state_version(&startup.authorizer),
-            authorizer: startup.authorizer,
-            requested: startup.requested,
-            selected: Selection {
-                provider: resolved.binding,
-                policy: resolved.policy,
-            },
-            checked: timestamp,
-            attempted: timestamp,
-        },
-    )
-}
-
-fn await_resolution(
-    domain: &Domain,
-    startup: &Refresh,
-    receiver: &std::sync::mpsc::Receiver<Result<ssh_auth::Resolved>>,
-    deadline: Instant,
-) -> Result<Option<ssh_auth::Resolved>> {
-    loop {
-        if !refresh_open(domain, startup) || Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let timeout =
-            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now()));
-        match receiver.recv_timeout(timeout) {
-            Ok(result) => return result.map(Some),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
-        }
-    }
-}
-
-pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
-    if argv.get(1).is_none_or(|arg| arg != INTERNAL) {
-        return None;
-    }
-    Some((|| {
-        anyhow::ensure!(argv.len() == 3, "invalid SSH resolution refresh startup");
-        let encoded = argv[2]
-            .to_str()
-            .context("SSH resolution refresh startup is not UTF-8")?;
-        anyhow::ensure!(
-            encoded.len() <= MAX_STARTUP,
-            "SSH resolution refresh startup is too large"
-        );
-        run_refresh(serde_json::from_str(encoded)?)?;
-        Ok(0)
-    })())
 }
 
 fn state_paths(domain: &Domain, locks_only: bool) -> Result<Vec<PathBuf>> {
@@ -623,6 +419,7 @@ mod tests {
             selected: Selection {
                 provider: "a".repeat(64),
                 policy,
+                local: None,
             },
             checked: 1,
             attempted: 1,
@@ -638,17 +435,6 @@ mod tests {
         )
         .unwrap()
     }
-    fn startup(domain: &Domain, entry: &Entry) -> Refresh {
-        Refresh {
-            authorizer: entry.authorizer.clone(),
-            requested: entry.requested.clone(),
-            provider: entry.selected.provider.clone(),
-            generation: persistent::ensure_generation(domain).unwrap(),
-            scope: domain.explicit_path().map(Path::to_owned),
-            scope_identity: Some(domain.identity().unwrap()),
-        }
-    }
-
     #[test]
     fn metadata_survives_master_absence_but_is_bound_to_provider_and_endpoint() {
         let (_root, domain, entry) = fixture();
@@ -797,7 +583,7 @@ mod tests {
         let request = SessionRequest {
             provider: entry.authorizer.clone(),
             destination: entry.requested.clone(),
-            tty: Tty::Disabled,
+            tty: super::super::Tty::Disabled,
             command: Vec::new(),
         };
         store_at(&path, &entry).unwrap();
@@ -819,61 +605,5 @@ mod tests {
             .selected,
             changed.selected
         );
-    }
-
-    #[test]
-    fn refresh_wait_is_bounded_and_cancelled_while_provider_is_busy() {
-        let (_root, domain, entry) = fixture();
-        let startup = startup(&domain, &entry);
-        let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let started = Instant::now();
-        assert!(await_resolution(
-            &domain,
-            &startup,
-            &receiver,
-            started + Duration::from_millis(25)
-        )
-        .unwrap()
-        .is_none());
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let generation = domain.approved_index_path().join("account-generation");
-        let cancel = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            fs::remove_file(generation).unwrap();
-        });
-        let started = Instant::now();
-        let result = await_resolution(
-            &domain,
-            &startup,
-            &receiver,
-            started + Duration::from_secs(5),
-        );
-        cancel.join().unwrap();
-        assert!(result.unwrap().is_none());
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn refresh_lock_deduplicates_and_cleanup_waits_for_writer() {
-        let (_root, domain, entry) = fixture();
-        let path = entry_path(&domain, &entry);
-        store_at(&path, &entry).unwrap();
-        let lock = try_lock(&path).unwrap().unwrap();
-        assert!(try_lock(&path).unwrap().is_none());
-        // Atomic-write temporary files can coexist with the lock. Shutdown
-        // waits for the owner before validating/removing completed cache files.
-        let temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            drop(temporary);
-            drop(lock);
-        });
-        let result = cleanup(&domain);
-        writer.join().unwrap();
-        result.unwrap();
-        assert!(!path.parent().unwrap().exists());
-        assert!(domain.runtime_path().exists());
-        assert!(store_at(&path, &entry).is_err());
-        assert!(!path.parent().unwrap().exists());
     }
 }

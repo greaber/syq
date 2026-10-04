@@ -2009,8 +2009,9 @@ fn completion_cache_skips_repeated_hosts_and_replaces_damaged_files() {
     assert_eq!(listed.stdout, b"fake.example\n");
 }
 
-// A recorded approved master with a fake SSH liveness check. The serialized
-// format stays independent of completion: it is the existing version-1 index.
+// A recorded approved master with a fake SSH liveness/configuration check.
+const APPROVED_LOCAL_CONFIG: &str =
+    "user approved\nhostname resolved.example\nport 2222\nhostkeyalgorithms ssh-ed25519\n";
 fn approved_completion_master(t: &Tmp, authorizer: &str) -> PathBuf {
     approved_completion_master_in(t, authorizer, None)
 }
@@ -2059,6 +2060,7 @@ fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path
     struct Selection<'a> {
         provider: String,
         policy: Policy<'a>,
+        local: serde_json::Value,
     }
     let requested = Endpoint {
         user: None,
@@ -2088,8 +2090,17 @@ fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path
     .public_key()
     .to_openssh()
     .unwrap();
+    let config_digest = blake3::hash(APPROVED_LOCAL_CONFIG.as_bytes())
+        .to_hex()
+        .to_string();
     let selected = Selection {
         provider,
+        local: serde_json::json!({
+            "requested": requested,
+            "endpoint": {"user": "approved", "host": "resolved.example", "port": 2222},
+            "host_key_alias": null, "config_digest": config_digest,
+            "route": "Direct", "host_key_algorithms": "ssh-ed25519", "hop": null,
+        }),
         policy: Policy {
             endpoint: Endpoint {
                 user: Some("approved"),
@@ -2111,8 +2122,15 @@ fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path
         "version": 1, "authorizer": authorizer, "requested": requested,
         "endpoint": selected.policy.endpoint, "control": control,
     });
-    let identity =
-        serde_json::to_vec(&("resolved-account-v1", authorizer, &requested, &selected)).unwrap();
+    let identity = serde_json::to_vec(&(
+        "local-account-v1",
+        authorizer,
+        &requested,
+        &selected.provider,
+        &selected.policy,
+        &config_digest,
+    ))
+    .unwrap();
     let path = index.join(format!("{}.json", blake3::hash(&identity).to_hex()));
     write(&path, &serde_json::to_vec(&record).unwrap());
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2137,6 +2155,7 @@ fn approved_completion_fixture(t: &Tmp) {
     fs::create_dir_all(t.path("remote-home/data/nested")).unwrap();
     let ssh = fake_ssh(t);
     let script = fs::read_to_string(&ssh).unwrap()
+        .replacen("#!/bin/sh\n", &format!("#!/bin/sh\nif [ \"$1\" = -G ]; then printf '%s' '{}'; exit 0; fi\n", APPROVED_LOCAL_CONFIG), 1)
         .replace("-o|-l|-p|-S)", "-o|-l|-p|-S|-F)")
         .replace("shift\nHOME=", "shift\nif [ -n \"${FAKE_SSH_SESSION_STATUS:-}\" ]; then exit \"$FAKE_SSH_SESSION_STATUS\"; fi\nHOME=");
     executable(&ssh, script.as_bytes());
@@ -2296,7 +2315,7 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
 }
 
 #[test]
-fn approved_completion_keeps_stale_resolution_read_only_and_provider_bound() {
+fn approved_completion_keeps_cached_policy_read_only_and_provider_bound() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
     let control = approved_completion_master(&t, "laptop");

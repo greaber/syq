@@ -566,12 +566,16 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
     let ssh_keygen = temp.path().join("ssh-keygen");
     let (_, host_key) = key(54);
     let public = PublicKey::new(host_key.clone(), "").to_openssh().unwrap();
-    std::fs::write(&known_hosts, format!("stable-vault {public}\n")).unwrap();
+    std::fs::write(
+        &known_hosts,
+        format!("stable-vault {public}\n[literal]:2200 {public}\n"),
+    )
+    .unwrap();
     std::fs::write(
             &config,
             format!(
-                "Host vault\n  User backup\n  HostName vault.internal\n  Port 2222\n  HostKeyAlias stable-vault\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n  IdentityFile none\n",
-                known_hosts.display()
+                "Host vault\n  User backup\n  HostName vault.internal\n  Port 2222\n  HostKeyAlias stable-vault\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n  IdentityFile none\nHost literal\n  User backup\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n",
+                known_hosts.display(), known_hosts.display()
             ),
         )
         .unwrap();
@@ -598,6 +602,34 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
         resolve_host_policy_at(ssh.to_str().unwrap(), None, "vault", Some(2200)).unwrap();
     assert_eq!(overridden.port(), 2200);
     assert_eq!(overridden.known_hosts_name, "stable-vault");
+    // The requester chooses a different login, while provider trust still
+    // comes from its own alias and port rather than the requester route.
+    let account = resolve_account_trust_bounded(
+        ssh.to_str().unwrap(),
+        "requester-user",
+        "vault",
+        None,
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(account.login_user, "requester-user");
+    assert_eq!(account.connection_host(), "vault.internal");
+    assert_eq!(account.port(), 2222);
+    assert_eq!(account.known_hosts_name, "stable-vault");
+    assert_eq!(account.host_keys, overridden.host_keys);
+    let literal = resolve_account_trust_bounded(
+        ssh.to_str().unwrap(),
+        "requester-user",
+        "literal",
+        Some(2200),
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(literal.known_hosts_name, "[literal]:2200");
+    assert_eq!(literal.login_user, "requester-user");
+    assert_eq!(literal.host_keys, account.host_keys);
 }
 
 #[test]

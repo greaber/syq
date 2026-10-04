@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 pub(super) mod foreground;
+pub(crate) mod local_config;
 mod master_lifetime;
 pub(crate) mod persistent;
 pub(crate) mod provider;
@@ -190,6 +191,21 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     }
 }
 
+/// A known_hosts lookup label is not a network endpoint. In particular,
+/// OpenSSH permits bracketed host-and-port labels as HostKeyAlias values.
+pub(crate) fn validate_host_key_alias(alias: &str) -> Result<()> {
+    anyhow::ensure!(
+        !alias.is_empty()
+            && alias.len() <= 512
+            && !alias.starts_with('-')
+            && alias
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-:[]".contains(&byte)),
+        "SSH HostKeyAlias must be a bounded plain host-key lookup name"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
     if endpoint.host.is_empty()
         || endpoint.host.starts_with('-')
@@ -214,8 +230,7 @@ pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {
 
 impl SessionRequest {
     /// Append these arguments after the caller's authorization options. The
-    /// authorizer resolves its SSH aliases; do not resolve `destination` again
-    /// on the requesting server. No quoting is added: OpenSSH intentionally
+    /// selected endpoint comes from the requesting machine’s SSH configuration. No quoting is added: OpenSSH intentionally
     /// joins the remote command's arguments for the destination's shell.
     pub(crate) fn ssh_arguments(
         &self,

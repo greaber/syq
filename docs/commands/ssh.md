@@ -9,9 +9,10 @@ syq ssh --auth-from @laptop hostB -- hostname
 
 Run these commands on the server you are working on. First
 [connect your laptop to that server](../receive.md#set-up-receiving).
-Your laptop resolves the destination through its own SSH configuration and
-asks you to approve access to that account. The SSH connection and all
-session traffic go directly between the two servers.
+The requesting server's SSH configuration chooses the destination, login user,
+port, and route. Your laptop asks you to approve access to that account and
+checks its trusted host keys. Session traffic follows the requesting server's
+route; it is not relayed through the laptop for authorization.
 
 <!-- CLI: ssh -->
 ```text
@@ -61,8 +62,22 @@ The laptop's ordinary SSH agent is not forwarded. Syq limits its authentication
 requests to the approved destination host keys and login account. The requesting
 SSH client and destination SSH server need OpenSSH 8.9 or newer. Both servers
 must have exact plain host keys trusted by the laptop; host-certificate-only
-trust is unsupported. The laptop's key must be loaded in its local agent, and
-the requesting server must reach the destination's SSH port directly.
+trust is unsupported. The laptop's key must be loaded in its local agent.
+The requesting server's `IdentityFile` and `IdentitiesOnly` settings select
+which keys to offer; a public-key file on that server can select the matching
+private key in the laptop's agent. Laptop private-key paths are not imported.
+Syq supplies the restricted agent in place of the server's `IdentityAgent`.
+
+The provider looks up trusted host keys using the alias you typed, or your
+local `HostKeyAlias` when set. It uses its own SSH configuration for that trust
+lookup. This lets the same alias use a private address between servers and a
+public address on the laptop, provided both routes reach the trusted host. A
+port written explicitly in the target also applies to the trust lookup unless
+you set `HostKeyAlias`.
+
+Configured `ProxyJump` hosts receive separate account approvals and reusable
+connections. A custom `ProxyCommand` runs on the requesting server and uses
+its own authentication; it does not receive the laptop's agent.
 
 Stopping receiving prevents new laptop-authorized logins. Syq also cleans up
 its owned connections, but already authenticated sessions and commands are not

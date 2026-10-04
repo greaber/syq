@@ -253,6 +253,28 @@ pub(crate) fn resolve_host_policy_at_bounded(
     })
 }
 
+/// Look up provider-local host trust without importing the requester's route.
+/// The selected login account participates in provider Match rules. An
+/// explicitly written trust port is preserved, but the requester's resolved
+/// address and port never change this lookup.
+pub(crate) fn resolve_account_trust_bounded(
+    ssh_program: &str,
+    login_user: &str,
+    trust_name: &str,
+    trust_port: Option<u16>,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<HostPolicy> {
+    resolve_host_policy_at_bounded(
+        ssh_program,
+        Some(login_user),
+        trust_name,
+        trust_port,
+        deadline,
+        cancelled,
+    )
+}
+
 struct SshConfigurationInspection {
     output: Vec<u8>,
     known_hosts_configured: KnownHostsConfigured,

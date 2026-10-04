@@ -79,8 +79,8 @@ An ordinary SSH provider uses its default persistence domain and first
 configured receiving profile, which must be enabled. There is no selector for
 another remote profile or domain. A local `--pscope` selects this machine's
 preferences, provider connections, and approved destination connections; it
-does not select a domain on the provider. The provider resolves destination
-aliases through its own SSH configuration.
+does not select a domain on the provider. Destination aliases use the
+requesting machine's SSH configuration.
 
 `persist status --json` adds an `authorized_ssh` array alongside the usual
 `connections`. Each entry contains the `authorizer`, requested and resolved
@@ -88,20 +88,19 @@ endpoints, `control` socket path, and `connected` state. `authorizer` is a name
 string for `@NAME`, or an object containing an `ssh` endpoint for an ordinary
 SSH provider.
 
-The selected provider's SSH configuration determines the destination account,
-host, port, and trusted host keys. Syq caches that resolution separately from
-SSH connections. Repeated commands use it immediately; after 30 seconds, an
-ordinary command also starts a background refresh. Completion reads the local
-cache without contacting the provider to resolve the destination. A completed
-refresh applies to later commands, and does not redirect a command already
-started. Existing sessions keep their original destination.
+The requesting machine's SSH configuration determines the destination account,
+host, port, identity selection, and route. Syq resolves that configuration before
+looking for a reusable connection. Changing an alias therefore affects the next
+command whether or not a connection already exists; existing sessions keep
+their original destination. Different configurations can leave multiple
+connections visible in status.
 
-A new login checks the provider's current configuration before authorization.
-If it differs from the command's selected resolution, that invocation fails;
-retrying resolves again. If background refresh cannot reach the provider,
-commands can keep using the cached resolution and an existing approved login.
-Changing an alias can leave both old and new connections visible in status;
-later commands use the resolution currently selected by the cache.
+The provider independently checks trusted host keys and approves the selected
+account. Repeated commands reuse that authorization and connection without a
+provider round trip to resolve the destination. Completion checks local SSH
+configuration within a short deadline and reuses a matching connection; it
+never contacts the provider, requests approval, or opens a connection. Slow
+configuration lookups yield no remote path suggestions.
 A closed connection can request another login under the current session or
 remembered permission. A failure after execution starts ends that command
 without retrying it.
@@ -138,7 +137,7 @@ OpenSSH configuration for one existing approved login. Use it with `ssh`,
 `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.
 The endpoint must match the user, host spelling, and port used to open
 the approved connection; the configuration then supplies the host, account,
-and port resolved by the provider. It never requests approval or opens a login. Native-only
+and port selected when that connection was opened. It never requests approval or opens a login. Native-only
 `ssh` selection cannot export approved account access.
 
 The exported configuration is a snapshot. Its socket is bound to the resolved

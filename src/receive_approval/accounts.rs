@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 const VERSION: u16 = 1;
 const MAX_STATE: usize = 512 * 1024;
 
-/// Construct only from the laptop's resolved SSH policy. A requesting server
-/// cannot choose the endpoint or trusted host keys used for this identity.
+/// Construct only after the provider verifies the selected account and its
+/// independently trusted host keys; requester-supplied keys are not authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AccountIdentity {

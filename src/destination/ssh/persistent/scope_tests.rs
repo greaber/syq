@@ -114,6 +114,7 @@ fn startup_retains_default_encoding_and_does_not_survive_scoped_recreation() {
         requested: endpoint(),
         generation: ensure_generation(&domain).unwrap(),
         selected: None,
+        proxy: None,
         scope: domain.explicit_path().map(Path::to_path_buf),
         scope_identity: Some(domain.identity().unwrap()),
     };

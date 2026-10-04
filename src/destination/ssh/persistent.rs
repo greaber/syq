@@ -1,5 +1,5 @@
 //! A reusable approved SSH login, owned by a keeper while its laptop is connected.
-use super::{foreground, resolution, SessionRequest, Tty};
+use super::{foreground, local_config::LocalPlan, resolution, SessionRequest, Tty};
 use crate::auth_from::Provider;
 use crate::cli::{AuthFrom, NativeEndpoint};
 use crate::persistence::Domain;
@@ -37,6 +37,8 @@ struct Startup {
     scope: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope_identity: Option<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,7 +307,18 @@ fn selected_index_path(
     requested: &NativeEndpoint,
     selected: &resolution::Selection,
 ) -> Result<PathBuf> {
-    let identity = serde_json::to_vec(&("resolved-account-v1", authorizer, requested, selected))?;
+    let local = selected
+        .local
+        .as_ref()
+        .context("SSH account selection lacks requester configuration")?;
+    let identity = serde_json::to_vec(&(
+        "local-account-v1",
+        authorizer,
+        requested,
+        &selected.provider,
+        &selected.policy,
+        &local.config_digest,
+    ))?;
     Ok(domain
         .approved_index_path()
         .join(format!("{}.json", blake3::hash(&identity).to_hex())))
@@ -435,20 +448,62 @@ pub(crate) fn select_or_connect(
     };
     let request = lookup_request(authorizer, requested);
     super::super::ssh_auth::prepare(&request)?;
-    let plan = resolution::select(domain, &request)?;
-    if let Some(cached) = cached_selected(domain, authorizer, requested, &plan.selected)? {
-        return Ok(Some(cached));
+    // Resolve all account and route choices locally before consulting any
+    // cached provider policy or connection, including every ProxyJump hop.
+    let local = LocalPlan::resolve(requested)?;
+    connect_local(domain, authorizer, local).map(Some)
+}
+
+fn connect_local(domain: &Domain, authorizer: &Provider, local: LocalPlan) -> Result<Cached> {
+    let request = lookup_request(authorizer, &local.requested);
+    let proxy = if let Some(hop) = &local.hop {
+        let cached = connect_local(domain, authorizer, (**hop).clone())?;
+        let mut args = vec!["ssh".to_owned()];
+        for option in cached.options() {
+            args.push(
+                option
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("ProxyJump socket path is not UTF-8"))?,
+            );
+        }
+        // OpenSSH transports bytes through the separately approved jump
+        // account; it never lends the destination's agent to a proxy process.
+        args.extend([
+            "-o".into(),
+            "RemoteCommand=none".into(),
+            "-T".into(),
+            "-W".into(),
+            format!("[{}]:{}", local.endpoint.host, local.endpoint.port.unwrap()),
+        ]);
+        args.extend(
+            super::ssh_arguments(Tty::Disabled, &[], cached.endpoint())?
+                .into_iter()
+                .map(|arg| {
+                    arg.into_string()
+                        .map_err(|_| anyhow::anyhow!("invalid ProxyJump argument"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        // The outer SSH expands ProxyCommand tokens once before executing it;
+        // preserve escaped tokens intended for the strict inner SSH command.
+        Some(shell_words::join(args).replace('%', "%%"))
+    } else {
+        None
+    };
+    let plan = resolution::select(domain, &request, local, proxy)?;
+    if let Some(cached) = cached_selected(domain, authorizer, &request.destination, &plan.selected)?
+    {
+        return Ok(cached);
     }
     let selected = plan.selected.clone();
     if let Err(error) = start(domain, request.clone(), plan) {
         if let Err(invalidation) = resolution::invalidate(domain, &request, &selected) {
-            crate::output::diagnostic!("syq: warning: cannot clear failed SSH resolution ({invalidation:#}); remove the stale resolution cache before retrying");
+            crate::output::diagnostic!("syq: warning: cannot clear failed SSH policy metadata ({invalidation:#}); retry after removing the stale cache");
         }
         return Err(error);
     }
-    cached_selected(domain, authorizer, requested, &selected)?
+    cached_selected(domain, authorizer, &request.destination, &selected)?
         .context("approved SSH account connection ended before use")
-        .map(Some)
 }
 
 fn export_selected(
@@ -687,9 +742,18 @@ pub(super) fn command(
         return Ok(None);
     };
     let mut command = Command::new("ssh");
-    command
-        .args(cached.options())
-        .args(request.ssh_arguments(cached.endpoint())?);
+    let mut options = cached.options().into_iter();
+    while let Some(option) = options.next() {
+        if option == "-F" {
+            options.next();
+            continue;
+        }
+        command.arg(option);
+    }
+    command.args(["-o", &format!("HostName={}", cached.endpoint().host)]);
+    let mut endpoint = cached.endpoint().clone();
+    endpoint.host = request.destination.host.clone();
+    command.args(request.ssh_arguments(&endpoint)?);
     Ok(Some(command))
 }
 
@@ -771,6 +835,7 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
         requested: request.destination,
         generation: plan.generation,
         selected: Some(plan.selected),
+        proxy: plan.proxy,
         scope: domain.explicit_path().map(Path::to_path_buf),
         scope_identity: if domain.is_default() {
             None
@@ -864,6 +929,16 @@ fn keeper(startup: Startup) -> Result<()> {
         .as_ref()
         .context("SSH account startup lacks a resolved policy; retry the command")?;
     selected.policy.validate()?;
+    let local = selected
+        .local
+        .as_ref()
+        .context("SSH account startup lacks requester configuration")?
+        .clone();
+    local.validate()?;
+    anyhow::ensure!(
+        local.requested == request.destination && local.endpoint == selected.policy.endpoint,
+        "SSH account startup changed the selected requester endpoint"
+    );
     anyhow::ensure!(
         super::super::ssh_auth::local_binding(&domain, &request.provider)?.as_deref()
             == Some(selected.provider.as_str()),
@@ -915,6 +990,7 @@ fn keeper(startup: Startup) -> Result<()> {
     let approval_domain = domain.clone();
     let shown_command = startup.command.clone();
     let selected = selected.clone();
+    let approval_local = local.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     // The keeper is a dedicated child process. If setup is cancelled, it exits
     // and closes the pending return request even while approval is blocked.
@@ -927,6 +1003,7 @@ fn keeper(startup: Startup) -> Result<()> {
                 shown_command,
                 &selected.provider,
                 &selected.policy,
+                &approval_local,
             ));
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
@@ -960,6 +1037,9 @@ fn keeper(startup: Startup) -> Result<()> {
         None,
     )?;
     let mut master = Command::new("ssh");
+    master
+        .args(local.options())
+        .args(local.route_options(startup.proxy.as_deref())?);
     let mut iter = options.iter();
     while let Some(option) = iter.next() {
         if option == "-o" {
@@ -980,17 +1060,18 @@ fn keeper(startup: Startup) -> Result<()> {
     master
         .args(["-M", "-N", "-S"])
         .arg(crate::persistence::openssh_control_path(&control))
-        .args(["-o", persist])
+        .args([
+            "-o",
+            persist,
+            "-o",
+            "RemoteCommand=none",
+            "-o",
+            "RequestTTY=no",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let connect_request = SessionRequest {
-        provider: request.provider.clone(),
-        destination: request.destination.clone(),
-        tty: Tty::Disabled,
-        command: Vec::new(),
-    };
-    master.args(connect_request.ssh_arguments(endpoint)?);
+    master.args(["--", &local.requested.host]);
     let record = Record {
         version: provider_state_version(&request.provider),
         authorizer: request.provider,
@@ -1189,10 +1270,9 @@ fn close_master(record: &Record) -> Result<()> {
 }
 
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
-    if let Some(result) = super::resolution::dispatch(argv) {
-        return Some(result);
-    }
-    if argv.len() == 2 && argv[1] == "--account-ssh-probe" {
+    if argv.len() == 2
+        && (argv[1] == "--account-ssh-probe" || argv[1] == "--requester-ssh-policy-probe")
+    {
         return Some(Ok(0));
     }
     if argv.len() != 2 || argv[1] != INTERNAL {
@@ -1272,6 +1352,19 @@ mod tests {
         .unwrap();
         let selected = resolution::Selection {
             provider: "a".repeat(64),
+            local: Some(LocalPlan {
+                requested: requested.clone(),
+                endpoint: NativeEndpoint {
+                    user: Some("user".into()),
+                    host: "resolved.invalid".into(),
+                    port: Some(22),
+                },
+                host_key_alias: None,
+                config_digest: "b".repeat(64),
+                route: super::super::local_config::Route::Direct,
+                host_key_algorithms: "ssh-ed25519".into(),
+                hop: None,
+            }),
             policy: crate::destination::ssh_auth::ResolvedPolicy::new(
                 NativeEndpoint {
                     user: Some("user".into()),

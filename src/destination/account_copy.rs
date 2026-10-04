@@ -173,7 +173,7 @@ fn connection(
     options: Vec<std::ffi::OsString>,
 ) -> Result<crate::conn::RemoteSpec> {
     // Keep copy paths/identities in the caller's spelling. Only the transport
-    // uses the laptop-resolved endpoint. Explicit -S suppresses another mux.
+    // uses the approved requester-selected endpoint. Explicit -S suppresses another mux.
     let mut transport = args.clone();
     let words = std::iter::once("ssh".to_owned()).chain(
         options

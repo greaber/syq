@@ -217,7 +217,9 @@ also needs two simultaneous sessions on the destination's approved connection
 (`sshd MaxSessions` of at least 2); direct TCP data does not need the second
 session. The socket
 carries control, metadata, and worker setup; payload goes directly between the
-source and destination. Disabled forwarding is an error and never selects a
+source and destination. The invoking machine's `ProxyJump` route can
+reach the control endpoints, but does not provide a data route between the
+servers. Data workers still need to reach the peer directly. Disabled forwarding is an error and never selects a
 payload relay. Syq creates a receiver for this copy over the destination's
 approved account connection; durable receiver enrollment is unnecessary.
 The destination's [restricted-copy limits](#limits-and-unsupported-options)

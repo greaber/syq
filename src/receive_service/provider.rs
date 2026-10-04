@@ -50,6 +50,8 @@ enum Access {
 pub(crate) enum SessionRequest {
     Resolve(crate::cli::NativeEndpoint),
     Account(ssh_auth::Request),
+    ResolveLocal(ssh_auth::LocalTarget),
+    LocalAccount(ssh_auth::LocalRequest),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -483,27 +485,32 @@ impl Service {
                             || session.closed.load(Ordering::Acquire)
                             || disconnected(&socket)
                     };
+                    let context = AuthorizationContext {
+                        origin: AuthorizationOrigin::Provider {
+                            profile: &session.profile.settings.name,
+                            identity: &session.identity,
+                        },
+                        approvals: &session.profile.approvals,
+                        notifications: session.profile.settings.notifications,
+                        request_lock: &session.request_lock,
+                        active_count: &session.active_count,
+                        session_grants: &session.grants,
+                    };
                     match *operation {
+                        SessionRequest::ResolveLocal(target) => {
+                            ssh_auth::resolve_local_and_reply(&target, &mut stream, &cancelled)
+                        }
+                        SessionRequest::LocalAccount(request) => {
+                            ssh_auth::authorize_local_and_relay(
+                                context, request, tracked, 0, &cancelled,
+                            )
+                        }
                         SessionRequest::Resolve(target) => {
                             ssh_auth::resolve_and_reply(&target, &mut stream, &cancelled)
                         }
-                        SessionRequest::Account(request) => ssh_auth::authorize_and_relay(
-                            AuthorizationContext {
-                                origin: AuthorizationOrigin::Provider {
-                                    profile: &session.profile.settings.name,
-                                    identity: &session.identity,
-                                },
-                                approvals: &session.profile.approvals,
-                                notifications: session.profile.settings.notifications,
-                                request_lock: &session.request_lock,
-                                active_count: &session.active_count,
-                                session_grants: &session.grants,
-                            },
-                            request,
-                            tracked,
-                            0,
-                            &cancelled,
-                        ),
+                        SessionRequest::Account(request) => {
+                            ssh_auth::authorize_and_relay(context, request, tracked, 0, &cancelled)
+                        }
                     }
                 })();
                 if let Err(error) = result {

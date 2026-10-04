@@ -88,6 +88,89 @@ impl Request {
     }
 }
 
+/// The requester selects the connection route; the provider independently
+/// looks up trust by the original alias (or the explicit HostKeyAlias). No
+/// requester-supplied host key can become authorization policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalTarget {
+    requested: NativeEndpoint,
+    endpoint: NativeEndpoint,
+    host_key_alias: Option<String>,
+}
+
+impl LocalTarget {
+    fn from_plan(plan: &ssh::local_config::LocalPlan) -> Result<Self> {
+        plan.validate()?;
+        let target = Self {
+            requested: plan.requested.clone(),
+            endpoint: plan.endpoint.clone(),
+            host_key_alias: plan.host_key_alias.clone(),
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ssh::validate_endpoint(&self.requested)?;
+        ssh::validate_endpoint(&self.endpoint)?;
+        anyhow::ensure!(
+            self.endpoint.user.is_some() && self.endpoint.port.is_some(),
+            "requester SSH configuration must select an explicit account and port"
+        );
+        if let Some(alias) = &self.host_key_alias {
+            ssh::validate_host_key_alias(alias)?;
+        }
+        Ok(())
+    }
+
+    fn trust_name(&self) -> &str {
+        self.host_key_alias
+            .as_deref()
+            .unwrap_or(&self.requested.host)
+    }
+
+    fn trust_port(&self) -> Option<u16> {
+        // A port written in the target is part of that trust name. A port
+        // obtained from requester configuration belongs only to its route.
+        if self.host_key_alias.is_some() {
+            None
+        } else {
+            self.requested.port
+        }
+    }
+}
+
+/// A distinct, build-pinned request keeps legacy provider-selected requests
+/// and their persisted permissions readable without changing their meaning.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalRequest {
+    target: LocalTarget,
+    command: Vec<Vec<u8>>,
+    cwd: String,
+    expected: ResolvedPolicy,
+}
+
+impl LocalRequest {
+    fn into_request(self) -> Result<(Request, LocalTarget)> {
+        self.target.validate()?;
+        anyhow::ensure!(
+            self.expected.endpoint == self.target.endpoint,
+            "SSH approval expectation does not match the requester-selected account"
+        );
+        Ok((
+            Request::account(
+                self.target.endpoint.clone(),
+                self.command,
+                self.cwd,
+                Some(self.expected),
+            ),
+            self.target,
+        ))
+    }
+}
+
 /// Identity established by the transport adapter, never supplied by the
 /// authorization request. Native provider logins do not prove a source host.
 pub(crate) enum AuthorizationOrigin<'a> {
@@ -293,7 +376,16 @@ pub(crate) struct Resolved {
 
 /// Metadata is returned together with the authenticated connection that
 /// resolved it. Neither operation grants destination account access.
-pub(crate) fn resolve(domain: &Domain, request: &ssh::SessionRequest) -> Result<Resolved> {
+pub(crate) fn resolve(
+    domain: &Domain,
+    request: &ssh::SessionRequest,
+    local: &ssh::local_config::LocalPlan,
+) -> Result<Resolved> {
+    let target = LocalTarget::from_plan(local)?;
+    anyhow::ensure!(
+        target.requested == request.destination,
+        "SSH local plan target changed"
+    );
     request.provider.validate()?;
     ssh::validate_endpoint(&request.destination)?;
     let (binding, mut stream, reply) = match &request.provider {
@@ -302,7 +394,7 @@ pub(crate) fn resolve(domain: &Domain, request: &ssh::SessionRequest) -> Result<
             let binding = registration_binding(&registration)?;
             let (stream, reply) = exchange(
                 &registration,
-                Message::ResolveSsh(request.destination.clone()),
+                Message::ResolveLocalSsh(target.clone()),
                 RESOLVE_TIMEOUT,
                 Some(RESOLVE_TIMEOUT),
             )?;
@@ -314,9 +406,7 @@ pub(crate) fn resolve(domain: &Domain, request: &ssh::SessionRequest) -> Result<
                 domain,
                 &request.provider,
                 &binding,
-                crate::receive_service::provider::SessionRequest::Resolve(
-                    request.destination.clone(),
-                ),
+                crate::receive_service::provider::SessionRequest::ResolveLocal(target.clone()),
             )?;
             let reply = read_message(&mut DeadlineSocket {
                 socket: &mut stream,
@@ -334,6 +424,10 @@ pub(crate) fn resolve(domain: &Domain, request: &ssh::SessionRequest) -> Result<
         socket: &mut stream,
         deadline: Instant::now() + RESOLVE_TIMEOUT,
     })?;
+    anyhow::ensure!(
+        resolved.endpoint == target.endpoint,
+        "SSH provider returned a different account than the requester selected"
+    );
     Ok(Resolved {
         binding,
         policy: ResolvedPolicy::new(
@@ -350,16 +444,27 @@ pub(crate) fn authorize_expected(
     command: Vec<Vec<u8>>,
     provider_binding: &str,
     expected: &ResolvedPolicy,
+    local: &ssh::local_config::LocalPlan,
 ) -> Result<Session> {
+    let target = LocalTarget::from_plan(local)?;
+    anyhow::ensure!(
+        target.requested == request.destination,
+        "SSH local plan target changed"
+    );
+    anyhow::ensure!(
+        expected.endpoint == target.endpoint,
+        "SSH local configuration changed; retry the command"
+    );
     request.provider.validate()?;
     expected.validate()?;
+    let algorithms = local.intersect_host_algorithms(&expected.host_algorithms)?;
     crate::conn::require_constrained_openssh("ssh", "on this machine")?;
-    let operation = Request::account(
-        request.destination.clone(),
+    let operation = LocalRequest {
+        target,
         command,
-        crate::approval_command::current_directory(),
-        Some(expected.clone()),
-    );
+        cwd: crate::approval_command::current_directory(),
+        expected: expected.clone(),
+    };
     crate::output::diagnostic!(
         "syq: requesting SSH account access from {}; approve on that machine",
         request.provider.label()
@@ -375,7 +480,7 @@ pub(crate) fn authorize_expected(
             );
             exchange(
                 &registration,
-                Message::Ssh(operation),
+                Message::LocalSsh(operation),
                 REQUEST_TIMEOUT + Duration::from_secs(30),
                 Some(Duration::from_secs(120)),
             )?
@@ -385,7 +490,7 @@ pub(crate) fn authorize_expected(
                 domain,
                 &request.provider,
                 provider_binding,
-                crate::receive_service::provider::SessionRequest::Account(operation),
+                crate::receive_service::provider::SessionRequest::LocalAccount(operation),
             )?;
             let reply = read_message(&mut stream)?;
             (stream, reply)
@@ -426,11 +531,7 @@ pub(crate) fn authorize_expected(
         .mode(0o600)
         .open(&known_hosts)?;
     file.write_all(approved.known_hosts.as_bytes())?;
-    let options = ssh_options(
-        broker.socket_path(),
-        &known_hosts,
-        &approved.host_algorithms,
-    )?;
+    let options = ssh_options(broker.socket_path(), &known_hosts, &algorithms)?;
     Ok(Session {
         stream,
         _broker: broker,
@@ -465,16 +566,9 @@ fn ssh_options(agent: &Path, known_hosts: &Path, algorithms: &str) -> Result<Vec
     {
         bail!("invalid approved host-key algorithms");
     }
-    let mut options: Vec<OsString> = ["-F", "/dev/null", "-a", "-x", "-k"]
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let mut options: Vec<OsString> = ["-a", "-x", "-k"].into_iter().map(Into::into).collect();
     for option in [
-        "IdentitiesOnly=no".to_owned(),
-        "IdentityFile=none".into(),
-        "CertificateFile=none".into(),
-        "PKCS11Provider=none".into(),
-        "PubkeyAuthentication=host-bound".into(),
+        "PubkeyAuthentication=host-bound".to_owned(),
         "PreferredAuthentications=publickey".into(),
         "BatchMode=yes".into(),
         "ForwardAgent=no".into(),
@@ -483,10 +577,11 @@ fn ssh_options(agent: &Path, known_hosts: &Path, algorithms: &str) -> Result<Vec
         "ClearAllForwardings=yes".into(),
         "ControlMaster=no".into(),
         "ControlPath=none".into(),
-        "ProxyJump=none".into(),
-        "ProxyCommand=none".into(),
         "StrictHostKeyChecking=yes".into(),
         "GlobalKnownHostsFile=/dev/null".into(),
+        "KnownHostsCommand=none".into(),
+        "VerifyHostKeyDNS=no".into(),
+        "NoHostAuthenticationForLocalhost=no".into(),
         "UpdateHostKeys=no".into(),
         "CheckHostIP=no".into(),
         "ServerAliveInterval=15".into(),
@@ -511,6 +606,58 @@ fn resolve_policy(target: &NativeEndpoint, cancelled: &dyn Fn() -> bool) -> Resu
         Instant::now() + RESOLVE_TIMEOUT,
         cancelled,
     )
+}
+
+fn resolve_local_policy(target: &LocalTarget, cancelled: &dyn Fn() -> bool) -> Result<HostPolicy> {
+    target.validate()?;
+    crate::agent_broker::resolve_account_trust_bounded(
+        "ssh",
+        target
+            .endpoint
+            .user
+            .as_deref()
+            .context("missing selected SSH account")?,
+        target.trust_name(),
+        target.trust_port(),
+        Instant::now() + RESOLVE_TIMEOUT,
+        cancelled,
+    )
+}
+
+fn resolved_local(target: &LocalTarget, policy: &HostPolicy) -> Result<ResolvedPolicy> {
+    anyhow::ensure!(
+        target.endpoint.user.as_deref() == Some(policy.login_user.as_str()),
+        "SSH trust lookup changed the requester-selected account"
+    );
+    ResolvedPolicy::new(
+        target.endpoint.clone(),
+        &policy.known_hosts(HOST_ALIAS)?,
+        &policy.host_key_algorithms(),
+    )
+}
+
+fn resolve_local_target(
+    target: &LocalTarget,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ResolvedPolicy> {
+    if cancelled() {
+        bail!("SSH resolution disconnected");
+    }
+    let resolved = resolved_local(target, &resolve_local_policy(target, cancelled)?)?;
+    if cancelled() {
+        bail!("SSH resolution disconnected");
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn resolve_local_and_reply(
+    target: &LocalTarget,
+    writer: &mut impl Write,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let resolved = resolve_local_target(target, cancelled)?;
+    write_message(writer, &Reply::Ready)?;
+    write_message(writer, &resolved)
 }
 
 /// Resolve-only entry for authenticated adapters. This neither consults the
@@ -622,6 +769,35 @@ impl<'a> AccountApproval<'a> {
 pub(crate) fn authorize_and_relay(
     context: AuthorizationContext<'_>,
     request: Request,
+    stream: TrackedStream,
+    generation: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    authorize_and_relay_inner(context, request, None, stream, generation, cancelled)
+}
+
+pub(crate) fn authorize_local_and_relay(
+    context: AuthorizationContext<'_>,
+    request: LocalRequest,
+    stream: TrackedStream,
+    generation: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let (request, target) = request.into_request()?;
+    authorize_and_relay_inner(
+        context,
+        request,
+        Some(target),
+        stream,
+        generation,
+        cancelled,
+    )
+}
+
+fn authorize_and_relay_inner(
+    context: AuthorizationContext<'_>,
+    request: Request,
+    local_target: Option<LocalTarget>,
     mut stream: TrackedStream,
     generation: u64,
     cancelled: &dyn Fn() -> bool,
@@ -645,8 +821,15 @@ pub(crate) fn authorize_and_relay(
     if cancelled() {
         bail!("SSH request disconnected before authorization");
     }
-    let policy = resolve_policy(&request.target, cancelled)?;
-    let approved = ResolvedPolicy::from_policy(&policy)?;
+    let (policy, approved) = if let Some(target) = &local_target {
+        let policy = resolve_local_policy(target, cancelled)?;
+        let approved = resolved_local(target, &policy)?;
+        (policy, approved)
+    } else {
+        let policy = resolve_policy(&request.target, cancelled)?;
+        let approved = ResolvedPolicy::from_policy(&policy)?;
+        (policy, approved)
+    };
     approved.check_expected(request.expected.as_ref())?;
     if request.mode == Mode::Account {
         let destination = AccountIdentity::new(
@@ -710,16 +893,25 @@ pub(crate) fn authorize_and_relay(
 
 impl Receiver {
     pub(super) fn resolve_ssh(&self, target: NativeEndpoint, stream: TrackedStream) -> Result<()> {
+        ssh::validate_endpoint(&target)?;
         self.resolve_ssh_with(target, stream, resolve_target)
     }
 
-    fn resolve_ssh_with(
+    pub(super) fn resolve_local_ssh(
         &self,
-        target: NativeEndpoint,
-        mut stream: TrackedStream,
-        resolve: impl FnOnce(&NativeEndpoint, &dyn Fn() -> bool) -> Result<ResolvedPolicy>,
+        target: LocalTarget,
+        stream: TrackedStream,
     ) -> Result<()> {
-        ssh::validate_endpoint(&target)?;
+        target.validate()?;
+        self.resolve_ssh_with(target, stream, resolve_local_target)
+    }
+
+    fn resolve_ssh_with<T>(
+        &self,
+        target: T,
+        mut stream: TrackedStream,
+        resolve: impl FnOnce(&T, &dyn Fn() -> bool) -> Result<ResolvedPolicy>,
+    ) -> Result<()> {
         let (generation, _tracked) = {
             let _sessions = self.sessions.lock().unwrap();
             (
@@ -745,6 +937,24 @@ impl Receiver {
     }
 
     pub(super) fn authorize_ssh(&self, request: Request, stream: TrackedStream) -> Result<()> {
+        self.authorize_ssh_inner(request, None, stream)
+    }
+
+    pub(super) fn authorize_local_ssh(
+        &self,
+        request: LocalRequest,
+        stream: TrackedStream,
+    ) -> Result<()> {
+        let (request, target) = request.into_request()?;
+        self.authorize_ssh_inner(request, Some(target), stream)
+    }
+
+    fn authorize_ssh_inner(
+        &self,
+        request: Request,
+        target: Option<LocalTarget>,
+        stream: TrackedStream,
+    ) -> Result<()> {
         let context = AuthorizationContext {
             origin: AuthorizationOrigin::Return {
                 profile: &self.name,
@@ -770,7 +980,7 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        authorize_and_relay(context, request, stream, generation, &cancelled)
+        authorize_and_relay_inner(context, request, target, stream, generation, &cancelled)
     }
 }
 
@@ -1065,6 +1275,73 @@ mod tests {
     }
 
     #[test]
+    fn requester_target_keeps_actual_route_separate_from_trust_lookup() {
+        let mut target = LocalTarget {
+            requested: NativeEndpoint {
+                user: None,
+                host: "work-alias".into(),
+                port: Some(2200),
+            },
+            endpoint: NativeEndpoint {
+                user: Some("selected-user".into()),
+                host: "10.2.3.4".into(),
+                port: Some(2222),
+            },
+            host_key_alias: None,
+        };
+        target.validate().unwrap();
+        assert_eq!(target.trust_name(), "work-alias");
+        assert_eq!(target.trust_port(), Some(2200));
+        target.requested.port = None;
+        assert_eq!(target.trust_port(), None); // resolved private port stays local
+        target.host_key_alias = Some("stable-server".into());
+        target.validate().unwrap();
+        assert_eq!(target.trust_name(), "stable-server");
+        target.requested.port = Some(2200);
+        assert_eq!(target.trust_port(), None);
+        target.host_key_alias = Some("[stable-server]:2200".into());
+        target.validate().unwrap();
+        assert_eq!(target.trust_name(), "[stable-server]:2200");
+        assert_eq!(target.trust_port(), None);
+        let expected = ResolvedPolicy::new(
+            target.endpoint.clone(),
+            &policy(31).known_hosts,
+            "ssh-ed25519",
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&LocalRequest {
+            target: target.clone(),
+            command: Vec::new(),
+            cwd: "/tmp".into(),
+            expected: expected.clone(),
+        })
+        .unwrap();
+        assert!(serde_json::from_slice::<Request>(&encoded).is_err());
+        let (request, decoded) = serde_json::from_slice::<LocalRequest>(&encoded)
+            .unwrap()
+            .into_request()
+            .unwrap();
+        assert_eq!(decoded, target);
+        assert_eq!(request.target, target.endpoint);
+        assert!(request.mode == Mode::Account);
+        let mut changed = expected;
+        changed.endpoint.user = Some("different-account".into());
+        assert!(LocalRequest {
+            target: target.clone(),
+            command: Vec::new(),
+            cwd: String::new(),
+            expected: changed
+        }
+        .into_request()
+        .is_err());
+        target.endpoint.port = None;
+        assert!(target.validate().is_err());
+        target.endpoint.port = Some(22);
+        target.host_key_alias = Some("-oProxyCommand=anything".into());
+        assert!(target.validate().is_err());
+    }
+
+    #[test]
     fn agent_replies_do_not_cancel_the_ssh_session() {
         let (mut local, mut remote) = UnixStream::pair().unwrap();
         assert!(!disconnected(&local));
@@ -1091,10 +1368,27 @@ mod tests {
             "UserKnownHostsFile=/tmp/private/hosts",
             "ForwardAgent=no",
             "StrictHostKeyChecking=yes",
+            "KnownHostsCommand=none",
+            "VerifyHostKeyDNS=no",
+            "NoHostAuthenticationForLocalhost=no",
             "PubkeyAuthentication=host-bound",
             "ControlPath=none",
         ] {
             assert!(options.iter().any(|value| value == required), "{required}");
+        }
+        for forbidden in [
+            "-F",
+            "IdentitiesOnly=no",
+            "IdentityFile=none",
+            "CertificateFile=none",
+            "PKCS11Provider=none",
+            "ProxyJump=none",
+            "ProxyCommand=none",
+        ] {
+            assert!(
+                !options.iter().any(|value| value == forbidden),
+                "{forbidden}"
+            );
         }
         for path in ["/tmp/a b/agent", "/tmp/%h/agent", "/tmp/${HOME}/agent"] {
             assert!(ssh_options(Path::new(path), Path::new("/tmp/hosts"), "ssh-ed25519").is_err());

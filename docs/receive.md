@@ -210,8 +210,9 @@ syq cp results --to hostB
 ```
 
 The first operation connects to the provider using your machine's native SSH
-credentials. The provider resolves `hostB` through its own SSH configuration and
-asks for destination-account approval. Inspect and approve requests there with
+credentials. Your machine's SSH configuration determines `hostB`'s address,
+account, and route. The provider checks trusted host keys and asks for
+destination-account approval. Inspect and approve requests there with
 `syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
 Later commands reuse both connections; `persist connect` is optional.
 Your agent is not forwarded, and commands and file data travel directly to hostB.

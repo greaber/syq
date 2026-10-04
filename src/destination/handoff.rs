@@ -220,6 +220,14 @@ pub(crate) fn command_line() -> Result<&'static [OsString]> {
     Ok(COMMAND_LINE.get().context("command line not recorded")?)
 }
 
+fn supports_requester_ssh_policy(program: &std::ffi::OsStr) -> bool {
+    Command::new(program)
+        .arg("--requester-ssh-policy-probe")
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .capture_output()
+        .is_ok_and(|output| output.status.success())
+}
+
 pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     check_selection(selection)?;
     if selection.registration.identity == crate::identity::build() {
@@ -239,13 +247,8 @@ pub(super) fn maybe_exec(selection: &Selection) -> Result<()> {
     if selection.kind == Kind::Account {
         anyhow::ensure!(!ACCOUNT_PREFLIGHT_DONE.load(std::sync::atomic::Ordering::Acquire),
             "receiving connection changed after account preflight; retry the command to use its matching helper");
-        let supported = Command::new(program)
-            .arg("--account-ssh-probe")
-            .env("SYQ_NO_UPDATE_CHECK", "1")
-            .capture_output()
-            .is_ok_and(|output| output.status.success());
-        if !supported {
-            bail!("the registered helper for @{} does not support account authorization; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
+        if !supports_requester_ssh_policy(program) {
+            bail!("the registered helper for @{} does not support requester-selected SSH configuration; update syq on the receiving machine and reconnect with syq persist connect SERVER", selection.name);
         }
     }
     if matches!(selection.kind, Kind::Ssh | Kind::SshPersistent) {
@@ -342,6 +345,26 @@ mod tests {
         }
         assert!(!accepts_command(Kind::Copy, Some("rm"), None));
         assert!(!accepts_command(Kind::Command, Some("ssh"), None));
+    }
+
+    #[test]
+    fn older_account_probe_does_not_claim_requester_policy_support() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::test_support::tempdir().unwrap();
+        let helper = temp.path().join("old-helper");
+        std::fs::write(
+            &helper,
+            b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --account-ssh-probe ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new(&helper)
+            .arg("--account-ssh-probe")
+            .capture_output()
+            .unwrap()
+            .status
+            .success());
+        assert!(!supports_requester_ssh_policy(helper.as_os_str()));
     }
 
     #[test]

@@ -215,6 +215,8 @@ enum Message {
     Exec(exec::ExecRequest),
     ResolveSsh(crate::cli::NativeEndpoint),
     Ssh(ssh_auth::Request),
+    ResolveLocalSsh(ssh_auth::LocalTarget),
+    LocalSsh(ssh_auth::LocalRequest),
     // Copy and storage requests carry the command that produced them. The
     // receiving machine derives the request from it and shows it for approval.
     // `cwd` is the requesting process's working directory, shown with the
@@ -1225,6 +1227,8 @@ impl Receiver {
             Message::Exec(request) => self.execute(request, stream),
             Message::ResolveSsh(target) => self.resolve_ssh(target, stream),
             Message::Ssh(request) => self.authorize_ssh(request, stream),
+            Message::ResolveLocalSsh(target) => self.resolve_local_ssh(target, stream),
+            Message::LocalSsh(request) => self.authorize_local_ssh(request, stream),
             Message::Storage {
                 command,
                 cwd,

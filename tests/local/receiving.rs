@@ -1346,7 +1346,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nif [ \"$1\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nhostkeyalgorithms ssh-ed25519\\n'; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];
@@ -1435,10 +1435,14 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
             let responses = if envelope["message"] == "Ping" {
                 assert!(ssh_marker.exists(), "discovery preceded the SSH attempt");
                 vec![serde_json::json!("Ready")]
-            } else if let Some(target) = envelope["message"].get("ResolveSsh") {
+            } else if let Some(target) = envelope["message"].get("ResolveLocalSsh") {
                 assert_eq!(
                     target,
-                    &serde_json::json!({"user": null, "host": "backup", "port": null}),
+                    &serde_json::json!({
+                        "requested": {"user": null, "host": "backup", "port": null},
+                        "endpoint": {"user": "fixture-user", "host": "resolved-backup", "port": 2222},
+                        "host_key_alias": null,
+                    }),
                     "{envelope}"
                 );
                 assert!(
@@ -1446,9 +1450,15 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
                     "explicit account resolution tried native SSH"
                 );
                 vec![serde_json::json!("Ready"), resolved.clone()]
-            } else if let Some(account) = envelope["message"].get("Ssh") {
-                assert_eq!(account["mode"], "Account", "{envelope}");
-                assert_eq!(account["target"]["host"], "backup", "{envelope}");
+            } else if let Some(account) = envelope["message"].get("LocalSsh") {
+                assert_eq!(
+                    account["target"]["requested"]["host"], "backup",
+                    "{envelope}"
+                );
+                assert_eq!(
+                    account["target"]["endpoint"], resolved["endpoint"],
+                    "{envelope}"
+                );
                 assert_eq!(account["expected"], resolved, "{envelope}");
                 assert!(
                     !ssh_marker.exists(),
@@ -1605,8 +1615,14 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     for (pair, name) in messages[8..12].chunks_exact(2).zip(["z-other", "ssh"]) {
         assert_eq!(pair[0]["secret"], name);
         assert_eq!(pair[1]["secret"], name);
-        assert_eq!(pair[0]["message"]["ResolveSsh"]["host"], "backup");
-        assert_eq!(pair[1]["message"]["Ssh"]["mode"], "Account");
+        assert_eq!(
+            pair[0]["message"]["ResolveLocalSsh"]["requested"]["host"],
+            "backup"
+        );
+        assert_eq!(
+            pair[1]["message"]["LocalSsh"]["target"]["endpoint"],
+            pair[0]["message"]["ResolveLocalSsh"]["endpoint"]
+        );
     }
     // The registry remains, but every socket is now unavailable. Discovery
     // must allow ordinary SSH instead of treating stale names as reservations.

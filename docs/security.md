@@ -390,6 +390,13 @@ The laptop restricts authentication signatures to the approved destination host
 keys and login account. Its ordinary agent is not forwarded, and this permission
 cannot authenticate to a different destination account or sign arbitrary messages.
 
+The requesting machine chooses the account and route through its SSH
+configuration. It cannot make the provider trust a host key merely by including
+that key in a request: the provider checks its own trusted host information.
+`ProxyJump` requires permission for each jump account as well as the final
+account. Custom proxy commands use local authentication and do not receive
+the provider's agent socket.
+
 A laptop agent key constrained with `ssh-add -h hostB` can authorize this login:
 the agent sees the real direct binding to hostB. Syq separately approves the
 requesting source account; an agent constraint describing a forwarded A-to-B
