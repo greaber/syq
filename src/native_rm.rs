@@ -440,7 +440,8 @@ struct Pool {
     cancelled: AtomicBool,
     limit: AtomicUsize,
     active: AtomicUsize,
-    parked: Mutex<usize>,
+    parked: Mutex<()>,
+    waiting: AtomicUsize,
     wake: Condvar,
 }
 
@@ -494,23 +495,43 @@ impl Pool {
     }
 
     fn enter(&self) -> ActiveWorker<'_> {
-        let parked = self.parked.lock().unwrap();
-        let _parked = self.wait_for_capacity(parked);
-        self.active.fetch_add(1, Ordering::Relaxed);
+        if !self.try_enter() {
+            let parked = self.parked.lock().unwrap();
+            let _parked = self.wait_for_capacity(parked);
+        }
         ActiveWorker(self)
+    }
+
+    fn try_enter(&self) -> bool {
+        let mut active = self.active.load(Ordering::SeqCst);
+        loop {
+            if active >= self.limit.load(Ordering::Relaxed) && !self.is_cancelled() {
+                return false;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => active = current,
+            }
+        }
     }
 
     fn wait_for_capacity<'a>(
         &self,
-        mut parked: std::sync::MutexGuard<'a, usize>,
-    ) -> std::sync::MutexGuard<'a, usize> {
-        while self.active.load(Ordering::Relaxed) >= self.limit.load(Ordering::Relaxed)
-            && !self.is_cancelled()
-        {
-            *parked += 1;
+        mut parked: std::sync::MutexGuard<'a, ()>,
+    ) -> std::sync::MutexGuard<'a, ()> {
+        // Register before checking capacity. Together with the sequentially
+        // consistent release/check in ActiveWorker::drop, this prevents a
+        // missed wakeup without locking on uncontended admission or release.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        while !self.try_enter() {
             parked = self.wake.wait(parked).unwrap();
-            *parked -= 1;
         }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
         parked
     }
 
@@ -527,9 +548,8 @@ impl Pool {
         if self.active.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
             && !self.is_cancelled()
         {
-            self.active.fetch_sub(1, Ordering::Relaxed);
+            self.active.fetch_sub(1, Ordering::SeqCst);
             let _parked = self.wait_for_capacity(parked);
-            self.active.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -563,11 +583,9 @@ struct ActiveWorker<'a>(&'a Pool);
 
 impl Drop for ActiveWorker<'_> {
     fn drop(&mut self) {
-        let parked = self.0.parked.lock().unwrap();
-        self.0.active.fetch_sub(1, Ordering::Relaxed);
-        let waiting = *parked != 0;
-        drop(parked);
-        if waiting {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        if self.0.waiting.load(Ordering::SeqCst) != 0 {
+            let _parked = self.0.parked.lock().unwrap();
             self.0.wake.notify_one();
         }
     }
@@ -723,7 +741,8 @@ pub(crate) fn remove(
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(tuning.limit()),
         active: AtomicUsize::new(0),
-        parked: Mutex::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
     for selected in resolved {

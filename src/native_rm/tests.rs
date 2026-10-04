@@ -251,7 +251,8 @@ fn failed_attached_emit_cancels_pending_mutation() {
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(1),
         active: AtomicUsize::new(0),
-        parked: Mutex::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
 
@@ -516,7 +517,8 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
             active: AtomicUsize::new(0),
-            parked: Mutex::new(0),
+            parked: Mutex::new(()),
+            waiting: AtomicUsize::new(0),
             wake: Condvar::new(),
         };
         pool.task_done();
@@ -557,7 +559,8 @@ fn parked_removal_workers_wake_for_growth_cancellation_and_released_capacity() {
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
             active: AtomicUsize::new(0),
-            parked: Mutex::new(0),
+            parked: Mutex::new(()),
+            waiting: AtomicUsize::new(0),
             wake: Condvar::new(),
         });
         let mut active = Some(pool.enter());
@@ -625,7 +628,8 @@ fn cancellation_within_a_sibling_batch_leaves_remaining_files_and_drains_account
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(4),
         active: AtomicUsize::new(0),
-        parked: Mutex::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
     let cancel = Arc::downgrade(&pool);
@@ -676,7 +680,7 @@ fn wait_for_removal_state(pool: &Pool, ready: impl Fn() -> bool) -> bool {
             pool.active.load(Ordering::Relaxed),
             pool.limit.load(Ordering::Relaxed),
             *pool.pending.lock().unwrap(),
-            *pool.parked.lock().unwrap(),
+            pool.waiting.load(Ordering::SeqCst),
         );
     }
     ready
@@ -698,7 +702,8 @@ fn retirement_pauses_inline_scanning_before_the_directory_finishes() {
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(2),
         active: AtomicUsize::new(0),
-        parked: Mutex::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
     // Hold the one slot that will remain admitted after the reduction.
@@ -723,7 +728,7 @@ fn retirement_pauses_inline_scanning_before_the_directory_finishes() {
     pool.set_limit(1);
     assert!(!pool.backlogged());
     resume.send(()).unwrap();
-    let parked = wait_for_removal_state(&pool, || *pool.parked.lock().unwrap() == 1);
+    let parked = wait_for_removal_state(&pool, || pool.waiting.load(Ordering::SeqCst) == 1);
     let remaining = fs::read_dir(temp.path()).unwrap().count();
     let measurable = pool.backlogged();
     drop(retained);
@@ -763,7 +768,8 @@ fn reduced_scans_finish_with_idle_workers_waiting_on_the_queue() {
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(4),
         active: AtomicUsize::new(0),
-        parked: Mutex::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
     let (entered, entering) = mpsc::channel();
