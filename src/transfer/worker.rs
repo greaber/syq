@@ -314,9 +314,6 @@ impl Worker {
     fn inspects_destination(&self, job: &FileJobData) -> bool {
         job.resume_partial
             || self.opts.protects_existing_contents()
-            // A restricted receiver's in-place grant refuses batched
-            // publication.
-            || (self.opts.restricted_receiver && self.opts.inplace)
             || (self.opts.hardlinks && job.entry.nlink > 1)
     }
 
