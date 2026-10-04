@@ -230,7 +230,9 @@ impl Options {
         if explicit("auth_from")
             && !matches!(
                 matches.get_one::<crate::cli::AuthFrom>("auth_from"),
-                Some(crate::cli::AuthFrom::Return(_))
+                Some(crate::cli::AuthFrom::Provider(
+                    crate::auth_from::Provider::Return(_)
+                ))
             )
         {
             bail!("S3 authorization requires --auth-from @NAME; omit it to use local storage credentials");

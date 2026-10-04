@@ -4,6 +4,7 @@
 mod advanced;
 mod agent_broker;
 mod approval_command;
+mod auth_from;
 mod bwlimit;
 mod cli;
 mod completion;
@@ -36,7 +37,7 @@ mod persistence;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod private_broker;
 mod process;
-mod process_group;
+use process::group as process_group;
 mod progress;
 mod proto;
 #[cfg(target_os = "linux")]
@@ -277,6 +278,18 @@ fn main() {
         std::process::exit(2);
     }
     destination::handoff::record_command_line(&argv);
+    if argv.get(1).and_then(|arg| arg.to_str()) == Some("ssh") {
+        match destination::ssh::run(&argv[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<clap::Error>() {
+                    error.exit();
+                }
+                crate::output::diagnostic!("syq ssh: {error:#}");
+                std::process::exit(255);
+            }
+        }
+    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("exec") {
         match destination::exec::run(&argv[1..]) {
             Ok(code) => std::process::exit(code),
@@ -382,6 +395,10 @@ fn main() {
         return;
     }
     if let Err(error) = persistence::mark_explicit_scope(&mut args) {
+        crate::output::diagnostic!("syq: {error:#}");
+        std::process::exit(2);
+    }
+    if let Err(error) = destination::account_copy::prepare_handoff(&args) {
         crate::output::diagnostic!("syq: {error:#}");
         std::process::exit(2);
     }

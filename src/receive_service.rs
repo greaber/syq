@@ -1,5 +1,8 @@
 //! Background return connections owned by a persistence scope. Settings are
 //! durable; each endpoint's process and advertisement exist only while enabled.
+pub(crate) mod provider;
+
+use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -60,6 +63,14 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 impl Settings {
+    // Notification delivery does not change the authority of a live receiver.
+    // Keep the revision comparison: an intervening access change still revokes
+    // sessions even when the other fields have returned to their old values.
+    fn same_access(&self, other: &Self) -> bool {
+        let mut comparable = self.clone();
+        comparable.notifications = other.notifications;
+        comparable == *other
+    }
     fn allows_server(&self, endpoint: &str) -> bool {
         self.enabled && (self.servers.is_empty() || self.servers.iter().any(|s| s == endpoint))
     }
@@ -83,7 +94,7 @@ impl Settings {
             }
         }
         crate::output::human_stdout!(
-            "servers: {}",
+            "connections: {}",
             if self.servers.is_empty() {
                 "all".into()
             } else {
@@ -140,7 +151,17 @@ enum Action {
         timeout: u64,
     },
     /// Allow one pending request using the ID from persist receive pending
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// Remember this SSH account permission for future receiving connections or provider logins
+        #[arg(long)]
+        remember: bool,
+    },
+    /// List or remove account permissions remembered on this machine
+    Permissions {
+        #[command(subcommand)]
+        action: PermissionAction,
+    },
     /// Deny one pending request using the ID from persist receive pending
     Deny { id: String },
     /// Enable or configure a receiving profile (without --name, use the first profile)
@@ -170,6 +191,17 @@ enum Action {
         timeout: u64,
     },
 }
+#[derive(Subcommand, Debug)]
+enum PermissionAction {
+    /// Show remembered SSH account permissions
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop future authentications; already authenticated sessions may continue
+    Remove { id: String },
+}
+
 #[derive(Args, Default, Debug)]
 struct Configure {
     /// Automatically approve downloads confined to this directory
@@ -178,12 +210,15 @@ struct Configure {
     /// Require approval for every download again
     #[arg(long)]
     no_auto_approve_root: bool,
-    /// Limit this profile to these SSH destinations (repeat to allow several)
-    #[arg(long = "server", conflicts_with = "all_servers")]
-    servers: Vec<String>,
-    /// Make this profile available through every connected server
+    /// Replace the allowed connection list and connect these endpoints now (repeat for several)
+    ///
+    /// Only endpoints supplied in this invocation are connected. Omitting this
+    /// option keeps the saved restriction without dialing dormant endpoints.
+    #[arg(long, value_name = "ENDPOINT", conflicts_with = "all_connections")]
+    connection: Vec<String>,
+    /// Make this profile available through every connected SSH account
     #[arg(long)]
-    all_servers: bool,
+    all_connections: bool,
     /// Show desktop prompts, or use only local pending/approve/deny commands
     #[arg(long = "notify", value_enum)]
     notifications: Option<crate::receive_approval::Notifications>,
@@ -213,13 +248,15 @@ struct Configure {
     max_delete: Option<u64>,
 }
 
-pub(crate) fn config_path() -> Result<PathBuf> {
-    Ok(crate::persistence::config_path()
-        .context("HOME and XDG_CONFIG_HOME are unset")?
-        .with_file_name("receive.json"))
+pub(crate) fn config_path(domain: &Domain) -> Result<PathBuf> {
+    domain.config_file("receive.json")
 }
-fn default_settings() -> Result<Settings> {
-    let cwd = fs::canonicalize(std::env::var_os("HOME").context("HOME is unset")?)?;
+fn default_settings(domain: &Domain) -> Result<Settings> {
+    let cwd = match std::env::var_os("HOME") {
+        Some(home) => fs::canonicalize(home)?,
+        None if !domain.is_default() => std::env::current_dir()?,
+        None => bail!("HOME is unset"),
+    };
     let mut hostname = [0u8; 256];
     if unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), hostname.len()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -241,7 +278,7 @@ fn default_settings() -> Result<Settings> {
     Ok(Settings {
         version: SETTINGS_VERSION,
         revision: 0,
-        enabled: true,
+        enabled: domain.is_default(),
         name,
         cwd,
         cwd_explicit: false,
@@ -255,8 +292,8 @@ fn default_settings() -> Result<Settings> {
         notifications: Default::default(),
     })
 }
-fn preferences() -> Result<Preferences> {
-    let path = config_path()?;
+fn preferences(domain: &Domain) -> Result<Preferences> {
+    let path = config_path(domain)?;
     let bytes =
         match crate::delegation::read_private_regular(&path, "receive preferences", 512 * 1024) {
             Ok(bytes) => bytes,
@@ -268,7 +305,7 @@ fn preferences() -> Result<Preferences> {
             {
                 return Ok(Preferences {
                     version: PREFERENCES_VERSION,
-                    profiles: vec![default_settings()?],
+                    profiles: vec![default_settings(domain)?],
                 });
             }
             Err(error) => return Err(error),
@@ -326,8 +363,8 @@ fn validate_preferences(preferences: &Preferences) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn enabled_servers() -> Result<Vec<Vec<String>>> {
-    Ok(preferences()?
+pub(crate) fn enabled_servers(domain: &Domain) -> Result<Vec<Vec<String>>> {
+    Ok(preferences(domain)?
         .profiles
         .into_iter()
         .filter(|p| p.enabled)
@@ -366,7 +403,7 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     }
     for server in &settings.servers {
         if server.is_empty() || server.starts_with('-') || server.chars().any(char::is_whitespace) {
-            bail!("--server must name an SSH connection destination");
+            bail!("--connection must name an SSH connection destination");
         }
     }
     if settings.max_bytes == 0
@@ -378,15 +415,27 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     }
     Ok(())
 }
-fn save_settings(settings: &Preferences) -> Result<()> {
+fn save_settings(domain: &Domain, settings: &Preferences) -> Result<()> {
     validate_preferences(settings)?;
-    let path = config_path()?;
-    fs::create_dir_all(path.parent().unwrap())?;
+    let path = config_path(domain)?;
+    if domain.is_default() {
+        fs::create_dir_all(path.parent().unwrap())?;
+    }
     atomic_json(&path, settings)
 }
-fn settings_lock() -> Result<File> {
-    let path = config_path()?.with_file_name("receive.lock");
-    fs::create_dir_all(path.parent().unwrap())?;
+struct SettingsLock(File);
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        // A parallel fork retains the same open file description until exec.
+        // Release writer ownership now, even if that temporary copy survives.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+fn settings_lock(domain: &Domain) -> Result<SettingsLock> {
+    let path = config_path(domain)?.with_file_name("receive.lock");
+    if domain.is_default() {
+        fs::create_dir_all(path.parent().unwrap())?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -402,10 +451,10 @@ fn settings_lock() -> Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("receive preferences are being changed; retry shortly");
     }
-    Ok(file)
+    Ok(SettingsLock(file))
 }
-fn current_settings_exist() -> Result<bool> {
-    let path = config_path()?;
+fn current_settings_exist(domain: &Domain) -> Result<bool> {
+    let path = config_path(domain)?;
     match crate::delegation::read_private_regular(&path, "receive preferences", 512 * 1024) {
         Ok(bytes) => Ok(
             serde_json::from_slice::<serde_json::Value>(&bytes)?["version"] == PREFERENCES_VERSION,
@@ -421,16 +470,16 @@ fn current_settings_exist() -> Result<bool> {
         Err(error) => Err(error),
     }
 }
-fn ensure_current_settings() -> Result<Preferences> {
-    if current_settings_exist()? {
-        return preferences();
+fn ensure_current_settings(domain: &Domain) -> Result<Preferences> {
+    if current_settings_exist(domain)? {
+        return preferences(domain);
     }
-    let _lock = settings_lock()?;
+    let _lock = settings_lock(domain)?;
     // Re-read under the writer lock. A concurrent receiving command may have already
     // changed policy; initialization must never overwrite that newer choice.
-    let config = preferences()?;
-    if !current_settings_exist()? {
-        atomic_json(&config_path()?, &config)?;
+    let config = preferences(domain)?;
+    if !current_settings_exist(domain)? {
+        atomic_json(&config_path(domain)?, &config)?;
     }
     Ok(config)
 }
@@ -519,6 +568,8 @@ struct Decision {
         skip_serializing_if = "crate::receive_approval::Kind::is_copy"
     )]
     kind: crate::receive_approval::Kind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    remember: bool,
 }
 fn status(control: &Path, stop: bool) -> Result<Status> {
     query(control, stop, None)
@@ -600,8 +651,8 @@ fn read_spec(control: &Path) -> Result<ServiceSpec> {
 
 /// Called after a successful ordinary persistent SSH control connection. A
 /// failed return setup is visible but does not invalidate that ordinary copy.
-pub(crate) fn ensure(control: &Path, remote: &crate::conn::RemoteSpec) {
-    if let Err(error) = ensure_inner(control, remote) {
+pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) {
+    if let Err(error) = ensure_inner(domain, control, remote) {
         crate::output::diagnostic!(
             "syq: background receiving through {}: {error:#}",
             remote.label()
@@ -610,11 +661,12 @@ pub(crate) fn ensure(control: &Path, remote: &crate::conn::RemoteSpec) {
 }
 /// Return readiness for one owned endpoint; do not restart a healthy service.
 pub(crate) fn ensure_ready(
+    domain: &Domain,
     control: &Path,
     remote: &crate::conn::RemoteSpec,
     timeout: Duration,
 ) -> Result<Option<Vec<String>>> {
-    if !ensure_inner(control, remote)? {
+    if !ensure_inner(domain, control, remote)? {
         return Ok(None);
     }
     let deadline = Instant::now() + timeout;
@@ -684,25 +736,27 @@ pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
             .collect(),
     })
 }
-pub(crate) fn profile_names() -> Vec<String> {
-    preferences()
+pub(crate) fn profile_names(domain: &Domain) -> Vec<String> {
+    preferences(domain)
         .map(|p| p.profiles.into_iter().map(|p| p.name).collect())
         .unwrap_or_default()
 }
 
-fn ensure_inner(control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
+fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpec) -> Result<bool> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
-    // Ephemeral scopes only reuse forward SSH connections. Do not read or
-    // create receiving preferences for them.
-    if !crate::persistence::is_global_scope(scope)? || !crate::persistence::global_enabled()? {
+    anyhow::ensure!(
+        Domain::select(Some(scope))? == *domain,
+        "receiving control belongs to a different persistence domain"
+    );
+    if !domain.enabled()? {
         return Ok(false);
     }
     if scope.join(CLOSING).exists() {
         bail!("persistence scope is closing");
     }
     // Persist current preferences before reuse so older binaries cannot weaken policy.
-    let config = ensure_current_settings()?;
+    let config = ensure_current_settings(domain)?;
     let allowed = config
         .profiles
         .iter()
@@ -835,9 +889,10 @@ struct ProfileWorker {
     _worker: Worker,
 }
 impl ProfileWorker {
-    fn new(config: Settings, spec: ServiceSpec) -> Self {
+    fn new(domain: &Domain, config: Settings, spec: ServiceSpec) -> Self {
         let state = Arc::new(Mutex::new(ConnectionState::default()));
-        let approvals = Arc::new(crate::receive_approval::Queue::default());
+        let approvals = Arc::new(crate::receive_approval::Queue::new(domain.clone()));
+        approvals.set_notifications(config.notifications);
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_state, thread_approvals, thread_stop, thread_config) = (
             state.clone(),
@@ -888,17 +943,21 @@ impl ProfileWorker {
     }
 }
 fn reconcile(
+    domain: &Domain,
     workers: &mut Vec<ProfileWorker>,
     config: &Preferences,
     spec: &ServiceSpec,
     retry: bool,
 ) {
-    workers.retain(|worker| {
-        config
-            .profiles
-            .iter()
-            .any(|p| p.allows_server(&spec.endpoint.label()) && p == &worker.config)
-            && !(retry && worker.state.lock().unwrap().phase == "failed")
+    workers.retain_mut(|worker| {
+        let Some(profile) = config.profiles.iter().find(|profile| {
+            profile.allows_server(&spec.endpoint.label()) && profile.same_access(&worker.config)
+        }) else {
+            return false;
+        };
+        worker.approvals.set_notifications(profile.notifications);
+        worker.config = profile.clone();
+        !(retry && worker.state.lock().unwrap().phase == "failed")
     });
     for profile in config
         .profiles
@@ -906,7 +965,7 @@ fn reconcile(
         .filter(|p| p.allows_server(&spec.endpoint.label()))
     {
         if !workers.iter().any(|w| w.config.name == profile.name) {
-            workers.push(ProfileWorker::new(profile.clone(), spec.clone()));
+            workers.push(ProfileWorker::new(domain, profile.clone(), spec.clone()));
         }
     }
 }
@@ -930,8 +989,13 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
 }
 // Wait until each live supervisor has revoked changed/removed profiles. Healthy
 // workers remain in the same process, preserving streams and pending approvals.
-fn apply_preferences(config: &Preferences) -> Result<()> {
-    for control in all_controls()? {
+fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
+    if config.enabled() {
+        provider::refresh(domain)?;
+    } else {
+        provider::stop(domain)?;
+    }
+    for control in all_controls(domain)? {
         if !config.enabled() {
             stop_inner(&control, false)?;
             continue;
@@ -944,8 +1008,12 @@ fn apply_preferences(config: &Preferences) -> Result<()> {
         }
         if !is_running(&control)
             && config.enabled()
-            && crate::persistence::global_enabled()?
+            && domain.enabled()?
             && read_spec(&control).is_ok()
+            // A saved endpoint record is not a request to reconnect it. Only
+            // attach receiving to a master that is already running; explicit
+            // --connection endpoints are connected separately by configure.
+            && crate::persistence::socket_is_ready(&control).unwrap_or(false)
         {
             spawn(&control)?;
         }
@@ -986,16 +1054,20 @@ fn read_control_request(client: &mut UnixStream) -> Result<LocalRequest> {
     crate::destination::read_socket_message(client, Duration::from_millis(200))
 }
 
-fn run(control: &Path) -> Result<()> {
+fn run(domain: &Domain, control: &Path) -> Result<()> {
     let scope = control.parent().context("persistence scope missing")?;
     crate::persistence::validate_scope(scope)?;
-    if scope.join(CLOSING).exists() || !crate::persistence::is_global_scope(scope)? {
+    anyhow::ensure!(
+        Domain::select(Some(scope))? == *domain,
+        "receiving control belongs to a different persistence domain"
+    );
+    if scope.join(CLOSING).exists() || !domain.enabled()? {
         return Ok(());
     }
     let Some(_lock) = try_lock(control, true)? else {
         return Ok(());
     };
-    if scope.join(CLOSING).exists() || !preferences()?.enabled() {
+    if scope.join(CLOSING).exists() || !preferences(domain)?.enabled() {
         return Ok(());
     }
     let spec = read_spec(control)?;
@@ -1017,22 +1089,27 @@ fn run(control: &Path) -> Result<()> {
         identity: (meta.dev(), meta.ino()),
     };
     let shutdown = Arc::new(AtomicBool::new(false));
-    let sigint = signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone())?;
-    let sigterm = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())?;
+    let _signals = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
+        let mut registrations = crate::process::signals::Registrations::default();
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            registrations.push(signal_hook::flag::register(signal, shutdown.clone())?);
+        }
+        Ok(registrations)
+    })?;
     let result = (|| {
         let mut workers = Vec::<ProfileWorker>::new();
-        let mut config = preferences()?;
+        let mut config = preferences(domain)?;
         let mut last_check = Instant::now() - Duration::from_secs(1);
         while !shutdown.load(Ordering::Acquire) {
             if !fs::metadata(scope).is_ok_and(|m| (m.dev(), m.ino()) == scope_identity)
                 || scope.join(CLOSING).exists()
-                || !crate::persistence::global_enabled()?
+                || !domain.enabled()?
             {
                 break;
             }
             if last_check.elapsed() >= Duration::from_millis(200) {
-                config = preferences()?;
-                reconcile(&mut workers, &config, &spec, false);
+                config = preferences(domain)?;
+                reconcile(domain, &mut workers, &config, &spec, false);
                 last_check = Instant::now();
             }
             match listener.accept() {
@@ -1045,7 +1122,7 @@ fn run(control: &Path) -> Result<()> {
                                 shutdown.store(true, Ordering::Release);
                             }
                             if request.retry {
-                                reconcile(&mut workers, &config, &spec, true);
+                                reconcile(domain, &mut workers, &config, &spec, true);
                             }
                             let decision_error = request.decision.and_then(|decision| {
                                 workers
@@ -1055,10 +1132,11 @@ fn run(control: &Path) -> Result<()> {
                                     })
                                     .context("approval is unknown, expired, or already answered")
                                     .and_then(|w| {
-                                        w.approvals.decide(
+                                        w.approvals.decide_with_remember(
                                             &decision.id,
                                             decision.allow,
                                             decision.kind,
+                                            decision.remember,
                                         )
                                     })
                                     .err()
@@ -1091,16 +1169,14 @@ fn run(control: &Path) -> Result<()> {
         drop(workers);
         Ok(())
     })();
-    signal_hook::low_level::unregister(sigint);
-    signal_hook::low_level::unregister(sigterm);
     result
 }
 
-fn all_controls() -> Result<Vec<PathBuf>> {
-    crate::persistence::receiving_controls()
+fn all_controls(domain: &Domain) -> Result<Vec<PathBuf>> {
+    crate::persistence::receiving_controls(domain)
 }
-fn statuses() -> Result<Vec<Status>> {
-    Ok(all_controls()?
+fn statuses(domain: &Domain) -> Result<Vec<Status>> {
+    Ok(all_controls(domain)?
         .into_iter()
         .filter_map(|control| {
             status(&control, false).ok().or_else(|| {
@@ -1124,16 +1200,17 @@ fn statuses() -> Result<Vec<Status>> {
         })
         .collect())
 }
-fn configure(options: Configure) -> Result<()> {
-    let _lock = settings_lock()?;
-    let existed = config_path()?.exists();
-    let mut preferences = preferences()?;
+fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
+    let _lock = settings_lock(domain)?;
+    let existed = config_path(domain)?.exists();
+    let mut preferences = preferences(domain)?;
+    let previous_preferences = preferences.clone();
     let index = if let Some(name) = options.name.as_deref() {
         crate::destination::validate_name(name)?;
         match preferences.profiles.iter().position(|p| p.name == name) {
             Some(index) => index,
             None => {
-                let mut profile = default_settings()?;
+                let mut profile = default_settings(domain)?;
                 profile.name = name.into();
                 if !existed {
                     preferences.profiles.clear();
@@ -1146,11 +1223,8 @@ fn configure(options: Configure) -> Result<()> {
         0
     };
     let config = &mut preferences.profiles[index];
+    let previous = config.clone();
     config.enabled = true;
-    config.revision = config
-        .revision
-        .checked_add(1)
-        .context("receiving profile revision exhausted")?;
     if let Some(notifications) = options.notifications {
         config.notifications = notifications;
     }
@@ -1185,10 +1259,10 @@ fn configure(options: Configure) -> Result<()> {
     if options.no_auto_approve_root {
         config.auto_approve_root = None;
     }
-    if !options.servers.is_empty() {
-        config.servers = options.servers;
+    if !options.connection.is_empty() {
+        config.servers = options.connection;
     }
-    if options.all_servers {
+    if options.all_connections {
         config.servers.clear();
     }
     if !config.cwd_explicit {
@@ -1206,27 +1280,68 @@ fn configure(options: Configure) -> Result<()> {
     if let Some(deletions) = options.max_delete {
         config.max_delete = deletions;
     }
+    if !config.same_access(&previous) {
+        config.revision = config
+            .revision
+            .checked_add(1)
+            .context("receiving profile revision exhausted")?;
+    }
     let config = config.clone();
-    save_settings(&preferences)?;
-    apply_preferences(&preferences)?;
+    // Repeated on is a no-op for current settings, but an old format must
+    // still migrate before receiving starts (including its approval policy).
+    if preferences != previous_preferences || !current_settings_exist(domain)? {
+        save_settings(domain, &preferences)?;
+    }
+    drop(_lock);
+    domain.enable()?;
+    apply_preferences(domain, &preferences)?;
+    Ok(config)
+}
+fn configure(domain: &Domain, options: Configure) -> Result<()> {
+    let connections = options.connection.clone();
+    let config = configure_profile(domain, options)?;
+    provider::ensure(domain)?;
+    let mut failures = Vec::new();
+    for endpoint in &connections {
+        if let Err(error) = crate::persistence::connect_domain(
+            domain,
+            endpoint,
+            None,
+            false,
+            Duration::from_secs(30),
+        ) {
+            failures.push(format!("{endpoint}: {error:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "receiving settings saved, but some connections are not ready: {}",
+            failures.join("; ")
+        );
+    }
     crate::output::human_stdout!("Receiving is on: {}", config.name);
     config.print_paths();
-    crate::output::human_stdout!(
-        "Applies to persistent syq SSH connections; use syq persist on to enable persistence."
-    );
     Ok(())
 }
-fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
+fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> {
     if timeout == 0 || timeout > 3600 {
         bail!("timeout must be between 1 and 3600 seconds");
     }
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut progress = Instant::now();
     loop {
-        let requests: Vec<_> = statuses()?
+        let mut requests: Vec<_> = statuses(domain)?
             .into_iter()
             .flat_map(|status| status.pending)
             .collect();
+        if let Some(provider) = provider::snapshot(domain)? {
+            requests.extend(
+                provider
+                    .profiles
+                    .into_iter()
+                    .flat_map(|profile| profile.pending),
+            );
+        }
         if !wait || !requests.is_empty() {
             if json {
                 println!("{}", serde_json::to_string(&requests)?);
@@ -1240,7 +1355,7 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
                     crate::output::human_stdout!(
                         "{}\n{}\nNotification: {}\n",
                         request.id,
-                        request.description(|word| if terminal {
+                        request.description(domain, |word| if terminal {
                             format!("\x1b[2m{word}\x1b[0m")
                         } else {
                             word.to_owned()
@@ -1261,15 +1376,16 @@ fn pending(json: bool, wait: bool, timeout: u64) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
-fn decide(id: &str, allow: bool) -> Result<()> {
+fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> {
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("use the complete request ID from syq persist receive pending");
     }
-    for control in all_controls()? {
+    for control in all_controls(domain)? {
         let Ok(state) = status(&control, false) else {
             continue;
         };
         if let Some(request) = state.pending.iter().find(|request| request.id == id) {
+            anyhow::ensure!(!remember || (allow && request.can_remember()), "--remember applies only to SSH account requests that support remembering; update syq and reconnect receiving if needed");
             let response = query(
                 &control,
                 false,
@@ -1277,12 +1393,55 @@ fn decide(id: &str, allow: bool) -> Result<()> {
                     id: id.into(),
                     allow,
                     kind: request.kind(),
+                    remember,
                 }),
             )?;
             if let Some(error) = response.decision_error {
                 bail!("{error}");
             }
-            crate::output::human_stdout!("{} {id}", if allow { "Approved" } else { "Denied" });
+            crate::output::human_stdout!(
+                "{} {id}",
+                if remember {
+                    "Approved and remembered"
+                } else if allow {
+                    "Approved"
+                } else {
+                    "Denied"
+                }
+            );
+            return Ok(());
+        }
+    }
+    if let Some(provider) = provider::snapshot(domain)? {
+        if let Some(request) = provider
+            .profiles
+            .iter()
+            .flat_map(|profile| &profile.pending)
+            .find(|request| request.id == id)
+        {
+            anyhow::ensure!(
+                !remember || (allow && request.can_remember()),
+                "--remember applies only to SSH account requests that support remembering"
+            );
+            provider::decide(
+                domain,
+                Decision {
+                    id: id.into(),
+                    allow,
+                    kind: request.kind(),
+                    remember,
+                },
+            )?;
+            crate::output::human_stdout!(
+                "{} {id}",
+                if remember {
+                    "Approved and remembered"
+                } else if allow {
+                    "Approved"
+                } else {
+                    "Denied"
+                }
+            );
             return Ok(());
         }
     }
@@ -1290,32 +1449,93 @@ fn decide(id: &str, allow: bool) -> Result<()> {
 }
 
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if let Some(result) = provider::dispatch(argv) {
+        return Some(result);
+    }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--receive-service" => Some((|| {
             if argv.len() != 3 {
                 bail!("receive service needs its control path");
             }
             crate::fsops::reserve_startup_descriptors();
-            run(Path::new(&argv[2]))?;
+            let control = Path::new(&argv[2]);
+            let domain =
+                Domain::select(Some(control.parent().context("persistence scope missing")?))?;
+            run(&domain, control)?;
             Ok(0)
         })()),
         _ => None,
     }
 }
 
-pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
+pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i32> {
     match command.action {
-        Action::On(options) => configure(options)?,
+        Action::On(options) => configure(domain, options)?,
         Action::Pending {
             json,
             wait,
             timeout,
-        } => pending(json, wait, timeout)?,
-        Action::Approve { id } => decide(&id, true)?,
-        Action::Deny { id } => decide(&id, false)?,
+        } => pending(domain, json, wait, timeout)?,
+        Action::Approve { id, remember } => decide(domain, &id, true, remember)?,
+        Action::Deny { id } => decide(domain, &id, false, false)?,
+        Action::Permissions { action } => match action {
+            PermissionAction::List { json } => {
+                let permissions = crate::receive_approval::accounts::list(domain)?;
+                let provider_permissions =
+                    crate::receive_approval::provider_accounts::list(domain)?;
+                if json {
+                    // Existing return-permission rows retain their exact shape.
+                    let mut rows: Vec<_> = permissions
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<std::result::Result<_, _>>()?;
+                    rows.extend(
+                        provider_permissions
+                            .iter()
+                            .map(serde_json::to_value)
+                            .collect::<std::result::Result<Vec<_>, _>>()?,
+                    );
+                    println!("{}", serde_json::to_string(&rows)?);
+                } else if permissions.is_empty() && provider_permissions.is_empty() {
+                    crate::output::human_stdout!("No remembered account permissions");
+                } else {
+                    for item in permissions {
+                        crate::output::human_stdout!(
+                            "{}  {} -> {} (receiving profile @{})",
+                            item.id,
+                            item.permission.source.label(),
+                            item.permission.destination.label(),
+                            item.permission.profile
+                        );
+                    }
+                    for item in provider_permissions {
+                        crate::output::human_stdout!(
+                            "{}  {} -> {} (provider profile {})",
+                            item.id,
+                            item.permission.provider.label(),
+                            item.permission.destination.label(),
+                            item.permission.profile
+                        );
+                    }
+                }
+            }
+            PermissionAction::Remove { id } => {
+                // Validate both stores; never hide corrupt authority state while removing a grant.
+                crate::receive_approval::accounts::list(domain)?;
+                let provider_permissions =
+                    crate::receive_approval::provider_accounts::list(domain)?;
+                if provider_permissions.iter().any(|item| item.id == id) {
+                    crate::receive_approval::provider_accounts::remove(domain, &id)?;
+                } else {
+                    // Keep the original store's ID validation and not-found diagnostic.
+                    crate::receive_approval::accounts::remove(domain, &id)?;
+                }
+                crate::output::human_stdout!("Removed {id}; future authentications require approval. Already authenticated sessions may continue.");
+            }
+        },
         Action::Off { name } => {
-            let _lock = settings_lock()?;
-            let mut config = preferences()?;
+            let _lock = settings_lock(domain)?;
+            let mut config = preferences(domain)?;
             if let Some(name) = name {
                 let index = config.selected(Some(&name))?;
                 config.profiles[index].enabled = false;
@@ -1324,15 +1544,15 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                     profile.enabled = false;
                 }
             }
-            save_settings(&config)?;
-            apply_preferences(&config)?;
+            save_settings(domain, &config)?;
+            apply_preferences(domain, &config)?;
             crate::output::human_stdout!(
                 "Selected receiving profiles are off; ordinary SSH persistence is unchanged"
             );
         }
         Action::Remove { name } => {
-            let _lock = settings_lock()?;
-            let mut config = preferences()?;
+            let _lock = settings_lock(domain)?;
+            let mut config = preferences(domain)?;
             let index = config.selected(Some(&name))?;
             if config.profiles.len() == 1 {
                 bail!(
@@ -1340,16 +1560,22 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                 );
             }
             config.profiles.remove(index);
-            save_settings(&config)?;
-            apply_preferences(&config)?;
+            save_settings(domain, &config)?;
+            apply_preferences(domain, &config)?;
             crate::output::human_stdout!("Removed receiving profile {name}");
         }
         Action::Status { json, name } => {
-            let config = preferences()?;
+            let config = preferences(domain)?;
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;
             }
-            let mut connections = statuses()?;
+            let mut connections = statuses(domain)?;
+            let mut local_provider = provider::snapshot(domain)?;
+            if let (Some(provider), Some(name)) = (&mut local_provider, &name) {
+                provider
+                    .profiles
+                    .retain(|profile| &profile.settings.name == name);
+            }
             if let Some(name) = name.as_ref() {
                 connections.retain_mut(|s| {
                     if s.profiles.is_empty() {
@@ -1374,7 +1600,7 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                 println!(
                     "{}",
                     serde_json::to_string(
-                        &serde_json::json!({ "settings": selected[0], "profiles": selected, "connections": connections })
+                        &serde_json::json!({ "settings": selected[0], "profiles": selected, "connections": connections, "provider": local_provider })
                     )?
                 );
             } else {
@@ -1385,6 +1611,16 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
                         config.name
                     );
                     config.print_paths();
+                }
+                if let Some(provider) = local_provider {
+                    for profile in provider.profiles {
+                        crate::output::human_stdout!(
+                            "  local SSH provider {}: {} sessions ({} pending)",
+                            profile.settings.name,
+                            profile.sessions,
+                            profile.pending.len()
+                        );
+                    }
                 }
                 for state in connections {
                     if state.profiles.is_empty() {
@@ -1427,7 +1663,7 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             name,
             timeout,
         } => {
-            let config = preferences()?;
+            let config = preferences(domain)?;
             if let Some(name) = name.as_deref() {
                 config.selected(Some(name))?;
             }
@@ -1446,7 +1682,7 @@ pub(crate) fn run_command(command: ReceiveCommand) -> Result<i32> {
             let deadline = Instant::now() + Duration::from_secs(timeout);
             let mut progress = Instant::now();
             loop {
-                let states: Vec<_> = statuses()?
+                let states: Vec<_> = statuses(domain)?
                     .into_iter()
                     .filter(|s| s.endpoint == host)
                     .collect();
@@ -1495,7 +1731,7 @@ mod tests {
 
     #[test]
     fn profile_server_scope_matches_only_the_locally_selected_endpoint() {
-        let mut settings = default_settings().unwrap();
+        let mut settings = default_settings(&Domain::default()).unwrap();
         assert!(settings.allows_server("work"));
         settings.servers = vec!["work".into(), "alice@lab:2222".into()];
         assert!(settings.allows_server("work"));
@@ -1505,6 +1741,225 @@ mod tests {
         }
         settings.enabled = false;
         assert!(!settings.allows_server("work"));
+    }
+
+    #[test]
+    fn notification_refresh_preserves_worker_and_access_changes_revoke_it() {
+        let mut settings = default_settings(&Domain::default()).unwrap();
+        settings.notifications = crate::receive_approval::Notifications::Desktop;
+        let approvals = Arc::new(crate::receive_approval::Queue::default());
+        approvals.set_notifications(settings.notifications);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = vec![ProfileWorker {
+            config: settings.clone(),
+            state: Arc::new(Mutex::new(ConnectionState {
+                phase: "online".into(),
+                error: None,
+                ssh_pid: Some(42),
+            })),
+            approvals: approvals.clone(),
+            _worker: Worker {
+                stop: stop.clone(),
+                thread: None,
+            },
+        }];
+        let spec = ServiceSpec {
+            version: VERSION,
+            identity: crate::identity::build().into(),
+            endpoint: crate::persistence::EndpointRecord {
+                user: None,
+                host: "work".into(),
+                port: None,
+                ssh_options: Vec::new(),
+                ssh_options_directory: None,
+            },
+            program: "syq".into(),
+        };
+        settings.notifications = crate::receive_approval::Notifications::Off;
+        let mut config = Preferences {
+            version: PREFERENCES_VERSION,
+            profiles: vec![settings],
+        };
+        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        assert_eq!(workers.len(), 1);
+        assert!(Arc::ptr_eq(&workers[0].approvals, &approvals));
+        assert!(!stop.load(Ordering::Acquire));
+        assert_eq!(workers[0].snapshot().connection.ssh_pid, Some(42));
+        assert_eq!(
+            workers[0].snapshot().settings.notifications,
+            crate::receive_approval::Notifications::Off
+        );
+        assert_eq!(
+            approvals.notifications(crate::receive_approval::Notifications::Desktop),
+            crate::receive_approval::Notifications::Off
+        );
+
+        // Access changes still remove the old worker, including its authority.
+        config.profiles[0].servers = vec!["other".into()];
+        reconcile(&Domain::default(), &mut workers, &config, &spec, false);
+        assert!(workers.is_empty());
+        assert!(stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dormant_master_and_full_queue_do_not_block_preference_changes() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("master");
+        assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        let listen = || {
+            let listener =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            listener
+                .bind(&socket2::SockAddr::unix(&path).unwrap())
+                .unwrap();
+            listener.listen(1).unwrap();
+            listener
+        };
+        let listener = listen();
+        assert!(crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        let listener = listen();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut clients = Vec::new();
+        let mut full = false;
+        for _ in 0..128 {
+            let client =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            client.set_nonblocking(true).unwrap();
+            match client.connect(&socket2::SockAddr::unix(&path).unwrap()) {
+                Ok(()) => clients.push(client),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionRefused
+                    ) || error.raw_os_error() == Some(libc::EINPROGRESS) =>
+                {
+                    full = true;
+                    break;
+                }
+                other => panic!("unexpected local socket connect: {other:?}"),
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert!(full, "local listen queue did not fill");
+        assert!(!clients.is_empty());
+        // Retain queued clients so Darwin and Linux exercise the same actual
+        // saturation. Darwin may report refused rather than WouldBlock.
+        assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        assert!(Instant::now() < deadline);
+        drop(listener);
+        assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        drop(clients);
+    }
+
+    #[test]
+    fn receiving_writer_unlocks_while_an_inherited_description_remains_open() {
+        // A short basename leaves room for the domain's OpenSSH control suffix
+        // under Darwin's ambient temporary directory.
+        let temporary = tempfile::Builder::new()
+            .prefix("")
+            .tempdir_in(crate::test_support::temp_dir())
+            .unwrap();
+        crate::persistence::initialize_scope(temporary.path()).unwrap();
+        let domain = Domain::select(Some(temporary.path())).unwrap();
+        let writer = settings_lock(&domain).unwrap();
+        // dup and fork share the open file description that owns flock. This
+        // deterministically models another test between fork and close-on-exec.
+        let inherited = writer.0.try_clone().unwrap();
+        let error = settings_lock(&domain)
+            .err()
+            .expect("an active writer must still exclude a second writer");
+        assert!(error.to_string().contains("preferences are being changed"));
+        drop(writer);
+        let next = settings_lock(&domain)
+            .expect("a finished writer must release ownership before inherited copies close");
+        assert!(inherited.metadata().is_ok());
+        assert!(
+            settings_lock(&domain).is_err(),
+            "the next writer still owns the lock"
+        );
+        drop(inherited);
+        assert!(
+            settings_lock(&domain).is_err(),
+            "closing an old copy must not unlock a new writer"
+        );
+        drop(next);
+        assert!(settings_lock(&domain).is_ok());
+    }
+
+    #[test]
+    fn receiving_domains_have_fresh_disabled_and_independent_profiles() {
+        // Socket paths must fit even when the platform's ambient TMPDIR is long.
+        let root = std::fs::canonicalize("/tmp").unwrap();
+        let temporary = tempfile::tempdir_in(root).unwrap();
+        let first_path = temporary.path().join("first");
+        let second_path = temporary.path().join("second");
+        for path in [&first_path, &second_path] {
+            crate::persistence::initialize_scope(path).unwrap();
+        }
+        let first = Domain::select(Some(&first_path)).unwrap();
+        let second = Domain::select(Some(&second_path)).unwrap();
+        assert!(!preferences(&first).unwrap().enabled());
+        assert!(!preferences(&second).unwrap().enabled());
+        assert!(!config_path(&first).unwrap().exists());
+        assert!(!config_path(&second).unwrap().exists());
+        assert!(default_settings(&Domain::default()).unwrap().enabled);
+
+        configure_profile(
+            &first,
+            Configure {
+                name: Some("first-inbox".into()),
+                cwd: Some(temporary.path().to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(profile_names(&first), vec!["first-inbox"]);
+        assert!(preferences(&first).unwrap().enabled());
+        assert!(!preferences(&second).unwrap().enabled());
+        let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
+        let before = preferences(&first).unwrap().profiles.remove(0);
+        configure_profile(&first, Configure::default()).unwrap();
+        assert_eq!(fs::read(config_path(&first).unwrap()).unwrap(), first_bytes);
+        let notified = configure_profile(
+            &first,
+            Configure {
+                notifications: Some(crate::receive_approval::Notifications::Off),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(notified.revision, before.revision);
+        let changed = configure_profile(
+            &first,
+            Configure {
+                max_entries: Some(before.max_entries - 1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(changed.revision, before.revision + 1);
+        let first_bytes = fs::read(config_path(&first).unwrap()).unwrap();
+        configure_profile(
+            &second,
+            Configure {
+                name: Some("second-inbox".into()),
+                cwd: Some(temporary.path().to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        run_command(
+            &second,
+            ReceiveCommand {
+                action: Action::Off { name: None },
+            },
+        )
+        .unwrap();
+        assert!(!preferences(&second).unwrap().enabled());
+        assert_eq!(fs::read(config_path(&first).unwrap()).unwrap(), first_bytes);
+        assert_eq!(profile_names(&second), vec!["second-inbox"]);
     }
 
     #[test]
@@ -1568,6 +2023,58 @@ mod tests {
             crate::receive_approval::Kind::Copy
         );
         assert_eq!(serde_json::to_string(&request).unwrap(), old);
+    }
+
+    #[test]
+    fn ordinary_ssh_decision_bytes_are_unchanged_and_remember_is_explicit() {
+        let old =
+            r#"{"version":2,"stop":false,"decision":{"id":"fixture","allow":true,"kind":"ssh"}}"#;
+        let mut request: LocalRequest = serde_json::from_str(old).unwrap();
+        assert!(!request.decision.as_ref().unwrap().remember);
+        assert_eq!(serde_json::to_string(&request).unwrap(), old);
+        request.decision.as_mut().unwrap().remember = true;
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["decision"]["remember"],
+            true
+        );
+    }
+
+    #[test]
+    fn remembered_permissions_have_local_cli_management() {
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "approve", "request"])
+                .unwrap()
+                .action,
+            Action::Approve {
+                remember: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "approve", "request", "--remember"])
+                .unwrap()
+                .action,
+            Action::Approve { remember: true, .. }
+        ));
+        assert!(
+            ReceiveCommand::try_parse_from(["receive", "deny", "request", "--remember"]).is_err()
+        );
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "permissions", "list", "--json"])
+                .unwrap()
+                .action,
+            Action::Permissions {
+                action: PermissionAction::List { json: true }
+            }
+        ));
+        assert!(matches!(
+            ReceiveCommand::try_parse_from(["receive", "permissions", "remove", "id"])
+                .unwrap()
+                .action,
+            Action::Permissions {
+                action: PermissionAction::Remove { .. }
+            }
+        ));
     }
 
     #[test]

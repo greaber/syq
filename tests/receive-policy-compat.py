@@ -17,6 +17,7 @@ with tempfile.TemporaryDirectory(prefix="syq-policy-compat-") as temporary:
     home = Path(temporary)
     inbox = home / "inbox"
     inbox.mkdir()
+    (home / "runtime").mkdir()
     env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                XDG_RUNTIME_DIR=str(home / "runtime"), SYQ_NO_UPDATE_CHECK="1")
 
@@ -40,7 +41,16 @@ with tempfile.TemporaryDirectory(prefix="syq-policy-compat-") as temporary:
     assert upgraded["max_entries"] == 123
     assert "approval" not in upgraded
     assert path.read_bytes() == original  # Read-only status does not migrate on disk.
-    run(candidate, "on", "--auto-approve-root", str(inbox), "--server", "work")
+    # The candidate now starts explicitly configured connections. Reject SSH
+    # locally so this state-format check stays independent of network access.
+    bindir = home / "bin"
+    bindir.mkdir()
+    ssh = bindir / "ssh"
+    ssh.write_text('#!/bin/sh\nif [ "$1" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho fixture connection unavailable >&2\nexit 42\n')
+    ssh.chmod(0o700)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    failed = run(candidate, "on", "--auto-approve-root", str(inbox), "--connection", "work", success=False)
+    assert "receiving settings saved" in failed.stderr, failed
     saved = path.read_bytes()
     assert json.loads(saved)["version"] == 5
     for args in [("status", "--json"), ("on", "--approve", "always")]:

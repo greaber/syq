@@ -233,6 +233,37 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
 }
 
 #[test]
+fn configuration_failure_keeps_ssh_error_without_debug_trace() {
+    let root = crate::test_support::tempdir().unwrap();
+    let ssh = root.path().join("ssh");
+    // Write in a child so parallel test forks cannot inherit an executable's
+    // writable descriptor and cause ETXTBSY when this fixture is launched.
+    let written = Command::new("sh")
+        .args([
+            "-c",
+            "printf '%s' \"$1\" > \"$2\"",
+            "write-ssh",
+            "#!/bin/sh\nprintf '%s\n' 'debug1: Reading configuration data /private/config' 'debug2: checking match' '/private/config line 7: Bad configuration option: misspelled' 'debug3: final pass' >&2\nexit 255\n",
+        ])
+        .arg(&ssh)
+        .capture_output()
+        .unwrap();
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = inspect_ssh_configuration(ssh.to_str().unwrap(), None, "host.invalid", false)
+        .err()
+        .expect("configuration failure");
+    assert_eq!(
+        error.to_string(),
+        "could not inspect SSH configuration for host.invalid: /private/config line 7: Bad configuration option: misspelled"
+    );
+}
+
+#[test]
 fn configured_known_hosts_provenance_uses_files_openssh_read() {
     let temp = crate::test_support::tempdir().unwrap();
     let config = temp.path().join("ssh_config");
@@ -288,6 +319,49 @@ fn openssh_quoted_default_collision_is_rejected_end_to_end() {
 }
 
 #[test]
+fn unrelated_literal_known_hosts_options_preserve_real_default_lists() {
+    let defaults_output = inspect_ssh_configuration("ssh", None, "unused.example", true).unwrap();
+    let defaults = KnownHostsDefaults::from_openssh(&defaults_output.output).unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
+    let config = temp.path().join("ssh_config");
+    std::fs::write(&config, b"Host unrelated.example\n  UserKnownHostsFile /tmp/private-known-hosts\n  GlobalKnownHostsFile=/dev/null\n").unwrap();
+    let output = Command::new("ssh")
+        .args(["-G", "-vvv", "-F"])
+        .arg(&config)
+        .args(["--", "unused.example"])
+        .env("LC_ALL", "C")
+        .capture_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths = ssh_configuration_paths(&output.stderr).unwrap();
+    let configured = configured_known_hosts_directives(&paths).unwrap();
+    assert!(!configured.user && !configured.global);
+    let parsed =
+        parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured).unwrap();
+    let mut expected = defaults.user.files;
+    expected.extend(defaults.global.files);
+    expected.sort();
+    expected.dedup();
+    assert_eq!(parsed.files, expected);
+    for uncertain in [
+        b"UserKnownHostsFile \"/tmp/a /tmp/b\"".as_slice(),
+        b"UserKnownHostsFile /tmp/a\\ /tmp/b",
+        b"UserKnownHostsFile ~/.ssh/known_hosts",
+        b"UserKnownHostsFile ${HOME}/.ssh/known_hosts",
+        b"UserKnownHostsFile /tmp/%h",
+    ] {
+        assert!(contains_ambiguous_known_hosts_directive(
+            uncertain,
+            b"userknownhostsfile"
+        ));
+    }
+}
+
+#[test]
 fn pre_required_rsa_size_config_uses_historical_default() {
     let config = parse_ssh_config(
             b"user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\n",
@@ -337,6 +411,53 @@ fn host_key_algorithms_and_required_rsa_size_are_enforced() {
     assert!(configured_host_key_allowed(&config, &rsa));
     let (_, ed25519) = key(50);
     assert!(!configured_host_key_allowed(&config, &ed25519));
+}
+
+#[test]
+fn exported_host_algorithms_only_name_admitted_keys_and_preserve_rsa_policy() {
+    use ssh_agent_lib::ssh_key::{public::RsaPublicKey, Mpint};
+
+    let (_, ed25519) = key(80);
+    let mut policy = host_policy("backup", "vault", ed25519);
+    policy.host_key_algorithms = [
+        "ssh-ed25519-cert-v01@openssh.com",
+        "sk-ssh-ed25519@openssh.com",
+        "ecdsa-sha2-nistp256",
+        "rsa-sha2-512",
+        "ssh-ed25519",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    assert_eq!(policy.host_key_algorithms(), "ssh-ed25519");
+    policy.host_keys.push(KeyData::Rsa(RsaPublicKey {
+        e: Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+        n: Mpint::from_positive_bytes(&[0x80; 256]).unwrap(),
+    }));
+    assert_eq!(policy.host_key_algorithms(), "rsa-sha2-512,ssh-ed25519");
+    assert!(!policy.host_key_algorithms().contains("rsa-sha2-256"));
+}
+
+#[test]
+fn pinned_host_fingerprints_are_sorted_unique_and_use_actual_keys() {
+    let (_, first) = key(81);
+    let (_, second) = key(82);
+    let mut policy = host_policy("backup", "vault", first.clone());
+    policy.host_keys.extend([second.clone(), first.clone()]);
+    let fingerprints = policy.pinned_host_key_fingerprints();
+    let mut expected = [first, second]
+        .map(|key| {
+            PublicKey::new(key, "")
+                .fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256)
+                .to_string()
+        })
+        .to_vec();
+    expected.sort_unstable();
+    assert_eq!(fingerprints, expected);
+    assert!(fingerprints
+        .iter()
+        .all(|value| value.starts_with("SHA256:")));
+    policy.host_keys.reverse();
+    assert_eq!(policy.pinned_host_key_fingerprints(), fingerprints);
 }
 
 #[test]
@@ -434,6 +555,83 @@ fn openssh_defaults_and_hashed_known_hosts_lookup_are_exercised() {
 }
 
 #[test]
+fn policy_deadline_interrupts_real_openssh_match_exec() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let config = temp.path().join("ssh_config");
+    let ssh = temp.path().join("ssh");
+    let marker = temp.path().join("match-started");
+    std::fs::write(
+        &config,
+        format!(
+            "Match exec \"touch {}; sleep 30\"\n  User backup\n",
+            shell_words::quote(marker.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nexec ssh -F {} \"$@\"\n",
+            shell_words::quote(config.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = Instant::now();
+    let error = resolve_host_policy_at_bounded(
+        ssh.to_str().unwrap(),
+        None,
+        "unused.example",
+        None,
+        started + Duration::from_millis(300),
+        &|| false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(marker.exists(), "OpenSSH did not reach Match exec");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn known_host_search_obeys_deadline_and_cancellation() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let keygen = temp.path().join("ssh-keygen");
+    std::fs::write(&known_hosts, "").unwrap();
+    std::fs::write(&keygen, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&keygen, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = Instant::now();
+    let error = read_known_host_keys_bounded(
+        &keygen.clone().into_os_string(),
+        "vault",
+        std::slice::from_ref(&known_hosts),
+        started + Duration::from_millis(100),
+        &|| false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    let error = read_known_host_keys_bounded(
+        &keygen.into_os_string(),
+        "vault",
+        &[known_hosts],
+        Instant::now() + Duration::from_secs(5),
+        &|| true,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
 fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
     let temp = crate::test_support::tempdir().unwrap();
     let known_hosts = temp.path().join("known_hosts");
@@ -442,12 +640,16 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
     let ssh_keygen = temp.path().join("ssh-keygen");
     let (_, host_key) = key(54);
     let public = PublicKey::new(host_key.clone(), "").to_openssh().unwrap();
-    std::fs::write(&known_hosts, format!("stable-vault {public}\n")).unwrap();
+    std::fs::write(
+        &known_hosts,
+        format!("stable-vault {public}\n[literal]:2200 {public}\n"),
+    )
+    .unwrap();
     std::fs::write(
             &config,
             format!(
-                "Host vault\n  User backup\n  HostName vault.internal\n  Port 2222\n  HostKeyAlias stable-vault\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n  IdentityFile none\n",
-                known_hosts.display()
+                "Host vault\n  User backup\n  HostName vault.internal\n  Port 2222\n  HostKeyAlias stable-vault\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n  IdentityFile none\nHost literal\n  User backup\n  UserKnownHostsFile {}\n  GlobalKnownHostsFile none\n  HostKeyAlgorithms ssh-ed25519\n",
+                known_hosts.display(), known_hosts.display()
             ),
         )
         .unwrap();
@@ -474,6 +676,80 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
         resolve_host_policy_at(ssh.to_str().unwrap(), None, "vault", Some(2200)).unwrap();
     assert_eq!(overridden.port(), 2200);
     assert_eq!(overridden.known_hosts_name, "stable-vault");
+    // The requester chooses a different login, while provider trust still
+    // comes from its own alias and port rather than the requester route.
+    let account = resolve_account_trust_bounded(
+        ssh.to_str().unwrap(),
+        "requester-user",
+        "vault",
+        None,
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(account.login_user, "requester-user");
+    assert_eq!(account.connection_host(), "vault.internal");
+    assert_eq!(account.port(), 2222);
+    assert_eq!(account.known_hosts_name, "stable-vault");
+    assert_eq!(account.host_keys, overridden.host_keys);
+    let literal = resolve_account_trust_bounded(
+        ssh.to_str().unwrap(),
+        "requester-user",
+        "literal",
+        Some(2200),
+        Instant::now() + POLICY_TIMEOUT,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(literal.known_hosts_name, "[literal]:2200");
+    assert_eq!(literal.login_user, "requester-user");
+    assert_eq!(literal.host_keys, account.host_keys);
+}
+
+#[test]
+fn resolved_policy_exports_only_keys_above_laptop_rsa_minimum() {
+    use ssh_agent_lib::ssh_key::{public::RsaPublicKey, Mpint};
+    let temp = crate::test_support::tempdir().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let config = temp.path().join("config");
+    let ssh = temp.path().join("ssh");
+    let rsa = |bytes| {
+        KeyData::Rsa(RsaPublicKey {
+            e: Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+            n: Mpint::from_positive_bytes(&vec![0x80; bytes]).unwrap(),
+        })
+    };
+    let small = rsa(256);
+    let large = rsa(512);
+    let public = |key| PublicKey::new(key, "").to_openssh().unwrap();
+    std::fs::write(
+        &known_hosts,
+        format!("vault {}\nvault {}\n", public(small), public(large.clone())),
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        format!("UserKnownHostsFile {}\n", known_hosts.display()),
+    )
+    .unwrap();
+    // Supply the laptop's effective policy without making this regression
+    // depend on the test machine supporting the newer OpenSSH directive.
+    std::fs::write(&ssh, format!(
+        "#!/bin/sh\nconfiguration={}\nfor arg in \"$@\"; do if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi; done\necho \"debug1: Reading configuration data $configuration\" >&2\nprintf '%s\\n' 'user backup' 'hostname vault' 'port 22' {} 'globalknownhostsfile none' 'hostkeyalgorithms rsa-sha2-512' 'requiredrsasize 3072'\n",
+        shell_words::quote(config.to_str().unwrap()),
+        shell_words::quote(&format!("userknownhostsfile {}", known_hosts.display())),
+    )).unwrap();
+    let keygen = temp.path().join("ssh-keygen");
+    std::fs::write(&keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
+    for program in [&ssh, &keygen] {
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let policy = resolve_host_policy(ssh.to_str().unwrap(), None, "vault").unwrap();
+    assert_eq!(policy.host_keys.as_slice(), std::slice::from_ref(&large));
+    assert_eq!(
+        policy.known_hosts("syq-copy-peer").unwrap(),
+        format!("syq-copy-peer {}\n", public(large))
+    );
 }
 
 #[test]
@@ -521,7 +797,11 @@ fn bind_state_rejects_bad_signatures_wrong_hosts_and_extra_hops() {
     let policy = policy(source.clone(), destination.clone());
 
     let mut disallowed_algorithm = policy.clone();
-    disallowed_algorithm.coordinator.host_key_algorithms = vec!["rsa-sha2-512".into()];
+    disallowed_algorithm
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .host_key_algorithms = vec!["rsa-sha2-512".into()];
     assert!(BindState::default()
         .add(
             &disallowed_algorithm,
@@ -609,7 +889,7 @@ fn authorization_is_exact_for_user_session_host_and_method() {
         identity.clone(),
         &destination,
     );
-    state.authorize(&policy, &allowed).unwrap();
+    state.authorize(&policy, &allowed, false).unwrap();
     for denied in [
         sign_request(
             b"other-session",
@@ -640,8 +920,266 @@ fn authorization_is_exact_for_user_session_host_and_method() {
             &other_host,
         ),
     ] {
-        assert!(state.authorize(&policy, &denied).is_err());
+        assert!(state.authorize(&policy, &denied, false).is_err());
     }
+}
+
+#[test]
+fn direct_authorization_requires_the_exact_peer_and_login_without_forwarding() {
+    let (peer_private, peer) = key(101);
+    let (other_private, other) = key(102);
+    let (_, identity) = key(103);
+    let policy = BrokerPolicy::direct(host_policy("backup", "destination", peer.clone()));
+    let allowed = sign_request(
+        b"direct-session",
+        b"backup",
+        b"publickey-hostbound-v00@openssh.com",
+        identity.clone(),
+        &peer,
+    );
+    assert!(BindState::default()
+        .authorize(&policy, &allowed, false)
+        .is_err());
+    for denied in [
+        binding(&peer_private, peer.clone(), b"direct-session", true),
+        binding(&other_private, other.clone(), b"direct-session", false),
+        binding(&other_private, peer.clone(), b"direct-session", false),
+    ] {
+        assert!(BindState::default().add(&policy, denied).is_err());
+    }
+    let mut state = BindState::default();
+    state
+        .add(
+            &policy,
+            binding(&peer_private, peer.clone(), b"direct-session", false),
+        )
+        .unwrap();
+    state.authorize(&policy, &allowed, false).unwrap();
+    for denied in [
+        sign_request(
+            b"other-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            identity.clone(),
+            &peer,
+        ),
+        sign_request(
+            b"direct-session",
+            b"root",
+            b"publickey-hostbound-v00@openssh.com",
+            identity.clone(),
+            &peer,
+        ),
+        sign_request(
+            b"direct-session",
+            b"backup",
+            b"publickey",
+            identity.clone(),
+            &peer,
+        ),
+        sign_request(
+            b"direct-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            identity,
+            &other,
+        ),
+    ] {
+        assert!(state.authorize(&policy, &denied, false).is_err());
+    }
+    assert!(state
+        .add(
+            &policy,
+            binding(&peer_private, peer, b"extra-session", false)
+        )
+        .is_err());
+}
+
+fn user_certificate(key: KeyData) -> PublicCredential {
+    let (ca, _) = self::key(199);
+    let mut builder =
+        ssh_agent_lib::ssh_key::certificate::Builder::new(vec![0; 16], key, 0, u32::MAX.into())
+            .unwrap();
+    builder.valid_principal("backup").unwrap();
+    PublicCredential::Cert(Box::new(builder.sign(&PrivateKey::from(ca)).unwrap()))
+}
+
+#[test]
+fn ambient_certificate_keeps_exact_account_host_and_key_binding() {
+    let (peer_private, peer) = key(101);
+    let (_, identity) = key(103);
+    let (_, other) = key(104);
+    let policy = BrokerPolicy::direct(host_policy("backup", "destination", peer.clone()));
+    let mut state = BindState::default();
+    state
+        .add(
+            &policy,
+            binding(&peer_private, peer.clone(), b"certificate-session", false),
+        )
+        .unwrap();
+    let certificate = user_certificate(identity.clone());
+    let request = SignRequest {
+        credential: identity.clone().into(),
+        data: hostbound_data(
+            b"certificate-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            &certificate,
+            &peer,
+        ),
+        flags: 0,
+    };
+    state.authorize(&policy, &request, true).unwrap();
+    assert!(state.authorize(&policy, &request, false).is_err());
+    for (user, cert, host) in [
+        (b"root".as_slice(), certificate.clone(), peer.clone()),
+        (b"backup", user_certificate(other.clone()), peer.clone()),
+        (b"backup", certificate.clone(), other),
+    ] {
+        let mut changed = request.clone();
+        changed.data = hostbound_data(
+            b"certificate-session",
+            user,
+            b"publickey-hostbound-v00@openssh.com",
+            &cert,
+            &host,
+        );
+        assert!(state.authorize(&policy, &changed, true).is_err());
+    }
+    let mut encoded = Vec::new();
+    certificate.encode(&mut encoded).unwrap();
+    let last = encoded.len() - 1;
+    encoded[last] ^= 1;
+    assert!(!certificate_matches_signing_key(&encoded, &identity).unwrap());
+    encoded[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(certificate_matches_signing_key(&encoded, &identity).is_err());
+    let (ca, _) = key(199);
+    let mut builder = ssh_agent_lib::ssh_key::certificate::Builder::new(
+        vec![0; 16],
+        identity.clone(),
+        0,
+        u32::MAX.into(),
+    )
+    .unwrap();
+    builder.valid_principal("backup").unwrap();
+    builder
+        .cert_type(ssh_agent_lib::ssh_key::certificate::CertType::Host)
+        .unwrap();
+    let mut host_cert = Vec::new();
+    PublicCredential::Cert(Box::new(builder.sign(&PrivateKey::from(ca)).unwrap()))
+        .encode(&mut host_cert)
+        .unwrap();
+    assert!(!certificate_matches_signing_key(&host_cert, &identity).unwrap());
+}
+
+#[test]
+fn certificate_signature_reaches_real_ambient_agent_but_never_private_enrollment_key() {
+    use std::process::Stdio;
+    let temp = crate::test_support::tempdir().unwrap();
+    let ambient_socket = temp.path().join("a");
+    let mut command = Command::new("ssh-agent");
+    command
+        .args(["-D", "-a"])
+        .arg(&ambient_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut agent = crate::process::group::ProcessGroup::spawn(&mut command).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut progress = Instant::now();
+    while !ambient_socket.exists() {
+        assert!(
+            agent.poll().unwrap().is_none(),
+            "test ssh-agent exited before readiness"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "test ssh-agent did not create its socket"
+        );
+        if progress.elapsed() >= Duration::from_secs(1) {
+            eprintln!("waiting for certificate test ssh-agent socket");
+            progress = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (private, public) = key(195);
+    let private = PrivateKey::from(private);
+    let key_path = temp.path().join("identity");
+    private
+        .write_openssh_file(&key_path, ssh_agent_lib::ssh_key::LineEnding::LF)
+        .unwrap();
+    let added = Command::new("ssh-add")
+        .env("SSH_AUTH_SOCK", &ambient_socket)
+        .arg(&key_path)
+        .capture_output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let (peer_private, peer) = key(196);
+    let policy = BrokerPolicy::direct(host_policy("backup", "destination", peer.clone()));
+    let certificate = user_certificate(public.clone());
+    let request = SignRequest {
+        credential: public.clone().into(),
+        data: hostbound_data(
+            b"real-agent-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            &certificate,
+            &peer,
+        ),
+        flags: 0,
+    };
+    for ambient in [true, false] {
+        let broker = if ambient {
+            ConstrainedAgentBroker::start_with_ambient_socket(
+                ambient_socket.clone(),
+                policy.clone(),
+                TEST_BROKER_CONNECTIONS,
+            )
+            .unwrap()
+        } else {
+            ConstrainedAgentBroker::start_with_private_key_and_socket(
+                ambient_socket.clone(),
+                policy.clone(),
+                TEST_BROKER_CONNECTIONS,
+                private.clone(),
+            )
+            .unwrap()
+        };
+        let mut client = UnixStream::connect(broker.socket_path()).unwrap();
+        write_frame(
+            &mut client,
+            &bind_request(binding(
+                &peer_private,
+                peer.clone(),
+                b"real-agent-session",
+                false,
+            )),
+        )
+        .unwrap();
+        assert!(matches!(read_response(&mut client), Response::Success));
+        write_frame(&mut client, &[11]).unwrap();
+        let Response::IdentitiesAnswer(identities) = read_response(&mut client) else {
+            panic!("missing agent identity");
+        };
+        assert_eq!(identities.len(), 1);
+        write_frame(
+            &mut client,
+            &encode_request(Request::SignRequest(request.clone())),
+        )
+        .unwrap();
+        match read_response(&mut client) {
+            Response::SignResponse(signature) if ambient => {
+                public.verify(&request.data, &signature).unwrap()
+            }
+            Response::Failure if !ambient => assert_closed(&mut client),
+            response => panic!("unexpected certificate signing response: {response:?}"),
+        }
+    }
+    agent.close().unwrap();
 }
 
 #[test]

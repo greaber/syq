@@ -24,7 +24,7 @@ PermitTunnel no
 PermitUserEnvironment no
 AcceptEnv SYQ_REAL_SSH_SENT_ENV
 GatewayPorts no
-PermitTTY no
+PermitTTY yes
 
 LogLevel VERBOSE
 Subsystem sftp internal-sftp

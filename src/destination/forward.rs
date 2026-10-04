@@ -1,22 +1,45 @@
 //! One approved control stream through the receiving machine; data goes to the
-//! destination's restricted TCP workers. There is no remote signing interface.
+//! destination's restricted TCP or SSH workers. There is no remote signing interface.
+pub(super) mod ssh;
 use super::*;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::atomic::AtomicUsize;
 
 const HELPER_VERSION: u16 = 1;
-const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HelperRequest {
+pub(super) struct HelperRequest {
     version: u16,
     identity: String,
     request: CopyRequest,
 }
 
-fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
+pub(super) fn peer_receiver(
+    spec: &crate::conn::RemoteSpec,
+    request: CopyRequest,
+    deadline: Instant,
+) -> Result<(ForwardChild, Approved)> {
+    let (child, reply) = ForwardChild::over_spec(
+        spec,
+        "--peer-receiver",
+        &HelperRequest {
+            version: HELPER_VERSION,
+            identity: crate::identity::build().into(),
+            request,
+        },
+        deadline,
+        &|| false,
+    )?;
+    let Reply::Approved(approved) = reply else {
+        bail!("invalid peer receiver setup response")
+    };
+    Ok((child, approved))
+}
+
+pub(super) fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint> {
     if target.len() > 512 {
         bail!("destination SSH endpoint is too long");
     }
@@ -55,15 +78,13 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     if args.rsh.is_some()
         || args.syq_path.is_some()
         || args.no_bootstrap
-        || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
-        || args.no_tcp
         || args.no_tcp_encryption
         || args.peer_auth != PeerAuth::Restricted
         || args.coordinate_at != CoordinateAt::Auto
     {
-        bail!("return authorization owns its SSH connection and requires encrypted direct TCP; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --pscope, --detach, --no-tcp, --no-tcp-encryption, --peer-auth, or --coordinate-at");
+        bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
     if args.owner || args.group || args.devices || args.inplace {
         bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
@@ -79,7 +100,12 @@ pub(super) fn select(
     progress: Option<&crate::progress::Progress>,
 ) -> Result<Option<handoff::Selection>> {
     let explicit = match &args.auth_from {
-        crate::cli::AuthFrom::Return(name) => Some(name.clone()),
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) => {
+            Some(name.clone())
+        }
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. }) => {
+            bail!("this copy cannot use account authorization from an SSH provider; use a supported direct SSH copy or --auth-from @NAME for per-copy authorization");
+        }
         _ => handoff::selected_name(handoff::Kind::Forward).map(str::to_owned),
     };
     let target = match eligible_target(args) {
@@ -181,12 +207,13 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         bail!("unexpected remote copy approval response");
     };
     args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.auth_from = crate::cli::AuthFrom::Return(name);
+    args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     // The actual authority never leaves the destination helper. This internal
-    // marker makes the engine require TCP and suppress ordinary SSH fallback.
+    // marker selects its restricted executor and per-copy worker admission.
     args.restricted_grant = Some("return-control-v1".into());
+    let ssh = ssh::Client::new(registration, approved.token.clone());
     args.named_receipt = Some(Arc::new(NamedReceipt {
-        control: Mutex::new(Some(stream)),
+        connection: Some(ReturnConnection::new(stream, Some(ssh))),
         secret,
         approved,
         policy,
@@ -194,7 +221,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     Ok(())
 }
 
-struct Slot<'a>(&'a AtomicUsize);
+pub(super) struct Slot<'a>(pub(super) &'a AtomicUsize);
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
@@ -214,6 +241,7 @@ impl Receiver {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
         target_endpoint(&target)?;
+        crate::approval_command::check_authorizer(&command, &self.name)?;
         crate::approval_command::check_copy(&command, &request, None, Some(&target))?;
         if request.copy.destination != REQUEST_ROOT
             || request.destination.len() > 4096
@@ -273,16 +301,23 @@ impl Receiver {
         // This lock only serializes decisions, not SSH setup or active copies.
         drop(request_lock);
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes());
-        let (mut child, approved) = ForwardChild::connect(
+        let (mut child, reply) = ForwardChild::connect(
             &encoded,
             &HelperRequest {
                 version: HELPER_VERSION,
                 identity: crate::identity::build().into(),
                 request,
             },
+            "--return-receiver",
             Instant::now() + SETUP_TIMEOUT,
             &setup_cancelled,
         )?;
+        let Reply::Approved(mut approved) = reply else {
+            bail!("invalid destination setup response");
+        };
+        let session =
+            ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
+        approved.token = session.token();
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();
@@ -297,19 +332,20 @@ impl Receiver {
 
 /// Kill before reaping, including bootstrap/ProxyCommand descendants. Capture
 /// is bounded while the complete pipe is drained; diagnostics never block SSH.
-struct ForwardChild {
-    child: Child,
+pub(super) struct ForwardChild {
+    pub(super) child: Child,
     errors: Arc<Mutex<Vec<u8>>>,
     capture: Option<std::thread::JoinHandle<()>>,
     closed: bool,
 }
 impl ForwardChild {
-    fn connect(
+    pub(super) fn connect<T: Serialize>(
         target: &str,
-        request: &HelperRequest,
+        request: &T,
+        operation: &str,
         deadline: Instant,
         cancelled: &impl Fn() -> bool,
-    ) -> Result<(Self, Approved)> {
+    ) -> Result<(Self, Reply)> {
         for install in [false, true] {
             let mut command = Command::new(std::env::current_exe()?);
             command.args([
@@ -319,6 +355,7 @@ impl ForwardChild {
                     "--return-connect"
                 },
                 target,
+                operation,
             ]);
             let mut child = Self::spawn_command(command)?;
             let reply = (|| {
@@ -337,13 +374,19 @@ impl ForwardChild {
                 })
             })();
             match reply {
-                Ok(Reply::Approved(approved)) => return Ok((child, approved)),
+                Ok(reply @ (Reply::Approved(_) | Reply::SourceApproved { .. })) => {
+                    return Ok((child, reply))
+                }
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
+                Ok(Reply::RetryableError(error)) => {
+                    return Err(super::ssh_auth::RetryableSetupError(error).into());
+                }
                 Ok(
                     Reply::Ready
                     | Reply::Identity(_)
                     | Reply::TcpProbed(_)
-                    | Reply::TcpCongestionRejected(_),
+                    | Reply::TcpCongestionRejected(_)
+                    | Reply::ForwardSsh(_),
                 ) => {
                     bail!("invalid destination setup response")
                 }
@@ -381,9 +424,93 @@ impl ForwardChild {
         }
         unreachable!("the second helper attempt returns its result")
     }
-    fn wait_for_exit(
+    /// Reuse an already authorized account transport without another login.
+    pub(super) fn over_spec<T: Serialize>(
+        spec: &crate::conn::RemoteSpec,
+        operation: &str,
+        request: &T,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<(Self, Reply)> {
+        for install in [false, true] {
+            anyhow::ensure!(
+                !cancelled() && Instant::now() < deadline,
+                "copy setup stopped"
+            );
+            if install {
+                spec.install_helper()?;
+            }
+            let mut child = Self::spawn_command(spec.helper_command(&[operation.into()]))?;
+            let reply = (|| {
+                write_message(
+                    &mut DeadlineIo {
+                        inner: child.child.stdin.as_mut().unwrap(),
+                        deadline,
+                        cancelled: Some(cancelled),
+                    },
+                    request,
+                )?;
+                read_message(&mut DeadlineIo {
+                    inner: child.child.stdout.as_mut().unwrap(),
+                    deadline,
+                    cancelled: Some(cancelled),
+                })
+            })();
+            match reply {
+                Ok(Reply::Error(error)) => {
+                    return Err(ssh::SetupRefusal(format!(
+                        "remote copy helper refused setup: {error}"
+                    ))
+                    .into());
+                }
+                Ok(Reply::RetryableError(error)) => {
+                    return Err(super::ssh_auth::RetryableSetupError(error).into());
+                }
+                Ok(reply) => return Ok((child, reply)),
+                Err(error) => {
+                    let status = child.wait_for_exit(deadline, cancelled);
+                    if !install
+                        && spec.bootstrap_helper
+                        && status
+                            .as_ref()
+                            .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
+                    {
+                        continue;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("approved account helper failed: {}", child.errors())
+                    });
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    pub(super) fn spawn_streaming_command(mut command: Command) -> Result<Self> {
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .process_group(0)
+            .spawn_guarded()?;
+        Ok(Self {
+            child,
+            errors: Arc::new(Mutex::new(Vec::new())),
+            capture: None,
+            closed: false,
+        })
+    }
+
+    pub(super) fn wait_for_exit(
         &mut self,
         deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<std::process::ExitStatus> {
+        self.wait_until_exit(Some(deadline), cancelled)
+    }
+    pub(super) fn wait_until_exit(
+        &mut self,
+        deadline: Option<Instant>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<std::process::ExitStatus> {
         loop {
@@ -408,14 +535,14 @@ impl ForwardChild {
             if info.si_signo != 0 {
                 return Ok(self.close()?);
             }
-            if cancelled() || Instant::now() >= deadline {
+            if cancelled() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 let _ = self.close();
                 bail!("return helper stopped while waiting for its exit status");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    fn spawn_command(mut command: Command) -> Result<Self> {
+    pub(super) fn spawn_command(mut command: Command) -> Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -459,7 +586,7 @@ impl ForwardChild {
         }
         status
     }
-    fn errors(&self) -> String {
+    pub(super) fn errors(&self) -> String {
         format!(
             "{:?}",
             String::from_utf8_lossy(&self.errors.lock().unwrap())
@@ -490,29 +617,70 @@ fn pump(reader: &mut impl Read, writer: &mut impl Write) -> std::io::Result<u64>
     }
 }
 
-fn relay(
+pub(super) fn relay(
+    socket: UnixStream,
+    input: std::process::ChildStdin,
+    output: std::process::ChildStdout,
+    cancelled: impl Fn() -> bool,
+    child: &mut ForwardChild,
+) -> Result<()> {
+    relay_inner(socket, input, output, cancelled, child, false).map(|_| ())
+}
+
+/// Wait for the coordinator to release its control after peer EOF. Its final
+/// stdout may be slow without leaving any live destination authority behind.
+pub(super) fn relay_peer(
+    socket: UnixStream,
+    input: std::process::ChildStdin,
+    output: std::process::ChildStdout,
+    cancelled: impl Fn() -> bool,
+    child: &mut ForwardChild,
+) -> Result<bool> {
+    relay_inner(socket, input, output, cancelled, child, true)
+}
+
+fn relay_inner(
     mut socket: UnixStream,
     mut input: std::process::ChildStdin,
     mut output: std::process::ChildStdout,
     cancelled: impl Fn() -> bool,
     child: &mut ForwardChild,
-) -> Result<()> {
+    wait_for_release: bool,
+) -> Result<bool> {
     let mut writer = socket.try_clone()?;
     let shutdown = socket.try_clone()?;
     let (done, completions) = mpsc::channel();
     let sent = done.clone();
     let upload = std::thread::spawn(move || {
-        let _ = sent.send(pump(&mut socket, &mut input));
+        let _ = sent.send((true, pump(&mut socket, &mut input)));
     });
     let download = std::thread::spawn(move || {
-        let _ = done.send(pump(&mut output, &mut writer));
+        let _ = done.send((false, pump(&mut output, &mut writer)));
     });
+    let mut release_deadline = None;
     let result = loop {
         if cancelled() {
             break Err(anyhow::anyhow!("return connection stopped during copy"));
         }
-        match completions.recv_timeout(Duration::from_millis(100)) {
-            Ok(result) => break result.map(|_| ()).map_err(Into::into),
+        if release_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break Ok(false);
+        }
+        match completions.recv_timeout(Duration::from_millis(if wait_for_release {
+            10
+        } else {
+            100
+        })) {
+            Ok((true, result)) => break result.map(|_| true).map_err(Into::into),
+            Ok((false, result)) if !wait_for_release => {
+                break result.map(|_| false).map_err(Into::into)
+            }
+            Ok((false, _)) => {
+                // Do not shut the read side: only a natural upload EOF proves
+                // that B has released control, including on normal completion.
+                let _ = shutdown.shutdown(std::net::Shutdown::Write);
+                let _ = child.close();
+                release_deadline = Some(Instant::now() + Duration::from_secs(2));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => break Err(error.into()),
         }
@@ -524,10 +692,10 @@ fn relay(
     result
 }
 
-struct DeadlineIo<'a, T> {
-    inner: &'a mut T,
-    deadline: Instant,
-    cancelled: Option<&'a dyn Fn() -> bool>,
+pub(super) struct DeadlineIo<'a, T> {
+    pub(super) inner: &'a mut T,
+    pub(super) deadline: Instant,
+    pub(super) cancelled: Option<&'a dyn Fn() -> bool>,
 }
 impl<T: Read + AsRawFd> Read for DeadlineIo<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -555,7 +723,7 @@ impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     }
 }
 
-struct HandshakeInput<R> {
+pub(super) struct HandshakeInput<R> {
     inner: R,
     pending: Arc<AtomicBool>,
     deadline: Instant,
@@ -563,7 +731,7 @@ struct HandshakeInput<R> {
     started: bool,
 }
 impl<R> HandshakeInput<R> {
-    fn new(
+    pub(super) fn new(
         inner: R,
         pending: Arc<AtomicBool>,
         start_timeout: Duration,
@@ -613,7 +781,7 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
     resolve_destination(home, None, path)
 }
 
-fn receive() -> Result<i32> {
+fn receive(metadata_control: bool) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
@@ -647,10 +815,16 @@ fn receive() -> Result<i32> {
             return Err(error);
         }
     };
+    let _lifetime = metadata_control
+        .then(|| crate::server::ControlLifetime::watch(&input, authority.clone()))
+        .transpose()?;
+    let workers = ssh::Server::start(authority.clone())?;
+    let mut approved = approved;
+    approved.token = workers.ticket()?;
     write_message(&mut std::io::stdout(), &Reply::Approved(approved))?;
     let pending = Arc::new(AtomicBool::new(true));
-    crate::server::run_forwarded(
-        authority,
+    let result = crate::server::run_forwarded(
+        authority.clone(),
         HandshakeInput::new(
             input,
             pending.clone(),
@@ -658,15 +832,27 @@ fn receive() -> Result<i32> {
             Duration::from_secs(10),
         ),
         pending,
-    )?;
+        metadata_control,
+    );
+    authority.close_control();
+    drop(workers);
+    result?;
     Ok(0)
 }
-fn connect(target: &str, install: bool) -> Result<i32> {
+fn connect(target: &str, install: bool, operation: &str) -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let target =
         String::from_utf8(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(target)?)?;
-    let endpoint = target_endpoint(&target)?;
-    let spec = crate::conn::RemoteSpec {
+    let spec = target_spec(&target)?;
+    if install {
+        spec.install_helper()?;
+    }
+    Err(spec.helper_command(&[operation.into()]).exec().into())
+}
+/// Build the same SSH route for helper setup and laptop-side address lookup.
+pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
+    let endpoint = target_endpoint(target)?;
+    Ok(crate::conn::RemoteSpec {
         local_process: false,
         user: endpoint.user,
         host: endpoint.host,
@@ -696,24 +882,92 @@ fn connect(target: &str, install: bool) -> Result<i32> {
         primed_control: Default::default(),
         forwarded: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
-    };
-    if install {
-        spec.install_helper()?;
-    }
-    Err(spec
-        .helper_command(&["--return-receiver".into()])
-        .exec()
-        .into())
+    })
 }
+
+pub(super) fn source_data_hostname(
+    spec: &crate::conn::RemoteSpec,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    read_source_hostname(spec.ssh_hostname_command(), deadline, cancelled)
+}
+
+fn read_source_hostname(
+    command: Command,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String> {
+    // Reuse helper process-group ownership, bounded stderr capture, and the
+    // setup's absolute deadline. A local Match exec must not outlive revocation.
+    let mut child = ForwardChild::spawn_command(command)?;
+    drop(child.child.stdin.take());
+    let mut output = Vec::new();
+    DeadlineIo {
+        inner: child.child.stdout.as_mut().unwrap(),
+        deadline,
+        cancelled: Some(cancelled),
+    }
+    .take(MAX_MESSAGE as u64 + 1)
+    .read_to_end(&mut output)?;
+    anyhow::ensure!(
+        output.len() <= MAX_MESSAGE,
+        "source SSH configuration output is too large"
+    );
+    let status = child.wait_for_exit(deadline, cancelled)?;
+    anyhow::ensure!(
+        status.success(),
+        "resolve source SSH hostname: {}",
+        child.errors()
+    );
+    let text = std::str::from_utf8(&output).context("source SSH configuration is not UTF-8")?;
+    let hostname = text
+        .lines()
+        .find_map(|line| line.strip_prefix("hostname "))
+        .context("source SSH configuration did not report its hostname")?
+        .trim()
+        .to_owned();
+    validate_data_hostname(&hostname)?;
+    Ok(hostname)
+}
+
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
-        "--return-receiver" if argv.len() == 2 => Some(receive()),
-        "--return-connect" | "--return-connect-install" if argv.len() == 3 => Some(
+        "--return-receiver" if argv.len() == 2 => Some(receive(false)),
+        "--peer-receiver" if argv.len() == 2 => Some(receive(true)),
+        "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
+        "--return-ssh-worker" if argv.len() == 3 => Some(
+            argv[2]
+                .to_str()
+                .context("invalid copy worker admission")
+                .and_then(ssh::worker),
+        ),
+        "--return-ssh-connect" if argv.len() == 3 => Some(
             argv[2]
                 .to_str()
                 .context("invalid return target")
-                .and_then(|target| connect(target, argv[1] == "--return-connect-install")),
+                .and_then(|target| connect(target, false, "--return-ssh-setup")),
         ),
+        "--return-source-probe" if argv.len() == 2 => Some(Ok(0)),
+        "--return-source" if argv.len() == 2 => Some(super::pull::receive()),
+        "--return-connect" | "--return-connect-install" if argv.len() == 3 || argv.len() == 4 => {
+            Some(
+                argv[2]
+                    .to_str()
+                    .context("invalid return target")
+                    .and_then(|target| {
+                        connect(
+                            target,
+                            argv[1] == "--return-connect-install",
+                            match argv.get(3).and_then(|arg| arg.to_str()) {
+                                None | Some("--return-receiver") => "--return-receiver",
+                                Some("--return-source") => "--return-source",
+                                _ => bail!("invalid return helper operation"),
+                            },
+                        )
+                    }),
+            )
+        }
         _ => None,
     }
 }
@@ -722,6 +976,25 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use crate::destination::tests::{args, broker, request};
+
+    #[test]
+    fn source_hostname_lookup_obeys_setup_deadline_and_cancellation() {
+        for cancelled in [false, true] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30; printf 'hostname example.test\n'"]);
+            let start = Instant::now();
+            let result =
+                read_source_hostname(command, start + Duration::from_millis(20), &|| cancelled);
+            assert!(result.is_err());
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'hostname example.test\n'; exit 1"]);
+        assert!(
+            read_source_hostname(command, Instant::now() + Duration::from_secs(2), &|| false)
+                .is_err()
+        );
+    }
 
     #[test]
     fn hello_has_a_separate_start_budget_and_partial_bytes_do_not_extend_it() {
@@ -855,6 +1128,87 @@ mod tests {
         assert_eq!(&response, b"hello");
     }
     #[test]
+    fn peer_relay_release_allows_slow_final_coordinator_output() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf done"]);
+        let mut peer = ForwardChild::spawn_command(command).unwrap();
+        let input = peer.child.stdin.take().unwrap();
+        let output = peer.child.stdout.take().unwrap();
+        let thread =
+            std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
+        let mut result = Vec::new();
+        client.read_to_end(&mut result).unwrap();
+        assert_eq!(result, b"done");
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        let released = thread.join().unwrap().unwrap();
+        assert!(released);
+        // The independently owned coordinator may still flush its final stdout.
+        // No fixed deadline applies after it released its peer control.
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2.2; printf final"]);
+        let mut coordinator = ForwardChild::spawn_command(command).unwrap();
+        let mut output = coordinator.child.stdout.take().unwrap();
+        assert!(coordinator
+            .wait_until_exit(None, &|| !released)
+            .unwrap()
+            .success());
+        result.clear();
+        output.read_to_end(&mut result).unwrap();
+        assert_eq!(result, b"final");
+    }
+
+    #[test]
+    fn peer_relay_loss_without_control_release_stops_the_coordinator() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut peer = ForwardChild::spawn_command(command).unwrap();
+        let input = peer.child.stdin.take().unwrap();
+        let output = peer.child.stdout.take().unwrap();
+        let started = Instant::now();
+        let thread =
+            std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        // Keep B's read/upload side alive even though C disappeared.
+        assert!(!thread.join().unwrap().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(client.write_all(b"late").is_err());
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let mut coordinator = ForwardChild::spawn_command(command).unwrap();
+        assert!(coordinator.wait_until_exit(None, &|| true).is_err());
+        assert!(coordinator.child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn peer_relay_cancellation_wakes_both_blocked_pumps() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let mut command = Command::new("cat");
+        command.arg("-");
+        let mut peer = ForwardChild::spawn_command(command).unwrap();
+        let input = peer.child.stdin.take().unwrap();
+        let output = peer.child.stdout.take().unwrap();
+        let started = Instant::now();
+        assert!(relay_peer(
+            server,
+            input,
+            output,
+            || started.elapsed() >= Duration::from_millis(20),
+            &mut peer
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(peer.child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
     fn remote_targets_are_endpoints_not_shell_or_ssh_options() {
         for target in ["backup", "alice@backup:2222", "alice@[2001:db8::1]:22"] {
             assert!(target_endpoint(target).is_ok(), "{target}");
@@ -963,7 +1317,8 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             };
-            let description = pending.description(str::to_owned);
+            let description =
+                pending.description(&crate::persistence::Domain::default(), str::to_owned);
             assert!(description.contains("backup"));
             assert!(description.contains("output"));
             assert!(description.contains("SSH access"));

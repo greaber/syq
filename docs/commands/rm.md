@@ -21,10 +21,10 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <@NAME>` | Request storage authorization from a connected receiving machine |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use approved SSH account access, or request S3 authorization from a receiving machine |
 | `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--pscope <PATH>` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
+| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## Copy policy and filtering
 

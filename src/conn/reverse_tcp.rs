@@ -79,6 +79,7 @@ impl RemoteSpec {
             transport_stop: None,
             observation,
             child: None,
+            approved_login: None,
             w: FrameWriter::new(
                 Box::new(RecordWriter::new(
                     stream.try_clone()?,

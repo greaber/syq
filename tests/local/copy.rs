@@ -123,10 +123,25 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .find("candidate 2 -> 4 workers")
         .expect("the later measurement should select four workers");
     assert!(preparation < decision, "{stderr}");
-    // One downward transition exercises retirement. Later measurements may
-    // legitimately reject another reduction, especially around the injected
-    // connection failure; the final count is not a correctness contract.
-    assert!(stderr.contains("4 -> 3 workers"), "{stderr}");
+    // One activated downward transition exercises retirement. Useful upward
+    // probes may first raise the count above four; the exact counts and final
+    // choice depend on measured throughput, especially around the failure.
+    let retired = stderr.lines().any(|line| {
+        let Some(transition) = line.strip_prefix("syq: tune: ") else {
+            return false;
+        };
+        let mut words = transition.split_whitespace();
+        matches!(
+            (
+                words.next().and_then(|word| word.parse::<usize>().ok()),
+                words.next(),
+                words.next().and_then(|word| word.parse::<usize>().ok()),
+                words.next(),
+            ),
+            (Some(before), Some("->"), Some(after), Some("workers")) if after < before
+        )
+    });
+    assert!(retired, "{stderr}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("connections: auto:"),
         "{}",
