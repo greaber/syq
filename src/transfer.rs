@@ -43,7 +43,6 @@ use work_budget::{WorkBudget, WorkSize};
 use worker::*;
 
 const MAX_ATTEMPTS: u32 = 3;
-pub const LOCAL_DEFAULT_CONNECTIONS: usize = 32;
 // Amortize metadata requests across enough files to keep their shared pool
 // busy. The scheduler still divides queued files fairly among active workers,
 // and the byte limit bounds each batch independently of this ceiling.
@@ -378,9 +377,23 @@ fn print_benchmark_observations(opts: &Opts) {
 }
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
+    if let Some(spec) = crate::destination::account_copy::operation(loc, args)? {
+        return Ok(Endpoint::Remote(spec));
+    }
     Ok(match &loc.host {
         None => Endpoint::local(),
         Some(h) => {
+            let forwarded = args.return_source.clone().or_else(|| {
+                args.named_receipt
+                    .as_ref()
+                    .filter(|_| {
+                        matches!(
+                            args.auth_from,
+                            crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(_))
+                        )
+                    })
+                    .and_then(|receipt| receipt.connection.clone())
+            });
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
                 bail!(
@@ -410,7 +423,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     }
                 }),
             };
-            let ssh_multiplexer = match sharing {
+            let ssh_multiplexer = match sharing.filter(|_| forwarded.is_none()) {
                 None => None,
                 // A restricted grant keeps a private connection for this run.
                 Some(_) if args.restricted_grant.is_some() => {
@@ -470,7 +483,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                bootstrap_helper: args.restricted_grant.is_none()
+                bootstrap_helper: forwarded.is_none()
+                    && args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
                 restricted_grant: args.restricted_grant.clone(),
@@ -481,10 +495,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
-                forwarded: args
-                    .named_receipt
-                    .clone()
-                    .filter(|_| matches!(args.auth_from, crate::cli::AuthFrom::Return(_))),
+                forwarded,
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
@@ -536,13 +547,15 @@ fn open_control_connection(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> 
 
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
     let mut connection = open_control_connection(ep, args)?;
-    configure_hashing(
-        &mut *connection,
-        crate::hashing::HashPolicy {
+    // The reply carries nothing but success: check it with the next one
+    // rather than spending a round trip on it.
+    connection.send_expecting_ok(
+        Request::ConfigureHashing(crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
-        },
+        }),
+        "configure hashing",
     )?;
     configure_preservation(
         &mut *connection,
@@ -566,12 +579,12 @@ fn configure_preservation(
     destination: bool,
 ) -> Result<()> {
     if selection.any() || selection.open_noatime || sparse {
-        ok(
-            connection.call(Request::ConfigurePreservation {
+        connection.send_expecting_ok(
+            Request::ConfigurePreservation {
                 selection,
                 sparse,
                 destination,
-            })?,
+            },
             "configure inode metadata preservation",
         )?;
     }
@@ -801,7 +814,7 @@ pub(crate) fn connect_for_authorization(
     Ok(connection)
 }
 
-fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
+pub(crate) fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
     let mut seen = std::collections::HashSet::new();
     sources
         .iter()
@@ -1519,6 +1532,11 @@ fn handle_tcp_setup_error(
         progress.stop();
         return Err(error).context("TCP data transport required by test");
     }
+    if crate::conn::is_deferred_request_error(&error) {
+        sched.abort();
+        progress.stop();
+        return Err(error);
+    }
     if crate::conn::is_tcp_congestion_error(&error) {
         sched.abort();
         progress.stop();
@@ -1531,13 +1549,16 @@ fn handle_tcp_setup_error(
             )
         });
     }
-    if spec.forwarded.is_some() {
+    if args
+        .return_source
+        .as_ref()
+        .is_some_and(|source| !source.has_ssh())
+    {
         sched.abort();
         progress.stop();
-        return Err(error).with_context(|| {
-            let reason = "return authorization requires direct encrypted TCP data connections";
-            format!("{}: {reason}", spec.label())
-        });
+        return Err(error).context(
+            "approved source requires direct TCP; SSH source authorization is unavailable",
+        );
     }
     if !args.quiet || debug() {
         let congestion_note =
@@ -1809,11 +1830,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "--detach and --peer-auth apply only to a direct copy between two different remote endpoints"
         );
     }
-    if args.pscope_explicit && coordinator_is_remote {
-        bail!(
-            "--pscope is not supported with a remote transfer coordinator; use --coordinate-at local to keep the reusable connections on this machine"
-        );
-    }
     if args.restricted_grant.is_some()
         && (args.no_tcp_encryption || original_srcs[0].is_remote() || !dst.is_remote())
     {
@@ -1869,9 +1885,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    // A remote coordinator owns both SSH edges. Hand off before constructing
-    // local endpoints so the invoking machine neither reads its persistence
-    // policy nor creates records for connections it will never open.
+    // A remote coordinator owns the data route. Its launcher selects persistence
+    // only for the invoking machine's connection to that coordinator.
     if coordinator_is_remote {
         // The remote coordinator parses its own immutable input. Release this
         // process's preflight entries before waiting for the remote copy.
@@ -1919,9 +1934,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let prepared_source = args.prepared_source.take();
-    let src_ep = match &prepared_source {
-        Some(source) => source.endpoint.clone(),
-        None => endpoint(&srcs[0], &args)?,
+    let src_ep = match args.direct_source.take() {
+        Some(spec) => Endpoint::Remote(*spec),
+        None => match &prepared_source {
+            Some(source) => source.endpoint.clone(),
+            None => endpoint(&srcs[0], &args)?,
+        },
     };
     let mut dst_ep = match args.direct_destination.take() {
         Some(spec) => Endpoint::Remote(*spec),
@@ -2339,7 +2357,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
-                    if !gate.connection_needed(id) {
+                    // Once every file is finished or the copy has failed, a
+                    // connection, or a retry, would have nothing to do.
+                    if !gate.connection_needed(id) || sched.finished() || sched.is_aborted() {
                         gate.mark_absent(id);
                         return Ok(());
                     }
@@ -2368,8 +2388,41 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 )?,
                             ))
                         });
+                    // Tests fail the first worker's connection once every file
+                    // is finished or the copy has failed: "reject" as a
+                    // receiver rejecting its handshake, anything else as an
+                    // ordinary failure.
+                    #[cfg(debug_assertions)]
+                    let conns = match std::env::var("SYQ_TEST_FAIL_WORKER_AFTER_COPY") {
+                        Ok(failure) if id == 0 => {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(60);
+                            while !sched.finished()
+                                && !sched.is_aborted()
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            conns.and_then(|_| {
+                                Err(if failure == "reject" {
+                                    crate::conn::injected_worker_initialization_error()
+                                } else {
+                                    anyhow::anyhow!("injected worker connection failure")
+                                })
+                            })
+                        }
+                        _ => conns,
+                    };
                     let (mut src, mut dst) = match conns {
                         Ok(conns) => conns,
+                        // The copy no longer needs this connection, so its
+                        // failure cannot fail the copy, and a retry would
+                        // only delay its end. A failed copy has reported
+                        // its own error.
+                        Err(_) if sched.finished() || sched.is_aborted() => {
+                            gate.mark_absent(id);
+                            return Ok(());
+                        }
                         Err(error)
                             if crate::conn::is_tcp_congestion_error(&error)
                                 || crate::conn::is_worker_initialization_error(&error) =>
@@ -2463,6 +2516,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     match result {
                         Ok(()) => {
                             gate.mark_absent(id);
+                            worker.src.detach();
+                            worker.dst.detach();
                             return Ok(());
                         }
                         Err(error) if dropped => {
@@ -2565,7 +2620,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Signed/named routes keep their separately authorized resource policy.
     let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
         Endpoint::Remote(spec) => {
-            spec.local_process || (spec.restricted_grant.is_none() && spec.forwarded.is_none())
+            spec.local_process
+                || (spec.restricted_grant.is_none()
+                    && (spec.forwarded.is_none() || args.return_source.is_some()))
         }
         _ => true,
     });
@@ -2639,11 +2696,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
                     );
                 }
+                src_ctl.detach();
+                dst_ctl.detach();
                 return Ok(code);
             }
             SmallCopy::Declined => {
-                let _setup = progress.clock.setup.begin();
-                configure_hashing(&mut *dst_ctl, opts.hash_policy)?;
+                dst_ctl.send_expecting_ok(
+                    Request::ConfigureHashing(opts.hash_policy),
+                    "configure hashing",
+                )?;
             }
             SmallCopy::Reconnect => {
                 let _setup = progress.clock.setup.begin();
@@ -2653,30 +2714,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let setup = progress.clock.setup.begin();
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
-    let mut pending_tcp_setups = Vec::new();
+    // The listener requests share a round trip with the destination root
+    // stat; their replies are read once the stat returns.
+    let mut requested_tcp_listeners = Vec::new();
     if let Some(ports) = tcp_ports {
-        for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
+        for (source, ep, ctl) in [
+            (true, &src_ep, &mut src_ctl),
+            (false, &dst_ep, &mut dst_ctl),
+        ] {
             if let Endpoint::Remote(spec) = ep {
-                match spec.begin_tcp_setup(
+                match spec.request_tcp_listener(
                     &mut **ctl,
                     args.no_tcp_encryption,
                     ports,
                     args.tcp_congestion.as_deref(),
                     spec.pacing.lock().unwrap().clone(),
                 ) {
-                    Ok(pending) => pending_tcp_setups.push((spec.clone(), pending)),
+                    Ok(requested) => {
+                        requested_tcp_listeners.push((source, spec.clone(), requested))
+                    }
                     Err(error) => {
                         handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?
                     }
                 }
             }
         }
-    }
-    if debug() {
-        crate::output::diagnostic!(
-            "syq: TCP route probes started at {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
     }
     drop(setup);
     let mut planning = Some(progress.clock.planning.begin());
@@ -2720,6 +2782,30 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "syq: destination stat complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+    let mut pending_tcp_setups = Vec::new();
+    if !requested_tcp_listeners.is_empty() {
+        let _setup = progress.clock.setup.begin();
+        for (source, spec, requested) in requested_tcp_listeners {
+            let ctl = if source { &mut src_ctl } else { &mut dst_ctl };
+            match spec.begin_requested_tcp_setup(&mut **ctl, requested) {
+                Ok(pending) => pending_tcp_setups.push((spec, pending)),
+                Err(error) => handle_tcp_setup_error(
+                    &args,
+                    &spec,
+                    tcp_ports.expect("a TCP listener request has a port range"),
+                    error,
+                    &sched,
+                    &progress,
+                )?,
+            }
+        }
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: TCP route probes started at {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
     }
     let mut dst_initially_missing = dst_root_entry.is_none();
     let mut dst_existed = dst_root_entry.is_some();
@@ -2857,6 +2943,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         prepared_anchor = Some(anchor);
         prepared_filesystem = Some(filesystem);
         selection
+    } else if use_operator_anchor && allow_missing && dst.is_remote() && !args.existing {
+        let (selection, filesystem) = check_missing_destination(
+            &mut *dst_ctl,
+            &operator_directory,
+            opts.operator_symlink_policy,
+        )?;
+        prepared_filesystem = Some(filesystem);
+        selection
     } else if use_operator_anchor {
         check_operator_directory(
             &mut *dst_ctl,
@@ -2901,6 +2995,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             dst_initially_missing = false;
             dst_existed = true;
             dst_entry_is_dir = true;
+            // Inspected as missing; an existing directory is checked for
+            // emptiness instead.
+            prepared_filesystem = None;
         }
     }
     // A missing target, or an existing empty container, has no destination
@@ -3403,6 +3500,29 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
         );
         workers_started.set(true);
+    } else if (fresh_destination
+        || (src_ep.first_worker_needs_no_login() && dst_ep.first_worker_needs_no_login()))
+        && (src_ep.is_remote() || dst_ep.is_remote())
+        && transport_setup.is_some()
+        && !defer_destination_mutations
+        && !opts.same_host
+        && !opts.dry_run
+        && !opts.inplace
+        && (!destination_anchor_required || destination_anchor.get().is_some())
+    {
+        // One worker connects while planning finishes; the usual startup
+        // decision still chooses how many more to start. Every selected
+        // regular file is work for a fresh destination, so the worker
+        // connects once planning sees one, while the control connection
+        // creates directories. An existing destination may already hold the
+        // file, so there the worker connects only once planning queues a file
+        // to send, and starts early only when it needs no new login. A copy
+        // with nothing to send then opens no data connection.
+        connect_after_file_plan.store(true, Relaxed);
+        gate.set_active(1);
+        for id in gate.begin_warming(1) {
+            spawn_worker(id);
+        }
     }
 
     let ticker = progress.spawn_ticker();
@@ -4170,7 +4290,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
+    if !helpers_hold_the_only_tcp_port(tcp_ports) {
+        src_ctl.detach();
+        dst_ctl.detach();
+    }
     Ok(exit_code)
+}
+
+/// A finished connection need not wait for its helper to exit, except where
+/// the helper listens on the only TCP port the next copy may use. Port 0 asks
+/// the kernel for a free port, so it never holds one the next copy needs.
+fn helpers_hold_the_only_tcp_port(tcp_ports: Option<(u16, u16)>) -> bool {
+    matches!(tcp_ports, Some((lo, hi)) if lo == hi && lo != 0)
 }
 
 /// lstat (or stat, with `follow`) each path on `conn`.
@@ -4477,14 +4608,15 @@ fn check_operator_directory_ancestry(
     }
 }
 
-fn register_source_roots(
-    conn: &mut dyn Conn,
+/// The same source selection drives ordinary registration and laptop approval.
+pub(crate) fn source_registration(
     sources: &[Location],
     args: &Args,
-    shared_workers: usize,
-    independent_handoff_workers: usize,
-) -> Result<Vec<RegisteredSourceRoot>> {
-    let source_is_local = !sources.iter().any(Location::is_remote);
+) -> (
+    SourceRootBase,
+    Vec<SourceRootSelection>,
+    OperatorSymlinkPolicy,
+) {
     let base = if let Some(path) = &args.native_source_root {
         SourceRootBase {
             path: Some(path.clone()),
@@ -4507,11 +4639,26 @@ fn register_source_roots(
                 || source.follows_root(args.follows_native_source_paths()),
         })
         .collect();
+    (
+        base,
+        selections,
+        source_operator_symlink_policy(args, !sources.iter().any(Location::is_remote)),
+    )
+}
+
+fn register_source_roots(
+    conn: &mut dyn Conn,
+    sources: &[Location],
+    args: &Args,
+    shared_workers: usize,
+    independent_handoff_workers: usize,
+) -> Result<Vec<RegisteredSourceRoot>> {
+    let (base, selections, symlink_policy) = source_registration(sources, args);
     match ok(
         conn.call(Request::RegisterSourceRoots {
             base,
             selections,
-            symlink_policy: source_operator_symlink_policy(args, source_is_local),
+            symlink_policy,
             allow_unconfined_paths: false,
             shared_workers,
             independent_handoff_workers,
@@ -4641,6 +4788,39 @@ fn prepare_existing_destination(
         other => bail!("unexpected response {other:?}"),
     };
     Ok((selection, filesystem, anchor))
+}
+
+/// Select a missing remote destination's directory and inspect its
+/// filesystem in one network turn. Both are read-only, and the receiver
+/// inspects the directory the selection retained.
+fn check_missing_destination(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<(Option<DirectoryAnchor>, Option<DestinationFilesystemInfo>)> {
+    conn.send(Request::CheckOperatorDirectory {
+        path: path.to_vec(),
+        allow_missing: true,
+        symlink_policy,
+    })?;
+    conn.send(Request::DestinationFilesystemInfo {
+        check_empty: false,
+        target: None,
+    })?;
+    // Drain both replies even when the selection fails: pooled control
+    // sessions must never keep an unread response from a preceding copy.
+    let selection = conn.recv();
+    let filesystem = conn.recv();
+    let selection = match ok(selection?, "operator path")? {
+        Response::DirectorySelection(selection) => selection,
+        other => bail!("unexpected response {other:?}"),
+    };
+    let filesystem = match filesystem? {
+        Response::DestinationFilesystemInfo(info) => Some(info),
+        Response::EndpointError(_) | Response::Err(_) => None,
+        other => bail!("unexpected response {other:?}"),
+    };
+    Ok((selection, filesystem))
 }
 
 fn ancestor_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {

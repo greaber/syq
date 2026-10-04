@@ -20,6 +20,16 @@ pub(super) fn apply_one(
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Result<()> {
+    apply_one_with_deletions(op, guard, destination_root, destination_prefix, None)
+}
+
+pub(super) fn apply_one_with_deletions(
+    op: &Op,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+    deletion: Option<&mut crate::deletion::DirectoryBatch>,
+) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
         let relative = RelativePath::new(path)?;
@@ -71,14 +81,14 @@ pub(super) fn apply_one(
                 dev: *dev,
                 ino: *ino,
             };
-            return apply_one_rooted(&operation, &target.as_rooted());
+            return apply_one_rooted_with_deletions(&operation, &target.as_rooted(), deletion);
         }
-        return apply_one_rooted(op, &target.as_rooted());
+        return apply_one_rooted_with_deletions(op, &target.as_rooted(), deletion);
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target)
+    apply_one_rooted_with_deletions(op, &target, deletion)
 }
 
 pub(super) fn error_is_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool {
@@ -300,7 +310,11 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
+fn apply_one_rooted_with_deletions(
+    op: &Op,
+    target: &RootedTarget,
+    deletion: Option<&mut crate::deletion::DirectoryBatch>,
+) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
@@ -475,7 +489,12 @@ pub(super) fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                     target.label.display()
                 )
             }
-            Some(_) => root.unlink(path),
+            Some(metadata) => {
+                if let Some(deletion) = deletion {
+                    deletion.before_unlink(root, path, metadata.len)?;
+                }
+                root.unlink(path)
+            }
         },
         Op::Remove { .. } => bail!("recursive remove cannot use a confined destination root"),
     }

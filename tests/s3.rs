@@ -3364,6 +3364,65 @@ fn s3_transfer_timing_excludes_delayed_pruning() {
 }
 
 #[test]
+fn s3_download_prune_orders_parallel_children_and_preserves_ignored_entries() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let destination = temp.path().join("destination");
+    for directory in 0..32 {
+        let path = destination.join(format!("old/{directory}"));
+        std::fs::create_dir_all(&path).unwrap();
+        for file in 0..64 {
+            std::fs::write(path.join(file.to_string()), b"extra").unwrap();
+        }
+    }
+    std::fs::write(temp.path().join("outside"), b"keep outside").unwrap();
+    std::os::unix::fs::symlink(temp.path().join("outside"), destination.join("old/link")).unwrap();
+    std::fs::create_dir(destination.join("ignored")).unwrap();
+    std::fs::write(destination.join("ignored/keep"), b"keep ignored").unwrap();
+    let server = Server::start("prefix-ok");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "data",
+            "--into",
+            "destination",
+            "--prune",
+            "--ignore",
+            "ignored/",
+            "--results",
+            "results.ndjson",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(!destination.join("old").exists());
+    assert_eq!(
+        std::fs::read(destination.join("file")).unwrap(),
+        vec![b'x'; 65536]
+    );
+    assert_eq!(
+        std::fs::read(destination.join("ignored/keep")).unwrap(),
+        b"keep ignored"
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("outside")).unwrap(),
+        b"keep outside"
+    );
+    let records: Vec<serde_json::Value> =
+        std::fs::read_to_string(temp.path().join("results.ndjson"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(records.last().unwrap()["deletions_completed"], 2082);
+    assert_eq!(
+        records.iter().filter(|r| r["action"] == "delete").count(),
+        2082
+    );
+}
+
+#[test]
 fn s3_prune_reports_delete_failure_and_rejects_outside_listing() {
     for (fault, code, requests, planned) in [
         ("prune-denied", 23, 2, 1),
@@ -5900,7 +5959,7 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
             "parallel-delimiter-policy",
             "parallel-serial",
         ] {
-            // S3 removal has no public tuning option.
+            // S3 removal has no discovery-concurrency override.
             if command == "rm" && fault == "parallel-serial" {
                 continue;
             }

@@ -79,6 +79,7 @@ impl RemoteSpec {
             transport_stop: None,
             observation,
             child: None,
+            approved_login: None,
             w: FrameWriter::new(
                 Box::new(RecordWriter::new(
                     stream.try_clone()?,
@@ -87,6 +88,7 @@ impl RemoteSpec {
                 compress,
             ),
             rx: Some(rx),
+            deferred: Default::default(),
             reader: Some(reader),
             label: format!("{} (reverse tcp {})", self.label(), stream.peer_addr()?),
             dead: false,

@@ -112,7 +112,10 @@ impl Session {
             Some(local) => Endpoint::Local {
                 descriptor_session: local.0.clone(),
             },
-            None => crate::transfer::endpoint(location, args)?,
+            None => match crate::destination::account_copy::approved_operation(location, args)? {
+                Some(spec) => Endpoint::Remote(spec),
+                None => crate::transfer::endpoint(location, args)?,
+            },
         };
         anyhow::ensure!(
             args.tcp_congestion.is_none() || endpoint.is_remote(),

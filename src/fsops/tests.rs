@@ -508,6 +508,25 @@ fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for(
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn directories_are_listed_only_when_their_size_and_space_fit_the_names() {
+    // Sizes and occupied blocks measured for directories of 36-byte names.
+    let listed = |names, size, bytes: u64| small_enough_to_list(names, size, bytes / 512);
+    // ZFS reports entry counts as sizes; the occupied space tells a large
+    // directory from a small one.
+    assert!(listed(16, 130, 8_704), "ZFS, 128 entries");
+    assert!(!listed(64, 2_002, 41_472), "ZFS, 2,000 entries");
+    assert!(listed(128, 2_002, 41_472), "ZFS, 2,000 entries");
+    assert!(!listed(64, 20_002, 2_122_240), "ZFS, 20,000 entries");
+    // XFS and ext4 sizes are bytes, and decide for small directories.
+    assert!(listed(16, 8_192, 12_288), "XFS, 128 entries");
+    assert!(!listed(64, 98_304, 135_168), "XFS, 2,000 entries");
+    assert!(listed(512, 98_304, 135_168), "XFS, 2,000 entries");
+    assert!(!listed(16, 12_288, 12_288), "ext4, 128 entries");
+    assert!(listed(512, 135_168, 139_264), "ext4, 2,000 entries");
+}
+
 #[test]
 fn payload_integrity_checks_are_explicit() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
@@ -4837,6 +4856,61 @@ fn source_content_uses_registered_directory_after_name_replacement() {
         len: 12,
     });
     assert!(matches!(response, Response::Block { data, .. } if data == b"raw-original"));
+}
+
+#[test]
+fn registered_source_hash_rejects_short_prefixes_but_accepts_eof_tails() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let selected = temporary.path().join("selected");
+    let block = MIN_HASH_BLOCK_BYTES;
+    let original = vec![b'x'; block as usize + 7];
+    fs::write(&selected, &original).unwrap();
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let request = |off, len| Request::HashBlocks {
+        off,
+        path: selected.as_os_str().as_bytes().to_vec(),
+        source: Some(selections[0].clone()),
+        which: Which::Final,
+        copy_id: [0; 16],
+        block,
+        len,
+        attempt: 0,
+        guard: None,
+    };
+    for (off, len) in [(0, 1), (0, block + 1), (block, 1)] {
+        let response = worker.handle(&request(off, len));
+        assert!(matches!(response, Response::EndpointError(error)
+            if error.message.contains("current EOF")));
+    }
+    for (off, len, expected) in [
+        (0, block, vec![content_digest(&original[..block as usize])]),
+        (block, 7, vec![content_digest(&original[block as usize..])]),
+        (
+            0,
+            block + 7,
+            vec![
+                content_digest(&original[..block as usize]),
+                content_digest(&original[block as usize..]),
+            ],
+        ),
+    ] {
+        assert!(
+            matches!(worker.handle(&request(off, len)), Response::Hashes(hashes) if hashes == expected)
+        );
+    }
+    // Re-evaluate the opened file: a former tail cannot remain a short-prefix
+    // oracle after this same inode grows between scanning and hashing.
+    let mut grown = original;
+    grown.push(b'y');
+    fs::write(&selected, &grown).unwrap();
+    assert!(
+        matches!(worker.handle(&request(0, block + 7)), Response::EndpointError(error)
+        if error.message.contains("current EOF"))
+    );
+    assert!(
+        matches!(worker.handle(&request(block, 8)), Response::Hashes(hashes)
+        if hashes == vec![content_digest(&grown[block as usize..])])
+    );
 }
 
 #[test]

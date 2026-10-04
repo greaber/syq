@@ -3,8 +3,9 @@
 `--performance-tuning` overrides syq's automatic choices. To keep automatic
 choices within a ceiling, use [resource limits](resource-limits.md) instead.
 Leave performance tuning unset for everyday copies. These experimental controls
-are available in `syq cp` and `syq rsync`; `syq rm` and `syq clean-partials` accept
-only `workers` for filesystem removal.
+are available in `syq cp` and `syq rsync`. For removal, `syq rm` accepts
+`workers` for filesystems or `s3-requests` for S3; `syq clean-partials` accepts
+`workers`.
 
 Performance-tuning keys, accepted values, and behavior may change or be removed
 between releases without deprecation. Pin the syq version when a script depends
@@ -84,6 +85,25 @@ requests; selectors still name literal keys and prefixes. For copies,
 `--performance-tuning s3-parts-per-object=N` also caps unfiltered
 discovery; setting `N=1` keeps flat pagination. If a policy denies discovery, these operations retry with flat
 pagination at the original prefix.
+
+## Deletion
+
+`syq rm`, `syq clean-partials`, and pruning after a copy adjust deletion
+concurrency using completed entries per second. Filesystem deletion runs on
+the machine holding the target filesystem. S3 deletion adjusts concurrent
+requests while keeping supported batch requests. These measurements are
+separate from copying file contents and are not saved between runs. When a higher deletion count brings no clear
+throughput gain, syq returns to the previous count. It keeps a lower count
+when that improves throughput, such as when excess workers contend for the
+same filesystem locks.
+
+For `rm` and `clean-partials`, `--performance-tuning workers=N` fixes the
+filesystem worker count. For S3 removal, `--performance-tuning s3-requests=N`
+fixes the request count. For copies, the S3 request override and ceiling also
+apply during S3 pruning.
+Filesystem copy-worker settings apply to copying; filesystem pruning tunes its
+own workers. Filesystem deletion finishes children before removing their parent
+directories.
 
 <a id="s3-streams"></a>
 

@@ -397,6 +397,7 @@ pub struct Policy {
     recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
+    require_gain: bool,
     state: State,
     points: BTreeMap<usize, Point>,
     /// Consecutive failed probes up / down.
@@ -423,6 +424,7 @@ impl Policy {
             #[cfg(test)]
             recommended: n,
             startup_doubling: true,
+            require_gain: false,
             state: State::Initial,
             points: BTreeMap::new(),
             fails: [0, 0],
@@ -440,6 +442,14 @@ impl Policy {
             startup_doubling: false,
             ..Self::new(start, min, max)
         }
+    }
+
+    /// Deletion can burn CPU spinning on filesystem locks without increasing
+    /// throughput. Retain a changed count only when it measurably improves
+    /// throughput; transfer policies keep their treatment of uncertain increases.
+    pub(crate) fn require_gain(mut self) -> Self {
+        self.require_gain = true;
+        self
     }
 
     /// The count the policy considers right: `n`, unless a probe is in
@@ -861,7 +871,8 @@ impl Policy {
                 self.comparisons += 1;
                 let idx = direction.index();
                 let inverse = direction.opposite().index();
-                if direction == Direction::Up
+                if !self.require_gain
+                    && direction == Direction::Up
                     && !keep
                     && base > 0.0
                     && score >= base * (1.0 - NEAR_BEST_TOLERANCE)
@@ -907,6 +918,11 @@ impl Policy {
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.set_candidate(from);
                     self.state = State::Hold;
+                    if self.require_gain && direction == Direction::Up {
+                        // An unhelpful increase is also a reason to check
+                        // whether fewer workers improve throughput under contention.
+                        self.begin(Direction::Down, base);
+                    }
                 }
             }
         }

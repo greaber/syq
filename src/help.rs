@@ -54,8 +54,8 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                         arg.get_id().as_str(),
                         "auto_approve_root"
                             | "no_auto_approve_root"
-                            | "servers"
-                            | "all_servers"
+                            | "connection"
+                            | "all_connections"
                             | "notifications"
                             | "name"
                             | "cwd"
@@ -342,6 +342,7 @@ pub(crate) fn root() -> Command {
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
+        .subcommand(Command::new("ssh").about("Open an SSH shell or command using laptop authorization"))
         .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))
@@ -430,6 +431,7 @@ pub(crate) fn show_topic(topics: &[std::ffi::OsString]) -> anyhow::Result<()> {
     }
     let mut command = match topics.first().copied() {
         None => root_for_help(full),
+        Some("ssh") => crate::destination::ssh::command_for_help(),
         Some("exec") => crate::destination::exec::command_for_help(),
         Some("persist") => crate::persistence::command_for_help(),
         Some("completion") => crate::completion::command_for_help(),

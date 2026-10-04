@@ -1201,9 +1201,13 @@ impl Planner<'_> {
                 }
             }
         }
-        if batch
-            .iter()
-            .any(|entry| entry.kind == Kind::File && self.entry_is_payload(entry))
+        // Every selected regular file is work for an empty destination. An
+        // existing one may hold it unchanged; its first queued file is the
+        // signal instead.
+        if self.destination_children_known_missing
+            && batch
+                .iter()
+                .any(|entry| entry.kind == Kind::File && self.entry_is_payload(entry))
         {
             self.sched.anticipate_file_work();
         }

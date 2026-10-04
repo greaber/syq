@@ -33,6 +33,7 @@ fn short_and_long_help_spellings_are_identical_at_every_public_level() {
     for path in [
         vec![],
         vec!["cp"],
+        vec!["ssh"],
         vec!["exec"],
         vec!["rm"],
         vec!["map"],
@@ -135,6 +136,7 @@ fn lifecycle_and_root_help_describe_the_real_commands() {
     assert!(!run(&["--self-update", "unexpected"]).status.success());
     for path in [
         vec!["cp"],
+        vec!["ssh"],
         vec!["exec"],
         vec!["receiver", "enroll"],
         vec!["persist", "on"],
@@ -235,7 +237,7 @@ fn management_help_separates_everyday_options_from_manual_overrides() {
             vec!["persist", "receive", "on"],
             vec![
                 "--auto-approve-root",
-                "--server",
+                "--connection",
                 "--auto-cwd",
                 "--notify",
                 "--name",
@@ -378,6 +380,7 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
     let enroll = help(&["receiver", "enroll", "--help-all"]);
     assert!(enroll.contains("Copies normally enroll receivers automatically"));
     for path in [
+        vec!["ssh"],
         vec!["exec"],
         vec!["persist", "receive", "wait"],
         vec!["persist", "destinations", "wait"],
@@ -385,10 +388,10 @@ fn advanced_commands_are_discoverable_and_keep_their_full_descriptions() {
         let mut args = path;
         args.push("--help");
         let short = help(&args);
-        assert!(short.contains(if args[0] == "exec" {
-            "--cwd"
-        } else {
-            "--timeout"
+        assert!(short.contains(match args[0] {
+            "ssh" => "--auth-from",
+            "exec" => "--cwd",
+            _ => "--timeout",
         }));
     }
 }

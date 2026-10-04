@@ -101,7 +101,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--receiver-max-entries <N>` | Command-restricted receiver ceiling: refuse to touch more than N destination entries |
 | `--receiver-max-bytes <SIZE>` | Command-restricted receiver ceiling: refuse to write more than SIZE bytes of file data in total |
 | `--receiver-receipt <DETAIL>` | Command-restricted receiver receipt detail: final sizes (default) or also final BLAKE3 file hashes<br><br>Possible values:<br>- sizes: Final type and size of every path the transfer could have changed<br>- hashes: Sizes plus a closure-time BLAKE3 hash of every regular file |
-| `--auth-from <auto\|ssh\|@NAME>` | Use local SSH first, then an available receiving machine for credential, host-key, hostname, or refused-connection errors (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies) |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure |
 | `--coordinate-at <COORDINATE_AT>` | Choose the endpoint that runs the coordinator<br><br>Possible values:<br>- auto: Run locally unless both endpoints are remote, then run at the source<br>- src: Run the coordinator at the source endpoint<br>- dst: Run the coordinator at the destination endpoint<br>- local: Keep the coordinator on the invoking machine and relay the data there<br><br>[default: auto] |
 | `--rsh <COMMAND>` | Remote shell command (default: ssh); the command owns SSH and agent policy when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
@@ -112,7 +112,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Run at the remote coordinator and return after launch; requires --peer-auth own-credentials or --rsh |
 | `--peer-auth <MODE>` | How the coordinator authenticates to the peer (see the values below); --rsh takes over this policy entirely<br><br>Possible values:<br>- restricted: Constrained agent broker plus the command-restricted receiver on the peer<br>- broker: Constrained agent broker only; the peer runs no command-restricted receiver<br>- own-credentials: Forward nothing; the coordinator must hold its own credentials for the peer<br>- full-agent: Expose the complete local SSH agent to the coordinator, as `ssh -A` would<br><br>[default: restricted] |
-| `--pscope <PATH>` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
+| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## S3 connection settings
 
@@ -305,7 +305,9 @@ results and payload/completion descriptors must differ.
 Filesystem streams use parallel data workers over SSH or encrypted TCP, with
 automatic worker tuning as in regular-file copies. They accept `workers`,
 `request-size`, `pipeline-depth`, and `bw-pacing` tuning; `workers=N` fixes the
-worker count, and `--no-tcp` keeps data on SSH. S3 transfers one object using
+worker count, and `--no-tcp` keeps data on SSH. An authorization provider can
+request or reuse [account access](../persistence-reference.md#approved-account-connections);
+streams do not request per-copy SSH approval. S3 transfers one object using
 multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
 
 Restart recovery, named receiving destinations, detached execution,

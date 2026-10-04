@@ -200,26 +200,41 @@ pub(crate) fn run(
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let interrupt = async { tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }; Ok::<_, anyhow::Error>(()) };
+        let mut signals = crate::process::signals::interrupt_and_terminate()?;
+        let (sigint, term) = &mut *signals;
+        let interrupt = async {
+            tokio::select! { _ = sigint.recv() => { }, _ = term.recv() => {} };
+            Ok::<_, anyhow::Error>(())
+        };
         tokio::pin!(interrupt);
-        let commit = commit_fd.map(|n| Descriptor::open(n, true, cancelled.clone())).transpose()?;
+        let commit = commit_fd
+            .map(|n| Descriptor::open(n, true, cancelled.clone()))
+            .transpose()?;
         // Protect caller-owned FDs before connecting. Defer opening a named
         // FIFO until the destination conditions have been checked.
         let descriptor = match &source {
-            Some(Source::Descriptor(number)) => Some(Descriptor::open(*number, true, cancelled.clone())?),
+            Some(Source::Descriptor(number)) => {
+                Some(Descriptor::open(*number, true, cancelled.clone())?)
+            }
             Some(Source::Pipe { .. }) => None,
             None => Some(Descriptor::open(as_fd.unwrap(), false, cancelled.clone())?),
         };
         let source_meta = descriptor.as_ref().and_then(Descriptor::metadata);
         if options.route == crate::s3::Route::Upload {
             controls.metadata.source(source_meta.clone())?;
-            if let Some(size) = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten() {
+            if let Some(size) = descriptor
+                .as_ref()
+                .map(Descriptor::remaining_len)
+                .transpose()?
+                .flatten()
+            {
                 controls.set_size(size);
             }
         }
         if options.route == crate::s3::Route::Download {
-            controls.metadata.output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
+            controls
+                .metadata
+                .output(descriptor.as_ref().and_then(Descriptor::metadata).is_some())?;
         }
         let authorization = tokio::select! {
             value = authorization::connect(args, &options, &target, placement.existence) => value?,
@@ -229,16 +244,38 @@ pub(crate) fn run(
             value = Session::connect(options, controls, authorization.clone()) => value?,
             value = &mut interrupt => { value?; bail!("stream cancelled"); }
         };
-        let plan = Plan { session: &session, controls, options: session.options.clone(), key, placement, target, source_meta };
-        let size = descriptor.as_ref().map(Descriptor::remaining_len).transpose()?.flatten();
+        let plan = Plan {
+            session: &session,
+            controls,
+            options: session.options.clone(),
+            key,
+            placement,
+            target,
+            source_meta,
+        };
+        let size = descriptor
+            .as_ref()
+            .map(Descriptor::remaining_len)
+            .transpose()?
+            .flatten();
         let prepared = session.prepare(&plan, size).await?;
         if let Some(authorization) = authorization {
             if let Err(error) = authorization.finish().await {
-                if let Some(prepared) = &prepared { session.abort_prepared(prepared).await; }
+                if let Some(prepared) = &prepared {
+                    session.abort_prepared(prepared).await;
+                }
                 return Err(error);
             }
         }
-        let operation = execute(&plan, source, descriptor, commit, cancelled.clone(), None, prepared);
+        let operation = execute(
+            &plan,
+            source,
+            descriptor,
+            commit,
+            cancelled.clone(),
+            None,
+            prepared,
+        );
         tokio::pin!(operation);
         tokio::select! {
             result = &mut operation => result,

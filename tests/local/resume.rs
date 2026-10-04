@@ -468,6 +468,38 @@ fn small_file_failure_never_publishes_partial_contents() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn a_failure_while_a_network_batch_writes_in_parallel_stays_with_its_file() {
+    // On a network filesystem the files of a batch are written in parallel;
+    // each result still belongs to its own file.
+    let t = Tmp::new();
+    for i in 0..12 {
+        write(
+            &t.path(&format!("src/f{i:02}")),
+            format!("contents {i}").as_bytes(),
+        );
+    }
+    let out = compat_command()
+        .args(["-a", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_TEST_NETWORK_FILESYSTEM", "1")
+        .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "/f07")
+        .run()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    for i in 0..12 {
+        let path = t.path(&format!("dst/f{i:02}"));
+        if i == 7 {
+            assert!(!path.exists());
+        } else {
+            assert_eq!(read(&path), format!("contents {i}").as_bytes(), "{i}");
+        }
+    }
+    let partials = partial_files(&t.path("dst"));
+    assert_eq!(partials.len(), 1);
+    assert_eq!(read(&partials[0]), b"contents 7");
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn hardlinked_partial_does_not_corrupt_external_file() {
     let t = Tmp::new();
     write(&t.path("src"), &vec![9u8; 5 * 1024 * 1024]);

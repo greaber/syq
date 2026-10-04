@@ -877,6 +877,8 @@ pub enum WireRequest<Data> {
         selections: Vec<NativeRemoveSelection>,
         follow_symlinks: bool,
         dry_run: bool,
+        /// Zero selects endpoint-local automatic deletion tuning. Nonzero
+        /// counts remain fixed. Helpers enforce matching build identities.
         workers: usize,
     },
     /// lstat each path; with `follow`, stat through symlinks instead.

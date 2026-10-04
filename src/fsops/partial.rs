@@ -1738,7 +1738,7 @@ impl FsOps {
             };
         }
         let stage = self.create_small_stage(put, rooted)?;
-        self.write_small_stage(put, None, &stage)?;
+        self.write_small_stage(put, None, &stage, None)?;
         self.publish_small_stage(put, &stage)?;
         self.finish_small_stage(put, stage)
     }
@@ -1776,6 +1776,13 @@ impl FsOps {
             if let Some((_, source_target)) = self.source_content_target(target.source)? {
                 let mut file =
                     open_registered_source(&source_target, self.inode_preservation.open_noatime)?;
+                // A partial block describes only the source's actual EOF
+                // tail, not an arbitrary prefix that could be queried byte
+                // by byte. Full-block windows need no extra metadata lookup.
+                anyhow::ensure!(
+                    len.is_multiple_of(block) || off + len == file.metadata()?.len(),
+                    "short source hash block must end at the file's current EOF"
+                );
                 file.seek(SeekFrom::Start(off))?;
                 return hash_reader_observed(
                     &mut file,
@@ -2394,6 +2401,18 @@ impl FsOps {
         source: Option<&RegisteredPath>,
         guard: Option<&ContainerGuard>,
     ) -> Result<Response> {
+        self.file_hash_checked(path, source, guard, &mut |_, _| Ok(()))
+    }
+
+    /// Check an approved source hash's size and lifetime before reading and
+    /// after each bounded chunk. Ordinary hashing supplies a no-op check.
+    pub(crate) fn file_hash_checked(
+        &mut self,
+        path: &[u8],
+        source: Option<&RegisteredPath>,
+        guard: Option<&ContainerGuard>,
+        check: &mut impl FnMut(&File, u64) -> Result<()>,
+    ) -> Result<Response> {
         let mut f = if source.is_some()
             || (self.destination_root.is_none() && !self.source_roots.is_empty())
         {
@@ -2414,17 +2433,20 @@ impl FsOps {
         } else {
             open_existing_regular(&resolve(path), false)?
         };
+        check(&f, 0)?;
         crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         let mut h = self.hash_policy.algorithm.hasher();
         let mut buf = vec![0u8; 1 << 20];
         let mut size = 0u64;
         loop {
+            check(&f, size)?;
             let n = f.read(&mut buf)?;
             if n == 0 {
                 break;
             }
-            h.update(&buf[..n]);
             size += n as u64;
+            check(&f, size)?;
+            h.update(&buf[..n]);
         }
         Ok(Response::FileHash {
             size,

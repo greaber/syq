@@ -170,9 +170,11 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
     reader.join().unwrap(); // The following reply and EOF are already queued.
     let mut conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: Some(rx),
         reader: None,
@@ -709,9 +711,11 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
     let writes = Arc::new(AtomicUsize::new(0));
     let mut conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
         rx: Some(rx),
         reader: None,
@@ -983,9 +987,11 @@ fn hello_carries_destination_initialization_before_readiness() {
     );
     let conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         reader: Some(reader),
@@ -1038,9 +1044,11 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
     );
     let conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         reader: Some(reader),
@@ -1085,9 +1093,11 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         .unwrap();
     let mut conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
+        approved_login: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: None,
         reader: None,
@@ -1139,9 +1149,11 @@ fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
     let stdin = child.stdin.take().unwrap();
     let conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
+        approved_login: None,
         w: FrameWriter::new(Box::new(stdin), false),
         rx: None,
         reader: None,
@@ -1269,9 +1281,11 @@ fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
         );
         let mut connection = RemoteConn {
             batch_receipts: Default::default(),
+            deferred: Default::default(),
             transport_stop: None,
             observation: Default::default(),
             child: None,
+            approved_login: None,
             w: FrameWriter::new(Box::new(writer), false),
             rx: Some(rx),
             reader: Some(reader),
@@ -1346,9 +1360,11 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
         let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
         let mut remote = RemoteConn {
             batch_receipts: Default::default(),
+            deferred: Default::default(),
             transport_stop: None,
             observation: Default::default(),
             child: None,
+            approved_login: None,
             w: FrameWriter::new(Box::new(Vec::new()), false),
             rx: Some(rx),
             reader: Some(reader),
@@ -1480,8 +1496,8 @@ fn captured_commands_bound_both_streams_and_feed_input() {
 fn remote_download_report_frames_manifest_and_digest() {
     let digest = "a".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
+    );
     let report = read_remote_download_report(&mut bytes.as_bytes())
         .unwrap()
         .unwrap();
@@ -1503,8 +1519,8 @@ fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
     let spoofed = "a".repeat(64);
     let actual = "b".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
+    );
     let report = read_remote_download_report(&mut bytes.as_bytes())
         .unwrap()
         .unwrap();
@@ -1523,8 +1539,8 @@ fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
 fn remote_download_report_rejects_data_after_the_digest() {
     let digest = "a".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
+    );
     let error = read_remote_download_report(&mut bytes.as_bytes()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -1827,6 +1843,40 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
 }
 
 #[test]
+fn approved_pool_attachment_preserves_the_master_and_never_creates_one() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let control = directory.path().join("master");
+    std::fs::write(&control, b"owned by the account keeper").unwrap();
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.rsh = vec![
+        "ssh".into(),
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "PubkeyAuthentication=no".into(),
+        "-o".into(),
+        "ProxyCommand=false".into(),
+    ];
+    spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer::approved(
+        &control, None,
+    )));
+    let command = spec.ssh_command(SshConnection::Control, false);
+    let args: Vec<_> = command.get_args().collect();
+    assert!(args.iter().any(|arg| *arg == "ControlMaster=no"));
+    assert!(!args
+        .iter()
+        .any(|arg| *arg == "ControlMaster=auto" || *arg == "ControlMaster=yes"));
+    assert!(args.iter().any(|arg| *arg == "PubkeyAuthentication=no"));
+    assert_eq!(
+        std::fs::read(control).unwrap(),
+        b"owned by the account keeper"
+    );
+    assert!(spec.pool_endpoint().ignore_ssh_config);
+    assert!(!spec.ssh_multiplexer.as_ref().unwrap().automatic_receiving);
+}
+
+#[test]
 fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
     let mut spec = RemoteSpec::local_receiver(false);
     spec.rsh = vec!["ssh".into()];
@@ -1841,9 +1891,12 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
     assert!(!verbose(&spec, true));
     spec.restricted_grant = None;
     spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer {
+        domain: None,
         _directory: None,
         path: PathBuf::from("/tmp/syq-test-socket"),
         persistent: true,
+        existing_only: false,
+        approved_workers: None,
         idle_timeout: "300",
         automatic_receiving: false,
         session_pool: true,
@@ -1865,9 +1918,12 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         b"/tmp/scope with space/%h/non-utf8-\xff/socket".to_vec(),
     ));
     let multiplexer = SshMultiplexer {
+        domain: None,
         _directory: None,
         path,
         persistent: true,
+        existing_only: false,
+        approved_workers: None,
         idle_timeout: "300",
         automatic_receiving: false,
         session_pool: true,
@@ -2144,9 +2200,11 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
     let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
     let conn = RemoteConn {
         batch_receipts: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: Some(rx),
         reader: Some(reader),
@@ -2202,6 +2260,96 @@ fn fragmented_metadata_replies_preserve_counts_and_errors() {
     assert!(connection_replaying(&[Response::StatsMore(vec![None])])
         .call(Request::Shutdown)
         .is_err());
+}
+
+#[test]
+fn deferred_replies_are_checked_before_the_next_and_a_failure_sticks() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let mut conn = connection_replaying(&[Response::Ok, Response::Ok, Response::Stats(vec![])]);
+    conn.send_expecting_ok(configure(), "first").unwrap();
+    conn.send_expecting_ok(configure(), "second").unwrap();
+    assert!(matches!(
+        conn.call(Request::Shutdown).unwrap(),
+        Response::Stats(_)
+    ));
+
+    let mut conn = connection_replaying(&[
+        Response::Ok,
+        Response::Err("cannot preserve".into()),
+        Response::Ok,
+        Response::Ok,
+    ]);
+    conn.send_expecting_ok(configure(), "first").unwrap();
+    conn.send_expecting_ok(configure(), "second").unwrap();
+    conn.send_expecting_ok(configure(), "third").unwrap();
+    for _ in 0..2 {
+        let error = conn.call(Request::Shutdown).unwrap_err();
+        assert!(is_deferred_request_error(&error));
+        assert_eq!(format!("{error:#}"), "second: cannot preserve");
+    }
+}
+
+#[test]
+fn pending_replies_are_kept_while_later_replies_are_returned() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let stat = |count| Request::StatMany {
+        paths: vec![b"x".to_vec(); count],
+        sources: None,
+        follow: false,
+        guard: None,
+    };
+    let mut conn = connection_replaying(&[
+        Response::StatsMore(vec![None]),
+        Response::Stats(vec![None]),
+        Response::Ok,
+        Response::Err("first".into()),
+        Response::Err("second".into()),
+        Response::Err("own".into()),
+    ]);
+    let fragmented = conn.send_pending(stat(2)).unwrap();
+    conn.send_expecting_ok(configure(), "configure").unwrap();
+    let first = conn.send_pending(Request::Shutdown).unwrap();
+    let second = conn.send_pending(Request::Shutdown).unwrap();
+    // A reply taken out of order keeps the ones before it for later.
+    assert!(matches!(
+        conn.take_reply(second).unwrap(),
+        Response::Err(error) if error == "second"
+    ));
+    assert!(matches!(
+        conn.call(Request::Shutdown).unwrap(),
+        Response::Err(error) if error == "own"
+    ));
+    assert!(matches!(
+        conn.take_reply(fragmented).unwrap(),
+        Response::Stats(entries) if entries.len() == 2
+    ));
+    assert!(matches!(
+        conn.take_reply(first).unwrap(),
+        Response::Err(error) if error == "first"
+    ));
+
+    // A kept reply must still match its request's entry count.
+    let mut conn = connection_replaying(&[Response::Stats(vec![None])]);
+    let short = conn.send_pending(stat(2)).unwrap();
+    assert!(conn.take_reply(short).is_err());
+
+    // A reply kept before a failed deferred request is still returned; one
+    // sent after it reports that failure.
+    let mut conn = connection_replaying(&[
+        Response::Err("before".into()),
+        Response::Err("cannot preserve".into()),
+        Response::Ok,
+    ]);
+    let before = conn.send_pending(Request::Shutdown).unwrap();
+    conn.send_expecting_ok(configure(), "configure").unwrap();
+    let after = conn.send_pending(Request::Shutdown).unwrap();
+    let error = conn.take_reply(after).unwrap_err();
+    assert!(is_deferred_request_error(&error));
+    assert_eq!(format!("{error:#}"), "configure: cannot preserve");
+    assert!(matches!(
+        conn.take_reply(before).unwrap(),
+        Response::Err(error) if error == "before"
+    ));
 }
 
 /// Later sessions of a run skip `uname`, but the session pool's key must not
@@ -2410,10 +2558,12 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     let mut requests = FrameReader::new(peer);
     let mut conn = RemoteConn {
         batch_receipts,
+        deferred: Default::default(),
         transport_stop: None,
         rpc_observation: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(client.try_clone().unwrap()), false),
         rx: Some(rx),
         reader: Some(reader),

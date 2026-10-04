@@ -50,7 +50,7 @@ syq clean-partials [OPTIONS] <TREE>...
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#transfer-controls) |
+| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#deletion) |
 
 ## Progress and results
 
@@ -67,6 +67,8 @@ syq clean-partials [OPTIONS] <TREE>...
 |---|---|
 | `--syq-path <PATH>` | Use this exact syq executable on the remote removal endpoint |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use an approved SSH account connection, or native SSH authentication |
+| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## Help and version
 

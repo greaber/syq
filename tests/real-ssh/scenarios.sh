@@ -312,7 +312,11 @@ state = json.load(open("/tmp/syq-ephemeral-connected.json"))
 connection = next(c for c in state["connections"] if c["endpoint"] == "source")
 assert connection["state"] == "ready" and connection["ssh_connected"], connection
 assert connection["receiving_enabled"] is False and connection["receiving"] is None, connection
-assert not any(".recv" in p.name for p in Path(state["scope"]).iterdir()), state
+# Endpoint records let a later receive-on start without another connect.
+# Receiving is disabled: no profile is running and no listener exists.
+assert connection["receiving_profiles"] == [], connection
+entries = [p.name for p in Path(state["scope"]).iterdir()]
+assert not any(name.endswith(".recv") for name in entries), entries
 PYEPHEMERAL
 syq persist status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["enabled"] is False'
 syq persist off --pscope "$ephemeral_connect_scope"
@@ -444,16 +448,20 @@ if syq persist receive approve "$request_id"; then echo 'disconnected request wa
 test ! -e "$receive_root/disconnected"
 
 printf 'case: changing policy cancels a pending request\n'
+max_entries=$(syq persist receive status --json | python3 -c 'import json,sys; value=json.load(sys.stdin)["settings"]["max_entries"]; assert value > 1; print(value)')
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as cancelled-policy' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
-syq persist receive on --notify off
+# Notification delivery is harmless; change an actual access limit instead.
+syq persist receive on --max-entries "$((max_entries - 1))" --notify off
 if wait "$return_copy_pid"; then echo 'cancelled copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
 return_copy_pid=
 syq persist receive wait source --timeout 30
 if syq persist receive approve "$request_id"; then echo 'cancelled request was approved' >&2; exit 1; fi
 test ! -e "$receive_root/cancelled-policy"
+syq persist receive on --max-entries "$max_entries"
+syq persist receive wait source --timeout 30
 
 printf 'case: native Linux notification actions control return copies\n'
 dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py
@@ -467,6 +475,21 @@ python3 /usr/local/libexec/syq-test-forward-copy.py
 
 printf 'case: remote commands run through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-exec.py
+
+printf 'case: source copies authorized through the return connection\n'
+python3 /usr/local/libexec/syq-test-pull-copy.py
+
+printf 'case: direct SSH sessions authorized through the return connection\n'
+python3 /usr/local/libexec/syq-test-return-ssh.py
+
+printf 'case: native tools reuse laptop-approved account connections\n'
+python3 /usr/local/libexec/syq-test-ssh-tools.py
+
+printf 'case: ordinary SSH provider account access without agent forwarding\n'
+python3 /usr/local/libexec/syq-test-provider-ssh.py
+
+printf 'case: direct three-server copies use approved account connections\n'
+python3 /usr/local/libexec/syq-test-peer-bridge.py
 
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
@@ -897,6 +920,9 @@ ssh destination '
 '
 
 python3 /usr/local/libexec/syq-test-restricted-mapping.py
+
+printf 'case: receiver keys preserve login key protection\n'
+python3 /usr/local/libexec/syq-test-receiver-keys.py
 
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py

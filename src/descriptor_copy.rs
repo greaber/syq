@@ -130,10 +130,11 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut signals = crate::process::signals::interrupt_and_terminate()?;
+        let (sigint, term) = &mut *signals;
         tokio::select! {
             result = parallel::run(args, plan, controls.clone(), cancelled.clone()) => result,
-            result = tokio::signal::ctrl_c() => { result?; Err(anyhow::anyhow!("descriptor copy cancelled")) },
+            _ = sigint.recv() => { Err(anyhow::anyhow!("descriptor copy cancelled")) },
             _ = term.recv() => Err(anyhow::anyhow!("descriptor copy cancelled")),
         }
     });

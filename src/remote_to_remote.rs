@@ -766,9 +766,27 @@ fn run_remote(
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
-    let rsh = parse_rsh(&args.rsh)?;
-    let coordinator = if coordinator_at_dst { dst } else { &srcs[0] };
-    let peer = if coordinator_at_dst { &srcs[0] } else { dst };
+    let mut peer_bridge = args
+        .peer_bridge
+        .as_deref()
+        .cloned()
+        .map(|selected| selected.prepare(args, srcs, dst))
+        .transpose()?;
+    let mut coordinator = if coordinator_at_dst { dst } else { &srcs[0] }.clone();
+    let mut peer = if coordinator_at_dst { &srcs[0] } else { dst }.clone();
+    let rsh = if let Some(bridge) = &peer_bridge {
+        coordinator.user = bridge.coordinator.user.clone();
+        coordinator.host = Some(bridge.coordinator.host.clone());
+        coordinator.port = bridge.coordinator.port;
+        peer.user = bridge.peer.user.clone();
+        peer.host = Some(bridge.peer.host.clone());
+        peer.port = bridge.peer.port;
+        bridge.coordinator.rsh.clone()
+    } else {
+        parse_rsh(&args.rsh)?
+    };
+    let coordinator = &coordinator;
+    let peer = &peer;
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
     if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
@@ -785,7 +803,19 @@ fn run_remote(
     let mut restricted_destination_path = None;
     let mut restricted_grant = None;
     let mut receipt_expectation = None;
-    let default_ssh_agent_policy = if args.rsh.is_some() {
+    let default_ssh_agent_policy = if let Some(bridge) = &mut peer_bridge {
+        restricted_destination_path = Some(bridge.approved.destination.clone());
+        restricted_grant = Some(crate::destination::peer_bridge::GRANT.into());
+        receipt_expectation = Some(ReceiptExpectation {
+            public_key: bridge.approved.receipt_key.clone(),
+            enrollment_id: bridge.approved.enrollment,
+            request_id: bridge.approved.request,
+            recipient_secret: bridge.receipt_secret.take(),
+            policy: bridge.receipt_policy.clone(),
+            grant_digest: Some(bridge.approved.digest),
+        });
+        Some(AgentForwarding::Disabled)
+    } else if args.rsh.is_some() {
         None
     } else if same_host || args.peer_auth == PeerAuth::OwnCredentials {
         Some(AgentForwarding::Disabled)
@@ -822,6 +852,7 @@ fn run_remote(
                     dst,
                     &coordinator_policy.login_user,
                     &peer_policy.login_user,
+                    peer_policy.agent_socket(),
                     !args.dry_run,
                 )
             })
@@ -855,11 +886,7 @@ fn run_remote(
                     prepared.enrollment_id
                 );
             }
-            crate::agent_broker::ConstrainedAgentBroker::start_with_private_key(
-                policy,
-                limit,
-                prepared.private_key,
-            )?
+            prepared.private_key.start_broker(policy, limit)?
         } else {
             crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?
         };
@@ -881,24 +908,41 @@ fn run_remote(
         );
     }
     let coordinator_target = endpoint_display(coordinator);
-    let spec = crate::conn::RemoteSpec {
-        local_process: false,
-        user: coordinator.user.clone(),
-        host: coordinator_host.clone(),
-        port: coordinator.port,
-        rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
-        syq_path: args.syq_path.clone(),
-        bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
-        restricted_grant: None,
-        helper_install: Default::default(),
-        ssh_multiplexer: None,
-        quiet: args.quiet,
-        pacing: Default::default(),
-        tcp: Default::default(),
-        diagnostics: Default::default(),
-        primed_control: Default::default(),
-        forwarded: None,
-        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+    let spec = if let Some(bridge) = &peer_bridge {
+        bridge.coordinator.clone()
+    } else if matches!(
+        default_ssh_agent_policy,
+        None | Some(AgentForwarding::Disabled)
+    ) {
+        // Only this machine selects a persistence domain. A native coordinator
+        // can reuse its local master; credential-bound forwarding below remains
+        // private to this copy. Never send the scope path to the coordinator.
+        let crate::conn::Endpoint::Remote(mut spec) = crate::transfer::endpoint(coordinator, args)?
+        else {
+            unreachable!()
+        };
+        spec.rsh = source_setup_rsh(&rsh, args.rsh.is_some());
+        spec
+    } else {
+        crate::conn::RemoteSpec {
+            local_process: false,
+            user: coordinator.user.clone(),
+            host: coordinator_host.clone(),
+            port: coordinator.port,
+            rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
+            syq_path: args.syq_path.clone(),
+            bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: None,
+            quiet: args.quiet,
+            pacing: Default::default(),
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+            primed_control: Default::default(),
+            forwarded: None,
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        }
     };
 
     // Rebuild the native command for the remote coordinator. Placement stays
@@ -1116,7 +1160,7 @@ fn run_remote(
     if !coordinator_at_dst && !same_host {
         remote.push("--to".into());
         remote.push(endpoint_arg(
-            dst,
+            peer,
             peer_login_user.as_deref(),
             peer_connection_host.as_deref(),
         ));
@@ -1205,6 +1249,9 @@ fn run_remote(
     };
 
     let make_command = || {
+        if spec.ssh_multiplexer.is_some() {
+            return spec.coordinator_command(&remote_cmd);
+        }
         direct_command(
             &rsh,
             coordinator.user.as_deref(),
@@ -1254,6 +1301,9 @@ fn run_remote(
         crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
     }
     let run = || {
+        if let Some(bridge) = &peer_bridge {
+            return bridge.run(&remote_cmd, args.mapping_contents.clone(), relay_stdout);
+        }
         let mut cmd = make_command();
         cmd.stdin(if args.mapping_contents.is_some() {
             Stdio::piped()
@@ -1298,7 +1348,7 @@ fn run_remote(
         Ok::<_, anyhow::Error>((status, relayed?))
     };
     let (mut status, mut receipt_payload) = run()?;
-    if helper_missing(status.code(), spec.bootstrap_helper) {
+    if peer_bridge.is_none() && helper_missing(status.code(), spec.bootstrap_helper) {
         spec.install_helper()?;
         (status, receipt_payload) = run()?;
     }
@@ -1317,8 +1367,12 @@ fn run_remote(
         Some(c @ (1 | 23 | 25)) => Ok(c),
         // These arms build Err values rather than bailing: every failure
         // must pass through the held-terminal settlement below.
+        Some(c) if peer_bridge.is_some() => Err(anyhow::anyhow!(
+            "approved server-to-server copy on {coordinator_host} failed (exit {c}); check the preceding SSH error and reconnect the approved account connection if it closed"
+        )),
         Some(c) => {
-            if args.rsh.is_none()
+            if peer_bridge.is_none()
+                && args.rsh.is_none()
                 && matches!(args.peer_auth, PeerAuth::Restricted | PeerAuth::Broker)
                 && !same_host
             {

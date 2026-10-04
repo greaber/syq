@@ -337,6 +337,30 @@ fn automatic_workers_still_respect_restricted_receiver_authority() {
 }
 
 #[test]
+fn automatic_workers_respect_source_scope_but_not_full_account_ssh() {
+    let mut args = native_engine_defaults();
+    let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    args.return_source = Some(crate::destination::ReturnConnection::new(control, None));
+    assert_eq!(args.automatic_worker_limit(), 128);
+    args.resource_limits = Some(crate::advanced::ResourceLimits {
+        workers: Some(3),
+        ..Default::default()
+    });
+    assert_eq!(args.automatic_worker_limit(), 3);
+    args.resource_limits.as_mut().unwrap().workers = Some(1000);
+    assert_eq!(args.automatic_worker_limit(), 128);
+    // Account-authorized copies use a primed ordinary RemoteSpec instead of
+    // the per-copy source-authority control channel.
+    args.return_source = None;
+    args.auth_from =
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return("laptop".into()));
+    args.direct_source = Some(Box::new(crate::conn::RemoteSpec::local_receiver(true)));
+    assert_eq!(args.automatic_worker_limit(), 1000);
+    args.resource_limits = None;
+    assert_eq!(args.automatic_worker_limit(), usize::MAX);
+}
+
+#[test]
 fn resource_limits_keep_automatic_workers_and_reject_conflicts() {
     let args = parse_native_copy(
         &["source", "--as", "target", "--resource-limits=workers=3"].map(OsString::from),
@@ -877,10 +901,12 @@ fn storage_authorization_is_explicit_and_preserves_provider_options() {
             "storage",
         ]);
         let args = parse_native_copy(&argv(&command)).unwrap();
-        assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
+        assert!(
+            matches!(args.auth_from, super::AuthFrom::Provider(crate::auth_from::Provider::Return(ref name)) if name == "laptop")
+        );
         assert_eq!(args.s3.unwrap().profile.as_deref(), Some("storage"));
     }
-    for mode in ["auto", "ssh"] {
+    for mode in ["auto", "ssh", "alice@provider:2222"] {
         let error = parse_native_copy(&argv(&[
             "source",
             "--to",
@@ -916,7 +942,9 @@ fn storage_callbacks_preserve_an_explicit_authorizer() {
     ]))
     .unwrap();
     assert_eq!(args.stream_mapping_fd, Some(4));
-    assert!(matches!(args.auth_from, super::AuthFrom::Return(ref name) if name == "laptop"));
+    assert!(
+        matches!(args.auth_from, super::AuthFrom::Provider(crate::auth_from::Provider::Return(ref name)) if name == "laptop")
+    );
 }
 
 #[test]
@@ -1122,4 +1150,140 @@ fn rsync_whole_file_spellings_follow_last_option_and_keep_native_defaults_separa
     assert!(
         NativeCopyCommand::try_parse_from(["cp", "-W", "source", "--as", "destination"]).is_err()
     );
+}
+
+#[test]
+fn account_auth_selection_is_explicit_for_each_ssh_operation() {
+    for words in [
+        vec![
+            "cp",
+            "--src-fd",
+            "0",
+            "--to",
+            "server",
+            "--as",
+            "file",
+            "--auth-from",
+            "@laptop",
+        ],
+        vec![
+            "cp",
+            "--from",
+            "server",
+            "file",
+            "--as-fd",
+            "1",
+            "--auth-from",
+            "@laptop",
+        ],
+        vec!["map", "--from", "server", "file", "--auth-from", "@laptop"],
+        vec!["rm", "--on", "server", "file", "--auth-from", "@laptop"],
+        vec![
+            "clean-partials",
+            "--on",
+            "server",
+            "tree",
+            "--auth-from",
+            "@laptop",
+        ],
+        vec![
+            "rsync",
+            "server:file",
+            "local",
+            "--syq-auth-from",
+            "@laptop",
+        ],
+    ] {
+        for provider in ["@laptop", "alice@provider:2222"] {
+            let words: Vec<_> = words
+                .iter()
+                .map(|word| if *word == "@laptop" { provider } else { *word })
+                .collect();
+            let args = Args::parse_args(&argv(&words)).unwrap();
+            assert!(args.auth_from_explicit, "{words:?}");
+            assert_eq!(args.auth_from, super::parse_auth_from(provider).unwrap());
+        }
+    }
+    for words in [
+        vec!["map", "file"],
+        vec!["rm", "file"],
+        vec!["clean-partials", "tree"],
+    ] {
+        let mut words = words;
+        words.extend(["--auth-from", "@laptop"]);
+        assert!(Args::parse_args(&argv(&words)).is_err(), "{words:?}");
+    }
+}
+
+#[test]
+fn rsync_defers_file_lists_and_ignore_inputs_until_after_account_handoff() {
+    let root = crate::test_support::tempdir().unwrap();
+    let files = root.path().join("files");
+    let ignore = root.path().join("ignore");
+    let mut file_args = Args::parse_rsync(&[
+        OsString::from("source/"),
+        OsString::from("host:destination"),
+        OsString::from("--files-from"),
+        files.clone().into_os_string(),
+    ])
+    .unwrap();
+    let mut ignore_args = Args::parse_rsync(&[
+        OsString::from("source/"),
+        OsString::from("host:destination"),
+        OsString::from("--syq-ignore"),
+        OsString::from("first"),
+        OsString::from("--syq-ignore-from"),
+        ignore.clone().into_os_string(),
+        OsString::from("--syq-ignore"),
+        OsString::from("last"),
+    ])
+    .unwrap();
+    assert!(file_args.files_from_lines.is_empty());
+    assert!(ignore_args.ignore_lines.is_empty());
+    std::fs::write(&files, b"file-one\nfile-two\n").unwrap();
+    std::fs::write(&ignore, b"middle\n").unwrap();
+    file_args.read_copy_inputs().unwrap();
+    ignore_args.read_copy_inputs().unwrap();
+    assert_eq!(
+        file_args.files_from_lines,
+        [b"file-one".to_vec(), b"file-two".to_vec()]
+    );
+    assert_eq!(ignore_args.ignore_lines, ["first", "middle", "last"]);
+    std::fs::remove_file(files).unwrap();
+    std::fs::remove_file(ignore).unwrap();
+    file_args.read_copy_inputs().unwrap();
+    ignore_args.read_copy_inputs().unwrap();
+}
+
+#[test]
+fn removal_tuning_accepts_only_the_matching_endpoint_control() {
+    let parse =
+        |words: &[&str]| Args::parse_args(&words.iter().map(OsString::from).collect::<Vec<_>>());
+    let filesystem = parse(&["rm", "file", "--performance-tuning=workers=3"]).unwrap();
+    assert_eq!(filesystem.connections_opt, Some(3));
+    let s3 = parse(&[
+        "rm",
+        "--on=s3://bucket",
+        "key",
+        "--performance-tuning=s3-requests=4",
+    ])
+    .unwrap();
+    assert_eq!(s3.tuning_options.unwrap().s3_requests, Some(4));
+    for words in [
+        vec!["rm", "file", "--performance-tuning=s3-requests=4"],
+        vec![
+            "rm",
+            "--on=s3://bucket",
+            "key",
+            "--performance-tuning=workers=3",
+        ],
+        vec![
+            "rm",
+            "--on=s3://bucket",
+            "key",
+            "--performance-tuning=s3-objects=4",
+        ],
+    ] {
+        assert!(parse(&words).is_err(), "{words:?}");
+    }
 }

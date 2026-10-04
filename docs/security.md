@@ -187,8 +187,8 @@ The protection has several parts:
 1. **Set up a restricted entry point on hostB.** Your laptop uses its normal
    SSH access to install a receiver and a dedicated public key. That key's
    `authorized_keys` entry permits only the receiver command, with SSH
-   forwarding disabled. The private key stays on your laptop. Later copies
-   reuse this setup.
+   forwarding disabled. The key stays on your laptop or hardware token,
+   matching the setup login's protection. Later copies reuse this setup.
 2. **Authenticate hostA's connection without handing it the key.** A small
    signing service on your laptop answers hostA's SSH authentication requests.
    Before signing, it checks OpenSSH's cryptographic proof of which server
@@ -209,6 +209,14 @@ File data travels directly from hostA to hostB, over encrypted TCP or SSH.
 Your laptop provides authorization and verifies the result without carrying
 the file data. See [Copy between servers](remote-to-remote.md) for setup and
 revoking access.
+
+For passphrase-protected software logins, syq encrypts the receiver key on disk
+and uses the original key's agent to unlock it locally. Anyone able to request
+unrestricted signatures from that agent and read the encrypted file can also
+unlock it. Syq's constrained signing service does not expose that operation.
+The decrypted software key exists in local memory during a copy; a FIDO
+receiver key continues to require its hardware device. See
+[key matching and supported logins](remote-reference.md#enrollment).
 
 Alternative authentication modes grant more authority. `--peer-auth broker`
 limits authentication to the chosen host and user but allows that account's
@@ -258,24 +266,36 @@ consistency, and durability considerations are covered in
 ## Persistent connections
 
 A persistent SSH login lets processes running as your local user access the
-server without another key touch or agent approval. This access remains
-available even with receiving turned off. `syq persist off` closes the
-persistent connections, including receiving.
+server without another key touch or agent approval. Independent SSH data
+connections authenticate separately, even when syq account permission already
+covers them; your agent may require confirmation for each one. This access remains
+available even with receiving turned off. `syq persist off` closes the default
+domain's persistent connections, including receiving; add `--pscope PATH` to
+close an explicit domain instead.
+
+Domains separate syq's connections, saved authorization choices, receiving
+profiles, and remembered account permissions. They share your OS account's SSH
+configuration, keys, agents, and receiver identity. They are not a security
+boundary between processes running as that account. Closing an explicit domain
+also removes its saved policy; closing the default domain preserves its policy.
 
 ## Receivers
 
 With receiving enabled, servers you have persistent connections to can request
-copies to or commands on your machine, or authorization for copies to another
-server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
-disables these requests while keeping SSH reuse.
+copies to or commands on your machine, SSH account access on another server,
+or authorization for copies to or from another server or object storage.
+Receiving is configured separately. It defaults to enabled in the default
+domain and disabled in a fresh explicit domain. `syq persist receive off`
+disables these requests in the selected domain while keeping SSH reuse.
 
 Requests from a server are subject to local approval:
 
 | Request | Approval on your machine |
 |---|---|
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
-| Use your SSH access for a copy to another server | Always required |
+| Authorize one copy to or from another server | Always required |
 | Run a command on your machine | Always required |
+| Authorize an SSH login to another server account | Required unless this source and destination account pair has a session or remembered permission |
 | Use your storage credentials for a transfer | Always required |
 
 The prompt shows the server account and the requested command. For copies and
@@ -283,8 +303,9 @@ authorizations, that is the syq command the server ran, including options from
 its environment variables; your laptop derives what it enforces from that
 command and rejects a request that does not match. It cannot prove who typed
 the command. Approving a copy does not approve a later
-command. By default, every connected server can use every enabled profile.
-A profile's optional `--server` list limits which locally selected SSH
+command. By default, every connected server in a domain can use that domain's
+enabled profiles.
+A profile's optional `--connection` list limits which locally selected SSH
 connections may use it. Within each allowed server account, all processes
 share this authority; choosing a different profile name does not isolate them.
 
@@ -315,7 +336,24 @@ private key stays on your machine and grants no SSH login access.
 
 A connected server can ask your laptop to authorize a copy to another server.
 The copy uses your laptop's SSH access and the restricted receiver protections
-described in [Copies between servers](#copies-between-servers).
+described in [Copies between servers](#copies-between-servers). File data goes
+directly between the servers over encrypted TCP or SSH. When SSH data is needed,
+syq gives the source a temporary key whose destination authorization forces it
+into this copy's live worker connection, with terminal access, forwarding and
+`~/.ssh/rc` disabled (the account's shell may still read its startup files). The destination still enforces the approved
+copy scope. Closing the copy invalidates its worker connections and removes
+the key entry; an entry left by an interrupted cleanup cannot join another
+copy. Your laptop's credentials and signing agent remain on the laptop.
+
+A server can also request source-read approval to download files from another
+server. The source helper confines reads to the approved files and directory
+trees, checks the selected symlink behavior, and limits returned file data,
+entries, and connections. Hashing approved files for comparison and verification
+is permitted separately; the data limit is not a limit on information that can
+be inferred from those hashes. It accepts no writes or removal operations.
+File data uses authenticated encrypted TCP directly between the servers;
+metadata and control use the laptop connection. If direct TCP is unavailable,
+the copy fails. Closing the approval connection stops further reads.
 
 <a id="approved-commands-on-receiving-machines"></a>
 
@@ -336,3 +374,67 @@ a signature does not cover.
 Anyone with the URLs can reuse them until expiry; stopping receiving does not
 revoke them. Filesystem receiver roots, aggregate limits, one-use grants, and
 signed receipts do not apply.
+
+## SSH account access
+
+Selecting `--auth-from @laptop` for an SSH command or an ordinary remote file
+operation requests access to the destination account. Approval grants that
+account's authority, including arbitrary commands and access to its files.
+The displayed command is requester-supplied context; it is not an enforced
+command restriction. Copy paths, download roots, and byte limits do not constrain
+account permission. Explicit restricted-copy grants retain their own scope.
+
+**Allow** approves the source-account/destination-account pair for the current
+laptop-to-source receiving connection. **Remember** permits future authentications
+through the same profile in the same authorizing domain while the laptop is
+available. The permission binds
+the selected account and connection route to the provider's trusted host name and
+plain SSH host keys; changed identities require fresh approval. The approval
+identifies the host using the provider's trust lookup and shows the
+requester-supplied connection address separately. The source connection is pinned to
+that identity when it starts. Unsupported source identity lookup does not affect
+ordinary receiving, but account authorization requires a supported trusted identity.
+
+Commands and copies reuse the approved SSH connection. Any process running as
+the requesting account can use its owner-only control socket. Trust therefore
+extends to that account's processes, not just the shell asking for permission.
+The laptop restricts authentication signatures to the approved destination host
+keys and login account. Its ordinary agent is not forwarded, and this permission
+cannot authenticate to a different destination account or sign arbitrary messages.
+
+The requesting machine chooses the account and route through its SSH
+configuration. It cannot make the provider trust a host key merely by including
+that key in a request: the provider checks its own trusted host information.
+`ProxyJump` requires permission for each jump account as well as the final
+account. Custom proxy commands use local authentication and do not receive
+the provider's agent socket.
+
+A laptop agent key constrained with `ssh-add -h hostB` can authorize this login:
+the agent sees the real direct binding to hostB. Syq separately approves the
+requesting source account; an agent constraint describing a forwarded A-to-B
+hop is not implied by that approval.
+
+Stopping receiving ends further authorization through that connection. Removing
+a remembered permission requires new approval for future authentications. Syq
+cleans up its owned connections, but already authenticated sessions may continue,
+including additional commands within them. These actions cannot undo remote
+changes, stop detached processes, or revoke independent access already created
+with the approved account. See [account permission controls](persistence-reference.md#account-permissions).
+
+### Ordinary SSH authorization providers
+
+`--auth-from [USER@]HOST[:PORT]` opens a native SSH login to the provider account.
+That account's local receiving service holds the agent environment and asks for
+access to each destination account. It does not learn or verify which source
+machine initiated the login. The prompt therefore identifies access through the
+provider account, rather than asserting a source-server identity. **Allow** lasts
+for the current provider connection; **Remember** covers later logins to that
+provider account through the same profile and authorizing domain.
+
+The provider login has full account access. A caller with that access can run
+programs there and use its credentials outside syq. Syq's prompts are useful
+controls for its own operations, not an enforcement boundary against someone
+who controls the provider account. Use a receiving connection from a laptop when
+the requesting server must not have a full SSH login to the credential holder.
+Stopping receiving prevents further syq authorizations but does not revoke the
+caller's independent SSH access to the provider.

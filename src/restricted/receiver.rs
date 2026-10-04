@@ -11,7 +11,7 @@ pub(crate) fn receiver_config(id: EnrollmentId) -> Result<(ReceiverEnrollment, P
         MAX_STATE_FILE,
     )?;
     let config: ReceiverEnrollment = serde_json::from_slice(&encoded)?;
-    if config.version != CONFIG_VERSION || config.id != id {
+    if !supported_config_version(config.version) || config.id != id {
         bail!("restricted receiver configuration does not match enrollment");
     }
     Ok((config, state.join("allowed-signers"), state.join("replay")))
@@ -67,6 +67,7 @@ pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
         allowed_signers,
         revocation_file: None,
     };
+    enforce_grant_security_key_flags(&envelope, config.security_key_flags)?;
     let verified = delegation::verify_and_redeem(&envelope, &context, &policy, &replay)?;
     let (grant, extensions, grant_digest, deadline) = verified.into_parts();
     let receipt_key = load_receipt_key(replay_path.parent().context("receiver state directory")?)?;
@@ -192,27 +193,35 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             let active = load_local_enrollments()?
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
-            let (target_login, host, port, directory) = match active {
+            let (target_login, host, port, directory, security_key_flags) = match active {
                 Some((metadata, directory)) => (
                     metadata.target_login,
                     metadata.host,
                     metadata.port,
                     directory,
+                    metadata.security_key_flags,
                 ),
                 None => {
                     let (pending, directory) = load_pending_enrollments()?
                         .into_iter()
                         .find(|(pending, _)| pending.id == id)
                         .context("no local enrollment has that ID")?;
-                    (pending.target_login, pending.host, pending.port, directory)
+                    (
+                        pending.target_login,
+                        pending.host,
+                        pending.port,
+                        directory,
+                        pending.security_key_flags,
+                    )
                 }
             };
-            let private_key = load_private_key(&directory)?;
+            let public_key = load_enrollment_public_key(&directory)?;
             let request = RevokeRequest {
+                security_key_flags,
                 version: CONFIG_VERSION,
                 id,
                 target_login: target_login.clone(),
-                public_key: private_key.public_key().to_openssh()?,
+                public_key: public_key.to_openssh()?,
             };
             let target = endpoint(&target_login, &host, port)?;
             let encoded = serde_json::to_vec(&request)?;

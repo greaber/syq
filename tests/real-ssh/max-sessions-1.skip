@@ -1,10 +1,11 @@
 # Cases skipped with --profile max-sessions-1 in CI; every other case runs.
-# The profile changes only the destination's sshd and the runner's
-# strict-multiplexing SSH wrapper, which applies only to connections to
-# destination. A case that never contacts destination, directly, through a
-# script it runs, or through a coordinator on another host, behaves exactly
-# as in the default profile. List only such cases, and only when no case that
-# still runs needs their setup. New cases run in both profiles unless listed.
+# The profile changes destination's sshd and its strict-multiplexing wrapper.
+# Skip cases unaffected by destination's session limit when no remaining case
+# needs their setup, plus workflows that require concurrent shared sessions.
+# These cases still run in the default profile. New cases run in both unless
+# listed here with a shared-session requirement or no destination interaction.
+# The approved peer bridge holds C's control while opening SSH worker setup.
+direct three-server copies use approved account connections
 privileged copies keep root security checks
 ephemeral connect only reuses forward SSH and leaves receiving off
 return copies await local approval and denial leaves no destination

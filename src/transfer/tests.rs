@@ -42,6 +42,14 @@ fn seeded_hashes_preserve_selected_positions_and_require_actual_matches() {
 }
 
 #[test]
+fn only_a_single_fixed_tcp_port_waits_for_helpers() {
+    assert!(!helpers_hold_the_only_tcp_port(None));
+    assert!(!helpers_hold_the_only_tcp_port(Some((0, 0))));
+    assert!(!helpers_hold_the_only_tcp_port(Some((47_600, 47_699))));
+    assert!(helpers_hold_the_only_tcp_port(Some((47_600, 47_600))));
+}
+
+#[test]
 fn source_block_must_match_the_requested_range() {
     assert!(validate_range_reply(4096, 1024, 4096, 1024).is_ok());
     for (off, len) in [

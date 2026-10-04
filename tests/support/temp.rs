@@ -1,6 +1,6 @@
 //! Temporary fixture roots shared by unit and integration tests.
 //!
-//! Resolve only the ambient temporary directory, before creating fixtures.
+//! Resolve temporary roots before creating fixtures.
 //! Symlinks created inside a fixture keep their meaning for product tests.
 
 use std::path::PathBuf;
@@ -16,4 +16,12 @@ pub(crate) fn temp_dir() -> PathBuf {
 #[allow(dead_code)]
 pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::tempdir_in(temp_dir())
+}
+
+/// A canonical short root for fixtures whose Unix socket paths or persistence
+/// scopes must fit the platform's path limit, even with a long ambient TMPDIR.
+/// Keep ordinary filesystem fixtures on tempdir() so they use the ambient root.
+#[allow(dead_code)]
+pub(crate) fn short_tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(std::fs::canonicalize("/tmp")?)
 }

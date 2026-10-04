@@ -28,10 +28,15 @@ use std::time::{Duration, Instant};
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
 use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
+pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
 pub(crate) mod handoff;
 mod identity;
+pub(crate) mod peer_bridge;
+pub(crate) mod pull;
+pub(crate) mod ssh;
+pub(crate) mod ssh_auth;
 pub(crate) mod storage;
 pub(crate) mod tcp;
 
@@ -59,7 +64,8 @@ enum Approval {
 #[derive(Parser, Debug)]
 #[command(
     name = "destinations",
-    about = "Inspect named destinations available to this server account"
+    about = "Inspect named destinations available to this server account",
+    long_about = "Inspect named destinations available to this server account. Registrations are shared across persistence domains: --pscope does not filter names, and forgetting an offline name releases it for the whole account."
 )]
 pub(crate) struct Destinations {
     #[command(subcommand)]
@@ -104,13 +110,67 @@ pub(crate) struct Approved {
 
 #[derive(Debug)]
 pub(crate) struct NamedReceipt {
-    control: Mutex<Option<UnixStream>>,
+    pub(crate) connection: Option<Arc<ReturnConnection>>,
     secret: crate::receipt::RecipientSecret,
     approved: Approved,
     policy: crate::receipt::ReceiptPolicy,
 }
 
-impl NamedReceipt {
+/// One approved control channel and its direct worker transport. Copies from
+/// an approved source use this without a destination receipt.
+#[derive(Debug)]
+pub(crate) struct ReturnConnection {
+    ssh: Option<forward::ssh::Client>,
+    data_hostname: Option<String>,
+    control: Mutex<Option<UnixStream>>,
+}
+
+impl ReturnConnection {
+    pub(super) fn new(stream: UnixStream, ssh: Option<forward::ssh::Client>) -> Arc<Self> {
+        Arc::new(Self {
+            ssh,
+            data_hostname: None,
+            control: Mutex::new(Some(stream)),
+        })
+    }
+
+    pub(super) fn source(stream: UnixStream, data_hostname: String) -> Result<Arc<Self>> {
+        validate_data_hostname(&data_hostname)?;
+        Ok(Arc::new(Self {
+            ssh: None,
+            data_hostname: Some(data_hostname),
+            control: Mutex::new(Some(stream)),
+        }))
+    }
+
+    pub(super) fn peer(
+        stream: UnixStream,
+        ssh: forward::ssh::Client,
+        data_hostname: String,
+    ) -> Result<Arc<Self>> {
+        validate_data_hostname(&data_hostname)?;
+        Ok(Arc::new(Self {
+            ssh: Some(ssh),
+            data_hostname: Some(data_hostname),
+            control: Mutex::new(Some(stream)),
+        }))
+    }
+
+    pub(crate) fn data_hostname(&self) -> Option<&str> {
+        self.data_hostname.as_deref()
+    }
+
+    pub(crate) fn has_ssh(&self) -> bool {
+        self.ssh.is_some()
+    }
+
+    pub(crate) fn ssh_command(&self) -> Result<Command> {
+        self.ssh
+            .as_ref()
+            .context("copy has no SSH worker authorization")?
+            .command()
+    }
+
     pub(crate) fn take_control(&self) -> Result<UnixStream> {
         self.control
             .lock()
@@ -118,6 +178,21 @@ impl NamedReceipt {
             .take()
             .context("approved return control connection was already consumed")
     }
+}
+
+/// This value is a TCP address candidate only, never SSH or shell syntax.
+fn validate_data_hostname(host: &str) -> Result<()> {
+    anyhow::ensure!(
+        !host.is_empty()
+            && host.len() <= 512
+            && !host.starts_with('-')
+            && (host.parse::<std::net::Ipv6Addr>().is_ok()
+                || host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))),
+        "approved source data hostname is not a plain hostname or IP address"
+    );
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,6 +213,8 @@ enum Message {
         challenge: String,
     },
     Exec(exec::ExecRequest),
+    ResolveLocalSsh(ssh_auth::LocalTarget),
+    LocalSsh(ssh_auth::LocalRequest),
     // Copy and storage requests carry the command that produced them. The
     // receiving machine derives the request from it and shows it for approval.
     // `cwd` is the requesting process's working directory, shown with the
@@ -154,6 +231,16 @@ enum Message {
         cwd: String,
         request: Box<CopyRequest>,
     },
+    Pull {
+        target: String,
+        command: Vec<Vec<u8>>,
+        cwd: String,
+        request: Box<pull::PullRequest>,
+    },
+    ForwardSsh {
+        token: String,
+        public_key: String,
+    },
     Forward {
         target: String,
         command: Vec<Vec<u8>>,
@@ -168,6 +255,9 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    RetryableError(String),
+    SourceApproved { data_hostname: Option<String> },
+    ForwardSsh(forward::ssh::Peer),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
     Ready,
@@ -400,6 +490,13 @@ pub(crate) fn receiver_identity_directory() -> Result<PathBuf> {
     Ok(fs::canonicalize(home)?.join(".syq-receiver-identity"))
 }
 
+pub(crate) fn receiving_identity_fingerprint() -> Result<String> {
+    Ok(identity::load_key()?
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string())
+}
+
 fn registry() -> Result<PathBuf> {
     private_directory(".syq-destinations-v3")
 }
@@ -456,27 +553,41 @@ pub(crate) fn registered_names() -> Vec<String> {
     names
 }
 
-fn read_registration(name: &str) -> Result<Registration> {
+/// Inspect local registration metadata without creating state or contacting
+/// the provider. Absence is ordinary for completion and optional caches.
+fn read_existing_registration(name: &str) -> Result<Option<Registration>> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
+    read_existing_registration_at(&home.join(".syq-destinations-v3"), name)
+}
+
+fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<Registration>> {
     validate_name(name)?;
-    let path = registry()?.join(format!("{name}.json"));
-    let encoded = match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
-        Ok(encoded) => encoded,
-        Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => {
-            if identity::owner(&registry()?, name)?.is_some() {
-                bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
-            }
-            let names = registered_names();
-            let advice = if names.is_empty() {
-                "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
-            } else {
-                let shown = names.iter().take(8).map(|name| format!("@{name}")).collect::<Vec<_>>().join(", ");
-                format!("Registered names: {shown}{}. Use one of these names, or connect another receiving machine with `syq persist connect SERVER`.", if names.len() > 8 { ", ..." } else { "" })
-            };
-            bail!("no receiving machine named @{name} is registered for this account.\n{advice}\nRun `syq persist destinations list` to see names and connection status.");
-        }
-        Err(error) => return Err(error).with_context(|| format!("cannot read the registration for @{name}; check its permissions or reconnect from the receiving machine")),
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        bail!("destination registry must be an owned directory with mode 0700");
+    }
+    let path = directory.join(format!("{name}.json"));
+    let encoded =
+        match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
+            Ok(encoded) => encoded,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
     let registration: Registration = serde_json::from_slice(&encoded)?;
     if registration.version != REGISTRATION_VERSION {
         bail!("unsupported destination registration; reconnect from the receiving machine");
@@ -487,7 +598,31 @@ fn read_registration(name: &str) -> Result<Registration> {
     {
         bail!("invalid destination helper registration; reconnect from the receiving machine");
     }
-    Ok(registration)
+    Ok(Some(registration))
+}
+
+fn read_registration(name: &str) -> Result<Registration> {
+    if let Some(registration) = read_existing_registration(name)
+        .with_context(|| format!("cannot read the registration for @{name}; check its permissions or reconnect from the receiving machine"))?
+    {
+        return Ok(registration);
+    }
+    if identity::owner(&registry()?, name)?.is_some() {
+        bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
+    }
+    let names = registered_names();
+    let advice = if names.is_empty() {
+        "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
+    } else {
+        let shown = names
+            .iter()
+            .take(8)
+            .map(|name| format!("@{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Registered names: {shown}{}. Use one of these names, or connect another receiving machine with `syq persist connect SERVER`.", if names.len() > 8 { ", ..." } else { "" })
+    };
+    bail!("no receiving machine named @{name} is registered for this account.\n{advice}\nRun `syq persist destinations list` to see names and connection status.");
 }
 
 fn load_registration(name: &str) -> Result<Registration> {
@@ -707,9 +842,66 @@ fn select_copy(
     args: &mut crate::cli::Args,
     progress: Option<&crate::progress::Progress>,
 ) -> Result<Option<handoff::Selection>> {
+    // Other operation interfaces select account authorization at their
+    // transport boundary; native copies select it here before reading inputs.
+    if args.interface != crate::cli::Interface::NativeCp
+        || args.coordinate_at == crate::cli::CoordinateAt::Local
+    {
+        return Ok(None);
+    }
+    if peer_bridge::configure(args)? {
+        return Ok(None);
+    }
+    // A helper handoff carries the already selected, identity-checked receiver.
+    // Re-reading mutable defaults here could redirect the original request.
+    if let Some(name) = handoff::selected_name(handoff::Kind::Forward)
+        .or_else(|| handoff::selected_name(handoff::Kind::Pull))
+    {
+        args.auth_from =
+            crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name.to_owned()));
+    } else {
+        crate::auth_from::apply_copy(args)?;
+        if let Some(selection) = peer_bridge::select(args)? {
+            args.peer_bridge = Some(Arc::new(selection));
+            return Ok(None);
+        }
+        if account_copy::select(args)? {
+            return Ok(None);
+        }
+    }
+    let is_pull = args
+        .locations
+        .split_last()
+        .is_some_and(|(destination, sources)| {
+            !destination.is_remote() && sources.iter().any(|source| source.is_remote())
+        });
+    if is_pull {
+        return pull::select(args, progress);
+    }
     match &args.auth_from {
-        crate::cli::AuthFrom::Return(_) => return forward::select(args, progress),
+        crate::cli::AuthFrom::Provider(_) => return forward::select(args, progress),
         crate::cli::AuthFrom::Ssh => {
+            if args
+                .locations
+                .split_last()
+                .is_some_and(|(destination, sources)| {
+                    destination.is_remote()
+                        && destination
+                            .host
+                            .as_deref()
+                            .is_none_or(|host| !host.starts_with('@'))
+                        && !sources.is_empty()
+                        && sources.iter().all(|source| {
+                            source.is_remote()
+                                && source
+                                    .host
+                                    .as_deref()
+                                    .is_none_or(|host| !host.starts_with('@'))
+                        })
+                })
+            {
+                return Ok(None);
+            }
             let (destination, sources) = args
                 .locations
                 .split_last()
@@ -753,13 +945,12 @@ fn select_copy(
     }
     if args.syq_path.is_some()
         || args.rsh.is_some()
-        || args.pscope_explicit
         || args.detach
         || args.restricted_grant.is_some()
         || args.no_tcp_encryption
         || args.peer_auth != crate::cli::PeerAuth::Restricted
     {
-        bail!("named destinations own their connection; --syq-path, --rsh, --pscope, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
+        bail!("named destinations own their connection; --syq-path, --rsh, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
     }
     if args.connections_opt.is_some()
         && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)
@@ -778,6 +969,9 @@ fn select_copy(
 }
 
 pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
+    if peer_bridge::configure(args)? {
+        return Ok(());
+    }
     let selection = match args.return_selection.take() {
         Some(selection) => selection,
         None => select_copy(args, None)?,
@@ -786,6 +980,9 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         return Ok(());
     };
     handoff::check_selection(&selection)?;
+    if selection.kind == handoff::Kind::Pull {
+        return pull::prepare(args, selection);
+    }
     if selection.kind == handoff::Kind::Forward {
         return forward::prepare(args, selection);
     }
@@ -828,7 +1025,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         })?)
     ));
     args.named_receipt = Some(Arc::new(NamedReceipt {
-        control: Mutex::new(None),
+        connection: None,
         secret,
         approved,
         policy,
@@ -944,7 +1141,11 @@ struct Receiver {
     sessions: Mutex<HashMap<String, Session>>,
     active_streams: Arc<crate::private_broker::ConnectionRegistry>,
     exec_count: AtomicU64,
+    ssh_count: AtomicU64,
+    account_source: Mutex<std::result::Result<crate::receive_approval::AccountIdentity, String>>,
+    account_sessions: Mutex<HashMap<String, u64>>,
     forward_count: std::sync::atomic::AtomicUsize,
+    forward_sessions: Mutex<HashMap<String, Arc<forward::ssh::Session>>>,
     request_lock: Mutex<()>,
     stop: Arc<AtomicBool>,
 }
@@ -994,6 +1195,7 @@ impl Receiver {
     fn revoke_all(&self) {
         let mut sessions = self.sessions.lock().unwrap();
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.account_sessions.lock().unwrap().clear();
         self.active_streams.shutdown_all();
         for (_, session) in sessions.drain() {
             session.authority.close_control();
@@ -1022,6 +1224,8 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
+            Message::ResolveLocalSsh(target) => self.resolve_local_ssh(target, stream),
+            Message::LocalSsh(request) => self.authorize_local_ssh(request, stream),
             Message::Storage {
                 command,
                 cwd,
@@ -1034,6 +1238,15 @@ impl Receiver {
                 }
                 let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
                 write_message(&mut stream, &Reply::Identity(proof))
+            }
+            Message::Pull {
+                target,
+                command,
+                cwd,
+                request,
+            } => self.pull(target, command, cwd, *request, stream),
+            Message::ForwardSsh { token, public_key } => {
+                self.forward_ssh(token, public_key, stream)
             }
             Message::Forward {
                 target,
@@ -1246,6 +1459,55 @@ fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     }
     cmd
 }
+fn pin_receiving_source(
+    command: &mut Command,
+    policy: &crate::agent_broker::HostPolicy,
+    hosts: &Path,
+) -> Result<crate::receive_approval::AccountIdentity> {
+    let identity = crate::receive_approval::AccountIdentity::new(
+        crate::cli::NativeEndpoint {
+            user: Some(policy.login_user.clone()),
+            host: policy.connection_host().into(),
+            port: Some(policy.port()),
+        },
+        policy.pinned_host_key_fingerprints(),
+    )?;
+    anyhow::ensure!(
+        hosts
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(byte)),
+        "account approval requires a temporary path without SSH expansion tokens or whitespace"
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(hosts)?;
+    // Keep the native lookup spelling (configured HostKeyAlias, otherwise the
+    // resolved host and port). A synthetic alias would also alter SSH's %k.
+    file.write_all(policy.native_known_hosts()?.as_bytes())?;
+    command.args(["-l", &policy.login_user, "-p", &policy.port().to_string()]);
+    for option in [
+        format!("Hostname={}", policy.connection_host()),
+        "StrictHostKeyChecking=yes".into(),
+        "VerifyHostKeyDNS=no".into(),
+        "KnownHostsCommand=none".into(),
+        "NoHostAuthenticationForLocalhost=no".into(),
+        format!("UserKnownHostsFile={}", hosts.display()),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "UpdateHostKeys=no".into(),
+        "CheckHostIP=no".into(),
+        format!("HostKeyAlgorithms={}", policy.host_key_algorithms()),
+    ] {
+        command.args(["-o", &option]);
+    }
+    Ok(identity)
+}
+
 pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
@@ -1290,7 +1552,11 @@ pub(crate) fn serve_background(
             Duration::from_secs(10),
         )),
         exec_count: AtomicU64::new(0),
+        ssh_count: AtomicU64::new(0),
+        account_source: Mutex::new(Err("receiving SSH connection is not ready".into())),
+        account_sessions: Mutex::new(HashMap::new()),
         forward_count: std::sync::atomic::AtomicUsize::new(0),
+        forward_sessions: Mutex::new(HashMap::new()),
         request_lock: Mutex::new(()),
         stop: stop.clone(),
     });
@@ -1308,7 +1574,7 @@ pub(crate) fn serve_background(
             let writer = stream.try_clone();
             if let Err(error) = handler.handle(stream) {
                 if let Ok(mut writer) = writer {
-                    let _ = write_message(&mut writer, &Reply::Error(format!("{error:#}")));
+                    let _ = ssh_auth::reply_error(&mut writer, &error);
                 }
             }
         },
@@ -1324,6 +1590,27 @@ pub(crate) fn serve_background(
                 receiver.secret.clone(),
             ];
             let mut command = ssh_command(&spec.endpoint);
+            // Remembered permissions identify the actual locally selected source
+            // account and its trusted host keys. Freeze that policy for this SSH
+            // connection; reconnecting takes a new snapshot and clears session grants.
+            // Unsupported policy does not prevent ordinary receiving.
+            let source_identity = (|| -> Result<crate::receive_approval::AccountIdentity> {
+                let policy = crate::agent_broker::resolve_host_policy_at_bounded(
+                    "ssh",
+                    spec.endpoint.user.as_deref(),
+                    &spec.endpoint.host,
+                    spec.endpoint.port,
+                    Instant::now() + Duration::from_secs(30),
+                    &|| stop.load(Ordering::Acquire),
+                )?;
+                let hosts = broker.socket_path().with_file_name("source-known-hosts");
+                pin_receiving_source(&mut command, &policy, &hosts)
+            })();
+            *receiver.account_source.lock().unwrap() = source_identity.map_err(|error|
+                format!("cannot identify the requesting SSH account for account approval: {error:#}; trust this source's plain SSH host key on the laptop and reconnect"));
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             command
                 .args([
                     "-o",
@@ -1666,6 +1953,15 @@ fn destinations(action: DestinationAction) -> Result<i32> {
     }
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if let Some(result) = peer_bridge::dispatch(argv) {
+        return Some(result);
+    }
+    if let Some(result) = ssh::provider::dispatch(argv) {
+        return Some(result);
+    }
+    if let Some(result) = ssh::persistent::dispatch(argv) {
+        return Some(result);
+    }
     match argv.get(1).and_then(|s| s.to_str())? {
         "--destination-register" => Some((|| {
             if argv.len() != 5 {

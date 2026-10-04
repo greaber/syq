@@ -60,6 +60,7 @@ Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_non_dir` and `src_d
 | `cwd` | Source resolution base; may be remote for `cp` and `rm` |
 | `root` | Confine source resolution beneath this directory; requires relative selectors; conflicts with `cwd` |
 | `follow`, `follow_src` | Follow source symlinks; `follow` also enables destination following for `cp` |
+| `auth_from` | `"auto"`, `"ssh"`, `"@NAME"`, or an SSH provider endpoint; SSH operations request or reuse account access. S3 `cp` and `rm` can request operation authorization through `"@NAME"` |
 | `timeout` | Omitted: use client default; `None`: no timeout; number: timeout in seconds |
 
 Boolean flags default to `False`; other optional arguments default to `None`,
@@ -103,7 +104,6 @@ In addition to the shared arguments above, it accepts:
 | `s3_endpoint`, `s3_region`, `s3_profile` | Endpoint URL, signing region, and AWS profile strings |
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
 | `s3_write_header` | Iterable of `"NAME: VALUE"` strings; applied only to requests that create or replace objects |
-| `auth_from` | Credential source string |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
 | `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
 | `syq_path` | Remote executable path |
@@ -131,8 +131,8 @@ for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility)
 for executable selection.
 
-Typed SSH-to-SSH copies require an enrolled receiver or
-`coordinate_at="local"`. With `dry_run=True`, they require
+Typed SSH-to-SSH copies use an enrolled receiver, existing approved account
+connections to both endpoints, or `coordinate_at="local"`. With `dry_run=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,
@@ -153,7 +153,7 @@ returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `no_tcp_encryption`,
-`tcp_ports`, `tcp_congestion`, `auth_from` (S3), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
+`tcp_ports`, `tcp_congestion`, `auth_from` (S3 authorization or requested/reused SSH account access), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`. `open_writer` also accepts
@@ -278,7 +278,10 @@ enabled.
 arguments, it accepts `on`, `dry_run`, `performance_tuning`, `syq_path`,
 `no_bootstrap`, `pscope`, `on_event`, `results`, and `check` with the types above.
 It supports local, ordinary SSH, and S3 endpoints. Command-restricted receivers
-reject removal. See [Remove files](https://greaber.github.io/syq/remove.html).
+reject removal. `performance_tuning="workers=N"` fixes filesystem deletion
+concurrency; `performance_tuning="s3-requests=N"` fixes S3 deletion concurrency.
+Omitting it lets syq tune deletion separately from copying. See
+[Remove files](https://greaber.github.io/syq/remove.html).
 
 S3 removal uses `rm(..., on="s3://bucket")` with optional `s3_endpoint`,
 `s3_region`, `s3_profile`, `s3_header`, and `auth_from="@NAME"`. `s3_all_versions=True` permanently
@@ -311,7 +314,7 @@ For S3, `mtime` is stored filesystem time, omitted when unavailable;
 `s3_last_modified` is the independent S3 object modification time. Requesting
 `kind` or `mtime` reads S3 object metadata; generation never downloads bodies.
 
-Connection options are `rsh`, `syq_path`, `no_bootstrap`, `s3_endpoint`,
+Connection options are `auth_from`, `rsh`, `syq_path`, `no_bootstrap`, `s3_endpoint`,
 `s3_region`, `s3_profile`, and `s3_header`, with the same types as on `cp`.
 Explicit connection options are kept through transformations and copying.
 For example, the consumer uses the same object service here:
@@ -338,7 +341,7 @@ with a different `process_cwd`.
 `Mapping(entries, *, from_=None, cwd=None, root=None, follow_src=False,
 **connection_options)` accepts an iterable of `MappingEntry`.
 `AsyncMapping(...)` accepts an async iterable. The connection options are the
-same seven options listed for `map` above.
+same options listed for `map` above.
 
 Supply at most one of `cwd` and `root`; `root` confines source resolution.
 Local relative bases resolve against the Python process directory at

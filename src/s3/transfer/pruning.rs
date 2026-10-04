@@ -3,6 +3,8 @@ use crate::s3::prune::{self, Plan};
 use std::collections::BTreeSet;
 
 struct Candidate {
+    depth: usize,
+    size: u64,
     path: Vec<u8>,
     // An S3 marker retains its trailing slash; local directories do not.
     key: Option<String>,
@@ -12,7 +14,7 @@ struct Candidate {
 
 impl Engine {
     pub(super) async fn prune(
-        &self,
+        self: &Arc<Self>,
         mut plan: Plan,
         destination: Option<&Destination>,
     ) -> Result<()> {
@@ -49,22 +51,58 @@ impl Engine {
         }
         if destination.is_none() && !self.args.dry_run {
             self.delete_objects(&found).await?;
-        } else {
+        } else if self.args.dry_run {
             for candidate in found {
                 self.check_cancelled()?;
-                let result = if self.args.dry_run {
-                    Ok(())
-                } else {
-                    let root = &destination.unwrap().root;
-                    let path = RelativePath::new(&candidate.path)?;
-                    if candidate.kind == "dir" {
-                        root.remove_directory(&path)
-                    } else {
-                        root.unlink(&path)
-                    }
-                };
-                self.deletion_finished(&candidate, result, "io");
+                self.deletion_finished(&candidate, Ok(()), "io");
             }
+        } else {
+            let root = destination.unwrap().root.clone();
+            let engine = self.clone();
+            // Blocking filesystem calls belong off the async executor. Await
+            // the worker even on cancellation, as Engine::run drains its work.
+            tokio::task::spawn_blocking(move || {
+                let mut found = found;
+                found.sort_by_key(|c| std::cmp::Reverse(c.depth));
+                let mut deletion = crate::deletion::Batch::default();
+                // Equal-depth entries are independent; finish children before
+                // admitting their parents and never remove a tree recursively.
+                for level in found.chunk_by(|a, b| a.depth == b.depth) {
+                    let mut remaining = level;
+                    while !remaining.is_empty() {
+                        engine.check_cancelled()?;
+                        let (chunk, rest) =
+                            remaining.split_at(remaining.len().min(deletion.chunk_size()));
+                        remaining = rest;
+                        let results = deletion.run_init(
+                            chunk,
+                            crate::deletion::DirectoryBatch::default,
+                            |admission, candidate| {
+                                if engine.check_cancelled().is_err() {
+                                    return None;
+                                }
+                                Some(RelativePath::new(&candidate.path).and_then(|path| {
+                                    if candidate.kind == "dir" {
+                                        root.remove_directory(&path)
+                                    } else {
+                                        admission.before_unlink(&root, &path, candidate.size)?;
+                                        root.unlink(&path)
+                                    }
+                                }))
+                            },
+                            |result| matches!(result, Some(Ok(()))),
+                        )?;
+                        for (candidate, result) in chunk.iter().zip(results) {
+                            if let Some(result) = result {
+                                engine.deletion_finished(candidate, result, "io");
+                            }
+                        }
+                        engine.check_cancelled()?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
         }
         Ok(())
     }
@@ -126,6 +164,8 @@ impl Engine {
                         }
                     }
                     found.push(Candidate {
+                        depth: path.iter().filter(|&&b| b == b'/').count(),
+                        size: meta.len,
                         path,
                         key: None,
                         identity: Some((meta.dev, meta.ino)),
@@ -184,6 +224,8 @@ impl Engine {
                     // Ignored keys need not be representable as local paths.
                     local::key_path(&path)?;
                     found.push(Candidate {
+                        depth: path.iter().filter(|&&b| b == b'/').count(),
+                        size,
                         path,
                         key: Some(key),
                         identity: None,
@@ -266,7 +308,7 @@ impl Engine {
         crate::s3::delete::Deleter {
             client: &self.client,
             bucket: &self.options.bucket,
-            budget: &self.tuning.requests,
+            concurrency: crate::deletion::Concurrency::s3(&self.args),
             individual: self.authorization.is_some(),
         }
         .run(
@@ -280,7 +322,7 @@ impl Engine {
                 let class = result.as_ref().err().map_or("transport", |e| e.class);
                 self.deletion_finished(
                     candidate,
-                    result.map_err(|e| anyhow::anyhow!(e.message)),
+                    result.map(|_| ()).map_err(|e| anyhow::anyhow!(e.message)),
                     class,
                 );
             },

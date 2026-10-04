@@ -1383,7 +1383,13 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     });
     for args in [
         vec!["persist", "status", "--pscope", scope.to_str().unwrap()],
-        vec!["persist", "receive", "status"],
+        vec![
+            "persist",
+            "receive",
+            "status",
+            "--pscope",
+            scope.to_str().unwrap(),
+        ],
     ] {
         let output = command(&args).run().unwrap();
         assert_output_ok(&output);
@@ -1393,9 +1399,16 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
             "{text}"
         );
     }
-    let output = command(&["persist", "receive", "status", "--json"])
-        .run()
-        .unwrap();
+    let output = command(&[
+        "persist",
+        "receive",
+        "status",
+        "--json",
+        "--pscope",
+        scope.to_str().unwrap(),
+    ])
+    .run()
+    .unwrap();
     assert_output_ok(&output);
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["connections"][0]["connection"]["error"], error);

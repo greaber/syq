@@ -504,6 +504,24 @@ infer sustained performance from subsecond runs unless there is evidence that
 they reach a representative steady state quickly. Consider startup, autotuning
 and variability, and lengthen or repeat the test as needed to support the claim.
 
+Record resource use with every benchmark, not only elapsed time. At minimum,
+report CPU time (user and system) and peak memory for each process, the
+coordinator and every helper, and compare both with the baseline. Also record
+the other resources the change could affect, such as bytes sent or written,
+threads and open files, filesystem or network requests, and disk space. A
+change can be faster while using several times the memory or CPU, and timing
+alone hides that.
+
+When new code replaces or bypasses an existing path, first list what the
+existing path does for performance and resource use: preallocation, cloning
+or in-kernel copies, read-ahead and access hints, request sizes, memory bounds
+and batching. Either carry each one over, or measure the cases it was meant to
+help and show that the new path does not regress them. Measure on the kinds of
+system those choices target, such as filesystems with and without cloning
+(XFS or btrfs against ext4), network filesystems, and slow and fast links. A
+choice that only matters elsewhere is invisible on the development machine's
+own filesystem.
+
 ## Verification
 
 **Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
@@ -520,7 +538,9 @@ from `tests/support/temp.rs` (re-exported by `src/test_support.rs` for unit
 tests). These resolve the ambient temporary root before creating fixtures,
 so macOS `/var` and other host symlinks do not become paths under test.
 Create intentional symlinks inside that root; do not canonicalize product
-arguments or add follow flags merely to make a fixture pass.
+arguments or add follow flags merely to make a fixture pass. For fixtures that
+must fit Unix socket path limits, use `test_support::short_tempdir()`; it
+centralizes the canonical short-root exception without changing `TMPDIR`.
 
 Testing happens in three places, each running more than the one before:
 before merge, after merge (post-merge CI, which selects checks by changed

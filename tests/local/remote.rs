@@ -609,6 +609,245 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
     assert!(partial_files(&t.0).is_empty());
 }
 
+/// A copy of `src` into the existing `dst` whose first worker needs no new
+/// login: over TCP data, or over SSH data as a channel on the copy's own
+/// connection. Both ends create their private directories in `temporary`,
+/// which is short enough for the sockets inside them.
+#[cfg(debug_assertions)]
+fn existing_destination_copy(t: &Tmp, tcp: bool, temporary: &Path) -> Command {
+    let mut command = if tcp {
+        let mut command = compat_command();
+        command
+            .arg("-e")
+            .arg(fake_rsh(t))
+            .arg("--rsync-path")
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "--syq-tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "-a",
+                "--no-progress",
+            ])
+            .arg(format!("{}/", t.s("src")))
+            .arg(format!("127.0.0.1:{}/", t.s("dst")));
+        command
+    } else {
+        let ssh = fake_ssh(t);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp"])
+            .args(["-q", "--copy-metadata=permissions", "--srcs-in"])
+            .arg(t.path("src"))
+            .args(["--to", "fake.example", "--into"])
+            .arg(t.path("dst"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            );
+        command
+    };
+    command
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("TMPDIR", temporary);
+    command
+}
+
+/// Files a, b and c in both `src` and `dst`, with b changed when `changed`.
+#[cfg(debug_assertions)]
+fn existing_destination_tree(t: &Tmp, changed: bool) {
+    for name in ["a", "b", "c"] {
+        for side in ["src", "dst"] {
+            let path = t.path(&format!("{side}/{name}"));
+            write(&path, name.as_bytes());
+            set_mtime(&path, 1_600_000_000);
+        }
+    }
+    if changed {
+        write(&t.path("src/b"), b"changed");
+        set_mtime(&t.path("src/b"), 1_600_000_000);
+    }
+}
+
+/// For an existing destination, the worker that connects during planning
+/// waits until planning queues a file to send, so an unchanged copy opens no
+/// worker connection. No copy leaves private temporary directories behind.
+#[cfg(debug_assertions)]
+#[test]
+fn an_early_worker_connects_only_for_a_file_to_send() {
+    for (tcp, changed) in [(true, false), (true, true), (false, false), (false, true)] {
+        let case = format!("tcp={tcp} changed={changed}");
+        let t = Tmp::new();
+        existing_destination_tree(&t, changed);
+        let temporary = t.runtime();
+        fs::create_dir(&temporary).unwrap();
+        let started = t.path("worker-started");
+        let events = t.path("worker-events");
+        let out = existing_destination_copy(&t, tcp, &temporary)
+            .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/b")), read(&t.path("src/b")), "{case}");
+        let connected = fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("connected "))
+            .count();
+        assert_eq!(started.exists(), changed, "{case}: {out:?}");
+        assert_eq!(connected > 0, changed, "{case}: {out:?}");
+        // A leaked directory stays; a helper's own cleanup may trail its exit.
+        let leftovers = || {
+            fs::read_dir(&temporary)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("syq-"))
+                .collect::<Vec<_>>()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut left = leftovers();
+        while !left.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            left = leftovers();
+        }
+        assert!(left.is_empty(), "{case}: left {left:?}: {out:?}");
+    }
+}
+
+/// The early worker connects while planning goes on. Planning queues the
+/// changed b, then repairs c's permissions itself; the repair waits here
+/// until the worker has connected.
+#[cfg(debug_assertions)]
+#[test]
+fn an_early_worker_connects_before_planning_finishes() {
+    for tcp in [true, false] {
+        let t = Tmp::new();
+        existing_destination_tree(&t, true);
+        fs::set_permissions(t.path("src/c"), fs::Permissions::from_mode(0o600)).unwrap();
+        let temporary = t.runtime();
+        fs::create_dir(&temporary).unwrap();
+        let held = t.path("planning-held");
+        let release = t.path("planning-release");
+        let events = t.path("worker-events");
+        let mut child = existing_destination_copy(&t, tcp, &temporary)
+            .env("SYQ_TEST_QUICK_META_READY_FILE", &held)
+            .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &release)
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &held, "planning's permission repair");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fs::read_to_string(&events)
+            .unwrap_or_default()
+            .contains("connected ")
+        {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                panic!("tcp={tcp}: no worker connected while planning waited");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        release_confinement_barrier(&release);
+        let out = child.wait_with_output().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/b")), b"changed", "tcp={tcp}");
+        let mode = fs::metadata(t.path("dst/c")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "tcp={tcp}");
+    }
+}
+
+/// A worker connection that fails once every file is finished cannot fail
+/// the copy, even when the receiver rejects its handshake.
+#[cfg(debug_assertions)]
+#[test]
+fn a_worker_rejected_after_the_last_file_does_not_fail_the_copy() {
+    let t = Tmp::new();
+    write(&t.path("src/large"), b"larger than the size limit");
+    fs::create_dir(t.path("dst")).unwrap();
+    let started = t.path("worker-started");
+    // An empty destination starts a worker as soon as planning sees a
+    // regular file; the size limit then leaves nothing to send.
+    let out = compat_command()
+        .arg("-e")
+        .arg(fake_rsh(&t))
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--syq-tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "-a",
+            "--no-progress",
+            "--max-size=1",
+        ])
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("127.0.0.1:{}/", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
+        .env("SYQ_TEST_FAIL_WORKER_AFTER_COPY", "reject")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(started.exists(), "no worker started: {out:?}");
+    assert!(!stderr_of(&out).contains("injected"), "{out:?}");
+    assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
+}
+
+/// Once a copy has failed, a worker whose connection fails stops quietly
+/// rather than retrying.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_copy_does_not_retry_a_worker_connection() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"contents");
+    std::os::unix::fs::symlink("target", t.path("src/z-full")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let started = t.path("worker-started");
+    // An empty destination starts a worker as soon as planning sees the
+    // file; creating the symlink then runs out of space, failing the copy.
+    let out = compat_command()
+        .arg("-e")
+        .arg(fake_rsh(&t))
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--syq-tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "-a",
+            "--no-progress",
+        ])
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("127.0.0.1:{}/", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "z-full")
+        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
+        .env("SYQ_TEST_FAIL_WORKER_AFTER_COPY", "fail")
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("injected capacity failure"),
+        "{out:?}"
+    );
+    assert!(started.exists(), "no worker started: {out:?}");
+    assert!(!stderr_of(&out).contains("retrying"), "{out:?}");
+    assert!(!stderr_of(&out).contains("injected worker"), "{out:?}");
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();
@@ -2014,54 +2253,92 @@ fn native_remote_exact_bare_home_expands_before_identity_check() {
 }
 
 #[test]
-fn explicit_pscope_is_refused_for_remote_coordinators() {
-    let t = Tmp::new();
-    fs::create_dir(t.runtime()).unwrap();
-    let scope = ephemeral_scope(&t);
-    let scope = scope.to_str().unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "rsync",
-            "-a",
-            "--syq-pscope",
-            scope,
-            "hostA:src/",
-            "hostB:dst/",
-            "--no-progress",
-        ])
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.runtime())
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("source and destination cannot both be remote"));
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            "--pscope",
-            scope,
-            "--from",
-            "hostA",
-            "--srcs-in",
-            "src",
-            "--to",
-            "hostB",
-            "--coordinate-at",
-            "dst",
-            "--into",
-            "dst",
-            "-q",
-        ])
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.runtime())
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
-    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
+fn explicit_pscope_stays_local_to_direct_remote_coordinators() {
+    for coordinator in ["src", "dst"] {
+        let t = Tmp::new();
+        fs::create_dir(t.runtime()).unwrap();
+        let scope = ephemeral_scope(&t);
+        let ssh = fake_ssh(&t);
+        fs::create_dir_all(t.path("remote-bin")).unwrap();
+        std::os::unix::fs::symlink(&ssh, t.path("remote-bin/ssh")).unwrap();
+        write(&t.path("src/file"), b"direct scoped copy");
+        // The fresh scope must not borrow the global authorization preference.
+        write(
+            &t.path("config/syq/auth-from.json"),
+            br#"{"default":"@missing"}"#,
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--pscope"])
+            .arg(&scope)
+            .args([
+                "--peer-auth",
+                "own-credentials",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--coordinate-at",
+                coordinator,
+                "--no-tcp",
+                "--performance-tuning=workers=1",
+                "--from",
+                "hostA",
+                "--srcs-in",
+                &t.s("src"),
+                "--to",
+                "hostB",
+                "--into",
+                &t.s("dst"),
+                "--no-progress",
+            ])
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/file")), b"direct scoped copy");
+        assert!(!stderr_of(&output).contains("relaying data"));
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        let launch = log.lines().next().unwrap();
+        let endpoint = if coordinator == "src" {
+            "hostA"
+        } else {
+            "hostB"
+        };
+        let (local_options, remote_command) =
+            launch.split_once(&format!("-- {endpoint} ")).unwrap();
+        assert!(local_options.contains("ControlMaster=auto"), "{log}");
+        assert!(local_options.contains(scope.to_str().unwrap()), "{log}");
+        assert!(remote_command.contains("--delegated-operands-b64"), "{log}");
+        assert!(!remote_command.contains("--pscope"), "{log}");
+        assert!(!remote_command.contains(scope.to_str().unwrap()), "{log}");
+        assert!(
+            log.lines()
+                .skip(1)
+                .all(|line| !line.contains(scope.to_str().unwrap())),
+            "{log}"
+        );
+        let records: Vec<_> = fs::read_dir(&scope)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(records[0].path()).unwrap()).unwrap();
+        assert_eq!(record["host"], endpoint);
+    }
 }
 
 #[test]

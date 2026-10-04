@@ -623,6 +623,24 @@ pub(crate) fn sign_grant(
     constraints: GrantConstraints,
     private_key: &PrivateKey,
 ) -> Result<Vec<u8>> {
+    sign_grant_with(grant, constraints, |payload| {
+        if private_key.is_encrypted() {
+            bail!("cannot sign a grant with an encrypted enrollment key");
+        }
+        Ok(private_key
+            .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, payload)
+            .context("sign restricted transfer grant")?
+            .to_pem(LineEnding::LF)
+            .context("encode restricted transfer SSHSIG")?
+            .into_bytes())
+    })
+}
+
+pub(crate) fn sign_grant_with(
+    grant: Grant,
+    constraints: GrantConstraints,
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let GrantConstraints {
         max_file_data_bytes_per_second,
         mut filters,
@@ -632,9 +650,6 @@ pub(crate) fn sign_grant(
         mapping,
         hashing,
     } = constraints;
-    if private_key.is_encrypted() {
-        bail!("cannot sign a grant with an encrypted enrollment key");
-    }
     filters.normalize();
     filters.validate(&grant)?;
     let payload = signing_payload(
@@ -647,12 +662,7 @@ pub(crate) fn sign_grant(
         mapping.as_ref(),
         hashing.as_ref(),
     )?;
-    let signature = private_key
-        .sign(SSHSIG_NAMESPACE, HashAlg::Sha256, &payload)
-        .context("sign restricted transfer grant")?
-        .to_pem(LineEnding::LF)
-        .context("encode restricted transfer SSHSIG")?
-        .into_bytes();
+    let signature = sign(&payload)?;
     SignedGrantEnvelope {
         grant,
         max_file_data_bytes_per_second,
