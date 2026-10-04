@@ -110,6 +110,9 @@ impl<'a> ForegroundChild<'a> {
     }
 
     fn follow_terminal_stop(&self) -> std::io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // Consume only a stop notification; Child remains the sole owner of
         // exit/reaping. OpenSSH's ~^Z stops its own PID, not the whole job.
@@ -123,7 +126,12 @@ impl<'a> ForegroundChild<'a> {
         } < 0
         {
             let error = std::io::Error::last_os_error();
-            return if error.kind() == std::io::ErrorKind::Interrupted {
+            // Linux also reports ECHILD when this child has exited but is
+            // still unreaped: WSTOPPED excludes its pending exit event. The
+            // next Child::poll owns that status; this was only a stop lookup.
+            return if error.kind() == std::io::ErrorKind::Interrupted
+                || error.raw_os_error() == Some(libc::ECHILD)
+            {
                 Ok(())
             } else {
                 Err(error)
@@ -468,6 +476,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(lifetime);
+    }
+
+    #[test]
+    fn terminal_stop_observation_preserves_exited_and_reaped_child_status() {
+        let signals = Signals::new().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 17"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = ForegroundChild::spawn(&mut command, &signals).unwrap();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        let mut progress = started + Duration::from_secs(2);
+        // Freeze the race deterministically: wait until exit, but leave its
+        // status for Child::poll. Linux's stop-only lookup returns ECHILD here.
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.child.id() as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            if info.si_signo != 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not exit; no pending exit event"
+            );
+            if Instant::now() >= progress {
+                eprintln!("Waiting for unreaped child exit; no exit event yet");
+                progress += Duration::from_secs(2);
+            }
+            signals.wait(Duration::from_millis(10)).unwrap();
+        }
+        assert!(child.status.is_none());
+        child.follow_terminal_stop().unwrap();
+        assert_eq!(child.poll().unwrap().unwrap().code(), Some(17));
+        // A repeated observation must not touch a PID whose status we own.
+        child.follow_terminal_stop().unwrap();
+        assert_eq!(child.poll().unwrap().unwrap().code(), Some(17));
     }
 
     #[test]
