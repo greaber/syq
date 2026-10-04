@@ -5,7 +5,8 @@
 //! inode metadata are written between the two bursts, outside any turn.
 use super::*;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError>;
 
@@ -86,6 +87,47 @@ fn start_thread<'scope, R: Send + 'scope>(
         return Err(io::Error::from_raw_os_error(libc::EAGAIN));
     }
     std::thread::Builder::new().spawn_scoped(scope, work)
+}
+
+/// Data writes made on threads that cannot record observations: their time
+/// and bytes, and the time the threads spent on the files they wrote.
+#[derive(Default)]
+pub(super) struct OffThreadWrites {
+    writing: AtomicU64,
+    busy: AtomicU64,
+    bytes: AtomicU64,
+}
+
+fn nanos_since(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl OffThreadWrites {
+    /// Count the time `work` takes as busy.
+    fn busy<R>(&self, work: impl FnOnce() -> R) -> R {
+        let started = Instant::now();
+        let result = work();
+        self.busy.fetch_add(nanos_since(started), Ordering::Relaxed);
+        result
+    }
+
+    /// Count the time a data write takes, and its bytes if it succeeds.
+    fn write(&self, bytes: usize, write: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let started = Instant::now();
+        let result = write();
+        self.writing
+            .fetch_add(nanos_since(started), Ordering::Relaxed);
+        if result.is_ok() {
+            self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// The share of the busy time spent writing data.
+    fn share(&self) -> f64 {
+        let busy = self.busy.load(Ordering::Relaxed).max(1);
+        self.writing.load(Ordering::Relaxed) as f64 / busy as f64
+    }
 }
 
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
@@ -218,31 +260,29 @@ impl FsOps {
         // filesystem each step waits a round trip, so the files of a run
         // are written on threads of their own: every worker's runs proceed
         // at once, as when each worker wrote its files in turn. Only this
-        // thread records observations, so the writes are one span.
+        // thread records observations, so it counts the time the threads
+        // took as writing in the share they spent in data writes.
         let network = stages.first().is_some_and(|(_, stage)| {
             stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
         });
         let written: Vec<Result<()>> = if network {
-            let writing = self
-                .operation
-                .span(crate::transfer_observations::Stage::DestinationWrite);
+            let started = Instant::now();
+            let writes = OffThreadWrites::default();
             let this = &*self;
             let written = on_threads(stages.iter().collect(), |(index, stage)| {
-                this.write_small_stage(&puts[*index], stage, false)
+                writes.busy(|| this.write_small_stage(&puts[*index], stage, Some(&writes)))
             });
-            writing.bytes(
-                stages
-                    .iter()
-                    .zip(&written)
-                    .filter(|(_, result)| result.is_ok())
-                    .map(|((index, _), _)| puts[*index].data.len() as u64)
-                    .sum(),
+            self.operation.split_since(
+                started,
+                crate::transfer_observations::Stage::DestinationWrite,
+                writes.share(),
+                writes.bytes.into_inner(),
             );
             written
         } else {
             stages
                 .iter()
-                .map(|(index, stage)| self.write_small_stage(&puts[*index], stage, true))
+                .map(|(index, stage)| self.write_small_stage(&puts[*index], stage, None))
                 .collect()
         };
         let mut written = written.into_iter();
@@ -346,13 +386,13 @@ impl FsOps {
         Ok(Some((file, metadata, basis_size)))
     }
 
-    /// Write a staged file's data and metadata. Unless `observe`, the caller
-    /// records the write: observations take one thread at a time.
+    /// Write a staged file's data and metadata. The data write is observed,
+    /// or counted in `writes` on a thread that cannot record observations.
     pub(super) fn write_small_stage(
         &self,
         put: &SmallPut,
         stage: &SmallStage,
-        observe: bool,
+        writes: Option<&OffThreadWrites>,
     ) -> Result<()> {
         #[cfg(debug_assertions)]
         test_race_barrier(
@@ -363,10 +403,11 @@ impl FsOps {
         if stage.reused {
             stage.file.set_len(0)?;
         }
-        if observe {
-            observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
-        } else {
-            write_data(&stage.file, &put.data, 0, self.sparse)
+        match writes {
+            None => observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse),
+            Some(writes) => writes.write(put.data.len(), || {
+                write_data(&stage.file, &put.data, 0, self.sparse)
+            }),
         }
         .with_context(|| format!("write {}", stage.label.display()))?;
         check_destination_writes(&stage.file, &stage.label)?;
@@ -633,12 +674,12 @@ mod tests {
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(!stage.reused);
-        ops.write_small_stage(&file, &stage, true).unwrap();
+        ops.write_small_stage(&file, &stage, None).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(stage.reused);
-        ops.write_small_stage(&file, &stage, true).unwrap();
+        ops.write_small_stage(&file, &stage, None).unwrap();
         ops.publish_small_stage(&file, &stage).unwrap();
         assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
         assert_eq!(
