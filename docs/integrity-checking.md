@@ -34,9 +34,21 @@ syq cp --hash --srcs-in project --into backup
 ```
 
 `--hash` uses BLAKE3. In rsync syntax, use `-c` or `--checksum` for the same
-comparison. The comparison only decides which files need copying. A file that
-differs is copied the same way as without `--hash`, so local copies keep the
-filesystem's copy optimizations.
+comparison. The comparison only decides which files need copying: a file whose
+contents already match is left alone, keeping its inode and any other hard
+links to it, and only its metadata is updated. A file that differs is copied
+the same way as without `--hash`, so local copies keep the filesystem's copy
+optimizations.
+
+`--hash-or-copy` also stops trusting matching size and timestamp, but compares
+only the files that the
+[transfer strategy](reference.md#choose-a-transfer-strategy) would compare and
+copies the rest whole, so a file whose contents already match may be
+rewritten. With the default strategy, copies with a remote syq endpoint compare
+files whose size is unchanged and keep those that match, and same-machine
+copies copy every file. In rsync syntax, use `-I` or `--ignore-times`; `-c`
+takes precedence when both are given. A dry run with `--hash-or-copy` compares
+where the copy would compare, and lists the files the copy would write.
 
 File uploads store a whole-file hash in the object's syq metadata: BLAKE3,
 unless a `transfer` algorithm or expected hash selects another. When a local/S3

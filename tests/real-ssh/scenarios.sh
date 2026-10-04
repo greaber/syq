@@ -1235,6 +1235,65 @@ syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \
 assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
     destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
+printf 'case: grouped comparison through a command-restricted receiver\n'
+ssh source sh -s <<'EOF'
+set -eu
+root=/tmp/syq-real-ssh/grouped-source
+install -d "$root"
+for n in 1 2 3 4 5 6 7 8; do
+    head -c 262144 /dev/urandom >"$root/file-$n"
+done
+EOF
+syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/grouped-source \
+    --to destination --into /tmp/syq-real-ssh/grouped-destination
+# Change one byte of half the files and the time of every file, so that each
+# is compared: the receiver keeps the unchanged ones and patches the others,
+# reusing all but the first 64 KiB block of each.
+ssh source sh -s <<'EOF'
+set -eu
+root=/tmp/syq-real-ssh/grouped-source
+for n in 1 2 3 4; do
+    printf X | dd of="$root/file-$n" bs=1 seek=100 conv=notrunc status=none
+done
+touch -m -d @1700000000 "$root"/file-*
+EOF
+grouped_results=/tmp/syq-real-ssh-grouped.ndjson
+grouped_debug=/tmp/syq-real-ssh-grouped.debug
+if ! SYQ_DEBUG=1 syq cp --no-progress --results "$grouped_results" \
+    --from source --srcs-in /tmp/syq-real-ssh/grouped-source \
+    --to destination --into /tmp/syq-real-ssh/grouped-destination \
+    2>"$grouped_debug"; then
+    cat "$grouped_debug" >&2
+    exit 1
+fi
+python3 - "$grouped_results" "$grouped_debug" <<'PYTHON'
+import json, sys
+from pathlib import Path
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
+operations = {
+    record['dst']['value'].rsplit('/', 1)[-1]: (record['action'], record['disposition'])
+    for record in records
+    if record['type'] == 'operation_result'
+}
+for n in range(1, 9):
+    action = 'transfer_file' if n <= 4 else 'set_metadata'
+    assert operations.get(f'file-{n}') == (action, 'succeeded'), operations
+marker = 'syq: tuning observed: '
+observed = [
+    json.loads(line.split(marker, 1)[1])
+    for line in Path(sys.argv[2]).read_text().splitlines()
+    if marker in line
+]
+assert any(
+    (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
+    for counts in observed
+), observed
+PYTHON
+assert_same_tree source /tmp/syq-real-ssh/grouped-source \
+    destination /tmp/syq-real-ssh/grouped-destination grouped
+
 printf 'case: in-place copies of small files through a command-restricted receiver\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-small; for n in 1 2 3; do printf "small $n" >/tmp/syq-real-ssh/inplace-small/$n; done'
 syq cp --inplace --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \

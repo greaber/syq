@@ -350,7 +350,9 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::CopySmallFiles(_)
         | Request::ReadStream(_)
         | Request::DescriptorCopy(_)
-        | Request::ReadComparedRange { .. } => true,
+        | Request::ReadComparedRange { .. }
+        | Request::ReadDifferingBatch { .. }
+        | Request::PatchSmallBatch(_) => true,
         Request::Hello { .. }
         | Request::TcpListen { .. }
         | Request::Scan { .. }
@@ -369,6 +371,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::ProbePartial { .. }
         | Request::Prepare { .. }
         | Request::HashAndHold { .. }
+        | Request::HashExistingBatch { .. }
         | Request::FinishBasis { .. }
         | Request::SeedBasis { .. }
         | Request::CopyLocal { .. }
@@ -954,6 +957,17 @@ fn serve<R: Read + Send + 'static, W: Write>(
             Request::ReadSmallBatch(reads) => {
                 blocks += reads.len() as u64;
                 bytes += reads.iter().map(|read| u64::from(read.len)).sum::<u64>();
+            }
+            Request::ReadDifferingBatch { reads, .. } => {
+                blocks += reads.len() as u64;
+                bytes += reads.iter().map(|read| u64::from(read.len)).sum::<u64>();
+            }
+            Request::PatchSmallBatch(patches) => {
+                blocks += patches.len() as u64;
+                bytes += patches
+                    .iter()
+                    .map(|patch| patch.data.len() as u64)
+                    .sum::<u64>();
             }
             Request::PutSmallBatch(puts) => {
                 blocks += puts.len() as u64;

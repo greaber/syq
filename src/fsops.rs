@@ -170,6 +170,9 @@ pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileSystemTraits {
     is_nfs: bool,
+    /// NFS, SMB, Ceph, or a FUSE mount such as sshfs: each operation waits
+    /// for a network round trip.
+    network: bool,
     synchronous: bool,
     measured_local_source: bool,
     local_userspace_copy: bool,
@@ -308,6 +311,15 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
+            network: [
+                libc::NFS_SUPER_MAGIC as u32,
+                libc::FUSE_SUPER_MAGIC as u32,
+                libc::SMB_SUPER_MAGIC as u32,
+                0xfe53_4d42, // SMB2
+                0xff53_4d42, // CIFS
+                0x00c3_6400, // Ceph
+            ]
+            .contains(&file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
             // tmpfs also provides a real cross-filesystem control for this path.
@@ -379,6 +391,23 @@ fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
 fn unsupported_copy_pairs() -> &'static Mutex<HashSet<(FileSystemKey, FileSystemKey)>> {
     static PAIRS: OnceLock<Mutex<HashSet<(FileSystemKey, FileSystemKey)>>> = OnceLock::new();
     PAIRS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether `file`, on device `dev`, lies on a network filesystem.
+fn on_network_file_system(file: &File, dev: u64) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_NETWORK_FILESYSTEM").is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        file_system_traits(file, file_system_key(file, dev)).network
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, dev);
+        false
+    }
 }
 
 /// One file of a small copy, staged but not yet published.
@@ -1760,6 +1789,10 @@ impl FsOps {
             | Request::ValidateDigest { guard, .. }
             | Request::Canonicalize { guard, .. } => guard.is_some(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
+            Request::HashExistingBatch { files, .. } => {
+                files.iter().any(|file| file.guard.is_some())
+            }
+            Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_some()),
             _ => false,
         };
         if has_guard {
@@ -1788,6 +1821,10 @@ impl FsOps {
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. } => guard.is_none(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_none()),
+            Request::HashExistingBatch { files, .. } => {
+                files.iter().any(|file| file.guard.is_none())
+            }
+            Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_none()),
             Request::CopyLocal { .. } => true,
             _ => false,
         };
@@ -2103,6 +2140,25 @@ impl FsOps {
             Request::ReadSmallBatch(reads) => {
                 for read in reads {
                     map(&mut read.path)?;
+                }
+            }
+            Request::ReadDifferingBatch { reads, .. } => {
+                for read in reads {
+                    map(&mut read.path)?;
+                }
+            }
+            Request::PatchSmallBatch(patches) => {
+                for patch in patches {
+                    if patch.guard.is_none() {
+                        map(&mut patch.path)?;
+                    }
+                }
+            }
+            Request::HashExistingBatch { files, .. } => {
+                for file in files {
+                    if file.guard.is_none() {
+                        map(&mut file.path)?;
+                    }
                 }
             }
             Request::PutSmallBatch(puts) => {
@@ -2757,6 +2813,12 @@ const LISTING_MIN_NAMES: usize = 16;
 const LISTING_BYTES_PER_NAME: u64 = 256;
 #[cfg(target_os = "linux")]
 const LISTING_SLACK_BYTES: u64 = 4 << 10;
+/// ZFS reports a directory's entry count as its size, so the space the
+/// directory occupies is checked too. That space includes overhead, 8 to
+/// 17 KiB for a ZFS directory of up to several hundred entries, so it gets a
+/// larger allowance.
+#[cfg(target_os = "linux")]
+const LISTING_ALLOCATED_SLACK_BYTES: u64 = 16 << 10;
 /// Whatever size the filesystem reports (ZFS reports its entry count), the
 /// listing stops after this many entries per name, enough to reach the end
 /// of any directory the size allows.
@@ -2802,6 +2864,15 @@ fn directories_to_list<'a>(
     candidates
 }
 
+/// Whether a directory of `size` reported bytes occupying `blocks` 512-byte
+/// blocks is small enough to list for `names` requested names.
+#[cfg(target_os = "linux")]
+fn small_enough_to_list(names: usize, size: u64, blocks: u64) -> bool {
+    let expected = LISTING_BYTES_PER_NAME.saturating_mul(names as u64);
+    size <= expected.saturating_add(LISTING_SLACK_BYTES)
+        && blocks.saturating_mul(512) <= expected.saturating_add(LISTING_ALLOCATED_SLACK_BYTES)
+}
+
 /// List each NFS directory that enough of the paths about to be stat'ed
 /// are in. The first stat of a name that another process created makes the
 /// NFS client confirm the entry with the server, one LOOKUP per name; a
@@ -2835,8 +2906,7 @@ fn list_nfs_directories_before_stats(
         let Ok(metadata) = directory.metadata() else {
             return false;
         };
-        let expected = LISTING_BYTES_PER_NAME.saturating_mul(*names as u64);
-        if metadata.len() > expected.saturating_add(LISTING_SLACK_BYTES) {
+        if !small_enough_to_list(*names, metadata.len(), metadata.blocks()) {
             return false;
         }
         let Ok(first) = RelativePath::new(first) else {
@@ -3039,14 +3109,19 @@ fn observed_write(
     sparse: bool,
 ) -> std::io::Result<()> {
     let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
-    if sparse {
-        crate::sparse::write_at(file, data, off, false)?;
-        crate::sparse::set_len(file, off + data.len() as u64)?;
-    } else {
-        file.write_all_at(data, off)?;
-    }
+    write_data(file, data, off, sparse)?;
     writing.bytes(data.len() as u64);
     Ok(())
+}
+
+/// `observed_write` for a caller that records the write itself.
+fn write_data(file: &File, data: &[u8], off: u64, sparse: bool) -> std::io::Result<()> {
+    if sparse {
+        crate::sparse::write_at(file, data, off, false)?;
+        crate::sparse::set_len(file, off + data.len() as u64)
+    } else {
+        file.write_all_at(data, off)
+    }
 }
 fn hash_reader_observed(
     reader: &mut impl Read,

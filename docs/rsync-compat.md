@@ -28,7 +28,10 @@ quick check. Native `syq cp` also compares fractional seconds at the precision
 suggested by the destination timestamp; see [timestamp matching](reference.md#check-file-contents).
 Use `-c` to compare contents when size and timestamp match; source timestamps
 are preserved, so ordinary clock skew does not require the source timestamp
-to be newer.
+to be newer. `-I` (`--ignore-times`) also stops skipping those files, but
+compares only those that block reuse would compare (by default, remote copies
+of files whose size is unchanged) and copies the rest whole, so files that
+already match may be rewritten.
 
 Without `-p`, existing files keep their destination permissions. On Linux, new
 files use the source permission bits limited by the destination parent's default
@@ -56,7 +59,7 @@ ranges into sparse holes. See the
 | Link filtering or rewriting | `--safe-links`, `--munge-links` |
 | Other placement and filesystem controls | `-R` / `--relative`, `--partial-dir`, `-x` / `--one-file-system` |
 | Early deletion | `--delete-before`, `--delete-during`, `--force` |
-| Other comparison and output controls | `--size-only`, `-I` / `--ignore-times`, `--modify-window`, `--chmod`, `--log-file`, `-i` / `--itemize-changes` |
+| Other comparison and output controls | `--size-only`, `--modify-window`, `--chmod`, `--log-file`, `-i` / `--itemize-changes` |
 | Daemon connections | `rsync://`, `host::module` |
 
 Unsupported common flags are rejected with an explanation. Selected symlink

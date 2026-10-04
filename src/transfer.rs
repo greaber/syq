@@ -32,6 +32,7 @@ mod diagnostics;
 mod dry_run;
 mod hardlinks;
 mod planner;
+mod small_compare;
 mod work_budget;
 mod worker;
 
@@ -153,6 +154,9 @@ pub struct Opts {
     hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
     pub devices: bool,
     pub checksum: bool,
+    /// Don't trust matching size and time, but compare only the files block
+    /// reuse would compare, and copy the rest.
+    pub hash_or_copy: bool,
     pub precise_mtime: bool,
     pub inplace: bool,
     pub same_host: bool,
@@ -192,6 +196,39 @@ pub struct Opts {
 }
 
 impl Opts {
+    /// Whether to compare a file of `size` bytes with the existing entry it
+    /// replaces and reuse its matching blocks. The default strategy compares
+    /// a remote file only when its destination has the same size: a file
+    /// whose size changed was almost always rewritten, and comparing it
+    /// would read and hash the old file for nothing. An explicit
+    /// aligned-block strategy compares every replaced file.
+    pub(crate) fn reuses_blocks(&self, size: u64, existing: Option<&Entry>) -> bool {
+        match self.transfer_strategy {
+            crate::cli::TransferStrategy::Locality => {
+                !self.same_host
+                    && existing
+                        .is_none_or(|existing| existing.kind != Kind::File || existing.size == size)
+            }
+            strategy => strategy.reuse_destination_blocks(self.same_host),
+        }
+    }
+
+    /// Whether a destination whose size and modification time match its
+    /// source counts as unchanged. --hash and --hash-or-copy both stop
+    /// trusting them.
+    fn trusts_size_and_time(&self) -> bool {
+        !self.checksum && !self.hash_or_copy
+    }
+
+    /// Whether a dry run compares an existing file of the same size to
+    /// learn whether the copy would change it, because the copy would
+    /// compare it too.
+    fn previews_by_comparing(&self, size: u64, existing: Option<&Entry>) -> bool {
+        self.checksum
+            || self.protects_existing_contents()
+            || (self.hash_or_copy && self.reuses_blocks(size, existing))
+    }
+
     fn adaptive_ranges(&self) -> bool {
         !self.same_host
             && !self.block_explicit
@@ -855,6 +892,7 @@ fn small_copy_eligible(
         && !args.delete
         && !args.update
         && !args.checksum
+        && !args.hash_or_copy
         && !args.ignore_existing
         && !args.existing
         && args.files_from.is_none()
@@ -2016,6 +2054,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         hardlink_completions: Mutex::new(Default::default()),
         devices: args.devices,
         checksum: args.checksum,
+        hash_or_copy: args.hash_or_copy && !args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),

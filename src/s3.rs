@@ -363,6 +363,9 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<()> {
 }
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
+    // Checking a file's hash, often against one stored with the object,
+    // costs less than an upload or download, so --hash-or-copy compares.
+    args.checksum |= std::mem::take(&mut args.hash_or_copy);
     if args.rm {
         return remove::run(args);
     }

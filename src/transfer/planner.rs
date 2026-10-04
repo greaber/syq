@@ -1872,7 +1872,10 @@ impl Planner<'_> {
             );
             return;
         }
-        if same && !opts.checksum && (opts.dry_run || opts.expected_for(&dst_rel).is_none()) {
+        if same
+            && opts.trusts_size_and_time()
+            && (opts.dry_run || opts.expected_for(&dst_rel).is_none())
+        {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
@@ -1917,13 +1920,14 @@ impl Planner<'_> {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
         } else if opts.dry_run
-            && (opts.checksum || opts.protects_existing_contents())
+            && opts.previews_by_comparing(e.size, dst_entry.as_ref())
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.kind == Kind::File && d.size == e.size)
         {
-            // Equal-size files need a real comparison. Hash them through the
-            // workers so large trees do not serialize all reads in the planner.
+            // Equal-size files need a real comparison, as the copy would make
+            // one. Hash them through the workers so large trees do not
+            // serialize all reads in the planner.
             self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
             self.progress.files_total.fetch_add(1, Relaxed);
@@ -1962,6 +1966,9 @@ impl Planner<'_> {
                     }
                     Some(_) if opts.checksum => {
                         format!("update file {shown} (content comparison requested)")
+                    }
+                    Some(d) if opts.hash_or_copy && opts.metadata_matches(&dst_rel, &e, d) => {
+                        format!("update file {shown} (size and time not trusted)")
                     }
                     Some(d)
                         if opts.flags & flags::TIMES != 0
@@ -3185,6 +3192,9 @@ impl Planner<'_> {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
+                compared: false,
+                resume_partial: false,
+                recompared: 0,
                 src,
                 source,
                 dst,
