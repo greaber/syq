@@ -410,7 +410,18 @@ impl FsOps {
         let reused = patch.len - patch.data.len() as u64;
         let clones = reused >= CLONE_MIN_REUSED && reused * 2 >= patch.len;
         if let (Some(old), Some(basis), true) = (&old, patch.basis, clones) {
-            if fingerprint(&old.metadata()?) == basis {
+            // A clone keeps the reused blocks unread, so each must lie
+            // within the file it comes from. Otherwise assembling reads them
+            // and fails.
+            let within = patch
+                .reuse
+                .iter()
+                .enumerate()
+                .filter(|(_, reuse)| reuse.is_some())
+                .all(|(index, _)| {
+                    (index as u64 * patch.block + patch.block).min(patch.len) <= basis.len
+                });
+            if within && fingerprint(&old.metadata()?) == basis {
                 let hash = if self.hash_policy.transfer_integrity {
                     self.observed_payload_hash(&[])
                 } else {
@@ -948,6 +959,46 @@ mod tests {
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
             assert_eq!(entries(directory), 2);
         }
+    }
+
+    #[test]
+    fn a_patch_reuses_no_blocks_past_the_end_of_the_file_it_replaces() {
+        let block = MIN_HASH_BLOCK_BYTES;
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let old = vec![7; 32 * block as usize];
+        fs::write(directory.join("file"), &old).unwrap();
+        let mut ops = receiver(directory);
+        let read = ExistingRead {
+            path: b"file".to_vec(),
+            len: 40 * block,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let hashed = ops.hash_existing_batch(block, &[read]).remove(0).unwrap();
+        // Blocks past the old end claim to be reused, which a clone would
+        // turn into zeros without reading them.
+        let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
+        reuse.resize(40, Some([0; 32]));
+        let patch = SmallPatch {
+            path: b"file".to_vec(),
+            copy_id: [4; 16],
+            len: 40 * block,
+            block,
+            reuse,
+            hash: content_digest(&[]),
+            data: Vec::new(),
+            basis: hashed.fingerprint,
+            meta: put("file", b"").meta,
+            flags: 0,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let results = ops.patch_small_batch(&[patch]);
+        assert!(results[0].is_err(), "{:?}", results[0]);
+        assert_eq!(fs::read(directory.join("file")).unwrap(), old);
+        assert_eq!(entries(directory), 1);
     }
 
     #[test]

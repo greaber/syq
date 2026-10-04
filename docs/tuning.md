@@ -200,7 +200,9 @@ source once and sends only the blocks that differ, and the receiving side
 builds the new file from those and its own matching blocks, checking each
 again as it reads it. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
-however many files it holds.
+however many files it holds. A copy between servers through a restricted
+receiver compares in the comparison block size it was authorized with: 4 MiB
+unless `comparison-block-size` or `-B` sets another.
 
 Larger files, `--inplace` updates and explicit `--hash` comparisons are
 compared one file at a time, in comparison blocks of 4 MiB by default. For
