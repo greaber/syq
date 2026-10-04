@@ -63,6 +63,19 @@ pub trait Conn: Send {
         Ok(None)
     }
     fn recv(&mut self) -> Result<Response>;
+    /// Arrival timestamp excludes time a reply spent queued behind other
+    /// worker operations. Used to time payload-free write acknowledgments.
+    fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
+        let response = self.recv()?;
+        Ok((response, std::time::Instant::now()))
+    }
+
+    /// Consume an already-arrived reply without waiting for another one.
+    /// Connections without an asynchronous reader can leave it for recv.
+    fn try_recv_with_arrival(&mut self) -> Option<Result<(Response, std::time::Instant)>> {
+        None
+    }
+
     /// Enter a phase containing only small-file batch writes. Remote readers
     /// can account for replies before the worker consumes them.
     fn track_small_batches(
@@ -886,6 +899,30 @@ impl Conn for RemoteConn {
     }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)
+    }
+    fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
+        let response = self.receive_response()?;
+        let completed = response.started_at;
+        Ok((response.into_inner(), completed))
+    }
+    fn try_recv_with_arrival(&mut self) -> Option<Result<(Response, std::time::Instant)>> {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = &self.rx else {
+            return Some(Err(anyhow!(
+                "response reader is collecting streaming writes"
+            )));
+        };
+        match rx.try_recv() {
+            Ok(Ok(response)) => {
+                let arrived = response.started_at;
+                Some(Ok((response.into_inner(), arrived)))
+            }
+            Ok(Err(error)) => Some(Err(self.io_err(error.into()))),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(self.io_err(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into(),
+            ))),
+        }
     }
     fn track_small_batches(
         &mut self,

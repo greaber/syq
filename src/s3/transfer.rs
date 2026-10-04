@@ -377,6 +377,7 @@ impl Engine {
                 })
                 .await?;
             }
+            self.progress.finish_transfer();
             self.prune(prune, None).await?;
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
@@ -418,6 +419,7 @@ impl Engine {
                 }
             })
             .await?;
+            self.progress.finish_transfer();
             // Prune while directories are writable, then restore their modes and times.
             // Apply metadata even when the deletion budget refuses pruning.
             let pruned = self.prune(prune, Some(&destination)).await;

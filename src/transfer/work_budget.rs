@@ -16,8 +16,10 @@ impl WorkSize {
 
 pub(super) struct WorkBudget {
     limit: WorkSize,
+    max_bytes: u64,
     target: Duration,
     recheck_latency: bool,
+    ever_slow: bool,
     next_latency_check: Instant,
     earliest_latency_check: Instant,
     limit_at_check: WorkSize,
@@ -29,8 +31,10 @@ impl Default for WorkBudget {
                 bytes: 64 << 10,
                 files: 64,
             },
+            max_bytes: 1 << 20,
             target: Duration::from_millis(250),
             recheck_latency: false,
+            ever_slow: false,
             next_latency_check: Instant::now() + Duration::from_secs(30),
             earliest_latency_check: Instant::now() + Duration::from_secs(2),
             limit_at_check: WorkSize {
@@ -41,6 +45,38 @@ impl Default for WorkBudget {
     }
 }
 impl WorkBudget {
+    pub fn ranges(max_bytes: u64, target: Duration, starting_bytes: Option<u64>) -> Self {
+        let limit = WorkSize {
+            bytes: starting_bytes.unwrap_or(1 << 20).max(512).min(max_bytes),
+            files: 0,
+        };
+        Self {
+            limit,
+            max_bytes,
+            target,
+            limit_at_check: limit,
+            ..Self::default()
+        }
+    }
+
+    pub fn range_latency_check_due(&self, now: Instant) -> bool {
+        // A healthy range already at its ceiling has nothing to gain from a
+        // periodic pause. Once any reply is slow, keep the existing checks,
+        // including those that lower a congestion-inflated allowance later.
+        (self.ever_slow || self.request_bytes() < self.max_bytes) && self.latency_check_due(now)
+    }
+
+    pub fn request_bytes(&self) -> u64 {
+        // Quantize updates so ordinary timing variation does not require a
+        // scheduler notification after every block. Never exceed the caller's
+        // configured request/receiver ceiling.
+        self.limit
+            .bytes
+            .max(512)
+            .next_power_of_two()
+            .min(self.max_bytes)
+    }
+
     /// Configuration RPCs supply a latency allowance on SSH too. Include both
     /// endpoints, but not connection startup, authentication or helper setup.
     pub fn set_latency(&mut self, round_trip: Duration) {
@@ -104,6 +140,7 @@ impl WorkBudget {
     /// per observation so a briefly cached operation cannot reserve a huge tail.
     pub fn observe(&mut self, work: WorkSize, elapsed: Duration) {
         self.recheck_latency |= elapsed > self.target;
+        self.ever_slow |= self.recheck_latency;
         let elapsed = elapsed.max(Duration::from_micros(1)).as_nanos();
         let target = self.target.as_nanos();
         fn resized(current: u64, amount: u64, elapsed: u128, target: u128) -> u64 {
@@ -130,7 +167,8 @@ impl WorkBudget {
                 estimate.min(current)
             }
         }
-        self.limit.bytes = resized(self.limit.bytes, work.bytes, elapsed, target).min(1 << 20);
+        self.limit.bytes =
+            resized(self.limit.bytes, work.bytes, elapsed, target).min(self.max_bytes);
         self.limit.files =
             resized(self.limit.files as u64, work.files as u64, elapsed, target).min(2048) as usize;
     }
@@ -139,6 +177,96 @@ impl WorkBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_requests_shrink_and_recover_within_the_payload_ceiling() {
+        for max in [512, 4096, 3 << 20, 4 << 20] {
+            let mut budget = WorkBudget::ranges(max, Duration::from_millis(250), None);
+            assert_eq!(budget.request_bytes(), max.min(1 << 20));
+            for _ in 0..4 {
+                budget.observe(
+                    WorkSize {
+                        bytes: budget.request_bytes(),
+                        files: 0,
+                    },
+                    Duration::from_secs(4),
+                );
+            }
+            let reduced = budget.request_bytes();
+            assert!(reduced >= 512 && reduced <= max);
+            if max > 512 {
+                assert!(reduced < max);
+            }
+            for _ in 0..16 {
+                budget.observe(
+                    WorkSize {
+                        bytes: budget.request_bytes(),
+                        files: 0,
+                    },
+                    Duration::from_millis(20),
+                );
+            }
+            assert_eq!(budget.request_bytes(), max);
+            assert_eq!(budget.limit().files, 0);
+        }
+    }
+
+    #[test]
+    fn inherited_range_sizes_are_bounded_and_can_grow_on_a_faster_peer() {
+        for (ceiling, hint, expected) in [
+            (4 << 20, 0, 512),
+            (4 << 20, 32 << 10, 32 << 10),
+            (512, 64 << 10, 512),
+            (3 << 20, u64::MAX, 3 << 20),
+        ] {
+            let mut budget = WorkBudget::ranges(ceiling, Duration::from_secs(1), Some(hint));
+            assert_eq!(budget.request_bytes(), expected);
+            for _ in 0..8 {
+                budget.observe(budget.limit(), Duration::from_millis(250));
+            }
+            assert_eq!(budget.request_bytes(), ceiling);
+        }
+    }
+
+    #[test]
+    fn healthy_ranges_skip_periodic_checks_at_the_ceiling_only() {
+        let mut budget = WorkBudget::ranges(4 << 20, Duration::from_millis(600), None);
+        let later = Instant::now() + Duration::from_secs(31);
+        assert!(
+            budget.range_latency_check_due(later),
+            "still below the ceiling"
+        );
+        budget.observe(budget.limit(), Duration::from_millis(100));
+        assert_eq!(budget.request_bytes(), 4 << 20);
+        assert!(!budget.range_latency_check_due(later));
+        assert!(!budget.range_latency_check_due(later + Duration::from_secs(600)));
+        assert!(
+            budget.latency_check_due(later),
+            "batch checks keep their existing policy"
+        );
+    }
+
+    #[test]
+    fn a_slow_range_keeps_checks_after_reaching_the_ceiling_again() {
+        let mut budget = WorkBudget::ranges(4 << 20, Duration::from_millis(600), None);
+        let later = Instant::now() + Duration::from_secs(31);
+        budget.observe(budget.limit(), Duration::from_secs(2));
+        assert!(budget.range_latency_check_due(later));
+        budget.refreshed_latency(Duration::from_millis(400), later);
+        assert_eq!(budget.latency_target(), Duration::from_millis(1600));
+        for _ in 0..8 {
+            budget.observe(budget.limit(), Duration::from_millis(100));
+        }
+        assert_eq!(budget.request_bytes(), 4 << 20);
+        assert!(!budget.range_latency_check_due(later + Duration::from_secs(29)));
+        assert!(budget.range_latency_check_due(later + Duration::from_secs(30)));
+        budget.refreshed_latency(Duration::from_millis(150), later + Duration::from_secs(30));
+        assert_eq!(budget.latency_target(), Duration::from_millis(600));
+        assert!(
+            budget.range_latency_check_due(later + Duration::from_secs(60)),
+            "a completed check must not forget the earlier slowdown"
+        );
+    }
 
     #[test]
     fn budgets_follow_each_workers_service_and_recover_after_a_slowdown() {

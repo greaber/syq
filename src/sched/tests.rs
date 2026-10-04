@@ -591,6 +591,7 @@ fn tuning_split_threshold_controls_when_idle_workers_can_help() {
         let sched = Sched::new(4 << 20, tuning.split_min_size(4 << 20));
         let mut inner = sched.inner.lock().unwrap();
         inner.inflight.push(Arc::new(Mutex::new(RangeState {
+            split: None,
             idx: 0,
             pos: 0,
             end: 48 << 20,
@@ -837,6 +838,7 @@ fn single_file_group_is_not_registered_for_stealing() {
 fn retry_range_replaces_the_failed_inflight_share() {
     let sched = Sched::new(64, 128);
     let range = Arc::new(Mutex::new(RangeState {
+        split: None,
         idx: 4,
         pos: 192,
         end: 256,
@@ -857,6 +859,7 @@ fn retry_range_replaces_the_failed_inflight_share() {
 fn retry_of_an_empty_claim_preserves_finalization() {
     let sched = Sched::new(64, 128);
     let range = Arc::new(Mutex::new(RangeState {
+        split: None,
         idx: 5,
         pos: 256,
         end: 256,
@@ -1319,4 +1322,45 @@ fn bounded_batch_claim_always_makes_progress_on_an_oversized_or_empty_file() {
         assert_eq!(handle.lock().unwrap().claim(1, 1), Some(2..3));
         assert_eq!(handle.lock().unwrap().claim(1, 1), None);
     }
+}
+
+#[test]
+fn slow_range_budget_wakes_idle_workers_without_sharing_issued_bytes() {
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    sched.inner.lock().unwrap().probing = 1;
+    let first = sched.ranges_ready(0, vec![(0, 8 << 20)]).unwrap();
+    first.lock().unwrap().pos = 1 << 20;
+    sched.scan_done();
+    assert!(!sched.tuning_work(2, 0, 0).parallel);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let other = sched.clone();
+    let peer = std::thread::spawn(move || tx.send(other.next()).unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sched.inner.lock().unwrap().waiting_workers == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    sched.update_range_split(
+        &first,
+        RangeSplit {
+            block: 512,
+            minimum: 128 << 10,
+        },
+    );
+    let Item::Range(stolen) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected range after wakeup")
+    };
+    peer.join().unwrap();
+    let cut = first.lock().unwrap().end;
+    let range = stolen.lock().unwrap();
+    assert_eq!(range.pos, cut);
+    assert_eq!(range.end, 8 << 20);
+    assert!(cut > 1 << 20, "never steal issued prefix");
+    assert_eq!(cut % 512, 0);
+    assert_eq!(range.split, first.lock().unwrap().split);
+    drop(range);
+    assert!(sched.tuning_work(4, 0, 0).parallel);
+    assert!(!sched.range_done(&first));
+    assert!(sched.range_done(&stolen));
+    assert!(matches!(sched.next(), Item::Exit));
 }

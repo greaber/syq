@@ -149,6 +149,7 @@ fn draining_counts_discarded_payload_and_preserves_the_next_response() {
 #[test]
 fn streaming_claim_preserves_a_stolen_suffix_and_checks_its_hash() {
     let range = Arc::new(Mutex::new(crate::sched::RangeState {
+        split: None,
         idx: 0,
         pos: 0,
         end: 5,
@@ -171,6 +172,7 @@ fn streaming_claim_preserves_a_stolen_suffix_and_checks_its_hash() {
 #[test]
 fn split_hashing_unlocks_the_range_and_revalidates_a_further_steal() {
     let range = Arc::new(Mutex::new(crate::sched::RangeState {
+        split: None,
         idx: 0,
         pos: 0,
         end: 5,
@@ -197,6 +199,7 @@ fn split_hashing_unlocks_the_range_and_revalidates_a_further_steal() {
 fn split_hashing_preserves_payload_when_cancelled_or_position_changes() {
     for changed_position in [false, true] {
         let range = Arc::new(Mutex::new(crate::sched::RangeState {
+            split: None,
             idx: 0,
             pos: 0,
             end: 5,
@@ -231,6 +234,7 @@ fn split_hashing_preserves_payload_when_cancelled_or_position_changes() {
 fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
     for end in [0, 8, 16] {
         let range = Arc::new(Mutex::new(crate::sched::RangeState {
+            split: None,
             idx: 0,
             pos: 0,
             end,

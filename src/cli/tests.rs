@@ -236,6 +236,7 @@ fn comparison_block_size_is_a_native_advanced_control() {
     )
     .unwrap();
     assert_eq!(args.block_size, 64 << 10);
+    assert!(!args.block_size_explicit);
     assert_eq!(args.tuning_options.unwrap().request_size, Some(4 << 20));
     let error = parse_native_copy(
         &[
@@ -258,6 +259,7 @@ fn comparison_block_size_is_a_native_advanced_control() {
             Args::parse_rsync(&["source", "destination", spelling, "128K"].map(OsString::from))
                 .unwrap();
         assert_eq!(args.block_size, 128 << 10);
+        assert!(args.block_size_explicit);
         let error = Args::parse_rsync(
             &[
                 "source",
@@ -1012,32 +1014,112 @@ fn native_mtime_matching_is_explicit_and_has_no_opt_out() {
 }
 
 #[test]
-fn block_reuse_is_a_native_filesystem_control() {
-    let args = parse_native_copy(
-        &[
+fn transfer_strategy_preserves_automatic_tuning_and_existing_defaults() {
+    for strategy in [
+        None,
+        Some("whole-file"),
+        Some("aligned-block"),
+        Some("locality"),
+    ] {
+        for native in [false, true] {
+            let mut command = if native {
+                argv(&["source", "--as", "destination"])
+            } else {
+                argv(&["source", "destination"])
+            };
+            if let Some(strategy) = strategy {
+                if native {
+                    command.extend(argv(&["--transfer-strategy", strategy]));
+                } else {
+                    match strategy {
+                        "whole-file" => command.extend(argv(&["--whole-file"])),
+                        "aligned-block" => command.extend(argv(&["--no-whole-file"])),
+                        // The placement rule is implicit in the rsync interface.
+                        "locality" => continue,
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            let args = if native {
+                parse_native_copy(&command)
+            } else {
+                Args::parse_rsync(&command)
+            }
+            .unwrap();
+            assert!(args.tuning_options.is_none());
+            assert!(args.connections_default);
+            for local in [false, true] {
+                let reuse = match strategy {
+                    Some("whole-file") => false,
+                    Some("aligned-block") => true,
+                    _ => !local,
+                };
+                assert_eq!(
+                    args.transfer_strategy
+                        .unwrap_or_default()
+                        .reuse_destination_blocks(local),
+                    reuse,
+                    "{strategy:?} native={native} local={local}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn transfer_strategy_rejects_removed_tuning_key_and_nonfilesystem_controls() {
+    for legacy in ["auto", "on", "off"] {
+        let error = parse_native_copy(&argv(&[
             "source",
             "--as",
             "destination",
-            "--performance-tuning=block-reuse=off",
-        ]
-        .map(OsString::from),
-    )
-    .unwrap();
-    assert!(!args.tuning_options.unwrap().reuse_destination_blocks(false));
-    let error = parse_native_copy(
-        &[
-            "source",
-            "--to",
-            "s3://bucket",
-            "--as",
-            "object",
-            "--performance-tuning=block-reuse=off",
-        ]
-        .map(OsString::from),
-    )
-    .unwrap_err();
+            "--transfer-strategy=whole-file",
+            &format!("--performance-tuning=block-reuse={legacy}"),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid --performance-tuning"),
+            "{error}"
+        );
+    }
+    for extra in [
+        vec!["source", "--to", "s3://bucket", "--as", "object"],
+        vec!["--src-fd", "0", "--as", "destination"],
+    ] {
+        let mut command = extra;
+        command.push("--transfer-strategy=aligned-block");
+        let error = parse_native_copy(&argv(&command)).unwrap_err();
+        assert!(error.to_string().contains("--transfer-strategy"), "{error}");
+    }
+}
+
+#[test]
+fn rsync_whole_file_spellings_follow_last_option_and_keep_native_defaults_separate() {
+    use super::TransferStrategy::{AlignedBlock, WholeFile};
+    for (flags, expected) in [
+        (vec!["-W"], WholeFile),
+        (vec!["--whole-file"], WholeFile),
+        (vec!["--no-W"], AlignedBlock),
+        (vec!["--no-whole-file"], AlignedBlock),
+        (vec!["-aW", "--no-W"], AlignedBlock),
+        (vec!["--no-whole-file", "-aW"], WholeFile),
+        (vec!["-W", "--whole-file"], WholeFile),
+        (vec!["--no-W", "--no-whole-file"], AlignedBlock),
+    ] {
+        let mut command = argv(&flags);
+        command.extend(argv(&["source", "destination"]));
+        let args = Args::parse_rsync(&command).unwrap();
+        assert_eq!(args.transfer_strategy, Some(expected), "{flags:?}");
+        assert!(args.tuning_options.is_none());
+        assert!(args.connections_default);
+    }
+    for flag in [
+        "--transfer-strategy=whole-file",
+        "--syq-transfer-strategy=whole-file",
+    ] {
+        assert!(Args::try_parse_from(["syq rsync", flag, "source", "destination"]).is_err());
+    }
     assert!(
-        error.to_string().contains("filesystem performance tuning"),
-        "{error}"
+        NativeCopyCommand::try_parse_from(["cp", "-W", "source", "--as", "destination"]).is_err()
     );
 }

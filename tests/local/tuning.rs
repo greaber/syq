@@ -1,6 +1,305 @@
 use super::*;
 
 #[test]
+fn small_remote_transfer_strategies_honor_replacement_and_reuse() {
+    use std::os::unix::fs::MetadataExt;
+
+    for strategy in ["whole-file", "aligned-block", "locality"] {
+        for changed in [false, true] {
+            for protected in [false, true] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                t.expose_remote_syq();
+                let data = prng(512 << 10, 487);
+                let mut previous = data.clone();
+                if changed {
+                    *previous.last_mut().unwrap() ^= 1;
+                }
+                write(&t.path("source"), &data);
+                write(&t.path("destination"), &previous);
+                set_mtime(&t.path("source"), 1_700_000_001);
+                set_mtime(&t.path("destination"), 1_700_000_000);
+                let original_inode = fs::metadata(t.path("destination")).unwrap().ino();
+                let result = t.path("result.ndjson");
+                let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+                    .args(["cp", "--no-progress", "--transfer-strategy", strategy])
+                    .arg(t.path("source"))
+                    .args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"])
+                    .arg(&rsh)
+                    .arg("--as")
+                    .arg(t.path("destination"))
+                    .args([
+                        "--performance-tuning=comparison-block-size=64K",
+                        "--if-exists",
+                        if protected {
+                            "error-if-different"
+                        } else {
+                            "update"
+                        },
+                    ])
+                    .arg("--results")
+                    .arg(&result)
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("XDG_CACHE_HOME", t.path("cache"))
+                    .env("SYQ_DEBUG", "1")
+                    .run()
+                    .unwrap();
+                if protected && changed {
+                    assert!(!output.status.success());
+                    assert_eq!(read(&t.path("destination")), previous);
+                    assert_eq!(
+                        fs::metadata(t.path("destination")).unwrap().ino(),
+                        original_inode
+                    );
+                    continue;
+                }
+                assert_output_ok(&output);
+                assert_eq!(read(&t.path("destination")), data);
+                let records = fs::read_to_string(&result).unwrap();
+                let summary: serde_json::Value =
+                    serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                let transferred = if strategy == "whole-file" && !protected {
+                    512 << 10
+                } else if changed {
+                    64 << 10
+                } else {
+                    0
+                };
+                assert_eq!(
+                    summary["bytes_transferred"], transferred,
+                    "{strategy} changed={changed} protected={protected}: {summary}"
+                );
+                assert_eq!(summary["bytes_unchanged"], (512 << 10) - transferred);
+                assert_eq!(
+                    tuning_observed(&output)["native_small_copies"],
+                    u64::from(strategy == "whole-file"),
+                    "{output:?}"
+                );
+                if strategy == "whole-file" && !protected {
+                    assert_ne!(
+                        fs::metadata(t.path("destination")).unwrap().ino(),
+                        original_inode
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn small_remote_multiblock_files_keep_shortcut_when_no_reuse_is_needed() {
+    for strategy in [
+        None,
+        Some("whole-file"),
+        Some("aligned-block"),
+        Some("locality"),
+    ] {
+        for case in ["new", "unchanged", "mixed-unchanged", "mixed-changed"] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            t.expose_remote_syq();
+            fs::create_dir(t.path("destination")).unwrap();
+            let data = prng(200 << 10, 489);
+            for name in ["one", "two"] {
+                write(&t.path(&format!("source/{name}")), &data);
+                set_mtime(&t.path(&format!("source/{name}")), 1_700_000_001);
+                if case == "unchanged" || (case.starts_with("mixed") && name == "two") {
+                    let mut previous = data.clone();
+                    if case == "mixed-changed" {
+                        *previous.last_mut().unwrap() ^= 1;
+                    }
+                    write(&t.path(&format!("destination/{name}")), &previous);
+                    set_mtime(
+                        &t.path(&format!("destination/{name}")),
+                        if case == "mixed-changed" {
+                            1_700_000_000
+                        } else {
+                            1_700_000_001
+                        },
+                    );
+                }
+            }
+            let result = t.path("result.ndjson");
+            let connections = t.path("connections");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args([
+                    "cp",
+                    "--no-progress",
+                    "--performance-tuning=comparison-block-size=64K",
+                ])
+                .arg(t.path("source/one"))
+                .arg(t.path("source/two"))
+                .args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"])
+                .arg(&rsh)
+                .arg("--into")
+                .arg(t.path("destination"))
+                .arg("--results")
+                .arg(&result)
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", &connections)
+                .env("XDG_CACHE_HOME", t.path("cache"))
+                .env("SYQ_DEBUG", "1");
+            if let Some(strategy) = strategy {
+                command.args(["--transfer-strategy", strategy]);
+            }
+            let output = command.run().unwrap();
+            assert_output_ok(&output);
+            for name in ["one", "two"] {
+                assert_eq!(read(&t.path(&format!("destination/{name}"))), data);
+            }
+            let shortcut = case != "mixed-changed" || strategy == Some("whole-file");
+            assert_eq!(
+                tuning_observed(&output)["native_small_copies"],
+                u64::from(shortcut),
+                "{strategy:?} {case}: {output:?}"
+            );
+            if shortcut {
+                assert_eq!(
+                    fs::read_to_string(&connections).unwrap().lines().count(),
+                    1,
+                    "{strategy:?} {case}: {output:?}"
+                );
+            }
+            let records = fs::read_to_string(&result).unwrap();
+            let summary: serde_json::Value =
+                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+            let transferred = match case {
+                "new" => 400 << 10,
+                "unchanged" => 0,
+                "mixed-unchanged" => 200 << 10,
+                "mixed-changed" if strategy == Some("whole-file") => 400 << 10,
+                "mixed-changed" => (200 + 8) << 10,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                summary["bytes_transferred"], transferred,
+                "{strategy:?} {case}: {summary}"
+            );
+            assert_eq!(summary["bytes_unchanged"], (400 << 10) - transferred);
+            assert!(partial_files(&t.path("destination")).is_empty());
+        }
+    }
+}
+
+#[test]
+fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
+    for native in [false, true] {
+        for remote in [false, true] {
+            for (strategy, transferred, unchanged) in [
+                ("whole-file", 12 << 20, 0),
+                ("aligned-block", 4 << 20, 8 << 20),
+                (
+                    "locality",
+                    if remote { 4 << 20 } else { 12 << 20 },
+                    if remote { 8 << 20 } else { 0 },
+                ),
+            ] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                t.expose_remote_syq();
+                let data = prng(12 << 20, 482);
+                write(&t.path("source"), &data);
+                set_mtime(&t.path("source"), 1_700_000_001);
+                for hash in [false, true] {
+                    let mut previous = data.clone();
+                    *previous.last_mut().unwrap() ^= 1;
+                    write(&t.path("destination"), &previous);
+                    set_mtime(&t.path("destination"), 1_700_000_000);
+                    for repeat in [false, true] {
+                        let result = t.path(&format!("result-{hash}-{repeat}.ndjson"));
+                        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                        if native {
+                            command.args(["cp", "--no-progress", "--transfer-strategy", strategy]);
+                            command.arg(t.path("source"));
+                            if remote {
+                                command.args([
+                                    "--to",
+                                    "fake",
+                                    "--no-tcp",
+                                    "--no-bootstrap",
+                                    "--rsh",
+                                ]);
+                                command.arg(&rsh);
+                            }
+                            command.arg("--as").arg(t.path("destination"));
+                        } else {
+                            command.args(["rsync", "-a", "--no-progress"]);
+                            match strategy {
+                                "whole-file" => {
+                                    command.arg("-W");
+                                }
+                                "aligned-block" => {
+                                    command.arg("--no-W");
+                                }
+                                "locality" => {} // rsync's local/remote defaults
+                                _ => unreachable!(),
+                            }
+                            command.arg(t.path("source"));
+                            if remote {
+                                command.args(["--syq-no-tcp", "--syq-no-bootstrap", "--rsh"]);
+                                command.arg(&rsh);
+                                command.arg(format!("fake:{}", t.s("destination")));
+                            } else {
+                                command.arg(t.path("destination"));
+                            }
+                        }
+                        if hash {
+                            command.arg(if native { "--hash" } else { "--checksum" });
+                        }
+                        if native {
+                            command.arg("--results").arg(&result);
+                        } else {
+                            command.arg("--stats");
+                        }
+                        let output = command
+                            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                            .env("XDG_CACHE_HOME", t.path("cache"))
+                            .run()
+                            .unwrap();
+                        assert_output_ok(&output);
+                        assert_eq!(read(&t.path("destination")), data);
+                        let actual = if native {
+                            let records = fs::read_to_string(&result).unwrap();
+                            let summary: serde_json::Value =
+                                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                            (
+                                summary["bytes_transferred"].as_u64().unwrap(),
+                                summary["bytes_unchanged"].as_u64().unwrap(),
+                            )
+                        } else {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stat = |prefix: &str| -> u64 {
+                                stdout
+                                    .lines()
+                                    .find_map(|line| line.trim().strip_prefix(prefix))
+                                    .unwrap()
+                                    .replace(',', "")
+                                    .parse()
+                                    .unwrap()
+                            };
+                            (stat("bytes transferred: "), stat("bytes unchanged: "))
+                        };
+                        assert_eq!(
+                            actual,
+                            if repeat {
+                                (0, 12 << 20)
+                            } else {
+                                (transferred, unchanged)
+                            },
+                            "native={native} remote={remote} {strategy} hash={hash}: {output:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn source_fd_budget_handles_deep_tree_with_96_slots() {
     let t = Tmp::new();
     let mut deepest = t.path("source");
@@ -1614,10 +1913,20 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
             "--into",
             &t.s("private-destination"),
             "--no-progress",
+            "--results",
+            &t.s("results.ndjson"),
         ])
         .run()
         .unwrap();
     assert_output_ok(&output);
+    let terminal: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(t.path("results.ndjson"))
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
     let output = history_command(&t)
         .args(["tuning-cache", "export"])
         .run()
@@ -1632,6 +1941,10 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(records[0]["run"]["status"], "success");
+    let copying_ms = records[0]["run"]["summary"]["copying_elapsed_ms"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(terminal["timings"]["transfer_ms"], copying_ms);
     assert!(records[0]["run"]["selected_workers"].is_null());
     assert!(records
         .iter()
@@ -1780,7 +2093,10 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
             .unwrap();
         copy(name, controls)
     };
-    assert_output_ok(&copy_with_hint("second", &[]));
+    assert_output_ok(&copy_with_hint(
+        "second",
+        &["--transfer-strategy=whole-file"],
+    ));
     assert!(startup_doubling(2));
     let event: String = db
         .query_row(
@@ -1794,7 +2110,11 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     assert_eq!(event["data"]["hint"]["matched"], "filesystems");
     assert_output_ok(&copy_with_hint(
         "capped",
-        &["--resource-limits", "workers=2"],
+        &[
+            "--resource-limits",
+            "workers=2",
+            "--transfer-strategy=locality",
+        ],
     ));
     assert!(startup_doubling(3));
     let event: String = db
@@ -1842,6 +2162,20 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
         &["--resource-limits", "workers=2"],
     ));
     assert!(startup_doubling(6));
+    // A strategy that changes local copying must not inherit the default's hint.
+    assert_output_ok(&copy_with_hint(
+        "aligned",
+        &["--transfer-strategy=aligned-block"],
+    ));
+    let event: String = db
+        .query_row(
+            "SELECT data FROM events WHERE run=7 AND json_extract(data,'$.kind')='starting_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    assert!(event["data"]["hint"].is_null(), "{event}");
 }
 
 #[cfg(debug_assertions)]

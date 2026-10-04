@@ -958,6 +958,21 @@ impl FsOps {
                 outcome: SmallCopyOutcome::UnsupportedTarget,
             }));
         }
+        // The offer contains whole-file payloads. Only existing files that
+        // need content work can benefit from multi-block reuse; keep new
+        // files, rejected entries and quick-check matches on this path.
+        if request.reuse_block_size.is_some_and(|block| {
+            request.files.iter().zip(&destinations).zip(&unchanged).any(
+                |((file, destination), unchanged)| {
+                    destination.is_some() && !unchanged && file.size > block
+                },
+            )
+        }) {
+            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::NeedsBlockReuse,
+            }));
+        }
         let ticket = self.descriptor_session.register(selection.directory)?;
         let directory = self.descriptor_session.acquire(&ticket)?;
         self.install_destination(directory, &request.request_prefix)?;
@@ -1037,7 +1052,9 @@ impl FsOps {
         let mut matched_content: Vec<Option<(RootedTarget, File)>> =
             (0..request.files.len()).map(|_| None).collect();
         for (i, file) in request.files.iter().enumerate() {
-            if unchanged[i]
+            if (request.reuse_block_size.is_none()
+                && request.if_exists != crate::cli::IfExists::ErrorIfDifferent)
+                || unchanged[i]
                 || destinations[i]
                     .as_ref()
                     .is_none_or(|stat| stat.st_size as u64 != file.size)

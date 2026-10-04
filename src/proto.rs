@@ -1167,6 +1167,10 @@ pub struct SmallCopyPayload {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyRequest {
+    /// Reuse matching destination blocks of this size. Existing files that
+    /// need multiple blocks decline before payloads or session setup; new
+    /// files and quick-check matches can still use the shortcut.
+    pub reuse_block_size: Option<u64>,
     pub if_exists: crate::cli::IfExists,
     pub matching_flags: u8,
     pub hash_policy: crate::hashing::HashPolicy,
@@ -1200,6 +1204,10 @@ pub enum SmallCopyOutcome {
     /// remain for resume, and the session now holds the destination root,
     /// so the engine needs a fresh control session to continue.
     StagingFailed(WireError),
+    /// A selected existing file needs multi-block reuse. No payload was
+    /// requested, nothing was written, and the control session can continue
+    /// through the ordinary engine.
+    NeedsBlockReuse,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
