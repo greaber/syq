@@ -437,11 +437,23 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = crate::test_support::tempdir().unwrap();
         let helper = temp.path().join("old-helper");
-        std::fs::write(
-            &helper,
-            b"#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --account-ssh-probe ]\n",
-        )
-        .unwrap();
+        // Write in a child so a concurrent test's fork cannot inherit a writable
+        // descriptor for the helper and make its exec fail with ETXTBSY.
+        let written = Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s' \"$1\" > \"$2\"",
+                "write-helper",
+                "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --account-ssh-probe ]\n",
+            ])
+            .arg(&helper)
+            .capture_output()
+            .unwrap();
+        assert!(
+            written.status.success(),
+            "{}",
+            String::from_utf8_lossy(&written.stderr)
+        );
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(Command::new(&helper)
             .arg("--account-ssh-probe")

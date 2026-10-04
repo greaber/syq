@@ -2673,10 +2673,16 @@ fn approved_completion_selected_and_unselected_masters_keep_their_routes() {
     fs::remove_file(t.path("rsh.log")).unwrap();
 
     drop(_master);
-    assert!(
-        control.exists(),
-        "stopped master should leave a stale socket"
-    );
+    // Another test's concurrent fork can briefly retain the old listener.
+    // Bind without listening to establish a stale socket independently of
+    // those inherited descriptors, preserving the separate missing-path case.
+    fs::remove_file(&control).unwrap();
+    let stale = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    stale
+        .bind(&socket2::SockAddr::unix(&control).unwrap())
+        .unwrap();
+    drop(stale);
+    assert!(control.exists(), "stale socket pathname must remain");
     for missing in [false, true] {
         if missing {
             fs::remove_file(&control).unwrap();
@@ -2685,7 +2691,7 @@ fn approved_completion_selected_and_unselected_masters_keep_their_routes() {
             .run()
             .unwrap();
         assert_output_ok(&output);
-        assert!(output.stdout.is_empty());
+        assert!(output.stdout.is_empty(), "missing={missing}: {output:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("no live approved account connection"),
             "missing={missing}: {output:?}"
