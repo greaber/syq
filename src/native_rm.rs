@@ -1021,8 +1021,12 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
             });
         }
     };
-    for component in names {
-        pool.retire_excess();
+    for (index, component) in names.into_iter().enumerate() {
+        // Check at bounded intervals even when entries are skipped. Reading
+        // shared admission state for every name adds cache traffic to scanning.
+        if index % LEAF_BATCH_FILES == 0 {
+            pool.retire_excess();
+        }
         if pool.is_cancelled() {
             break;
         }
