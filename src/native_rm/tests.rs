@@ -250,8 +250,9 @@ fn failed_attached_emit_cancels_pending_mutation() {
         dry_run: false,
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(1),
-        active: vec![AtomicBool::new(false)],
+        active: AtomicUsize::new(0),
         parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
 
@@ -515,8 +516,9 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             dry_run: false,
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
-            active: vec![AtomicBool::new(false)],
+            active: AtomicUsize::new(0),
             parked: Mutex::new(()),
+            waiting: AtomicUsize::new(0),
             wake: Condvar::new(),
         };
         pool.task_done();
@@ -545,8 +547,8 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
 }
 
 #[test]
-fn parked_removal_workers_wake_for_growth_cancellation_and_completion() {
-    for reason in ["growth", "cancel", "complete"] {
+fn parked_removal_workers_wake_for_growth_cancellation_and_released_capacity() {
+    for reason in ["growth", "cancel", "capacity"] {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let (events, _event_rx) = mpsc::channel();
         let pool = Arc::new(Pool {
@@ -556,13 +558,18 @@ fn parked_removal_workers_wake_for_growth_cancellation_and_completion() {
             dry_run: false,
             cancelled: AtomicBool::new(false),
             limit: AtomicUsize::new(1),
-            active: (0..2).map(|_| AtomicBool::new(false)).collect(),
+            active: AtomicUsize::new(0),
             parked: Mutex::new(()),
+            waiting: AtomicUsize::new(0),
             wake: Condvar::new(),
         });
+        let mut active = Some(pool.enter());
         let (finished, result) = mpsc::channel();
         let worker_pool = pool.clone();
-        let thread = std::thread::spawn(move || finished.send(worker_pool.wait(1)).unwrap());
+        let thread = std::thread::spawn(move || {
+            let _active = worker_pool.enter();
+            finished.send(()).unwrap();
+        });
         assert!(matches!(
             result.recv_timeout(Duration::from_millis(10)),
             Err(mpsc::RecvTimeoutError::Timeout)
@@ -570,16 +577,10 @@ fn parked_removal_workers_wake_for_growth_cancellation_and_completion() {
         match reason {
             "growth" => pool.set_limit(2),
             "cancel" => pool.cancel(),
-            "complete" => {
-                pool.task_done();
-                pool.close();
-            }
+            "capacity" => drop(active.take()),
             _ => unreachable!(),
         }
-        assert_eq!(
-            result.recv_timeout(Duration::from_secs(5)).unwrap(),
-            reason != "complete"
-        );
+        result.recv_timeout(Duration::from_secs(5)).unwrap();
         thread.join().unwrap();
     }
 }
@@ -626,8 +627,9 @@ fn cancellation_within_a_sibling_batch_leaves_remaining_files_and_drains_account
         dry_run: false,
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(4),
-        active: (0..4).map(|_| AtomicBool::new(false)).collect(),
+        active: AtomicUsize::new(0),
         parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
     let cancel = Arc::downgrade(&pool);
@@ -648,4 +650,193 @@ fn cancellation_within_a_sibling_batch_leaves_remaining_files_and_drains_account
     // and all batch children must be accounted for so shutdown cannot hang.
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 13);
     assert_eq!(parent.remaining.load(Ordering::SeqCst), 1);
+}
+
+fn scan_job(directory: &std::path::Path) -> Arc<DirectoryJob> {
+    Arc::new(DirectoryJob {
+        selector: 0,
+        directory: File::open(directory).unwrap(),
+        removal: None,
+        label: Vec::new(),
+        parent: None,
+        remaining: AtomicUsize::new(1),
+        retries: AtomicUsize::new(0),
+        descendant_failed: AtomicBool::new(false),
+        partials_only: false,
+        #[cfg(target_os = "linux")]
+        leaves: Arc::new(crate::rooted::directory_gate::Gate::new(4)),
+    })
+}
+
+fn wait_for_removal_state(pool: &Pool, ready: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let ready = ready();
+    if !ready {
+        eprintln!(
+            "removal wait timed out: active={}, limit={}, pending={}, parked={}",
+            pool.active.load(Ordering::Relaxed),
+            pool.limit.load(Ordering::Relaxed),
+            *pool.pending.lock().unwrap(),
+            pool.waiting.load(Ordering::SeqCst),
+        );
+    }
+    ready
+}
+
+#[test]
+fn retirement_pauses_inline_scanning_before_the_directory_finishes() {
+    let temp = crate::test_support::tempdir().unwrap();
+    for i in 0..512 {
+        fs::write(temp.path().join(i.to_string()), b"data").unwrap();
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let (events, outcomes) = mpsc::channel();
+    let pool = Arc::new(Pool {
+        sender: Mutex::new(Some(sender)),
+        pending: Mutex::new(0),
+        events,
+        dry_run: false,
+        cancelled: AtomicBool::new(false),
+        limit: AtomicUsize::new(2),
+        active: AtomicUsize::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
+        wake: Condvar::new(),
+    });
+    // Hold the one slot that will remain admitted after the reduction.
+    let retained = pool.enter();
+    pool.submit(Task::Scan(scan_job(temp.path())));
+    let (entered, entering) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let resumed = Mutex::new(resumed);
+    let seen = AtomicBool::new(false);
+    let _hook = hook_unlinks_in(temp.path(), move |_| {
+        if !seen.swap(true, Ordering::SeqCst) {
+            entered.send(()).unwrap();
+            resumed.lock().unwrap().recv().unwrap();
+        }
+    });
+    let worker_pool = pool.clone();
+    let thread =
+        std::thread::spawn(move || worker_loop(worker_pool, Arc::new(Mutex::new(receiver))));
+    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The only worker is inside a Scan: its first batch filled the queue,
+    // so the observed unlink is the next batch's inline fallback.
+    pool.set_limit(1);
+    assert!(!pool.backlogged());
+    resume.send(()).unwrap();
+    let parked = wait_for_removal_state(&pool, || pool.waiting.load(Ordering::SeqCst) == 1);
+    let remaining = fs::read_dir(temp.path()).unwrap().count();
+    let measurable = pool.backlogged();
+    drop(retained);
+    let finished = wait_for_removal_state(&pool, || pool.is_done());
+    if !finished {
+        pool.cancel();
+        assert!(wait_for_removal_state(&pool, || pool.is_done()));
+    }
+    pool.close();
+    thread.join().unwrap();
+    assert!(parked, "the worker did not retire within its scan");
+    assert!(remaining > 0 && remaining < 512, "remaining={remaining}");
+    assert!(measurable, "settled reduction must allow new measurements");
+    assert!(finished);
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    assert_eq!(
+        outcomes
+            .try_iter()
+            .flatten()
+            .filter(|o| o.disposition == NativeRemoveDisposition::Removed)
+            .count(),
+        512,
+    );
+    assert_eq!(pool.active.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn reduced_scans_finish_with_idle_workers_waiting_on_the_queue() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let (sender, receiver) = mpsc::sync_channel(2);
+    let (events, outcomes) = mpsc::channel();
+    let pool = Arc::new(Pool {
+        sender: Mutex::new(Some(sender)),
+        pending: Mutex::new(0),
+        events,
+        dry_run: false,
+        cancelled: AtomicBool::new(false),
+        limit: AtomicUsize::new(4),
+        active: AtomicUsize::new(0),
+        parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
+        wake: Condvar::new(),
+    });
+    let (entered, entering) = mpsc::channel();
+    let mut hooks = Vec::new();
+    let mut releases = Vec::new();
+    for d in 0..2 {
+        let path = temp.path().join(d.to_string());
+        fs::create_dir(&path).unwrap();
+        for i in 0..512 {
+            fs::write(path.join(i.to_string()), b"data").unwrap();
+        }
+        let (resume, resumed) = mpsc::channel();
+        releases.push(resume);
+        let resumed = Mutex::new(resumed);
+        let entered = entered.clone();
+        let seen = AtomicBool::new(false);
+        hooks.push(hook_unlinks_in(&path, move |_| {
+            if !seen.swap(true, Ordering::SeqCst) {
+                entered.send(()).unwrap();
+                resumed.lock().unwrap().recv().unwrap();
+            }
+        }));
+        pool.submit(Task::Scan(scan_job(&path)));
+    }
+    let receiver = Arc::new(Mutex::new(receiver));
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let pool = pool.clone();
+            let receiver = receiver.clone();
+            std::thread::spawn(move || worker_loop(pool, receiver))
+        })
+        .collect();
+    for _ in 0..2 {
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    pool.set_limit(1);
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    let finished = wait_for_removal_state(&pool, || pool.is_done());
+    if !finished {
+        pool.cancel();
+        assert!(wait_for_removal_state(&pool, || pool.is_done()));
+    }
+    pool.close();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert!(
+        finished,
+        "an idle receiver retained capacity needed by a paused scan"
+    );
+    assert_eq!(pool.active.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        outcomes
+            .try_iter()
+            .flatten()
+            .filter(|o| o.disposition == NativeRemoveDisposition::Removed)
+            .count(),
+        1024,
+    );
+    for d in 0..2 {
+        assert_eq!(
+            fs::read_dir(temp.path().join(d.to_string()))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 }
