@@ -1539,49 +1539,31 @@ impl FsOps {
         Ok(Response::DifferingBlocks(differing))
     }
 
-    /// Read each small source's ranges, convert their contents and payload
-    /// hash with `convert` as soon as they are read, and attach the source's
-    /// metadata rechecked after every read.
+    /// Read each small source whole, convert its contents and payload hash
+    /// with `convert` as soon as it is read, and attach the source's metadata
+    /// rechecked after every read.
     fn read_small_sources<R: SmallSourceRead, T: SmallSourceResult>(
         &mut self,
         reads: &[R],
         mut convert: impl FnMut(&Self, &R, Vec<u8>, ContentDigest) -> T,
     ) -> Result<Vec<std::result::Result<T, String>>> {
-        let total: u64 = reads
-            .iter()
-            .flat_map(|read| read.ranges())
-            .map(|(_, len)| u64::from(len))
-            .sum();
+        let total: u64 = reads.iter().map(|read| u64::from(read.len())).sum();
         if total > MAX_READ_BYTES {
             bail!("small-file batch requests {total} bytes, exceeding the {MAX_READ_BYTES}-byte protocol limit");
         }
         let mut blocks: Vec<_> = reads
             .iter()
             .map(|read| {
-                let ranges = read.ranges();
-                let read_one = |ops: &mut Self, off: u64, len: u32| {
-                    ops.read_range(read.path(), read.source(), read.attempt(), off, len)
+                // Metadata is enough for an empty file, even with mode 000.
+                let result = if read.len() == 0 {
+                    self.source_content_target(read.source())
+                        .map(|_| (Vec::new(), self.observed_payload_hash(&[])))
+                } else {
+                    self.read_range(read.path(), read.source(), read.attempt(), 0, read.len())
                         .and_then(|response| match response {
                             Response::Block { data, hash, .. } => Ok((data, hash)),
                             other => bail!("unexpected response {other:?}"),
                         })
-                };
-                let result = match ranges.as_slice() {
-                    // Metadata is enough for an empty file, even with mode 000.
-                    [] => self
-                        .source_content_target(read.source())
-                        .map(|_| (Vec::new(), self.observed_payload_hash(&[]))),
-                    [(off, len)] => read_one(self, *off, *len),
-                    _ => ranges
-                        .iter()
-                        .try_fold(Vec::new(), |mut data, &(off, len)| {
-                            data.extend(read_one(self, off, len)?.0);
-                            anyhow::Ok(data)
-                        })
-                        .map(|data| {
-                            let hash = self.observed_payload_hash(&data);
-                            (data, hash)
-                        }),
                 };
                 result
                     .map(|(data, hash)| convert(self, read, data, hash))
@@ -3649,7 +3631,8 @@ trait SmallSourceRead {
     fn path(&self) -> &PathBytes;
     fn source(&self) -> Option<&RegisteredPath>;
     fn attempt(&self) -> u32;
-    fn ranges(&self) -> Vec<(u64, u32)>;
+    /// The whole file's length, read from its start.
+    fn len(&self) -> u32;
 }
 
 impl SmallSourceRead for SmallRead {
@@ -3662,12 +3645,8 @@ impl SmallSourceRead for SmallRead {
     fn attempt(&self) -> u32 {
         self.attempt
     }
-    fn ranges(&self) -> Vec<(u64, u32)> {
-        if self.len == 0 {
-            Vec::new()
-        } else {
-            vec![(0, self.len)]
-        }
+    fn len(&self) -> u32 {
+        self.len
     }
 }
 
@@ -3681,12 +3660,8 @@ impl SmallSourceRead for DifferingRead {
     fn attempt(&self) -> u32 {
         self.attempt
     }
-    fn ranges(&self) -> Vec<(u64, u32)> {
-        if self.len == 0 {
-            Vec::new()
-        } else {
-            vec![(0, self.len)]
-        }
+    fn len(&self) -> u32 {
+        self.len
     }
 }
 
