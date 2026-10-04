@@ -111,31 +111,7 @@ impl Header {
             bail!("receiver unlocking key path must be absolute");
         }
         let socket = ensure_agent_key(agent, &self.protector.path, &public, None)?;
-        let mut bytes = agent::wrapping_signature(&socket, &public, NAMESPACE, &self.challenge)?;
-        match public.algorithm() {
-            Algorithm::Ed25519 => {}
-            Algorithm::Rsa { .. } => {
-                // Some agents omit leading zero bytes in an RSA signature.
-                // Normalize to the modulus length before deriving the key.
-                let length = public
-                    .key_data()
-                    .rsa()
-                    .context("RSA protector")?
-                    .n
-                    .as_positive_bytes()
-                    .context("RSA modulus")?
-                    .len();
-                if bytes.len() > length {
-                    bail!("invalid RSA unlocking signature length");
-                }
-                if bytes.len() < length {
-                    let mut padded = Zeroizing::new(vec![0; length - bytes.len()]);
-                    padded.extend_from_slice(&bytes);
-                    bytes = padded;
-                }
-            }
-            _ => bail!("receiver unlocking requires Ed25519 or RSA-SHA512 signatures"),
-        }
+        let bytes = agent::wrapping_signature(&socket, &public, NAMESPACE, &self.challenge)?;
         derive_key(&self.challenge, &bytes)
     }
 }

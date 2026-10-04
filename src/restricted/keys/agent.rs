@@ -73,11 +73,25 @@ pub(super) fn wrapping_signature(
     if !input.is_empty() {
         bail!("trailing bytes in SSH agent signing response");
     }
-    let Response::SignResponse(signature) = response else {
+    let Response::SignResponse(mut signature) = response else {
         bail!("SSH agent could not sign with the receiver unlocking identity");
     };
     if signature.algorithm() != expected_algorithm {
         bail!("SSH agent returned the wrong receiver unlocking signature algorithm");
+    }
+    if let Some(rsa) = public.key_data().rsa() {
+        let length = rsa.n.as_positive_bytes().context("RSA modulus")?.len();
+        let bytes = signature.as_bytes();
+        if bytes.len() > length {
+            bail!("invalid RSA unlocking signature length");
+        }
+        if bytes.len() < length {
+            // Agents may omit leading zeros. Restore them before verification,
+            // and return the same modulus-width bytes used by wrapping v1.
+            let mut padded = Zeroizing::new(vec![0; length]);
+            padded[length - bytes.len()..].copy_from_slice(bytes);
+            signature = ssh_key::Signature::new(signature.algorithm(), padded.to_vec())?;
+        }
     }
     public
         .key_data()
@@ -129,6 +143,69 @@ mod tests {
         for malformed in [&[12, 0, 0, 0, 1][..], &[5, 0], &[6]] {
             assert!(with_response(malformed, |socket| has_key(socket, public)).is_err());
         }
+    }
+
+    #[test]
+    fn unlocking_normalizes_short_rsa_signatures_before_verifying() {
+        // Public test vector from a disposable OpenSSH RSA key. Its RSA-SHA512
+        // signature starts with zero; agents may omit that byte on the wire.
+        let public = PublicKey::from_openssh(concat!(
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCXeiUO2+nW1JAi7fM3OoiYOojgPwX1D1lHsIt3",
+            "82/7h/wYWBWjjiHzfaeq+5k3eaakN8lYpeEGujGoY/yJtuQoMyBXZbFlPgNTT4Ip7RxX7Hpr4aU9",
+            "RRxqtyzxiPhSVQKYowLmqio6XmLhIcLmWwH1qxTaQ7QtAwVdXFYZ7YTwCQ00Idzas2PXbZkoV3bL",
+            "n2DFMDsME9Ja2DPJMjFmrB+tdM8dfCr9SYOZHDgAIQkNR6as+S3+9lcoj4U/y1AFgq9klefu/vq+",
+            "XLL3A/MrbHPqjRPubSMQY/fbDa4qD0TvFc8SgZL88LcEoS2xByBGQme/lpO3cAwsHIr57mQnzcPr",
+        ))
+        .unwrap();
+        let payload = b"rsa-leading-zero-fixture-135";
+        let full = base64::engine::general_purpose::STANDARD
+            .decode(concat!(
+                "AIErXlq+dSgAmHEVT7r0YZZMgUbGNtwap5hct6Rak0Y6+z02iMg7eSzuRIcW3I1/CrH88xMSFp5q",
+                "VoXNO4qF3haPuSq6Ma+S58o5uKRgZECd75lsU0/C4A11YeloAsV547mK59WPnQ1brVRRDzFI7bhc",
+                "IO1GeNW6N9UGLgHC3dvuilP6doeOiQJ4M0YGDkA1dTB5Gq6YdvI+KO5vWQv11Kq/5I0CdjdNz3+R",
+                "Eckco4zu65ANYh+rr7l4Vjwo6hemg8kAWwC1cEETjFsDTKd1V0mxMMEqHOw4bTTdLM34GKnw8JkS",
+                "93aybuVVqr6sYJJGT3Q4qqKwuIZNFdKPkq61dg==",
+            ))
+            .unwrap();
+        assert_eq!(full[0], 0);
+        assert_ne!(full[1], 0);
+        let algorithm = Algorithm::Rsa {
+            hash: Some(ssh_key::HashAlg::Sha512),
+        };
+        let check = |bytes: &[u8], algorithm: Algorithm, payload: &[u8]| {
+            let signature = ssh_key::Signature::new(algorithm, bytes.to_vec()).unwrap();
+            let mut response = Vec::new();
+            Response::SignResponse(signature)
+                .encode(&mut response)
+                .unwrap();
+            with_response(&response, |socket| {
+                wrapping_signature(socket, &public, "fixture", payload)
+            })
+        };
+        assert_eq!(&*check(&full, algorithm.clone(), payload).unwrap(), &full);
+        assert_eq!(
+            &*check(&full[1..], algorithm.clone(), payload).unwrap(),
+            &full
+        );
+
+        // Padding must not accept lost nonzero bytes, corrupt signatures,
+        // wrong payloads or algorithms, or signatures larger than the modulus.
+        assert!(check(&full[2..], algorithm.clone(), payload).is_err());
+        assert!(check(&[], algorithm.clone(), payload).is_err());
+        let mut corrupt = full.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(check(&corrupt[1..], algorithm.clone(), payload).is_err());
+        assert!(check(&full[1..], algorithm.clone(), b"different payload").is_err());
+        assert!(check(
+            &full[1..],
+            Algorithm::Rsa {
+                hash: Some(ssh_key::HashAlg::Sha256)
+            },
+            payload
+        )
+        .is_err());
+        let oversized = [vec![0], full].concat();
+        assert!(check(&oversized, algorithm, payload).is_err());
     }
 
     #[test]
