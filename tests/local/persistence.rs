@@ -1274,6 +1274,7 @@ fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
 #[test]
 fn persist_connect_native_auth_modes_accept_helper_and_receiving_options() {
     let t = Tmp::new();
+    fs::create_dir_all(t.runtime()).unwrap();
     fs::create_dir_all(t.path("home")).unwrap();
     fs::create_dir_all(t.path("remote-home")).unwrap();
     t.expose_remote_syq();

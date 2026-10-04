@@ -516,6 +516,10 @@ syq persist off [OPTIONS]
 ## syq persist status
 
 Inspect connections without starting them. `--json` uses the [connection-status contract](../automation.md#connection-status). `--pscope` selects an ephemeral scope.
+If individual approved-account records cannot be inspected, status still shows
+healthy connections, reports the inspection errors, and exits unsuccessfully.
+See [approved account status](../persistence-reference.md#approved-account-connections)
+for the JSON fields.
 
 <!-- CLI: persist status -->
 ```text

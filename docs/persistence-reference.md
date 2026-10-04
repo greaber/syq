@@ -86,7 +86,10 @@ requesting machine's SSH configuration.
 `connections`. Each entry contains the `authorizer`, requested and resolved
 endpoints, `control` socket path, and `connected` state. `authorizer` is a name
 string for `@NAME`, or an object containing an `ssh` endpoint for an ordinary
-SSH provider.
+SSH provider. If an individual account record cannot be inspected, the output
+keeps the readable entries in `authorized_ssh` and lists the inspection errors
+in `authorized_ssh_errors`. Status then exits unsuccessfully; damaged records
+do not hide healthy connections.
 
 The requesting machine's SSH configuration determines the destination account,
 host, port, identity selection, and route. Syq resolves that configuration before

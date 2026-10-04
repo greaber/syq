@@ -36,7 +36,8 @@ const MASTER_OPTIONS: &[&str] = &[
     "RemoteCommand=none",
     "ServerAliveInterval=15",
     "ServerAliveCountMax=3",
-    // Later -O forward commands use this master's bind policy.
+    // Later -O forward commands use this master's bind policy. Configured
+    // masks can override it, so also normalize the socket after forwarding.
     "StreamLocalBindMask=0177",
 ];
 
@@ -574,6 +575,61 @@ fn socket_path(path: &Path) -> Result<()> {
         "SSH provider Unix forwarding requires a plain absolute socket path without SSH expansion tokens");
     Ok(())
 }
+fn privatize_forwarded_socket(path: &Path) -> Result<()> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .context("open SSH provider forwarding directory")?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+        "SSH provider forwarding directory must be owned and private"
+    );
+    let socket_metadata = || -> Result<libc::stat> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                c"f".as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("inspect SSH provider forward");
+        }
+        Ok(unsafe { metadata.assume_init() })
+    };
+    let before = socket_metadata()?;
+    anyhow::ensure!(
+        before.st_mode & libc::S_IFMT == libc::S_IFSOCK
+            && before.st_uid == unsafe { libc::geteuid() },
+        "SSH provider forward must be an owned Unix socket"
+    );
+    // OpenSSH may use a configured StreamLocalBindMask instead of our CLI
+    // value. The private parent protects this socket until we set its mode,
+    // before publishing the attachment. Never follow a substituted symlink.
+    let result = unsafe {
+        libc::fchmodat(
+            directory.as_raw_fd(),
+            c"f".as_ptr(),
+            0o600,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("make SSH provider forward private");
+    }
+    let after = socket_metadata()?;
+    anyhow::ensure!(
+        (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+            && after.st_mode & 0o777 == 0o600,
+        "SSH provider forward changed while setting private permissions"
+    );
+    Ok(())
+}
+
 fn forward_service(record: &Record, remote: &Path) -> Result<()> {
     socket_path(remote)?;
     let mut command = Command::new("ssh");
@@ -613,6 +669,7 @@ fn forward_service(record: &Record, remote: &Path) -> Result<()> {
         "SSH provider requires local Unix socket forwarding: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    privatize_forwarded_socket(&record.directory)?;
     Ok(())
 }
 fn keeper(startup: Startup) -> Result<()> {
@@ -940,10 +997,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_master_pins_private_unix_forward_permissions() {
+    fn provider_master_defaults_to_private_unix_forward_permissions() {
         let root = crate::test_support::tempdir().unwrap();
         let config = root.path().join("config");
-        fs::write(&config, "Host *\n StreamLocalBindMask 0000\n").unwrap();
+        fs::write(&config, "# No configured bind mask\n").unwrap();
         let mut command = Command::new("ssh");
         command.args(["-G", "-MNf", "-F"]).arg(config);
         for option in MASTER_OPTIONS {
@@ -970,6 +1027,58 @@ mod tests {
                 .any(|line| line == "forkafterauthentication yes"),
             "{config}"
         );
+    }
+
+    #[test]
+    fn provider_forward_normalizes_configured_mask_before_publication() {
+        let root = crate::test_support::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.path().join("f");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        // Model the actual socket created by a master configured with mask 0000.
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o777)).unwrap();
+        privatize_forwarded_socket(root.path()).unwrap();
+        let metadata = fs::symlink_metadata(&socket).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn provider_forward_refuses_non_socket_and_non_private_parent() {
+        let root = crate::test_support::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.path().join("f");
+        let target = root.path().join("target");
+        fs::write(&target, b"untouched").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &socket).unwrap();
+        assert_eq!(
+            privatize_forwarded_socket(root.path())
+                .unwrap_err()
+                .to_string(),
+            "SSH provider forward must be an owned Unix socket"
+        );
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+        fs::remove_file(&socket).unwrap();
+        fs::write(&socket, b"not a socket").unwrap();
+        assert_eq!(
+            privatize_forwarded_socket(root.path())
+                .unwrap_err()
+                .to_string(),
+            "SSH provider forward must be an owned Unix socket"
+        );
+        fs::remove_file(&socket).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            privatize_forwarded_socket(root.path())
+                .unwrap_err()
+                .to_string(),
+            "SSH provider forwarding directory must be owned and private"
+        );
+        assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o777);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
