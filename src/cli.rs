@@ -2512,7 +2512,9 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         if args.devices {
             bail!("--copy-metadata=specials is not supported for S3 copies");
         }
-        if options.route.is_server_copy() && (args.checksum || args.transfer_integrity) {
+        if options.route.is_server_copy()
+            && (args.checksum || args.hash_or_copy || args.transfer_integrity)
+        {
             bail!("S3-to-S3 copies stay server-side; content hash and verification options require reading object contents and are not supported");
         }
         let (destination, sources) = args.locations.split_last_mut().unwrap();
