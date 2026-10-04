@@ -468,7 +468,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         .args(endpoint_arguments(owner.record.endpoint()?))
         .stdout(Stdio::null());
     anyhow::ensure!(
-        foreground::run_cached(&mut master, &cancelled)? == 0,
+        foreground::run_cached(&mut master, cancelled)? == 0,
         "could not authenticate to SSH authorization provider {}",
         provider.label()
     );

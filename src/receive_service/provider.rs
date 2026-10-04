@@ -43,7 +43,7 @@ enum Access {
     },
     Request {
         session: String,
-        operation: SessionRequest,
+        operation: Box<SessionRequest>,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -146,7 +146,7 @@ fn send_operation(
         &mut stream,
         &Access::Request {
             session: session.into(),
-            operation,
+            operation: Box::new(operation),
         },
     )?;
     stream.set_read_timeout(Some(
@@ -483,7 +483,7 @@ impl Service {
                             || session.closed.load(Ordering::Acquire)
                             || disconnected(&socket)
                     };
-                    match operation {
+                    match *operation {
                         SessionRequest::Resolve(target) => {
                             ssh_auth::resolve_and_reply(&target, &mut stream, &cancelled)
                         }
