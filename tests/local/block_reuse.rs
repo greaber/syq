@@ -995,9 +995,11 @@ fn bandwidth_limited_relays_transfer_only_differing_blocks() {
 fn staging_recovery_preserves_patch_sources() {
     for network in [false, true] {
         let t = Tmp::new();
-        let source = prng(8 << 20, 8317);
+        // A comparison group must fit more than two files so the failure
+        // leaves two staged patches to write on the network worker threads.
+        let source = prng(2 << 20, 8317);
         let mut old = source.clone();
-        old[..4 << 20].fill(b'x');
+        old[..1 << 20].fill(b'x');
         for index in 0..8 {
             write(&t.path(&format!("src/f{index}")), &source);
             write(&t.path(&format!("dst/f{index}")), &old);
@@ -1009,7 +1011,7 @@ fn staging_recovery_preserves_patch_sources() {
                 "-a",
                 "--no-progress",
                 "--no-whole-file",
-                "--performance-tuning=workers=2,batch-files=8,batch-bytes=64M",
+                "--performance-tuning=workers=2,batch-files=8",
                 &t.s("src/"),
                 &t.s("dst/"),
             ])
