@@ -369,7 +369,9 @@ remembered-permission management.
 
 SSH configuration, keys, agents, and the local account's receiving identity
 remain shared. Names advertised by other receiving machines are also available
-regardless of the requesting domain. A domain separates syq's saved policy and
+regardless of the requesting domain. `persist destinations list`, `wait`, and
+`forget` use this shared registry even with `--pscope`: forgetting an offline name
+releases it for the whole account. A domain separates syq's saved policy and
 owned connections; it does not isolate processes running as the same OS account.
 
 Scoped `persist off` closes that domain's connections and receiving services,
