@@ -918,3 +918,129 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
         Ok(0)
     })())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn provider() -> Provider {
+        Provider::Ssh {
+            endpoint: NativeEndpoint {
+                user: Some("user".into()),
+                host: "provider.invalid".into(),
+                port: Some(22),
+            },
+        }
+    }
+
+    #[test]
+    fn absent_local_binding_creates_no_state_or_provider_connection() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let path = root.path().join("scope");
+        let domain = Domain::Explicit(path.clone());
+        assert!(local_binding(&domain, &provider()).unwrap().is_none());
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+
+        crate::persistence::initialize_scope(&path).unwrap();
+        let mut before = fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(local_binding(&domain, &provider()).unwrap().is_none());
+        let mut after = fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before.sort();
+        after.sort();
+        assert_eq!(after, before);
+        assert!(!index(&domain).exists());
+        assert!(!domain.approved_index_path().exists());
+    }
+
+    #[test]
+    fn local_binding_requires_live_ownership_and_current_domain_generation() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let scope = root.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        directory(&domain).unwrap();
+        let provider = provider();
+        let physical = tempfile::Builder::new()
+            .prefix("provider-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(&scope)
+            .unwrap();
+        let mut owner = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(physical.path().join("owner"))
+            .unwrap();
+        owner.write_all(key(&provider).unwrap().as_bytes()).unwrap();
+        let record = Record {
+            version: 1,
+            build: crate::identity::build().into(),
+            provider: provider.clone(),
+            generation: persistent::ensure_generation(&domain).unwrap(),
+            scope_identity: domain.identity().unwrap(),
+            directory: physical.path().into(),
+            ticket: Some(Ticket {
+                session: "a".repeat(64),
+                profile: "provider".into(),
+                identity: crate::receive_approval::provider_accounts::ProviderIdentity::new(
+                    "user".into(),
+                    ssh_key::Fingerprint::Sha256([1; 32]).to_string(),
+                )
+                .unwrap(),
+            }),
+        };
+        let socket = UnixListener::bind(record.forwarded()).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        fs::set_permissions(record.forwarded(), fs::Permissions::from_mode(0o600)).unwrap();
+        write_record(&domain, &record).unwrap();
+        // A stale record and socket alone cannot prove a live provider lease.
+        assert!(local_binding(&domain, &provider).unwrap().is_none());
+        let lock = lock_file(
+            &record_path(&domain, &provider)
+                .unwrap()
+                .with_extension("lock"),
+            true,
+        )
+        .unwrap();
+        assert!(local_binding(&domain, &provider).unwrap().is_none());
+        assert!(try_lock(&lock).unwrap());
+        assert_eq!(
+            local_binding(&domain, &provider).unwrap(),
+            record.binding().unwrap()
+        );
+
+        let mut stale = record.clone();
+        stale.generation = if record.generation == "b".repeat(64) {
+            "c".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
+        write_record(&domain, &stale).unwrap();
+        assert!(local_binding(&domain, &provider).unwrap().is_none());
+        stale = record.clone();
+        stale.scope_identity.1 ^= 1;
+        write_record(&domain, &stale).unwrap();
+        assert!(local_binding(&domain, &provider).unwrap().is_none());
+        write_record(&domain, &record).unwrap();
+        assert_eq!(
+            local_binding(&domain, &provider).unwrap(),
+            record.binding().unwrap()
+        );
+        // Warm lookup has not connected even to the local forwarding socket.
+        assert_eq!(
+            socket.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(lock);
+        assert!(local_binding(&domain, &provider).unwrap().is_none());
+    }
+}
