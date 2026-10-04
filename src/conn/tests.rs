@@ -1915,6 +1915,27 @@ fn probe_reachable_probes_each_socket_address_once() {
         .map(|mut it| it.any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST))
         .unwrap_or(false);
     listener.set_nonblocking(true).unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let acceptor = std::thread::spawn(move || {
+        let mut accepted = 0;
+        loop {
+            match listener.accept() {
+                Ok(_) => {
+                    accepted += 1;
+                    let _ = accepted_tx.send(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match stop_rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        _ => break,
+                    }
+                }
+                Err(error) => panic!("accept probe: {error}"),
+            }
+        }
+        accepted
+    });
     let candidate = |address: &str| TcpCandidate {
         address: address.to_string(),
         speed_mbps: 0,
@@ -1927,20 +1948,17 @@ fn probe_reachable_probes_each_socket_address_once() {
         candidate("localhost"),
         candidate("127.0.0.1"),
     ];
-    probe_reachable(&mut candidates, port).unwrap();
+    let probed = probe_reachable(&mut candidates, port);
+    // A completed client connect does not mean accept is ready yet. Wait for
+    // the acceptor itself, then stop and join it before checking the count.
+    let first = accepted_rx.recv_timeout(std::time::Duration::from_secs(60));
+    drop(stop_tx);
+    let accepted = acceptor.join().unwrap();
+    probed.unwrap();
+    first.expect("probe connection was not accepted");
     assert_eq!(candidates[0].reachable, Some(true));
     assert_eq!(candidates[2].reachable, Some(true));
     assert_eq!(candidates[1].reachable, Some(via_localhost));
-    // Successful probes have completed connect(), so their connections are
-    // already queued. Drain them without racing a background accept thread.
-    let mut accepted = 0;
-    loop {
-        match listener.accept() {
-            Ok(_) => accepted += 1,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(error) => panic!("accept probe: {error}"),
-        }
-    }
     assert_eq!(accepted, 1);
 }
 
