@@ -213,6 +213,7 @@ enum Message {
         challenge: String,
     },
     Exec(exec::ExecRequest),
+    ResolveSsh(crate::cli::NativeEndpoint),
     Ssh(ssh_auth::Request),
     // Copy and storage requests carry the command that produced them. The
     // receiving machine derives the request from it and shows it for approval.
@@ -488,6 +489,13 @@ pub(crate) fn receiver_identity_directory() -> Result<PathBuf> {
     Ok(fs::canonicalize(home)?.join(".syq-receiver-identity"))
 }
 
+pub(crate) fn receiving_identity_fingerprint() -> Result<String> {
+    Ok(identity::load_key()?
+        .public_key()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string())
+}
+
 fn registry() -> Result<PathBuf> {
     private_directory(".syq-destinations-v3")
 }
@@ -544,27 +552,41 @@ pub(crate) fn registered_names() -> Vec<String> {
     names
 }
 
-fn read_registration(name: &str) -> Result<Registration> {
+/// Inspect local registration metadata without creating state or contacting
+/// the provider. Absence is ordinary for completion and optional caches.
+fn read_existing_registration(name: &str) -> Result<Option<Registration>> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
+    read_existing_registration_at(&home.join(".syq-destinations-v3"), name)
+}
+
+fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<Registration>> {
     validate_name(name)?;
-    let path = registry()?.join(format!("{name}.json"));
-    let encoded = match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
-        Ok(encoded) => encoded,
-        Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => {
-            if identity::owner(&registry()?, name)?.is_some() {
-                bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
-            }
-            let names = registered_names();
-            let advice = if names.is_empty() {
-                "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
-            } else {
-                let shown = names.iter().take(8).map(|name| format!("@{name}")).collect::<Vec<_>>().join(", ");
-                format!("Registered names: {shown}{}. Use one of these names, or connect another receiving machine with `syq persist connect SERVER`.", if names.len() > 8 { ", ..." } else { "" })
-            };
-            bail!("no receiving machine named @{name} is registered for this account.\n{advice}\nRun `syq persist destinations list` to see names and connection status.");
-        }
-        Err(error) => return Err(error).with_context(|| format!("cannot read the registration for @{name}; check its permissions or reconnect from the receiving machine")),
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        bail!("destination registry must be an owned directory with mode 0700");
+    }
+    let path = directory.join(format!("{name}.json"));
+    let encoded =
+        match crate::delegation::read_private_regular(&path, "named destination", MAX_MESSAGE) {
+            Ok(encoded) => encoded,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
     let registration: Registration = serde_json::from_slice(&encoded)?;
     if registration.version != REGISTRATION_VERSION {
         bail!("unsupported destination registration; reconnect from the receiving machine");
@@ -575,7 +597,31 @@ fn read_registration(name: &str) -> Result<Registration> {
     {
         bail!("invalid destination helper registration; reconnect from the receiving machine");
     }
-    Ok(registration)
+    Ok(Some(registration))
+}
+
+fn read_registration(name: &str) -> Result<Registration> {
+    if let Some(registration) = read_existing_registration(name)
+        .with_context(|| format!("cannot read the registration for @{name}; check its permissions or reconnect from the receiving machine"))?
+    {
+        return Ok(registration);
+    }
+    if identity::owner(&registry()?, name)?.is_some() {
+        bail!("receiving machine @{name} is offline; reconnect its original receiver with `syq persist connect SERVER`, or release the name on this server with `syq persist destinations forget {name}`");
+    }
+    let names = registered_names();
+    let advice = if names.is_empty() {
+        "On the receiving machine, run `syq persist connect SERVER`, using the SSH endpoint for this server account.".to_owned()
+    } else {
+        let shown = names
+            .iter()
+            .take(8)
+            .map(|name| format!("@{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Registered names: {shown}{}. Use one of these names, or connect another receiving machine with `syq persist connect SERVER`.", if names.len() > 8 { ", ..." } else { "" })
+    };
+    bail!("no receiving machine named @{name} is registered for this account.\n{advice}\nRun `syq persist destinations list` to see names and connection status.");
 }
 
 fn load_registration(name: &str) -> Result<Registration> {
@@ -1176,6 +1222,7 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
+            Message::ResolveSsh(target) => self.resolve_ssh(target, stream),
             Message::Ssh(request) => self.authorize_ssh(request, stream),
             Message::Storage {
                 command,

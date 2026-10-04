@@ -259,6 +259,18 @@ pub(crate) struct Peer {
     algorithms: String,
 }
 impl Peer {
+    pub(crate) fn resolved_policy(&self) -> Result<super::super::ssh_auth::ResolvedPolicy> {
+        super::super::ssh_auth::ResolvedPolicy::new(
+            crate::cli::NativeEndpoint {
+                user: Some(self.user.clone()),
+                host: self.host.clone(),
+                port: Some(self.port),
+            },
+            &self.known_hosts,
+            &self.algorithms,
+        )
+    }
+
     pub(crate) fn from_approved(
         endpoint: &crate::cli::NativeEndpoint,
         known_hosts: &str,

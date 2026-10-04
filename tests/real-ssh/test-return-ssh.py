@@ -329,6 +329,95 @@ def scoped_account_cases(expected):
             source_run(["persist", "off", "--pscope", scope])
 
 
+
+def resolution_cache_cases(expected):
+    print("case: cached provider resolution stays fast and refreshes independently of SSH masters", flush=True)
+    alias = "syq-resolution-fixture"
+    scope = source_run(["persist", "on", "--ephemeral"]).strip()
+    config = Path.home() / ".ssh/config"
+    original = config.read_bytes()
+    with tempfile.TemporaryDirectory(prefix="syq-resolution-") as local:
+        marker = Path(local) / "lookups"
+
+        def configure(host):
+            # Match exec is evaluated by the provider's ssh -G inspection. Direct
+            # requester logins use pinned settings and never read this config.
+            prefix = ("Host " + alias + "\n  HostName " + host + "\n  User syq\n  Port 22\n"
+                      "Match originalhost " + alias + " exec \"printf x >> " + str(marker) + "\"\n"
+                      "Match all\n")
+            config.write_bytes(prefix.encode() + original)
+
+        def command():
+            return "exec env " + native_path + " " + shlex.join([
+                "syq", "ssh", "--pscope", scope, "--auth-from", "@laptop", alias, "--", "hostname"])
+
+        def cache(age=False):
+            script = """
+import json, pathlib, sys
+entries = list((pathlib.Path(sys.argv[1])/'authorized-ssh-v1/resolution-v1').glob('*.json'))
+assert len(entries) == 1, entries
+path = entries[0]
+entry = json.loads(path.read_text())
+assert entry['requested']['host'] == sys.argv[2], entry
+if sys.argv[3] == 'age':
+    entry['checked'] = entry['attempted'] = 0
+    path.write_text(json.dumps(entry))
+print(json.dumps(entry))
+"""
+            return json.loads(run("ssh", "source", shlex.join([
+                "python3", "-c", script, scope, alias, "age" if age else "read"])))
+
+        try:
+            configure("destination")
+            assert run("ssh", "source", command()).encode() == expected
+            calls = marker.read_bytes()
+            assert calls, "cold login did not inspect the provider config"
+            for _ in range(2):
+                assert run("ssh", "source", command()).encode() == expected
+            assert marker.read_bytes() == calls, "warm login inspected provider config again"
+
+            configure("source")
+            # Before refresh, the selected metadata is the same with a warm or
+            # cold master. Age only the disposable cache, without sleeping 30s.
+            cache(age=True)
+            assert run("ssh", "source", command()).encode() == expected
+            wait_for("provider alias refresh", lambda: cache()["selected"]["policy"]["endpoint"]["host"] == "source")
+            assert len(marker.read_bytes()) > len(calls), "stale cache was not refreshed"
+
+            process = subprocess.Popen(["ssh", "source", command()], stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True)
+            try:
+                pending(target="syq@source:22")
+                out, err = process.communicate(timeout=30)
+                assert process.returncode == 0, (out, err)
+                assert out == run("ssh", "source", "hostname").encode(), (out, err)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+            rows = json.loads(source_run(["persist", "status", "--pscope", scope, "--json"]))["authorized_ssh"]
+            assert {row["endpoint"]["host"] for row in rows} == {"source", "destination"}, rows
+            assert all(row["connected"] for row in rows), rows
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+
+            # A fresh cache cannot silently redirect a cold login after config
+            # changes. Fail this invocation, then let the next one resolve anew.
+            source_control = next(row["control"] for row in rows if row["endpoint"]["host"] == "source")
+            run("ssh", "source", shlex.join(["env", native_path, "ssh", "-F", "/dev/null",
+                 "-S", source_control, "-O", "exit", "source"]))
+            wait_for("closed old-resolution master", lambda: not any(
+                row["endpoint"]["host"] == "source" and row["connected"]
+                for row in json.loads(source_run(["persist", "status", "--pscope", scope, "--json"]))["authorized_ssh"]))
+            configure("destination")
+            failed = subprocess.run(["ssh", "source", command()], input=b"", capture_output=True, timeout=40)
+            assert failed.returncode == 255 and b"configuration changed" in failed.stderr, failed
+            assert run("ssh", "source", command()).encode() == expected
+            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+        finally:
+            config.write_bytes(original)
+            source_run(["persist", "off", "--pscope", scope])
+
+
 def persistent_crash():
     print("case: killing the keeper hangs up its active native master", flush=True)
     persistent_connect()
@@ -504,6 +593,7 @@ assert 'does not match' in reply['Error'], reply
     assert execute(["hostname"], ask=True)[0] == expected
     persistent_cases(expected)
     scoped_account_cases(expected)
+    resolution_cache_cases(expected)
     persistent_crash()
     cold_copy_and_remembered_cases(expected)
     print("Direct laptop-authorized SSH passed", flush=True)

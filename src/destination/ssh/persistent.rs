@@ -1,5 +1,5 @@
 //! A reusable approved SSH login, owned by a keeper while its laptop is connected.
-use super::{foreground, SessionRequest, Tty};
+use super::{foreground, resolution, SessionRequest, Tty};
 use crate::cli::{AuthFrom, NativeEndpoint};
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
@@ -31,6 +31,8 @@ struct Startup {
     requested: NativeEndpoint,
     generation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected: Option<resolution::Selection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     scope: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope_identity: Option<(u64, u64)>,
@@ -59,7 +61,7 @@ fn ensure_master_parent(domain: &Domain) -> Result<PathBuf> {
         domain.ensure_runtime()
     }
 }
-fn directory(domain: &Domain) -> Result<PathBuf> {
+pub(super) fn directory(domain: &Domain) -> Result<PathBuf> {
     ensure_master_parent(domain)?;
     let path = domain.approved_index_path();
     match fs::DirBuilder::new().mode(0o700).create(&path) {
@@ -69,7 +71,7 @@ fn directory(domain: &Domain) -> Result<PathBuf> {
     }
     existing_directory(domain)?.context("SSH authority directory disappeared")
 }
-fn existing_directory(domain: &Domain) -> Result<Option<PathBuf>> {
+pub(super) fn existing_directory(domain: &Domain) -> Result<Option<PathBuf>> {
     let path = domain.approved_index_path();
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
@@ -116,7 +118,7 @@ fn read_generation(path: &Path) -> Result<Option<String>> {
 fn generation_path(domain: &Domain) -> PathBuf {
     domain.approved_index_path().join(GENERATION)
 }
-fn ensure_generation(domain: &Domain) -> Result<String> {
+pub(super) fn ensure_generation(domain: &Domain) -> Result<String> {
     ensure_generation_at(&directory(domain)?)
 }
 fn ensure_generation_at(directory: &Path) -> Result<String> {
@@ -137,7 +139,7 @@ fn ensure_generation_at(directory: &Path) -> Result<String> {
         Err(error) => Err(error.error.into()),
     }
 }
-fn generation_open(domain: &Domain, generation: &str) -> Result<bool> {
+pub(super) fn generation_open(domain: &Domain, generation: &str) -> Result<bool> {
     if !domain.is_default() && !domain.enabled()? {
         return Ok(false);
     }
@@ -286,6 +288,58 @@ pub(crate) fn cached(
     active_record(domain, record)
 }
 
+fn selected_index_path(
+    domain: &Domain,
+    authorizer: &str,
+    requested: &NativeEndpoint,
+    selected: &resolution::Selection,
+) -> Result<PathBuf> {
+    let identity = serde_json::to_vec(&("resolved-account-v1", authorizer, requested, selected))?;
+    Ok(domain
+        .approved_index_path()
+        .join(format!("{}.json", blake3::hash(&identity).to_hex())))
+}
+
+fn cached_selected(
+    domain: &Domain,
+    authorizer: &str,
+    requested: &NativeEndpoint,
+    selected: &resolution::Selection,
+) -> Result<Option<Cached>> {
+    if existing_directory(domain)?.is_none() {
+        return Ok(None);
+    }
+    // Old records have no provider binding. They remain readable for status,
+    // shutdown and explicit export, but commands require newly bound authority.
+    let path = selected_index_path(domain, authorizer, requested, selected)?;
+    let Some(record) = read_record(&path)? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        record.authorizer == authorizer && record.requested == *requested,
+        "SSH authority record does not match the requested login"
+    );
+    if record.endpoint != selected.policy.endpoint || !record.control.exists() {
+        return Ok(None);
+    }
+    validate_record(domain, &record)?;
+    let peer = read_peer(&record)?;
+    anyhow::ensure!(
+        crate::destination::ssh_auth::ResolvedPolicy::from_peer(&peer)? == selected.policy,
+        "SSH authority peer policy does not match the selected provider"
+    );
+    active_record(domain, record)
+}
+
+fn lookup_request(authorizer: &str, requested: &NativeEndpoint) -> SessionRequest {
+    SessionRequest {
+        authorizer: authorizer.to_owned(),
+        destination: requested.clone(),
+        tty: Tty::Disabled,
+        command: Vec::new(),
+    }
+}
+
 fn active_record(domain: &Domain, record: Record) -> Result<Option<Cached>> {
     // A crashed keeper can leave an expired index. Never reconnect through it.
     if !record.control.exists() {
@@ -319,7 +373,13 @@ pub(crate) fn select_cached(
     mode: &AuthFrom,
 ) -> Result<Option<Cached>> {
     match mode {
-        AuthFrom::Return(authorizer) => cached(domain, authorizer, requested),
+        AuthFrom::Return(authorizer) => {
+            let request = lookup_request(authorizer, requested);
+            let Some(selected) = resolution::cached(domain, &request)? else {
+                return Ok(None);
+            };
+            cached_selected(domain, authorizer, requested, &selected)
+        }
         AuthFrom::Auto | AuthFrom::Ssh => Ok(None),
     }
 }
@@ -331,8 +391,10 @@ pub(crate) fn select_export(
     requested: &NativeEndpoint,
     mode: &AuthFrom,
 ) -> Result<Option<Cached>> {
-    if !matches!(mode, AuthFrom::Auto) {
-        return select_cached(domain, requested, mode);
+    match mode {
+        AuthFrom::Return(authorizer) => return export_selected(domain, authorizer, requested),
+        AuthFrom::Ssh => return Ok(None),
+        AuthFrom::Auto => {}
     }
     let mut matches = match export_matches(domain, requested) {
         Ok(matches) => matches,
@@ -357,22 +419,38 @@ pub(crate) fn select_or_connect(
     mode: &AuthFrom,
 ) -> Result<Option<Cached>> {
     super::super::handoff::validate_account_selection(mode)?;
-    if let Some(cached) = select_cached(domain, requested, mode)? {
-        return Ok(Some(cached));
-    }
     let AuthFrom::Return(authorizer) = mode else {
         return Ok(None);
     };
-    let request = SessionRequest {
-        authorizer: authorizer.clone(),
-        destination: requested.clone(),
-        tty: Tty::Disabled,
-        command: Vec::new(),
-    };
-    start(domain, request)?;
-    cached(domain, authorizer, requested)?
+    let request = lookup_request(authorizer, requested);
+    super::super::ssh_auth::prepare_account(&request)?;
+    let plan = resolution::select(domain, &request)?;
+    if let Some(cached) = cached_selected(domain, authorizer, requested, &plan.selected)? {
+        return Ok(Some(cached));
+    }
+    let selected = plan.selected.clone();
+    if let Err(error) = start(domain, request.clone(), plan) {
+        if let Err(invalidation) = resolution::invalidate(domain, &request, &selected) {
+            crate::output::diagnostic!("syq: warning: cannot clear failed SSH resolution ({invalidation:#}); remove the stale resolution cache before retrying");
+        }
+        return Err(error);
+    }
+    cached_selected(domain, authorizer, requested, &selected)?
         .context("approved SSH account connection ended before use")
         .map(Some)
+}
+
+fn export_selected(
+    domain: &Domain,
+    authorizer: &str,
+    requested: &NativeEndpoint,
+) -> Result<Option<Cached>> {
+    if let Some(selected) = resolution::cached(domain, &lookup_request(authorizer, requested))? {
+        return cached_selected(domain, authorizer, requested, &selected);
+    }
+    // An explicit snapshot can still export one legacy typed-endpoint record.
+    // It never guesses between historical policy-keyed records or authorizes.
+    cached(domain, authorizer, requested)
 }
 
 fn export_matches(domain: &Domain, requested: &NativeEndpoint) -> Result<Vec<Cached>> {
@@ -385,6 +463,7 @@ fn export_matches(domain: &Domain, requested: &NativeEndpoint) -> Result<Vec<Cac
     let Some(index) = existing_directory(domain)? else {
         return Ok(matches);
     };
+    let mut authorizers = std::collections::BTreeSet::new();
     for entry in fs::read_dir(index)? {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -393,11 +472,13 @@ fn export_matches(domain: &Domain, requested: &NativeEndpoint) -> Result<Vec<Cac
         let Some(record) = read_record(&path)? else {
             continue;
         };
-        if record.requested != *requested {
-            continue;
+        if record.requested == *requested {
+            authorizers.insert(record.authorizer);
         }
-        if let Some(active) = active_record(domain, record)? {
-            matches.push(active);
+    }
+    for authorizer in authorizers {
+        if let Some(cached) = export_selected(domain, &authorizer, requested)? {
+            matches.push(cached);
         }
     }
     Ok(matches)
@@ -521,6 +602,9 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
         }
         std::thread::sleep(POLL);
     }
+    if let Err(error) = resolution::wait(domain) {
+        errors.push(format!("{error:#}"));
+    }
     if !domain.is_default() {
         if let Err(error) = cleanup::wait_for_keepers(domain) {
             errors.push(format!("{error:#}"));
@@ -619,7 +703,7 @@ pub(crate) fn connect(domain: &Domain, request: SessionRequest) -> Result<()> {
     Ok(())
 }
 
-fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
+pub(super) fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
     #[cfg(target_os = "linux")]
     let directory = "/proc/self/fd";
     #[cfg(not(target_os = "linux"))]
@@ -661,13 +745,17 @@ fn protect_keeper_inheritance(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn start(domain: &Domain, request: SessionRequest) -> Result<()> {
-    super::super::ssh_auth::prepare_account(&request)?;
+fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Result<()> {
+    anyhow::ensure!(
+        generation_open(domain, &plan.generation)?,
+        "SSH account setup was cancelled"
+    );
     let startup = Startup {
         command: crate::approval_command::current()?,
         authorizer: request.authorizer,
         requested: request.destination,
-        generation: ensure_generation(domain)?,
+        generation: plan.generation,
+        selected: Some(plan.selected),
         scope: domain.explicit_path().map(Path::to_path_buf),
         scope_identity: if domain.is_default() {
             None
@@ -756,7 +844,16 @@ fn keeper(startup: Startup) -> Result<()> {
     if !startup_open(&domain, &startup)? {
         bail!("SSH account setup was cancelled before startup");
     }
-    let path = index_path(&domain, &request.authorizer, &request.destination)?;
+    let selected = startup
+        .selected
+        .as_ref()
+        .context("SSH account startup lacks a resolved policy; retry the command")?;
+    selected.policy.validate()?;
+    anyhow::ensure!(
+        resolution::provider_binding(&request.authorizer)? == selected.provider,
+        "SSH provider connection changed before account setup; retry the command"
+    );
+    let path = selected_index_path(&domain, &request.authorizer, &request.destination, selected)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -778,7 +875,9 @@ fn keeper(startup: Startup) -> Result<()> {
         if !startup_open(&domain, &startup)? || signals.received.load(Ordering::Acquire) != 0 {
             bail!("SSH account setup cancelled while waiting for another request");
         }
-        if let Some(cached) = cached(&domain, &request.authorizer, &request.destination)? {
+        if let Some(cached) =
+            cached_selected(&domain, &request.authorizer, &request.destination, selected)?
+        {
             return super::super::write_message(
                 &mut std::io::stdout(),
                 &Ok::<_, String>(cached.endpoint().host.clone()),
@@ -798,15 +897,18 @@ fn keeper(startup: Startup) -> Result<()> {
     }
     let approval_request = request.clone();
     let shown_command = startup.command.clone();
+    let selected = selected.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     // The keeper is a dedicated child process. If setup is cancelled, it exits
     // and closes the pending return request even while approval is blocked.
     std::thread::Builder::new()
         .name("syq-ssh-approve".into())
         .spawn(move || {
-            let _ = sender.send(super::super::ssh_auth::authorize_account(
+            let _ = sender.send(super::super::ssh_auth::authorize_account_expected_from(
                 &approval_request,
                 shown_command,
+                &selected.policy,
+                &selected.provider,
             ));
         })?;
     let approval_deadline = Instant::now() + Duration::from_secs(330);
@@ -1069,6 +1171,9 @@ fn close_master(record: &Record) -> Result<()> {
 }
 
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
+    if let Some(result) = super::resolution::dispatch(argv) {
+        return Some(result);
+    }
     if argv.len() == 2 && argv[1] == "--account-ssh-probe" {
         return Some(Ok(0));
     }
@@ -1115,21 +1220,84 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         for unreadable in [false, true] {
             if unreadable {
-                fs::set_permissions(&index, fs::Permissions::from_mode(0)).unwrap();
+                fs::set_permissions(&index, fs::Permissions::from_mode(0o0)).unwrap();
             }
             // Native selection needs no provider record or SSH process. The
-            // selected-provider path still reports corrupt/unreadable state.
+            // legacy authority reader still reports corrupt/unreadable state.
             for mode in [AuthFrom::Auto, AuthFrom::Ssh] {
                 assert!(select_cached(&domain, &requested, &mode).unwrap().is_none());
                 assert!(select_or_connect(&domain, &requested, &mode)
                     .unwrap()
                     .is_none());
             }
-            assert!(
-                select_cached(&domain, &requested, &AuthFrom::Return("laptop".into())).is_err()
-            );
+            assert!(cached(&domain, "laptop", &requested).is_err());
         }
         fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn policy_bound_indices_keep_old_authority_separate() {
+        let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+        let scope = root.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        directory(&domain).unwrap();
+        let requested = NativeEndpoint {
+            user: None,
+            host: "alias".into(),
+            port: None,
+        };
+        let key = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+            "",
+        )
+        .unwrap();
+        let selected = resolution::Selection {
+            provider: "a".repeat(64),
+            policy: crate::destination::ssh_auth::ResolvedPolicy::new(
+                NativeEndpoint {
+                    user: Some("user".into()),
+                    host: "resolved.invalid".into(),
+                    port: Some(22),
+                },
+                &format!(
+                    "syq-approved-peer {}\n",
+                    key.public_key().to_openssh().unwrap()
+                ),
+                "ssh-ed25519",
+            )
+            .unwrap(),
+        };
+        let first = selected_index_path(&domain, "laptop", &requested, &selected).unwrap();
+        let mut changed = selected.clone();
+        changed.policy.endpoint.host = "other.invalid".into();
+        assert_ne!(
+            first,
+            selected_index_path(&domain, "laptop", &requested, &changed).unwrap()
+        );
+        changed = selected.clone();
+        changed.provider = "b".repeat(64);
+        assert_ne!(
+            first,
+            selected_index_path(&domain, "laptop", &requested, &changed).unwrap()
+        );
+        let old = Record {
+            version: 1,
+            authorizer: "laptop".into(),
+            requested: requested.clone(),
+            endpoint: selected.policy.endpoint.clone(),
+            control: scope.join("old-control"),
+        };
+        let legacy = index_path(&domain, "laptop", &requested).unwrap();
+        fs::write(&legacy, serde_json::to_vec(&old).unwrap()).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
+        // Even identical resolved accounts cannot establish the provider binding
+        // of an old record. Do not probe/reuse its control socket for commands.
+        assert!(cached_selected(&domain, "laptop", &requested, &selected)
+            .unwrap()
+            .is_none());
+        assert!(read_record(&legacy).unwrap().is_some());
+        assert!(!first.exists());
     }
 
     #[test]

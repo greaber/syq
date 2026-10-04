@@ -9,6 +9,7 @@ use std::path::PathBuf;
 pub(super) mod foreground;
 mod master_lifetime;
 pub(crate) mod persistent;
+pub(crate) mod resolution;
 
 #[derive(Parser)]
 #[command(

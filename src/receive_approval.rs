@@ -14,7 +14,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod accounts;
+pub(crate) mod provider_accounts;
 pub(crate) use accounts::{AccountIdentity, AccountPermission};
+pub(crate) use provider_accounts::ProviderLoginPermission;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountDecision {
@@ -67,6 +69,7 @@ pub(crate) enum Kind {
     Copy,
     Command,
     Ssh,
+    ProviderSsh,
     Storage,
     Source,
 }
@@ -135,6 +138,12 @@ pub(crate) enum Details {
         max_bytes: u64,
         max_entries: u64,
     },
+    ProviderSsh {
+        kind: ProviderSshKind,
+        destination: String,
+        permission: String,
+        provider_account: ProviderLoginPermission,
+    },
     Ssh {
         kind: SshKind,
         reusable: bool,
@@ -171,6 +180,11 @@ pub(crate) enum CommandKind {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SshKind {
     Ssh,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderSshKind {
+    ProviderSsh,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -300,6 +314,7 @@ impl Summary {
             Details::Copy { .. } => Kind::Copy,
             Details::Command { .. } => Kind::Command,
             Details::Ssh { .. } => Kind::Ssh,
+            Details::ProviderSsh { .. } => Kind::ProviderSsh,
             Details::Storage { .. } => Kind::Storage,
         }
     }
@@ -308,6 +323,22 @@ impl Summary {
             Details::Ssh { account, .. } => account.as_ref(),
             _ => None,
         }
+    }
+    pub(crate) fn provider_account(&self) -> Option<&ProviderLoginPermission> {
+        match &self.details {
+            Details::ProviderSsh {
+                provider_account, ..
+            } => Some(provider_account),
+            _ => None,
+        }
+    }
+    pub(crate) fn can_remember(&self) -> bool {
+        self.account_permission().is_some()
+    }
+    fn account_permission(&self) -> Option<AccountPermissionRef<'_>> {
+        self.account()
+            .map(AccountPermissionRef::Return)
+            .or_else(|| self.provider_account().map(AccountPermissionRef::Provider))
     }
     /// The requesting command. `server_input` styles arguments naming files that
     /// the server reads and this machine cannot check.
@@ -379,14 +410,20 @@ impl Summary {
             String::new()
         } else {
             format!(
-                "\nServer command: {}",
+                "\n{} command: {}",
+                if self.kind() == Kind::ProviderSsh {
+                    "Requester"
+                } else {
+                    "Server"
+                },
                 self.command_text(None, str::to_owned, server_input)
             )
         };
         let body = match &self.details {
             Details::Source { source, scopes, permission, max_bytes, max_entries, .. } => format!("{source}\n{}\n{permission}\nAt most {max_bytes} bytes and {max_entries} entries", scopes.join("\n")),
             Details::Storage { description, .. } => description.clone(),
-            Details::Ssh { destination, permission, .. } => format!("{destination}\n{permission}"),
+            Details::Ssh { destination, permission, .. }
+            | Details::ProviderSsh { destination, permission, .. } => format!("{destination}\n{permission}"),
             Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
                 format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine."),
             Details::Command { argv, cwd, permission, .. } =>
@@ -400,10 +437,10 @@ impl Summary {
             Kind::Source => "Allow these source reads once?",
             Kind::Copy => "Allow this copy once?",
             Kind::Command => "Run this command once?",
-            Kind::Ssh => "Allow access to this SSH account?",
+            Kind::Ssh | Kind::ProviderSsh => "Allow access to this SSH account?",
             Kind::Storage => "Authorize this storage access?",
         };
-        let remember = if self.account().is_some() {
+        let remember = if self.can_remember() {
             format!(
                 "\nRemember this account permission: syq persist receive approve {} --remember",
                 self.id
@@ -605,6 +642,12 @@ fn storage_request(
     (verb, sources, preposition, target, notes)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountPermissionRef<'a> {
+    Return(&'a AccountPermission),
+    Provider(&'a ProviderLoginPermission),
+}
+
 struct Pending {
     summary: Summary,
     deadline: Instant,
@@ -624,6 +667,12 @@ impl Queue {
     }
     pub(crate) fn account_remembered(&self, permission: &AccountPermission) -> Result<bool> {
         accounts::remembered(&self.domain, permission)
+    }
+    pub(crate) fn provider_account_remembered(
+        &self,
+        permission: &ProviderLoginPermission,
+    ) -> Result<bool> {
+        provider_accounts::remembered(&self.domain, permission)
     }
     pub(crate) fn snapshots(&self) -> Vec<Summary> {
         self.pending
@@ -645,8 +694,13 @@ impl Queue {
         kind: Kind,
         remember: bool,
     ) -> Result<()> {
-        self.decide_using(id, allow, kind, remember, |permission| {
-            accounts::remember(&self.domain, permission)
+        self.decide_using(id, allow, kind, remember, |permission| match permission {
+            AccountPermissionRef::Return(permission) => {
+                accounts::remember(&self.domain, permission)
+            }
+            AccountPermissionRef::Provider(permission) => {
+                provider_accounts::remember(&self.domain, permission)
+            }
         })
     }
     fn decide_using(
@@ -655,7 +709,7 @@ impl Queue {
         allow: bool,
         kind: Kind,
         remember: bool,
-        save: impl FnOnce(&AccountPermission) -> Result<()>,
+        save: impl FnOnce(AccountPermissionRef<'_>) -> Result<()>,
     ) -> Result<()> {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending
@@ -671,10 +725,10 @@ impl Queue {
         }
         if remember {
             anyhow::ensure!(
-                allow && kind == Kind::Ssh,
+                allow && matches!(kind, Kind::Ssh | Kind::ProviderSsh),
                 "--remember applies only to SSH account approval"
             );
-            let account = entry.summary.account().context("this SSH request does not support remembered permissions; update syq and reconnect receiving")?;
+            let account = entry.summary.account_permission().context("this SSH request does not support remembered permissions; update syq and reconnect receiving")?;
             save(account)
                 .context("remember account permission; the request is still awaiting approval")?;
         }
@@ -847,6 +901,68 @@ impl Queue {
                 account: Some(account.clone()),
             },
         }, notifications, TIMEOUT, cancelled)
+    }
+
+    /// The provider supplies its verified local identity and destination policy.
+    /// Command/cwd are requester context, never proof of an originating host.
+    pub(crate) fn request_provider_account(
+        &self,
+        command: &[Vec<u8>],
+        cwd: &str,
+        account: &ProviderLoginPermission,
+        notifications: Notifications,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<AccountDecision> {
+        account.validate()?;
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
+        let target = account.destination.label();
+        let origin = account.provider.label();
+        let authority = "May use this destination account's full authority for commands and copies. Copy roots and limits do not apply; the displayed command is context, not a restriction.";
+        let allow = "Allow lasts for this provider-issued authorization session.";
+        let remember = format!("Remember also permits future SSH logins to this provider account through profile @{} to request the same destination account. It does not identify a requesting source machine. Removing a remembered permission requires new approval for future authentications; already authenticated sessions may continue.", account.profile);
+        let identity = format!(
+            "Provider receiving identity: {} (not an SSH host key).",
+            account.provider.receiver_identity
+        );
+        let mut notes = vec![
+            authority.into(),
+            allow.into(),
+            remember.clone(),
+            identity.clone(),
+        ];
+        if !cwd.is_empty() {
+            notes.push(format!(
+                "Requester's reported directory: {}",
+                shown_directory(cwd)
+            ));
+        }
+        self.wait_decision(
+            Summary {
+                id: id.iter().map(|byte| format!("{byte:02x}")).collect(),
+                from: format!("{origin} (provider profile @{})", account.profile),
+                server: format!("provider account {}", account.provider.user),
+                expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+                    + TIMEOUT.as_secs(),
+                notification: "starting".into(),
+                command: crate::approval_command::display(command),
+                server_cwd: String::new(),
+                verb: "requests SSH account access",
+                sources: vec![origin.clone()],
+                preposition: "to",
+                target: target.clone(),
+                notes,
+                details: Details::ProviderSsh {
+                    kind: ProviderSshKind::ProviderSsh,
+                    destination: target,
+                    permission: format!("{origin}. {authority} {allow} {remember} {identity}"),
+                    provider_account: account.clone(),
+                },
+            },
+            notifications,
+            TIMEOUT,
+            cancelled,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1184,7 +1300,7 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
             &description,
             &lifetime.as_secs().max(1).to_string(),
             &title,
-            if summary.account().is_some() {
+            if summary.can_remember() {
                 "account"
             } else {
                 "once"
@@ -1196,7 +1312,7 @@ fn notification_command(summary: &Summary, lifetime: Duration) -> Command {
     {
         let mut cmd = Command::new("/usr/bin/notify-send");
         cmd.args(["--app-name=syq", "--wait"]);
-        if summary.account().is_some() {
+        if summary.can_remember() {
             cmd.args(["--action=allow=Allow", "--action=remember=Remember"]);
         } else {
             cmd.arg("--action=allow=Allow once");
@@ -1917,7 +2033,10 @@ mod tests {
             let mut saved = false;
             queue
                 .decide_using(&pending.id, true, Kind::Ssh, remember, |permission| {
-                    assert_eq!(permission, &account_permission());
+                    assert_eq!(
+                        permission,
+                        AccountPermissionRef::Return(&account_permission())
+                    );
                     saved = true;
                     Ok(())
                 })
@@ -1935,6 +2054,149 @@ mod tests {
                 .decide_with_remember(&pending.id, true, Kind::Ssh, true)
                 .is_err());
         }
+    }
+
+    fn provider_permission() -> ProviderLoginPermission {
+        ProviderLoginPermission::new(
+            "provider".into(),
+            provider_accounts::ProviderIdentity::new(
+                "alice".into(),
+                ssh_key::Fingerprint::Sha256([7; 32]).to_string(),
+            )
+            .unwrap(),
+            account_permission().destination,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn provider_approval_has_distinct_origin_and_session_or_remember_decisions() {
+        let root = std::fs::canonicalize("/tmp").unwrap();
+        let temporary = tempfile::tempdir_in(root).unwrap();
+        for remember in [false, true] {
+            let scope = temporary
+                .path()
+                .join(if remember { "remember" } else { "session" });
+            crate::persistence::initialize_scope(&scope).unwrap();
+            let domain = crate::persistence::Domain::select(Some(&scope)).unwrap();
+            let queue = Arc::new(Queue::new(domain.clone()));
+            let waiter = queue.clone();
+            let task = std::thread::spawn(move || {
+                waiter.request_provider_account(
+                    &[b"ssh".to_vec(), b"destination".to_vec()],
+                    "/claimed/source-directory",
+                    &provider_permission(),
+                    Notifications::Off,
+                    || false,
+                )
+            });
+            wait_pending(&queue);
+            let pending = queue.snapshots().pop().unwrap();
+            assert_eq!(pending.kind(), Kind::ProviderSsh);
+            assert_eq!(pending.account(), None);
+            assert_eq!(pending.provider_account(), Some(&provider_permission()));
+            assert!(pending.can_remember());
+            assert!(!pending.title().contains("claimed"));
+            let desktop = pending.desktop_description(false);
+            assert!(desktop.contains("SSH logins to this provider account"));
+            assert!(desktop.contains("Requester's reported directory"));
+            assert!(desktop.contains("provider-issued authorization session"));
+            assert!(desktop.contains("not an SSH host key"));
+            let json = serde_json::to_value(&pending).unwrap();
+            assert_eq!(json["kind"], "provider_ssh");
+            assert!(json.get("account").is_none());
+            assert!(json["provider_account"].get("source").is_none());
+            let decoded: Summary = serde_json::from_value(json).unwrap();
+            let details = decoded.description(str::to_owned);
+            assert!(details.contains("commands and copies"));
+            assert!(details.contains("future SSH logins to this provider account"));
+            assert!(details.contains("already authenticated sessions may continue"));
+            assert!(details.contains("--remember"));
+            let notification = notification_command(&pending, TIMEOUT);
+            let args: Vec<_> = notification
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect();
+            #[cfg(not(target_os = "macos"))]
+            assert!(args.iter().any(|arg| arg == "--action=remember=Remember"));
+            #[cfg(target_os = "macos")]
+            assert_eq!(args.last().unwrap(), "account");
+            for wrong_kind in [
+                Kind::Ssh,
+                Kind::Copy,
+                Kind::Command,
+                Kind::Source,
+                Kind::Storage,
+            ] {
+                assert!(queue.decide(&pending.id, true, wrong_kind).is_err());
+            }
+            assert!(!queue
+                .provider_account_remembered(&provider_permission())
+                .unwrap());
+            queue
+                .decide_with_remember(&pending.id, true, Kind::ProviderSsh, remember)
+                .unwrap();
+            assert_eq!(
+                task.join().unwrap().unwrap(),
+                if remember {
+                    AccountDecision::Remember
+                } else {
+                    AccountDecision::Session
+                }
+            );
+            assert_eq!(
+                queue
+                    .provider_account_remembered(&provider_permission())
+                    .unwrap(),
+                remember
+            );
+            assert!(accounts::list(&domain).unwrap().is_empty());
+            assert!(!domain
+                .config_file("account-permissions-v1.json")
+                .unwrap()
+                .exists());
+            if remember {
+                provider_accounts::remove(&domain, &provider_permission().id()).unwrap();
+                assert!(!queue
+                    .provider_account_remembered(&provider_permission())
+                    .unwrap());
+            }
+            assert!(queue.decide(&pending.id, true, Kind::ProviderSsh).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_remember_failure_and_session_disconnect_never_approve() {
+        let queue = Arc::new(Queue::default());
+        let waiter = queue.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let cancelled = stopped.clone();
+        let task = std::thread::spawn(move || {
+            waiter.request_provider_account(
+                &[],
+                "",
+                &provider_permission(),
+                Notifications::Off,
+                || cancelled.load(Ordering::Acquire),
+            )
+        });
+        wait_pending(&queue);
+        let pending = queue.snapshots().pop().unwrap();
+        let error = queue
+            .decide_using(&pending.id, true, Kind::ProviderSsh, true, |permission| {
+                assert_eq!(
+                    permission,
+                    AccountPermissionRef::Provider(&provider_permission())
+                );
+                bail!("provider permissions are unreadable")
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("still awaiting approval"));
+        assert_eq!(queue.snapshots().len(), 1);
+        stopped.store(true, Ordering::Release);
+        assert!(task.join().unwrap().is_err());
+        assert!(queue.snapshots().is_empty());
+        assert!(queue.decide(&pending.id, true, Kind::ProviderSsh).is_err());
     }
 
     #[test]

@@ -1956,23 +1956,99 @@ fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path
         }
     }
     let _listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
-    let requested = r#"{"user":null,"host":"backup","port":null}"#;
-    let identity = format!(
-        "[{},{}]",
-        serde_json::to_string(authorizer).unwrap(),
-        requested
-    );
-    let record = serde_json::json!({
-        "version": 1, "authorizer": authorizer,
-        "requested": serde_json::from_str::<serde_json::Value>(requested).unwrap(),
-        "endpoint": {"user": "approved", "host": "resolved.example", "port": 2222},
-        "control": control,
+    #[derive(serde::Serialize)]
+    struct Endpoint<'a> {
+        user: Option<&'a str>,
+        host: &'a str,
+        port: Option<u16>,
+    }
+    #[derive(serde::Serialize)]
+    struct Registration<'a> {
+        version: u16,
+        identity: &'a str,
+        socket: PathBuf,
+        secret: &'a str,
+        program: Vec<u8>,
+    }
+    #[derive(serde::Serialize)]
+    struct Policy<'a> {
+        endpoint: Endpoint<'a>,
+        host_algorithms: &'a str,
+        known_hosts: String,
+    }
+    #[derive(serde::Serialize)]
+    struct Selection<'a> {
+        provider: String,
+        policy: Policy<'a>,
+    }
+    let requested = Endpoint {
+        user: None,
+        host: "backup",
+        port: None,
+    };
+    let registry = t.path("home/.syq-destinations-v3");
+    fs::create_dir_all(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+    let registration = serde_json::to_vec(&Registration {
+        version: 3,
+        identity: "fixture-provider",
+        socket: t.runtime().join("provider.sock"),
+        secret: "fixture-secret",
+        program: env!("CARGO_BIN_EXE_syq").as_bytes().to_vec(),
+    })
+    .unwrap();
+    let registration_path = registry.join(format!("{authorizer}.json"));
+    write(&registration_path, &registration);
+    fs::set_permissions(registration_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let provider = blake3::hash(&registration).to_hex().to_string();
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+        "",
+    )
+    .unwrap()
+    .public_key()
+    .to_openssh()
+    .unwrap();
+    let selected = Selection {
+        provider,
+        policy: Policy {
+            endpoint: Endpoint {
+                user: Some("approved"),
+                host: "resolved.example",
+                port: Some(2222),
+            },
+            host_algorithms: "ssh-ed25519",
+            known_hosts: format!("syq-approved-peer {key}\n"),
+        },
+    };
+    let peer = serde_json::json!({
+        "user": "approved", "host": "resolved.example", "port": 2222,
+        "known_hosts": format!("syq-copy-peer {key}\n"), "algorithms": "ssh-ed25519",
     });
-    let path = index.join(format!(
-        "{}.json",
-        blake3::hash(identity.as_bytes()).to_hex()
-    ));
+    let peer_path = control.with_extension("peer.json");
+    write(&peer_path, &serde_json::to_vec(&peer).unwrap());
+    fs::set_permissions(peer_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let record = serde_json::json!({
+        "version": 1, "authorizer": authorizer, "requested": requested,
+        "endpoint": selected.policy.endpoint, "control": control,
+    });
+    let identity =
+        serde_json::to_vec(&("resolved-account-v1", authorizer, &requested, &selected)).unwrap();
+    let path = index.join(format!("{}.json", blake3::hash(&identity).to_hex()));
     write(&path, &serde_json::to_vec(&record).unwrap());
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    let directory = index.join("resolution-v1");
+    fs::create_dir_all(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = serde_json::to_vec(&(authorizer, &requested, &selected.provider)).unwrap();
+    let path = directory.join(format!("{}.json", blake3::hash(&identity).to_hex()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let entry = serde_json::json!({"version": 1, "authorizer": authorizer, "requested": requested,
+        "selected": selected, "checked": now, "attempted": now});
+    write(&path, &serde_json::to_vec(&entry).unwrap());
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     control
 }
@@ -2138,6 +2214,82 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
             assert!(!t.path("rsh.log").exists());
         }
     }
+}
+
+#[test]
+fn approved_completion_keeps_stale_resolution_read_only_and_provider_bound() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    let control = approved_completion_master(&t, "laptop");
+    let directory = control
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("authorized-ssh-v1/resolution-v1");
+    let cache_path = fs::read_dir(&directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut entry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+    entry["checked"] = 0.into();
+    entry["attempted"] = 0.into();
+    let original = serde_json::to_vec(&entry).unwrap();
+    write(&cache_path, &original);
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let words = [
+        "syq",
+        "cp",
+        "--syq-path",
+        env!("CARGO_BIN_EXE_syq"),
+        "--from",
+        "backup",
+        "--auth-from",
+        "@laptop",
+        &path,
+    ];
+    let output = approved_completion_command(&t, &words).run().unwrap();
+    assert_output_ok(&output);
+    assert!(!output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(fs::read(&cache_path).unwrap(), original);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        log.lines().all(|line| line.contains("ProxyCommand=false")),
+        "{log}"
+    );
+    fs::remove_file(t.path("rsh.log")).unwrap();
+
+    let registration_path = t.path("home/.syq-destinations-v3/laptop.json");
+    let registration = fs::read(&registration_path).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_slice(&registration).unwrap();
+    changed["secret"] = "different-provider-generation".into();
+    write(&registration_path, &serde_json::to_vec(&changed).unwrap());
+    let output = approved_completion_command(&t, &words)
+        .env_remove("SYQ_COMPLETION_DEBUG")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(!t.path("rsh.log").exists());
+    assert_eq!(fs::read(&cache_path).unwrap(), original);
+
+    write(&registration_path, &registration);
+    write(&cache_path, b"{");
+    let output = approved_completion_command(&t, &words)
+        .env_remove("SYQ_COMPLETION_DEBUG")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(!t.path("rsh.log").exists());
+    assert_eq!(fs::read(&cache_path).unwrap(), b"{");
 }
 
 #[test]

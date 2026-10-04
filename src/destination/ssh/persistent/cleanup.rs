@@ -161,6 +161,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
         "SSH account cleanup requires a closing persistence scope"
     );
     wait_for_keepers(domain)?;
+    super::resolution::cleanup(domain)?;
     // Any remaining approved directory belongs to an exited keeper. Never
     // recursively remove it: validate every owned file and close native SSH.
     for entry in fs::read_dir(&scope)? {

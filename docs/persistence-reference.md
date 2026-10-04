@@ -72,8 +72,22 @@ Readiness means the approved SSH connection accepts sessions.
 
 `persist status --json` adds an `authorized_ssh` array alongside the usual
 `connections`. Each entry contains the authorizer name, requested and resolved
-endpoints, `control` socket path, and `connected` state. A matching receiving
-name, login, typed host/alias, and port selects the same approved login.
+endpoints, `control` socket path, and `connected` state.
+
+The selected provider's SSH configuration determines the destination account,
+host, port, and trusted host keys. Syq caches that resolution separately from
+SSH connections. Repeated commands use it immediately; after 30 seconds, an
+ordinary command also starts a background refresh. Completion reads the local
+cache without contacting the provider to resolve the destination. A completed
+refresh applies to later commands, and does not redirect a command already
+started. Existing sessions keep their original destination.
+
+A new login checks the provider's current configuration before authorization.
+If it differs from the command's selected resolution, that invocation fails;
+retrying resolves again. If background refresh cannot reach the provider,
+commands can keep using the cached resolution and an existing approved login.
+Changing an alias can leave both old and new connections visible in status;
+later commands use the resolution currently selected by the cache.
 A closed connection can request another login under the current session or
 remembered permission. A failure after execution starts ends that command
 without retrying it.
@@ -118,8 +132,12 @@ socket. Missing or closed connections fail without attempting other
 authentication. Export again after reconnecting. The output contains no private
 key; syq writes only a temporary socket alias inside the connection's scope.
 
-Connection records live in the selected domain's runtime directory, separately
-from ordinary SSH connections. Existing default-domain records remain readable.
+Connection records and resolution metadata live in the selected domain's
+runtime directory, separately from ordinary SSH connections. Existing
+connection records remain readable. Connections opened by older builds without
+provider binding remain visible and can be exported explicitly with `ssh-config`.
+Ordinary commands request a new bound login before reusing that access;
+completion waits until an ordinary command has prepared it.
 Use a current syq client to close these connections: older clients may not manage
 account connections opened while ordinary persistence is off.
 

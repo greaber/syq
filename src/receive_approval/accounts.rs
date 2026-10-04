@@ -34,7 +34,7 @@ impl AccountIdentity {
         identity.validate()?;
         Ok(identity)
     }
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         crate::destination::ssh::validate_endpoint(&self.endpoint)?;
         anyhow::ensure!(
             self.endpoint
@@ -112,17 +112,17 @@ impl AccountPermission {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RememberedPermission {
+pub(crate) struct RememberedPermission<P = AccountPermission> {
     pub id: String,
-    pub permission: AccountPermission,
+    pub permission: P,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct State {
+pub(super) struct State<P = AccountPermission> {
     version: u16,
-    permissions: Vec<RememberedPermission>,
+    pub(super) permissions: Vec<RememberedPermission<P>>,
 }
-impl Default for State {
+impl<P> Default for State<P> {
     fn default() -> Self {
         Self {
             version: VERSION,
@@ -133,14 +133,32 @@ impl Default for State {
 fn path(domain: &Domain) -> Result<PathBuf> {
     domain.config_file("account-permissions-v1.json")
 }
+pub(super) trait StoredPermission:
+    Clone + PartialEq + Serialize + serde::de::DeserializeOwned
+{
+    fn validate(&self) -> Result<()>;
+    fn id(&self) -> String;
+}
+impl StoredPermission for AccountPermission {
+    fn validate(&self) -> Result<()> {
+        AccountPermission::validate(self)
+    }
+    fn id(&self) -> String {
+        AccountPermission::id(self)
+    }
+}
+
 fn read(path: &Path) -> Result<State> {
+    read_permissions(path)
+}
+pub(super) fn read_permissions<P: StoredPermission>(path: &Path) -> Result<State<P>> {
     let bytes = match crate::delegation::read_private_regular(path, "remembered account permissions", MAX_STATE) {
         Ok(bytes) => bytes,
         Err(error) if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)) => return Ok(State::default()),
         Err(error) => return Err(error).with_context(|| format!("read remembered account permissions {}; repair the file before authorizing accounts", path.display())),
     };
-    let state: State = serde_json::from_slice(&bytes).with_context(|| {
+    let state: State<P> = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "parse remembered account permissions {}; repair the file before authorizing accounts",
             path.display()
@@ -180,25 +198,33 @@ pub(crate) fn remember(domain: &Domain, permission: &AccountPermission) -> Resul
     update_domain(domain, Some(permission), None)
 }
 pub(crate) fn remove(domain: &Domain, id: &str) -> Result<()> {
+    validate_id(id)?;
+    update_domain(domain, None, Some(id))
+}
+pub(super) fn validate_id(id: &str) -> Result<()> {
     anyhow::ensure!(
         id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "use the complete permission ID from syq persist receive permissions list"
     );
-    update_domain(domain, None, Some(id))
+    Ok(())
 }
 fn update_domain(
     domain: &Domain,
     add: Option<&AccountPermission>,
     remove: Option<&str>,
 ) -> Result<()> {
-    let path = path(domain)?;
+    let path = prepare_store(domain, "account-permissions-v1.json")?;
+    update(&path, add, remove)
+}
+pub(super) fn prepare_store(domain: &Domain, filename: &str) -> Result<PathBuf> {
+    let path = domain.config_file(filename)?;
     if domain.is_default() {
         fs::create_dir_all(
             path.parent()
                 .context("account permission directory missing")?,
         )?;
     }
-    update(&path, add, remove)
+    Ok(path)
 }
 
 struct PermissionLock(std::fs::File);
@@ -210,6 +236,13 @@ impl Drop for PermissionLock {
     }
 }
 fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) -> Result<()> {
+    update_permissions(path, add, remove)
+}
+pub(super) fn update_permissions<P: StoredPermission>(
+    path: &Path,
+    add: Option<&P>,
+    remove: Option<&str>,
+) -> Result<()> {
     if let Some(permission) = add {
         permission.validate()?;
     }
@@ -235,7 +268,7 @@ fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) ->
         bail!("account permissions are being changed; retry shortly");
     }
     let _lock = PermissionLock(lock);
-    let mut state = read(path)?;
+    let mut state: State<P> = read_permissions(path)?;
     if let Some(id) = remove {
         let count = state.permissions.len();
         state.permissions.retain(|item| item.id != id);
@@ -297,6 +330,29 @@ mod tests {
     fn write(path: &Path, data: &[u8]) {
         fs::write(path, data).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn return_permission_v1_serialization_and_identity_remain_unchanged() {
+        let original = r#"{"profile":"laptop","source":{"endpoint":{"user":"alice","host":"source","port":22},"host_keys":["SHA256:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"]},"destination":{"endpoint":{"user":"alice","host":"destination","port":22},"host_keys":["SHA256:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"]}}"#;
+        let permission: AccountPermission = serde_json::from_str(original).unwrap();
+        permission.validate().unwrap();
+        assert_eq!(serde_json::to_string(&permission).unwrap(), original);
+        // v1 used the unprefixed hash of these exact serialized bytes.
+        let id = blake3::hash(original.as_bytes()).to_hex().to_string();
+        assert_eq!(permission.id(), id);
+        let original_state =
+            format!(r#"{{"version":1,"permissions":[{{"id":"{id}","permission":{original}}}]}}"#);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("account-permissions-v1.json");
+        write(&path, original_state.as_bytes());
+        let state = read(&path).unwrap();
+        assert_eq!(serde_json::to_string(&state).unwrap(), original_state);
+        update(&path, Some(&permission), None).unwrap();
+        assert_eq!(
+            serde_json::to_string(&read(&path).unwrap()).unwrap(),
+            original_state
+        );
     }
 
     #[test]
@@ -408,7 +464,7 @@ mod tests {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("account-permissions-v1.json");
         let target = temp.path().join("other");
-        let bytes = serde_json::to_vec(&State::default()).unwrap();
+        let bytes = serde_json::to_vec(&State::<AccountPermission>::default()).unwrap();
         write(&target, &bytes);
         symlink(&target, &path).unwrap();
         assert!(read(&path).is_err());

@@ -1,9 +1,12 @@
 //! Explicit destination-account authorization over an authenticated return channel.
 use super::*;
-use crate::agent_broker::{BrokerPolicy, ConstrainedAgentBroker};
+use crate::agent_broker::{BrokerPolicy, ConstrainedAgentBroker, HostPolicy};
 use crate::cli::NativeEndpoint;
+use crate::receive_approval::provider_accounts::{ProviderIdentity, ProviderLoginPermission};
+use crate::receive_approval::{AccountDecision, AccountIdentity, AccountPermission, Queue};
 
 const HOST_ALIAS: &str = "syq-approved-peer";
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Mode {
@@ -16,20 +19,178 @@ pub(super) enum Mode {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Request {
+pub(crate) struct Request {
     #[serde(default)]
     mode: Mode,
     target: NativeEndpoint,
     command: Vec<Vec<u8>>,
     cwd: String,
+    #[serde(default)]
+    expected: Option<ResolvedPolicy>,
 }
 
-#[derive(Serialize, Deserialize)]
+impl Request {
+    pub(crate) fn account(
+        target: NativeEndpoint,
+        command: Vec<Vec<u8>>,
+        cwd: String,
+        expected: Option<ResolvedPolicy>,
+    ) -> Self {
+        Self {
+            mode: Mode::Account,
+            target,
+            command,
+            cwd,
+            expected,
+        }
+    }
+
+    fn validate(&self, origin: &AuthorizationOrigin<'_>) -> Result<()> {
+        if self.command.len() > 256 || self.command.iter().map(Vec::len).sum::<usize>() > 16 * 1024
+        {
+            bail!("SSH approval command exceeds its limits");
+        }
+        ssh::validate_endpoint(&self.target)?;
+        if let Some(expected) = &self.expected {
+            expected.validate()?;
+        }
+        if self.mode == Mode::Account {
+            // The account is authoritative. Command text only describes intent.
+            return Ok(());
+        }
+        let AuthorizationOrigin::Return { profile, .. } = origin else {
+            bail!("SSH providers require an account authorization request");
+        };
+        let command: Vec<OsString> = self
+            .command
+            .iter()
+            .cloned()
+            .map(OsString::from_vec)
+            .collect();
+        let parsed = match self.mode {
+            Mode::Once => {
+                if command.first().is_none_or(|arg| arg != "ssh") {
+                    bail!("SSH approval needs the requesting syq ssh command");
+                }
+                ssh::parse_for_approval(&command, profile)?
+            }
+            Mode::Persistent => crate::persistence::parse_account_connect(&command, profile)?,
+            Mode::Account => unreachable!(),
+        };
+        if parsed.destination != self.target || parsed.authorizer != *profile {
+            bail!("SSH destination or authorizer does not match the shown command");
+        }
+        Ok(())
+    }
+}
+
+/// Identity established by the transport adapter, never supplied by the
+/// authorization request. Native provider logins do not prove a source host.
+pub(crate) enum AuthorizationOrigin<'a> {
+    Return {
+        profile: &'a str,
+        requester: &'a crate::receive_approval::Requester,
+        source: &'a Mutex<std::result::Result<AccountIdentity, String>>,
+    },
+    Provider {
+        profile: &'a str,
+        identity: &'a ProviderIdentity,
+    },
+}
+
+/// Borrowed state of one live authorization session. Its transport adapter
+/// owns generation changes, stream shutdown and clearing session grants on
+/// disconnect; a provider must not share these grants across unrelated logins.
+pub(crate) struct AuthorizationContext<'a> {
+    pub(crate) origin: AuthorizationOrigin<'a>,
+    pub(crate) approvals: &'a Queue,
+    pub(crate) notifications: crate::receive_approval::Notifications,
+    pub(crate) request_lock: &'a Mutex<()>,
+    pub(crate) active_count: &'a AtomicU64,
+    pub(crate) session_grants: &'a Mutex<HashMap<String, u64>>,
+}
+
+/// Public connection metadata, not an authorization grant. The provider must
+/// resolve its own trusted policy again before approving a new account login.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Authorized {
-    endpoint: NativeEndpoint,
-    host_algorithms: String,
-    known_hosts: String,
+pub(crate) struct ResolvedPolicy {
+    pub(crate) endpoint: NativeEndpoint,
+    pub(crate) host_algorithms: String,
+    pub(crate) known_hosts: String,
+}
+
+impl ResolvedPolicy {
+    pub(crate) fn new(
+        endpoint: NativeEndpoint,
+        known_hosts: &str,
+        host_algorithms: &str,
+    ) -> Result<Self> {
+        let mut resolved = Self {
+            endpoint,
+            host_algorithms: host_algorithms.into(),
+            known_hosts: known_hosts.into(),
+        };
+        resolved.validate()?;
+        // Pin order and comments do not change trust. Both account and copy
+        // peers use this representation when comparing selected resolutions.
+        let mut lines = Vec::new();
+        for line in known_hosts.lines() {
+            let (_, key) = line.split_once(' ').context("invalid approved host key")?;
+            let key = ssh_key::PublicKey::from_openssh(key)?;
+            let key = ssh_key::PublicKey::new(key.key_data().clone(), "");
+            lines.push(format!("{HOST_ALIAS} {}\n", key.to_openssh()?));
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        resolved.known_hosts = lines.concat();
+        Ok(resolved)
+    }
+
+    fn from_policy(policy: &HostPolicy) -> Result<Self> {
+        Self::new(
+            NativeEndpoint {
+                user: Some(policy.login_user.clone()),
+                host: policy.connection_host().into(),
+                port: Some(policy.port()),
+            },
+            &policy.known_hosts(HOST_ALIAS)?,
+            &policy.host_key_algorithms(),
+        )
+    }
+
+    pub(crate) fn from_peer(peer: &super::forward::ssh::Peer) -> Result<Self> {
+        peer.resolved_policy()
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        ssh::validate_endpoint(&self.endpoint)?;
+        self.peer()?;
+        Ok(())
+    }
+
+    pub(crate) fn peer(&self) -> Result<super::forward::ssh::Peer> {
+        super::forward::ssh::Peer::from_approved(
+            &self.endpoint,
+            &self.known_hosts,
+            &self.host_algorithms,
+        )
+    }
+
+    fn check_expected(&self, expected: Option<&Self>) -> Result<()> {
+        if let Some(expected) = expected {
+            let expected = Self::new(
+                expected.endpoint.clone(),
+                &expected.known_hosts,
+                &expected.host_algorithms,
+            )?;
+            anyhow::ensure!(
+                *self == expected,
+                "SSH provider configuration changed since this destination was resolved; retry the command"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One approved native SSH login. Keep the return channel alive until SSH exits,
@@ -88,31 +249,90 @@ impl Drop for Session {
 }
 
 pub(crate) fn prepare_account(request: &ssh::SessionRequest) -> Result<()> {
+    let registration = read_registration(&request.authorizer)?;
+    // Same-build commands need no handoff or provider round trip. The later
+    // metadata/authorization exchange verifies identity before trusting it;
+    // maybe_exec also checks any guard inherited from a genuine handoff.
+    let registration = if registration.identity == crate::identity::build() {
+        registration
+    } else {
+        load_registration(&request.authorizer)?
+    };
     let selection = handoff::Selection::new(
         request.authorizer.clone(),
-        load_registration(&request.authorizer)?,
+        registration,
         handoff::Kind::Account,
         None,
     );
     handoff::maybe_exec(&selection)
 }
 
-pub(crate) fn authorize_account(
+pub(crate) fn authorize_account_expected_from(
     request: &ssh::SessionRequest,
     command: Vec<Vec<u8>>,
+    expected: &ResolvedPolicy,
+    provider_binding: &str,
 ) -> Result<Session> {
-    authorize_mode(request, Mode::Account, Some(command))
+    expected.validate()?;
+    authorize_mode(
+        request,
+        Mode::Account,
+        Some(command),
+        Some(expected.clone()),
+        Some(provider_binding),
+    )
+}
+
+pub(in crate::destination) fn registration_binding(registration: &Registration) -> Result<String> {
+    Ok(blake3::hash(&serde_json::to_vec(registration)?)
+        .to_hex()
+        .to_string())
+}
+
+/// Resolve using the authenticated provider's configuration without asking
+/// for account access, opening a destination connection, or starting an agent.
+pub(crate) fn resolve(request: &ssh::SessionRequest) -> Result<ResolvedPolicy> {
+    ssh::validate_endpoint(&request.destination)?;
+    let registration = load_registration(&request.authorizer)?;
+    let deadline = Instant::now() + RESOLVE_TIMEOUT;
+    let (mut stream, reply) = exchange(
+        &registration,
+        Message::ResolveSsh(request.destination.clone()),
+        RESOLVE_TIMEOUT,
+        Some(RESOLVE_TIMEOUT),
+    )?;
+    if !matches!(reply, Reply::Ready) {
+        bail!("unexpected SSH resolution response");
+    }
+    let resolved: ResolvedPolicy = read_message(&mut DeadlineSocket {
+        socket: &mut stream,
+        deadline,
+    })?;
+    ResolvedPolicy::new(
+        resolved.endpoint,
+        &resolved.known_hosts,
+        &resolved.host_algorithms,
+    )
 }
 
 fn authorize_mode(
     request: &ssh::SessionRequest,
     mode: Mode,
     command: Option<Vec<Vec<u8>>>,
+    expected: Option<ResolvedPolicy>,
+    expected_provider: Option<&str>,
 ) -> Result<Session> {
     crate::conn::require_constrained_openssh("ssh", "on this machine")?;
+    let registration = load_registration(&request.authorizer)?;
+    if let Some(expected) = expected_provider {
+        anyhow::ensure!(
+            registration_binding(&registration)? == expected,
+            "SSH authorization provider changed since this destination was resolved; retry the command"
+        );
+    }
     let selection = handoff::Selection::new(
         request.authorizer.clone(),
-        load_registration(&request.authorizer)?,
+        registration,
         match mode {
             Mode::Once => handoff::Kind::Ssh,
             Mode::Persistent => handoff::Kind::SshPersistent,
@@ -138,6 +358,7 @@ fn authorize_mode(
                 .map(Ok)
                 .unwrap_or_else(crate::approval_command::current)?,
             cwd: crate::approval_command::current_directory(),
+            expected: expected.clone(),
         }),
         REQUEST_TIMEOUT + Duration::from_secs(30),
         Some(Duration::from_secs(120)),
@@ -145,7 +366,9 @@ fn authorize_mode(
     if !matches!(reply, Reply::Ready) {
         bail!("unexpected SSH approval response");
     }
-    let approved: Authorized = read_message(&mut stream)?;
+    let approved: ResolvedPolicy = read_message(&mut stream)?;
+    approved.validate()?;
+    approved.check_expected(expected.as_ref())?;
     request.ssh_arguments(&approved.endpoint)?;
     let channel = Mutex::new(Some(stream.try_clone()?));
     let broker = PrivateBroker::start_managed(
@@ -181,11 +404,7 @@ fn authorize_mode(
     Ok(Session {
         stream,
         _broker: broker,
-        peer: super::forward::ssh::Peer::from_approved(
-            &approved.endpoint,
-            &approved.known_hosts,
-            &approved.host_algorithms,
-        )?,
+        peer: approved.peer()?,
         endpoint: approved.endpoint,
         options,
     })
@@ -252,58 +471,225 @@ fn ssh_options(agent: &Path, known_hosts: &Path, algorithms: &str) -> Result<Vec
     Ok(options)
 }
 
-impl Receiver {
-    pub(super) fn authorize_ssh(&self, request: Request, mut stream: TrackedStream) -> Result<()> {
-        if request.command.len() > 256
-            || request.command.iter().map(Vec::len).sum::<usize>() > 16 * 1024
-        {
-            bail!("SSH approval command exceeds its limits");
+fn resolve_policy(target: &NativeEndpoint, cancelled: &dyn Fn() -> bool) -> Result<HostPolicy> {
+    ssh::validate_endpoint(target)?;
+    crate::agent_broker::resolve_host_policy_at_bounded(
+        "ssh",
+        target.user.as_deref(),
+        &target.host,
+        target.port,
+        Instant::now() + RESOLVE_TIMEOUT,
+        cancelled,
+    )
+}
+
+/// Resolve-only entry for authenticated adapters. This neither consults the
+/// approval queue nor admits an account session.
+pub(crate) fn resolve_target(
+    target: &NativeEndpoint,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ResolvedPolicy> {
+    if cancelled() {
+        bail!("SSH resolution disconnected");
+    }
+    let resolved = ResolvedPolicy::from_policy(&resolve_policy(target, cancelled)?)?;
+    if cancelled() {
+        bail!("SSH resolution disconnected");
+    }
+    Ok(resolved)
+}
+
+/// Share the existing SSH reply framing with non-return transport adapters.
+pub(crate) fn resolve_and_reply(
+    target: &NativeEndpoint,
+    writer: &mut impl Write,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let resolved = resolve_target(target, cancelled)?;
+    write_message(writer, &Reply::Ready)?;
+    write_message(writer, &resolved)
+}
+
+pub(crate) fn reply_error(writer: &mut impl Write, error: &anyhow::Error) -> Result<()> {
+    write_message(writer, &Reply::Error(format!("{error:#}")))
+}
+
+enum AccountApproval<'a> {
+    Return {
+        requester: &'a crate::receive_approval::Requester,
+        permission: AccountPermission,
+    },
+    Provider(ProviderLoginPermission),
+}
+
+impl<'a> AccountApproval<'a> {
+    fn new(origin: &AuthorizationOrigin<'a>, destination: AccountIdentity) -> Result<Self> {
+        Ok(match origin {
+            AuthorizationOrigin::Return {
+                profile,
+                requester,
+                source,
+            } => Self::Return {
+                requester,
+                permission: AccountPermission::new(
+                    (*profile).into(),
+                    source.lock().unwrap().clone().map_err(anyhow::Error::msg)?,
+                    destination,
+                )?,
+            },
+            AuthorizationOrigin::Provider { profile, identity } => Self::Provider(
+                ProviderLoginPermission::new((*profile).into(), (*identity).clone(), destination)?,
+            ),
+        })
+    }
+
+    fn id(&self) -> String {
+        match self {
+            Self::Return { permission, .. } => permission.id(),
+            Self::Provider(permission) => permission.id(),
         }
-        let command: Vec<OsString> = request
-            .command
-            .iter()
-            .cloned()
-            .map(OsString::from_vec)
-            .collect();
-        let parsed = match request.mode {
-            Mode::Once => {
-                if command.first().is_none_or(|arg| arg != "ssh") {
-                    bail!("SSH approval needs the requesting syq ssh command");
-                }
-                ssh::parse_for_approval(&command, &self.name)?
+    }
+
+    fn remembered(&self, queue: &Queue) -> Result<bool> {
+        match self {
+            Self::Return { permission, .. } => queue.account_remembered(permission),
+            Self::Provider(permission) => queue.provider_account_remembered(permission),
+        }
+    }
+
+    fn request(
+        &self,
+        context: &AuthorizationContext<'_>,
+        request: &Request,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<AccountDecision> {
+        match self {
+            Self::Return {
+                requester,
+                permission,
+            } => context.approvals.request_account(
+                requester,
+                &request.command,
+                &request.cwd,
+                permission,
+                context.notifications,
+                cancelled,
+            ),
+            Self::Provider(permission) => context.approvals.request_provider_account(
+                &request.command,
+                &request.cwd,
+                permission,
+                context.notifications,
+                cancelled,
+            ),
+        }
+    }
+}
+
+/// The caller authenticates the transport, tracks its streams and captures a
+/// live session generation before entering. The broker never trusts requested
+/// pins: resolve again, compare the expectation, and sign only for that policy.
+pub(crate) fn authorize_and_relay(
+    context: AuthorizationContext<'_>,
+    request: Request,
+    mut stream: TrackedStream,
+    generation: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    request.validate(&context.origin)?;
+    let request_lock = context
+        .request_lock
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))?;
+    let count = context.active_count.fetch_add(1, Ordering::AcqRel);
+    struct Slot<'a>(&'a AtomicU64);
+    impl Drop for Slot<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    let _slot = Slot(context.active_count);
+    if count >= 64 {
+        bail!("too many active approved SSH connections");
+    }
+    if cancelled() {
+        bail!("SSH request disconnected before authorization");
+    }
+    let policy = resolve_policy(&request.target, cancelled)?;
+    let approved = ResolvedPolicy::from_policy(&policy)?;
+    approved.check_expected(request.expected.as_ref())?;
+    if request.mode == Mode::Account {
+        let destination = AccountIdentity::new(
+            approved.endpoint.clone(),
+            policy.pinned_host_key_fingerprints(),
+        )?;
+        let permission = AccountApproval::new(&context.origin, destination)?;
+        let key = permission.id();
+        let session_approved = context
+            .session_grants
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|approved_generation| *approved_generation == generation);
+        if !session_approved && !permission.remembered(context.approvals)? {
+            let decision = permission.request(&context, &request, cancelled)?;
+            if cancelled() {
+                bail!("SSH request disconnected before authorization");
             }
-            Mode::Persistent => crate::persistence::parse_account_connect(&command, &self.name)?,
-            Mode::Account => {
-                // Full account authority is approved against the resolved endpoint below.
-                // Remote command text describes intent; it cannot constrain an SSH login.
-                let parsed = ssh::SessionRequest {
-                    authorizer: self.name.clone(),
-                    destination: request.target.clone(),
-                    tty: ssh::Tty::Disabled,
-                    command: Vec::new(),
-                };
-                ssh::validate_endpoint(&request.target)?;
-                parsed
+            if decision == AccountDecision::Session {
+                context
+                    .session_grants
+                    .lock()
+                    .unwrap()
+                    .insert(key, generation);
             }
+        }
+    } else {
+        // Legacy requests are accepted only through the return adapter and
+        // retain their explicit one-login/reusable-login approval wording.
+        let AuthorizationOrigin::Return { requester, .. } = &context.origin else {
+            bail!("SSH providers require an account authorization request");
         };
-        if parsed.destination != request.target || parsed.authorizer != self.name {
-            bail!("SSH destination or authorizer does not match the shown command");
-        }
-        let request_lock = self
-            .request_lock
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))?;
-        let count = self.ssh_count.fetch_add(1, Ordering::AcqRel);
-        struct Slot<'a>(&'a AtomicU64);
-        impl Drop for Slot<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _slot = Slot(&self.ssh_count);
-        if count >= 64 {
-            bail!("too many active approved SSH connections");
-        }
+        context.approvals.request_ssh(
+            requester,
+            &request.command,
+            &request.cwd,
+            &approved.endpoint,
+            request.mode == Mode::Persistent,
+            context.notifications,
+            cancelled,
+        )?;
+    }
+    if cancelled() {
+        bail!("SSH request disconnected before authorization");
+    }
+    drop(request_lock);
+    let broker = ConstrainedAgentBroker::start(BrokerPolicy::direct(policy), 1)?;
+    let mut upstream = UnixStream::connect(broker.socket_path())?;
+    upstream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    upstream.set_write_timeout(Some(Duration::from_secs(120)))?;
+    // The adapter closes this tracked socket when its session ends, including
+    // after authentication. Quiet approved sessions may otherwise remain open.
+    let socket = stream.try_clone()?;
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(Some(Duration::from_secs(120)))?;
+    write_message(&mut stream, &Reply::Ready)?;
+    write_message(&mut stream, &approved)?;
+    crate::agent_broker::relay_frames(&mut stream, &mut upstream)
+}
+
+impl Receiver {
+    pub(super) fn resolve_ssh(&self, target: NativeEndpoint, stream: TrackedStream) -> Result<()> {
+        self.resolve_ssh_with(target, stream, resolve_target)
+    }
+
+    fn resolve_ssh_with(
+        &self,
+        target: NativeEndpoint,
+        mut stream: TrackedStream,
+        resolve: impl FnOnce(&NativeEndpoint, &dyn Fn() -> bool) -> Result<ResolvedPolicy>,
+    ) -> Result<()> {
+        ssh::validate_endpoint(&target)?;
         let (generation, _tracked) = {
             let _sessions = self.sessions.lock().unwrap();
             (
@@ -317,99 +703,337 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
-            "ssh",
-            request.target.user.as_deref(),
-            &request.target.host,
-            request.target.port,
-            Instant::now() + Duration::from_secs(30),
-            &cancelled,
-        )?;
-        let endpoint = NativeEndpoint {
-            user: Some(policy.login_user.clone()),
-            host: policy.connection_host().into(),
-            port: Some(policy.port()),
-        };
-        if request.mode == Mode::Account {
-            let source = self
-                .account_source
-                .lock()
-                .unwrap()
-                .clone()
-                .map_err(anyhow::Error::msg)?;
-            let destination = crate::receive_approval::AccountIdentity::new(
-                endpoint.clone(),
-                policy.pinned_host_key_fingerprints(),
-            )?;
-            let permission = crate::receive_approval::AccountPermission::new(
-                self.name.clone(),
-                source,
-                destination,
-            )?;
-            let key = permission.id();
-            let session_approved = self
-                .account_sessions
-                .lock()
-                .unwrap()
-                .get(&key)
-                .is_some_and(|approved_generation| *approved_generation == generation);
-            if !session_approved && !self.approvals.account_remembered(&permission)? {
-                let decision = self.approvals.request_account(
-                    &self.requester,
-                    &request.command,
-                    &request.cwd,
-                    &permission,
-                    self.notifications,
-                    cancelled,
-                )?;
-                if cancelled() {
-                    bail!("SSH request disconnected before authorization");
-                }
-                if decision == crate::receive_approval::AccountDecision::Session {
-                    self.account_sessions
-                        .lock()
-                        .unwrap()
-                        .insert(key, generation);
-                }
-            }
-        } else {
-            // Older account invocations keep their explicit one-login approval.
-            self.approvals.request_ssh(
-                &self.requester,
-                &request.command,
-                &request.cwd,
-                &endpoint,
-                request.mode == Mode::Persistent,
-                self.notifications,
-                cancelled,
-            )?;
-        }
         if cancelled() {
-            bail!("SSH request disconnected before authorization");
+            bail!("SSH resolution disconnected");
         }
-        drop(request_lock);
-        let approved = Authorized {
-            endpoint,
-            host_algorithms: policy.host_key_algorithms(),
-            known_hosts: policy.known_hosts(HOST_ALIAS)?,
-        };
-        let broker = ConstrainedAgentBroker::start(BrokerPolicy::direct(policy), 1)?;
-        let mut upstream = UnixStream::connect(broker.socket_path())?;
-        upstream.set_read_timeout(Some(Duration::from_secs(120)))?;
-        upstream.set_write_timeout(Some(Duration::from_secs(120)))?;
-        // Quiet sessions may last indefinitely. Revocation closes the tracked
-        // return socket and wakes this read, including after authentication.
-        socket.set_read_timeout(None)?;
-        socket.set_write_timeout(Some(Duration::from_secs(120)))?;
+        let resolved = resolve(&target, &cancelled)?;
+        if cancelled() {
+            bail!("SSH resolution disconnected");
+        }
         write_message(&mut stream, &Reply::Ready)?;
-        write_message(&mut stream, &approved)?;
-        crate::agent_broker::relay_frames(&mut stream, &mut upstream)
+        write_message(&mut stream, &resolved)
+    }
+
+    pub(super) fn authorize_ssh(&self, request: Request, stream: TrackedStream) -> Result<()> {
+        let context = AuthorizationContext {
+            origin: AuthorizationOrigin::Return {
+                profile: &self.name,
+                requester: &self.requester,
+                source: &self.account_source,
+            },
+            approvals: &self.approvals,
+            notifications: self.notifications,
+            request_lock: &self.request_lock,
+            active_count: &self.ssh_count,
+            session_grants: &self.account_sessions,
+        };
+        let (generation, _tracked) = {
+            let _sessions = self.sessions.lock().unwrap();
+            (
+                self.generation.load(Ordering::Acquire),
+                self.active_streams.track(stream.try_clone()?)?,
+            )
+        };
+        let socket = stream.try_clone()?;
+        let cancelled = || {
+            self.stop.load(Ordering::Acquire)
+                || self.generation.load(Ordering::Acquire) != generation
+                || requester_closed(&socket)
+        };
+        authorize_and_relay(context, request, stream, generation, &cancelled)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy(seed: u8) -> ResolvedPolicy {
+        let key = ssh_key::PrivateKey::new(
+            ssh_key::private::Ed25519Keypair::from_seed(&[seed; 32]).into(),
+            "",
+        )
+        .unwrap();
+        ResolvedPolicy::new(
+            NativeEndpoint {
+                user: Some("account".into()),
+                host: "destination".into(),
+                port: Some(22),
+            },
+            &format!("{HOST_ALIAS} {}\n", key.public_key().to_openssh().unwrap()),
+            "ssh-ed25519",
+        )
+        .unwrap()
+    }
+
+    fn provider_identity() -> ProviderIdentity {
+        ProviderIdentity::new(
+            "provider-user".into(),
+            ssh_key::Fingerprint::Sha256([7; 32]).to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn optional_registration_read_creates_nothing_and_preserves_private_validation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path().join("registry");
+        assert!(read_existing_registration_at(&directory, "laptop")
+            .unwrap()
+            .is_none());
+        assert!(!directory.exists());
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        assert!(read_existing_registration_at(&directory, "laptop")
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        let registration = Registration {
+            version: REGISTRATION_VERSION,
+            identity: crate::identity::build().into(),
+            socket: directory.join("socket"),
+            secret: "test-only".into(),
+            program: b"/syq-helper".to_vec(),
+        };
+        let path = directory.join("laptop.json");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&registration).unwrap())
+            .unwrap();
+        assert!(read_existing_registration_at(&directory, "laptop")
+            .unwrap()
+            .is_some());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_existing_registration_at(&directory, "laptop").is_err());
+        let alias = temporary.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        assert!(read_existing_registration_at(&alias, "laptop").is_err());
+    }
+
+    #[test]
+    fn provider_accepts_account_intent_without_parsing_return_commands() {
+        let identity = provider_identity();
+        let origin = AuthorizationOrigin::Provider {
+            profile: "laptop",
+            identity: &identity,
+        };
+        let mut request = Request::account(
+            policy(1).endpoint,
+            vec![b"rm".to_vec(), b"untrusted intent only".to_vec()],
+            "/tmp".into(),
+            None,
+        );
+        assert!(request.validate(&origin).is_ok());
+        for mode in [Mode::Once, Mode::Persistent] {
+            request.mode = mode;
+            assert!(request
+                .validate(&origin)
+                .unwrap_err()
+                .to_string()
+                .contains("providers require an account authorization request"));
+        }
+        request.mode = Mode::Account;
+        request.command = vec![vec![b'x'; 16 * 1024 + 1]];
+        assert!(request.validate(&origin).is_err());
+    }
+
+    #[test]
+    fn provider_permission_uses_local_identity_without_a_source_host() {
+        let identity = provider_identity();
+        let origin = AuthorizationOrigin::Provider {
+            profile: "provider",
+            identity: &identity,
+        };
+        let destination = AccountIdentity::new(
+            policy(1).endpoint,
+            vec![ssh_key::Fingerprint::Sha256([8; 32]).to_string()],
+        )
+        .unwrap();
+        let AccountApproval::Provider(permission) =
+            AccountApproval::new(&origin, destination.clone()).unwrap()
+        else {
+            panic!("provider login became a return permission");
+        };
+        assert_eq!(permission.provider, identity);
+        assert_eq!(permission.profile, "provider");
+        assert_eq!(permission.destination, destination);
+        assert!(serde_json::to_value(&permission)
+            .unwrap()
+            .get("source")
+            .is_none());
+    }
+
+    #[test]
+    fn shared_authorization_releases_admission_on_cancel_or_full_capacity() {
+        let identity = provider_identity();
+        let approvals = Queue::default();
+        let lock = Mutex::new(());
+        let grants = Mutex::new(HashMap::new());
+        let streams = Arc::new(crate::private_broker::ConnectionRegistry::new(
+            Duration::from_secs(1),
+        ));
+        for (initial_count, cancelled) in [(0, true), (64, false)] {
+            let count = AtomicU64::new(initial_count);
+            let (server, _client) = UnixStream::pair().unwrap();
+            let context = AuthorizationContext {
+                origin: AuthorizationOrigin::Provider {
+                    profile: "provider",
+                    identity: &identity,
+                },
+                approvals: &approvals,
+                notifications: crate::receive_approval::Notifications::Off,
+                request_lock: &lock,
+                active_count: &count,
+                session_grants: &grants,
+            };
+            let request = Request::account(policy(1).endpoint, vec![], String::new(), None);
+            let error =
+                authorize_and_relay(context, request, streams.track(server).unwrap(), 0, &|| {
+                    cancelled
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains(if cancelled {
+                "disconnected"
+            } else {
+                "too many active"
+            }));
+            assert_eq!(count.load(Ordering::Acquire), initial_count);
+            assert!(lock.try_lock().is_ok());
+            assert!(grants.lock().unwrap().is_empty());
+            assert!(approvals.snapshots().is_empty());
+        }
+    }
+
+    #[test]
+    fn expected_resolution_rejects_account_pin_or_algorithm_changes() {
+        let resolved = policy(1);
+        assert!(resolved.check_expected(None).is_ok());
+        assert!(resolved.check_expected(Some(&resolved)).is_ok());
+        let mut changed = Vec::new();
+        for endpoint in [
+            NativeEndpoint {
+                user: Some("other".into()),
+                ..resolved.endpoint.clone()
+            },
+            NativeEndpoint {
+                host: "other".into(),
+                ..resolved.endpoint.clone()
+            },
+            NativeEndpoint {
+                port: Some(2222),
+                ..resolved.endpoint.clone()
+            },
+        ] {
+            changed.push(ResolvedPolicy {
+                endpoint,
+                ..resolved.clone()
+            });
+        }
+        changed.push(policy(2));
+        changed.push(ResolvedPolicy {
+            host_algorithms: "ssh-ed25519,rsa-sha2-512".into(),
+            ..resolved.clone()
+        });
+        for expected in changed {
+            let error = resolved.check_expected(Some(&expected)).unwrap_err();
+            assert!(error.to_string().contains("provider configuration changed"));
+            assert!(error.to_string().contains("retry the command"));
+        }
+    }
+
+    #[test]
+    fn resolved_policy_canonicalizes_pins_and_round_trips_copy_peers() {
+        let first = policy(1);
+        let second = policy(2);
+        let keys = format!("{}{}", first.known_hosts, second.known_hosts);
+        let resolved = ResolvedPolicy::new(first.endpoint.clone(), &keys, "ssh-ed25519").unwrap();
+        let reordered = format!(
+            "{}{}{}",
+            second.known_hosts, first.known_hosts, first.known_hosts
+        )
+        .replace("syq-approved-peer", "syq-copy-peer")
+        .replace('\n', " ignored-comment\n");
+        let equivalent = ResolvedPolicy::new(first.endpoint, &reordered, "ssh-ed25519").unwrap();
+        assert_eq!(resolved, equivalent);
+        assert_eq!(
+            ResolvedPolicy::from_peer(&resolved.peer().unwrap()).unwrap(),
+            resolved
+        );
+        let encoded = serde_json::to_vec(&resolved).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ResolvedPolicy>(&encoded).unwrap(),
+            resolved
+        );
+        let mut invalid = resolved;
+        invalid.endpoint.user = None;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn resolve_only_does_not_take_approval_lock_or_queue_account_access() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, _registration, prompts) =
+            super::super::tests::broker(temporary.path(), Approval::Ask);
+        let _approval_lock = receiver.request_lock.lock().unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let stream = receiver.active_streams.track(server).unwrap();
+        let resolved = policy(1);
+        receiver
+            .resolve_ssh_with(resolved.endpoint.clone(), stream, |target, cancelled| {
+                assert_eq!(target, &resolved.endpoint);
+                assert!(!cancelled());
+                Ok(resolved.clone())
+            })
+            .unwrap();
+        assert!(matches!(
+            read_message::<Reply>(&mut client).unwrap(),
+            Reply::Ready
+        ));
+        assert_eq!(
+            read_message::<ResolvedPolicy>(&mut client).unwrap(),
+            resolved
+        );
+        assert!(receiver.approvals.snapshots().is_empty());
+        assert!(receiver.account_sessions.lock().unwrap().is_empty());
+        assert_eq!(receiver.ssh_count.load(Ordering::Acquire), 0);
+        assert!(prompts.try_recv().is_err());
+    }
+
+    #[test]
+    fn resolve_only_stops_on_receiving_generation_change() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, _registration, _prompts) =
+            super::super::tests::broker(temporary.path(), Approval::Ask);
+        let (server, _client) = UnixStream::pair().unwrap();
+        let stream = receiver.active_streams.track(server).unwrap();
+        let resolved = policy(1);
+        let error = receiver
+            .resolve_ssh_with(resolved.endpoint.clone(), stream, |_, cancelled| {
+                receiver.revoke_all();
+                assert!(cancelled());
+                Ok(resolved)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("resolution disconnected"));
+        assert!(receiver.approvals.snapshots().is_empty());
+    }
+
+    #[test]
+    fn previous_ssh_request_without_expected_policy_still_deserializes() {
+        let request: Request = serde_json::from_str(
+            r#"{"target":{"user":null,"host":"destination","port":null},"command":[],"cwd":"/tmp"}"#,
+        ).unwrap();
+        assert!(request.mode == Mode::Once);
+        assert!(request.expected.is_none());
+    }
+
     #[test]
     fn agent_replies_do_not_cancel_the_ssh_session() {
         let (mut local, mut remote) = UnixStream::pair().unwrap();

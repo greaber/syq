@@ -1069,6 +1069,8 @@ const DOMAIN_SETTINGS: &[&str] = &[
     "receive.lock",
     "account-permissions-v1.json",
     "account-permissions-v1.lock",
+    crate::receive_approval::provider_accounts::STATE_FILE,
+    crate::receive_approval::provider_accounts::LOCK_FILE,
 ];
 
 fn close_scope(scope: &Path) -> Result<()> {
