@@ -1422,14 +1422,14 @@ fn nested_work_guards_keep_retirement_visible_until_the_outer_operation_finishes
 }
 
 #[test]
-fn deletion_policy_reduces_a_plateau_without_accepting_cumulative_losses() {
+fn deletion_policy_requires_a_gain_in_either_direction() {
     for start in [4, 32] {
-        let policy = simulate_policy(Policy::refine(start, 1, 64).prefer_fewer(), 4, 200, |_| 1.0);
-        assert_eq!(policy.settled(), 4, "{:?}", policy.history);
+        let policy = simulate_policy(Policy::refine(start, 1, 64).require_gain(), 4, 200, |_| 1.0);
+        assert_eq!(policy.settled(), start, "{:?}", policy.history);
     }
     // A small real loss on every reduction must not accumulate into a large
     // throughput sacrifice just because each individual step looks close.
-    let mut policy = Policy::refine(32, 1, 64).prefer_fewer();
+    let mut policy = Policy::refine(32, 1, 64).require_gain();
     for _ in 0..200 {
         let score = 1000.0 + policy.n as f64;
         measure(&mut policy, score);

@@ -112,6 +112,7 @@ impl Drop for Turn {
 struct Registry {
     gates: HashMap<Directory, Weak<Gate>>,
     sweep_at: usize,
+    limit: usize,
 }
 
 impl Registry {
@@ -119,6 +120,7 @@ impl Registry {
         Self {
             gates: HashMap::new(),
             sweep_at: 1024,
+            limit: MUTATORS,
         }
     }
 
@@ -131,7 +133,7 @@ impl Registry {
             .get(&key)
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
-                let gate = Arc::new(Gate::new(MUTATORS));
+                let gate = Arc::new(Gate::new(self.limit));
                 self.gates.insert(key, Arc::downgrade(&gate));
                 gate
             })
@@ -181,6 +183,27 @@ pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
     // The caller keeps its root descriptor alive throughout the operation,
     // preventing root inode reuse while a permit or its waiter is live.
     // Never hold the registry lock while waiting or performing filesystem I/O.
+    gate.acquire()
+}
+
+/// Small-file deletion keeps a few syscalls active while other callers park.
+/// Its callers retain the root and release a turn before taking another one.
+#[cfg(target_os = "linux")]
+pub(crate) fn deletion(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    let gate = REGISTRY
+        .get_or_init(|| {
+            Mutex::new(Registry {
+                limit: 4,
+                ..Registry::new()
+            })
+        })
+        .lock()
+        .unwrap()
+        .gate(Directory {
+            root,
+            parents: parents.to_vec(),
+        });
     gate.acquire()
 }
 

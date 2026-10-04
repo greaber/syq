@@ -324,7 +324,7 @@ fn finished(
     progress: &Progress,
     summary: &mut RmResultRecord,
     entry: &Entry,
-    result: std::result::Result<(), delete::Failure>,
+    result: std::result::Result<u64, delete::Failure>,
 ) {
     let failure = result.as_ref().err();
     let message = result
@@ -370,7 +370,11 @@ fn finished(
             path: entry.key.as_bytes(),
             kind: Some(entry.kind()),
             disposition: if result.is_ok() { "removed" } else { "failed" },
-            attempts: Some(failure.map_or(1, |f| f.attempts)),
+            attempts: Some(
+                result
+                    .as_ref()
+                    .map_or_else(|f| f.attempts, |attempts| *attempts),
+            ),
             retryable: failure.map(|f| f.retryable),
             class: failure.map(|f| f.class),
             os_kind: failure.and_then(|f| f.os_kind),
@@ -468,7 +472,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
             if args.dry_run {
                 for entry in &entries {
                     check()?;
-                    finished(&args, &progress, &mut summary, entry, Ok(()));
+                    finished(&args, &progress, &mut summary, entry, Ok(0));
                 }
             } else {
                 // Planning is read-only and can be dropped on cancellation.

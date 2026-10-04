@@ -204,3 +204,184 @@ async fn deletion_backoff_recovers_from_request_contention() {
     eprintln!("contended individual deletes, fixed/automatic seconds: {times:?}");
     assert!(times[1] < times[0] * 0.85, "fixed/automatic: {times:?}");
 }
+
+#[derive(Clone, Debug)]
+struct BulkResponses {
+    calls: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+    transport_failure: bool,
+}
+
+impl HttpConnector for BulkResponses {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        assert_eq!(request.method(), "POST");
+        let body = std::str::from_utf8(request.body().bytes().unwrap()).unwrap();
+        let value = |object: &str, tag: &str| {
+            object
+                .split_once(&format!("<{tag}>"))
+                .unwrap()
+                .1
+                .split_once(&format!("</{tag}>"))
+                .unwrap()
+                .0
+                .to_owned()
+        };
+        let objects: Vec<_> = body
+            .split("<Object>")
+            .skip(1)
+            .map(|object| (value(object, "Key"), value(object, "VersionId")))
+            .collect();
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(objects.clone());
+        let attempt = calls.len();
+        let mut xml = String::from("<DeleteResult>");
+        for (key, version) in objects {
+            let code = match key.as_str() {
+                "denied" => Some("AccessDenied"),
+                "busy" => Some("SlowDown"),
+                "once" if version == "v1" && attempt == 1 => Some("SlowDown"),
+                _ => None,
+            };
+            if let Some(code) = code {
+                xml.push_str(&format!("<Error><Key>{key}</Key><VersionId>{version}</VersionId><Code>{code}</Code></Error>"));
+            } else {
+                xml.push_str(&format!(
+                    "<Deleted><Key>{key}</Key><VersionId>{version}</VersionId></Deleted>"
+                ));
+            }
+        }
+        xml.push_str("</DeleteResult>");
+        let status = if self.transport_failure { 503 } else { 200 };
+        if self.transport_failure {
+            xml = "<Error><Code>SlowDown</Code></Error>".into();
+        }
+        HttpConnectorFuture::new(async move {
+            Ok(HttpResponse::new(
+                status.try_into().unwrap(),
+                SdkBody::from(xml),
+            ))
+        })
+    }
+}
+
+fn bulk_client(transport: BulkResponses) -> Client {
+    Client::from_conf(
+        aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "fixture",
+            ))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .endpoint_url("http://localhost")
+            .force_path_style(true)
+            .http_client(http_client_fn(move |_, _| {
+                SharedHttpConnector::new(transport.clone())
+            }))
+            .build(),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn bulk_retries_only_transient_failed_versions_and_bounds_attempts() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = bulk_client(BulkResponses {
+        calls: calls.clone(),
+        transport_failure: false,
+    });
+    let deleter = Deleter {
+        client: &client,
+        bucket: "bucket",
+        individual: false,
+        concurrency: crate::deletion::Concurrency::filesystem(1),
+    };
+    let items: Vec<_> = [
+        ("good", "v1"),
+        ("once", "v1"),
+        ("once", "v2"),
+        ("denied", "v1"),
+        ("busy", "v1"),
+    ]
+    .into_iter()
+    .map(|(key, version)| Target {
+        key: key.into(),
+        version: Some(version.into()),
+    })
+    .collect();
+    let mut outcomes = Vec::new();
+    deleter
+        .run(
+            &items,
+            Clone::clone,
+            || Ok(()),
+            |target, outcome| {
+                outcomes.push((target.clone(), outcome));
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 5);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>(),
+        items.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(outcomes[0].1.as_ref().unwrap(), &1);
+    assert_eq!(outcomes[1].1.as_ref().unwrap(), &2);
+    assert_eq!(outcomes[2].1.as_ref().unwrap(), &1);
+    let denied = outcomes[3].1.as_ref().unwrap_err();
+    assert_eq!((denied.attempts, denied.retryable), (1, "no"));
+    let busy = outcomes[4].1.as_ref().unwrap_err();
+    assert_eq!((busy.attempts, busy.retryable), (3, "yes"));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[1],
+        vec![("once".into(), "v1".into()), ("busy".into(), "v1".into())]
+    );
+    assert_eq!(calls[2], vec![("busy".into(), "v1".into())]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn bulk_retry_backoff_observes_cancellation_and_does_not_repeat_transport_errors() {
+    for transport_failure in [false, true] {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = bulk_client(BulkResponses {
+            calls: calls.clone(),
+            transport_failure,
+        });
+        let deleter = Deleter {
+            client: &client,
+            bucket: "bucket",
+            individual: false,
+            concurrency: crate::deletion::Concurrency::filesystem(1),
+        };
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            signal.store(true, Relaxed);
+        });
+        let mut outcomes = Vec::new();
+        let result = deleter
+            .run(
+                &[Target {
+                    key: "busy".into(),
+                    version: Some("v1".into()),
+                }],
+                Clone::clone,
+                || {
+                    anyhow::ensure!(!cancelled.load(Relaxed), "cancelled");
+                    Ok(())
+                },
+                |_, outcome| outcomes.push(outcome),
+            )
+            .await;
+        assert_eq!(result.is_err(), !transport_failure);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].as_ref().unwrap_err().attempts, 1);
+        task.await.unwrap();
+    }
+}

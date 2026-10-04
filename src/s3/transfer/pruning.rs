@@ -3,6 +3,8 @@ use crate::s3::prune::{self, Plan};
 use std::collections::BTreeSet;
 
 struct Candidate {
+    depth: usize,
+    size: u64,
     path: Vec<u8>,
     // An S3 marker retains its trailing slash; local directories do not.
     key: Option<String>,
@@ -61,32 +63,21 @@ impl Engine {
             // the worker even on cancellation, as Engine::run drains its work.
             tokio::task::spawn_blocking(move || {
                 let mut found = found;
-                let depth = |c: &Candidate| c.path.iter().filter(|&&b| b == b'/').count();
-                found.sort_by_key(|c| std::cmp::Reverse(depth(c)));
-                // A flat directory starts serially to avoid local directory
-                // lock contention. Independent directories start with useful
-                // parallelism; measured throughput can grow either starting pool.
-                let parent = |c: &Candidate| c.path.iter().rposition(|&b| b == b'/');
-                let independent = found.first().is_some_and(|first| {
-                    let first_parent = &first.path[..parent(first).unwrap_or(0)];
-                    found
-                        .iter()
-                        .take_while(|c| depth(c) == depth(first))
-                        .any(|c| &c.path[..parent(c).unwrap_or(0)] != first_parent)
-                });
-                let mut deletion = crate::deletion::Batch::new(if independent { 8 } else { 1 });
+                found.sort_by_key(|c| std::cmp::Reverse(c.depth));
+                let mut deletion = crate::deletion::Batch::default();
                 // Equal-depth entries are independent; finish children before
                 // admitting their parents and never remove a tree recursively.
-                for level in found.chunk_by(|a, b| depth(a) == depth(b)) {
+                for level in found.chunk_by(|a, b| a.depth == b.depth) {
                     let mut remaining = level;
                     while !remaining.is_empty() {
                         engine.check_cancelled()?;
                         let (chunk, rest) =
                             remaining.split_at(remaining.len().min(deletion.chunk_size()));
                         remaining = rest;
-                        let results = deletion.run(
+                        let results = deletion.run_init(
                             chunk,
-                            |candidate| {
+                            crate::deletion::DirectoryBatch::default,
+                            |admission, candidate| {
                                 if engine.check_cancelled().is_err() {
                                     return None;
                                 }
@@ -94,6 +85,7 @@ impl Engine {
                                     if candidate.kind == "dir" {
                                         root.remove_directory(&path)
                                     } else {
+                                        admission.before_unlink(&root, &path, candidate.size)?;
                                         root.unlink(&path)
                                     }
                                 }))
@@ -172,6 +164,8 @@ impl Engine {
                         }
                     }
                     found.push(Candidate {
+                        depth: path.iter().filter(|&&b| b == b'/').count(),
+                        size: meta.len,
                         path,
                         key: None,
                         identity: Some((meta.dev, meta.ino)),
@@ -230,6 +224,8 @@ impl Engine {
                     // Ignored keys need not be representable as local paths.
                     local::key_path(&path)?;
                     found.push(Candidate {
+                        depth: path.iter().filter(|&&b| b == b'/').count(),
+                        size: size as u64,
                         path,
                         key: Some(key),
                         identity: None,
@@ -326,7 +322,7 @@ impl Engine {
                 let class = result.as_ref().err().map_or("transport", |e| e.class);
                 self.deletion_finished(
                     candidate,
-                    result.map_err(|e| anyhow::anyhow!(e.message)),
+                    result.map(|_| ()).map_err(|e| anyhow::anyhow!(e.message)),
                     class,
                 );
             },

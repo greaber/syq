@@ -2628,13 +2628,20 @@ impl FsOps {
             return self
                 .deletions
                 .get_or_insert_with(Default::default)
-                .run(
+                .run_init(
                     ops,
-                    |op| {
-                        apply_one(op, guard, destination_root.clone(), destination_prefix)
-                            .err()
-                            .as_ref()
-                            .map(wire_error)
+                    crate::deletion::DirectoryBatch::default,
+                    |deletion, op| {
+                        apply::apply_one_with_deletions(
+                            op,
+                            guard,
+                            destination_root.clone(),
+                            destination_prefix,
+                            Some(deletion),
+                        )
+                        .err()
+                        .as_ref()
+                        .map(wire_error)
                     },
                     Option::is_none,
                 )

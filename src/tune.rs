@@ -397,7 +397,7 @@ pub struct Policy {
     recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
-    prefer_fewer: bool,
+    require_gain: bool,
     state: State,
     points: BTreeMap<usize, Point>,
     /// Consecutive failed probes up / down.
@@ -424,7 +424,7 @@ impl Policy {
             #[cfg(test)]
             recommended: n,
             startup_doubling: true,
-            prefer_fewer: false,
+            require_gain: false,
             state: State::Initial,
             points: BTreeMap::new(),
             fails: [0, 0],
@@ -445,10 +445,10 @@ impl Policy {
     }
 
     /// Deletion can burn CPU spinning on filesystem locks without increasing
-    /// throughput. Keep the smaller count on a tie; transfer policies retain
-    /// their existing treatment of uncertain measurements.
-    pub(crate) fn prefer_fewer(mut self) -> Self {
-        self.prefer_fewer = true;
+    /// throughput. Retain a changed count only when it measurably improves
+    /// throughput; transfer policies keep their treatment of uncertain increases.
+    pub(crate) fn require_gain(mut self) -> Self {
+        self.require_gain = true;
         self
     }
 
@@ -866,13 +866,12 @@ impl Policy {
                     // high-water scores can describe conditions that no longer
                     // apply, even when revisiting them refreshes their age.
                     Direction::Up => base < score * (1.0 - NEAR_BEST_TOLERANCE),
-                    Direction::Down if self.prefer_fewer => score >= base,
                     Direction::Down => score * (1.0 - NEAR_BEST_TOLERANCE) > base,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
                 let inverse = direction.opposite().index();
-                if !self.prefer_fewer
+                if !self.require_gain
                     && direction == Direction::Up
                     && !keep
                     && base > 0.0
@@ -919,9 +918,9 @@ impl Policy {
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.set_candidate(from);
                     self.state = State::Hold;
-                    if self.prefer_fewer && direction == Direction::Up {
+                    if self.require_gain && direction == Direction::Up {
                         // An unhelpful increase is also a reason to check
-                        // whether fewer workers can do the same work.
+                        // whether fewer workers improve throughput under contention.
                         self.begin(Direction::Down, base);
                     }
                 }

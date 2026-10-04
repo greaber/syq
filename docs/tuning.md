@@ -91,11 +91,12 @@ pagination at the original prefix.
 
 `syq rm`, `syq clean-partials`, and pruning after a copy adjust deletion
 concurrency using completed entries per second. Filesystem deletion runs on
-the machine holding the target filesystem. S3 deletion adjusts concurrent requests while keeping supported
-batch requests. These measurements are separate from copying file contents and
+the machine holding the target filesystem. S3 deletion adjusts concurrent
+requests while keeping supported batch requests. These measurements are separate from copying file contents and
 are not saved between runs. When a higher deletion count brings no clear
-throughput gain, syq returns to the lower count and checks whether fewer
-workers can do the same work.
+throughput gain, syq returns to the previous count. It keeps a lower count
+when that improves throughput, such as when excess workers contend for the
+same filesystem locks.
 
 For `rm` and `clean-partials`, `--performance-tuning workers=N` fixes the
 filesystem worker count. For S3 removal, `--performance-tuning s3-requests=N`

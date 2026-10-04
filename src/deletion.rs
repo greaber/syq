@@ -1,5 +1,7 @@
 //! Deletion admission is measured separately from payload transfers.
+use crate::rooted::{RelativePath, Root};
 use crate::tune::{Policy, Sampler};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) const SAMPLE: Duration = Duration::from_millis(250);
@@ -76,7 +78,7 @@ impl Control {
             } else {
                 Policy::refine(concurrency.initial, 1, concurrency.maximum)
             })
-            .prefer_fewer(),
+            .require_gain(),
             automatic: concurrency.automatic,
             sampler,
             completed: 0,
@@ -127,6 +129,65 @@ impl Control {
     }
 }
 
+/// A worker shares one directory turn across a short run of small unlinks.
+/// Metadata comes from the existing pre-unlink check, with no extra queries.
+#[derive(Default)]
+pub(crate) struct DirectoryBatch {
+    #[cfg(target_os = "linux")]
+    held: Option<DeletionDirectory>,
+}
+
+#[cfg(target_os = "linux")]
+struct DeletionDirectory {
+    root: Arc<Root>,
+    parents: Vec<Vec<u8>>,
+    _permit: crate::rooted::directory_gate::Permit,
+    entries: usize,
+    bytes: u64,
+}
+
+impl DirectoryBatch {
+    pub(crate) fn before_unlink(
+        &mut self,
+        _root: &Arc<Root>,
+        _path: &RelativePath,
+        _len: u64,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            const BYTES: u64 = 128 * 1024;
+            if _len >= BYTES {
+                // Block reclamation for large files benefits from parallelism.
+                self.held = None;
+                return Ok(());
+            }
+            let (parents, _) = _path.leaf()?;
+            let reuse = self.held.as_ref().is_some_and(|held| {
+                held.root.identity() == _root.identity()
+                    && held.parents == parents
+                    && held.entries < 64
+                    && held.bytes + _len <= BYTES
+            });
+            if !reuse {
+                // Never wait for a directory while holding another one's turn.
+                self.held = None;
+                let permit = crate::rooted::directory_gate::deletion(_root.identity(), parents);
+                self.held = Some(DeletionDirectory {
+                    root: _root.clone(),
+                    parents: parents.to_vec(),
+                    _permit: permit,
+                    entries: 0,
+                    bytes: 0,
+                });
+            }
+            let held = self.held.as_mut().unwrap();
+            held.entries += 1;
+            held.bytes += _len;
+        }
+        Ok(())
+    }
+}
+
 /// Reuse endpoint-local threads across prune batches. Pool construction and
 /// control-connection round trips do not enter filesystem throughput samples.
 pub(crate) struct Batch {
@@ -155,22 +216,40 @@ impl Batch {
         (self.control.limit() * 32).min(1000)
     }
 
+    #[cfg(test)]
     pub fn run<T: Sync, R: Send>(
         &mut self,
         items: &[T],
         work: impl Fn(&T) -> R + Sync,
         succeeded: impl Fn(&R) -> bool,
     ) -> anyhow::Result<Vec<R>> {
+        self.run_init(items, || (), |_, item| work(item), succeeded)
+    }
+
+    pub fn run_init<T: Sync, R: Send, S>(
+        &mut self,
+        items: &[T],
+        init: impl Fn() -> S + Sync,
+        work: impl Fn(&mut S, &T) -> R + Sync,
+        succeeded: impl Fn(&R) -> bool,
+    ) -> anyhow::Result<Vec<R>> {
+        let run_chunk = |chunk: &[T]| {
+            let mut state = init();
+            chunk
+                .iter()
+                .map(|item| work(&mut state, item))
+                .collect::<Vec<_>>()
+        };
         // Avoid creating a pool for a few entries and exclude the short tail
         // from the next batch's measurement.
         if items.len() < 32 {
             self.control.observe(0, Duration::ZERO, false);
-            return Ok(items.iter().map(work).collect());
+            return Ok(run_chunk(items));
         }
         let workers = self.control.limit().min(items.len());
         if workers == 1 {
             let start = Instant::now();
-            let results: Vec<_> = items.iter().map(work).collect();
+            let results = run_chunk(items);
             self.control.observe(
                 results.iter().filter(|r| succeeded(r)).count() as u64,
                 start.elapsed(),
@@ -181,7 +260,7 @@ impl Batch {
         if self
             .pool
             .as_ref()
-            .is_none_or(|p| p.current_num_threads() != workers)
+            .is_none_or(|p| p.current_num_threads() < workers)
         {
             self.pool = Some(
                 rayon::ThreadPoolBuilder::new()
@@ -201,7 +280,7 @@ impl Batch {
             .install(|| {
                 items
                     .par_chunks(items.len().div_ceil(workers))
-                    .flat_map_iter(|chunk| chunk.iter().map(&work))
+                    .flat_map_iter(run_chunk)
                     .collect()
             });
         self.control.observe(
@@ -276,6 +355,82 @@ mod tests {
                 .unwrap();
             for (n, result) in results.into_iter().enumerate() {
                 assert_eq!(result, if n % 7 == 0 { Err(n) } else { Ok(n) });
+            }
+        }
+    }
+    #[test]
+    fn prune_pool_survives_short_batches_and_worker_reductions() {
+        let mut batch = Batch::new(64);
+        batch.control = Control::new(Concurrency::filesystem(64));
+        let items: Vec<_> = (0..1000).collect();
+        assert_eq!(batch.run(&items, |n| *n, |_| true).unwrap(), items);
+        assert_eq!(batch.pool.as_ref().unwrap().current_num_threads(), 64);
+        assert_eq!(
+            batch.run(&items[..32], |n| *n, |_| true).unwrap(),
+            items[..32]
+        );
+        assert_eq!(batch.pool.as_ref().unwrap().current_num_threads(), 64);
+        batch.control = Control::new(Concurrency::filesystem(8));
+        assert_eq!(batch.run(&items, |n| *n, |_| true).unwrap(), items);
+        assert_eq!(batch.pool.as_ref().unwrap().current_num_threads(), 64);
+    }
+
+    #[test]
+    fn noisy_deletion_measurements_preserve_throughput_and_find_clear_gains() {
+        fn uniform(state: &mut u64) -> f64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((*state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+        }
+        for sigma in [0.03, 0.06] {
+            for curve in 0..3 {
+                let rate = |n: usize| match curve {
+                    0 => n as f64 / (n as f64 + 2.0),
+                    1 => {
+                        if n <= 8 {
+                            n as f64 / 8.0
+                        } else {
+                            8.0 / n as f64
+                        }
+                    }
+                    _ => n.min(128) as f64 / 128.0,
+                };
+                let reference = if curve == 0 { rate(32) } else { 1.0 };
+                let mut scores = Vec::new();
+                for seed in 1..=40 {
+                    let mut rng = seed;
+                    let mut control = Control::new(Concurrency {
+                        initial: 32,
+                        maximum: 256,
+                        automatic: true,
+                        startup_doubling: false,
+                    });
+                    let mut tail = 0.0;
+                    for tick in 0..960 {
+                        let n = control.limit();
+                        let noise = (-2.0 * uniform(&mut rng).ln()).sqrt()
+                            * (std::f64::consts::TAU * uniform(&mut rng)).cos();
+                        let completed =
+                            (rate(n) * 25000.0 * (1.0 + sigma * noise)).max(0.0).round() as u64;
+                        if tick >= 720 {
+                            tail += rate(n) / 240.0;
+                        }
+                        control.observe(completed, SAMPLE, true);
+                    }
+                    scores.push(tail / reference);
+                }
+                scores.sort_by(f64::total_cmp);
+                // Judge useful throughput, not whether the search reaches an
+                // exact count. This catches noisy cumulative downward drift.
+                assert!(
+                    scores[20] >= 0.97,
+                    "curve {curve}, noise {sigma}: {scores:?}"
+                );
+                assert!(
+                    scores[4] >= 0.93,
+                    "curve {curve}, noise {sigma}: {scores:?}"
+                );
             }
         }
     }

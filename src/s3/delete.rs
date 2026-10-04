@@ -23,6 +23,7 @@ pub(super) struct Failure {
     pub os_kind: Option<&'static str>,
     // Counts bulk operations; SDK transport retries remain internal.
     pub attempts: u64,
+    bulk_retry: bool,
 }
 impl Failure {
     fn new(message: String, code: Option<&str>, status: Option<u16>) -> Self {
@@ -33,6 +34,7 @@ impl Failure {
             retryable,
             os_kind,
             attempts: 1,
+            bulk_retry: false,
         }
     }
     pub fn preserved_marker() -> Self {
@@ -45,6 +47,7 @@ impl Failure {
             retryable: "unknown",
             os_kind: None,
             attempts: 0,
+            bulk_retry: false,
         }
     }
 }
@@ -83,7 +86,7 @@ impl Deleter<'_> {
         items: &[T],
         identify: impl Fn(&T) -> Target,
         check: impl Fn() -> Result<()>,
-        mut finished: impl FnMut(&T, std::result::Result<(), Failure>),
+        mut finished: impl FnMut(&T, std::result::Result<u64, Failure>),
     ) -> Result<()> {
         let mut tuning = crate::deletion::Control::new(self.concurrency);
         let mut batches = items.chunks(if self.individual { 1 } else { 1000 });
@@ -93,6 +96,7 @@ impl Deleter<'_> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut sampled = tokio::time::Instant::now();
         let mut completed = 0;
+        let check = &check;
         let mut generation = 0;
         let mut old_pending = 0usize;
         loop {
@@ -104,7 +108,7 @@ impl Deleter<'_> {
                 }
                 let targets: Vec<_> = batch.iter().map(&identify).collect();
                 let prepared = generation;
-                pending.push(async move { (prepared, batch, self.batch(&targets).await) });
+                pending.push(async move { (prepared, batch, self.batch(&targets, check).await) });
             }
             if pending.is_empty() {
                 break;
@@ -113,7 +117,8 @@ impl Deleter<'_> {
             // sent. No detached request may outlive the deletion operation.
             tokio::select! {
                 result = pending.next() => {
-                    let (prepared, batch, outcomes) = result.unwrap();
+                    let (prepared, batch, (outcomes, cancelled)) = result.unwrap();
+                    if failure.is_none() { failure = cancelled; }
                     if prepared != generation {
                         old_pending -= 1;
                     }
@@ -142,7 +147,56 @@ impl Deleter<'_> {
         failure.map_or(Ok(()), Err)
     }
 
-    async fn batch(&self, targets: &[Target]) -> Vec<std::result::Result<(), Failure>> {
+    async fn batch(
+        &self,
+        targets: &[Target],
+        check: &impl Fn() -> Result<()>,
+    ) -> (
+        Vec<std::result::Result<u64, Failure>>,
+        Option<anyhow::Error>,
+    ) {
+        let mut outcomes = self.batch_once(targets).await;
+        // The SDK retries request-level failures. Errors carried inside an HTTP
+        // success need their own bounded retries; never resend successful keys.
+        for attempt in 2..=3 {
+            let retry: Vec<_> = outcomes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, outcome)| {
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| error.bulk_retry)
+                        .then_some(i)
+                })
+                .collect();
+            if retry.is_empty() {
+                break;
+            }
+            if let Err(error) = check() {
+                return (outcomes, Some(error));
+            }
+            let base = 100u64 << (attempt - 2);
+            let mut jitter = [0; 8];
+            // Jitter is best effort; unavailable entropy must not prevent cleanup.
+            let _ = getrandom::fill(&mut jitter);
+            let delay = base + u64::from_ne_bytes(jitter) % base;
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            if let Err(error) = check() {
+                return (outcomes, Some(error));
+            }
+            let selected: Vec<_> = retry.iter().map(|&i| targets[i].clone()).collect();
+            for (index, result) in retry.into_iter().zip(self.batch_once(&selected).await) {
+                outcomes[index] = result.map(|_| attempt).map_err(|mut error| {
+                    error.attempts = attempt;
+                    error
+                });
+            }
+        }
+        (outcomes, None)
+    }
+
+    async fn batch_once(&self, targets: &[Target]) -> Vec<std::result::Result<u64, Failure>> {
         if self.individual {
             let target = &targets[0];
             let result = self
@@ -164,7 +218,7 @@ impl Deleter<'_> {
                             None,
                         ))
                     } else {
-                        Ok(())
+                        Ok(1)
                     }
                 }
                 Err(error) => Err(Failure::new(
@@ -231,7 +285,7 @@ impl Deleter<'_> {
                             id = (target.key.as_str(), None);
                         }
                         if let Some(error) = errors.get(&id) {
-                            Err(Failure::new(
+                            let mut failure = Failure::new(
                                 format!(
                                     "{}: {}",
                                     error.code().unwrap_or("S3 deletion error"),
@@ -239,7 +293,9 @@ impl Deleter<'_> {
                                 ),
                                 error.code(),
                                 None,
-                            ))
+                            );
+                            failure.bulk_retry = failure.retryable == "yes";
+                            Err(failure)
                         } else if let Some(deleted) = deleted.get(&id) {
                             if let Some(version) = target.version.as_deref() {
                                 let marker_version = deleted.delete_marker_version_id();
@@ -262,7 +318,7 @@ impl Deleter<'_> {
                                     ));
                                 }
                             }
-                            Ok(())
+                            Ok(1)
                         } else {
                             Err(Failure::new(
                                 format!(
