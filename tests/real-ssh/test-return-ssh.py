@@ -343,6 +343,7 @@ def resolution_cache_cases(expected):
             # Match exec is evaluated by the provider's ssh -G inspection. Direct
             # requester logins use pinned settings and never read this config.
             prefix = ("Host " + alias + "\n  HostName " + host + "\n  User syq\n  Port 22\n"
+                      "  UserKnownHostsFile /home/syq/.ssh/known_hosts\n  GlobalKnownHostsFile /dev/null\n"
                       "Match originalhost " + alias + " exec \"printf x >> " + str(marker) + "\"\n"
                       "Match all\n")
             config.write_bytes(prefix.encode() + original)
