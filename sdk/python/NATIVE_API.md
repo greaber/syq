@@ -88,6 +88,7 @@ In addition to the shared arguments above, it accepts:
 | `stream_concurrency` | Maximum callback entries active at once; default `4`, range `1..256`; transport worker and request limits are shared across entries |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
+| `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
 | `if_exists` | `"error-if-different"`, `"error"`, `"keep"`, `"update"` (default), or `"update-if-older"` |
 | `ignore` | Pattern string, `IgnoreFrom(path)`, or ordered iterable of either |

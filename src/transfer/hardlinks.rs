@@ -87,7 +87,8 @@ impl Planner<'_> {
             }
             let compare_before_link = self.opts.protects_existing_contents()
                 && destination.as_ref().is_some_and(|d| {
-                    self.opts.checksum || !self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)
+                    !self.opts.trusts_size_and_time()
+                        || !self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)
                 });
             group.followers.push(Follower {
                 compare_before_link,
@@ -109,14 +110,19 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         } else if self.opts.dry_run
-            && (!(self.opts.checksum || self.opts.protects_existing_contents())
+            && (!self
+                .opts
+                .previews_by_comparing(leaf.e.size, destination.as_ref())
                 || destination
                     .as_ref()
                     .is_none_or(|d| d.kind != Kind::File || d.size != leaf.e.size))
         {
-            let matched = destination
-                .as_ref()
-                .is_some_and(|d| self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d));
+            // A copy that would not compare the file rewrites it unless its
+            // size and time are trusted.
+            let matched = self.opts.trusts_size_and_time()
+                && destination
+                    .as_ref()
+                    .is_some_and(|d| self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d));
             if matched {
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                 self.progress
@@ -511,6 +517,13 @@ impl Worker {
             }
     }
 
+    /// Metadata flags for a destination kept because its contents already
+    /// match: publication's, with the times policy of a content match.
+    pub(super) fn unchanged_flags(&self, job: &WorkerJob) -> u8 {
+        (self.publication_flags(job) & !flags::TIMES)
+            | (self.opts.matching_flags_for(&job.rel_bytes) & flags::TIMES)
+    }
+
     pub(super) fn finish_matched_basis(&mut self, idx: usize, job: &WorkerJob) -> Result<()> {
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(job);
@@ -520,8 +533,7 @@ impl Worker {
                 path: job.dst.clone(),
                 copy_id: self.copy_id(),
                 meta,
-                flags: (self.publication_flags(job) & !flags::TIMES)
-                    | (self.opts.matching_flags_for(&job.rel_bytes) & flags::TIMES),
+                flags: self.unchanged_flags(job),
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
             })?,

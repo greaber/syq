@@ -439,8 +439,9 @@ struct Pool {
     dry_run: bool,
     cancelled: AtomicBool,
     limit: AtomicUsize,
-    active: Vec<AtomicBool>,
+    active: AtomicUsize,
     parked: Mutex<()>,
+    waiting: AtomicUsize,
     wake: Condvar,
 }
 
@@ -493,26 +494,69 @@ impl Pool {
         self.wake.notify_all();
     }
 
-    fn wait(&self, worker: usize) -> bool {
-        if worker < self.limit.load(Ordering::Relaxed) {
-            return true;
+    fn enter(&self) -> ActiveWorker<'_> {
+        if !self.try_enter() {
+            let parked = self.parked.lock().unwrap();
+            let _parked = self.wait_for_capacity(parked);
         }
-        let mut parked = self.parked.lock().unwrap();
-        while worker >= self.limit.load(Ordering::Relaxed)
-            && !self.is_cancelled()
-            && !self.is_done()
-        {
+        ActiveWorker(self)
+    }
+
+    fn try_enter(&self) -> bool {
+        let mut active = self.active.load(Ordering::SeqCst);
+        loop {
+            if active >= self.limit.load(Ordering::Relaxed) && !self.is_cancelled() {
+                return false;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => active = current,
+            }
+        }
+    }
+
+    fn wait_for_capacity<'a>(
+        &self,
+        mut parked: std::sync::MutexGuard<'a, ()>,
+    ) -> std::sync::MutexGuard<'a, ()> {
+        // Register before checking capacity. Together with the sequentially
+        // consistent release/check in ActiveWorker::drop, this prevents a
+        // missed wakeup without locking on uncontended admission or release.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        while !self.try_enter() {
             parked = self.wake.wait(parked).unwrap();
         }
-        !self.is_done()
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        parked
+    }
+
+    /// A scan may keep executing inline work while the queue is full. Let
+    /// excess workers pause in that scan, retaining its existing state. Any
+    /// worker can resume when another releases capacity; worker IDs cannot
+    /// decide admission because a parked scan still needs to finish.
+    /// Call only while active and without a directory mutation permit.
+    fn retire_excess(&self) {
+        if self.active.load(Ordering::Relaxed) <= self.limit.load(Ordering::Relaxed) {
+            return;
+        }
+        let parked = self.parked.lock().unwrap();
+        if self.active.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
+            && !self.is_cancelled()
+        {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let _parked = self.wait_for_capacity(parked);
+        }
     }
 
     fn backlogged(&self) -> bool {
         let limit = self.limit.load(Ordering::Relaxed);
         *self.pending.lock().unwrap() >= limit + limit.min(16)
-            && !self.active[limit..]
-                .iter()
-                .any(|active| active.load(Ordering::Relaxed))
+            && self.active.load(Ordering::Relaxed) <= limit
     }
 
     fn cancel(&self) {
@@ -528,6 +572,21 @@ impl Pool {
     fn outcome(&self, outcome: NativeRemoveOutcome) {
         if !self.is_cancelled() {
             let _ = self.events.send(Some(outcome));
+        }
+    }
+}
+
+/// Capacity belongs to a worker only while it can make progress. In
+/// particular, waiting for an empty task queue must release it so a paused
+/// scan can resume and produce the remaining work.
+struct ActiveWorker<'a>(&'a Pool);
+
+impl Drop for ActiveWorker<'_> {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+        if self.0.waiting.load(Ordering::SeqCst) != 0 {
+            let _parked = self.0.parked.lock().unwrap();
+            self.0.wake.notify_one();
         }
     }
 }
@@ -681,10 +740,9 @@ pub(crate) fn remove(
         dry_run,
         cancelled: AtomicBool::new(false),
         limit: AtomicUsize::new(tuning.limit()),
-        active: (0..concurrency.maximum)
-            .map(|_| AtomicBool::new(false))
-            .collect(),
+        active: AtomicUsize::new(0),
         parked: Mutex::new(()),
+        waiting: AtomicUsize::new(0),
         wake: Condvar::new(),
     });
     for selected in resolved {
@@ -722,10 +780,9 @@ pub(crate) fn remove(
     let mut threads = Vec::new();
     let mut spawn_to = |limit: usize| {
         while threads.len() < limit {
-            let id = threads.len();
             let pool = pool.clone();
             let task_rx = task_rx.clone();
-            threads.push(std::thread::spawn(move || worker_loop(pool, task_rx, id)));
+            threads.push(std::thread::spawn(move || worker_loop(pool, task_rx)));
         }
     };
     spawn_to(tuning.limit());
@@ -799,24 +856,30 @@ pub(crate) fn remove(
     Ok(())
 }
 
-fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>, id: usize) {
-    while pool.wait(id) {
-        // Mark participation for the whole active stretch, not each file.
-        // On a reduction, measurements wait until surplus workers reach this
-        // boundary and park; cancellation lets every worker drain the queue.
-        pool.active[id].store(true, Ordering::Relaxed);
-        while id < pool.limit.load(Ordering::Relaxed) || pool.is_cancelled() {
-            let task = match receiver.lock().unwrap().recv() {
-                Ok(task) => task,
-                Err(_) => {
-                    pool.active[id].store(false, Ordering::Relaxed);
-                    return;
-                }
-            };
+fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>) {
+    loop {
+        let mut task = match receiver.lock().unwrap().recv() {
+            Ok(task) => task,
+            Err(_) => return,
+        };
+        let _active = pool.enter();
+        loop {
+            pool.retire_excess();
             process_task(&pool, task);
             pool.task_done();
+            // Keep admission across available work, but never while waiting
+            // on the queue: paused scans may be its only remaining producers.
+            let next = match receiver.try_lock() {
+                Ok(receiver) => receiver.try_recv(),
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(error) => panic!("removal receiver lock poisoned: {error}"),
+            };
+            match next {
+                Ok(next) => task = next,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
         }
-        pool.active[id].store(false, Ordering::Relaxed);
     }
 }
 
@@ -846,42 +909,15 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
             label,
             parent,
         } => {
-            if pool.is_cancelled() {
-                if let Some(parent) = parent {
-                    directory_part_done(pool, parent);
-                }
-                return;
-            }
-            let kind = name.identity.kind();
-            let outcome = if pool.dry_run {
-                removal_outcome(
+            let failed = process_leaf(
+                pool,
+                PinnedLeaf {
                     selector,
+                    name,
+                    _object,
                     label,
-                    kind,
-                    NativeRemoveDisposition::WouldRemove,
-                    None,
-                )
-            } else {
-                match remove_pinned(&name, None) {
-                    Ok(RemovePinnedOutcome::Removed) => removal_outcome(
-                        selector,
-                        label,
-                        kind,
-                        NativeRemoveDisposition::Removed,
-                        Some(1),
-                    ),
-                    Ok(RemovePinnedOutcome::AlreadyAbsent) => removal_outcome(
-                        selector,
-                        label,
-                        kind,
-                        NativeRemoveDisposition::AlreadyAbsent,
-                        Some(1),
-                    ),
-                    Err(error) => failed_outcome(selector, label, Some(kind), 1, error),
-                }
-            };
-            let failed = outcome.disposition == NativeRemoveDisposition::Failed;
-            pool.outcome(outcome);
+                },
+            );
             if let Some(parent) = parent {
                 if failed {
                     directory_part_failed(pool, parent);
@@ -891,28 +927,75 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
             }
         }
         Task::Leaves { parent, leaves } => {
-            // A turn covers a short batch, avoiding a wakeup for every unlink.
-            // Single-file jobs include large files and do not take this gate.
-            #[cfg(target_os = "linux")]
-            let _permit = (leaves.len() > 1).then(|| parent.leaves.acquire());
-            for leaf in leaves {
-                process_task(
-                    pool,
-                    Task::Leaf {
-                        selector: leaf.selector,
-                        name: leaf.name,
-                        _object: leaf._object,
-                        label: leaf.label,
-                        parent: Some(parent.clone()),
-                    },
-                );
+            let count = leaves.len();
+            let mut failed = false;
+            {
+                // A turn covers a short batch, avoiding a wakeup for every
+                // unlink. Single-file jobs bypass this directory gate.
+                #[cfg(target_os = "linux")]
+                let _permit = (count > 1).then(|| parent.leaves.acquire());
+                for leaf in leaves {
+                    failed |= process_leaf(pool, leaf);
+                }
+            }
+            if failed {
+                parent.descendant_failed.store(true, Ordering::SeqCst);
+            }
+            // Finishing may retry a directory scan inline. Release the
+            // directory permit before that scan can park for worker capacity.
+            for _ in 0..count {
+                directory_part_done(pool, parent.clone());
             }
         }
         Task::Finish(job) => finish_directory(pool, job),
     }
 }
 
+fn process_leaf(pool: &Pool, leaf: PinnedLeaf) -> bool {
+    if pool.is_cancelled() {
+        return false;
+    }
+    let PinnedLeaf {
+        selector,
+        name,
+        _object,
+        label,
+    } = leaf;
+    let kind = name.identity.kind();
+    let outcome = if pool.dry_run {
+        removal_outcome(
+            selector,
+            label,
+            kind,
+            NativeRemoveDisposition::WouldRemove,
+            None,
+        )
+    } else {
+        match remove_pinned(&name, None) {
+            Ok(RemovePinnedOutcome::Removed) => removal_outcome(
+                selector,
+                label,
+                kind,
+                NativeRemoveDisposition::Removed,
+                Some(1),
+            ),
+            Ok(RemovePinnedOutcome::AlreadyAbsent) => removal_outcome(
+                selector,
+                label,
+                kind,
+                NativeRemoveDisposition::AlreadyAbsent,
+                Some(1),
+            ),
+            Err(error) => failed_outcome(selector, label, Some(kind), 1, error),
+        }
+    };
+    let failed = outcome.disposition == NativeRemoveDisposition::Failed;
+    pool.outcome(outcome);
+    failed
+}
+
 fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
+    pool.retire_excess();
     let names = match read_directory(&job.directory) {
         Ok(names) => names,
         Err(error) => {
@@ -957,7 +1040,12 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
             });
         }
     };
-    for component in names {
+    for (index, component) in names.into_iter().enumerate() {
+        // Check at bounded intervals even when entries are skipped. Reading
+        // shared admission state for every name adds cache traffic to scanning.
+        if index % LEAF_BATCH_FILES == 0 {
+            pool.retire_excess();
+        }
         if pool.is_cancelled() {
             break;
         }

@@ -42,6 +42,14 @@ fn seeded_hashes_preserve_selected_positions_and_require_actual_matches() {
 }
 
 #[test]
+fn only_a_single_fixed_tcp_port_waits_for_helpers() {
+    assert!(!helpers_hold_the_only_tcp_port(None));
+    assert!(!helpers_hold_the_only_tcp_port(Some((0, 0))));
+    assert!(!helpers_hold_the_only_tcp_port(Some((47_600, 47_699))));
+    assert!(helpers_hold_the_only_tcp_port(Some((47_600, 47_600))));
+}
+
+#[test]
 fn source_block_must_match_the_requested_range() {
     assert!(validate_range_reply(4096, 1024, 4096, 1024).is_ok());
     for (off, len) in [
@@ -425,6 +433,7 @@ fn pipeline_worker(
         hardlink_completions: Mutex::new(Default::default()),
         devices: false,
         checksum: false,
+        hash_or_copy: false,
         precise_mtime: true,
         inplace: false,
         same_host: false,
@@ -4151,4 +4160,493 @@ fn arrived_range_writes_update_progress_before_the_next_source_reply() {
         "arrived writes need not wait for the window to fill"
     );
     assert!(sched.range_done(&range));
+}
+
+/// Answers each request as it is sent, in order.
+struct AnsweringConn<F> {
+    answer: F,
+    replies: std::collections::VecDeque<Response>,
+}
+
+impl<F: FnMut(Request) -> Response + Send> Conn for AnsweringConn<F> {
+    fn send(&mut self, request: Request) -> Result<()> {
+        let reply = (self.answer)(request);
+        self.replies.push_back(reply);
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.replies
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("missing reply"))
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(String),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// A source that reads each file whole from disk and reports it with its
+/// planned entry.
+fn reading_source(entries: std::collections::HashMap<PathBytes, Entry>) -> Box<dyn Conn> {
+    let read = move |path: &PathBytes| {
+        let contents = std::fs::read(OsStr::from_bytes(path)).unwrap();
+        (contents, entries[path].clone())
+    };
+    Box::new(AnsweringConn {
+        answer: move |request| match request {
+            Request::ReadDifferingBatch { block, reads } => Response::DifferingBlocks(
+                reads
+                    .iter()
+                    .map(|wanted| {
+                        let (contents, entry) = read(&wanted.path);
+                        let mut matching = Vec::new();
+                        let mut data = Vec::new();
+                        for (index, chunk) in contents.chunks(block as usize).enumerate() {
+                            let same = wanted.expected.get(index) == Some(&content_digest(chunk));
+                            if !same && !wanted.compare_only {
+                                data.extend_from_slice(chunk);
+                            }
+                            matching.push(same);
+                        }
+                        Ok(DifferingBlocks {
+                            source: Some(entry),
+                            matching,
+                            hash: content_digest(&data),
+                            data,
+                        })
+                    })
+                    .collect(),
+            ),
+            Request::ReadSmallBatch(reads) => Response::SmallBlocks(
+                reads
+                    .iter()
+                    .map(|wanted| {
+                        let (data, entry) = read(&wanted.path);
+                        Ok(SmallBlock {
+                            source: Some(entry),
+                            hash: content_digest(&data),
+                            data,
+                        })
+                    })
+                    .collect(),
+            ),
+            other => panic!("unexpected source request {other:?}"),
+        },
+        replies: Default::default(),
+    })
+}
+
+/// A command-restricted receiver: each request is authorized, executed and
+/// settled as its server does, and recorded once executed. `before_patch`
+/// runs between a patch batch's authorization and its execution.
+fn restricted_destination(
+    authority: Arc<crate::restricted::RestrictedAuthority>,
+    requests: Arc<Mutex<Vec<Request>>>,
+    mut before_patch: impl FnMut() + Send + 'static,
+) -> Box<dyn Conn> {
+    let mut ops = crate::fsops::FsOps::new();
+    Box::new(AnsweringConn {
+        answer: move |mut request: Request| {
+            let settlement = match authority.authorize(&mut request, false) {
+                Ok(settlement) => settlement,
+                Err(error) => return Response::Err(format!("{error:#}")),
+            };
+            if matches!(request, Request::PatchSmallBatch(_)) {
+                before_patch();
+            }
+            let response = ops.handle(&request);
+            authority.settle(settlement, &response);
+            requests.lock().unwrap().push(request);
+            response
+        },
+        replies: Default::default(),
+    })
+}
+
+/// Run `workers` on threads of their own until the copy ends, and check
+/// that it finished without errors. A worker that panics, or a copy still
+/// running after a minute, stops the others.
+fn run_workers(sched: &Sched, workers: Vec<Worker>) {
+    struct AbortOnPanic<'a>(&'a Sched);
+    impl Drop for AbortOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.abort();
+            }
+        }
+    }
+    let (done, ended) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                ended.recv_timeout(std::time::Duration::from_secs(60))
+            {
+                sched.abort();
+            }
+        });
+        let running: Vec<_> = workers
+            .into_iter()
+            .map(|mut worker| {
+                scope.spawn(move || {
+                    let _abort = AbortOnPanic(sched);
+                    loop {
+                        match sched.next() {
+                            Item::Exit => break,
+                            item => worker.process_item(item).unwrap(),
+                        }
+                    }
+                    worker.progress.errors.load(Relaxed)
+                })
+            })
+            .collect();
+        let results: Vec<_> = running.into_iter().map(|worker| worker.join()).collect();
+        drop(done);
+        for result in results {
+            match result {
+                Ok(errors) => assert_eq!(errors, 0),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+    });
+    assert!(sched.finished(), "the copy did not finish");
+}
+
+/// Copy each of `files`, a name and its source's modification time, from
+/// `root/source` into `root/target` through a restricted receiver with
+/// `workers` workers, preserving times, and return how many hash and
+/// whole-file batches the receiver executed. Each worker's connection runs
+/// `before_patch` between a patch batch's authorization and its execution.
+fn copy_through_restricted_receiver(
+    root: &std::path::Path,
+    files: &[(&str, i64)],
+    workers: usize,
+    before_patch: impl Fn() + Send + Sync + 'static,
+) -> (usize, usize) {
+    use std::os::unix::fs::MetadataExt;
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut entries = std::collections::HashMap::new();
+    for &(name, mtime) in files {
+        let source = root.join("source").join(name);
+        let mut job = pipeline_job(name.as_bytes(), 0);
+        job.src = source.as_os_str().as_bytes().to_vec();
+        job.dst = root
+            .join("target")
+            .join(name)
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        job.entry.size = std::fs::metadata(&source).unwrap().len();
+        job.entry.mtime = mtime;
+        let existing = std::fs::metadata(OsStr::from_bytes(&job.dst)).unwrap();
+        job.dst_entry = Some(Entry {
+            size: existing.len(),
+            mtime: 0,
+            dev: existing.dev(),
+            ino: existing.ino(),
+            nlink: existing.nlink(),
+            ..job.entry.clone()
+        });
+        entries.insert(job.src.clone(), job.entry.clone());
+        sched.push_file(job);
+    }
+    sched.scan_done();
+    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority(
+        root,
+    ));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let before_patch = Arc::new(before_patch);
+    let gate = Gate::new(workers);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let workers = (0..workers)
+        .map(|id| {
+            let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+            worker.id = id;
+            worker.gate = gate.clone();
+            worker.src = reading_source(entries.clone());
+            let before_patch = before_patch.clone();
+            worker.dst =
+                restricted_destination(authority.clone(), requests.clone(), move || before_patch());
+            worker.fast_batch_files = files.len();
+            let opts = Arc::get_mut(&mut worker.opts).unwrap();
+            opts.restricted_receiver = true;
+            // Comparisons use their own smaller block; a file copied whole
+            // after all goes in a batch of whole files.
+            opts.block = 1 << 20;
+            opts.flags = flags::TIMES;
+            opts.matching_flags = flags::TIMES;
+            worker
+        })
+        .collect();
+    run_workers(&sched, workers);
+    let requests = requests.lock().unwrap();
+    let count = |kind: fn(&Request) -> bool| requests.iter().filter(|r| kind(r)).count();
+    (
+        count(|r| matches!(r, Request::HashExistingBatch { .. })),
+        count(|r| matches!(r, Request::PutSmallBatch(_))),
+    )
+}
+
+#[test]
+fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
+    use std::os::unix::fs::MetadataExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    for directory in ["source", "target"] {
+        std::fs::create_dir(root.join(directory)).unwrap();
+    }
+    for name in ["a", "b"] {
+        std::fs::write(root.join("source").join(name), b"same").unwrap();
+    }
+    let (a, b) = (root.join("target/a"), root.join("target/b"));
+    std::fs::write(&a, b"same").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    let inode = std::fs::metadata(&a).unwrap().ino();
+    // Keeping one name sets the times of the file both names share, which
+    // changes its change time once the clock has moved on.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let batches = copy_through_restricted_receiver(
+        root,
+        &[("a", 1_600_000_000), ("b", 1_600_000_000)],
+        1,
+        || {},
+    );
+    for path in [&a, &b] {
+        let metadata = std::fs::metadata(path).unwrap();
+        assert_eq!(
+            (metadata.ino(), metadata.mtime()),
+            (inode, 1_600_000_000),
+            "{}",
+            path.display()
+        );
+    }
+    // The second name was compared once more, under a fresh condition, and
+    // never copied whole.
+    assert_eq!(batches, (2, 0));
+}
+
+#[test]
+fn a_restricted_receiver_compares_a_changed_destination_again_only_once() {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let contents: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8).collect();
+    for changes in [1, 2] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        for directory in ["source", "target"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("source/file"), &contents).unwrap();
+        let destination = root.join("target/file");
+        std::fs::write(&destination, &contents).unwrap();
+        let inode = std::fs::metadata(&destination).unwrap().ino();
+        // Each of the first `changes` patches finds the destination's second
+        // block rewritten after the receiver authorized it.
+        let patches = std::sync::atomic::AtomicUsize::new(0);
+        let rewritten = destination.clone();
+        let batches =
+            copy_through_restricted_receiver(root, &[("file", 1_600_000_000)], 1, move || {
+                let changed = patches.fetch_add(1, Relaxed) + 1;
+                if changed <= changes {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&rewritten)
+                        .unwrap()
+                        .write_all_at(&[changed as u8; 16], block as u64)
+                        .unwrap();
+                }
+            });
+        // The destination is never kept: it ends with the source's contents.
+        let metadata = std::fs::metadata(&destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), contents, "{changes}");
+        assert_ne!(metadata.ino(), inode, "{changes}");
+        assert_eq!(metadata.mtime(), 1_600_000_000, "{changes}");
+        // It is compared again once; a second stale condition copies it
+        // whole.
+        assert_eq!(batches, (2, changes - 1), "{changes}");
+    }
+}
+
+/// `names` names of one destination file holding `contents`, each with a
+/// source holding the same contents: the names, and the inode they share.
+fn linked_destination(root: &std::path::Path, names: usize, contents: &[u8]) -> (Vec<String>, u64) {
+    use std::os::unix::fs::MetadataExt;
+    for directory in ["source", "target"] {
+        std::fs::create_dir(root.join(directory)).unwrap();
+    }
+    let names: Vec<String> = (0..names).map(|i| format!("name{i}")).collect();
+    let first = root.join("target").join(&names[0]);
+    std::fs::write(&first, contents).unwrap();
+    for name in &names {
+        std::fs::write(root.join("source").join(name), contents).unwrap();
+        if *name != names[0] {
+            std::fs::hard_link(&first, root.join("target").join(name)).unwrap();
+        }
+    }
+    (names, std::fs::metadata(&first).unwrap().ino())
+}
+
+/// Give the destination file `name` `count` more names outside the copy, as
+/// a backup snapshot tree gives its files.
+fn link_outside(root: &std::path::Path, name: &str, count: usize) {
+    let outside = root.join("snapshots");
+    std::fs::create_dir_all(&outside).unwrap();
+    for i in 0..count {
+        std::fs::hard_link(
+            root.join("target").join(name),
+            outside.join(format!("{name}.{i}")),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
+    use std::os::unix::fs::MetadataExt;
+    for (count, workers, outside) in [(3, 1, 0), (5, 1, 0), (3, 3, 0), (5, 3, 0), (3, 3, 16)] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let (names, inode) = linked_destination(root, count, b"same");
+        // Names outside the copy are never kept or replaced, so they leave
+        // no condition stale.
+        link_outside(root, &names[0], outside);
+        // Each name has a source time of its own, so keeping each name sets
+        // new times on the file they all share. That changes its change
+        // time, once the clock has moved on, and leaves the conditions of
+        // the names not yet kept stale.
+        let files: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), 1_600_000_000 + i as i64))
+            .collect();
+        let (hashed, whole) = copy_through_restricted_receiver(root, &files, workers, || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let case = format!("{count} names, {workers} workers, {outside} outside");
+        for name in &names {
+            let path = root.join("target").join(name);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode,
+                "{case}: {name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"same", "{case}: {name}");
+        }
+        assert_eq!(whole, 0, "{case}: a name was copied whole");
+        // One worker compares the names not yet kept together and keeps one
+        // of them each time, so the last is compared once for each name.
+        if workers == 1 {
+            assert_eq!(hashed, count, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_restricted_receiver_replaces_a_linked_destination_that_keeps_changing() {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    // A short second block keeps what the retried patches send, and the
+    // grant charges, small.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let contents: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
+    // One worker: with several, a write could also land while another
+    // worker copies a name whole, which the receiver refuses to publish.
+    for count in [3, 5] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let (names, _) = linked_destination(root, count, &contents);
+        // Every patch finds the second block of the file the names share
+        // rewritten after the receiver authorized it.
+        let shared = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("target").join(&names[0]))
+            .unwrap();
+        let writes = std::sync::atomic::AtomicU8::new(0);
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), 1_600_000_000))
+            .collect();
+        let (hashed, whole) = copy_through_restricted_receiver(root, &files, 1, move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let write = writes.fetch_add(1, Relaxed).wrapping_add(1);
+            shared.write_all_at(&[write; 16], block as u64).unwrap();
+        });
+        for name in &names {
+            let path = root.join("target").join(name);
+            assert_eq!(std::fs::read(&path).unwrap(), contents, "{count}: {name}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mtime(),
+                1_600_000_000,
+                "{count}: {name}"
+            );
+        }
+        // Compared again once for each name the file has, the names are then
+        // copied whole.
+        assert_eq!(hashed, count + 1, "{count}");
+        assert_ne!(whole, 0, "{count}");
+    }
+}
+
+#[test]
+fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_the_copy() {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let contents: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    // Two of the file's twenty names are in the copy.
+    let (names, _) = linked_destination(root, 2, &contents);
+    link_outside(root, &names[0], 18);
+    let first = root.join("target").join(&names[0]);
+    assert_eq!(std::fs::metadata(&first).unwrap().nlink(), 20);
+    // Every patch finds the file's second block rewritten after the receiver
+    // authorized it.
+    let shared = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&first)
+        .unwrap();
+    let writes = std::sync::atomic::AtomicU8::new(0);
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_str(), 1_600_000_000))
+        .collect();
+    let (hashed, whole) = copy_through_restricted_receiver(root, &files, 1, move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let write = writes.fetch_add(1, Relaxed).wrapping_add(1);
+        shared.write_all_at(&[write; 16], block as u64).unwrap();
+    });
+    for name in &names {
+        let path = root.join("target").join(name);
+        assert_eq!(std::fs::read(&path).unwrap(), contents, "{name}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mtime(),
+            1_600_000_000,
+            "{name}"
+        );
+    }
+    // Compared again once for each name in the copy, not for each of the
+    // file's names, the names are then copied whole.
+    assert_eq!(hashed, 3);
+    assert_ne!(whole, 0);
 }

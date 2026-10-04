@@ -852,6 +852,7 @@ fn run_remote(
                     dst,
                     &coordinator_policy.login_user,
                     &peer_policy.login_user,
+                    peer_policy.agent_socket(),
                     !args.dry_run,
                 )
             })
@@ -885,11 +886,7 @@ fn run_remote(
                     prepared.enrollment_id
                 );
             }
-            crate::agent_broker::ConstrainedAgentBroker::start_with_private_key(
-                policy,
-                limit,
-                prepared.private_key,
-            )?
+            prepared.private_key.start_broker(policy, limit)?
         } else {
             crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?
         };
@@ -978,6 +975,9 @@ fn run_remote(
     }
     if !args.compress {
         remote.push("--no-compress".into());
+    }
+    if args.hash_or_copy && !args.checksum {
+        remote.push("--hash-or-copy".into());
     }
     if args.checksum {
         if args.hash_algorithm == crate::hashing::HashAlgorithm::Blake3 {

@@ -5,6 +5,9 @@ pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
         data: FileJobData {
             compare_ranges: false,
             compare_final: false,
+            compared: false,
+            resume_partial: false,
+            recompared: 0,
             src: name.to_vec(),
             source: RegisteredPath::new(serde_json::from_str("0").unwrap(), name.to_vec()).unwrap(),
             dst: [name, b"-dst"].concat(),
@@ -236,6 +239,9 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
+                compared: false,
+                resume_partial: false,
+                recompared: 0,
                 src: b"src/file".to_vec(),
                 source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"file".to_vec())
                     .unwrap(),
@@ -652,6 +658,19 @@ fn eager_connections_wait_for_a_planned_file_and_skip_empty_scans() {
     };
     empty.scan_done();
     assert!(!waiter.join().unwrap());
+
+    // Planning anticipates no work for an existing destination, whose files
+    // may be unchanged; its first queued file wakes the waiter instead.
+    let queued = Arc::new(Sched::new(64, 128));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let sched = queued.clone();
+        std::thread::spawn(move || tx.send(sched.wait_for_anticipated_file_work()).unwrap())
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    queued.push_file(test_job(b"source", 4096));
+    assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    waiter.join().unwrap();
 }
 
 #[test]
@@ -1363,4 +1382,32 @@ fn slow_range_budget_wakes_idle_workers_without_sharing_issued_bytes() {
     assert!(!sched.range_done(&first));
     assert!(sched.range_done(&stolen));
     assert!(matches!(sched.next(), Item::Exit));
+}
+
+#[test]
+fn destination_names_count_the_jobs_planned_for_each_linked_file() {
+    let mut jobs = Jobs::default();
+    let planned = |ino, nlink| {
+        let mut job = test_job(b"source", 4);
+        job.dst_entry = Some(Entry {
+            ino,
+            nlink,
+            ..job.entry.clone()
+        });
+        job
+    };
+    jobs.push(planned(7, 20));
+    jobs.push(planned(8, 1));
+    jobs.push(planned(8, 1));
+    assert_eq!(jobs.destination_names(0), 1);
+    // A file with one name counts only the job itself.
+    assert_eq!(jobs.destination_names(1), 1);
+    // Jobs planned after the first count are counted too, and a retry that
+    // replaced a job's destination leaves it counted for the file it was
+    // planned for.
+    jobs.push(planned(7, 20));
+    jobs.push(planned(7, 20));
+    jobs.set_destination(4, test_job(b"other", 4).data.entry);
+    assert_eq!(jobs.destination_names(0), 3);
+    assert_eq!(jobs.destination_names(3), 3);
 }

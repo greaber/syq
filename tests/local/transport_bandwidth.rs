@@ -154,7 +154,9 @@ fn high_network_cap_keeps_single_read_comparison() {
         write(&t.path("src"), &source);
         write(&t.path("dst"), &vec![0; source.len()]);
         set_mtime(&t.path("dst"), 1);
-        let out = command(&t, mode, pull, "1G")
+        // The per-file path, rather than a grouped comparison.
+        let out = automatic_command(&t, mode, pull, "1G")
+            .arg("--performance-tuning=workers=4,copy-path=ranges")
             .args(paths(&t, pull, false))
             .env("SYQ_TEST_COMPARED_READ_EVENTS", t.path("reads"))
             .run()
@@ -207,7 +209,9 @@ fn relay_caps_both_legs_and_keeps_comparison_pipelining() {
         write(&t.path("dst"), &vec![0; source.len()]);
         set_mtime(&t.path("dst"), 1);
         let start = std::time::Instant::now();
-        let out = command(&t, mode, true, "1M")
+        // The per-file path, rather than a grouped comparison.
+        let out = automatic_command(&t, mode, true, "1M")
+            .arg("--performance-tuning=workers=4,copy-path=ranges")
             .arg("--no-compress")
             .args([
                 &t.s("src"),

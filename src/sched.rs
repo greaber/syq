@@ -50,6 +50,16 @@ pub struct FileJobData {
     /// Compare bounded windows against the prepared private output.
     pub compare_ranges: bool,
     pub compare_final: bool,
+    /// A small destination was compared with this source and differs: the
+    /// copy replaces it whole instead of comparing it again.
+    pub compared: bool,
+    /// Earlier runs left partial copies of this file: it takes the per-file
+    /// path, which resumes from them.
+    pub resume_partial: bool,
+    /// How many times a grouped patch of this file found its destination no
+    /// longer met the patch's target condition, and the file was compared
+    /// again.
+    pub recompared: u32,
     pub src: PathBytes,
     /// Descriptor-session authority corresponding to `src`. Source workers,
     /// and Linux destination workers using CopyLocal, claim its root during
@@ -108,6 +118,16 @@ pub struct Jobs {
     chunks: Vec<Arc<Vec<OnceLock<FileJobData>>>>,
     destinations: Vec<Option<Arc<Entry>>>,
     retries: HashMap<usize, Arc<FileJobData>>,
+    /// How many of the first `named` jobs were planned to replace each
+    /// multiply linked destination file, by device and inode. Counted only
+    /// when first asked, then extended over the jobs planned since.
+    destination_names: HashMap<(u64, u64), u32>,
+    named: usize,
+}
+
+/// The device and inode of a destination file other names may share.
+fn linked_identity(entry: &Entry) -> Option<(u64, u64)> {
+    (entry.kind == crate::proto::Kind::File && entry.nlink > 1).then_some((entry.dev, entry.ino))
 }
 
 /// A borrowed current version also identifies the owner needed by snapshots.
@@ -199,7 +219,39 @@ impl Jobs {
     }
 
     pub fn set_destination(&mut self, idx: usize, entry: Entry) {
+        // A name still counts toward the file it was planned to replace.
+        if self.destinations[idx]
+            .as_deref()
+            .and_then(linked_identity)
+            .is_some()
+        {
+            self.name_destinations(idx + 1);
+        }
         self.destinations[idx] = Some(Arc::new(entry));
+    }
+
+    /// How many jobs of this copy were planned to replace the file planned
+    /// as `idx`'s destination, `idx` among them.
+    pub fn destination_names(&mut self, idx: usize) -> u32 {
+        self.name_destinations(self.len());
+        self.destinations[idx]
+            .as_deref()
+            .and_then(linked_identity)
+            .and_then(|identity| self.destination_names.get(&identity).copied())
+            .unwrap_or(1)
+    }
+
+    /// Count the destinations of the jobs before `end` not yet counted.
+    fn name_destinations(&mut self, end: usize) {
+        if end <= self.named {
+            return;
+        }
+        for entry in self.destinations[self.named..end].iter().flatten() {
+            if let Some(identity) = linked_identity(entry) {
+                *self.destination_names.entry(identity).or_default() += 1;
+            }
+        }
+        self.named = end;
     }
 
     fn release(&mut self) {
@@ -500,7 +552,8 @@ struct Inner {
     /// Workers currently processing one pipelined small-file batch.
     fast_batches: usize,
     fast_groups: Vec<FastBatchHandle>,
-    /// Planning has observed at least one regular file, before destination
+    /// Planning has found work for a regular file: a queued job, or, for an
+    /// empty destination, a selected source file before destination
     /// namespace checks and directory creation make it runnable.
     file_work_anticipated: bool,
     scan_done: bool,
@@ -590,10 +643,14 @@ impl Sched {
         let mut inner = self.inner.lock().unwrap();
         inner.files.register(idx, &job.dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
+        let first_work = !std::mem::replace(&mut inner.file_work_anticipated, true);
         // New batches can run once the source-wide preflights have passed.
         let runnable = inner.scan_done || inner.work_released;
         drop(inner);
-        if runnable {
+        if first_work {
+            // Also wake a worker waiting to learn whether there is file work.
+            self.cv.notify_all();
+        } else if runnable {
             self.cv.notify_one();
         }
         idx
@@ -658,8 +715,10 @@ impl Sched {
         }
     }
 
-    /// Let speculative TCP workers warm while the planner performs remote
-    /// namespace and directory work for a batch that contains regular files.
+    /// Let speculative workers warm while the planner performs remote
+    /// namespace and directory work for a batch whose regular files are all
+    /// work, as for an empty destination. Otherwise the first queued file
+    /// signals file work.
     pub fn anticipate_file_work(&self) {
         let mut inner = self.inner.lock().unwrap();
         let first = !inner.file_work_anticipated;
@@ -670,8 +729,8 @@ impl Sched {
         }
     }
 
-    /// Wait to learn whether planning found any regular files. False means the
-    /// scan ended or aborted without one, so an eager worker need not connect.
+    /// Wait to learn whether planning found file work. False means the scan
+    /// ended or aborted without any, so an eager worker need not connect.
     pub fn wait_for_anticipated_file_work(&self) -> bool {
         let mut inner = self.inner.lock().unwrap();
         loop {

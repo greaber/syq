@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) fn generate_enrollment_key(id: EnrollmentId) -> Result<PrivateKey> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).context("generate enrollment key")?;
@@ -232,7 +233,7 @@ pub(crate) fn remote_install() -> Result<()> {
     }
     let request: InstallRequest =
         serde_json::from_slice(&encoded).context("decode restricted enrollment request")?;
-    if request.version != CONFIG_VERSION {
+    if !supported_config_version(request.version) {
         bail!("unsupported restricted enrollment request version");
     }
     request.id.validate()?;
@@ -284,7 +285,12 @@ pub(crate) fn remote_install() -> Result<()> {
     // installer that already started has its bytes and recreates it before
     // publishing the new forced authorization.
     let receiver_path = materialize_receiver(&home, &receiver_contents)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
+    let entry = AuthorizedKeyEntry::with_security_key_flags(
+        request.id,
+        &receiver_path,
+        &enrollment_key,
+        request.security_key_flags,
+    )?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
@@ -302,6 +308,7 @@ pub(crate) fn remote_install() -> Result<()> {
         0o600,
     )?;
     let config = ReceiverEnrollment {
+        security_key_flags: request.security_key_flags,
         version: CONFIG_VERSION,
         id: request.id,
         target_login: request.target_login.clone(),
@@ -371,7 +378,7 @@ pub(crate) fn remote_revoke() -> Result<()> {
         bail!("restricted revocation request is too large");
     }
     let request: RevokeRequest = serde_json::from_slice(&encoded)?;
-    if request.version != CONFIG_VERSION {
+    if !supported_config_version(request.version) {
         bail!("unsupported restricted revocation request version");
     }
     request.id.validate()?;
@@ -414,7 +421,12 @@ pub(super) fn revoke_for_account(
         Err(error) => return Err(error).context("inspect restricted receiver state"),
     };
     let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
-    let entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &enrollment_key)?;
+    let entry = AuthorizedKeyEntry::with_security_key_flags(
+        request.id,
+        &receiver_path,
+        &enrollment_key,
+        request.security_key_flags,
+    )?;
     // Validate the shared state chain before removing the credential. The
     // second check below determines whether the now-updated state is empty.
     let _ = directory_is_empty(&state_base)?;

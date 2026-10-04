@@ -125,63 +125,37 @@ pub trait Conn: Send {
             }
         }
     }
+    /// Send a request whose reply must be `Ok` without waiting for it. The
+    /// reply is checked before the next one is returned, so a failure
+    /// surfaces there. A connection that cannot defer it waits here.
+    fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
+        ok(self.call(req)?, what).map(|_| ())
+    }
     fn call(&mut self, req: Request) -> Result<Response> {
-        let expected = match &req {
-            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
-                Some(("stat", paths.len()))
-            }
-            Request::Apply { ops, .. } => Some(("apply", ops.len())),
-            Request::PartialPaths { paths, .. } => Some(("partial paths", paths.len())),
-            _ => None,
-        };
+        let expected = reply_shape(&req);
         self.send(req)?;
-        let mut response = self.recv()?;
-        if matches!(response, Response::StatsMore(_)) {
-            let Some(("stat", expected_count)) = expected else {
-                bail!("unexpected fragmented metadata response");
-            };
-            let mut entries = Vec::new();
-            loop {
-                match response {
-                    Response::StatsMore(batch) => {
-                        anyhow::ensure!(
-                            !batch.is_empty()
-                                && entries.len().saturating_add(batch.len()) < expected_count,
-                            "invalid metadata fragment count"
-                        );
-                        entries.extend(batch);
-                        response = self.recv()?;
-                    }
-                    Response::Stats(batch) => {
-                        entries.extend(batch);
-                        response = Response::Stats(entries);
-                        break;
-                    }
-                    Response::Err(_) | Response::EndpointError(_) => break,
-                    _ => bail!("unexpected response in fragmented metadata"),
-                }
-            }
+        let first = self.recv()?;
+        assemble_reply(expected, first, || self.recv())
+    }
+    /// Send a request whose reply the caller takes later with `take_reply`.
+    /// Replies to requests sent after it are returned as usual. A connection
+    /// that cannot defer it answers here.
+    fn send_pending(&mut self, req: Request) -> Result<PendingReply> {
+        self.call(req).map(PendingReply::Ready)
+    }
+    fn take_reply(&mut self, pending: PendingReply) -> Result<Response> {
+        match pending {
+            PendingReply::Ready(response) => Ok(response),
+            PendingReply::Queued(_) => bail!("this connection has no deferred replies"),
         }
-        if let Some((operation, expected)) = expected {
-            let actual = match &response {
-                Response::Stats(values) => Some(values.len()),
-                Response::Applied(values) => Some(values.len()),
-                Response::PathResults(values) => Some(values.len()),
-                _ => None,
-            };
-            if actual.is_some_and(|actual| actual != expected) {
-                bail!(
-                    "{operation} reply count {} does not match request count {expected}",
-                    actual.unwrap()
-                );
-            }
-        }
-        Ok(response)
     }
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
         false
     }
+    /// Close without waiting for the peer to exit. Every reply has been
+    /// consumed, so waiting would only delay the caller by a round trip.
+    fn detach(&mut self) {}
     /// Whether sending several requests before receiving their responses can
     /// overlap useful work. LocalConn executes requests synchronously, so
     /// queueing several block responses there only retains their buffers.
@@ -298,6 +272,119 @@ pub(crate) fn is_tcp_congestion_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<TcpCongestionError>())
 }
 
+/// The operation and entry count a metadata request's reply must match.
+fn reply_shape(req: &Request) -> Option<(&'static str, usize)> {
+    match req {
+        Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
+            Some(("stat", paths.len()))
+        }
+        Request::Apply { ops, .. } => Some(("apply", ops.len())),
+        Request::PartialPaths { paths, .. } => Some(("partial paths", paths.len())),
+        _ => None,
+    }
+}
+
+/// Join a fragmented metadata reply, reading further fragments with `next`,
+/// and check its entry count against the request's.
+fn assemble_reply(
+    expected: Option<(&'static str, usize)>,
+    mut response: Response,
+    mut next: impl FnMut() -> Result<Response>,
+) -> Result<Response> {
+    if matches!(response, Response::StatsMore(_)) {
+        let Some(("stat", expected_count)) = expected else {
+            bail!("unexpected fragmented metadata response");
+        };
+        let mut entries = Vec::new();
+        loop {
+            match response {
+                Response::StatsMore(batch) => {
+                    anyhow::ensure!(
+                        !batch.is_empty()
+                            && entries.len().saturating_add(batch.len()) < expected_count,
+                        "invalid metadata fragment count"
+                    );
+                    entries.extend(batch);
+                    response = next()?;
+                }
+                Response::Stats(batch) => {
+                    entries.extend(batch);
+                    response = Response::Stats(entries);
+                    break;
+                }
+                Response::Err(_) | Response::EndpointError(_) => break,
+                _ => bail!("unexpected response in fragmented metadata"),
+            }
+        }
+    }
+    if let Some((operation, expected)) = expected {
+        let actual = match &response {
+            Response::Stats(values) => Some(values.len()),
+            Response::Applied(values) => Some(values.len()),
+            Response::PathResults(values) => Some(values.len()),
+            _ => None,
+        };
+        if actual.is_some_and(|actual| actual != expected) {
+            bail!(
+                "{operation} reply count {} does not match request count {expected}",
+                actual.unwrap()
+            );
+        }
+    }
+    Ok(response)
+}
+
+/// A reply the caller collects later with [`Conn::take_reply`].
+#[derive(Debug)]
+#[must_use = "take the reply with Conn::take_reply"]
+pub(crate) enum PendingReply {
+    /// The connection answered when the request was sent.
+    Ready(Response),
+    /// The reply is still on its way over a remote connection.
+    Queued(u64),
+}
+
+/// A request sent without waiting for its reply failed. Requests sent after
+/// it assumed it succeeded, so the connection refuses every later reply.
+#[derive(Debug)]
+pub(crate) struct DeferredRequestError(String);
+
+impl std::fmt::Display for DeferredRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeferredRequestError {}
+
+pub(crate) fn is_deferred_request_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<DeferredRequestError>())
+}
+
+/// A request sent without waiting for its reply.
+enum Deferred {
+    /// Its reply must be `Ok`.
+    Ok(&'static str),
+    /// Its reply is kept until the caller takes it.
+    Reply {
+        id: u64,
+        expected: Option<(&'static str, usize)>,
+    },
+}
+
+/// Requests sent without waiting for their replies.
+#[derive(Default)]
+struct DeferredReplies {
+    /// Oldest first. Their replies precede any other.
+    pending: std::collections::VecDeque<Deferred>,
+    /// Replies read ahead of a later one, kept until taken.
+    arrived: std::collections::HashMap<u64, Response>,
+    next: u64,
+    failed: Option<String>,
+}
+
 pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
     requested
         .map(|algorithm| {
@@ -323,6 +410,12 @@ pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.is::<WorkerInitializationError>())
+}
+
+/// A worker handshake rejection that tests inject.
+#[cfg(debug_assertions)]
+pub(crate) fn injected_worker_initialization_error() -> anyhow::Error {
+    WorkerInitializationError("injected worker handshake rejection".into()).into()
 }
 
 /// OpenSSH could not establish the initial helper session (exit 255).
@@ -472,6 +565,7 @@ pub struct RemoteConn {
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
     rx: Option<std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>>,
+    deferred: DeferredReplies,
     reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
@@ -660,6 +754,7 @@ impl RemoteConn {
             approved_login: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
             rx: Some(rx),
+            deferred: Default::default(),
             reader: Some(reader),
             label,
             dead: false,
@@ -683,7 +778,11 @@ impl RemoteConn {
         // clone. Bound the actual response wait instead. This connection is
         // retired immediately after collection, so a late reply cannot become
         // a response to a later request.
-        let peer = if self.dead || self.send(Request::TransportStats).is_err() {
+        // A deferred reply still pending would be read as this one.
+        let peer = if self.dead
+            || !self.deferred.pending.is_empty()
+            || self.send(Request::TransportStats).is_err()
+        {
             None
         } else {
             receive_transport_stats(self.rx.as_ref().expect("reader receiver present"), timeout)
@@ -757,6 +856,41 @@ impl RemoteConn {
     }
 
     fn receive_response(&mut self) -> Result<ReceivedResponse> {
+        self.receive_deferred(None)?;
+        self.receive_next_response()
+    }
+
+    /// Read the replies of requests sent without waiting, in order: all of
+    /// them, or up to the kept reply `until`. A reply that must be `Ok` and
+    /// is not fails this and every later read.
+    fn receive_deferred(&mut self, until: Option<u64>) -> Result<()> {
+        while let Some(deferred) = self.deferred.pending.pop_front() {
+            match deferred {
+                Deferred::Ok(what) => {
+                    if let Err(error) = ok(self.receive_next_response()?.into_inner(), what) {
+                        self.deferred.pending.clear();
+                        self.deferred.failed = Some(format!("{error:#}"));
+                    }
+                }
+                Deferred::Reply { id, expected } => {
+                    let first = self.receive_next_response()?.into_inner();
+                    let reply = assemble_reply(expected, first, || {
+                        Ok(self.receive_next_response()?.into_inner())
+                    })?;
+                    self.deferred.arrived.insert(id, reply);
+                    if until == Some(id) {
+                        break;
+                    }
+                }
+            }
+        }
+        match &self.deferred.failed {
+            Some(failure) => Err(DeferredRequestError(failure.clone()).into()),
+            None => Ok(()),
+        }
+    }
+
+    fn receive_next_response(&mut self) -> Result<ReceivedResponse> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         let response = if let Some(stop) = &self.transport_stop {
             let rx = self
@@ -907,6 +1041,35 @@ impl Conn for RemoteConn {
             _ => None,
         })
     }
+    fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
+        self.send(req)?;
+        self.deferred.pending.push_back(Deferred::Ok(what));
+        Ok(())
+    }
+    fn send_pending(&mut self, req: Request) -> Result<PendingReply> {
+        let expected = reply_shape(&req);
+        self.send(req)?;
+        let id = self.deferred.next;
+        self.deferred.next += 1;
+        self.deferred
+            .pending
+            .push_back(Deferred::Reply { id, expected });
+        Ok(PendingReply::Queued(id))
+    }
+    fn take_reply(&mut self, pending: PendingReply) -> Result<Response> {
+        let id = match pending {
+            PendingReply::Ready(response) => return Ok(response),
+            PendingReply::Queued(id) => id,
+        };
+        if let Some(reply) = self.deferred.arrived.remove(&id) {
+            return Ok(reply);
+        }
+        self.receive_deferred(Some(id))?;
+        self.deferred
+            .arrived
+            .remove(&id)
+            .context("deferred reply was already taken")
+    }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)
     }
@@ -917,6 +1080,9 @@ impl Conn for RemoteConn {
     }
     fn try_recv_with_arrival(&mut self) -> Option<Result<(Response, std::time::Instant)>> {
         use std::sync::mpsc::TryRecvError;
+        if let Err(error) = self.receive_deferred(None) {
+            return Some(Err(error));
+        }
         let Some(rx) = &self.rx else {
             return Some(Err(anyhow!(
                 "response reader is collecting streaming writes"
@@ -942,6 +1108,7 @@ impl Conn for RemoteConn {
             self.write_stream.is_none(),
             "streaming writes are already active"
         );
+        self.receive_deferred(None)?;
         self.batch_receipts.begin(progress).map(Some)
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -953,11 +1120,15 @@ impl Conn for RemoteConn {
     fn is_dead(&self) -> bool {
         self.dead
     }
+    fn detach(&mut self) {
+        self.detached = true;
+    }
     fn begin_streaming_writes(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.write_stream.is_none(),
             "streaming writes already active"
         );
+        self.receive_deferred(None)?;
         self.write_stream = Some(crate::streaming::WriteReplies::spawn(
             self.rx.take().context("response reader missing")?,
         ));
@@ -1109,9 +1280,14 @@ impl Drop for RemoteConn {
         self.w = FrameWriter::new(Box::new(std::io::sink()), false);
         if self.detached {
             // Closing the pipes is the whole teardown: the remote exits on
-            // Shutdown or EOF, and waiting for its exit status would cost
-            // the round trip the pool exists to save.
+            // Shutdown or EOF, and waiting for its exit status would cost a
+            // round trip. Reap our ssh client, if any, once it exits.
             self.rx.take();
+            if let Some(mut child) = self.child.take() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
             return;
         }
         // Sending Shutdown asks for an orderly peer exit; shutting down the
@@ -1244,6 +1420,23 @@ impl std::fmt::Debug for TransportPacing {
             .field("remote_sender", &self.remote_sender)
             .finish_non_exhaustive()
     }
+}
+
+/// A TCP listener requested over the control connection whose reply has
+/// not been read yet. Other requests can share its round trip.
+pub(crate) struct RequestedTcpListener {
+    pacing: Option<TransportPacing>,
+    ports: (u16, u16),
+    key: Option<Vec<u8>>,
+    token: Vec<u8>,
+    congestion_control: Option<String>,
+    reply: TcpListenReply,
+}
+
+enum TcpListenReply {
+    Pending(PendingReply),
+    /// Named destinations set up their reverse listener at once.
+    Reverse(PendingTcpSetup),
 }
 
 /// TCP listener state whose route probes are running in the background.
@@ -1876,6 +2069,7 @@ impl RemoteSpec {
                 approved_login: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
                 rx: Some(rx),
+                deferred: Default::default(),
                 reader: Some(reader),
                 label: self.label(),
                 dead: false,
@@ -2023,6 +2217,7 @@ impl RemoteSpec {
             approved_login,
             w: FrameWriter::new(writer, compress),
             rx: Some(rx),
+            deferred: Default::default(),
             reader: Some(reader),
             label: self.label(),
             dead: false,
@@ -2108,13 +2303,41 @@ impl RemoteSpec {
         congestion_control: Option<&str>,
         pacing: Option<TransportPacing>,
     ) -> Result<PendingTcpSetup> {
+        let requested = self.request_tcp_listener(ctl, plain, ports, congestion_control, pacing)?;
+        self.begin_requested_tcp_setup(ctl, requested)
+    }
+
+    /// Send the control connection's TcpListen request without waiting for
+    /// its reply; `begin_requested_tcp_setup` reads it and starts the probes.
+    pub(crate) fn request_tcp_listener(
+        &self,
+        ctl: &mut dyn Conn,
+        plain: bool,
+        ports: (u16, u16),
+        congestion_control: Option<&str>,
+        pacing: Option<TransportPacing>,
+    ) -> Result<RequestedTcpListener> {
         *self.tcp.lock().unwrap() = None;
         {
             let mut diagnostics = self.diagnostics.lock().unwrap();
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.begin_tcp_setup_inner(ctl, plain, ports, congestion_control, pacing);
+        let result = self.request_tcp_listener_inner(ctl, plain, ports, congestion_control, pacing);
+        if let Err(error) = &result {
+            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
+        }
+        result
+    }
+
+    /// Read the reply to `request_tcp_listener` and begin probing the
+    /// advertised routes in the background.
+    pub(crate) fn begin_requested_tcp_setup(
+        &self,
+        ctl: &mut dyn Conn,
+        requested: RequestedTcpListener,
+    ) -> Result<PendingTcpSetup> {
+        let result = self.begin_requested_tcp_setup_inner(ctl, requested);
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }
@@ -2130,17 +2353,26 @@ impl RemoteSpec {
         result
     }
 
-    fn begin_tcp_setup_inner(
+    fn request_tcp_listener_inner(
         &self,
         ctl: &mut dyn Conn,
         plain: bool,
         ports: (u16, u16),
         congestion_control: Option<&str>,
         pacing: Option<TransportPacing>,
-    ) -> Result<PendingTcpSetup> {
+    ) -> Result<RequestedTcpListener> {
         if crate::destination::is_named(&self.restricted_grant) {
             anyhow::ensure!(!plain, "named destinations require encrypted TCP");
-            return self.begin_reverse_tcp_setup(ports, congestion_control);
+            return Ok(RequestedTcpListener {
+                pacing: None,
+                ports,
+                key: None,
+                token: Vec::new(),
+                congestion_control: None,
+                reply: TcpListenReply::Reverse(
+                    self.begin_reverse_tcp_setup(ports, congestion_control)?,
+                ),
+            });
         }
         let key = if plain {
             None
@@ -2150,7 +2382,7 @@ impl RemoteSpec {
             ))
         };
         let token = crate::tcp_records::random_bytes(16);
-        let resp = ctl.call(Request::TcpListen {
+        let reply = ctl.send_pending(Request::TcpListen {
             key: key.clone(),
             token: token.clone(),
             port_lo: ports.0,
@@ -2161,7 +2393,34 @@ impl RemoteSpec {
                 .filter(|p| p.remote_sender)
                 .map(|p| p.budget.rate()),
         })?;
-        let (port, advertised, remote_congestion_control) = match resp {
+        Ok(RequestedTcpListener {
+            pacing,
+            ports,
+            key,
+            token,
+            congestion_control: congestion_control.map(str::to_owned),
+            reply: TcpListenReply::Pending(reply),
+        })
+    }
+
+    fn begin_requested_tcp_setup_inner(
+        &self,
+        ctl: &mut dyn Conn,
+        requested: RequestedTcpListener,
+    ) -> Result<PendingTcpSetup> {
+        let RequestedTcpListener {
+            pacing,
+            ports,
+            key,
+            token,
+            congestion_control,
+            reply,
+        } = requested;
+        let reply = match reply {
+            TcpListenReply::Reverse(pending) => return Ok(pending),
+            TcpListenReply::Pending(reply) => reply,
+        };
+        let (port, advertised, remote_congestion_control) = match ctl.take_reply(reply)? {
             Response::TcpCongestionRejected(error) => return Err(TcpCongestionError(error).into()),
             response => match ok(response, "tcp listen")? {
                 Response::TcpListening {
@@ -2187,7 +2446,7 @@ impl RemoteSpec {
             port,
             key,
             token,
-            congestion_control: congestion_control.map(str::to_owned),
+            congestion_control,
             remote_congestion_control,
             probe,
         })
@@ -2433,6 +2692,7 @@ impl RemoteSpec {
             approved_login: None,
             w: FrameWriter::new(Box::new(writer), compress),
             rx: Some(rx),
+            deferred: Default::default(),
             reader: Some(reader),
             label: format!("{} (tcp {addr_s})", self.label()),
             dead: false,
@@ -2829,6 +3089,20 @@ impl Endpoint {
 
     pub fn is_remote(&self) -> bool {
         matches!(self, Endpoint::Remote(spec) if !spec.local_process)
+    }
+
+    /// Whether a first data worker connects without a new login: in this
+    /// process, over the TCP data route, or as a channel on this copy's own
+    /// authenticated SSH connection.
+    pub(crate) fn first_worker_needs_no_login(&self) -> bool {
+        match self {
+            Endpoint::Local { .. } => true,
+            Endpoint::Remote(spec) => {
+                spec.local_process
+                    || spec.data_transport() != DataTransport::Ssh
+                    || spec.ssh_connection(true, true) == SshConnection::Worker
+            }
+        }
     }
 
     pub fn has_data_server(&self) -> bool {
