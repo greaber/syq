@@ -291,6 +291,7 @@ def assert_no_native_credentials(host):
 def main():
     config = Path.home()/".ssh/config"
     original = config.read_bytes()
+    requester_config = None
     roots = {}
     try:
         config.write_bytes(original + b"\nHost requester\n    HostName 127.0.0.1\n    User longhome\n"
@@ -304,6 +305,16 @@ def main():
             roots[host] = remote(host, "mktemp -d /tmp/syq-peer-bridge.XXXXXX").strip()
         a, b, c = (roots[host] for host in ("requester", "source", "destination"))
         assert remote("requester", "id -un").strip() == "longhome"
+        # The requester chooses the accounts; the laptop supplies their trust
+        # and authentication. These aliases carry no keys or agent authority.
+        requester_config = json.loads(remote("requester", "python3 -c " + shlex.quote(
+            "from pathlib import Path; import json; p=Path.home()/'.ssh/config'; "
+            "print(json.dumps({'content': p.read_text() if p.exists() else None}))")))
+        remote("requester", "python3 -c " + shlex.quote(
+            "from pathlib import Path; import sys; p=Path.home()/'.ssh/config'; "
+            "p.parent.mkdir(mode=0o700, exist_ok=True); "
+            "p.write_text(sys.stdin.read() + (p.read_text() if p.exists() else ''))"),
+            stdin="Host source destination\n    User syq\n")
         remote("requester", "test ! -r /home/syq/.ssh/id_ed25519")
         assert_no_native_credentials("requester")
         assert_no_native_credentials("source")
@@ -505,6 +516,12 @@ def main():
             for host in ("source", "destination"):
                 requester("persist", "auth-from", "--reset", "--for", host)
             requester("persist", "off")
+        if requester_config is not None:
+            remote("requester", "python3 -c " + shlex.quote(
+                "from pathlib import Path; import json, sys; p=Path.home()/'.ssh/config'; "
+                "value=json.load(sys.stdin)['content']; "
+                "p.write_text(value) if value is not None else p.unlink()"),
+                stdin=json.dumps(requester_config))
         for host, root in roots.items():
             remote(host, "rm -rf -- " + shlex.quote(root))
         config.write_bytes(original)

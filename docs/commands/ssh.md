@@ -65,7 +65,8 @@ must have exact plain host keys trusted by the laptop; host-certificate-only
 trust is unsupported. The laptop's key must be loaded in its local agent.
 The requesting server's `IdentityFile` and `IdentitiesOnly` settings select
 which keys to offer; a public-key file on that server can select the matching
-private key in the laptop's agent. Laptop private-key paths are not imported.
+private key in the laptop's agent. A local `CertificateFile` can pair a user
+certificate with that agent key. Laptop private-key paths are not imported.
 Syq supplies the restricted agent in place of the server's `IdentityAgent`.
 
 The provider looks up trusted host keys using the alias you typed, or your

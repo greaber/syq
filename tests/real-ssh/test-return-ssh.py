@@ -353,9 +353,10 @@ def requester_config_cases(expected):
             run("ssh", "source", "cat > " + shlex.quote(path), stdin=key)
         # The provider's route/user differ deliberately. Only its trust policy
         # applies: this alias trusts destination's key, not source's key.
+        trust_files = "  UserKnownHostsFile /home/syq/.ssh/known_hosts\n  GlobalKnownHostsFile /dev/null\n"
         prefix = ("Host " + alias + "\n  HostName source\n  User longhome\n  HostKeyAlias destination\n"
-                  "Host " + source_trust + "\n  HostName source\n  HostKeyAlias source\n"
-                  "Match originalhost " + alias + "," + source_trust
+                  + trust_files + "Host " + source_trust + "\n  HostName source\n  HostKeyAlias source\n"
+                  + trust_files + "Match originalhost " + alias + "," + source_trust
                   + " exec \"printf x >> " + str(marker) + "\"\nMatch all\n")
         config.write_bytes(prefix.encode() + original)
 
@@ -374,20 +375,32 @@ def requester_config_cases(expected):
                 "--", "printf '%s ' \"$(id -un)\"; hostname"])
 
         def invoke(*, approve=None, success=True):
-            process = subprocess.Popen(["ssh", "source", command()], stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, start_new_session=True)
-            try:
-                if approve:
-                    pending(target=approve)
-                out, err = process.communicate(timeout=30)
-                assert (process.returncode == 0) == success, (out, err, process.returncode)
-                if not success:
-                    assert process.returncode == 255, (out, err, process.returncode)
-                return out
-            finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=5)
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                process = subprocess.Popen(["ssh", "source", command()], stdout=stdout,
+                                           stderr=stderr, start_new_session=True)
+                try:
+                    if approve:
+                        pending(target=approve)
+                    status = process.wait(timeout=30)
+                    stdout.seek(0); stderr.seek(0)
+                    out, err = stdout.read(), stderr.read()
+                    assert (status == 0) == success, (out, err, status)
+                    if not success:
+                        assert status == 255, (out, err, status)
+                    return out
+                except BaseException:
+                    stdout.seek(0); stderr.seek(0)
+                    print("Requester config command status:", process.poll(),
+                          "stdout:", stdout.read(), "stderr:", stderr.read(), flush=True)
+                    raise
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=3)
 
         def completion():
             words = ["syq", "cp", "--pscope", scope, "--auth-from", "@laptop",

@@ -296,7 +296,8 @@ def main():
                 trust_config = ("Host " + trust + "\n  HostName " + address + "\n  Port " + str(port)
                                 + "\n  UserKnownHostsFile " + str(trust_file) + "\n  GlobalKnownHostsFile /dev/null\n"
                                 + "Host " + via_jump + " " + via_command
-                                + "\n  HostName destination\n  HostKeyAlias destination\n")
+                                + "\n  HostName destination\n  HostKeyAlias destination\n"
+                                + "  UserKnownHostsFile /home/syq/.ssh/known_hosts\n  GlobalKnownHostsFile /dev/null\n")
                 config.write_bytes(trust_config.encode() + config.read_bytes())
                 source("python3", "-c", "from pathlib import Path; import sys; p=Path.home()/'.ssh/config'; "
                        "p.write_text(sys.stdin.read()+p.read_text())", data=jump_config)

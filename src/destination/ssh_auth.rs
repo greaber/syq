@@ -530,8 +530,13 @@ pub(crate) fn authorize_expected(
         .create_new(true)
         .mode(0o600)
         .open(&known_hosts)?;
-    file.write_all(approved.known_hosts.as_bytes())?;
-    let options = ssh_options(broker.socket_path(), &known_hosts, &algorithms)?;
+    file.write_all(session_known_hosts(&approved, local)?.as_bytes())?;
+    let options = ssh_options(
+        broker.socket_path(),
+        &known_hosts,
+        &algorithms,
+        local.host_key_alias.as_deref(),
+    )?;
     Ok(Session {
         stream,
         _broker: broker,
@@ -541,7 +546,41 @@ pub(crate) fn authorize_expected(
     })
 }
 
-fn ssh_options(agent: &Path, known_hosts: &Path, algorithms: &str) -> Result<Vec<OsString>> {
+/// Serialized policies use a canonical label for equality. The native client
+/// must use its own lookup name so HostKeyAlias and %k keep their SSH meaning.
+fn session_known_hosts(
+    approved: &ResolvedPolicy,
+    local: &ssh::local_config::LocalPlan,
+) -> Result<String> {
+    local.validate()?;
+    anyhow::ensure!(
+        approved.endpoint == local.endpoint,
+        "SSH session host-key policy changed its endpoint"
+    );
+    let label = local.host_key_alias.clone().unwrap_or_else(|| {
+        if local.endpoint.port == Some(22) {
+            local.endpoint.host.clone()
+        } else {
+            format!("[{}]:{}", local.endpoint.host, local.endpoint.port.unwrap())
+        }
+    });
+    let mut hosts = String::new();
+    for line in approved.known_hosts.lines() {
+        let (_, key) = line.split_once(' ').context("invalid approved host key")?;
+        hosts.push_str(&label);
+        hosts.push(' ');
+        hosts.push_str(key);
+        hosts.push('\n');
+    }
+    Ok(hosts)
+}
+
+fn ssh_options(
+    agent: &Path,
+    known_hosts: &Path,
+    algorithms: &str,
+    host_key_alias: Option<&str>,
+) -> Result<Vec<OsString>> {
     let agent = agent.to_str().context("agent socket path is not UTF-8")?;
     let known_hosts = known_hosts
         .to_str()
@@ -586,12 +625,15 @@ fn ssh_options(agent: &Path, known_hosts: &Path, algorithms: &str) -> Result<Vec
         "CheckHostIP=no".into(),
         "ServerAliveInterval=15".into(),
         "ServerAliveCountMax=3".into(),
-        format!("HostKeyAlias={HOST_ALIAS}"),
         format!("IdentityAgent={agent}"),
         format!("UserKnownHostsFile={known_hosts}"),
         format!("HostKeyAlgorithms={algorithms}"),
     ] {
         options.extend(["-o".into(), option.into()]);
+    }
+    if let Some(alias) = host_key_alias {
+        ssh::validate_host_key_alias(alias)?;
+        options.extend(["-o".into(), format!("HostKeyAlias={alias}").into()]);
     }
     Ok(options)
 }
@@ -1356,11 +1398,116 @@ mod tests {
     }
 
     #[test]
+    fn session_pins_preserve_native_host_key_alias_tokens() {
+        for alias in [Some("stable-alias"), None] {
+            let root = crate::test_support::tempdir().unwrap();
+            let host_alias = "request-alias";
+            let token = alias.unwrap_or(host_alias);
+            let marker = root.path().join("proxy-token");
+            let identity = root.path().join(format!("{token}.pub"));
+            let config = root.path().join("config");
+            let approved = policy(41);
+            let key = approved
+                .known_hosts
+                .lines()
+                .next()
+                .unwrap()
+                .split_once(' ')
+                .unwrap()
+                .1;
+            std::fs::write(&identity, format!("{key}\n")).unwrap();
+            let mut contents = format!("Host {host_alias}\n HostName destination\n User account\n Port 2200\n IdentityFile {}/%k.pub\n IdentitiesOnly yes\n ProxyCommand sh -c 'printf %%s \"$1\" > \"$2\"' sh '%k' {}\n",
+                root.path().display(), shell_words::quote(marker.to_str().unwrap()));
+            if let Some(alias) = alias {
+                contents.push_str(&format!(" HostKeyAlias {alias}\n"));
+            }
+            std::fs::write(&config, contents).unwrap();
+            let endpoint = NativeEndpoint {
+                user: Some("account".into()),
+                host: "destination".into(),
+                port: Some(2200),
+            };
+            let local = ssh::local_config::LocalPlan {
+                requested: NativeEndpoint {
+                    user: None,
+                    host: host_alias.into(),
+                    port: None,
+                },
+                endpoint: endpoint.clone(),
+                host_key_alias: alias.map(str::to_owned),
+                config_digest: "a".repeat(64),
+                route: ssh::local_config::Route::Direct,
+                host_key_algorithms: "ssh-ed25519".into(),
+                hop: None,
+            };
+            let approved =
+                ResolvedPolicy::new(endpoint, &approved.known_hosts, &approved.host_algorithms)
+                    .unwrap();
+            let canonical = approved.known_hosts.clone();
+            let hosts = root.path().join("known_hosts");
+            std::fs::write(&hosts, session_known_hosts(&approved, &local).unwrap()).unwrap();
+            assert_eq!(approved.known_hosts, canonical); // session spelling never mutates serialized authority
+            let lookup = alias.unwrap_or("[destination]:2200");
+            let mut keygen = std::process::Command::new("ssh-keygen");
+            keygen.args(["-F", lookup, "-f"]).arg(&hosts);
+            let found = crate::process::capture_output_bounded(
+                &mut keygen,
+                Instant::now() + Duration::from_secs(5),
+                &|| false,
+                64 * 1024,
+            )
+            .unwrap();
+            assert!(
+                found.status.success(),
+                "{}",
+                String::from_utf8_lossy(&found.stderr)
+            );
+            let mut command = std::process::Command::new("ssh");
+            command
+                .args(["-vvv", "-F"])
+                .arg(&config)
+                .args(
+                    ssh_options(&root.path().join("agent"), &hosts, "ssh-ed25519", alias).unwrap(),
+                )
+                .args(["--", host_alias]);
+            // The local proxy exits without a transport. No network or agent
+            // is needed to observe OpenSSH's actual token/identity expansion.
+            let output = crate::process::capture_output_bounded(
+                &mut command,
+                Instant::now() + Duration::from_secs(5),
+                &|| false,
+                64 * 1024,
+            )
+            .unwrap();
+            assert!(!output.status.success());
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                token,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            let prefix = format!("debug1: identity file {} type ", identity.display());
+            let identity_type = diagnostics
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap_or_else(|| {
+                    panic!("native SSH did not select the configured identity: {diagnostics}")
+                });
+            assert_ne!(
+                identity_type, "-1",
+                "native SSH did not load the public identity: {diagnostics}"
+            );
+        }
+    }
+
+    #[test]
     fn native_ssh_uses_only_the_approved_agent_and_host_policy() {
         let options = ssh_options(
             Path::new("/tmp/private/agent"),
             Path::new("/tmp/private/hosts"),
             "ssh-ed25519",
+            None,
         )
         .unwrap();
         for required in [
@@ -1384,6 +1531,7 @@ mod tests {
             "PKCS11Provider=none",
             "ProxyJump=none",
             "ProxyCommand=none",
+            "HostKeyAlias=syq-approved-peer",
         ] {
             assert!(
                 !options.iter().any(|value| value == forbidden),
@@ -1391,7 +1539,13 @@ mod tests {
             );
         }
         for path in ["/tmp/a b/agent", "/tmp/%h/agent", "/tmp/${HOME}/agent"] {
-            assert!(ssh_options(Path::new(path), Path::new("/tmp/hosts"), "ssh-ed25519").is_err());
+            assert!(ssh_options(
+                Path::new(path),
+                Path::new("/tmp/hosts"),
+                "ssh-ed25519",
+                None
+            )
+            .is_err());
         }
     }
 }

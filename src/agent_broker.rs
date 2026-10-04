@@ -362,6 +362,9 @@ fn inspect_ssh_configuration_at(
 
 #[derive(Clone, Copy, Debug, Default)]
 struct KnownHostsConfigured {
+    // An uncertain directive may have produced a single filename which
+    // flattens to the compiled-default list. Simple literal absolute paths
+    // cannot do that, even in an unrelated Host/Match block.
     user: bool,
     global: bool,
 }
@@ -417,13 +420,15 @@ fn configured_known_hosts_directives(paths: &[PathBuf]) -> Result<KnownHostsConf
                 path.display()
             );
         }
-        configured.user |= contains_ssh_config_directive(&contents, b"userknownhostsfile");
-        configured.global |= contains_ssh_config_directive(&contents, b"globalknownhostsfile");
+        configured.user |=
+            contains_ambiguous_known_hosts_directive(&contents, b"userknownhostsfile");
+        configured.global |=
+            contains_ambiguous_known_hosts_directive(&contents, b"globalknownhostsfile");
     }
     Ok(configured)
 }
 
-fn contains_ssh_config_directive(contents: &[u8], keyword: &[u8]) -> bool {
+fn contains_ambiguous_known_hosts_directive(contents: &[u8], keyword: &[u8]) -> bool {
     contents.split(|byte| *byte == b'\n').any(|line| {
         let line = line.trim_ascii_start();
         if line.is_empty() || line[0] == b'#' {
@@ -433,7 +438,32 @@ fn contains_ssh_config_directive(contents: &[u8], keyword: &[u8]) -> bool {
             .iter()
             .position(|byte| byte.is_ascii_whitespace() || *byte == b'=')
             .unwrap_or(line.len());
-        line[..end].eq_ignore_ascii_case(keyword)
+        if !line[..end].eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        let arguments = line[end..].trim_ascii_start();
+        let arguments = arguments
+            .strip_prefix(b"=")
+            .unwrap_or(arguments)
+            .trim_ascii_start();
+        // Do not reproduce SSH quoting, expansion or conditional matching.
+        // Conservatively retain ambiguity for every spelling other than a
+        // literal absolute filename list or `none`. In that small subset,
+        // spaces can only separate filenames, never belong to one filename.
+        let mut words = arguments
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|word| !word.is_empty())
+            .peekable();
+        if words.peek().is_none() {
+            return true;
+        }
+        words.any(|word| {
+            word != b"none"
+                && (!word.starts_with(b"/")
+                    || !word
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(byte)))
+        })
     })
 }
 
@@ -1103,7 +1133,12 @@ impl BindState {
         Ok(())
     }
 
-    fn authorize(&self, policy: &BrokerPolicy, request: &SignRequest) -> Result<()> {
+    fn authorize(
+        &self,
+        policy: &BrokerPolicy,
+        request: &SignRequest,
+        ambient_certificate: bool,
+    ) -> Result<()> {
         let peer = match (policy.coordinator.as_ref(), self.bindings.as_slice()) {
             (Some(_), [_, peer]) | (None, [peer]) => peer,
             _ => bail!("signature requested before the exact authorized path was bound"),
@@ -1127,7 +1162,15 @@ impl BindState {
             .encode(&mut credential)
             .context("encode requested credential")?;
         if parsed.credential != credential {
-            bail!("embedded userauth credential did not match sign request");
+            anyhow::ensure!(
+                ambient_certificate
+                    && matches!(request.credential, PublicCredential::Key(_))
+                    && certificate_matches_signing_key(
+                        parsed.credential,
+                        request.credential.key_data()
+                    )?,
+                "embedded userauth credential did not match sign request"
+            );
         }
         let mut host_key = Vec::new();
         peer.host_key
@@ -1139,6 +1182,21 @@ impl BindState {
         validate_signature_algorithm(parsed.algorithm, parsed.credential, request.flags)?;
         Ok(())
     }
+}
+
+/// Native OpenSSH can ask a plain agent key to sign authentication with a
+/// requester-side CertificateFile. Only ambient keys allow that association:
+/// an enrollment key must never acquire a certificate's independent authority.
+fn certificate_matches_signing_key(encoded: &[u8], signing_key: &KeyData) -> Result<bool> {
+    // Bound every nested length before ssh-agent-lib's allocating decoder.
+    validate_public_credential_wire(encoded)?;
+    let mut input = encoded;
+    let credential = PublicCredential::decode(&mut input)?;
+    anyhow::ensure!(input.is_empty(), "trailing embedded credential data");
+    Ok(matches!(&credential, PublicCredential::Cert(certificate)
+        if certificate.cert_type() == ssh_agent_lib::ssh_key::certificate::CertType::User)
+        && credential.key_data() == signing_key
+        && credential_is_cryptographically_verifiable(&credential))
 }
 
 fn serve_client(
@@ -1180,7 +1238,13 @@ fn serve_client(
                 };
                 if !identities.iter().any(|identity| {
                     credentials_equal_on_wire(&identity.credential, &request.credential)
-                }) || state.authorize(policy, &request).is_err()
+                }) || state
+                    .authorize(
+                        policy,
+                        &request,
+                        matches!(backend, SigningBackend::Ambient(_)),
+                    )
+                    .is_err()
                 {
                     write_frame(&mut downstream, SSH_AGENT_FAILURE)?;
                     break;

@@ -288,6 +288,49 @@ fn openssh_quoted_default_collision_is_rejected_end_to_end() {
 }
 
 #[test]
+fn unrelated_literal_known_hosts_options_preserve_real_default_lists() {
+    let defaults_output = inspect_ssh_configuration("ssh", None, "unused.example", true).unwrap();
+    let defaults = KnownHostsDefaults::from_openssh(&defaults_output.output).unwrap();
+    let temp = crate::test_support::tempdir().unwrap();
+    let config = temp.path().join("ssh_config");
+    std::fs::write(&config, b"Host unrelated.example\n  UserKnownHostsFile /tmp/private-known-hosts\n  GlobalKnownHostsFile=/dev/null\n").unwrap();
+    let output = Command::new("ssh")
+        .args(["-G", "-vvv", "-F"])
+        .arg(&config)
+        .args(["--", "unused.example"])
+        .env("LC_ALL", "C")
+        .capture_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let paths = ssh_configuration_paths(&output.stderr).unwrap();
+    let configured = configured_known_hosts_directives(&paths).unwrap();
+    assert!(!configured.user && !configured.global);
+    let parsed =
+        parse_ssh_config_with_defaults(&output.stdout, Some(&defaults), &configured).unwrap();
+    let mut expected = defaults.user.files;
+    expected.extend(defaults.global.files);
+    expected.sort();
+    expected.dedup();
+    assert_eq!(parsed.files, expected);
+    for uncertain in [
+        b"UserKnownHostsFile \"/tmp/a /tmp/b\"".as_slice(),
+        b"UserKnownHostsFile /tmp/a\\ /tmp/b",
+        b"UserKnownHostsFile ~/.ssh/known_hosts",
+        b"UserKnownHostsFile ${HOME}/.ssh/known_hosts",
+        b"UserKnownHostsFile /tmp/%h",
+    ] {
+        assert!(contains_ambiguous_known_hosts_directive(
+            uncertain,
+            b"userknownhostsfile"
+        ));
+    }
+}
+
+#[test]
 fn pre_required_rsa_size_config_uses_historical_default() {
     let config = parse_ssh_config(
             b"user backup\nhostname vault.internal\nport 22\nuserknownhostsfile /tmp/known\nhostkeyalgorithms ssh-ed25519\n",
@@ -815,7 +858,7 @@ fn authorization_is_exact_for_user_session_host_and_method() {
         identity.clone(),
         &destination,
     );
-    state.authorize(&policy, &allowed).unwrap();
+    state.authorize(&policy, &allowed, false).unwrap();
     for denied in [
         sign_request(
             b"other-session",
@@ -846,7 +889,7 @@ fn authorization_is_exact_for_user_session_host_and_method() {
             &other_host,
         ),
     ] {
-        assert!(state.authorize(&policy, &denied).is_err());
+        assert!(state.authorize(&policy, &denied, false).is_err());
     }
 }
 
@@ -863,7 +906,9 @@ fn direct_authorization_requires_the_exact_peer_and_login_without_forwarding() {
         identity.clone(),
         &peer,
     );
-    assert!(BindState::default().authorize(&policy, &allowed).is_err());
+    assert!(BindState::default()
+        .authorize(&policy, &allowed, false)
+        .is_err());
     for denied in [
         binding(&peer_private, peer.clone(), b"direct-session", true),
         binding(&other_private, other.clone(), b"direct-session", false),
@@ -878,7 +923,7 @@ fn direct_authorization_requires_the_exact_peer_and_login_without_forwarding() {
             binding(&peer_private, peer.clone(), b"direct-session", false),
         )
         .unwrap();
-    state.authorize(&policy, &allowed).unwrap();
+    state.authorize(&policy, &allowed, false).unwrap();
     for denied in [
         sign_request(
             b"other-session",
@@ -909,7 +954,7 @@ fn direct_authorization_requires_the_exact_peer_and_login_without_forwarding() {
             &other,
         ),
     ] {
-        assert!(state.authorize(&policy, &denied).is_err());
+        assert!(state.authorize(&policy, &denied, false).is_err());
     }
     assert!(state
         .add(
@@ -917,6 +962,193 @@ fn direct_authorization_requires_the_exact_peer_and_login_without_forwarding() {
             binding(&peer_private, peer, b"extra-session", false)
         )
         .is_err());
+}
+
+fn user_certificate(key: KeyData) -> PublicCredential {
+    let (ca, _) = self::key(199);
+    let mut builder =
+        ssh_agent_lib::ssh_key::certificate::Builder::new(vec![0; 16], key, 0, u32::MAX.into())
+            .unwrap();
+    builder.valid_principal("backup").unwrap();
+    PublicCredential::Cert(Box::new(builder.sign(&PrivateKey::from(ca)).unwrap()))
+}
+
+#[test]
+fn ambient_certificate_keeps_exact_account_host_and_key_binding() {
+    let (peer_private, peer) = key(101);
+    let (_, identity) = key(103);
+    let (_, other) = key(104);
+    let policy = BrokerPolicy::direct(host_policy("backup", "destination", peer.clone()));
+    let mut state = BindState::default();
+    state
+        .add(
+            &policy,
+            binding(&peer_private, peer.clone(), b"certificate-session", false),
+        )
+        .unwrap();
+    let certificate = user_certificate(identity.clone());
+    let request = SignRequest {
+        credential: identity.clone().into(),
+        data: hostbound_data(
+            b"certificate-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            &certificate,
+            &peer,
+        ),
+        flags: 0,
+    };
+    state.authorize(&policy, &request, true).unwrap();
+    assert!(state.authorize(&policy, &request, false).is_err());
+    for (user, cert, host) in [
+        (b"root".as_slice(), certificate.clone(), peer.clone()),
+        (b"backup", user_certificate(other.clone()), peer.clone()),
+        (b"backup", certificate.clone(), other),
+    ] {
+        let mut changed = request.clone();
+        changed.data = hostbound_data(
+            b"certificate-session",
+            user,
+            b"publickey-hostbound-v00@openssh.com",
+            &cert,
+            &host,
+        );
+        assert!(state.authorize(&policy, &changed, true).is_err());
+    }
+    let mut encoded = Vec::new();
+    certificate.encode(&mut encoded).unwrap();
+    let last = encoded.len() - 1;
+    encoded[last] ^= 1;
+    assert!(!certificate_matches_signing_key(&encoded, &identity).unwrap());
+    encoded[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(certificate_matches_signing_key(&encoded, &identity).is_err());
+    let (ca, _) = key(199);
+    let mut builder = ssh_agent_lib::ssh_key::certificate::Builder::new(
+        vec![0; 16],
+        identity.clone(),
+        0,
+        u32::MAX.into(),
+    )
+    .unwrap();
+    builder.valid_principal("backup").unwrap();
+    builder
+        .cert_type(ssh_agent_lib::ssh_key::certificate::CertType::Host)
+        .unwrap();
+    let mut host_cert = Vec::new();
+    PublicCredential::Cert(Box::new(builder.sign(&PrivateKey::from(ca)).unwrap()))
+        .encode(&mut host_cert)
+        .unwrap();
+    assert!(!certificate_matches_signing_key(&host_cert, &identity).unwrap());
+}
+
+#[test]
+fn certificate_signature_reaches_real_ambient_agent_but_never_private_enrollment_key() {
+    use std::process::Stdio;
+    let temp = crate::test_support::tempdir().unwrap();
+    let ambient_socket = temp.path().join("a");
+    let mut command = Command::new("ssh-agent");
+    command
+        .args(["-D", "-a"])
+        .arg(&ambient_socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut agent = crate::process::group::ProcessGroup::spawn(&mut command).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut progress = Instant::now();
+    while !ambient_socket.exists() {
+        assert!(
+            agent.poll().unwrap().is_none(),
+            "test ssh-agent exited before readiness"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "test ssh-agent did not create its socket"
+        );
+        if progress.elapsed() >= Duration::from_secs(1) {
+            eprintln!("waiting for certificate test ssh-agent socket");
+            progress = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (private, public) = key(195);
+    let private = PrivateKey::from(private);
+    let key_path = temp.path().join("identity");
+    private
+        .write_openssh_file(&key_path, ssh_agent_lib::ssh_key::LineEnding::LF)
+        .unwrap();
+    let added = Command::new("ssh-add")
+        .env("SSH_AUTH_SOCK", &ambient_socket)
+        .arg(&key_path)
+        .capture_output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let (peer_private, peer) = key(196);
+    let policy = BrokerPolicy::direct(host_policy("backup", "destination", peer.clone()));
+    let certificate = user_certificate(public.clone());
+    let request = SignRequest {
+        credential: public.clone().into(),
+        data: hostbound_data(
+            b"real-agent-session",
+            b"backup",
+            b"publickey-hostbound-v00@openssh.com",
+            &certificate,
+            &peer,
+        ),
+        flags: 0,
+    };
+    for ambient in [true, false] {
+        let broker = if ambient {
+            ConstrainedAgentBroker::start_with_ambient_socket(
+                ambient_socket.clone(),
+                policy.clone(),
+                TEST_BROKER_CONNECTIONS,
+            )
+            .unwrap()
+        } else {
+            ConstrainedAgentBroker::start_with_private_key_and_socket(
+                ambient_socket.clone(),
+                policy.clone(),
+                TEST_BROKER_CONNECTIONS,
+                private.clone(),
+            )
+            .unwrap()
+        };
+        let mut client = UnixStream::connect(broker.socket_path()).unwrap();
+        write_frame(
+            &mut client,
+            &bind_request(binding(
+                &peer_private,
+                peer.clone(),
+                b"real-agent-session",
+                false,
+            )),
+        )
+        .unwrap();
+        assert!(matches!(read_response(&mut client), Response::Success));
+        write_frame(&mut client, &[11]).unwrap();
+        let Response::IdentitiesAnswer(identities) = read_response(&mut client) else {
+            panic!("missing agent identity");
+        };
+        assert_eq!(identities.len(), 1);
+        write_frame(
+            &mut client,
+            &encode_request(Request::SignRequest(request.clone())),
+        )
+        .unwrap();
+        match read_response(&mut client) {
+            Response::SignResponse(signature) if ambient => {
+                public.verify(&request.data, &signature).unwrap()
+            }
+            Response::Failure if !ambient => assert_closed(&mut client),
+            response => panic!("unexpected certificate signing response: {response:?}"),
+        }
+    }
+    agent.close().unwrap();
 }
 
 #[test]
