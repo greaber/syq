@@ -180,6 +180,29 @@ fn check_patch_layout(patch: &SmallPatch) -> Result<()> {
     Ok(())
 }
 
+/// Whether `file` is exactly as long as a patch's file and every block
+/// still hashes as the patch reuses it.
+fn holds_reused_blocks(
+    file: &File,
+    algorithm: crate::hashing::HashAlgorithm,
+    patch: &SmallPatch,
+) -> Result<bool> {
+    if file.metadata()?.len() != patch.len {
+        return Ok(false);
+    }
+    let mut buffer = Vec::new();
+    for (index, reuse) in patch.reuse.iter().enumerate() {
+        let off = index as u64 * patch.block;
+        let len = patch.block.min(patch.len - off) as usize;
+        if !read_block(file, off, len, &mut buffer)?
+            || Some(algorithm.hash(&buffer[..len])) != *reuse
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Read `len` bytes at `off` into the start of `buffer`. Returns false when
 /// the file ends first.
 fn read_block(file: &File, off: u64, len: usize, buffer: &mut Vec<u8>) -> Result<bool> {
@@ -374,7 +397,10 @@ impl FsOps {
     }
 
     /// Keep the existing file a patch would reproduce whole: every block is
-    /// reused, and nothing has changed the file since it was hashed.
+    /// reused, and the file still holds them. Its fingerprint shows that
+    /// nothing has changed it since it was hashed; when it has changed, as
+    /// keeping another name of the same file changes it, the file is hashed
+    /// again.
     fn keep_patched(&mut self, patch: &SmallPatch) -> Result<Option<Option<(u64, u64)>>> {
         let Some(basis) = patch.basis else {
             return Ok(None);
@@ -390,7 +416,9 @@ impl FsOps {
         else {
             return Ok(None);
         };
-        if fingerprint(&file.metadata()?) != basis {
+        if fingerprint(&file.metadata()?) != basis
+            && !holds_reused_blocks(&file, self.hash_policy.algorithm, patch)?
+        {
             return Ok(None);
         }
         self.keep_open_small(
@@ -1079,6 +1107,75 @@ mod tests {
             assert_eq!(fs::read(directory.join("file")).unwrap(), new);
             assert_eq!(entries(directory), 1);
         }
+    }
+
+    #[test]
+    fn a_whole_match_whose_file_changed_after_it_was_hashed_is_hashed_again() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old: Vec<u8> = (0..3 * block).map(|i| (i % 241) as u8).collect();
+        for name in ["touched", "edited"] {
+            fs::write(directory.join(name), &old).unwrap();
+        }
+        let mut ops = receiver(directory);
+        let read = |name: &str| ExistingRead {
+            path: name.as_bytes().to_vec(),
+            len: old.len() as u64,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let hashed = ops.hash_existing_batch(block, &[read("touched"), read("edited")]);
+        let patch = |name: &str, hashed: &ExistingHashes| SmallPatch {
+            path: name.as_bytes().to_vec(),
+            copy_id: [7; 16],
+            len: old.len() as u64,
+            block,
+            reuse: hashed.hashes.iter().copied().map(Some).collect(),
+            hash: content_digest(&[]),
+            data: Vec::new(),
+            basis: hashed.fingerprint,
+            meta: put(name, b"").meta,
+            flags: 0,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let patches = [
+            patch("touched", hashed[0].as_ref().unwrap()),
+            patch("edited", hashed[1].as_ref().unwrap()),
+        ];
+        // Only metadata changes for one; a block of the other is rewritten
+        // in place at the same length. Change times are coarser than a
+        // nanosecond, so wait until the changes give new ones.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let inode = |name: &str| fs::metadata(directory.join(name)).unwrap().ino();
+        let before = inode("touched");
+        fs::set_permissions(directory.join("touched"), fs::Permissions::from_mode(0o640)).unwrap();
+        let mut edited = old.clone();
+        edited[block as usize + 3] ^= 1;
+        File::options()
+            .write(true)
+            .open(directory.join("edited"))
+            .unwrap()
+            .write_all_at(&edited[block as usize..][..4], block)
+            .unwrap();
+        for (patch, name) in patches.iter().zip(["touched", "edited"]) {
+            let now = fingerprint(&fs::metadata(directory.join(name)).unwrap());
+            assert_ne!(Some(now), patch.basis, "{name}");
+        }
+        let results = ops.patch_small_batch(&patches).unwrap();
+        assert_eq!(
+            results[0],
+            Ok(SmallPatched {
+                kept: true,
+                identity: None
+            })
+        );
+        assert_eq!(inode("touched"), before);
+        assert!(results[1].is_err(), "{:?}", results[1]);
+        assert_eq!(fs::read(directory.join("edited")).unwrap(), edited);
+        assert_eq!(entries(directory), 2);
     }
 
     #[test]

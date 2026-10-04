@@ -7,8 +7,8 @@
 //!    hashes differ (`ReadDifferingBatch`);
 //! 3. the destination publishes each file from those blocks and the
 //!    matching blocks of the file it replaces, hashing them again as it reads
-//!    them, or keeps a file that matched whole and has not changed since it
-//!    was hashed (`PatchSmallBatch`).
+//!    them, or keeps a file that matched whole and still does
+//!    (`PatchSmallBatch`).
 //!
 //! Groups are pipelined through these stages, so a run of files costs about
 //! one round trip of lead time rather than round trips per file.

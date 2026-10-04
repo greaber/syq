@@ -1075,3 +1075,52 @@ fn hash_or_copy_repairs_hard_links_whose_size_and_time_match() {
     native(&[]);
     assert_linked_pair(&t, b"new contents");
 }
+
+#[test]
+fn hash_keeps_hard_linked_destinations_that_already_match() {
+    for native in [false, true] {
+        let t = Tmp::new();
+        let contents = prng(64 << 10, 990);
+        write(&t.path("src/a"), &contents);
+        write(&t.path("src/b"), &contents);
+        write(&t.path("dst/a"), &contents);
+        fs::hard_link(t.path("dst/a"), t.path("dst/b")).unwrap();
+        let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
+        // Keeping the first name changes the shared inode's metadata before
+        // the second is decided.
+        if native {
+            run_native_ok(&[
+                "cp",
+                "--hash",
+                "--performance-tuning",
+                "workers=1",
+                "--srcs-in",
+                &t.s("src"),
+                "--into-existing",
+                &t.s("dst"),
+            ]);
+        } else {
+            let out = compat_command()
+                .args([
+                    "-ac",
+                    "--no-progress",
+                    "--performance-tuning",
+                    "workers=1",
+                    &t.s("src/"),
+                    &t.s("dst/"),
+                ])
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+        }
+        for name in ["a", "b"] {
+            let path = t.path(&format!("dst/{name}"));
+            assert_eq!(read(&path), contents, "native={native} {name}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().ino(),
+                inode,
+                "native={native} {name}"
+            );
+        }
+    }
+}

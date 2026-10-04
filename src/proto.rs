@@ -437,7 +437,8 @@ pub struct DifferingBlocks {
 /// replaces. Block `i` comes from the existing destination when `reuse[i]`
 /// holds its comparison hash, and otherwise from the next bytes of `data`.
 /// When every block is reused and the existing file still has the `basis`
-/// fingerprint, that file is kept and only its metadata is set.
+/// fingerprint, or hashes as `reuse` again, that file is kept and only its
+/// metadata is set.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallPatch {
     pub path: PathBytes,
