@@ -253,7 +253,9 @@ syq persist receive permissions remove [OPTIONS] <ID>
 
 Omitted settings keep saved values. New profiles ask for approval with desktop
 prompts and use the home directory. Set `--root` to confine copies to a directory.
-Changing settings cancels the profile’s active requests. See
+Only endpoints supplied with `--connection` are connected explicitly; otherwise
+receiving applies to active and future connections. Changing access settings
+cancels the profile’s active requests; changing `--notify` preserves them. See
 [profile settings](../persistence-reference.md#names-and-profiles) and
 [copy limits](../persistence-reference.md#copy-limits).
 
@@ -269,7 +271,7 @@ syq persist receive on [OPTIONS]
 | `--auto-approve-root <AUTO_APPROVE_ROOT>` | Automatically approve downloads confined to this directory |
 | `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 | `--no-auto-approve-root` | Require approval for every download again |
-| `--connection <ENDPOINT>` | Limit this profile to these SSH connections (repeat to allow several) |
+| `--connection <ENDPOINT>` | Connect these SSH endpoints and limit this profile to them (repeat for several) |
 | `--all-connections` | Make this profile available through every connected SSH account |
 | `--notify <NOTIFICATIONS>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |

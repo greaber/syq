@@ -31,9 +31,10 @@ syq persist receive on --connection server
 
 This enables persistence, saves the server as this profile's allowed connection,
 and waits until receiving is ready. Repeat `--connection` to allow and connect
-several endpoints. A later `syq persist receive on` reconnects the saved list.
-With no saved list, it uses tracked connections and future syq connections;
-an ordinary `ssh server` session does not enable receiving.
+several endpoints. Without `--connection`, enabling receiving or changing its
+settings applies to active and future syq connections without dialing saved
+servers. Use `syq persist connect server` when you want to prepare a connection
+before working there; an ordinary `ssh server` session does not enable receiving.
 
 By default, your receiving name is your laptop's short hostname, and downloads
 and commands start in your home directory. The command prints the receiving

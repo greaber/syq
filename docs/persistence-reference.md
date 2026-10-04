@@ -222,12 +222,13 @@ can be saved.
 
 `receive on --name NAME` creates a profile or updates that name's settings;
 omitted options keep their saved values. It enables persistence in the selected
-domain and connects the profile's saved explicit endpoint list, waiting for
-receiving to become ready. If a listed connection fails, the settings stay saved
-and healthy connections keep running, but the command exits unsuccessfully.
-With no list, it applies the profile to tracked and future connections without
-waiting for receiving to become ready; use `receive wait` when readiness matters.
-It does not guess servers to contact.
+domain and applies the profile to active and future connections. Only endpoints
+supplied with `--connection` in this invocation are connected explicitly; the
+command waits for receiving to become ready on those endpoints. If one fails,
+the settings stay saved and healthy connections keep running, but the command
+exits unsuccessfully. Without `--connection`, saved endpoints remain the
+profile's allowed connections and are not dialed. Use `persist connect HOST`
+to start one, or `receive wait HOST` to wait for readiness without starting it.
 Without `--name`, `receive on` updates the first saved profile, shown first by
 `receive status`. The initial hostname profile becomes a saved profile when
 persistence first connects; adding a new name then keeps that original profile.
@@ -243,8 +244,10 @@ syq persist receive remove project
 syq persist receive wait server --name laptop --timeout 30
 ```
 
-Updating, stopping, or removing a profile cancels only that profile's copies,
-commands, and pending approvals. Other profiles keep working. `receive off`
+Changing a profile's access settings, stopping it, or removing it cancels only
+that profile's copies, commands, and pending approvals. Changing `--notify` or
+repeating `receive on` with unchanged settings preserves them. Other profiles
+keep working. `receive off`
 without a name stops all profiles; `receive on` enables the first profile, and
 `receive on --name NAME` enables another. Removing the first profile makes the
 next saved profile the default. The last profile can be disabled but cannot be
@@ -278,8 +281,9 @@ The server cannot select its own identity for this check. Changing your local
 SSH configuration can change which account an allowed alias reaches.
 
 Repeat `--connection` to supply several endpoints. Each supplied list replaces
-the saved list, and `receive on` connects every listed endpoint.
-`--all-connections` clears the restriction and starts receiving on tracked
+the saved list and connects the supplied endpoints. Omitting `--connection`
+keeps the restriction without connecting dormant endpoints.
+`--all-connections` clears the restriction and starts receiving on active
 connections; it does not discover additional servers. Changes apply to existing
 persistent connections too. `receive wait HOST` waits only for profiles allowed
 on HOST in the selected domain.
@@ -458,9 +462,10 @@ syq on both machines and reconnect from your laptop.
 Before upgrading, run `syq persist off` on the receiving machine to stop its
 background services. Replacing the executable alone does not update running
 services. Close script scopes with `syq persist off --pscope PATH` too.
-After upgrading both machines, run `syq persist receive on` to reconnect a
-profile's saved explicit endpoints, or `syq persist connect server` for each
-server you choose.
+After upgrading both machines, run `syq persist connect server` for each server
+you want to use. If receiving was disabled, enable it first with
+`syq persist receive on`, or enable and connect together with
+`syq persist receive on --connection server`.
 
 Use the current binary to close explicit domains. An older binary may stop their
 services but refuse to remove newer settings; rerun scoped `off` with the current
