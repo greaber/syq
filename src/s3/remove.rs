@@ -472,7 +472,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
             if args.dry_run {
                 for entry in &entries {
                     check()?;
-                    finished(&args, &progress, &mut summary, entry, Ok(0));
+                    finished(&args, &progress, &mut summary, entry, Ok(1));
                 }
             } else {
                 // Planning is read-only and can be dropped on cancellation.
