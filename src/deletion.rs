@@ -152,7 +152,7 @@ impl DirectoryBatch {
         _root: &Arc<Root>,
         _path: &RelativePath,
         _len: u64,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         {
             const BYTES: u64 = 128 * 1024;
