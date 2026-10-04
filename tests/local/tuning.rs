@@ -2652,7 +2652,7 @@ fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
             stderr_of(&output)
         );
         let history = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
-        let initial: usize = history.query_row(
+        let initial: i64 = history.query_row(
             "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='starting_count'",
             [], |row| row.get(0),
         ).unwrap();
