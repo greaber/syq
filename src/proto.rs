@@ -33,6 +33,8 @@ pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
 pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
+/// One file's fingerprint and framing in an `ExistingHashes` response.
+const EXISTING_HASHES_OVERHEAD: u64 = 64;
 const COMPRESS_MIN: usize = 512;
 const WIRE_PREAMBLE_MAGIC: &[u8; 8] = b"SYQWIRE\0";
 const WIRE_PREAMBLE_FIXED_LEN: usize = WIRE_PREAMBLE_MAGIC.len() + 2;
@@ -64,6 +66,23 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
     entries
         .checked_mul(HASH_RESPONSE_BYTES_PER_ENTRY)
         .and_then(|bytes| bytes.checked_add(HASH_RESPONSE_OVERHEAD))
+        .is_some_and(|bytes| bytes < MAX_FRAME as u64)
+}
+
+/// Whether hashing existing files of these lengths in `block` byte blocks
+/// fits one `ExistingHashes` response, as `hash_response_fits` does for the
+/// hashes of one file.
+pub(crate) fn existing_hashes_fit(block: u64, lens: impl IntoIterator<Item = u64>) -> bool {
+    if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
+        return false;
+    }
+    lens.into_iter()
+        .try_fold(HASH_RESPONSE_OVERHEAD, |bytes, len| {
+            len.div_ceil(block)
+                .checked_mul(HASH_RESPONSE_BYTES_PER_ENTRY + 1)
+                .and_then(|hashes| hashes.checked_add(EXISTING_HASHES_OVERHEAD))
+                .and_then(|file| bytes.checked_add(file))
+        })
         .is_some_and(|bytes| bytes < MAX_FRAME as u64)
 }
 

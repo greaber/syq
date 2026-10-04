@@ -302,7 +302,7 @@ impl Worker {
             || (!job.compared
                 && (self.compares_first(job, existing)
                     || (self.reuses_blocks_for(job, Some(existing))
-                        && job.entry.size > super::small_compare::PATCH_MAX_FILE)));
+                        && job.entry.size > self.compare_group_limits().0)));
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
             && !inspects_destination
@@ -311,7 +311,9 @@ impl Worker {
     fn inspects_destination(&self, job: &FileJobData) -> bool {
         job.resume_partial
             || self.opts.protects_existing_contents()
-            || self.opts.restricted_receiver
+            // A restricted receiver's in-place grant refuses batched
+            // publication.
+            || (self.opts.restricted_receiver && self.opts.inplace)
             || (self.opts.hardlinks && job.entry.nlink > 1)
     }
 
@@ -332,8 +334,8 @@ impl Worker {
                 || (self.opts.checksum && same_size))
     }
 
-    /// A replaced file of up to `PATCH_MAX_FILE` bytes is compared before any
-    /// contents are sent, in pipelined groups (see `small_compare`): the
+    /// A replaced file small enough to compare in groups is compared before
+    /// any contents are sent, in pipelined groups (see `small_compare`): the
     /// destination keeps a file that already matches and is sent only the
     /// blocks it lacks. Under a bandwidth limit this costs only hashes for
     /// unchanged files, and elsewhere it saves sending and rewriting them.
@@ -350,7 +352,7 @@ impl Worker {
             && j.attempt == 0
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
-            && j.entry.size <= super::small_compare::PATCH_MAX_FILE
+            && j.entry.size <= self.compare_group_limits().0
             // In place, only the blocks that differ are written; that is the
             // per-file path.
             && !self.opts.inplace

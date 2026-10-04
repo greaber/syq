@@ -1055,6 +1055,11 @@ impl RestrictedAuthority {
                 proto::Response::Applied(results) => results
                     .get(index)
                     .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
+                proto::Response::PatchedBatch(results) => match results.get(index) {
+                    Some(Ok(_)) => None,
+                    Some(Err(error)) => Some(error.as_str()),
+                    None => Some("receiver returned no outcome for this file"),
+                },
                 _ => None,
             }
         };
@@ -1091,6 +1096,46 @@ impl RestrictedAuthority {
                             outcome_error(0).or(Some("receiver returned no file hash")),
                         );
                     }
+                }
+                PendingOutcome::Patch {
+                    index,
+                    path,
+                    copy_id,
+                    size,
+                    kept_flags,
+                    hold,
+                } => {
+                    let kept = matches!(
+                        response,
+                        proto::Response::PatchedBatch(results)
+                            if matches!(results.get(index), Some(Ok(patched)) if patched.kept)
+                    );
+                    // A kept file occupies nothing new. A publication, or a
+                    // failed attempt, keeps the size it declared, as staging
+                    // keeps its declaration.
+                    if let Some(hold) = hold {
+                        let key = (path.clone(), copy_id);
+                        Self::settle_observation_reservation(&mut state, &key, hold, !kept);
+                    }
+                    let error = outcome_error(index);
+                    self.append_operation(
+                        &mut state,
+                        &path,
+                        if kept {
+                            crate::receipt::OperationAction::SetMetadata { flags: kept_flags }
+                        } else {
+                            crate::receipt::OperationAction::PublishFile {
+                                size,
+                                inplace: false,
+                            }
+                        },
+                        if error.is_some() {
+                            crate::receipt::OperationDisposition::Failed
+                        } else {
+                            crate::receipt::OperationDisposition::Succeeded
+                        },
+                        error,
+                    );
                 }
                 PendingOutcome::Logical {
                     index,
@@ -1775,6 +1820,22 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// A grouped comparison may use any block the protocol allows. The
+    /// grant's block applies to the per-file comparison; `HashWindow` already
+    /// returns hashes in blocks of any size, so these reveal nothing more.
+    pub(super) fn check_comparison_request(&self, block: u64, len: u64) -> Result<()> {
+        if !(proto::MIN_HASH_BLOCK_BYTES..=proto::MAX_HASH_BLOCK_BYTES).contains(&block) {
+            bail!("comparison block size is outside protocol limits");
+        }
+        if len > self.copy.limits.max_file_bytes {
+            bail!("signed grant per-file byte limit exceeded");
+        }
+        if !proto::hash_response_fits(block, len) {
+            bail!("hash response would exceed protocol limits");
+        }
+        Ok(())
+    }
+
     pub(super) fn charge_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
         self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
@@ -1822,6 +1883,72 @@ impl RestrictedAuthority {
         state.deletions += 1;
         if state.deletions > self.copy.limits.max_deletions {
             bail!("signed grant deletion limit exceeded");
+        }
+        Ok(())
+    }
+
+    /// A patch either keeps the existing file, as FinishBasis does, or
+    /// publishes a new file from its data and the existing file's blocks, as
+    /// a staged copy that reuses compared blocks does. Only the executor's
+    /// reply says which, so each patch passes the rules of both: its new data
+    /// is charged as written ranges are, the size its publication would
+    /// occupy is held as staging would declare it, and `settle` records the
+    /// outcome the reply reports.
+    pub(super) fn authorize_patches(
+        &self,
+        patches: &mut [proto::SmallPatch],
+        pending: &mut Vec<PendingCreation>,
+        outcomes: &mut Vec<PendingOutcome>,
+        touched: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
+            bail!("small-file publication does not match the signed publication policy");
+        }
+        if let Some(limit) = &self.file_data_limit {
+            let bytes = patches.iter().try_fold(0u64, |total, patch| {
+                total
+                    .checked_add(patch.data.len() as u64)
+                    .context("small-file batch byte count overflow")
+            })?;
+            if bytes > limit.burst_bytes() {
+                bail!("small-file batch exceeds the signed file-data rate-limit burst");
+            }
+        }
+        for (index, patch) in patches.iter_mut().enumerate() {
+            if self.expected_hash(&patch.path)?.is_some() {
+                bail!("expected-hash files require checked finalization");
+            }
+            self.check_comparison_request(patch.block, patch.len)?;
+            // Keeping the file may apply other times than publishing it,
+            // but nothing else.
+            if (patch.flags ^ patch.unchanged_flags) & !proto::flags::TIMES != 0 {
+                bail!("kept and published metadata flags differ beyond times");
+            }
+            self.check_flags(patch.unchanged_flags)?;
+            self.charge_bytes(&patch.path, 0, patch.data.len())?;
+            self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
+            self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
+            self.constrain_receiver_mode(
+                &patch.path,
+                &mut patch.meta,
+                &mut patch.flags,
+                &mut patch.condition,
+                ReceiverModeTarget::RegularFile,
+            )?;
+            // The receiver's choice of mode applies to the kept file too.
+            patch.unchanged_flags = (patch.flags & !proto::flags::TIMES)
+                | (patch.unchanged_flags & proto::flags::TIMES);
+            let hold = self.reserve_bytes(&patch.path, patch.copy_id, patch.len, true)?;
+            outcomes.push(PendingOutcome::Patch {
+                index,
+                path: patch.path.clone(),
+                copy_id: patch.copy_id,
+                size: patch.len,
+                kept_flags: patch.unchanged_flags,
+                hold,
+            });
+            touched.push(patch.path.clone());
+            patch.guard = Some(self.guard.clone());
         }
         Ok(())
     }
@@ -2373,6 +2500,20 @@ impl RestrictedAuthority {
                 self.check_observation_path(path)?;
                 *guard = Some(self.guard.clone());
             }
+            // Each file is observed as HashAndHold observes one, and the
+            // hashes of the whole batch share one response.
+            Request::HashExistingBatch { block, files } => {
+                for file in files.iter() {
+                    self.check_comparison_request(*block, file.len)?;
+                }
+                if !proto::existing_hashes_fit(*block, files.iter().map(|file| file.len)) {
+                    bail!("hash response would exceed protocol limits");
+                }
+                for file in files.iter_mut() {
+                    self.check_observation_path(&file.path)?;
+                    file.guard = Some(self.guard.clone());
+                }
+            }
             Request::StageBasis {
                 path,
                 copy_id,
@@ -2623,6 +2764,31 @@ impl RestrictedAuthority {
                     put.guard = Some(self.guard.clone());
                 }
             }
+            Request::PatchSmallBatch(patches) => {
+                let first = outcomes.len();
+                if let Err(error) = self.authorize_patches(patches, pending, outcomes, touched) {
+                    // A refused batch executes nothing: release the sizes
+                    // its patches already hold.
+                    let mut state = self.state.lock().unwrap();
+                    for outcome in outcomes.drain(first..) {
+                        if let PendingOutcome::Patch {
+                            path,
+                            copy_id,
+                            hold: Some(hold),
+                            ..
+                        } = outcome
+                        {
+                            Self::settle_observation_reservation(
+                                &mut state,
+                                &(path, copy_id),
+                                hold,
+                                false,
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            }
             Request::CopyLocal { .. }
             | Request::ReadRange { .. }
             | Request::ReadComparedRange { .. }
@@ -2632,11 +2798,7 @@ impl RestrictedAuthority {
             | Request::ReadSmallBatch(_)
             | Request::ReadDifferingBatch { .. }
             | Request::PrepareSmallFiles(_)
-            | Request::CopySmallFiles(_)
-            // Grants authorize keeping a content-identical file only through
-            // the checked per-file comparison and FinishBasis.
-            | Request::HashExistingBatch { .. }
-            | Request::PatchSmallBatch(_) => {
+            | Request::CopySmallFiles(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::ListDir { .. }
@@ -2752,6 +2914,17 @@ pub(super) enum PendingOutcome {
         /// releases or retains precisely this hold without affecting a
         /// concurrent preparation for the same partial.
         observation_hold: Option<ReservationHoldId>,
+    },
+    /// A small-file patch, which the executor reports as kept or published.
+    Patch {
+        index: usize,
+        path: Vec<u8>,
+        copy_id: proto::CopyId,
+        size: u64,
+        /// The metadata flags applied if the existing file is kept.
+        kept_flags: u8,
+        /// The size a publication occupies, held until the reply.
+        hold: Option<ReservationHoldId>,
     },
 }
 

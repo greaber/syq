@@ -21,7 +21,7 @@ const COMPARE_GROUP_FILES: usize = 256;
 const COMPARE_GROUP_BYTES: u64 = 16 << 20;
 /// Files up to this size are compared and patched in groups. A larger file
 /// takes the per-file path, whose ranges several workers can share.
-pub(super) const PATCH_MAX_FILE: u64 = 64 << 20;
+const PATCH_MAX_FILE: u64 = 64 << 20;
 /// Comparison block of the grouped path unless one is configured. A small
 /// edit then costs this much, not a whole default comparison block.
 const PATCH_BLOCK: u64 = crate::proto::MIN_HASH_BLOCK_BYTES;
@@ -76,6 +76,20 @@ impl Worker {
         }
     }
 
+    /// The largest file, and the most source bytes of one group, to compare
+    /// in groups. A restricted receiver with a rate limit refuses a request
+    /// carrying more file data than one burst, so a group's files, and with
+    /// them the data its patches send, stay within that.
+    pub(super) fn compare_group_limits(&self) -> (u64, u64) {
+        match &self.bwlimit {
+            Some(limit) if self.opts.restricted_receiver => {
+                let burst = limit.burst_bytes();
+                (PATCH_MAX_FILE.min(burst), COMPARE_GROUP_BYTES.min(burst))
+            }
+            _ => (PATCH_MAX_FILE, COMPARE_GROUP_BYTES),
+        }
+    }
+
     /// Claim files near `idx` whose destinations can be compared, and
     /// compare them. Kept and published files are complete; the others
     /// return to the queue, those that failed marked to be replaced whole.
@@ -84,14 +98,14 @@ impl Worker {
         let target = self
             .sched
             .begin_fast_batch(self.gate.active(), self.fast_batch_files);
+        let (max_file, group_bytes) = self.compare_group_limits();
         // Only differing blocks cross the network, so a batch holds enough
         // groups to keep the pipeline full: two windows of them.
-        let batch_bytes =
-            COMPARE_GROUP_BYTES * 2 * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64;
+        let batch_bytes = group_bytes * 2 * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64;
         let mut batch = vec![idx];
         batch.extend(self.sched.take_small_near(
             idx,
-            PATCH_MAX_FILE,
+            max_file,
             target - 1,
             batch_bytes.saturating_sub(first_bytes),
         ));
@@ -142,11 +156,12 @@ impl Worker {
         };
         let mut outcomes: Vec<Option<Compared>> = (0..jobs.len()).map(|_| None).collect();
         let mut unissued = std::collections::VecDeque::new();
+        let (_, group_bytes) = self.compare_group_limits();
         let (mut start, mut bytes) = (0, 0u64);
         for (i, job) in jobs.iter().enumerate() {
             if i > start
                 && (i - start >= COMPARE_GROUP_FILES
-                    || bytes.saturating_add(job.entry.size) > COMPARE_GROUP_BYTES)
+                    || bytes.saturating_add(job.entry.size) > group_bytes)
             {
                 unissued.push_back((start..i).collect::<Vec<_>>());
                 (start, bytes) = (i, 0);

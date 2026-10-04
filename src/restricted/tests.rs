@@ -4873,3 +4873,474 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
         .authorize(&mut reuse(target, id, 0, 4 << 20), false)
         .is_err());
 }
+
+fn existing_read(path: &Path, len: u64) -> proto::ExistingRead {
+    proto::ExistingRead {
+        path: path_bytes(path),
+        len,
+        condition: proto::TargetCondition::Any,
+        guard: None,
+    }
+}
+
+fn small_patch(
+    path: &Path,
+    len: u64,
+    block: u64,
+    reuse: Vec<Option<proto::ContentDigest>>,
+    data: &[u8],
+) -> proto::SmallPatch {
+    proto::SmallPatch {
+        path: path_bytes(path),
+        copy_id: [1; 16],
+        len,
+        block,
+        reuse,
+        data: data.to_vec(),
+        hash: crate::fsops::content_digest(data),
+        basis: None,
+        meta: plain_meta(),
+        flags: 0,
+        unchanged_flags: 0,
+        condition: proto::TargetCondition::Any,
+        guard: None,
+    }
+}
+
+#[test]
+fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let same = target.join("same");
+    let edited = target.join("edited");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(&same, b"same").unwrap();
+    fs::write(&edited, b"old!").unwrap();
+    for path in [&same, &edited] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let same_inode = fs::metadata(&same).unwrap().ino();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.receiver_umask = 0o022;
+    let block = authority.copy.limits.hash_block_bytes;
+
+    let mut hash = Request::HashExistingBatch {
+        block,
+        files: vec![existing_read(&same, 4), existing_read(&edited, 4)],
+    };
+    let settlement = authority.authorize(&mut hash, false).unwrap();
+    let Request::HashExistingBatch { files, .. } = &hash else {
+        unreachable!()
+    };
+    assert!(files.iter().all(|file| file.guard.is_some()));
+    let response = crate::fsops::FsOps::new().handle(&hash);
+    authority.settle(settlement, &response);
+    let proto::Response::ExistingHashes(existing) = response else {
+        panic!("unexpected hash response {response:?}")
+    };
+    let existing: Vec<_> = existing.into_iter().map(Result::unwrap).collect();
+
+    // Unrestricted modes are proposed; the receiver keeps the existing ones.
+    let receiver_mode = |mut patch: proto::SmallPatch, basis: &proto::ExistingHashes| {
+        patch.basis = basis.fingerprint;
+        patch.meta.mode = 0o7777;
+        patch.flags = proto::flags::RECEIVER_MODE;
+        patch.unchanged_flags = proto::flags::RECEIVER_MODE;
+        patch
+    };
+    let mut patch = Request::PatchSmallBatch(vec![
+        receiver_mode(
+            small_patch(&same, 4, block, vec![Some(existing[0].hashes[0])], b""),
+            &existing[0],
+        ),
+        receiver_mode(
+            small_patch(&edited, 4, block, vec![None], b"new!"),
+            &existing[1],
+        ),
+    ]);
+    let settlement = authority.authorize(&mut patch, false).unwrap();
+    let Request::PatchSmallBatch(patches) = &patch else {
+        unreachable!()
+    };
+    for patch in patches {
+        assert_eq!(
+            (patch.meta.mode, patch.flags, patch.unchanged_flags),
+            (0o640, proto::flags::MODE, proto::flags::MODE)
+        );
+        assert!(matches!(
+            patch.condition,
+            proto::TargetCondition::MatchesFingerprint { .. }
+        ));
+        assert!(patch.guard.is_some());
+    }
+    {
+        let state = authority.state.lock().unwrap();
+        // Only the new data crossed the transport; both publications are
+        // held until the reply says which file was kept.
+        assert_eq!(state.transferred_bytes, 4);
+        assert_eq!(state.reserved_bytes, 8);
+    }
+    let response = crate::fsops::FsOps::new().handle(&patch);
+    authority.settle(settlement, &response);
+    let proto::Response::PatchedBatch(patched) = response else {
+        panic!("unexpected patch response {response:?}")
+    };
+    assert_eq!(
+        patched,
+        vec![
+            Ok(proto::SmallPatched {
+                kept: true,
+                identity: None
+            }),
+            Ok(proto::SmallPatched {
+                kept: false,
+                identity: None
+            }),
+        ]
+    );
+    assert_eq!(fs::metadata(&same).unwrap().ino(), same_inode);
+    assert_eq!(fs::read(&edited).unwrap(), b"new!");
+    for path in [&same, &edited] {
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o7777, 0o640);
+    }
+    // The kept file released its hold; the published one keeps its size.
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4);
+}
+
+#[test]
+fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
+    use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let file = target.join("file");
+    let outside = root.join("outside");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(&file, b"data").unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let block = authority.copy.limits.hash_block_bytes;
+    let hash = |files| Request::HashExistingBatch { block, files };
+    let patch = |patch| Request::PatchSmallBatch(vec![patch]);
+    let reused = |path: &Path| small_patch(path, 4, block, vec![Some([0; 32])], b"");
+
+    let mut allowed = hash(vec![existing_read(&file, 4)]);
+    authority.authorize(&mut allowed, false).unwrap();
+    let mut allowed = patch(reused(&file));
+    authority.authorize(&mut allowed, false).unwrap();
+    // The grouped comparison is not bound to the grant's block, which the
+    // per-file comparison uses.
+    assert_ne!(block, proto::MIN_HASH_BLOCK_BYTES);
+    let small = proto::MIN_HASH_BLOCK_BYTES;
+    let mut allowed = Request::HashExistingBatch {
+        block: small,
+        files: vec![existing_read(&file, 4)],
+    };
+    authority.authorize(&mut allowed, false).unwrap();
+    let mut allowed = patch(small_patch(&file, 4, small, vec![Some([0; 32])], b""));
+    authority.authorize(&mut allowed, false).unwrap();
+
+    let mut altered = small_patch(&file, 4, block, vec![None], b"data");
+    altered.flags = proto::flags::RECEIVER_MODE;
+    let mut flags_differ = small_patch(&file, 4, block, vec![None], b"data");
+    flags_differ.unchanged_flags = proto::flags::OWNER;
+    for (mut request, error) in [
+        (
+            hash(vec![existing_read(&file, 4), existing_read(&outside, 4)]),
+            "receiver observation is outside the signed destination scopes",
+        ),
+        (
+            Request::HashExistingBatch {
+                block: 4096,
+                files: vec![existing_read(&file, 4)],
+            },
+            "comparison block size is outside protocol limits",
+        ),
+        (
+            hash(vec![existing_read(&file, 1025)]),
+            "signed grant per-file byte limit exceeded",
+        ),
+        (
+            patch(reused(&outside)),
+            "receiver mutation is outside the signed destination scopes",
+        ),
+        (
+            patch(small_patch(&file, 4, 4096, vec![Some([0; 32])], b"")),
+            "comparison block size is outside protocol limits",
+        ),
+        (
+            patch(small_patch(&file, 1025, block, vec![Some([0; 32])], b"")),
+            "signed grant per-file byte limit exceeded",
+        ),
+        (
+            patch(altered),
+            "kept and published metadata flags differ beyond times",
+        ),
+        (
+            patch(flags_differ),
+            "kept and published metadata flags differ beyond times",
+        ),
+    ] {
+        assert_eq!(
+            authority
+                .authorize(&mut request, false)
+                .unwrap_err()
+                .to_string(),
+            error,
+            "{request:?}"
+        );
+    }
+
+    // Each file's hashes may fit a response while the batch's do not.
+    authority.copy.limits.max_file_bytes = u64::MAX;
+    let half = (proto::MAX_FRAME as u64 / 33 / 2 + 1) * proto::MIN_HASH_BLOCK_BYTES;
+    let mut excessive = Request::HashExistingBatch {
+        block: proto::MIN_HASH_BLOCK_BYTES,
+        files: vec![existing_read(&file, half), existing_read(&file, half)],
+    };
+    assert_eq!(
+        authority
+            .authorize(&mut excessive, false)
+            .unwrap_err()
+            .to_string(),
+        "hash response would exceed protocol limits"
+    );
+    authority.copy.limits.max_file_bytes = 1024;
+
+    // Files with an expected hash keep checked finalization.
+    authority.hashing = Some(CopyHashing {
+        policy: HashPolicy {
+            algorithm: HashAlgorithm::Blake3,
+            transfer_integrity: true,
+            transfer_hash_type: None,
+        },
+        expected_hash: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"data")),
+    });
+    assert_eq!(
+        authority
+            .authorize(&mut patch(reused(&target)), false)
+            .unwrap_err()
+            .to_string(),
+        "expected-hash files require checked finalization"
+    );
+    authority.hashing = None;
+
+    authority.copy.options.dry_run = true;
+    assert!(authority
+        .authorize(&mut patch(reused(&file)), false)
+        .is_err());
+    authority.copy.options.dry_run = false;
+    authority.copy.policy.publication = PublicationPolicy::InPlace;
+    assert_eq!(
+        authority
+            .authorize(&mut patch(reused(&file)), false)
+            .unwrap_err()
+            .to_string(),
+        "small-file publication does not match the signed publication policy"
+    );
+
+    // A grant that retains existing files lets a patch neither keep nor
+    // replace one.
+    let retaining = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryAsChild,
+        RootExistence::Any,
+    )
+    .unwrap();
+    assert!(retaining
+        .authorize(&mut patch(reused(&file)), false)
+        .is_err());
+}
+
+#[test]
+fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 200_000, 4096);
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let burst = authority.file_data_limit.as_ref().unwrap().burst_bytes() as usize;
+    let len = block + 100;
+    let patch = |name: &str, data: &[u8]| {
+        small_patch(
+            &target.join(name),
+            len,
+            block,
+            vec![Some([0; 32]), None],
+            data,
+        )
+    };
+
+    // Reused blocks are not charged against the rate limit; new data is,
+    // a whole batch within one burst.
+    let mut over = Request::PatchSmallBatch(vec![
+        patch("a", &vec![0; burst / 2 + 1]),
+        patch("b", &vec![0; burst / 2 + 1]),
+    ]);
+    assert_eq!(
+        authority
+            .authorize(&mut over, false)
+            .unwrap_err()
+            .to_string(),
+        "small-file batch exceeds the signed file-data rate-limit burst"
+    );
+    let mut within = Request::PatchSmallBatch(vec![patch("a", &[0; 100])]);
+    let settlement = authority.authorize(&mut within, false).unwrap();
+    {
+        let state = authority.state.lock().unwrap();
+        assert_eq!(state.transferred_bytes, 100);
+        assert_eq!(state.reserved_bytes, len);
+    }
+    authority.settle(
+        settlement,
+        &proto::Response::PatchedBatch(vec![Ok(proto::SmallPatched {
+            kept: false,
+            identity: None,
+        })]),
+    );
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
+
+    // Publishing the same partial again declares nothing new, while a
+    // batch whose sizes would exceed the signed total holds none of them.
+    let mut again = Request::PatchSmallBatch(vec![patch("a", &[0; 100])]);
+    let settlement = authority.authorize(&mut again, false).unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::PatchedBatch(vec![Ok(proto::SmallPatched {
+            kept: true,
+            identity: None,
+        })]),
+    );
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
+    let mut excessive = Request::PatchSmallBatch(vec![
+        patch("b", &[0; 100]),
+        patch("c", &[0; 100]),
+        patch("d", &[0; 100]),
+    ]);
+    assert_eq!(
+        authority
+            .authorize(&mut excessive, false)
+            .unwrap_err()
+            .to_string(),
+        "signed grant total-byte limit exceeded by file preparation"
+    );
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, len);
+}
+
+#[test]
+fn grouped_patch_receipts_record_kept_published_and_failed_files() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let kept = target.join("kept");
+    let published = target.join("published");
+    let failed = target.join("failed");
+    fs::create_dir_all(&target).unwrap();
+    for path in [&kept, &published, &failed] {
+        fs::write(path, b"old").unwrap();
+    }
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = encrypted_policy(true);
+    let authority = test_authority_with_receipt(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy.clone())),
+    )
+    .unwrap();
+    let block = authority.copy.limits.hash_block_bytes;
+    let mut batch = Request::PatchSmallBatch(vec![
+        small_patch(&kept, 3, block, vec![Some([0; 32])], b""),
+        small_patch(&published, 3, block, vec![None], b"new"),
+        small_patch(&failed, 3, block, vec![None], b"new"),
+    ]);
+    let settlement = authority.authorize(&mut batch, false).unwrap();
+    fs::write(&published, b"new").unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::PatchedBatch(vec![
+            Ok(proto::SmallPatched {
+                kept: true,
+                identity: None,
+            }),
+            Ok(proto::SmallPatched {
+                kept: false,
+                identity: None,
+            }),
+            Err("executor rejected it".into()),
+        ]),
+    );
+
+    let mut verified = open_issued(&authority, &secret, &policy);
+    assert_eq!(verified.terminal.summary.operations, 3);
+    assert_eq!(verified.terminal.summary.published_files, 1);
+    assert_eq!(verified.terminal.summary.published_bytes, 3);
+    assert_eq!(verified.terminal.summary.failed, 1);
+    let mut records = Vec::new();
+    verified
+        .for_each_record(|record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+    let operation = |path: &[u8]| {
+        records
+            .iter()
+            .find_map(|record| match record {
+                crate::receipt::ReceiptRecord::Operation(operation) if operation.path == path => {
+                    Some((operation.action, operation.disposition))
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        operation(b"kept"),
+        (
+            crate::receipt::OperationAction::SetMetadata { flags: 0 },
+            crate::receipt::OperationDisposition::Succeeded
+        )
+    );
+    assert_eq!(
+        operation(b"published"),
+        (
+            crate::receipt::OperationAction::PublishFile {
+                size: 3,
+                inplace: false
+            },
+            crate::receipt::OperationDisposition::Succeeded
+        )
+    );
+    assert_eq!(
+        operation(b"failed"),
+        (
+            crate::receipt::OperationAction::PublishFile {
+                size: 3,
+                inplace: false
+            },
+            crate::receipt::OperationDisposition::Failed
+        )
+    );
+    for (path, contents) in [(&b"kept"[..], b"old"), (b"published", b"new")] {
+        assert!(records.iter().any(|record| matches!(
+            record,
+            crate::receipt::ReceiptRecord::FinalState(state)
+                if state.path == path
+                    && matches!(
+                        state.object,
+                        crate::receipt::FinalObject::Present {
+                            digest: Some(digest),
+                            ..
+                        } if digest == *blake3::hash(contents).as_bytes()
+                    )
+        )));
+    }
+}
