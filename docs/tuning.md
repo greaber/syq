@@ -324,8 +324,11 @@ Remote copies batch new files up to the smaller of `request-size` and
 batch files up to 64 KiB. Larger limits allow more data to be held in memory;
 interrupted whole-file copies restart from the beginning. A file that already exists at the destination joins a batch when syq
 replaces it without reading it first, as same-machine copies do by default.
-Files that need comparison (block reuse or `--hash`), files protected by an
-`--if-exists` policy, and preserved hard links are handled one at a time. On macOS, files above the batching
+With block reuse, a file no larger than one comparison block also joins a
+batch unless a bandwidth limit applies, and the receiving side compares it
+there. Larger files with block reuse, files checked with `--hash`, files
+protected by an `--if-exists` policy, and preserved hard links are handled one
+at a time. On macOS, files above the batching
 limit can use APFS cloning. That limit is the smallest of the comparison block
 size, `batch-bytes`, and `request-size`.
 
