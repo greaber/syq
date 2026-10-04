@@ -733,7 +733,8 @@ printf 'refused\n' >> "$FAKE_RSH_LOG"
 exit 255
 "#,
     );
-    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
         .arg("--session-pool")
         .arg(scope.join("cm-00112233aabbccdd"))
         .args(["", "fake.example", "", "unused --server"])
@@ -742,10 +743,9 @@ exit 255
             format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
         )
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut pool = process_group::ProcessGroup::spawn(&mut command).unwrap();
     // Observe retries, then stop the pool. A fixed eight-second lifetime made
     // the count depend on SSH startup and scheduling delays. The exact retry
     // boundary is tested with explicit Instants in session_pool's unit tests.
@@ -755,8 +755,12 @@ exit 255
         || fs::read_to_string(t.path("rsh.log")).is_ok_and(|log| log.lines().count() >= 2),
     );
     fs::remove_file(scope.join("cm-00112233aabbccdd.pool")).unwrap();
-    let output = wait_for_child_output(child, std::time::Duration::from_secs(30));
-    assert_output_ok(&output);
+    wait_for(
+        "the pool to exit",
+        std::time::Duration::from_secs(30),
+        || pool.poll().unwrap().is_some(),
+    );
+    assert!(pool.close().unwrap().success());
     assert!(!scope.join("cm-00112233aabbccdd.pool").exists());
     assert!(!scope.join("cm-00112233aabbccdd.pool.lock").exists());
 }
