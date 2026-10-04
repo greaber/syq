@@ -140,12 +140,7 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
         bail!("return handoff guard too large");
     }
     let guard: Guard = serde_json::from_slice(encoded.as_bytes())?;
-    let command = argv.get(3).and_then(|arg| arg.to_str());
-    if !accepts_command(
-        guard.kind,
-        command,
-        argv.get(4).and_then(|arg| arg.to_str()),
-    ) {
+    if !accepts_command(guard.kind, argv.get(3..).unwrap_or_default()) {
         bail!("invalid return handoff command");
     }
     if matches!(
@@ -163,13 +158,19 @@ pub(crate) fn enter(mut argv: Vec<OsString>) -> Result<Vec<OsString>> {
     Ok(argv)
 }
 
-fn accepts_command(kind: Kind, command: Option<&str>, subcommand: Option<&str>) -> bool {
-    match (kind, command) {
+fn accepts_command(kind: Kind, argv: &[OsString]) -> bool {
+    match (kind, argv.first().and_then(|arg| arg.to_str())) {
         (Kind::Copy | Kind::Forward | Kind::Pull, Some("cp"))
         | (Kind::Command, Some("exec"))
         | (Kind::Ssh, Some("ssh"))
         | (Kind::Account, Some("ssh" | "cp" | "rm" | "rsync" | "map" | "clean-partials")) => true,
-        (Kind::SshPersistent | Kind::Account, Some("persist")) => subcommand == Some("connect"),
+        (Kind::SshPersistent | Kind::Account, Some("persist")) => {
+            // Global persistence options may precede the action. Use the same
+            // grammar as public parsing, without opening the selected scope.
+            crate::persistence::command_for_help()
+                .try_get_matches_from(argv)
+                .is_ok_and(|matches| matches.subcommand_name() == Some("connect"))
+        }
         _ => false,
     }
 }
@@ -321,30 +322,114 @@ pub(crate) fn copy(
 mod tests {
     use super::*;
 
+    fn accepts(kind: Kind, words: &[&str]) -> bool {
+        accepts_command(kind, &words.iter().map(OsString::from).collect::<Vec<_>>())
+    }
+
     #[test]
     fn account_handoff_accepts_operations_but_never_other_persistence_actions() {
         for command in ["ssh", "cp", "rm", "rsync", "map", "clean-partials"] {
-            assert!(accepts_command(Kind::Account, Some(command), None));
+            assert!(accepts(Kind::Account, &[command]));
         }
+        assert!(accepts(Kind::Account, &["persist", "connect", "host"]));
+        for command in ["exec", "completion", "--self-update", "unknown"] {
+            assert!(!accepts(Kind::Account, &[command]));
+        }
+        for action in ["off", "receive", "auth-from", "ssh-config"] {
+            assert!(!accepts(Kind::Account, &["persist", action]));
+        }
+        assert!(!accepts(Kind::Account, &["persist"]));
+        assert!(!accepts(Kind::Copy, &["rm"]));
+        assert!(!accepts(Kind::Command, &["ssh"]));
+    }
+
+    #[test]
+    fn persistence_handoff_uses_global_option_grammar_without_opening_scope() {
+        for kind in [Kind::Account, Kind::SshPersistent] {
+            for words in [
+                vec![
+                    "persist",
+                    "--pscope",
+                    "/requester-only/scope",
+                    "connect",
+                    "host",
+                    "--auth-from",
+                    "@laptop",
+                ],
+                vec![
+                    "persist",
+                    "--pscope=/requester-only/scope",
+                    "connect",
+                    "host",
+                    "--auth-from=@laptop",
+                ],
+                vec![
+                    "persist",
+                    "connect",
+                    "--pscope",
+                    "/requester-only/scope",
+                    "host",
+                    "--auth-from",
+                    "@laptop",
+                ],
+                vec![
+                    "persist",
+                    "connect",
+                    "host",
+                    "--pscope=/requester-only/scope",
+                    "--auth-from",
+                    "@laptop",
+                ],
+                vec![
+                    "persist",
+                    "connect",
+                    "host",
+                    "--auth-from",
+                    "@laptop",
+                    "--pscope",
+                    "/requester-only/scope",
+                ],
+            ] {
+                assert!(accepts(kind, &words), "{kind:?}: {words:?}");
+            }
+            for words in [
+                vec!["persist", "--pscope", "connect", "off"],
+                vec!["persist", "--pscope=/requester-only/scope", "off"],
+                vec![
+                    "persist",
+                    "--pscope",
+                    "/requester-only/scope",
+                    "receive",
+                    "on",
+                ],
+                vec![
+                    "persist",
+                    "--pscope",
+                    "--auth-from",
+                    "@laptop",
+                    "connect",
+                    "host",
+                ],
+                vec!["persist", "--pscope"],
+                vec!["persist", "-p", "/requester-only/scope", "connect", "host"],
+            ] {
+                assert!(!accepts(kind, &words), "{kind:?}: {words:?}");
+            }
+        }
+        // Scope paths are opaque local paths, not UTF-8 protocol names.
+        use std::os::unix::ffi::OsStringExt;
         assert!(accepts_command(
             Kind::Account,
-            Some("persist"),
-            Some("connect")
+            &[
+                "persist".into(),
+                "--pscope".into(),
+                OsString::from_vec(b"/requester-only/\xff".to_vec()),
+                "connect".into(),
+                "host".into(),
+                "--auth-from".into(),
+                "@laptop".into(),
+            ]
         ));
-        for command in ["exec", "completion", "--self-update", "unknown"] {
-            assert!(!accepts_command(Kind::Account, Some(command), None));
-        }
-        for action in [
-            None,
-            Some("off"),
-            Some("receive"),
-            Some("auth-from"),
-            Some("ssh-config"),
-        ] {
-            assert!(!accepts_command(Kind::Account, Some("persist"), action));
-        }
-        assert!(!accepts_command(Kind::Copy, Some("rm"), None));
-        assert!(!accepts_command(Kind::Command, Some("ssh"), None));
     }
 
     #[test]
