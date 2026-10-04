@@ -61,7 +61,11 @@ fn client(transport: impl HttpConnector + Clone + 'static, retries: u32) -> Clie
             .credentials_provider(Credentials::new("test", "test", None, None, "fixture"))
             .endpoint_url("http://localhost")
             .force_path_style(true)
-            .retry_config(RetryConfig::standard().with_max_attempts(retries + 1))
+            .retry_config(
+                RetryConfig::standard()
+                    .with_max_attempts(retries + 1)
+                    .with_use_static_exponential_base(true),
+            )
             .retry_partition(partition())
             .retry_classifier(crate::s3::client::Throttling)
             .http_client(http_client_fn(move |_, _| {
@@ -253,24 +257,29 @@ fn payload_backoff_spreads_retries_and_honors_server_hints() {
     assert!((Duration::from_secs(10)..=Duration::from_secs(20)).contains(&delay(u32::MAX, false)));
 }
 
-#[derive(Clone, Debug, Default)]
-struct RateLimited(Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>);
+#[derive(Clone, Debug)]
+struct RateLimited {
+    sent: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    code: &'static str,
+    header: (&'static str, &'static str),
+}
 impl HttpConnector for RateLimited {
     fn call(&self, _: HttpRequest) -> HttpConnectorFuture {
-        let mut sent = self.0.lock().unwrap();
+        let mut sent = self.sent.lock().unwrap();
         sent.push(tokio::time::Instant::now());
         let first = sent.len() == 1;
+        let code = self.code;
+        let (header, value) = self.header;
         HttpConnectorFuture::new(async move {
-            // This is the response observed from R2 for concurrent writes to one key.
             let mut response = if first {
                 HttpResponse::new(
                     429.try_into().unwrap(),
-                    SdkBody::from("<Error><Code>ServiceUnavailable</Code></Error>"),
+                    SdkBody::from(format!("<Error><Code>{code}</Code></Error>")),
                 )
             } else {
                 HttpResponse::new(204.try_into().unwrap(), SdkBody::empty())
             };
-            response.headers_mut().insert("retry-after", "5");
+            response.headers_mut().insert(header, value);
             Ok(response)
         })
     }
@@ -278,16 +287,40 @@ impl HttpConnector for RateLimited {
 
 #[tokio::test(start_paused = true)]
 async fn sdk_requests_honor_rate_limit_retry_after() {
-    let transport = RateLimited::default();
-    let client = client(transport.clone(), 1);
-    client
-        .delete_object()
-        .bucket("bucket")
-        .key("key")
-        .send()
-        .await
-        .unwrap();
-    let sent = transport.0.lock().unwrap();
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent[1] - sent[0], Duration::from_secs(5));
+    // R2 used ServiceUnavailable; known AWS throttling codes must not let a
+    // later SDK classifier discard the hint. Zero must preserve normal backoff.
+    for code in [
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "TooManyRequestsException",
+    ] {
+        for (header, value, seconds) in [
+            ("retry-after", "5", 5),
+            ("x-amz-retry-after", "5000", 5),
+            ("retry-after", "0", 1),
+            ("x-amz-retry-after", "0", 1),
+        ] {
+            let transport = RateLimited {
+                sent: Default::default(),
+                code,
+                header: (header, value),
+            };
+            let client = client(transport.clone(), 1);
+            client
+                .delete_object()
+                .bucket("bucket")
+                .key("key")
+                .send()
+                .await
+                .unwrap();
+            let sent = transport.sent.lock().unwrap();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(
+                sent[1] - sent[0],
+                Duration::from_secs(seconds),
+                "{code}: {header}={value}"
+            );
+        }
+    }
 }

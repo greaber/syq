@@ -15,7 +15,7 @@ use aws_smithy_runtime_api::{
             },
             Intercept,
         },
-        retries::classifiers::{ClassifyRetry, RetryAction},
+        retries::classifiers::{ClassifyRetry, RetryAction, RetryClassifierPriority},
         runtime_components::RuntimeComponents,
     },
 };
@@ -33,21 +33,28 @@ impl ClassifyRetry for Throttling {
     fn classify_retry(&self, context: &InterceptorContext) -> RetryAction {
         if let Some(response) = context.response().filter(|r| r.status().as_u16() == 429) {
             // R2 sends Retry-After seconds; the SDK only reads x-amz-retry-after.
-            super::retry::server_delay(response).map_or_else(
-                RetryAction::throttling_error,
-                |delay| {
+            super::retry::server_delay(response)
+                // A zero hint must not disable the SDK's normal backoff.
+                .filter(|delay| !delay.is_zero())
+                .map_or_else(RetryAction::throttling_error, |delay| {
                     RetryAction::retryable_error_with_explicit_delay(
                         aws_smithy_types::retry::ErrorKind::ThrottlingError,
                         delay,
                     )
-                },
-            )
+                })
         } else {
             RetryAction::NoActionIndicated
         }
     }
     fn name(&self) -> &'static str {
         "S3 HTTP 429 throttling"
+    }
+    fn priority(&self) -> RetryClassifierPriority {
+        // Run after AWS error-code and modeled-error classification so known
+        // codes such as SlowDown cannot discard our Retry-After delay.
+        RetryClassifierPriority::run_after(
+            RetryClassifierPriority::modeled_as_retryable_classifier(),
+        )
     }
 }
 

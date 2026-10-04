@@ -60,6 +60,10 @@ timeout, or a server error or throttling response, `syq cp` and `syq rm` stop
 instead of trying the remaining objects; rerun the command once the service is
 available.
 
+For bulk deletion, syq retries only keys with temporary errors, up to
+`s3-retries` times during pruning or 10 times with `syq rm`. This count is
+separate from retries of the batch request itself.
+
 The concurrency limits are nested. For example:
 
 ```sh
@@ -94,13 +98,11 @@ pagination at the original prefix.
 `syq rm`, `syq clean-partials`, and pruning after a copy adjust deletion
 concurrency using completed entries per second. Filesystem deletion runs on
 the machine holding the target filesystem. S3 deletion adjusts concurrent
-requests while keeping supported batch requests. If a batch reports errors for
-individual keys, syq retries only the keys with temporary failures, using the
-same retry allowance as other S3 requests. These measurements are separate from
-copying file contents and are not saved between runs. When a higher deletion
-count brings no clear throughput gain, syq returns to the previous count. It keeps a lower count
-when that improves throughput, such as when excess workers contend for the
-same filesystem locks.
+requests while keeping supported batch requests. These measurements are
+separate from copying file contents and are not saved between runs. When a
+higher deletion count brings no clear throughput gain, syq returns to the
+previous count. It keeps a lower count when that improves throughput, such as
+when excess workers contend for the same filesystem locks.
 
 For `rm` and `clean-partials`, `--performance-tuning workers=N` fixes the
 filesystem worker count. For S3 removal, `--performance-tuning s3-requests=N`
