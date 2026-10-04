@@ -1,6 +1,7 @@
 use super::*;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::UnixStream;
 use std::process::Child;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -184,9 +185,29 @@ fn write_allowed_signers(path: &Path, signer: &str, public_key: &Path, certifica
     write_private(path, line.as_bytes());
 }
 
+fn agent_is_listening(socket: &Path) -> bool {
+    // bind() creates the socket file before listen() makes it connectable.
+    UnixStream::connect(socket).is_ok()
+}
+
+#[test]
+fn agent_readiness_requires_a_listener_not_just_a_socket_file() {
+    let directory = TestDir::new("agent-ready");
+    let path = directory.join("agent.sock");
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        .expect("create bound agent fixture");
+    socket
+        .bind(&socket2::SockAddr::unix(&path).unwrap())
+        .unwrap();
+    assert!(path.exists());
+    assert!(!agent_is_listening(&path));
+    socket.listen(1).unwrap();
+    assert!(agent_is_listening(&path));
+}
+
 fn start_agent(directory: &TestDir) -> AgentGuard {
     let socket = directory.join("agent.sock");
-    let mut child = Command::new(ssh_tool("ssh-agent"))
+    let child = Command::new(ssh_tool("ssh-agent"))
         .env_clear()
         .args(["-D", "-a"])
         .arg(&socket)
@@ -195,18 +216,34 @@ fn start_agent(directory: &TestDir) -> AgentGuard {
         .stderr(Stdio::null())
         .spawn_guarded()
         .expect("start test ssh-agent");
-    for _ in 0..200 {
-        if fs::symlink_metadata(&socket)
-            .map(|metadata| metadata.file_type().is_socket())
-            .unwrap_or(false)
-        {
-            return AgentGuard { child, socket };
+    let mut agent = AgentGuard { child, socket };
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
+    let mut next_report = started + Duration::from_secs(1);
+    loop {
+        let status = agent.child.try_wait().expect("check test ssh-agent");
+        assert!(
+            status.is_none(),
+            "test ssh-agent exited before listening: {status:?}"
+        );
+        if agent_is_listening(&agent.socket) {
+            return agent;
+        }
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "test ssh-agent did not listen on {}",
+            agent.socket.display()
+        );
+        if now >= next_report {
+            eprintln!(
+                "waiting for test ssh-agent to listen on {}",
+                agent.socket.display()
+            );
+            next_report = now + Duration::from_secs(1);
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("test ssh-agent did not create its socket");
 }
 
 fn add_to_agent(agent: &AgentGuard, key: &Path) {

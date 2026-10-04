@@ -15,9 +15,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn broken_output() -> Stdio {
-    let (reader, writer) = UnixStream::pair().unwrap();
-    drop(reader);
-    Stdio::from(OwnedFd::from(writer))
+    // Darwin sets close-on-exec after socketpair(). A concurrent child must
+    // not inherit the reader and keep this supposedly broken sink writable.
+    process::with_inheritance_guard(|| {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        Stdio::from(OwnedFd::from(writer))
+    })
 }
 
 fn command(directory: &std::path::Path) -> Command {
@@ -127,7 +131,7 @@ fn full_stdout_keeps_results_progress_running() {
     let directory = crate::test_support::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     fs::write(root.join("src"), b"data").unwrap();
-    let (mut reader, mut writer) = UnixStream::pair().unwrap();
+    let (mut reader, mut writer) = process::with_inheritance_guard(UnixStream::pair).unwrap();
     // Fill the sink before starting syq, then restore blocking writes. A
     // verbose dry run will block on its first stdout line deterministically.
     writer.set_nonblocking(true).unwrap();

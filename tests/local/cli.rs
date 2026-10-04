@@ -984,8 +984,9 @@ fn stream_placement_and_source_roots() {
     mkfifo(&t.path("pipe"));
     let rsh = fake_rsh(&t);
 
-    // Tiny payloads keep captured output below pipe capacity. Bound failures
-    // so opening a FIFO before checking placement cannot hang the test suite.
+    // Tiny payloads keep captured output below pipe capacity. This is a
+    // deadlock guard, not a startup benchmark: remote helpers may start slowly
+    // under load. Opening a FIFO before checking placement must still fail it.
     let cp = |args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         for (name, _) in std::env::vars_os() {
@@ -1011,7 +1012,7 @@ fn stream_placement_and_source_roots() {
         let mut next_progress = 1;
         while child.try_wait().unwrap().is_none() {
             let elapsed = started.elapsed().as_secs();
-            if elapsed >= 15 {
+            if elapsed >= 60 {
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
@@ -1545,7 +1546,10 @@ fn stream_previews_and_results_do_not_consume_payload() {
         let mut report_at = 1;
         while child.try_wait().unwrap().is_none() {
             let seconds = start.elapsed().as_secs();
-            if seconds >= 10 {
+            // A regression that opens the unwritten FIFO blocks indefinitely.
+            // Leave room for helper startup under concurrent suite load; the
+            // assertions below, not elapsed time, establish preview behavior.
+            if seconds >= 60 {
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }

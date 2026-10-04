@@ -408,6 +408,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
     result
 }
 
+fn retry_ready(last_failure: Option<Instant>, now: Instant) -> bool {
+    last_failure.is_none_or(|failure| now.duration_since(failure) >= RETRY_AFTER_FAILURE)
+}
+
 impl Pool {
     fn serve(&mut self) -> Result<()> {
         loop {
@@ -474,11 +478,7 @@ impl Pool {
             Ok(metadata) if metadata.ino() == self.bound_ino => {}
             _ => return Verdict::Exit,
         }
-        if self.spares.len() < DEPTH
-            && self
-                .last_failure
-                .is_none_or(|failure| failure.elapsed() >= RETRY_AFTER_FAILURE)
-        {
+        if self.spares.len() < DEPTH && retry_ready(self.last_failure, Instant::now()) {
             match self.open_spare() {
                 Ok(spare) => self.spares.push(spare),
                 Err(_) => self.last_failure = Some(Instant::now()),
@@ -764,6 +764,18 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_retry_waits_for_the_failure_backoff_boundary() {
+        let failed = Instant::now();
+        assert!(retry_ready(None, failed));
+        assert!(!retry_ready(Some(failed), failed));
+        assert!(!retry_ready(
+            Some(failed),
+            failed + RETRY_AFTER_FAILURE - Duration::from_nanos(1),
+        ));
+        assert!(retry_ready(Some(failed), failed + RETRY_AFTER_FAILURE));
+    }
 
     #[test]
     fn pool_files_sit_beside_the_control_socket_and_are_recognized() {

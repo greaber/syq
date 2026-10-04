@@ -111,6 +111,8 @@ impl Budget {
         }
         let now = Instant::now();
         let delay = self.reserve(clock_ns(), bytes);
+        #[cfg(debug_assertions)]
+        crate::fsops::record_test_event("SYQ_TEST_PACED_BYTES", format_args!("{bytes}"))?;
         if delay.is_zero() {
             return Ok(());
         }

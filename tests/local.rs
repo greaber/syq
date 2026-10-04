@@ -158,7 +158,9 @@ fn native_syq(args: &[&str]) -> Output {
 
 fn wait_for_confinement_marker(child: &mut std::process::Child, marker: &Path, stage: &str) {
     let started = std::time::Instant::now();
-    let deadline = started + std::time::Duration::from_secs(5);
+    // The marker establishes ordering. This is only a deadlock bound, matching
+    // the worker's continuation barrier, not a requirement on process startup.
+    let deadline = started + std::time::Duration::from_secs(60);
     let mut next_progress = started + std::time::Duration::from_secs(1);
     loop {
         let status = child.try_wait().unwrap();

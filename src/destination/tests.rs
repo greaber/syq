@@ -312,7 +312,9 @@ pub(super) fn command(source: &Path, options: &[&str]) -> Vec<Vec<u8>> {
     [b"cp".to_vec(), b"--src".to_vec(), source]
         .into_iter()
         .chain(
-            ["--to", "@laptop", "--into", "."]
+            // Kernel-assigned ports keep concurrent native fixtures isolated,
+            // including wildcard and loopback listeners sharing a macOS host.
+            ["--to", "@laptop", "--into", ".", "--tcp-ports", "0-0"]
                 .iter()
                 .chain(options)
                 .chain(workers)
@@ -1020,7 +1022,7 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
         let mut control = spec.connect_with(false, false).unwrap();
         if tcp {
             let pending = spec
-                .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
+                .begin_tcp_setup(&mut control, false, (0, 0), None, None)
                 .unwrap();
             spec.finish_tcp_setup(pending).unwrap();
         }
@@ -1098,7 +1100,7 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         spec.restricted_grant = Some(route(registration, approved.token.clone()));
         let mut control = spec.connect_with(false, false).unwrap();
         let pending = spec
-            .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
+            .begin_tcp_setup(&mut control, false, (0, 0), None, None)
             .unwrap();
         spec.finish_tcp_setup(pending).unwrap();
         assert_eq!(
@@ -1164,7 +1166,7 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
-        .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
+        .begin_tcp_setup(&mut control, false, (0, 0), None, None)
         .unwrap();
     spec.finish_tcp_setup(pending).unwrap();
     // Replace the selected route with a reserved, non-listening socket. Setup
@@ -1224,12 +1226,13 @@ fn named_tcp_workers_connect_concurrently() {
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
-        .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
+        .begin_tcp_setup(&mut control, false, (0, 0), None, None)
         .unwrap();
     spec.finish_tcp_setup(pending).unwrap();
     let start = Arc::new(std::sync::Barrier::new(8));
     let threads = (0..8)
         .map(|_| {
+            let tcp = Arc::clone(&spec.tcp);
             let endpoint = crate::conn::Endpoint::Remote(spec.clone());
             let start = Arc::clone(&start);
             std::thread::spawn(move || {
@@ -1239,7 +1242,11 @@ fn named_tcp_workers_connect_concurrently() {
                     .unwrap();
                 assert!(
                     worker.transport_stats().is_some(),
-                    "worker fell back to SSH"
+                    "worker fell back to SSH: {:?}",
+                    tcp.lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|info| info.failure.as_deref())
                 );
                 worker
             })
@@ -1269,7 +1276,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     spec.restricted_grant = Some(route(registration, approved.token.clone()));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
-        .begin_tcp_setup(&mut control, false, (47600, 47699), None, None)
+        .begin_tcp_setup(&mut control, false, (0, 0), None, None)
         .unwrap();
     spec.finish_tcp_setup(pending).unwrap();
     let port = spec.tcp.lock().unwrap().as_ref().unwrap().port;
