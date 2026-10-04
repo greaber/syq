@@ -1105,23 +1105,43 @@ impl RestrictedAuthority {
                     kept_flags,
                     hold,
                 } => {
+                    let reply = match response {
+                        proto::Response::PatchedBatch(results) => results.get(index),
+                        _ => None,
+                    };
                     // A file that already matched was kept, or failed only
                     // to be kept.
                     let kept = matches!(
-                        response,
-                        proto::Response::PatchedBatch(results)
-                            if matches!(
-                                results.get(index),
-                                Some(Ok(proto::SmallPatched { kept: true, .. }))
-                                    | Some(Err(proto::SmallPatchError { matched: true, .. }))
-                            )
+                        reply,
+                        Some(Ok(proto::SmallPatched { kept: true, .. }))
+                            | Some(Err(proto::SmallPatchError { matched: true, .. }))
                     );
-                    // A kept file occupies nothing new. A publication, or a
-                    // failed attempt, keeps the size it declared, as staging
-                    // keeps its declaration.
+                    // A file that no longer met its condition was neither
+                    // kept nor written, and the sender compares it again.
+                    let stale = matches!(
+                        reply,
+                        Some(Err(proto::SmallPatchError {
+                            stale_condition: true,
+                            ..
+                        }))
+                    );
+                    // A kept or stale file occupies nothing new. A
+                    // publication, or another failed attempt, keeps the size
+                    // it declared, as staging keeps its declaration.
                     if let Some(hold) = hold {
                         let key = (path.clone(), copy_id);
-                        Self::settle_observation_reservation(&mut state, &key, hold, !kept);
+                        Self::settle_observation_reservation(
+                            &mut state,
+                            &key,
+                            hold,
+                            !kept && !stale,
+                        );
+                    }
+                    // As for a staged file whose publication failed on its
+                    // condition and was then retried, only the retry's
+                    // outcome is recorded.
+                    if stale {
+                        continue;
                     }
                     let error = outcome_error(index);
                     self.append_operation(

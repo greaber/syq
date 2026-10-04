@@ -5145,6 +5145,87 @@ fn keeping_one_name_of_a_file_leaves_its_other_names_stale_until_compared_again(
 }
 
 #[test]
+fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let (a, b) = (target.join("a"), target.join("b"));
+    fs::create_dir_all(&target).unwrap();
+    fs::write(&a, b"same").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = encrypted_policy(true);
+    let mut authority = test_authority_with_receipt(
+        &root,
+        DeletionPolicy::Forbid,
+        8,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        Some((key, policy.clone())),
+    )
+    .unwrap();
+    authority.copy.options.preserve_times = true;
+    let mut ops = crate::fsops::FsOps::new();
+    let kept = Ok(proto::SmallPatched {
+        kept: true,
+        identity: None,
+    });
+    // Keeping the first name changes the change time the second's
+    // condition holds, so the second is refused as stale.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
+    assert_eq!(results[0], kept);
+    assert!(
+        matches!(
+            &results[1],
+            Err(proto::SmallPatchError {
+                stale_condition: true,
+                ..
+            })
+        ),
+        "{:?}",
+        results[1]
+    );
+    // Nothing was written for it, so it holds none of the grant's bytes.
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, 0);
+    assert_eq!(compare_and_keep(&authority, &mut ops, &[&b]), vec![kept]);
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, 0);
+
+    // The receipt shows each name kept once, and no failure.
+    let mut verified = open_issued(&authority, &secret, &policy);
+    assert_eq!(
+        verified.terminal.status,
+        crate::receipt::ReceiptStatus::Clean
+    );
+    assert_eq!(verified.terminal.summary.failed, 0);
+    let mut operations = Vec::new();
+    verified
+        .for_each_record(|record| {
+            if let crate::receipt::ReceiptRecord::Operation(operation) = record {
+                operations.push((operation.path, operation.action, operation.disposition));
+            }
+            Ok(())
+        })
+        .unwrap();
+    operations.sort_by(|left, right| left.0.cmp(&right.0));
+    let kept_with = crate::receipt::OperationAction::SetMetadata {
+        flags: proto::flags::MODE | proto::flags::TIMES,
+    };
+    let succeeded = crate::receipt::OperationDisposition::Succeeded;
+    assert_eq!(
+        operations,
+        vec![
+            (b"a".to_vec(), kept_with, succeeded),
+            (b"b".to_vec(), kept_with, succeeded),
+        ]
+    );
+}
+
+#[test]
 fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
     let temporary = crate::test_support::tempdir().unwrap();
