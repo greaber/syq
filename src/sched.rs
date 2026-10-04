@@ -56,6 +56,9 @@ pub struct FileJobData {
     /// Earlier runs left partial copies of this file: it takes the per-file
     /// path, which resumes from them.
     pub resume_partial: bool,
+    /// A grouped patch of this file found its destination no longer met the
+    /// patch's target condition, and the file was compared once more.
+    pub recompared: bool,
     pub src: PathBytes,
     /// Descriptor-session authority corresponding to `src`. Source workers,
     /// and Linux destination workers using CopyLocal, claim its root during

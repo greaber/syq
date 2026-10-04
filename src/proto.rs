@@ -476,6 +476,10 @@ pub struct SmallPatchError {
     /// keeping it, by setting its metadata, failed. Nothing was published in
     /// its place, and copying it again would rewrite the same contents.
     pub matched: bool,
+    /// The file no longer met the patch's target condition, so nothing was
+    /// kept or written. Compared again, under a fresh condition, it may
+    /// still be kept or patched.
+    pub stale_condition: bool,
 }
 
 /// Contents and integrity hash for one successful `SmallRead`.

@@ -48,6 +48,10 @@ pub(super) enum Compared {
     ResumePartial,
     /// The file could not be compared or patched: replace it whole.
     Differs,
+    /// The destination no longer met the patch's target condition, as when
+    /// keeping another name of the same file changed it: compare it once
+    /// more, under a fresh condition.
+    StaleCondition,
     /// The destination already held the source's contents, but keeping it
     /// failed: a file error, as for a content-identical per-file finish.
     KeepFailed(WireError),
@@ -132,6 +136,15 @@ impl Worker {
             match outcome {
                 Some(Compared::Differs) => {
                     self.sched.jobs.lock().unwrap()[i].compared = true;
+                    self.sched.requeue(i);
+                }
+                Some(Compared::StaleCondition) => {
+                    // A second stale condition replaces the file whole.
+                    let mut jobs = self.sched.jobs.lock().unwrap();
+                    let job = &mut jobs[i];
+                    job.compared = job.recompared;
+                    job.recompared = true;
+                    drop(jobs);
                     self.sched.requeue(i);
                 }
                 Some(Compared::ResumePartial) => {
@@ -446,7 +459,12 @@ impl Worker {
                 Err(SmallPatchError {
                     error,
                     matched: true,
+                    ..
                 }) => Compared::KeepFailed(error),
+                Err(SmallPatchError {
+                    stale_condition: true,
+                    ..
+                }) => Compared::StaleCondition,
                 Err(_) => Compared::Differs,
             });
         }
@@ -478,9 +496,10 @@ impl Worker {
                 idx,
                 anyhow::Error::new(error).context("finish content-identical destination"),
             ),
-            Compared::SourceChanged(_) | Compared::ResumePartial | Compared::Differs => {
-                unreachable!("these files are requeued")
-            }
+            Compared::SourceChanged(_)
+            | Compared::ResumePartial
+            | Compared::Differs
+            | Compared::StaleCondition => unreachable!("these files are requeued"),
         }
     }
 

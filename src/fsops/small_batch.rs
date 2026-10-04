@@ -286,25 +286,6 @@ impl FsOps {
         })
     }
 
-    /// The existing regular file a small file would replace, opened for
-    /// reading under the destination root and the target's condition, or
-    /// None when there is no such file to compare with.
-    fn open_existing_small(
-        &mut self,
-        path: &[u8],
-        guard: Option<&ContainerGuard>,
-        condition: TargetCondition,
-    ) -> Result<Option<(RootedTarget, File)>> {
-        let target = self.destination_mutation_target(path, guard)?;
-        let Ok(file) = target.root.open_regular_read(&target.relative) else {
-            return Ok(None);
-        };
-        if require_open_target(&file, &target.label, condition).is_err() {
-            return Ok(None);
-        }
-        Ok(Some((target, file)))
-    }
-
     /// Keep an existing file found to hold a small file's contents: set its
     /// metadata through the descriptor its contents were read from, as a
     /// content-identical per-file finish does. A writer that extended or
@@ -399,6 +380,7 @@ impl FsOps {
                 .map_err(|error| SmallPatchError {
                     error,
                     matched: false,
+                    stale_condition: false,
                 });
         }
         Ok(results)
@@ -406,93 +388,101 @@ impl FsOps {
 
     /// Keep the existing file a patch reproduces whole, or stage the patch.
     /// A file found to match whose keeping fails is reported as matched, so
-    /// the copy does not rewrite the same contents.
+    /// the copy does not rewrite the same contents. A file whose blocks the
+    /// patch reuses but that no longer meets its target condition is
+    /// reported as stale, before anything is kept or written: keeping
+    /// another name of the same file, say, changes the change time a
+    /// restricted receiver's condition holds.
     fn prepare_patch<'a>(
         &mut self,
         patch: &'a SmallPatch,
     ) -> std::result::Result<PatchStep<'a>, SmallPatchError> {
-        let failed = |matched| {
+        let failed = |matched, stale_condition| {
             move |error: anyhow::Error| SmallPatchError {
                 error: wire_error(&error),
                 matched,
+                stale_condition,
             }
         };
-        check_patch_layout(patch).map_err(failed(false))?;
-        if let Some((target, file)) = self.whole_match(patch).map_err(failed(false))? {
-            let kept = self
-                .keep_open_small(
-                    &target,
-                    &file,
-                    patch.len,
-                    &patch.meta,
-                    patch.unchanged_flags,
-                    patch.guard.is_some(),
-                    patch.condition,
-                )
-                .map_err(failed(true))?;
-            if let Some(identity) = kept {
-                return Ok(PatchStep::Kept(identity));
+        check_patch_layout(patch).map_err(failed(false, false))?;
+        let old = self.open_reused(patch).map_err(failed(false, false))?;
+        if let Some((target, file)) = &old {
+            require_open_target(file, &target.label, patch.condition)
+                .map_err(failed(false, true))?;
+            if self
+                .whole_match(patch, file)
+                .map_err(failed(false, false))?
+            {
+                let kept = self
+                    .keep_open_small(
+                        target,
+                        file,
+                        patch.len,
+                        &patch.meta,
+                        patch.unchanged_flags,
+                        patch.guard.is_some(),
+                        patch.condition,
+                    )
+                    .map_err(failed(true, false))?;
+                if let Some(identity) = kept {
+                    return Ok(PatchStep::Kept(identity));
+                }
             }
         }
-        let (put, source) = self.stage_patch(patch).map_err(failed(false))?;
+        let (put, source) = self
+            .stage_patch(patch, old.map(|(_, file)| file))
+            .map_err(failed(false, false))?;
         Ok(PatchStep::Staged(Box::new(put), source))
     }
 
-    /// The existing file a patch would reproduce whole: every block is
-    /// reused, and the file still holds them. Its fingerprint shows that
-    /// nothing has changed it since it was hashed; when it has changed, as
-    /// keeping another name of the same file changes it, the file is hashed
-    /// again.
-    fn whole_match(&mut self, patch: &SmallPatch) -> Result<Option<(RootedTarget, File)>> {
-        let Some(basis) = patch.basis else {
+    /// The existing file whose blocks a patch reuses, opened for reading
+    /// under the destination root, or None when it reuses none.
+    fn open_reused(&mut self, patch: &SmallPatch) -> Result<Option<(RootedTarget, File)>> {
+        if patch.reuse.iter().all(Option::is_none) {
             return Ok(None);
+        }
+        let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
+        let file = target
+            .root
+            .open_regular_read(&target.relative)
+            .with_context(|| format!("open {} to reuse its blocks", target.label.display()))?;
+        Ok(Some((target, file)))
+    }
+
+    /// Whether a patch reproduces `file` whole: every block is reused, and
+    /// the file still holds them. Its fingerprint shows that nothing has
+    /// changed it since it was hashed; when it has changed, as keeping
+    /// another name of the same file changes it, the file is hashed again.
+    fn whole_match(&self, patch: &SmallPatch, file: &File) -> Result<bool> {
+        let Some(basis) = patch.basis else {
+            return Ok(false);
         };
         if basis.len != patch.len
             || !patch.data.is_empty()
             || patch.reuse.iter().any(Option::is_none)
         {
-            return Ok(None);
+            return Ok(false);
         }
-        let Some((target, file)) =
-            self.open_existing_small(&patch.path, patch.guard.as_ref(), patch.condition)?
-        else {
-            return Ok(None);
-        };
-        if fingerprint(&file.metadata()?) != basis
-            && !holds_reused_blocks(&file, self.hash_policy.algorithm, patch)?
-        {
-            return Ok(None);
-        }
-        Ok(Some((target, file)))
+        Ok(fingerprint(&file.metadata()?) == basis
+            || holds_reused_blocks(file, self.hash_policy.algorithm, patch)?)
     }
 
     /// The put that publishes a patch, and the file whose blocks it reuses.
     /// With enough of a file reused, the stage clones that file and writes
     /// only the differing blocks over it, when the filesystem can clone.
     /// Otherwise the put carries the whole file, its reused blocks read and
-    /// checked here. The patch's layout has been checked.
+    /// checked here. The patch's layout has been checked, and `old` is the
+    /// file it reuses blocks of, if any.
     fn stage_patch<'a>(
         &mut self,
         patch: &'a SmallPatch,
+        old: Option<File>,
     ) -> Result<(SmallPut, Option<PatchSource<'a>>)> {
         if self.hash_policy.transfer_integrity
             && self.observed_payload_hash(&patch.data) != patch.hash
         {
             bail!("block hash mismatch on receive");
         }
-        let old = if patch.reuse.iter().any(Option::is_some) {
-            let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
-            Some(
-                target
-                    .root
-                    .open_regular_read(&target.relative)
-                    .with_context(|| {
-                        format!("open {} to reuse its blocks", target.label.display())
-                    })?,
-            )
-        } else {
-            None
-        };
         let put = |data: Vec<u8>, hash| SmallPut {
             path: patch.path.clone(),
             copy_id: patch.copy_id,

@@ -433,6 +433,15 @@ pub(crate) fn tcp_test_authority(root: &Path) -> RestrictedAuthority {
     test_authority(root, DeletionPolicy::Forbid, 1024)
 }
 
+/// A signed-grant authority over `root/target` that preserves times,
+/// manages modes on the receiver, and admits files of up to 1 MiB, for
+/// other modules' tests.
+pub(crate) fn time_preserving_test_authority(root: &Path) -> RestrictedAuthority {
+    let mut authority = test_authority(root, DeletionPolicy::Forbid, 1 << 20);
+    authority.copy.options.preserve_times = true;
+    authority
+}
+
 fn test_authority_with_rate(
     root: &Path,
     deletion: DeletionPolicy,
@@ -5008,6 +5017,133 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4);
 }
 
+/// Authorize, execute and settle `request` as the receiver's server does.
+fn execute_authorized(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    mut request: Request,
+) -> proto::Response {
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    let response = ops.handle(&request);
+    authority.settle(settlement, &response);
+    response
+}
+
+/// Hash `paths` and patch each from every block it holds, with
+/// receiver-managed modes and new times.
+fn compare_and_keep(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    paths: &[&Path],
+) -> Vec<std::result::Result<proto::SmallPatched, proto::SmallPatchError>> {
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let hash = Request::HashExistingBatch {
+        block,
+        files: paths.iter().map(|path| existing_read(path, 4)).collect(),
+    };
+    let proto::Response::ExistingHashes(existing) = execute_authorized(authority, ops, hash) else {
+        panic!("unexpected hash response")
+    };
+    let patches = paths
+        .iter()
+        .zip(existing)
+        .map(|(path, hashed)| {
+            let hashed = hashed.unwrap();
+            let mut patch = small_patch(path, 4, block, vec![Some(hashed.hashes[0])], b"");
+            patch.basis = hashed.fingerprint;
+            patch.meta.mtime = 1_600_000_000;
+            patch.flags = proto::flags::RECEIVER_MODE | proto::flags::TIMES;
+            patch.unchanged_flags = patch.flags;
+            patch
+        })
+        .collect();
+    match execute_authorized(authority, ops, Request::PatchSmallBatch(patches)) {
+        proto::Response::PatchedBatch(results) => results,
+        other => panic!("unexpected patch response {other:?}"),
+    }
+}
+
+#[test]
+fn keeping_one_name_of_a_file_leaves_its_other_names_stale_until_compared_again() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let (a, b) = (target.join("a"), target.join("b"));
+    fs::create_dir_all(&target).unwrap();
+    fs::write(&a, b"same").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+    let inode = fs::metadata(&a).unwrap().ino();
+    let authority = time_preserving_test_authority(&root);
+    let mut ops = crate::fsops::FsOps::new();
+    let kept = Ok(proto::SmallPatched {
+        kept: true,
+        identity: None,
+    });
+    // Both conditions hold the change time of the one file. Keeping the
+    // first name sets its times, which changes that once the clock has
+    // moved on, so the second is refused as stale with nothing written.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
+    assert_eq!(results[0], kept);
+    assert!(
+        matches!(
+            &results[1],
+            Err(proto::SmallPatchError {
+                matched: false,
+                stale_condition: true,
+                ..
+            })
+        ),
+        "{:?}",
+        results[1]
+    );
+    // Compared again, under a fresh condition, it is kept too.
+    assert_eq!(compare_and_keep(&authority, &mut ops, &[&b]), vec![kept]);
+    for path in [&a, &b] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!((metadata.ino(), metadata.mtime()), (inode, 1_600_000_000));
+        assert_eq!(fs::read(path).unwrap(), b"same");
+    }
+
+    // Contents changed after they were hashed, under a condition that still
+    // holds, fail as before: the file is neither kept nor stale.
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let hash = Request::HashExistingBatch {
+        block,
+        files: vec![existing_read(&a, 4)],
+    };
+    let proto::Response::ExistingHashes(mut existing) =
+        execute_authorized(&authority, &mut ops, hash)
+    else {
+        panic!("unexpected hash response")
+    };
+    let hashed = existing.remove(0).unwrap();
+    // A new change time shows that the file changed, as a fingerprint
+    // would.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(&a, b"SAME").unwrap();
+    let mut patch = small_patch(&a, 4, block, vec![Some(hashed.hashes[0])], b"");
+    patch.basis = hashed.fingerprint;
+    patch.flags = proto::flags::RECEIVER_MODE;
+    patch.unchanged_flags = patch.flags;
+    let response = execute_authorized(&authority, &mut ops, Request::PatchSmallBatch(vec![patch]));
+    assert!(
+        matches!(
+            &response,
+            proto::Response::PatchedBatch(results) if matches!(
+                results.as_slice(),
+                [Err(proto::SmallPatchError {
+                    matched: false,
+                    stale_condition: false,
+                    ..
+                })]
+            )
+        ),
+        "{response:?}"
+    );
+    assert_eq!(fs::read(&a).unwrap(), b"SAME");
+}
+
 #[test]
 fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
@@ -5318,10 +5454,12 @@ fn grouped_patch_receipts_record_kept_published_and_failed_files() {
             Err(proto::SmallPatchError {
                 error: "executor rejected it".into(),
                 matched: false,
+                stale_condition: false,
             }),
             Err(proto::SmallPatchError {
                 error: "keeping it failed".into(),
                 matched: true,
+                stale_condition: false,
             }),
         ]),
     );
