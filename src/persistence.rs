@@ -913,6 +913,28 @@ fn socket_is_live(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+/// A fast local readiness check, without spawning SSH or waiting for a full
+/// listen queue. Busy is an error, not evidence that a socket is stale: the
+/// existing native cleanup predicate above must not unlink a busy master.
+pub(crate) fn socket_is_ready(path: &Path) -> std::io::Result<bool> {
+    let socket = crate::process::with_inheritance_guard(|| {
+        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+    })?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&socket2::SockAddr::unix(path)?) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Serialize)]
 struct ConnectionStatus {
     endpoint: String,

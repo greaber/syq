@@ -87,6 +87,59 @@ fn scoped_records_cannot_borrow_another_scope_or_legacy_generation() {
 }
 
 #[test]
+fn warm_account_lookup_checks_local_readiness_without_replacing_a_busy_master() {
+    let root = crate::test_support::tempdir().unwrap();
+    let domain = domain(root.path(), "scope");
+    let record = new_record(&domain);
+    let control = record.control.clone();
+    let generation = ensure_generation(&domain).unwrap();
+    private_write(&control.with_extension("generation"), generation.as_bytes());
+    let record = || Record {
+        version: 1,
+        authorizer: Provider::Return("laptop".into()),
+        requested: endpoint(),
+        endpoint: endpoint(),
+        control: control.clone(),
+    };
+    assert!(active_record(&domain, record()).unwrap().is_none());
+    let listener =
+        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    listener
+        .bind(&socket2::SockAddr::unix(&control).unwrap())
+        .unwrap();
+    listener.listen(1).unwrap();
+    assert!(active_record(&domain, record()).unwrap().is_some());
+    let started = Instant::now();
+    let mut full = false;
+    for _ in 0..128 {
+        match crate::persistence::socket_is_ready(&control) {
+            Ok(true) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                full = true;
+                break;
+            }
+            other => panic!("unexpected local socket readiness: {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+    assert!(full, "fixture listen queue did not fill");
+    let error = active_record(&domain, record())
+        .err()
+        .expect("busy master must not reconnect");
+    assert!(
+        error.to_string().contains("temporarily unavailable"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(control.exists(), "busy master path must remain intact");
+    drop(listener);
+    assert!(control.exists());
+    assert!(active_record(&domain, record()).unwrap().is_none());
+    fs::remove_file(&control).unwrap();
+    assert!(active_record(&domain, record()).unwrap().is_none());
+}
+
+#[test]
 fn scoped_index_refuses_links_to_another_domain() {
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let first = domain(root.path(), "a");
