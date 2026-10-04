@@ -33,7 +33,8 @@ pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
 pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
-/// One file's fingerprint and framing in an `ExistingHashes` response.
+/// One file's fingerprint, link count and framing in an `ExistingHashes`
+/// response.
 const EXISTING_HASHES_OVERHEAD: u64 = 64;
 const COMPRESS_MIN: usize = 512;
 const WIRE_PREAMBLE_MAGIC: &[u8; 8] = b"SYQWIRE\0";
@@ -401,6 +402,10 @@ pub struct ExistingHashes {
     pub hashes: Vec<ContentDigest>,
     /// Earlier runs left partial copies of this file to resume from.
     pub partials: bool,
+    /// How many names the file has, or 0 without a file. Keeping or
+    /// replacing each other name of it can leave a patch's target condition
+    /// stale.
+    pub links: u64,
 }
 
 /// One source file to read, returning only the blocks whose comparison

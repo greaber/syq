@@ -275,9 +275,11 @@ impl FsOps {
                 fingerprint: None,
                 hashes: Vec::new(),
                 partials,
+                links: 0,
             });
         };
-        let fingerprint = fingerprint(&file.metadata()?);
+        let metadata = file.metadata()?;
+        let fingerprint = fingerprint(&metadata);
         let algorithm = self.hash_policy.algorithm;
         let mut hashes = Vec::with_capacity(blocks);
         for index in 0..blocks as u64 {
@@ -292,6 +294,7 @@ impl FsOps {
             fingerprint: Some(fingerprint),
             hashes,
             partials,
+            links: metadata.nlink(),
         })
     }
 

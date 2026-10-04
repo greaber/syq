@@ -49,10 +49,11 @@ pub(super) enum Compared {
     ResumePartial,
     /// The file could not be compared or patched: replace it whole.
     Differs,
-    /// The destination no longer met the patch's target condition, as when
-    /// keeping another name of the same file changed it: compare it once
-    /// more, under a fresh condition.
-    StaleCondition,
+    /// The destination, which had `links` names when it was hashed, no
+    /// longer met the patch's target condition, as when keeping another name
+    /// of the same file changed it: compare it again, under a fresh
+    /// condition.
+    StaleCondition { links: u64 },
     /// The destination already held the source's contents, but keeping it
     /// failed: a file error, as for a content-identical per-file finish.
     KeepFailed(WireError),
@@ -65,17 +66,29 @@ enum Stage {
     Patch,
 }
 
+/// A file of a group sent to be read.
+struct PendingRead {
+    /// Its position in the batch.
+    file: usize,
+    /// The destination's block hashes, and the fingerprint and link count
+    /// of the file they came from.
+    expected: Vec<ContentDigest>,
+    basis: Option<FileFingerprint>,
+    links: u64,
+    /// The comparison only decides whether the file is unchanged.
+    compare_only: bool,
+}
+
 /// One group's files, as positions in the batch, and what each stage
 /// learned about those still in flight.
 #[derive(Default)]
 struct Group {
     files: Vec<usize>,
-    /// Files sent to be read: the destination's block hashes, the
-    /// fingerprint of the file they came from, and whether the comparison
-    /// only decides if the file is unchanged.
-    reads: Vec<(usize, Vec<ContentDigest>, Option<FileFingerprint>, bool)>,
-    /// Files sent to be published: the bytes sent and reused.
-    published: Vec<(usize, u64, u64)>,
+    /// Files sent to be read.
+    reads: Vec<PendingRead>,
+    /// Files sent to be published: the bytes sent and reused, and the link
+    /// count of the file they replace.
+    published: Vec<(usize, u64, u64, u64)>,
 }
 
 impl Worker {
@@ -139,12 +152,19 @@ impl Worker {
                     self.sched.jobs.lock().unwrap()[i].compared = true;
                     self.sched.requeue(i);
                 }
-                Some(Compared::StaleCondition) => {
-                    // A second stale condition replaces the file whole.
+                Some(Compared::StaleCondition { links }) => {
+                    // Keeping or replacing each other name of the
+                    // destination changes the change time its condition
+                    // holds, once, and so can leave this name's condition
+                    // stale once. Comparing it again as many times as the
+                    // file has names lets every name be kept; a file that
+                    // goes stale more often than that is replaced whole.
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let job = &mut jobs[i];
-                    job.compared = job.recompared;
-                    job.recompared = true;
+                    let links = u32::try_from(links).unwrap_or(u32::MAX);
+                    job.destination_links = job.destination_links.max(links);
+                    job.recompared = job.recompared.saturating_add(1);
+                    job.compared = job.recompared > job.destination_links;
                     drop(jobs);
                     self.sched.requeue(i);
                 }
@@ -310,7 +330,7 @@ impl Worker {
                 let mut reads = Vec::new();
                 for (&i, existing) in group.files.iter().zip(existing) {
                     let job = &jobs[i];
-                    let (expected, basis) = match existing {
+                    let (expected, basis, links) = match existing {
                         Ok(ExistingHashes { partials: true, .. }) => {
                             outcomes[i] = Some(Compared::ResumePartial);
                             continue;
@@ -318,9 +338,10 @@ impl Worker {
                         Ok(ExistingHashes {
                             fingerprint,
                             hashes,
+                            links,
                             ..
                         }) if hashes.len() as u64 <= job.entry.size.div_ceil(block) => {
-                            (hashes, fingerprint)
+                            (hashes, fingerprint, links)
                         }
                         _ => continue,
                     };
@@ -335,7 +356,13 @@ impl Worker {
                         expected: expected.clone(),
                         compare_only,
                     });
-                    group.reads.push((i, expected, basis, compare_only));
+                    group.reads.push(PendingRead {
+                        file: i,
+                        expected,
+                        basis,
+                        links,
+                        compare_only,
+                    });
                 }
                 Ok((!reads.is_empty())
                     .then(|| (Stage::Read, Request::ReadDifferingBatch { block, reads })))
@@ -351,8 +378,16 @@ impl Worker {
                     Err(_) => return Ok(None),
                 };
                 let mut patches = Vec::new();
-                for ((i, expected, basis, compare_only), differing) in
-                    std::mem::take(&mut group.reads).into_iter().zip(differing)
+                for (
+                    PendingRead {
+                        file: i,
+                        expected,
+                        basis,
+                        links,
+                        compare_only,
+                    },
+                    differing,
+                ) in std::mem::take(&mut group.reads).into_iter().zip(differing)
                 {
                     let job = &jobs[i];
                     let Ok(DifferingBlocks {
@@ -415,7 +450,7 @@ impl Worker {
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
                     });
-                    group.published.push((i, sent, reused));
+                    group.published.push((i, sent, reused, links));
                 }
                 Ok(
                     (!patches.is_empty())
@@ -446,7 +481,7 @@ impl Worker {
         if patched.len() != group.published.len() {
             return;
         }
-        for (&(i, sent, reused), patched) in group.published.iter().zip(patched) {
+        for (&(i, sent, reused, links), patched) in group.published.iter().zip(patched) {
             outcomes[i] = Some(match patched {
                 Ok(SmallPatched {
                     kept: true,
@@ -465,7 +500,7 @@ impl Worker {
                 Err(SmallPatchError {
                     stale_condition: true,
                     ..
-                }) => Compared::StaleCondition,
+                }) => Compared::StaleCondition { links },
                 Err(_) => Compared::Differs,
             });
         }
@@ -500,7 +535,7 @@ impl Worker {
             Compared::SourceChanged(_)
             | Compared::ResumePartial
             | Compared::Differs
-            | Compared::StaleCondition => unreachable!("these files are requeued"),
+            | Compared::StaleCondition { .. } => unreachable!("these files are requeued"),
         }
     }
 
