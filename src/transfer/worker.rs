@@ -285,6 +285,9 @@ impl Worker {
                 .destination(idx)
                 .is_none_or(|existing| self.replaces_without_comparison(j, existing))
             && (!self.opts.inplace || j.inplace)
+            // A restricted receiver's in-place grant refuses batched
+            // publication.
+            && !(self.opts.restricted_receiver && self.opts.inplace)
     }
 
     /// An existing file whose contents this copy would replace without

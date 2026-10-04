@@ -1209,6 +1209,16 @@ syq cp --from source --srcs-in /tmp/syq-real-ssh/tuning-batches \
 assert_same_tree source /tmp/syq-real-ssh/tuning-batches \
     destination /tmp/syq-real-ssh/tuning-batches tuning-batches
 
+printf 'case: in-place copies of small files through a command-restricted receiver\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-small; for n in 1 2 3; do printf "small $n" >/tmp/syq-real-ssh/inplace-small/$n; done'
+syq cp --inplace --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \
+    --to destination --into /tmp/syq-real-ssh/inplace-small
+ssh source 'printf "changed 2" >/tmp/syq-real-ssh/inplace-small/2'
+syq cp --inplace --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-small \
+    --to destination --into /tmp/syq-real-ssh/inplace-small
+assert_same_tree source /tmp/syq-real-ssh/inplace-small \
+    destination /tmp/syq-real-ssh/inplace-small inplace-small
+
 # Final checks after every selected case.
 if ssh source 'pgrep -x syq >/dev/null' || ssh destination 'pgrep -x syq >/dev/null'; then
     echo 'a remote syq process survived the attached test suite' >&2
