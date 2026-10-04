@@ -95,3 +95,7 @@ Named paths, `--src`, and `--src-non-dir` require non-directories. Use
 to remove its contents while keeping the directory. These directory selectors
 reject a final symlink even when following is enabled. All selections are
 checked before deletion begins. Filters are not supported.
+
+A concurrent rename can leave a selected directory at its new name even when
+removal succeeds. Avoid concurrent renames if all selected directories must
+be removed.

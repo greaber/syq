@@ -90,6 +90,35 @@ fn selector(path: &[u8], kind: NativeRemoveKind) -> NativeRemoveSelection {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn removed_directory_accepts_stale_handles_and_synthetic_fuse_link_counts() {
+    assert!(
+        check_removed_directory(Err(io::Error::from_raw_os_error(libc::ESTALE)), || {
+            panic!("a stale removed handle needs no filesystem query")
+        })
+        .is_ok()
+    );
+    assert!(
+        check_removed_directory(Err(io::Error::from_raw_os_error(libc::EACCES)), || true).is_err()
+    );
+
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("directory");
+    fs::create_dir(&path).unwrap();
+    let directory = File::open(&path).unwrap();
+    assert!(directory.metadata().unwrap().nlink() > 0);
+    // A synthetic positive count carries no evidence that the directory
+    // survived. A reliable positive count still catches the rename race.
+    assert!(check_removed_directory(directory.metadata(), || true).is_ok());
+    assert!(check_removed_directory(directory.metadata(), || false).is_err());
+    fs::remove_dir(&path).unwrap();
+    assert!(check_removed_directory(directory.metadata(), || {
+        panic!("a zero link count needs no filesystem query")
+    })
+    .is_ok());
+}
+
 #[test]
 fn selector_grammar_distinguishes_unconfined_and_rooted_bases() {
     for path in [&b"."[..], b"..", b"a/../b", b"a/./b", b"a//b/"] {

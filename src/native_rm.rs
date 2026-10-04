@@ -1173,10 +1173,11 @@ enum RemovePinnedOutcome {
 /// no identity-conditioned unlink, so an entry renamed over the name between
 /// them is removed as a single entry (never followed or descended) while the
 /// pinned object survives under its new name. For a directory the caller
-/// passes the descriptor it holds on the pinned directory, and on Linux every
-/// outcome that is not already a failure is checked against it: a pinned
-/// directory that is still linked afterwards, whether its name was swapped
-/// or renamed away, is reported as a failure instead of success. Leaves hold
+/// passes the descriptor it holds on the pinned directory. Where the filesystem
+/// reports reliable link counts, a pinned directory still linked afterwards
+/// is reported as a failure. FUSE can synthesize link counts and network
+/// filesystems can invalidate removed handles; those cannot prove that a
+/// concurrent rename did not leave the directory elsewhere. Leaves hold
 /// no descriptor, so a swapped leaf cannot be detected afterwards.
 fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<RemovePinnedOutcome> {
     let outcome = unlink_pinned(name, held_directory.is_some())?;
@@ -1216,16 +1217,31 @@ fn unlink_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutco
         .context("remove pinned object")
 }
 
-/// Once the pinned name is gone, the held descriptor must refer to an
-/// unlinked directory; otherwise the selected directory survives under
-/// another name, either because a replacement was removed in its place or
-/// because it was renamed away. Linux clears the link count of a removed
-/// directory. macOS keeps reporting the old count, so this check is not
-/// available there.
+/// Local Linux filesystems clear an unlinked directory's link count. NFS and
+/// SSHFS can instead invalidate its handle; FUSE can keep a synthetic positive
+/// count after removal. Those outcomes must not turn a successful rmdir into
+/// a false failure. macOS also keeps the old count and skips this extra check.
 #[cfg(target_os = "linux")]
 fn require_unlinked_directory(directory: &File) -> Result<()> {
-    let metadata = directory.metadata().context("inspect removed directory")?;
-    if metadata.nlink() != 0 {
+    check_removed_directory(directory.metadata(), || {
+        // Probe only the ambiguous positive-link case, not normal local
+        // removals. Failure to identify FUSE preserves the original check.
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        retry_zero(|| unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) }).is_ok()
+            && unsafe { stats.assume_init() }.f_type as u32 == libc::FUSE_SUPER_MAGIC as u32
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn check_removed_directory(
+    metadata: io::Result<std::fs::Metadata>,
+    is_fuse: impl FnOnce() -> bool,
+) -> Result<()> {
+    let metadata = match metadata {
+        Err(error) if error.raw_os_error() == Some(libc::ESTALE) => return Ok(()),
+        result => result.context("inspect removed directory")?,
+    };
+    if metadata.nlink() != 0 && !is_fuse() {
         bail!(
             "removal target {}:{} is still linked after its name was removed; the selected directory remains under another name",
             metadata.dev(),
