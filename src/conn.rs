@@ -363,9 +363,7 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || crate::destination::peer_bridge::is_setup_refusal(error)
-        || error
-            .chain()
-            .any(|cause| cause.is::<crate::destination::SshWorkersUnavailable>())
+        || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
             .chain()

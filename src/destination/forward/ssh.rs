@@ -692,6 +692,7 @@ mod tests {
         .to_openssh()
         .unwrap()
     }
+    #[track_caller]
     fn setup_key(ticket: &Ticket, public: &str) -> Reply {
         let mut socket = ticket.connect().unwrap();
         write_message(&mut socket, &public).unwrap();
@@ -927,7 +928,10 @@ mod tests {
         assert!(
             matches!(setup_reply(invalid), Reply::Error(message) if message.contains("build mismatch"))
         );
-        assert_eq!(*seen.lock().unwrap(), vec![public_key(1); 3]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![canonical_key(&public_key(1)).unwrap(); 3]
+        );
     }
 
     #[test]
@@ -957,7 +961,10 @@ mod tests {
             "{busy:#}"
         );
         assert!(!super::super::peer_bridge::is_setup_refusal(&busy));
-        setup.completed = Some((public_key(1), Err("destination home is unwritable".into())));
+        setup.completed = Some((
+            canonical_key(&public_key(1)).unwrap(),
+            Err("destination home is unwritable".into()),
+        ));
         drop(setup);
         for _ in 0..2 {
             let refused = attempt();

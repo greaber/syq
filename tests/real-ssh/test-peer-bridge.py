@@ -405,7 +405,9 @@ def main():
         controls = {row["control"] for row in rows}
         for host, path in (("source", b + "/da"), ("destination", c + "/")):
             words = ["syq", "cp", "--auth-from", "@laptop", "--from", host, path]
-            requester("completion", "__complete", "fish", str(len(words) - 1), "--", *words)
+            remote("requester", shlex.join([
+                "env", "PATH=/usr/bin:/bin:/usr/local/bin", "syq", "completion",
+                "__complete", "fish", str(len(words) - 1), "--", *words]))
         wait_for("prepared helpers on both approved masters",
                  lambda: probe("requester", "pool_spares", controls=list(controls)))
         no_pending()
