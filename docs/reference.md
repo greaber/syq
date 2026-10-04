@@ -183,11 +183,15 @@ files selected for copying in `syq cp`.
 | Strategy | Behavior |
 |---|---|
 | `whole-file` | Copy the selected file without comparing or reusing blocks from the final destination |
-| `aligned-block` | Reuse matching blocks at the same offsets in the corresponding destination file; shifted blocks and blocks from other files are not matched |
-| `locality` (default) | Use `whole-file` for local copies and `aligned-block` when a syq endpoint is remote |
+| `aligned-block` | Compare each replaced file with the destination file and reuse matching blocks at the same offsets; shifted blocks and blocks from other files are not matched |
+| `locality` (default) | Use `whole-file` for local copies. When a syq endpoint is remote, use `aligned-block` for a file whose destination has the same size, and `whole-file` for one whose size changed |
 
-`locality` treats paths on mounted network filesystems as local. It chooses by
-endpoint location, without measuring link or filesystem speed. To choose explicitly:
+A file whose size changed was usually rewritten, so `locality` copies it whole
+rather than reading the old file to look for matching blocks. A file with the
+same size may be unchanged or edited in place, and comparing it costs about a
+read of the old file on the destination. `locality` treats paths on mounted
+network filesystems as local. It chooses by endpoint location and file size,
+without measuring link or filesystem speed. To choose explicitly:
 
 ```sh
 syq cp --srcs-in source --to server --into destination \
@@ -201,8 +205,7 @@ sizes; automatic tuning remains enabled.
 
 `syq rsync` uses rsync's spellings: `-W` / `--whole-file` selects whole-file
 copying; `--no-W` / `--no-whole-file` selects aligned-block reuse. If both are
-specified, the last one wins. Its default is whole-file for local copies and
-aligned-block for remote copies.
+specified, the last one wins. Its default is `locality`.
 
 S3 and descriptor copies do not accept `--transfer-strategy`. See
 [comparison tuning](tuning.md#compare-block-reuse-with-full-replacement)

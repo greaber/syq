@@ -299,7 +299,7 @@ impl Worker {
     /// deciding what to write.
     fn replaces_in_batch(&self, job: &FileJobData, existing: &Entry) -> bool {
         let inspects_destination = self.inspects_destination(job)
-            || (self.reuses_blocks()
+            || (self.reuses_blocks_for(job, Some(existing))
                 && !job.compared
                 && (job.entry.size > super::small_compare::PATCH_MAX_FILE
                     || self.compares_first(job, existing)));
@@ -316,10 +316,22 @@ impl Worker {
             || (self.opts.hardlinks && job.entry.nlink > 1)
     }
 
-    fn reuses_blocks(&self) -> bool {
-        self.opts
-            .transfer_strategy
-            .reuse_destination_blocks(self.opts.same_host)
+    /// Whether to compare this file with the one it replaces and reuse its
+    /// matching blocks. The default strategy compares a remote file only
+    /// when its destination has the same size: a file whose size changed
+    /// was almost always rewritten, and comparing it would read and hash
+    /// the old file for nothing. An explicit aligned-block strategy compares
+    /// every replaced file.
+    pub(super) fn reuses_blocks_for(&self, job: &FileJobData, existing: Option<&Entry>) -> bool {
+        match self.opts.transfer_strategy {
+            crate::cli::TransferStrategy::Locality => {
+                !self.opts.same_host
+                    && existing.is_none_or(|existing| {
+                        existing.kind != Kind::File || existing.size == job.entry.size
+                    })
+            }
+            strategy => strategy.reuse_destination_blocks(self.opts.same_host),
+        }
     }
 
     /// Whether a destination can hold any of a file's blocks: its size
@@ -337,7 +349,7 @@ impl Worker {
     pub(super) fn compare_candidate(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
-        self.reuses_blocks()
+        self.reuses_blocks_for(j, jobs.destination(idx))
             && !j.compared
             && !self.opts.dry_run
             && j.attempt == 0
@@ -1042,10 +1054,7 @@ impl Worker {
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
         let inplace = job.inplace;
-        let reuse_blocks = self
-            .opts
-            .transfer_strategy
-            .reuse_destination_blocks(self.opts.same_host);
+        let reuse_blocks = self.reuses_blocks_for(&job, job.dst_entry.as_deref());
         let final_file = job
             .dst_entry
             .as_deref()

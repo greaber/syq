@@ -29,7 +29,7 @@ pub enum TransferStrategy {
     WholeFile,
     /// Reuse matching blocks at the same offsets in the corresponding destination file.
     AlignedBlock,
-    /// Use whole-file locally and aligned-block with a remote syq endpoint.
+    /// Use whole-file locally; with a remote syq endpoint, aligned-block for files of unchanged size and whole-file for the rest.
     #[default]
     Locality,
 }
@@ -62,7 +62,7 @@ impl TransferStrategy {
     }
 }
 
-const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
+const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems; when a syq endpoint is remote, it uses aligned-block for files whose destination has the same size and whole-file for files whose size changed. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {

@@ -193,7 +193,8 @@ in every mode: matching bytes from interrupted copies can still be reused,
 even with `whole-file`. The setting controls reuse of the final destination, not partials.
 
 With block reuse enabled, a replaced file of up to 64 MiB is compared before
-any of its contents are sent, together with other files. The receiving side
+any of its contents are sent, together with other files. (The default
+strategy compares only files whose destination has the same size.) The receiving side
 hashes the file it would replace in 64 KiB blocks, the sending side reads the
 source once and sends only the blocks that differ, and the receiving side
 builds the new file from those and its own matching blocks, checking each

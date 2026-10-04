@@ -458,6 +458,50 @@ fn bandwidth_limited_copies_send_only_the_small_files_that_differ() {
 }
 
 #[test]
+fn by_default_only_replaced_files_of_unchanged_size_are_compared() {
+    for explicit in [false, true] {
+        let t = Tmp::new();
+        let source = prng(2 << 20, 873);
+        let mut edited = source.clone();
+        edited[5] ^= 1;
+        write(&t.path("src/grown"), &source);
+        write(&t.path("dst/grown"), &source[..1 << 20]);
+        write(&t.path("src/edited"), &source);
+        write(&t.path("dst/edited"), &edited);
+        for name in ["grown", "edited"] {
+            set_mtime(&t.path(&format!("dst/{name}")), 1);
+        }
+        let rsh = fake_rsh(&t);
+        let destination = format!("fake:{}", t.s("dst/"));
+        let mut args = vec![
+            "-a",
+            "--rsync-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--syq-no-bootstrap",
+        ];
+        if explicit {
+            args.push("--no-W");
+        }
+        let source_dir = t.s("src/");
+        args.extend([source_dir.as_str(), destination.as_str()]);
+        let out = remote_syq_command(&t, &rsh, &args)
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        for name in ["grown", "edited"] {
+            assert_eq!(read(&t.path(&format!("dst/{name}"))), source, "{name}");
+        }
+        // A file whose size changed is copied whole without reading the old
+        // one, unless block reuse was chosen explicitly.
+        let observed = tuning_observed(&out);
+        let compared = if explicit { 2 } else { 1 };
+        assert_eq!(observed["compared_files"], compared, "explicit={explicit}");
+        assert_eq!(observed["patched_files"], compared, "explicit={explicit}");
+    }
+}
+
+#[test]
 fn a_leftover_partial_sends_a_replaced_file_to_the_resuming_path() {
     let t = Tmp::new();
     let source = prng(8 << 20, 871);
