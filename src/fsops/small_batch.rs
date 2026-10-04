@@ -24,6 +24,8 @@ pub(super) struct SmallStage {
     label: PathBuf,
     file: File,
     reused: bool,
+    /// Made as a clone of the file its patch replaces, as macOS clones.
+    cloned: bool,
     /// Read right after the sidecar was opened, when an NFS client answers
     /// from the create's reply; it decides the metadata step and gives the
     /// published identity, which a rename does not change.
@@ -74,6 +76,8 @@ fn on_threads<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> 
 thread_local! {
     /// Refuses the threads this thread starts, as a process limit would.
     static REFUSE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Patched files this thread wrote over a clone of the file they replace.
+    static CLONED_PATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Start `work` on a thread of `scope`, unless the system refuses one.
@@ -150,6 +154,9 @@ pub(super) struct PatchSource<'a> {
     patch: &'a SmallPatch,
 }
 
+/// Clone the file a patch replaces into its created stage. Linux clones into
+/// an open file; macOS clones only into a new name, so there the stage is
+/// made as the clone instead (`clone_patch_stage`).
 fn try_clone_basis(old: &File, stage: &File, len: u64) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -601,9 +608,10 @@ impl FsOps {
     }
 
     /// Write a cloning patch's stage: the file it replaces, cloned, with the
-    /// differing blocks written over it. When the file cannot be cloned, or
-    /// changed after it was hashed, the stage holds the assembled file
-    /// instead, its reused blocks read and checked again.
+    /// differing blocks written over it. A stage made as the clone holds it
+    /// already; any other is cloned into here. When the file cannot be
+    /// cloned, or changed after it was hashed, the stage holds the assembled
+    /// file instead, its reused blocks read and checked again.
     /// Write a patched file, observed unless `unobserved` collects its bytes
     /// for a caller that records them, as `write_small_stage` does.
     fn write_patch_stage(
@@ -614,9 +622,12 @@ impl FsOps {
     ) -> Result<()> {
         let patch = source.patch;
         let file = &stage.file;
-        file.set_len(0)?;
-        let cloned = try_clone_basis(&source.old, file, source.basis.len)
-            && fingerprint(&source.old.metadata()?) == source.basis;
+        let cloned = if stage.cloned {
+            true
+        } else {
+            file.set_len(0)?;
+            try_clone_basis(&source.old, file, source.basis.len)
+        } && fingerprint(&source.old.metadata()?) == source.basis;
         if !cloned {
             file.set_len(0)?;
             let data = assemble(Some(&source.old), self.hash_policy.algorithm, patch)?;
@@ -628,6 +639,8 @@ impl FsOps {
             }
             .with_context(|| format!("write {}", stage.label.display()));
         }
+        #[cfg(test)]
+        CLONED_PATCHES.set(CLONED_PATCHES.get() + 1);
         let writing = unobserved.is_none().then(|| {
             self.operation
                 .span(crate::transfer_observations::Stage::DestinationWrite)
@@ -745,13 +758,14 @@ impl FsOps {
             return;
         };
         let (root, directory) = (first.root.clone(), first.relative.clone());
+        let source = |index: usize| sources.get(index).and_then(Option::as_ref);
         let mut stages = Vec::with_capacity(run.len());
         {
             // A turn only schedules. If it cannot be taken, the operations
             // themselves report what is wrong with the path.
             let _turn = root.mutation_turn(&directory).ok();
             for (index, target) in run {
-                match self.create_small_stage(&puts[index], target) {
+                match self.create_stage(&puts[index], source(index), target) {
                     Ok(stage) => stages.push((index, stage)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
@@ -766,7 +780,6 @@ impl FsOps {
         let network = stages.first().is_some_and(|(_, stage)| {
             stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
         });
-        let source = |index: usize| sources.get(index).and_then(Option::as_ref);
         let written: Vec<Result<()>> = if network {
             let writing = self
                 .operation
@@ -831,6 +844,69 @@ impl FsOps {
         }
     }
 
+    /// Create the stage of a put, or of a patch with the file it reuses
+    /// blocks of. On macOS, where a clone is a new file, a cloning patch's
+    /// stage is made as a clone of that file when it can be.
+    fn create_stage(
+        &mut self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+        target: RootedTarget,
+    ) -> Result<SmallStage> {
+        #[cfg(target_os = "macos")]
+        if let Some(source) = source {
+            if let Some((partial, label, file)) = self.clone_patch_stage(put, source, &target)? {
+                let created = file.metadata()?;
+                return Ok(SmallStage {
+                    target,
+                    partial,
+                    label,
+                    file,
+                    reused: false,
+                    cloned: true,
+                    created,
+                });
+            }
+        }
+        let _ = source;
+        self.create_small_stage(put, target)
+    }
+
+    /// Clone the file a patch reuses blocks of to the patch's sidecar name,
+    /// as the per-file path clones its basis, and return the clone opened.
+    /// None when the file cannot be cloned there, or when the clone is not
+    /// fit to stage protected data, as a reused sidecar would not be; the
+    /// stage is then created as any other, and replaces the clone.
+    #[cfg(target_os = "macos")]
+    fn clone_patch_stage(
+        &mut self,
+        put: &SmallPut,
+        source: &PatchSource<'_>,
+        target: &RootedTarget,
+    ) -> Result<Option<(RelativePath, PathBuf, File)>> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+            return Ok(None);
+        }
+        self.uncache_rooted(&target.root, &target.relative);
+        let metadata = source.old.metadata()?;
+        let (partial, label, clone) = with_rooted_partial(target, &put.copy_id, |relative, _| {
+            self.uncache_rooted(&target.root, relative);
+            // A clone of a different length fails here; the stage then
+            // assembles the file, which reads its reused blocks again.
+            target
+                .root
+                .clone_file_open(&source.old, &metadata, relative, source.basis.len)
+        })?;
+        let Some(file) = clone else {
+            return Ok(None);
+        };
+        if !self.reusable_partial_permissions(&file)? {
+            return Ok(None);
+        }
+        Ok(Some((partial, label, file)))
+    }
+
     pub(super) fn create_small_stage(
         &mut self,
         put: &SmallPut,
@@ -868,6 +944,7 @@ impl FsOps {
             label,
             file,
             reused: basis_size.is_some(),
+            cloned: false,
             created,
         })
     }
@@ -990,6 +1067,39 @@ mod tests {
 
     fn entries(directory: &Path) -> usize {
         fs::read_dir(directory).unwrap().count()
+    }
+
+    /// Whether the filesystem holding `directory` clones files, probed apart
+    /// from the code under test. Linux clones on some filesystems only;
+    /// macOS CI runs on APFS, which clones.
+    fn clones_files(directory: &Path) -> bool {
+        let probe = directory.join("clone-probe");
+        fs::write(&probe, [1; 4096]).unwrap();
+        let source = File::open(&probe).unwrap();
+        #[cfg(target_os = "linux")]
+        let cloned = crate::local_copy::try_clone(
+            &source,
+            &File::create(directory.join("clone-probe-copy")).unwrap(),
+            4096,
+        );
+        #[cfg(target_os = "macos")]
+        let cloned = unsafe {
+            libc::fclonefileat(
+                source.as_raw_fd(),
+                File::open(directory).unwrap().as_raw_fd(),
+                c"clone-probe-copy".as_ptr(),
+                0,
+            )
+        } == 0;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let cloned = false;
+        let _ = fs::remove_file(directory.join("clone-probe-copy"));
+        fs::remove_file(&probe).unwrap();
+        assert!(
+            cloned || !cfg!(target_os = "macos") || std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "macOS CI requires a TMPDIR that clones files"
+        );
+        cloned
     }
 
     #[test]
@@ -1171,10 +1281,17 @@ mod tests {
                 patch("raced", hashed[1].as_ref().unwrap()),
             ];
             assert_eq!(patches[0].data.len() as u64, 2 * block + 4);
-            // A reused block of "raced" changes after it was hashed.
+            // A reused block of "raced" changes after it was hashed. A clone
+            // keeps reused blocks unread, so only the change time shows the
+            // change: wait until the write gives a new one.
+            std::thread::sleep(std::time::Duration::from_millis(50));
             let mut raced = old.clone();
             raced[0] ^= 1;
             fs::write(directory.join("raced"), &raced).unwrap();
+            let now = fingerprint(&fs::metadata(directory.join("raced")).unwrap());
+            assert_ne!(Some(now), patches[1].basis);
+            let cloned = clones_files(directory);
+            CLONED_PATCHES.set(0);
             let results = ops.patch_small_batch(&patches).unwrap();
             assert!(results[0].is_ok(), "{:?}", results[0]);
             assert_eq!(
@@ -1182,6 +1299,7 @@ mod tests {
                 new,
                 "sparse {sparse}"
             );
+            assert_eq!(CLONED_PATCHES.get(), usize::from(cloned), "sparse {sparse}");
             assert!(results[1].is_err(), "{:?}", results[1]);
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
             assert_eq!(entries(directory), 2);
@@ -1263,9 +1381,12 @@ mod tests {
                 assert_eq!(fs::read(directory.join("file")).unwrap(), old);
                 assert_eq!(entries(directory), 1, "{blocks} blocks");
             }
+            let cloned = blocks == 32 && clones_files(directory);
+            CLONED_PATCHES.set(0);
             let results = ops.patch_small_batch(&[valid]).unwrap();
             assert!(results[0].is_ok(), "{blocks} blocks: {:?}", results[0]);
             assert_eq!(fs::read(directory.join("file")).unwrap(), new);
+            assert_eq!(CLONED_PATCHES.get(), usize::from(cloned), "{blocks} blocks");
             assert_eq!(entries(directory), 1);
         }
     }
