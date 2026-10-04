@@ -1,12 +1,12 @@
 //! Shared bounded S3 deletion with one outcome per requested key/version.
-use super::{client, tuning::Budget};
+use super::client;
 use anyhow::Result;
 use aws_sdk_s3::{
     error::ProvideErrorMetadata,
     types::{Delete, ObjectIdentifier},
     Client,
 };
-use futures_util::{stream, StreamExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -74,7 +74,7 @@ fn failure_classification(
 pub(super) struct Deleter<'a> {
     pub client: &'a Client,
     pub bucket: &'a str,
-    pub budget: &'a std::sync::Arc<Budget>,
+    pub concurrency: crate::deletion::Concurrency,
     pub individual: bool,
 }
 impl Deleter<'_> {
@@ -85,31 +85,57 @@ impl Deleter<'_> {
         check: impl Fn() -> Result<()>,
         mut finished: impl FnMut(&T, std::result::Result<(), Failure>),
     ) -> Result<()> {
-        let mut batches = stream::iter(items.chunks(if self.individual { 1 } else { 1000 }).map(
-            |batch| {
-                let identify = &identify;
-                let check = &check;
-                async move {
-                    let _slot = self.budget.acquire().await;
-                    check()?;
-                    let targets: Vec<_> = batch.iter().map(identify).collect();
-                    let outcomes = self.batch(&targets).await;
-                    Ok::<_, anyhow::Error>((batch, outcomes))
-                }
-            },
-        ))
-        .buffer_unordered(10);
+        let mut tuning = crate::deletion::Control::new(self.concurrency);
+        let mut batches = items.chunks(if self.individual { 1 } else { 1000 });
+        let mut pending = FuturesUnordered::new();
         let mut failure = None;
-        // Stop starting requests when check fails, but drain all started ones.
-        while let Some(result) = batches.next().await {
-            match result {
-                Ok((batch, outcomes)) => {
+        let mut interval = tokio::time::interval(crate::deletion::SAMPLE);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut sampled = tokio::time::Instant::now();
+        let mut completed = 0;
+        let mut generation = 0;
+        let mut old_pending = 0usize;
+        loop {
+            while failure.is_none() && pending.len() < tuning.limit() {
+                let Some(batch) = batches.next() else { break };
+                if let Err(error) = check() {
+                    failure = Some(error);
+                    break;
+                }
+                let targets: Vec<_> = batch.iter().map(&identify).collect();
+                let prepared = generation;
+                pending.push(async move { (prepared, batch, self.batch(&targets).await) });
+            }
+            if pending.is_empty() {
+                break;
+            }
+            // Stop admitting on cancellation, but report every request already
+            // sent. No detached request may outlive the deletion operation.
+            tokio::select! {
+                result = pending.next() => {
+                    let (prepared, batch, outcomes) = result.unwrap();
+                    if prepared != generation {
+                        old_pending -= 1;
+                    }
                     for (item, outcome) in batch.iter().zip(outcomes) {
+                        if outcome.is_ok() { completed += 1; }
                         finished(item, outcome);
                     }
+                    if old_pending > 0 {
+                        completed = 0;
+                        sampled = tokio::time::Instant::now();
+                    }
                 }
-                Err(error) => {
-                    failure.get_or_insert(error);
+                _ = interval.tick(), if self.concurrency.automatic && failure.is_none() => {
+                    let before = tuning.limit();
+                    let limit = tuning.observe(completed, sampled.elapsed(),
+                        old_pending == 0 && pending.len() >= before && batches.len() >= before);
+                    completed = 0;
+                    sampled = tokio::time::Instant::now();
+                    if limit != before {
+                        generation += 1;
+                        old_pending = pending.len();
+                    }
                 }
             }
         }
@@ -253,3 +279,6 @@ impl Deleter<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

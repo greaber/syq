@@ -1123,3 +1123,36 @@ fn rsync_whole_file_spellings_follow_last_option_and_keep_native_defaults_separa
         NativeCopyCommand::try_parse_from(["cp", "-W", "source", "--as", "destination"]).is_err()
     );
 }
+
+#[test]
+fn removal_tuning_accepts_only_the_matching_endpoint_control() {
+    let parse =
+        |words: &[&str]| Args::parse_args(&words.iter().map(OsString::from).collect::<Vec<_>>());
+    let filesystem = parse(&["rm", "file", "--performance-tuning=workers=3"]).unwrap();
+    assert_eq!(filesystem.connections_opt, Some(3));
+    let s3 = parse(&[
+        "rm",
+        "--on=s3://bucket",
+        "key",
+        "--performance-tuning=s3-requests=4",
+    ])
+    .unwrap();
+    assert_eq!(s3.tuning_options.unwrap().s3_requests, Some(4));
+    for words in [
+        vec!["rm", "file", "--performance-tuning=s3-requests=4"],
+        vec![
+            "rm",
+            "--on=s3://bucket",
+            "key",
+            "--performance-tuning=workers=3",
+        ],
+        vec![
+            "rm",
+            "--on=s3://bucket",
+            "key",
+            "--performance-tuning=s3-objects=4",
+        ],
+    ] {
+        assert!(parse(&words).is_err(), "{words:?}");
+    }
+}
