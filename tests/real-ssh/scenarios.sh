@@ -448,16 +448,20 @@ if syq persist receive approve "$request_id"; then echo 'disconnected request wa
 test ! -e "$receive_root/disconnected"
 
 printf 'case: changing policy cancels a pending request\n'
+max_entries=$(syq persist receive status --json | python3 -c 'import json,sys; value=json.load(sys.stdin)["settings"]["max_entries"]; assert value > 1; print(value)')
 timeout 20 ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as cancelled-policy' &
 return_copy_pid=$!
 syq persist receive pending --wait --timeout 10 --json > /tmp/syq-pending.json
 request_id=$(python3 -c 'import json; print(json.load(open("/tmp/syq-pending.json"))[0]["id"])')
-syq persist receive on --notify off
+# Notification delivery is harmless; change an actual access limit instead.
+syq persist receive on --max-entries "$((max_entries - 1))" --notify off
 if wait "$return_copy_pid"; then echo 'cancelled copy succeeded' >&2; exit 1; else test "$?" -ne 124; fi
 return_copy_pid=
 syq persist receive wait source --timeout 30
 if syq persist receive approve "$request_id"; then echo 'cancelled request was approved' >&2; exit 1; fi
 test ! -e "$receive_root/cancelled-policy"
+syq persist receive on --max-entries "$max_entries"
+syq persist receive wait source --timeout 30
 
 printf 'case: native Linux notification actions control return copies\n'
 dbus-run-session -- python3 /usr/local/libexec/syq-test-receive-notifications.py

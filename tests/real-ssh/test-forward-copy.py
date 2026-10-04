@@ -60,7 +60,7 @@ def copy(path, *, allow=True, success=True, extra=(), cancel=False,
                         progress += 5
                     time.sleep(.1)
                 assert state == prefix, ("no complete resumable prefix before deadline", state)
-                run("syq", "persist", "receive", "on", "--notify", "off")
+                run("syq", "persist", "receive", "off", "--name", "laptop")
             deadline = time.monotonic() + 65
             last_output = 0
             while True:
@@ -336,7 +336,7 @@ copy("/tmp/syq-real-ssh/forward/ssh", extra=("--no-tcp",), auth=("--auth-from", 
 assert remote("sha256sum /tmp/syq-real-ssh/forward/ssh").split()[0] == source_hash
 wait_key_cleanup()
 
-print("case: receiver restart revokes an active remote copy; a new approval can resume", flush=True)
+print("case: stopping receiving revokes an active remote copy; a new approval can resume", flush=True)
 source = "/tmp/syq-real-ssh/return-source/forward-resume.bin"
 run("ssh", "source", f"dd if=/dev/urandom of={source} bs=1M count=16 status=none")
 prefix = run("ssh", "source", f"dd if={source} bs=1M count=4 status=none | sha256sum")
@@ -345,6 +345,7 @@ expected = run("ssh", "source", f"sha256sum {source}").split()[0]
 copy("/tmp/syq-real-ssh/forward/cancelled", source=source, prefix=prefix,
      extra=("--resource-limits", "bandwidth=512"), cancel=True, success=False)
 remote("test ! -e /tmp/syq-real-ssh/forward/cancelled")
+run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
 run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 results = "/tmp/syq-real-ssh/forward-resume.ndjson"
 copy("/tmp/syq-real-ssh/forward/cancelled", source=source, extra=("--results", results))
