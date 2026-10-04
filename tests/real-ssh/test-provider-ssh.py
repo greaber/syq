@@ -92,8 +92,11 @@ def provider_sshd(root, public_key, provider_environment):
         "AuthorizedKeysFile " + str(authorized), "StrictModes yes", "AllowUsers syq",
         "AuthenticationMethods publickey", "PubkeyAuthentication yes",
         "PasswordAuthentication no", "KbdInteractiveAuthentication no", "UsePAM no",
-        "UseDNS no", "AllowAgentForwarding no", "AllowTcpForwarding no",
-        "AllowStreamLocalForwarding local", "X11Forwarding no", "PermitTTY no",
+        "UseDNS no", "AllowAgentForwarding no",
+        # OpenSSH 9.2 initializes shared local-forward permissions from the
+        # TCP flag; denying it also denies Unix socket connections.
+        "AllowTcpForwarding local", "AllowStreamLocalForwarding local",
+        "X11Forwarding no", "PermitTTY no",
         "MaxSessions " + str(max_sessions), "LogLevel VERBOSE",
         # OpenSSH uses only the first SetEnv directive. Both variables must
         # be assignments in that one directive.
@@ -104,7 +107,11 @@ def provider_sshd(root, public_key, provider_environment):
     # The service inherits the local agent. Incoming provider logins do not.
     environment.pop("SSH_AUTH_SOCK", None)
     environment.pop("SSH_AGENT_PID", None)
-    run("/usr/sbin/sshd", "-t", "-f", str(config), env=environment)
+    effective = run("/usr/sbin/sshd", "-T", "-f", str(config), env=environment)
+    policy = dict(line.split(" ", 1) for line in effective.splitlines() if " " in line)
+    for name, expected in {"allowtcpforwarding": "local", "allowstreamlocalforwarding": "local",
+                           "allowagentforwarding": "no", "disableforwarding": "no"}.items():
+        assert policy.get(name) == expected, (name, policy.get(name), expected)
     with (root / "sshd.log").open("w+") as log:
         process = subprocess.Popen(["/usr/sbin/sshd", "-D", "-e", "-f", str(config)],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
