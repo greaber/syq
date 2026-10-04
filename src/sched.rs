@@ -500,7 +500,8 @@ struct Inner {
     /// Workers currently processing one pipelined small-file batch.
     fast_batches: usize,
     fast_groups: Vec<FastBatchHandle>,
-    /// Planning has observed at least one regular file, before destination
+    /// Planning has found work for a regular file: a queued job, or, for an
+    /// empty destination, a selected source file before destination
     /// namespace checks and directory creation make it runnable.
     file_work_anticipated: bool,
     scan_done: bool,
@@ -590,10 +591,14 @@ impl Sched {
         let mut inner = self.inner.lock().unwrap();
         inner.files.register(idx, &job.dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
+        let first_work = !std::mem::replace(&mut inner.file_work_anticipated, true);
         // New batches can run once the source-wide preflights have passed.
         let runnable = inner.scan_done || inner.work_released;
         drop(inner);
-        if runnable {
+        if first_work {
+            // Also wake a worker waiting to learn whether there is file work.
+            self.cv.notify_all();
+        } else if runnable {
             self.cv.notify_one();
         }
         idx
@@ -658,8 +663,10 @@ impl Sched {
         }
     }
 
-    /// Let speculative TCP workers warm while the planner performs remote
-    /// namespace and directory work for a batch that contains regular files.
+    /// Let speculative workers warm while the planner performs remote
+    /// namespace and directory work for a batch whose regular files are all
+    /// work, as for an empty destination. Otherwise the first queued file
+    /// signals file work.
     pub fn anticipate_file_work(&self) {
         let mut inner = self.inner.lock().unwrap();
         let first = !inner.file_work_anticipated;
@@ -670,8 +677,8 @@ impl Sched {
         }
     }
 
-    /// Wait to learn whether planning found any regular files. False means the
-    /// scan ended or aborted without one, so an eager worker need not connect.
+    /// Wait to learn whether planning found file work. False means the scan
+    /// ended or aborted without any, so an eager worker need not connect.
     pub fn wait_for_anticipated_file_work(&self) -> bool {
         let mut inner = self.inner.lock().unwrap();
         loop {
