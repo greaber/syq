@@ -1306,6 +1306,103 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_patch_publishes_requested_metadata_without_old_xattrs() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        if !clones_files(directory) {
+            return;
+        }
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old = vec![1; 32 * block as usize];
+        let path = directory.join("file");
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let original = File::open(&path).unwrap();
+        let attribute = c"syq.test.old-metadata";
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    original.as_raw_fd(),
+                    attribute.as_ptr(),
+                    b"old".as_ptr().cast(),
+                    3,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        let mut ops = receiver(directory);
+        let hashed = ops.hash_existing_batch(
+            block,
+            &[ExistingRead {
+                path: b"file".to_vec(),
+                len: old.len() as u64,
+                condition: TargetCondition::Any,
+                guard: None,
+            }],
+        );
+        let hashed = hashed[0].as_ref().unwrap();
+        let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
+        reuse[5] = None;
+        let data = vec![2; block as usize];
+        let patch = SmallPatch {
+            path: b"file".to_vec(),
+            copy_id: [5; 16],
+            len: old.len() as u64,
+            block,
+            reuse,
+            hash: content_digest(&data),
+            data,
+            basis: hashed.fingerprint,
+            meta: Meta {
+                // Match the old mode: using its metadata instead of the
+                // private clone's would incorrectly skip restoring this.
+                mode: 0o644,
+                mtime: 1_234_567_890,
+                mtime_nsec: 123_456_789,
+                ..put("file", b"").meta
+            },
+            flags: flags::MODE | flags::TIMES,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        CLONED_PATCHES.set(0);
+        let results = ops.patch_small_batch(&[patch]).unwrap();
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(CLONED_PATCHES.get(), 1);
+        let published = File::open(&path).unwrap();
+        let metadata = published.metadata().unwrap();
+        assert_ne!(metadata.ino(), original.metadata().unwrap().ino());
+        assert_eq!(metadata.mode() & 0o7777, 0o644);
+        assert_eq!(metadata.mtime(), 1_234_567_890);
+        assert_eq!(metadata.mtime_nsec(), 123_456_789);
+        assert_eq!(
+            unsafe {
+                libc::fgetxattr(
+                    published.as_raw_fd(),
+                    attribute.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOATTR)
+        );
+        let mut expected = old;
+        expected[5 * block as usize..6 * block as usize].fill(2);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(entries(directory), 1);
+    }
+
     #[test]
     fn a_malformed_patch_fails_its_file_and_leaves_nothing_behind() {
         // A file large and reused enough to clone, and one assembled whole.
