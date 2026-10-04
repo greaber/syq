@@ -133,9 +133,9 @@ still be running. The coordinating server needs `/bin/kill` and either
 
 For `syq cp` between this machine and one SSH server, omitted `--auth-from`
 uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
-or `auto` if none is set. `--auth-from auto` first reuses an existing approved
-account connection for that exact endpoint. Without one, it tries this
-machine's native SSH access. SSH keeps its normal prompts and configured
+or `auto` if none is set. `--auth-from auto` tries this machine's native SSH
+access, regardless of existing approved account connections.
+SSH keeps its normal prompts and configured
 timeouts. If SSH
 reports rejected credentials, a host-key verification failure, an unresolved
 hostname, or a refused connection, syq tries live receiving machines in
@@ -173,8 +173,8 @@ key already trusted by the authorizing machine and writable
 `~/.ssh/authorized_keys` on the destination. Syq temporarily adds a key that can
 join only this approved copy, then removes it when the copy closes. The source
 receives no laptop credentials or general SSH access. Remote path completion
-can reuse existing account approval, but never requests approval itself. Without
-an approved connection, `auto` and `ssh` completion use native SSH.
+can reuse existing account approval from the selected authorizer, but never
+requests approval itself. `auto` and `ssh` completion use native SSH.
 
 For restricted per-copy downloads (`--from HOST` to this machine), approval grants read access
 to the displayed source files and directory trees. `--src-non-dir` grants only

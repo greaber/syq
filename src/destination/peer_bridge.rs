@@ -37,8 +37,8 @@ fn requested(location: &Location) -> NativeEndpoint {
     }
 }
 
-/// An explicitly selected authorizer may approve each endpoint account. Auto
-/// only reuses existing sessions; it never creates account authority here.
+/// A saved or explicit authorizer may approve each endpoint account. Native
+/// auto/ssh do not select account authority from incidental cached sessions.
 pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     let Some((destination, sources)) = args.locations.split_last() else {
         return Ok(None);
@@ -885,16 +885,19 @@ mod tests {
     }
     #[test]
     fn explicit_native_peer_routes_remain_native_including_same_host() {
-        let mut args = args();
-        assert!(super::super::select_copy(&mut args, None)
-            .unwrap()
-            .is_none());
-        assert!(args.peer_bridge.is_none());
-        args.locations.last_mut().unwrap().host = Some("source.example".into());
-        assert!(super::super::select_copy(&mut args, None)
-            .unwrap()
-            .is_none());
-        assert!(args.peer_bridge.is_none());
+        for mode in [AuthFrom::Auto, AuthFrom::Ssh] {
+            let mut args = args();
+            args.auth_from = mode;
+            assert!(super::super::select_copy(&mut args, None)
+                .unwrap()
+                .is_none());
+            assert!(args.peer_bridge.is_none());
+            args.locations.last_mut().unwrap().host = Some("source.example".into());
+            assert!(super::super::select_copy(&mut args, None)
+                .unwrap()
+                .is_none());
+            assert!(args.peer_bridge.is_none());
+        }
     }
     #[test]
     fn custom_routes_bypass_saved_choices_but_reject_explicit_authorizers() {

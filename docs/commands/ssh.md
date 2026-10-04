@@ -29,7 +29,7 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME>` | Authorization source; omitted uses the saved preference, then an approved account connection or native SSH |
+| `--auth-from <auto\|ssh\|@NAME>` | Authorization source; omitted uses the saved preference, then native SSH |
 | `--pscope <PATH>` | Use connections and authorization preferences from this persistence scope |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |
@@ -94,10 +94,10 @@ or requesting approval.
 ## Authorization selection
 
 Omitting `--auth-from` uses your [saved choice](../persistence-reference.md#authorization-defaults),
-then `auto`. This first reuses an existing approved account connection for the
-same typed endpoint. Without one, it runs native SSH once using its ordinary
-configuration and syq's native persistent connections when enabled. Explicit
-`ssh` selection always uses native authentication.
+then `auto`. This runs native SSH once using its ordinary configuration and
+syq's native persistent connections when enabled. Existing approved account
+connections do not change the selected authorization or endpoint.
+Explicit `ssh` selection also uses native authentication.
 A failed login or command is never retried through a receiving machine.
 Use `--auth-from @NAME` or save that preference to ask your laptop directly.
 A laptop-authorized invocation opens or reuses an approved account connection.

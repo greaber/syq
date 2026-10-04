@@ -1,6 +1,9 @@
 //! Coordinate process creation and bounded policy-inspection subprocesses.
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
+#[path = "process_group.rs"]
+pub(crate) mod group;
+
 /// Serialize non-atomic close-on-exec setup with child launches on Darwin.
 /// The operation must only create/protect descriptors or launch a process;
 /// do not hold this guard while waiting for peer I/O or child completion.
@@ -108,7 +111,7 @@ pub(crate) fn capture_output_bounded(
     }
 
     check(deadline, cancelled)?;
-    let mut group = crate::process_group::ProcessGroup::spawn(
+    let mut group = group::ProcessGroup::spawn(
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

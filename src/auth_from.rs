@@ -27,15 +27,36 @@ pub(crate) struct PreferenceCommand {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_version"
+    )]
+    version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     hosts: BTreeMap<String, String>,
+    // Additive fields must survive edits by a binary that does not use them.
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_json::Value>,
 }
+
+fn deserialize_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
+}
+
 impl Config {
     fn validate(&self) -> Result<()> {
+        if let Some(version) = self.version {
+            anyhow::ensure!(
+                version == 1,
+                "unsupported authorization preferences version {version}"
+            );
+        }
         if let Some(value) = &self.default {
             crate::cli::parse_auth_from(value)?;
         }
@@ -314,7 +335,10 @@ mod tests {
             "{",
             r#"{"default":"laptop"}"#,
             r#"{"hosts":{"user@host":"ssh"}}"#,
-            r#"{"future":true}"#,
+            r#"{"version":2,"default":"@laptop","hosts":{"backup":"ssh"}}"#,
+            r#"{"version":0}"#,
+            r#"{"version":null}"#,
+            r#"{"version":"1"}"#,
         ] {
             std::fs::write(&path, data).unwrap();
             let errors = [
@@ -332,6 +356,53 @@ mod tests {
                 assert!(detail.contains("pass --auth-from explicitly"), "{detail}");
             }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn unversioned_preferences_remain_unversioned_after_edits() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("auth-from.json");
+        // The original unversioned format, unchanged by schema serialization.
+        let original = r#"{"default":"@laptop","hosts":{"backup":"ssh"}}"#;
+        std::fs::write(&path, original).unwrap();
+        let config = read(&path).unwrap();
+        assert_eq!(config.selected("backup").unwrap(), AuthFrom::Ssh);
+        assert_eq!(
+            config.selected("other").unwrap(),
+            AuthFrom::Return("laptop".into())
+        );
+        update(&path, None, None, true).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({"hosts": {"backup": "ssh"}}));
+    }
+
+    #[test]
+    fn additive_fields_survive_setting_and_resetting_preferences() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("auth-from.json");
+        for original in [
+            r#"{"future":true}"#,
+            r#"{"version":1,"future":{"values":[null,true,42,"text"],"nested":{"key":"value"}}}"#,
+        ] {
+            std::fs::write(&path, original).unwrap();
+            let original: serde_json::Value = serde_json::from_str(original).unwrap();
+            for (host, value) in [
+                (None, Some(AuthFrom::Return("laptop".into()))),
+                (Some("backup"), Some(AuthFrom::Ssh)),
+                (None, None),
+                (Some("backup"), None),
+            ] {
+                update(&path, host, value.as_ref(), true).unwrap();
+                let saved: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved.get("version"), original.get("version"));
+                assert_eq!(saved["future"], original["future"]);
+            }
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved, original);
         }
     }
 

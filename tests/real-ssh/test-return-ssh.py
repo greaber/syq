@@ -207,12 +207,15 @@ def persistent_cases(expected):
     assert direct.encode() == expected, direct
     for _ in range(3):
         assert source_run(["ssh", "--auth-from", "@laptop", "destination", "--", "hostname"]).encode() == expected
-    # A warm account login is usable without a saved preference.
-    assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
+    # Merely opening account access must not change native auto selection.
+    source_run(["ssh", "destination", "--", "hostname"], success=False)
+    assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
     # A preference selects the same existing authority without changing the
     # approval command or consulting preferences on the laptop.
     source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
     assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
+    source_run(["ssh", "--auth-from", "auto", "destination", "--", "hostname"], success=False)
+    assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
     single_session = os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1"
     transport = [] if single_session else ["--no-tcp"]
     rsync_transport = [] if single_session else ["--syq-no-tcp"]

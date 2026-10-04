@@ -311,20 +311,30 @@ fn active_record(domain: &Domain, record: Record) -> Result<Option<Cached>> {
     Ok(Some(Cached(record)))
 }
 
-/// Reuse existing account authority before opening another connection. An
-/// explicit authorizer never selects another laptop's approval; native-only
-/// mode never consults the authority index. Automatic selection must be unique.
+/// Look up only the account authority selected by command policy. Native
+/// auto/ssh never inspect account records or probe an incidental live master.
 pub(crate) fn select_cached(
     domain: &Domain,
     requested: &NativeEndpoint,
     mode: &AuthFrom,
 ) -> Result<Option<Cached>> {
     match mode {
-        AuthFrom::Ssh => return Ok(None),
-        AuthFrom::Return(authorizer) => return cached(domain, authorizer, requested),
-        AuthFrom::Auto => {}
+        AuthFrom::Return(authorizer) => cached(domain, authorizer, requested),
+        AuthFrom::Auto | AuthFrom::Ssh => Ok(None),
     }
-    let mut matches = match automatic_matches(domain, requested) {
+}
+
+/// An explicit ssh-config snapshot may discover a unique existing approval.
+/// This lookup never chooses the account used by an ordinary command.
+pub(crate) fn select_export(
+    domain: &Domain,
+    requested: &NativeEndpoint,
+    mode: &AuthFrom,
+) -> Result<Option<Cached>> {
+    if !matches!(mode, AuthFrom::Auto) {
+        return select_cached(domain, requested, mode);
+    }
+    let mut matches = match export_matches(domain, requested) {
         Ok(matches) => matches,
         Err(error) => {
             // This is optional cached authority. Discard the entire scan on
@@ -339,8 +349,8 @@ pub(crate) fn select_cached(
     Ok(matches.pop())
 }
 
-/// Actual operations may establish account authority. Completion and config
-/// export call select_cached instead and can never cause an approval prompt.
+/// Actual operations may establish explicitly selected account authority.
+/// Completion and config export use lookup-only entrypoints and never prompt.
 pub(crate) fn select_or_connect(
     domain: &Domain,
     requested: &NativeEndpoint,
@@ -365,7 +375,7 @@ pub(crate) fn select_or_connect(
         .map(Some)
 }
 
-fn automatic_matches(domain: &Domain, requested: &NativeEndpoint) -> Result<Vec<Cached>> {
+fn export_matches(domain: &Domain, requested: &NativeEndpoint) -> Result<Vec<Cached>> {
     let index = domain.approved_index_path();
     let mut matches = Vec::new();
     if !index.exists() {
@@ -1085,6 +1095,42 @@ mod scope_tests;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn native_selection_does_not_require_readable_account_records() {
+        let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+        let scope = root.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        let requested = NativeEndpoint {
+            user: None,
+            host: "unused.invalid".into(),
+            port: None,
+        };
+        let index = domain.approved_index_path();
+        fs::create_dir(&index).unwrap();
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = index_path(&domain, "laptop", &requested).unwrap();
+        fs::write(&path, b"{").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        for unreadable in [false, true] {
+            if unreadable {
+                fs::set_permissions(&index, fs::Permissions::from_mode(0)).unwrap();
+            }
+            // Native selection needs no provider record or SSH process. The
+            // selected-provider path still reports corrupt/unreadable state.
+            for mode in [AuthFrom::Auto, AuthFrom::Ssh] {
+                assert!(select_cached(&domain, &requested, &mode).unwrap().is_none());
+                assert!(select_or_connect(&domain, &requested, &mode)
+                    .unwrap()
+                    .is_none());
+            }
+            assert!(
+                select_cached(&domain, &requested, &AuthFrom::Return("laptop".into())).is_err()
+            );
+        }
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     #[test]
     fn keeper_does_not_inherit_caller_payload_descriptors() {

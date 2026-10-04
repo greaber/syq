@@ -1322,7 +1322,7 @@ pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Override saved authorization: reuse approved access or try local SSH (auto), require native SSH (ssh), or authorize through @NAME (also S3 copies). Eligible native copies can request laptop authorization after SSH failure
+    /// Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME (also S3 copies). Eligible native copies can request laptop authorization after SSH failure
     #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator

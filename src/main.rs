@@ -36,7 +36,7 @@ mod persistence;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod private_broker;
 mod process;
-mod process_group;
+use process::group as process_group;
 mod progress;
 mod proto;
 #[cfg(target_os = "linux")]

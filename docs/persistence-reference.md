@@ -28,11 +28,11 @@ credentials. If it is unavailable or refuses the request, the command fails.
 New authorization still needs its normal approval; existing account access can
 be reused.
 `ssh` uses the server's own access and ignores approved account connections.
-`auto` first reuses an existing approved account login for the exact typed
-endpoint. If more than one receiving name has approved that endpoint, choose
-one explicitly. Without an approved login, native copies try SSH and can ask
-an available receiving machine after an eligible SSH failure. Other commands
-run native SSH once; login and command failures never trigger a retry.
+`auto` starts with native SSH regardless of existing approved account connections.
+Eligible native copies can ask an available receiving machine after an SSH
+failure. Other commands run native SSH once; login and command failures never
+trigger a retry. Save an authorizer or select it explicitly to use approved
+account access.
 
 A `--for HOST` override wins over the default. Matching uses the exact hostname
 or SSH alias typed in the command, for every login and port; aliases are
@@ -52,11 +52,13 @@ advance. Custom `--rsh` routes, copies to receiving names, and object storage
 keep their own authentication. An explicit scope uses its own saved choices.
 The setting works independently of whether native SSH persistence is enabled.
 It is saved in `auth-from.json` in the selected domain; the default domain keeps
-it alongside `persistence.json`. Older syq versions ignore it. If it is
-unreadable or has an unknown format, the error names the file to repair.
-You can pass `--auth-from` explicitly to bypass it for one command. Setting or
-resetting a choice preserves the other saved choices, so neither can repair an
-unreadable file. To discard all saved choices, remove that file yourself.
+it alongside `persistence.json`. Older syq versions ignore it. Unversioned files
+and `"version": 1` are supported; edits preserve additional top-level fields and
+do not add a version to unversioned files. Invalid choices and unsupported
+versions report the file's path without changing it. Repair the file or pass
+`--auth-from` explicitly to bypass it for one command. Setting or resetting a
+choice preserves the other saved choices, so neither can repair an unreadable
+file. To discard all saved choices, remove that file yourself.
 
 ## Approved account connections
 
@@ -76,8 +78,8 @@ A closed connection can request another login under the current session or
 remembered permission. A failure after execution starts ends that command
 without retrying it.
 
-Copies can reuse the login with `auto` or the matching `@NAME`, including SSH
-data in either direction with `--no-tcp`. Copies between this machine and one
+Copies selecting the matching `@NAME`, explicitly or through a saved choice,
+can reuse the login, including SSH data in either direction with `--no-tcp`. Copies between this machine and one
 server use full account access without a per-copy grant; asking for a receiver
 receipt selects per-copy authorization instead. Direct copies between two other
 servers can use approved connections to both endpoints and give the source only

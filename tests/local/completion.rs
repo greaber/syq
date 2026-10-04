@@ -2025,14 +2025,14 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
             }
             words.push(&path);
             let mut invocation = approved_completion_command(&t, &words);
-            if mode == Some("ssh") {
+            if mode != Some("@laptop") {
                 // Refuse native login before it can warm the unrelated native
                 // helper pool. This case checks routing, not that pool's lifecycle.
                 invocation.env("FAKE_SSH_SESSION_STATUS", "55");
             }
             let output = invocation.run().unwrap();
             assert_output_ok(&output);
-            if mode == Some("ssh") {
+            if mode != Some("@laptop") {
                 assert!(output.stdout.is_empty(), "{output:?}");
             } else {
                 assert!(output.stderr.is_empty(), "{output:?}");
@@ -2047,9 +2047,10 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
                 );
             }
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-            if mode == Some("ssh") {
+            if mode != Some("@laptop") {
                 assert!(!log.contains("ProxyCommand=false"), "{log}");
                 assert!(!log.contains("resolved.example"), "{log}");
+                assert!(!log.contains("-O check"), "{log}");
                 assert!(log.contains("backup"), "{log}");
             } else {
                 assert!(log.contains(&format!("-S {}", control.display())), "{log}");
@@ -2110,7 +2111,7 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
         .unwrap()
         .contains("ProxyCommand=false"));
     fs::remove_file(t.path("rsh.log")).unwrap();
-    for mode in ["@missing", "ssh"] {
+    for mode in ["@missing", "ssh", "auto"] {
         let output = approved_completion_command(
             &t,
             &[
@@ -2128,9 +2129,11 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
         .unwrap();
         assert_output_ok(&output);
         assert!(output.stdout.is_empty(), "{output:?}");
-        if mode == "ssh" {
+        if mode != "@missing" {
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
             assert!(!log.contains("ProxyCommand=false"), "{log}");
+            assert!(!log.contains("-O check"), "{log}");
+            fs::remove_file(t.path("rsh.log")).unwrap();
         } else {
             assert!(!t.path("rsh.log").exists());
         }
@@ -2138,7 +2141,7 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
 }
 
 #[test]
-fn approved_completion_missing_ambiguous_and_failed_masters_never_fall_back() {
+fn approved_completion_selected_and_unselected_masters_keep_their_routes() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
     let control = approved_completion_master(&t, "laptop");
@@ -2169,16 +2172,21 @@ fn approved_completion_missing_ambiguous_and_failed_masters_never_fall_back() {
 
     let _other = approved_completion_master(&t, "other");
     let output = approved_completion_command(&t, &words("auto"))
+        .env("FAKE_SSH_SESSION_STATUS", "55")
         .run()
         .unwrap();
     assert_output_ok(&output);
     assert!(output.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("more than one laptop"),
+        !String::from_utf8_lossy(&output.stderr).contains("more than one laptop"),
         "{output:?}"
     );
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-    assert!(log.lines().all(|line| line.contains("-O check")), "{log}");
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(!log.contains("-O check"), "{log}");
+    assert!(!log.contains("ProxyCommand=false"), "{log}");
+    assert!(!log.contains("resolved.example"), "{log}");
+    assert!(log.contains("-- backup"), "{log}");
     fs::remove_file(t.path("rsh.log")).unwrap();
 
     let output = approved_completion_command(&t, &words("@laptop"))
@@ -2383,8 +2391,9 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
             write(&t.path("config/syq/persistence.json"), b"{");
         }
         let path = format!("{}/n", t.s("remote-home/data"));
-        // Approved account authority is independent of ordinary persistence.
-        let cached = damaged == "persistence-with-index";
+        // Auto never inspects account authority. Explicit provider selection
+        // remains usable independently of ordinary persistence settings.
+        let explicit_available = damaged == "persistence-with-index";
         let expected = vec![(
             b'p',
             t.path("remote-home/data/nested/")
@@ -2399,51 +2408,35 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
                 words.extend(["file", "--to", "backup", "--into"]);
             }
             words.push(&path);
-            let mut command = approved_completion_command(&t, &words);
-            if !cached {
-                // Refuse native login before Hello, avoiding its helper pool
-                // while proving unusable optional state did not block the route.
-                command.env("FAKE_SSH_SESSION_STATUS", "55");
-            }
-            let output = command.run().unwrap();
+            // Refuse native login before Hello while proving that neither
+            // optional persistence damage nor account records choose a provider.
+            let output = approved_completion_command(&t, &words)
+                .env("FAKE_SSH_SESSION_STATUS", "55")
+                .run()
+                .unwrap();
             assert_output_ok(&output);
-            if cached {
-                assert!(output.stderr.is_empty(), "{damaged}: {output:?}");
-                assert_eq!(completion_values(&output.stdout), expected);
-            } else {
-                assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("warning:"),
-                    "{damaged}: {output:?}"
-                );
-            }
+            assert!(output.stdout.is_empty(), "{damaged}: {output:?}");
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !diagnostic.contains("cannot inspect approved SSH"),
+                "{diagnostic}"
+            );
+            assert_eq!(
+                diagnostic.contains("warning:"),
+                damaged != "unrelated-index",
+                "{diagnostic}"
+            );
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();
-            let sessions: Vec<_> = log
-                .lines()
-                .filter(|line| !line.contains("-O check"))
-                .collect();
-            assert_eq!(sessions.len(), 1, "{damaged}: {log}");
-            if cached {
-                assert!(
-                    sessions[0].contains("-l approved -p 2222 -- resolved.example"),
-                    "{damaged}: {log}"
-                );
-                assert!(
-                    sessions[0].contains("ProxyCommand=false"),
-                    "{damaged}: {log}"
-                );
-            } else {
-                assert!(sessions[0].contains("-- backup"), "{damaged}: {log}");
-                assert!(
-                    !sessions[0].contains("ProxyCommand=false"),
-                    "{damaged}: {log}"
-                );
-            }
+            assert_eq!(log.lines().count(), 1, "{damaged}: {log}");
+            assert!(log.contains("-- backup"), "{damaged}: {log}");
+            assert!(!log.contains("-O check"), "{damaged}: {log}");
+            assert!(!log.contains("ProxyCommand=false"), "{damaged}: {log}");
+            assert!(!log.contains("resolved.example"), "{damaged}: {log}");
             fs::remove_file(t.path("rsh.log")).unwrap();
         }
         if damaged == "unrelated-index" {
             // Explicit selection must expose damage to its selected authority,
-            // even though automatic reuse treats an unusable index as optional.
+            // even though native auto never inspects that index.
             for entry in fs::read_dir(index.unwrap()).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|value| value == "json") {
@@ -2468,7 +2461,7 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
         .run()
         .unwrap();
         assert_output_ok(&output);
-        if cached {
+        if explicit_available {
             assert!(output.stderr.is_empty(), "{damaged}: {output:?}");
             assert_eq!(completion_values(&output.stdout), expected);
             let log = fs::read_to_string(t.path("rsh.log")).unwrap();

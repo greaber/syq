@@ -390,7 +390,9 @@ def main():
             no_pending()
             return
 
-        print("case: blocked TCP falls back to direct restricted SSH with warm automatic auth", flush=True)
+        print("case: blocked TCP falls back to direct restricted SSH with saved providers", flush=True)
+        for host in ("source", "destination"):
+            requester("persist", "auth-from", "@laptop", "--for", host)
         blocked = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
         with copying("fallback", ("--tcp-ports", blocked + "-" + blocked,
                                   "--resource-limits", "bandwidth=512K"), auth=()) as (process, output):
@@ -500,6 +502,8 @@ def main():
         print("Direct account-approved peer bridge passed", flush=True)
     finally:
         if "requester" in roots:
+            for host in ("source", "destination"):
+                requester("persist", "auth-from", "--reset", "--for", host)
             requester("persist", "off")
         for host, root in roots.items():
             remote(host, "rm -rf -- " + shlex.quote(root))

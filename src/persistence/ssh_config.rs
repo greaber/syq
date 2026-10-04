@@ -25,7 +25,7 @@ pub(crate) fn run(domain: &super::Domain, command: ExportCommand) -> Result<i32>
     let mode = crate::auth_from::resolve(domain, &requested.host, command.auth_from)?;
     ensure!(mode != AuthFrom::Ssh,
         "ssh-config exports approved account connections; use --auth-from auto or @NAME instead of native SSH authorization");
-    let cached = crate::destination::ssh::persistent::select_cached(domain, &requested, &mode)?
+    let cached = crate::destination::ssh::persistent::select_export(domain, &requested, &mode)?
         .context("no approved account connection matches; first run syq persist connect HOST --auth-from @NAME (ssh-config never opens a connection)")?;
     let config = export(&requested, cached.endpoint(), cached.control())?;
     std::io::stdout().lock().write_all(config.as_bytes())?;

@@ -3,9 +3,8 @@
 #[allow(dead_code)]
 #[path = "../src/process.rs"]
 mod process;
-#[path = "../src/process_group.rs"]
-mod process_group;
 use crate::process::CommandExt as _;
+use process::group as process_group;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -103,7 +102,7 @@ impl Tmp {
         if inside.as_os_str().len() <= 32 {
             return inside;
         }
-        let tmp = PathBuf::from("/tmp");
+        let tmp = fs::canonicalize("/tmp").expect("resolve short temporary fixture root");
         let name = self.0.file_name().unwrap().to_string_lossy();
         tmp.join(format!("{name}-rt"))
     }
