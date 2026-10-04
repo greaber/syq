@@ -110,8 +110,8 @@ fn network_compression_is_charged_after_compressing() {
         write(&t.path("src"), &vec![b'x'; 4 << 20]);
         let mut cmd = command(&t, mode, pull, "1M");
         cmd.arg("--performance-tuning=bw-pacing=average")
-            .args(paths(&t, pull, false));
-        let start = std::time::Instant::now();
+            .args(paths(&t, pull, false))
+            .env("SYQ_TEST_PACED_BYTES", t.path("paced"));
         let out = cmd.run().unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
@@ -119,10 +119,21 @@ fn network_compression_is_charged_after_compressing() {
             stderr_of(&out).matches("bw-pacing has no effect").count(),
             1
         );
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "logical bytes appear to be paced: {out:?}"
-        );
+        // Measure what the budget charged, independently of process startup
+        // and scheduler delays. Include TCP, SSH, and partial-TCP fallback.
+        #[cfg(debug_assertions)]
+        {
+            let charged: usize = fs::read_to_string(t.path("paced"))
+                .unwrap()
+                .lines()
+                .map(|line| line.parse::<usize>().unwrap())
+                .sum();
+            assert!(charged > 0, "compressed data bypassed pacing: {out:?}");
+            assert!(
+                charged < 64 * 1024,
+                "paced {charged} bytes for compressible data: {out:?}"
+            );
+        }
     }
 }
 
