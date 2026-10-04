@@ -1132,6 +1132,45 @@ fn hash_keeps_hard_linked_destinations_that_already_match() {
     }
 }
 
+#[test]
+fn hash_keeps_an_empty_destination_that_already_matches() {
+    for (native, remote) in [(false, false), (false, true), (true, false)] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"");
+        write(&t.path("dst/a"), b"");
+        fs::hard_link(t.path("dst/a"), t.path("dst/alias")).unwrap();
+        set_mtime(&t.path("src/a"), 1_600_000_000);
+        set_mtime(&t.path("dst/a"), 1_500_000_000);
+        let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
+        if native {
+            run_native_ok(&[
+                "cp",
+                "--hash",
+                "--srcs-in",
+                &t.s("src"),
+                "--into-existing",
+                &t.s("dst"),
+            ]);
+        } else {
+            let out = copy_tree(&t, remote, "-ac", &[]);
+            assert_output_ok(&out);
+            assert_eq!(tuning_observed(&out)["kept_files"], 1, "remote={remote}");
+            assert_eq!(
+                fs::metadata(t.path("dst/a")).unwrap().mtime(),
+                1_600_000_000,
+                "remote={remote}"
+            );
+        }
+        for name in ["a", "alias"] {
+            assert_eq!(
+                fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino(),
+                inode,
+                "native={native} remote={remote} {name}"
+            );
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn hash_reports_a_matching_file_it_cannot_keep_without_rewriting_it() {

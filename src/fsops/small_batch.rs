@@ -187,6 +187,15 @@ fn check_patch_layout(patch: &SmallPatch) -> Result<()> {
     Ok(())
 }
 
+/// Whether a patch describes the file it was compared with, unchanged: it
+/// has that file's length and reuses every block of it, which an empty file
+/// does vacuously.
+fn reproduces_basis(patch: &SmallPatch) -> bool {
+    patch.basis.is_some_and(|basis| basis.len == patch.len)
+        && patch.data.is_empty()
+        && patch.reuse.iter().all(Option::is_some)
+}
+
 /// Whether `file` is exactly as long as a patch's file and every block
 /// still hashes as the patch reuses it.
 fn holds_reused_blocks(
@@ -435,10 +444,12 @@ impl FsOps {
         Ok(PatchStep::Staged(Box::new(put), source))
     }
 
-    /// The existing file whose blocks a patch reuses, opened for reading
-    /// under the destination root, or None when it reuses none.
+    /// The existing file whose blocks a patch reuses, or that it may keep,
+    /// opened for reading under the destination root; None when the patch
+    /// needs nothing of it. An empty file has no blocks to reuse but may
+    /// still be kept.
     fn open_reused(&mut self, patch: &SmallPatch) -> Result<Option<(RootedTarget, File)>> {
-        if patch.reuse.iter().all(Option::is_none) {
+        if !reproduces_basis(patch) && patch.reuse.iter().all(Option::is_none) {
             return Ok(None);
         }
         let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
@@ -454,16 +465,10 @@ impl FsOps {
     /// changed it since it was hashed; when it has changed, as keeping
     /// another name of the same file changes it, the file is hashed again.
     fn whole_match(&self, patch: &SmallPatch, file: &File) -> Result<bool> {
-        let Some(basis) = patch.basis else {
-            return Ok(false);
-        };
-        if basis.len != patch.len
-            || !patch.data.is_empty()
-            || patch.reuse.iter().any(Option::is_none)
-        {
+        if !reproduces_basis(patch) {
             return Ok(false);
         }
-        Ok(fingerprint(&file.metadata()?) == basis
+        Ok(patch.basis == Some(fingerprint(&file.metadata()?))
             || holds_reused_blocks(file, self.hash_policy.algorithm, patch)?)
     }
 
