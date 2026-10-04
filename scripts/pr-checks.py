@@ -13,17 +13,18 @@ A merged pull request's list covers runs dispatched before it merged; later
 runs belong to work that reuses the branch name. Pull requests from forks
 have no dispatched checks here.
 
-Exit status: 0 when no check failed; 1 when a check's latest result is a
-failure, which also fails the pull request's `dispatched-checks` status while
-it is open; 2 on usage or GitHub errors.
+Resolved failures keep their original conclusion, reason, and replacement link.
+Exit status: 0 when no unresolved check failed; 1 when a check's latest result
+is an unresolved failure, which also fails the pull request's `dispatched-checks`
+status while it is open; 2 on usage or GitHub errors.
 """
 import json
 import shutil
 import sys
 
-from dispatched_checks import (BRANCH_WORKFLOWS, FAILED, branch_runs, check_results,
-                               dispatched_runs, fetch_jobs, in_parallel, merged_from_branch,
-                               result_lines, running)
+from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
+                               dispatched_runs, fetch_jobs, fetch_resolutions, in_parallel,
+                               merged_from_branch, result_lines, running, unresolved)
 from tooling import ToolError, json_output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -43,8 +44,9 @@ def report(number, json_report):
         runs = branch_runs([run for workflow_runs in found[1:] for run in workflow_runs],
                            branch, found[0], pr.get("mergedAt") or None)
         results = check_results(runs, fetch_jobs(REPOSITORY, runs))
+        results = apply_resolutions(pr["number"], results, fetch_resolutions(REPOSITORY, results))
         active = running(runs)
-    exit_status = 1 if any(entry["conclusion"] in FAILED for entry in results) else 0
+    exit_status = 1 if any(unresolved(entry) for entry in results) else 0
 
     if json_report:
         print(json.dumps({"pull_request": pr, "results": results, "running": active,

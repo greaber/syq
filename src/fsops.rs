@@ -466,6 +466,7 @@ struct PreparedSmallCopy {
 }
 
 pub struct FsOps {
+    deletions: Option<crate::deletion::Batch>,
     prepared_small_copy: Option<PreparedSmallCopy>,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
@@ -670,6 +671,7 @@ impl FsOps {
         let observations = Arc::new(crate::transfer_observations::Registry::default());
         let operation = observations.actor("filesystem");
         FsOps {
+            deletions: Default::default(),
             inode_preservation: Default::default(),
             sparse: false,
             descriptor_copy: Default::default(),
@@ -2643,6 +2645,36 @@ impl FsOps {
     /// parents come first), so they run in parallel too. Those that change
     /// directory entries share their directory between at most two threads.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
+        let destination_root = self.destination_root.clone();
+        let destination_prefix = self.destination_prefix.as_deref();
+        if ops
+            .iter()
+            .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
+        {
+            return self
+                .deletions
+                .get_or_insert_with(Default::default)
+                .run_init(
+                    ops,
+                    crate::deletion::DirectoryBatch::default,
+                    |deletion, op| {
+                        apply::apply_one_with_deletions(
+                            op,
+                            guard,
+                            destination_root.clone(),
+                            destination_prefix,
+                            Some(deletion),
+                        )
+                        .err()
+                        .as_ref()
+                        .map(wire_error)
+                    },
+                    Option::is_none,
+                )
+                .unwrap_or_else(|error| {
+                    (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
+                });
+        }
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
@@ -2660,8 +2692,6 @@ impl FsOps {
             .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
             .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
-        let destination_root = self.destination_root.clone();
-        let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         let gres = parallel_map(&guarded_idx, |&i| {
             apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
