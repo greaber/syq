@@ -65,7 +65,7 @@ Commands selecting `@NAME` request an approved account connection when needed.
 advance. Neither operation enables ordinary persistence or receiving on `HOST`.
 `--pscope` selects the domain that owns the connection. Helper overrides do not
 apply in this mode; `--timeout` is for native receiving setup and is rejected
-with `--auth-from`.
+when account authorization is selected explicitly or through a saved choice.
 Readiness means the approved SSH connection accepts sessions.
 
 `persist status --json` adds an `authorized_ssh` array alongside the usual

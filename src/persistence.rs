@@ -210,6 +210,13 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 .transpose()?;
             let authorizer = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
             if let crate::cli::AuthFrom::Return(authorizer) = authorizer {
+                let explicit_timeout = matches.subcommand_matches("connect").is_some_and(|args| {
+                    args.value_source("timeout") == Some(clap::parser::ValueSource::CommandLine)
+                });
+                anyhow::ensure!(
+                    !explicit_timeout,
+                    "--timeout applies only to native SSH receiving setup; saved authorization selects @{authorizer}"
+                );
                 anyhow::ensure!(
                     syq_path.is_none() && !no_bootstrap,
                     "approved account connections do not accept helper overrides"

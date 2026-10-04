@@ -1259,6 +1259,39 @@ fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
 }
 
 #[test]
+fn persist_connect_rejects_explicit_receiving_timeout_with_saved_account_authorization() {
+    let t = Tmp::new();
+    let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();
+    assert_output_ok(&run(&["auth-from", "@laptop"]));
+    for timeout in ["1", "30"] {
+        let output = run(&["connect", "backup", "--timeout", timeout]);
+        assert!(!output.status.success());
+        let error = stderr_of(&output);
+        assert!(
+            error.contains("--timeout applies only to native SSH receiving setup"),
+            "{error}"
+        );
+        assert!(
+            error.contains("saved authorization selects @laptop"),
+            "{error}"
+        );
+    }
+    assert_output_ok(&run(&["auth-from", "--reset"]));
+    assert_output_ok(&run(&["auth-from", "@other", "--for", "backup"]));
+    let output = run(&["connect", "alice@backup:2222", "--timeout", "30"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("saved authorization selects @other"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !t.runtime().exists(),
+        "refusal must happen before opening a connection"
+    );
+}
+
+#[test]
 fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");

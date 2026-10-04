@@ -520,6 +520,13 @@ fn approved_source_ssh_worker_uses_approved_budget_even_when_ticket_is_omitted()
 fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy() {
     use std::sync::{atomic::AtomicBool, atomic::Ordering, mpsc};
 
+    struct ReleaseOnDrop(mpsc::SyncSender<()>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
     struct PausedWriter {
         inner: UnixStream,
         armed: Arc<AtomicBool>,
@@ -560,6 +567,9 @@ fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy
         entered,
         release: released,
     });
+    // Drop before the server on assertion failure so its join never waits
+    // for the writer's safety timeout.
+    let release = ReleaseOnDrop(release);
     let roots = server.register(register);
     let source = roots[0].selection.clone();
     let role = ConnectionRole::SourceWorker {
@@ -643,15 +653,28 @@ fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(!server.control.thread.as_ref().unwrap().is_finished());
-    assert!(
-        !server.session.is_closed(),
-        "control must still own its session"
-    );
-    assert!(server.authority.acquire(&role, false).is_err());
-    writer.write_msg(&read(Some(source), 8)).unwrap();
-    // The existing encrypted data worker must return no more file payload.
-    assert!(reader.read_msg::<Response>().is_err());
-    release.send(()).unwrap();
+    let control_busy = !server.control.thread.as_ref().unwrap().is_finished();
+    let session_open = !server.session.is_closed();
+    let admission = server.authority.acquire(&role, false).err();
+    let response = writer
+        .write_msg(&read(Some(source), 8))
+        .and_then(|()| reader.read_msg::<Response>());
+    drop(release);
     socket.shutdown(std::net::Shutdown::Both).unwrap();
+
+    assert!(
+        control_busy,
+        "control must still be blocked on its response"
+    );
+    assert!(session_open, "control must still own its session");
+    assert_eq!(
+        admission.unwrap().to_string(),
+        "source authorization is closed"
+    );
+    // The encrypted data worker explicitly refuses further reads. A timeout
+    // is not evidence of revoked authority.
+    assert!(
+        matches!(&response, Ok(Response::Err(error)) if error == "source authorization is closed"),
+        "expected closed-source denial, received {response:?}"
+    );
 }

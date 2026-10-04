@@ -50,7 +50,6 @@ pub(crate) fn capture_output_bounded(
 ) -> std::io::Result<Output> {
     use std::io::{self, Read};
     use std::os::fd::{AsRawFd, RawFd};
-    use std::os::unix::process::CommandExt as _;
     use std::time::{Duration, Instant};
 
     fn check(deadline: Instant, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
@@ -75,17 +74,6 @@ pub(crate) fn capture_output_bounded(
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    }
-    struct Group(Child);
-    impl Drop for Group {
-        fn drop(&mut self) {
-            // Match exec commonly creates a shell plus a child. Killing only
-            // ssh would leave those processes and their inherited pipes alive.
-            unsafe {
-                libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = self.0.wait();
-        }
     }
     fn drain(
         reader: &mut impl Read,
@@ -120,16 +108,14 @@ pub(crate) fn capture_output_bounded(
     }
 
     check(deadline, cancelled)?;
-    let mut group = Group(
+    let mut group = crate::process_group::ProcessGroup::spawn(
         command
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn_guarded()?,
-    );
-    let mut stdout = group.0.stdout.take().unwrap();
-    let mut stderr = group.0.stderr.take().unwrap();
+            .stderr(Stdio::piped()),
+    )?;
+    let mut stdout = group.child.stdout.take().unwrap();
+    let mut stderr = group.child.stderr.take().unwrap();
     nonblocking(stdout.as_raw_fd())?;
     nonblocking(stderr.as_raw_fd())?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -144,14 +130,20 @@ pub(crate) fn capture_output_bounded(
             err_done = drain(&mut stderr, &mut err, &mut total, max_output_bytes)?;
         }
         // Keep the leader unreaped until its descendants have closed the
-        // pipes. That also keeps its process-group identifier reserved.
+        // pipes, then let ProcessGroup stop remaining descendants before
+        // reaping. The process-group identifier stays reserved until cleanup.
         if out_done && err_done {
-            if let Some(status) = group.0.try_wait()? {
-                return Ok(Output {
-                    status,
-                    stdout: out,
-                    stderr: err,
-                });
+            match group.poll() {
+                Ok(Some(status)) => {
+                    return Ok(Output {
+                        status,
+                        stdout: out,
+                        stderr: err,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
         }
         let mut descriptors = [
@@ -281,6 +273,28 @@ mod bounded_tests {
             .trim()
             .parse()
             .unwrap();
+        assert_descendant_stopped(pid);
+    }
+
+    #[test]
+    fn normal_completion_stops_descendant_without_output_pipes() {
+        let output = capture(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $!; exit 17",
+            Duration::from_secs(5),
+            &|| false,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        let pid = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_descendant_stopped(pid);
+    }
+
+    fn assert_descendant_stopped(pid: libc::pid_t) {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if unsafe { libc::kill(pid, 0) } != 0 {
