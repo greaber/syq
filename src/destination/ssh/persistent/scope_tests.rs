@@ -181,3 +181,22 @@ fn cleanup_refuses_unrecognized_files_without_recursive_removal() {
     assert!(cleanup_domain(&domain).is_err());
     assert_eq!(fs::read(unexpected).unwrap(), b"keep");
 }
+
+#[test]
+fn concurrent_keeper_cleanup_is_closed_but_damaged_present_state_still_errors() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let domain = domain(root.path(), "scope");
+    let record = new_record(&domain);
+    let approved = record.control.parent().unwrap();
+    let socket = UnixListener::bind(&record.control).unwrap();
+    private_write(&approved.join(".syq-persistence"), b"wrong marker");
+    assert!(mark_closing(&domain, &record).is_err());
+    drop(socket);
+    fs::remove_file(&record.control).unwrap();
+    // A damaged marker still reports an error when the socket has disappeared.
+    assert!(mark_closing(&domain, &record).is_err());
+    fs::remove_dir_all(approved).unwrap();
+    // This is the keeper's real cleanup race: its entire temporary scope went
+    // away between off's existence check and its validation/open operation.
+    assert!(!mark_closing(&domain, &record).unwrap());
+}

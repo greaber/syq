@@ -472,24 +472,16 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
             let Some(record) = read_record(&path)? else {
                 return Ok(());
             };
-            if !record.control.exists() {
+            match record.control.symlink_metadata() {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+            // Generation cancellation may already have made the keeper remove
+            // this socket and scope while off was inspecting its index record.
+            if !mark_closing(domain, &record)? {
                 return Ok(());
             }
-            validate_record(domain, &record)?;
-            // Mark each scope before asking native SSH to close. Other entries
-            // are still attempted if this record or process fails.
-            let closing = record
-                .control
-                .parent()
-                .unwrap()
-                .join(crate::receive_service::CLOSING);
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(closing)?;
             controls.push(record.control.clone());
             close_master(&record)?;
             Ok(())
@@ -530,6 +522,41 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
         errors.join("; ")
     );
     Ok(())
+}
+
+fn mark_closing(domain: &Domain, record: &Record) -> Result<bool> {
+    let result: Result<()> = (|| {
+        validate_record(domain, record)?;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(
+                record
+                    .control
+                    .parent()
+                    .unwrap()
+                    .join(crate::receive_service::CLOSING),
+            )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && record
+                    .control
+                    .symlink_metadata()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn live(record: &Record) -> bool {
