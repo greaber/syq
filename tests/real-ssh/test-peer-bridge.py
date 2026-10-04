@@ -389,8 +389,8 @@ def main():
             finish(process, output)
         assert_results("tcp")
 
-        # SSH setup authenticates independently from A to C. MaxSessions=1
-        # therefore runs these same direct, restricted B-to-C worker cases.
+        # SSH setup opens another session beside C's live control session.
+        # This scenario runs in the default profile, which allows both.
         print("case: blocked TCP falls back to direct restricted SSH with saved providers", flush=True)
         for host in ("source", "destination"):
             requester("persist", "auth-from", "@laptop", "--for", host)

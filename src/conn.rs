@@ -1595,21 +1595,6 @@ impl RemoteSpec {
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
     }
 
-    pub(crate) fn approved_helper_command(
-        &self,
-        args: &[String],
-    ) -> Result<(crate::destination::ssh::workers::Login, Command)> {
-        let authorization = self
-            .ssh_multiplexer
-            .as_ref()
-            .and_then(|mux| mux.approved_workers.as_ref())
-            .context("independent helper needs an approved account")?;
-        let login = authorization.begin()?;
-        let mut command = login.command()?;
-        command.arg(self.session_command(args));
-        Ok((login, command))
-    }
-
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
         let mut command = self.ssh_command(SshConnection::Independent, false);
         command.arg(self.program_command(args));

@@ -136,7 +136,9 @@ As with ordinary persistence, syq keeps a helper session ready for remote path
 completion. A warm lookup uses one network round trip for names and metadata.
 That ready helper occupies one session on the shared connection; shells and
 other tools using the same connection still share its server session limit.
-Independent SSH data workers do not occupy sessions on that shared connection.
+With `MaxSessions 1`, a ready helper leaves no session slot for a shell or
+another tool on that connection. Independent SSH data workers do not occupy
+sessions on that shared connection.
 
 `syq persist ssh-config HOST [--auth-from auto|ssh|@NAME|HOST]` prints a standalone
 OpenSSH configuration for one existing approved login. Use it with `ssh`,

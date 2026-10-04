@@ -220,46 +220,19 @@ pub(in crate::destination) fn setup_over_spec(
         public_key: canonical_key(public_key)?,
     };
     anyhow::ensure!(!cancelled(), "peer copy closed before SSH setup");
-    // The receiver already established this exact helper. A separate approved
-    // login leaves its control channel available on MaxSessions=1 servers.
-    // Keep the authorization alive until the owned child has been closed; the
-    // existing bounded I/O observes cancellation without a second PID watcher.
-    let (login, command) = spec.approved_helper_command(&["--return-ssh-setup".into()])?;
-    let cancelled = || cancelled() || login.cancelled();
+    // Setup is a short control operation on the approved account master.
+    // Its separate helper channel shares that master's ordinary session limit.
+    let (_child, reply) =
+        ForwardChild::over_spec(spec, "--return-ssh-setup", &request, deadline, cancelled)
+            .context("set up direct SSH data workers over the approved account connection")?;
+    anyhow::ensure!(
+        matches!(reply, Reply::Ready),
+        "invalid peer SSH setup response"
+    );
     anyhow::ensure!(
         !cancelled() && Instant::now() < deadline,
         "peer copy closed during SSH setup"
     );
-    let mut child = ForwardChild::spawn_command(command)?;
-    let reply = (|| {
-        write_message(
-            &mut DeadlineIo {
-                inner: child.child.stdin.as_mut().unwrap(),
-                deadline,
-                cancelled: Some(&cancelled),
-            },
-            &request,
-        )?;
-        read_message::<Reply>(&mut DeadlineIo {
-            inner: child.child.stdout.as_mut().unwrap(),
-            deadline,
-            cancelled: Some(&cancelled),
-        })
-    })();
-    let reply = match reply {
-        Ok(reply) => reply,
-        Err(error) => {
-            let _ = child.wait_for_exit(deadline, &cancelled);
-            return Err(error)
-                .with_context(|| format!("set up direct SSH data workers: {}", child.errors()));
-        }
-    };
-    match reply {
-        Reply::Ready => {}
-        Reply::Error(error) => bail!("remote copy helper refused SSH setup: {error}"),
-        _ => bail!("invalid peer SSH setup response"),
-    }
-    anyhow::ensure!(!cancelled(), "peer copy closed during SSH setup");
     Ok(())
 }
 

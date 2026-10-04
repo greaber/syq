@@ -157,7 +157,7 @@ def interactive_shell():
             os.waitpid(child, 0)
 
 
-def source_run(args, success=True, *, stdin=None, tcp=False, trace=None):
+def source_run(args, success=True, *, stdin=None, tcp=False, trace=None, pool_idle=None):
     # Trace transfer children only. The command/terminal cancellation cases
     # above continue to exercise native OpenSSH without a tracing parent.
     environment = native_path if trace is None else "PATH=/usr/local/bin:/usr/bin:/bin"
@@ -165,6 +165,8 @@ def source_run(args, success=True, *, stdin=None, tcp=False, trace=None):
         environment += " SYQ_TEST_REQUIRE_TCP=1"
     if trace is not None:
         environment += " SYQ_REAL_SSH_TRACE_FILE=" + shlex.quote(trace)
+    if pool_idle is not None:
+        environment += " SYQ_TEST_POOL_IDLE_SECS=" + str(pool_idle)
     return run("ssh", "source", "exec env " + environment + " " + shlex.join(["syq", *args]),
                success=success, stdin=stdin)
 
@@ -450,7 +452,12 @@ def requester_config_cases(expected):
         def completion():
             words = ["syq", "cp", "--pscope", scope, "--auth-from", "@laptop",
                      "--from", alias, destination_root + "/comple"]
-            return source_run(["completion", "__complete", "fish", str(len(words)-1), "--", *words])
+            # A prepared helper occupies the sole shared session with
+            # MaxSessions=1. Keep account-selection checks independent of that
+            # accepted limit; the default profile still exercises prewarming.
+            pool_idle = 0 if os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1" else None
+            return source_run(["completion", "__complete", "fish", str(len(words)-1), "--", *words],
+                              pool_idle=pool_idle)
 
         def no_pending():
             assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []

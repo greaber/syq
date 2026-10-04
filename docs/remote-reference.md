@@ -212,12 +212,11 @@ coordination, and other peer-auth modes keep their separate
 connection requirements. `--coordinate-at local` can reuse approved access to
 each endpoint and explicitly relays file data through the invoking machine.
 
-The source's SSH server must permit remote Unix-socket forwarding. SSH fallback
-opens a separate approved login to set up the copy's restricted data workers;
-it does not need a second session on the destination's existing connection.
-An agent that requires a hardware-key touch can require another touch for that
-login. The socket
-carries control, metadata, and worker setup; payload goes directly between the
+The source's SSH server must permit remote Unix-socket forwarding. SSH worker
+setup opens a short helper session on the destination's approved connection.
+It shares the server's session limit with the copy's control connection, ready
+helpers, and other tools using that login. The forwarded socket carries
+control, metadata, and worker setup; payload goes directly between the
 source and destination. The invoking machine's `ProxyJump` route can
 reach the control endpoints, but does not provide a data route between the
 servers. Data workers still need to reach the peer directly. Disabled forwarding is an error and never selects a

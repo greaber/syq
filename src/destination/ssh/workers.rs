@@ -167,10 +167,6 @@ impl Login {
         worker_command(&self.local, self.proxy.as_deref(), self.session.options())
     }
 
-    pub(crate) fn cancelled(&self) -> bool {
-        self.session.cancelled() || !self.control.exists()
-    }
-
     /// The child must lead its own process group. Keep this guard until SSH
     /// exits, and drop it BEFORE reaping the child so its PID cannot be reused.
     pub(crate) fn watch(self, child_pid: u32) -> Result<Guard> {

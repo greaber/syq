@@ -107,37 +107,6 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
     }
 }
 
-fn remote_spec(args: &Args, location: &Location, cached: &Cached) -> Result<RemoteSpec> {
-    let mut options = args.clone();
-    options.auth_from_explicit = false;
-    options.rsh = Some(shell_words::join(
-        std::iter::once("ssh".to_owned()).chain(
-            cached
-                .options()
-                .into_iter()
-                .map(|option| {
-                    option
-                        .into_string()
-                        .map_err(|_| anyhow::anyhow!("approved SSH option is not UTF-8"))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        ),
-    ));
-    let mut location = location.clone();
-    location.user = cached.endpoint().user.clone();
-    location.host = Some(cached.endpoint().host.clone());
-    location.port = cached.endpoint().port;
-    let Endpoint::Remote(mut spec) = crate::transfer::endpoint(&location, &options)? else {
-        unreachable!()
-    };
-    let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
-    spec.ssh_multiplexer = Some(Arc::new(crate::conn::SshMultiplexer::approved(
-        cached.control(),
-        Some(cached.worker_authorization(&domain)?),
-    )));
-    Ok(spec)
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Ticket {
@@ -282,17 +251,15 @@ impl Selection {
             "restricted peer copies require encrypted TCP or SSH"
         );
         let peer_policy = self.peer.peer()?;
-        let coordinator = remote_spec(args, &sources[0], &self.coordinator)?;
-        let peer_spec = remote_spec(args, destination, &self.peer)?;
-        // These helpers have a different protocol from the prepared --server
-        // session. Release that idle session before occupying the account's
-        // control channel, including servers with MaxSessions=1.
-        crate::session_pool::stop(self.coordinator.control())
-            .context("release the prepared source helper for peer coordination")?;
-        if self.peer.control() != self.coordinator.control() {
-            crate::session_pool::stop(self.peer.control())
-                .context("release the prepared destination helper for peer coordination")?;
-        }
+        let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
+        let coordinator = super::account_copy::approved_connection(
+            args,
+            &sources[0],
+            &domain,
+            &self.coordinator,
+        )?;
+        let peer_spec =
+            super::account_copy::approved_connection(args, destination, &domain, &self.peer)?;
         let (secret, recipient_public_key) = crate::receipt::generate_recipient()?;
         let policy = crate::receipt::ReceiptPolicy {
             required: true,

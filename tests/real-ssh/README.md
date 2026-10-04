@@ -42,8 +42,8 @@ Full nightly and manual `ci.yml` runs build the lab image once, then run the
 core suite, the metadata and benchmark suites below, and the alternate SSH
 profile as parallel jobs on GitHub's Linux runners. The core suite includes the
 storage checks. The alternate profile skips the cases listed in
-`max-sessions-1.skip`, which never contact the destination whose sshd the
-profile changes; new cases run in both profiles. Pull requests and post-merge
+`max-sessions-1.skip`: cases unaffected by the destination limit, and workflows
+that require concurrent sessions on one connection. New cases run in both profiles. Pull requests and post-merge
 runs do not run these suites.
 
 The suite also runs a pinned local S3 server fixture on the runner: PGSTY Silo,
@@ -71,12 +71,13 @@ The host runner is a Python script. Run it with the Python installed by
 
 Use the alternate destination sshd profile to exercise syq's fallback from a
 rejected multiplexed worker channel to independent SSH connections. The
-profile keeps every fixture file below syq's 4 MiB multiplexing threshold and
-requires evidence of both a rejected real OpenSSH multiplexed attempt and a
+native fallback cases keep their files below syq's 4 MiB multiplexing threshold
+and require evidence of both a rejected real OpenSSH multiplexed attempt and a
 successful `ControlPath=none` retry:
 
 ```sh
-scripts/test-real-ssh.py --profile max-sessions-1
+scripts/test-real-ssh.py --profile max-sessions-1 \
+  --skip-cases-from tests/real-ssh/max-sessions-1.skip
 ```
 
 OpenSSH normally hides this condition by opening an independent connection
@@ -85,6 +86,14 @@ wrapper gives only multiplexed destination workers a failing `ProxyCommand`.
 The live control socket is still tried over real SSH, but OpenSSH's internal
 fallback returns 255 so syq must issue the independently authenticated retry.
 All successful connections continue to run through `/usr/bin/ssh`.
+
+Approved-account uploads and downloads also run in this profile, with larger
+files and overlapping independent SSH data connections. The requester-config
+fixture disables idle helper prewarming only for its completion calls in this
+profile: a ready helper would occupy the sole session needed by its later shell
+commands. The default profile keeps prewarming enabled. Workflows that require
+concurrent sessions on one connection, including approved three-server SSH
+setup, run in the default profile and are listed in `max-sessions-1.skip`.
 
 The first build downloads the pinned Rust toolchain image, Debian packages, and
 Cargo dependencies. Test execution itself uses only the Compose project's

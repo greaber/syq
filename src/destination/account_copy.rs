@@ -103,7 +103,7 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
     else {
         return Ok(false);
     };
-    let spec = approved_connection(args, location, &domain, cached)?;
+    let spec = approved_connection(args, location, &domain, &cached)?;
     if pull {
         args.direct_source = Some(Box::new(spec));
     } else {
@@ -161,16 +161,16 @@ pub(crate) fn approved_operation(
         port: location.port,
     };
     if let Some(cached) = super::ssh::persistent::select_or_connect(&domain, &requested, &mode)? {
-        return approved_connection(args, location, &domain, cached).map(Some);
+        return approved_connection(args, location, &domain, &cached).map(Some);
     }
     Ok(None)
 }
 
-fn approved_connection(
+pub(super) fn approved_connection(
     args: &Args,
     location: &Location,
     domain: &crate::persistence::Domain,
-    cached: super::ssh::persistent::Cached,
+    cached: &super::ssh::persistent::Cached,
 ) -> Result<crate::conn::RemoteSpec> {
     let multiplexer = crate::conn::SshMultiplexer::approved(
         cached.control(),
