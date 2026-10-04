@@ -40,7 +40,7 @@ const RMDIR_RETRIES: usize = 3;
 // Share short sibling batches as copying does. Large files remain separate
 // jobs: their block reclamation can run outside the directory's inode lock.
 const LEAF_BATCH_FILES: usize = 64;
-const LEAF_BATCH_BYTES: u64 = 256 << 10;
+const LEAF_BATCH_BYTES: u64 = 128 << 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Identity {
@@ -934,7 +934,16 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
     let mut leaves = Vec::with_capacity(batch_files);
     let mut bytes = 0u64;
     let flush = |leaves: &mut Vec<PinnedLeaf>| {
-        if !leaves.is_empty() {
+        if leaves.len() == 1 {
+            let leaf = leaves.pop().unwrap();
+            pool.submit(Task::Leaf {
+                selector: leaf.selector,
+                name: leaf.name,
+                _object: leaf._object,
+                label: leaf.label,
+                parent: Some(job.clone()),
+            });
+        } else if !leaves.is_empty() {
             pool.submit(Task::Leaves {
                 parent: job.clone(),
                 leaves: std::mem::replace(leaves, Vec::with_capacity(batch_files)),
