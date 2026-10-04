@@ -6,7 +6,7 @@
 
 use crate::cli::Args;
 use crate::process::CommandExt as _;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
@@ -57,7 +57,7 @@ enum PersistAction {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
         /// Authorize a reusable destination-account login through a receiving machine
-        #[arg(long, value_name = "@NAME", conflicts_with_all = ["syq_path", "no_bootstrap"])]
+        #[arg(long, value_name = "auto|ssh|@NAME", conflicts_with_all = ["syq_path", "no_bootstrap"])]
         auth_from: Option<String>,
         /// Use this remote syq executable instead of installing a matching helper
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
@@ -296,7 +296,8 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     }
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| format!("inspect scope {}", scope.display()));
+                    return Err(error)
+                        .with_context(|| format!("inspect scope {}", scope.display()));
                 }
             }
         }
@@ -411,7 +412,7 @@ pub(crate) fn connect_domain(
 
 /// Remember whether the command explicitly selected a scope without touching
 /// configuration or runtime state. Commands that never construct an eligible
-/// implicit SSH endpoint must not depend on either location being accessible.
+/// local SSH connection must not depend on either location being accessible.
 pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
     args.pscope_explicit = args.pscope.is_some();
     if args.pscope.is_some()
@@ -428,12 +429,11 @@ pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
 }
 
 /// Resolve persistence only for an implicit local SSH edge. Explicit scopes
-/// are validated here, and the durable policy is read here, so local commands,
-/// custom remote shells, remote coordinators, and restricted receivers do not
-/// acquire an unrelated filesystem dependency.
+/// are validated here, and the durable policy is read here. Local commands and
+/// transports that do not use managed SSH avoid an unrelated state dependency.
 pub(crate) fn scope_for_implicit_ssh(explicit_scope: Option<&Path>) -> Result<Option<PathBuf>> {
     let domain = Domain::select(explicit_scope)?;
-    if domain.enabled()? {
+    if !domain.is_default() || domain.enabled()? {
         Ok(Some(domain.ensure_runtime()?))
     } else {
         Ok(None)
@@ -643,18 +643,13 @@ fn global_scope_path() -> Result<PathBuf> {
 }
 
 pub(crate) fn is_global_scope(scope: &Path) -> Result<bool> {
-    let global = global_scope_path()?;
-    let global = match std::fs::canonicalize(&global) {
-        Ok(global) => global,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("resolve global persistence scope {}", global.display()));
-        }
+    let candidate = std::fs::metadata(scope)
+        .with_context(|| format!("inspect persistence scope {}", scope.display()))?;
+    // An unrelated unavailable default location cannot block an explicit domain.
+    let Ok(global) = std::fs::metadata(global_scope_path()?) else {
+        return Ok(false);
     };
-    let candidate = std::fs::canonicalize(scope)
-        .with_context(|| format!("resolve persistence scope {}", scope.display()))?;
-    Ok(candidate == global)
+    Ok((candidate.dev(), candidate.ino()) == (global.dev(), global.ino()))
 }
 
 pub(crate) fn ensure_runtime_parent() -> Result<PathBuf> {
@@ -1010,9 +1005,7 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             line.push(')');
         }
         line.push_str(&format!("  {}", connection.state));
-        if kind == "ephemeral" {
-            line.push_str(" (ephemeral scope; receiving not supported)");
-        } else if connection.receiving_enabled == Some(false) {
+        if connection.receiving_enabled == Some(false) {
             line.push_str(" (receiving disabled)");
         } else if let Some(name) = connection
             .receiving_name

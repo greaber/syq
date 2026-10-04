@@ -2,7 +2,7 @@
 //! persistence state so older binaries can keep using their existing settings.
 use crate::cli::AuthFrom;
 use crate::persistence::Domain;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -169,11 +169,18 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     Ok(())
 }
 
-fn update(path: &Path, host: Option<&str>, value: Option<&AuthFrom>) -> Result<Config> {
+fn update(
+    path: &Path,
+    host: Option<&str>,
+    value: Option<&AuthFrom>,
+    create_parent: bool,
+) -> Result<Config> {
     let parent = path
         .parent()
         .context("authorization configuration parent missing")?;
-    std::fs::create_dir_all(parent).context("create authorization configuration directory")?;
+    if create_parent {
+        std::fs::create_dir_all(parent).context("create authorization configuration directory")?;
+    }
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -216,6 +223,7 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
             &path(domain)?,
             command.host.as_deref(),
             command.value.as_ref(),
+            domain.is_default(),
         )?
     } else {
         load(domain)?
@@ -250,21 +258,21 @@ mod tests {
             read(&path).unwrap().selected("backup").unwrap(),
             AuthFrom::Auto
         );
-        update(&path, None, Some(&AuthFrom::Return("laptop".into()))).unwrap();
-        let config = update(&path, Some("backup"), Some(&AuthFrom::Ssh)).unwrap();
+        update(&path, None, Some(&AuthFrom::Return("laptop".into())), true).unwrap();
+        let config = update(&path, Some("backup"), Some(&AuthFrom::Ssh), true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Ssh);
         assert_eq!(
             config.selected("Backup").unwrap(),
             AuthFrom::Return("laptop".into())
         );
-        let config = update(&path, Some("backup"), Some(&AuthFrom::Auto)).unwrap();
+        let config = update(&path, Some("backup"), Some(&AuthFrom::Auto), true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Auto);
-        let config = update(&path, Some("backup"), None).unwrap();
+        let config = update(&path, Some("backup"), None, true).unwrap();
         assert_eq!(
             config.selected("backup").unwrap(),
             AuthFrom::Return("laptop".into())
         );
-        let config = update(&path, None, None).unwrap();
+        let config = update(&path, None, None, true).unwrap();
         assert_eq!(config.selected("backup").unwrap(), AuthFrom::Auto);
     }
     #[test]
@@ -295,7 +303,7 @@ mod tests {
             r#"{"future":true}"#,
         ] {
             std::fs::write(&path, data).unwrap();
-            assert!(update(&path, None, Some(&AuthFrom::Auto)).is_err());
+            assert!(update(&path, None, Some(&AuthFrom::Auto), true).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), data);
         }
     }

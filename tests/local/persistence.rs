@@ -557,6 +557,13 @@ fn persistence_domains_isolate_preferences_receiving_and_cleanup() {
     let selected = run(&["auth-from", "--pscope", first.to_str().unwrap()]);
     assert_output_ok(&selected);
     assert_eq!(selected.stdout, b"default: @job-provider\n");
+    write(&t.path("unusable-global-runtime"), b"not a directory");
+    let independent = persistence_command(&t, &["auth-from", "--pscope", first.to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", t.path("unusable-global-runtime"))
+        .run()
+        .unwrap();
+    assert_output_ok(&independent);
+    assert_eq!(independent.stdout, b"default: @job-provider\n");
     let inactive = run(&[
         "--pscope",
         second.to_str().unwrap(),
@@ -1231,11 +1238,9 @@ fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state()
     );
     assert!(!t.path("ssh-used").exists());
     assert_output_ok(&run(&["persist", "auth-from", "ssh", "--for", "backup"]));
-    assert!(
-        !run(&["cp", "source", "--to", "user@backup:2222"])
-            .status
-            .success()
-    );
+    assert!(!run(&["cp", "source", "--to", "user@backup:2222"])
+        .status
+        .success());
     assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
     fs::remove_file(t.path("ssh-used")).unwrap();
     write(&t.path("config/syq/auth-from.json"), b"future schema");

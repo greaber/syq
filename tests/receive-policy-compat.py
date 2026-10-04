@@ -17,6 +17,7 @@ with tempfile.TemporaryDirectory(prefix="syq-policy-compat-") as temporary:
     home = Path(temporary)
     inbox = home / "inbox"
     inbox.mkdir()
+    (home / "runtime").mkdir()
     env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
                XDG_RUNTIME_DIR=str(home / "runtime"), SYQ_NO_UPDATE_CHECK="1")
 
