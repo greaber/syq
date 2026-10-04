@@ -64,7 +64,6 @@ int sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
     struct sk_sign_response **out) {
     (void)pin; (void)options;
     if (unavailable()) return SSH_SK_ERR_DEVICE_NOT_FOUND;
-    if (data_len != 32) return SSH_SK_ERR_GENERAL;
     const unsigned char *cursor = handle;
     EVP_PKEY *key = d2i_AutoPrivateKey(NULL, &cursor, (long)handle_len);
     struct sk_sign_response *r = calloc(1, sizeof(*r));
@@ -77,7 +76,7 @@ int sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
     message[32] = flags;
     message[33] = message[34] = message[35] = 0;
     message[36] = 1;
-    memcpy(message + 37, data, 32);
+    SHA256(data, data_len, message + 37);
     const EVP_MD *digest = alg == SSH_SK_ED25519 ? NULL : EVP_sha256();
     uint8_t signature[128];
     size_t length = sizeof(signature);

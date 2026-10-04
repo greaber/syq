@@ -234,6 +234,23 @@ fn receiver_configuration_preserves_released_v041_bytes() {
 }
 
 #[test]
+fn receiver_and_local_state_preserve_released_v071_bytes() {
+    // Unmodified output from checksum-verified v0.7.1 in the disposable SSH lab.
+    let receiver = include_bytes!("../../tests/fixtures/restricted-enrollment-v0.7.1.json");
+    let config: ReceiverEnrollment = serde_json::from_slice(receiver).unwrap();
+    assert_eq!(config.version, 4);
+    assert!(supported_config_version(config.version));
+    assert_eq!(config.security_key_flags, None);
+    assert_eq!(serde_json::to_vec(&config).unwrap(), receiver);
+    let local = include_bytes!("../../tests/fixtures/restricted-local-enrollment-v0.7.1.json");
+    let metadata: LocalEnrollment = serde_json::from_slice(local).unwrap();
+    assert!(supported_config_version(metadata.version));
+    assert_eq!(metadata.id, config.id);
+    assert_eq!(metadata.security_key_flags, None);
+    assert_eq!(serde_json::to_vec(&metadata).unwrap(), local);
+}
+
+#[test]
 fn enrollment_ssh_failures_distinguish_transport_from_remote_rejection() {
     let target = SshEndpoint::from_parts("backup", "host-b", Some(2222)).unwrap();
     let transport = enrollment_ssh_error(&target, true, "connection refused");

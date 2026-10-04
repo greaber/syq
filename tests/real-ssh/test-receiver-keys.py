@@ -2,6 +2,8 @@
 """Exercise receiver key protection with real OpenSSH in the disposable lab."""
 import json
 import os
+import pty
+import select
 from pathlib import Path
 import shlex
 import signal
@@ -16,6 +18,47 @@ def run(*args, **kwargs):
 
 def remote(command, **kwargs):
     return run('ssh', 'destination', command, **kwargs)
+
+
+def enroll_interactively(arguments):
+    """Exercise OpenSSH's terminal passphrase prompt with an empty agent."""
+    pid, terminal = pty.fork()
+    if pid == 0:
+        for variable in ('SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'DISPLAY'):
+            os.environ.pop(variable, None)
+        os.execvp(arguments[0], arguments)
+    output = bytearray()
+    answered = 0
+    deadline = time.monotonic() + 45
+    progress = time.monotonic() + 5
+    status = None
+    try:
+        while time.monotonic() < deadline:
+            if select.select([terminal], [], [], .1)[0]:
+                try:
+                    data = os.read(terminal, 4096)
+                except OSError:
+                    data = b''
+                output.extend(data)
+                prompts = output.count(b'Enter passphrase for ')
+                if prompts > answered:
+                    os.write(terminal, b'fixture-unlock\n')
+                    answered = prompts
+            waited, observed = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                status = observed
+                break
+            if time.monotonic() >= progress:
+                print(f'Waiting for terminal enrollment; passphrase prompts answered: {answered}', flush=True)
+                progress = time.monotonic() + 5
+        assert status is not None, ('terminal enrollment timed out', output.decode(errors='replace'))
+        assert answered >= 1, 'normal SSH passphrase prompt was not exercised'
+        return subprocess.CompletedProcess(arguments, os.waitstatus_to_exitcode(status), b'', bytes(output))
+    finally:
+        if status is None:
+            os.killpg(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(terminal)
 
 
 def main():
@@ -70,6 +113,8 @@ def main():
                 entry = (','.join(options) + ' ' if options else '') + public
                 config.write_bytes(original)
                 remote('cat >> ~/.ssh/authorized_keys', input=(entry + '\n').encode())
+                parent = f'/tmp/syq-real-ssh/key-protection-{index}'
+                remote('mkdir -p ' + shlex.quote(parent))
                 config.write_text(f'''Host destination
     User syq
     IdentitiesOnly yes
@@ -87,11 +132,13 @@ Host source
     UserKnownHostsFile /home/syq/.ssh/known_hosts
     GlobalKnownHostsFile /dev/null
 ''')
-                run('ssh-add', str(key))
-                parent = f'/tmp/syq-real-ssh/key-protection-{index}'
-                remote('mkdir -p ' + shlex.quote(parent))
-                enrolled = subprocess.run(['syq', 'receiver', 'enroll', f'destination:{parent}/copy'],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+                arguments = ['syq', 'receiver', 'enroll', f'destination:{parent}/copy']
+                if kind == 'ed25519' and protected:
+                    config.write_text(config.read_text().replace('BatchMode yes', 'BatchMode no'))
+                    enrolled = enroll_interactively(arguments)
+                else:
+                    run('ssh-add', '-S', provider, str(key))
+                    enrolled = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
                 if kind == 'ecdsa' and protected:
                     assert enrolled.returncode and b'ECDSA is unsupported' in enrolled.stderr, enrolled.stderr
                     continue

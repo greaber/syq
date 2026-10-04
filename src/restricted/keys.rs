@@ -706,6 +706,53 @@ mod tests {
         );
     }
     #[test]
+    fn grant_flags_require_the_configured_touch_and_pin_bits() {
+        use sha2::Digest;
+        use signature::Signer;
+        let mut envelope = delegation::SignedGrantEnvelope::decode(include_bytes!(
+            "../../tests/fixtures/restricted-grant-v0.4.1.bin"
+        ))
+        .unwrap();
+        assert!(enforce_grant_security_key_flags(&envelope.encode().unwrap(), Some(0)).is_err());
+        let namespace = delegation::SSHSIG_NAMESPACE;
+        let hash = ssh_key::HashAlg::Sha256;
+        let payload = b"FIDO policy fixture";
+        let data = ssh_key::SshSig::signed_data(namespace, hash, payload).unwrap();
+        for flags in [0, 1, 4, 5] {
+            let key = sk(flags);
+            let mut signed = sha2::Sha256::digest(b"ssh:").to_vec();
+            signed.push(flags);
+            signed.extend_from_slice(&1u32.to_be_bytes());
+            signed.extend_from_slice(&sha2::Sha256::digest(&data));
+            let plain = Ed25519Keypair::from_seed(&[73; 32])
+                .try_sign(&signed)
+                .unwrap();
+            let mut bytes = plain.as_bytes().to_vec();
+            bytes.push(flags);
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            let signature = ssh_key::SshSig::new(
+                key.public_key().key_data().clone(),
+                namespace,
+                hash,
+                ssh_key::Signature::new(Algorithm::SkEd25519, bytes).unwrap(),
+            )
+            .unwrap();
+            key.public_key()
+                .verify(namespace, payload, &signature)
+                .unwrap();
+            envelope.signature = signature.to_pem(LineEnding::LF).unwrap().into_bytes();
+            let encoded = envelope.encode().unwrap();
+            for required in [0, 1, 4, 5] {
+                assert_eq!(
+                    enforce_grant_security_key_flags(&encoded, Some(required)).is_ok(),
+                    flags & required == required
+                );
+            }
+            assert!(enforce_grant_security_key_flags(&encoded, Some(2)).is_err());
+        }
+    }
+
+    #[test]
     fn authorized_key_entry_preserves_touch_and_verification_requirements() {
         let public = EnrollmentPublicKey::parse(&sk(0).public_key().to_openssh().unwrap()).unwrap();
         let entry = AuthorizedKeyEntry::with_security_key_flags(
