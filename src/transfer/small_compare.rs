@@ -58,9 +58,10 @@ enum Stage {
 #[derive(Default)]
 struct Group {
     files: Vec<usize>,
-    /// Files sent to be read: the destination's block hashes and the
-    /// fingerprint of the file they came from.
-    reads: Vec<(usize, Vec<ContentDigest>, Option<FileFingerprint>)>,
+    /// Files sent to be read: the destination's block hashes, the
+    /// fingerprint of the file they came from, and whether the comparison
+    /// only decides if the file is unchanged.
+    reads: Vec<(usize, Vec<ContentDigest>, Option<FileFingerprint>, bool)>,
     /// Files sent to be published: the bytes sent and reused.
     published: Vec<(usize, u64, u64)>,
 }
@@ -287,14 +288,18 @@ impl Worker {
                         }
                         _ => continue,
                     };
+                    // Without block reuse (--hash alone), a comparison only
+                    // decides whether the file is unchanged.
+                    let compare_only = !self.reuses_blocks_for(job, job.dst_entry.as_deref());
                     reads.push(DifferingRead {
                         path: job.src.clone(),
                         source: self.source_reference(job),
                         attempt: job.attempt,
                         len: job.entry.size as u32,
                         expected: expected.clone(),
+                        compare_only,
                     });
-                    group.reads.push((i, expected, basis));
+                    group.reads.push((i, expected, basis, compare_only));
                 }
                 Ok((!reads.is_empty())
                     .then(|| (Stage::Read, Request::ReadDifferingBatch { block, reads })))
@@ -310,7 +315,7 @@ impl Worker {
                     Err(_) => return Ok(None),
                 };
                 let mut patches = Vec::new();
-                for ((i, expected, basis), differing) in
+                for ((i, expected, basis, compare_only), differing) in
                     std::mem::take(&mut group.reads).into_iter().zip(differing)
                 {
                     let job = &jobs[i];
@@ -327,7 +332,9 @@ impl Worker {
                         outcomes[i] = Some(Compared::SourceChanged(source));
                         continue;
                     }
-                    if matching.len() as u64 != job.entry.size.div_ceil(block) {
+                    if matching.len() as u64 != job.entry.size.div_ceil(block)
+                        || (compare_only && matching.iter().any(|same| !same))
+                    {
                         continue;
                     }
                     let Some(reuse) = matching

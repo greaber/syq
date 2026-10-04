@@ -44,6 +44,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `-P` | Same as --progress --partial |
 | `--partial` | No-op accepted for rsync compatibility (syq always keeps partial files) |
 | `-c, --checksum` | Skip quick check; compare file contents block by block and repair differences |
+| `-I, --ignore-times` | Don't skip files whose size and modification time match; compare or copy each one, whichever is faster |
 | `--inplace` | Update files in place instead of writing a partial and renaming. Use this to modify a large existing file without copying it first (saves time and disk space when only part of it changes). Cannot be combined with -u or --ignore-existing: an interrupted in-place write leaves a newer-looking final file those filters would then skip forever |
 | `--syq-ignore <PATTERN>` | Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only at the source root, `foo/` only directories, `!pat` re-includes). Repeatable. Named non-directory sources match their basename. Combined with --syq-ignore-from the patterns act like the lines of one .gitignore file, in command-line order, anchored at each source root. Skipping a directory skips its whole subtree, so to copy only *.jpg use: --syq-ignore '*' --syq-ignore '!*/' --syq-ignore '!*.jpg' |
 | `--syq-ignore-from <FILE>` | Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable |

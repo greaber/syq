@@ -202,7 +202,9 @@ again as it reads it. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
 however many files it holds.
 
-Larger files, `--inplace` updates and explicit `--hash` comparisons are
+Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
+without block reuse, they only decide whether a file is unchanged, and a file
+that differs is then copied whole. Larger files and `--inplace` updates are
 compared one file at a time, in comparison blocks of 4 MiB by default. For
 those, a difference near the end can add almost a full extra read of both
 files before copying. An output already being written by the current run
@@ -329,10 +331,10 @@ Remote copies batch new files up to the smaller of `request-size` and
 batch files up to 64 KiB. Larger limits allow more data to be held in memory;
 interrupted whole-file copies restart from the beginning. A file that already exists at the destination joins a batch when syq
 replaces it without reading it first, as same-machine copies do by default.
-With block reuse, replaced files of up to 64 MiB are compared and sent in
-batches as described above. Larger files with block reuse, files checked with
-`--hash`, files protected by an `--if-exists` policy, and preserved hard links
-are handled one at a time. On macOS, files above the batching
+With block reuse or `--hash`, replaced files of up to 64 MiB are compared in
+batches as described above. Larger files with block reuse or `--hash`, files
+protected by an `--if-exists` policy, and preserved hard links are handled one
+at a time. On macOS, files above the batching
 limit can use APFS cloning. That limit is the smallest of the comparison block
 size, `batch-bytes`, and `request-size`.
 

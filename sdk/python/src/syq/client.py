@@ -661,6 +661,7 @@ def _copy_arguments(
     inplace: bool,
     max_delete: int | None,
     transfer_strategy: str | None = None,
+    hash_or_copy: bool = False,
     integrity_checking: str | None = None,
     allow_missing_placement: bool = False,
     mapping: bool = False,
@@ -737,6 +738,8 @@ def _copy_arguments(
         argv.append("--dry-run")
     if hash:
         argv.append("--hash")
+    if hash_or_copy:
+        argv.append("--hash-or-copy")
     _append_text(argv, "--integrity-checking", integrity_checking)
     _warn_unsupported_copy_options(only_existing=only_existing,
                                    integrity_checking=integrity_checking)
@@ -1256,6 +1259,7 @@ class Client:
         prune: bool = False,
         dry_run: bool = False,
         hash: bool = False,
+        hash_or_copy: bool = False,
         integrity_checking: str | None = None,
         if_exists: str | None = None,
         only_existing: bool = False,
@@ -1338,6 +1342,7 @@ class Client:
             prune=prune,
             dry_run=dry_run,
             hash=hash,
+            hash_or_copy=hash_or_copy,
             integrity_checking=integrity_checking,
             if_exists=if_exists,
             only_existing=only_existing,

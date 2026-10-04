@@ -1523,7 +1523,7 @@ impl FsOps {
             let mut data = Vec::new();
             for (index, chunk) in contents.chunks(block as usize).enumerate() {
                 let same = read.expected.get(index) == Some(&ops.hash_policy.algorithm.hash(chunk));
-                if !same {
+                if !same && !read.compare_only {
                     data.extend_from_slice(chunk);
                 }
                 matching.push(same);

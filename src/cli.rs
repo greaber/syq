@@ -424,6 +424,9 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
+    /// Don't skip files whose size and modification time match; compare or copy each one, whichever is faster
+    #[arg(short = 'I', long = "ignore-times")]
+    pub hash_or_copy: bool,
     /// Algorithm for file content comparisons and optional transfer checks
     #[arg(skip)]
     pub hash_algorithm: crate::hashing::HashAlgorithm,
@@ -1248,6 +1251,9 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
+    /// Like --hash, but copy a file instead of comparing it when copying is faster, so identical files may be rewritten
+    #[arg(long, conflicts_with = "hash")]
+    hash_or_copy: bool,
     /// Choose a file transfer strategy (default: locality)
     #[arg(long, value_enum, value_name = "STRATEGY", long_help = TRANSFER_STRATEGY_HELP)]
     transfer_strategy: Option<TransferStrategy>,
@@ -2940,6 +2946,7 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        hash_or_copy,
         transfer_strategy,
         where_expression,
         copy_if,
@@ -2967,6 +2974,7 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
+    args.hash_or_copy = hash_or_copy;
     args.transfer_strategy = transfer_strategy;
     args.if_exists = Some(if_exists);
     args.ignore_existing = if_exists == IfExists::Keep;

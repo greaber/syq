@@ -259,6 +259,7 @@ fn checksum_compares_once_when_local_copy_is_unsupported() {
         .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
         .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
         .env("SYQ_TEST_BASIS_HASH_EVENTS", t.path("hashes"))
+        .env("SYQ_TEST_PER_FILE_COMPARISON", "1")
         .run()
         .unwrap();
     assert_output_ok(&out);

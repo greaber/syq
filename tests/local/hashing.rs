@@ -861,3 +861,144 @@ fn rejected_small_copy_payloads_reconnect_before_the_ordinary_engine() {
         "{stderr}"
     );
 }
+
+/// Equal-size, equal-time files: `same{n}` already matches its source and
+/// `bad{n}` differs by one byte. Returns the inodes of the `same` files.
+fn equal_metadata_tree(t: &Tmp, count: u64) -> Vec<u64> {
+    let mut inodes = Vec::new();
+    for n in 0..count {
+        let same = prng(64 << 10, 900 + n);
+        write(&t.path(&format!("src/same{n}")), &same);
+        write(&t.path(&format!("dst/same{n}")), &same);
+        let mut bad = prng(64 << 10, 950 + n);
+        write(&t.path(&format!("src/bad{n}")), &bad);
+        bad[n as usize] ^= 1;
+        write(&t.path(&format!("dst/bad{n}")), &bad);
+        for name in [format!("same{n}"), format!("bad{n}")] {
+            set_mtime(&t.path(&format!("src/{name}")), 1_600_000_000);
+            set_mtime(&t.path(&format!("dst/{name}")), 1_600_000_000);
+        }
+        inodes.push(fs::metadata(t.path(&format!("dst/same{n}"))).unwrap().ino());
+    }
+    inodes
+}
+
+fn copy_tree(t: &Tmp, remote: bool, flags: &str, extra: &[&str]) -> Output {
+    let source = t.s("src/");
+    let destination = if remote {
+        format!("fake:{}", t.s("dst/"))
+    } else {
+        t.s("dst/")
+    };
+    let mut args = vec![flags];
+    args.extend(extra);
+    args.extend([source.as_str(), destination.as_str()]);
+    let mut command = if remote {
+        let rsh = fake_rsh(t);
+        let mut command = remote_syq_command(t, &rsh, &args);
+        command.args([
+            "--rsync-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--syq-no-bootstrap",
+        ]);
+        command
+    } else {
+        let mut command = compat_command();
+        command.args(&args).arg("--no-progress");
+        command
+    };
+    command.env("SYQ_DEBUG", "1").run().unwrap()
+}
+
+#[test]
+fn hash_compares_files_in_groups_and_rewrites_only_those_that_differ() {
+    for remote in [false, true] {
+        let t = Tmp::new();
+        let inodes = equal_metadata_tree(&t, 4);
+        let out = copy_tree(&t, remote, "-ac", &[]);
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        for (n, inode) in inodes.iter().enumerate() {
+            let now = fs::metadata(t.path(&format!("dst/same{n}"))).unwrap().ino();
+            assert_eq!(now, *inode, "remote={remote} same{n}");
+        }
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], 8, "remote={remote}");
+        assert_eq!(observed["kept_files"], 4, "remote={remote}");
+        assert_eq!(observed["range_requests"], 0, "remote={remote}");
+    }
+}
+
+#[test]
+fn hash_or_copy_compares_or_copies_whichever_is_faster() {
+    for remote in [false, true] {
+        let t = Tmp::new();
+        let inodes = equal_metadata_tree(&t, 1);
+        let out = copy_tree(&t, remote, "-aI", &[]);
+        assert_output_ok(&out);
+        assert_same_tree(&t.path("src"), &t.path("dst"));
+        // Remote copies compare a file whose size is unchanged and keep it
+        // when it matches; a local copy is faster than reading both files.
+        let kept = fs::metadata(t.path("dst/same0")).unwrap().ino() == inodes[0];
+        assert_eq!(kept, remote, "remote={remote}");
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], if remote { 2 } else { 0 });
+    }
+    // An explicit content check wins: identical files are never rewritten.
+    let t = Tmp::new();
+    let inodes = equal_metadata_tree(&t, 1);
+    let out = copy_tree(&t, false, "-acI", &[]);
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    assert_eq!(fs::metadata(t.path("dst/same0")).unwrap().ino(), inodes[0]);
+}
+
+#[test]
+fn native_hash_or_copy_repairs_and_conflicts_with_hash() {
+    let t = Tmp::new();
+    equal_metadata_tree(&t, 1);
+    let (source, destination) = (t.s("src"), t.s("dst"));
+    run_native_ok(&[
+        "cp",
+        "--hash-or-copy",
+        "--srcs-in",
+        &source,
+        "--into-existing",
+        &destination,
+    ]);
+    for name in ["same0", "bad0"] {
+        assert_eq!(
+            read(&t.path(&format!("dst/{name}"))),
+            read(&t.path(&format!("src/{name}"))),
+            "{name}"
+        );
+    }
+    let out = native_syq(&[
+        "cp",
+        "--hash",
+        "--hash-or-copy",
+        "--srcs-in",
+        &source,
+        "--into-existing",
+        &destination,
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+#[test]
+fn hash_or_copy_dry_run_lists_what_the_copy_would_write() {
+    for remote in [false, true] {
+        let t = Tmp::new();
+        equal_metadata_tree(&t, 1);
+        let out = copy_tree(&t, remote, "-aI", &["--dry-run", "-v"]);
+        assert_output_ok(&out);
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(shown.contains("bad0"), "remote={remote}: {shown}");
+        // A remote copy would compare the matching file and keep it.
+        assert_eq!(shown.contains("same0"), !remote, "remote={remote}: {shown}");
+    }
+}

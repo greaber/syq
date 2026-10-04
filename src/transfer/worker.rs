@@ -299,10 +299,10 @@ impl Worker {
     /// deciding what to write.
     fn replaces_in_batch(&self, job: &FileJobData, existing: &Entry) -> bool {
         let inspects_destination = self.inspects_destination(job)
-            || (self.reuses_blocks_for(job, Some(existing))
-                && !job.compared
-                && (job.entry.size > super::small_compare::PATCH_MAX_FILE
-                    || self.compares_first(job, existing)));
+            || (!job.compared
+                && (self.compares_first(job, existing)
+                    || (self.reuses_blocks_for(job, Some(existing))
+                        && job.entry.size > super::small_compare::PATCH_MAX_FILE)));
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
             && !inspects_destination
@@ -311,34 +311,25 @@ impl Worker {
     fn inspects_destination(&self, job: &FileJobData) -> bool {
         job.resume_partial
             || self.opts.protects_existing_contents()
-            || self.opts.checksum
             || self.opts.restricted_receiver
             || (self.opts.hardlinks && job.entry.nlink > 1)
     }
 
-    /// Whether to compare this file with the one it replaces and reuse its
-    /// matching blocks. The default strategy compares a remote file only
-    /// when its destination has the same size: a file whose size changed
-    /// was almost always rewritten, and comparing it would read and hash
-    /// the old file for nothing. An explicit aligned-block strategy compares
-    /// every replaced file.
     pub(super) fn reuses_blocks_for(&self, job: &FileJobData, existing: Option<&Entry>) -> bool {
-        match self.opts.transfer_strategy {
-            crate::cli::TransferStrategy::Locality => {
-                !self.opts.same_host
-                    && existing.is_none_or(|existing| {
-                        existing.kind != Kind::File || existing.size == job.entry.size
-                    })
-            }
-            strategy => strategy.reuse_destination_blocks(self.opts.same_host),
-        }
+        self.opts.reuses_blocks(job.entry.size, existing)
     }
 
-    /// Whether a destination can hold any of a file's blocks: its size
-    /// matches, or the file spans more than one comparison block.
+    /// Whether to compare a file with its destination before copying it:
+    /// with block reuse, when the destination can hold any of its blocks
+    /// (its size matches, or the file spans more than one comparison block);
+    /// with --hash, when the destination could be identical (its size
+    /// matches).
     fn compares_first(&self, job: &FileJobData, existing: &Entry) -> bool {
+        let same_size = existing.size == job.entry.size;
         existing.kind == Kind::File
-            && (existing.size == job.entry.size || job.entry.size > self.patch_block())
+            && ((self.reuses_blocks_for(job, Some(existing))
+                && (same_size || job.entry.size > self.patch_block()))
+                || (self.opts.checksum && same_size))
     }
 
     /// A replaced file of up to `PATCH_MAX_FILE` bytes is compared before any
@@ -347,10 +338,14 @@ impl Worker {
     /// blocks it lacks. Under a bandwidth limit this costs only hashes for
     /// unchanged files, and elsewhere it saves sending and rewriting them.
     pub(super) fn compare_candidate(&self, idx: usize) -> bool {
+        // Tests of the per-file comparison path select it with this.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_PER_FILE_COMPARISON").is_some() {
+            return false;
+        }
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
-        self.reuses_blocks_for(j, jobs.destination(idx))
-            && !j.compared
+        !j.compared
             && !self.opts.dry_run
             && j.attempt == 0
             && !self.opts.has_expected_for(j)
@@ -1054,7 +1049,10 @@ impl Worker {
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
         let inplace = job.inplace;
-        let reuse_blocks = self.reuses_blocks_for(&job, job.dst_entry.as_deref());
+        // A file a grouped comparison already found different, or could not
+        // patch, is copied whole without comparing it again.
+        let reuse_blocks = !job.compared && self.reuses_blocks_for(&job, job.dst_entry.as_deref());
+        let checksum = self.opts.checksum && !job.compared;
         let final_file = job
             .dst_entry
             .as_deref()
@@ -1067,7 +1065,7 @@ impl Worker {
         // file finishes through its retained inode. Remote copies keep their
         // single exchange below.
         let mut known_different = false;
-        if self.opts.checksum && self.opts.same_host && !reuse_blocks && size > 0 {
+        if checksum && self.opts.same_host && !reuse_blocks && size > 0 {
             if let Some(existing) = final_file {
                 let matched = existing.size == size
                     && match self.matches_final_windows(&job) {
@@ -1164,26 +1162,24 @@ impl Worker {
             // below is reused rather than hashing the contents a second time.
             // A file the equality probe above found different is not compared
             // again.
-            let inplace_ranges = if inplace
-                && final_is_file
-                && (reuse_blocks || (self.opts.checksum && !known_different))
-            {
-                let diff = self.diff_final_and_hold(&job)?;
-                if diff.ranges.is_empty() && diff.held_len == Some(size) {
-                    self.finish_matched_basis(idx, &job)?;
-                    return Ok((vec![], false));
-                }
-                Some(diff.ranges)
-            } else {
-                None
-            };
+            let inplace_ranges =
+                if inplace && final_is_file && (reuse_blocks || (checksum && !known_different)) {
+                    let diff = self.diff_final_and_hold(&job)?;
+                    if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                        self.finish_matched_basis(idx, &job)?;
+                        return Ok((vec![], false));
+                    }
+                    Some(diff.ranges)
+                } else {
+                    None
+                };
 
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
             let prepared = self.prepare_file(
                 &job,
-                inplace || !final_is_file || (!reuse_blocks && !self.opts.checksum),
+                inplace || !final_is_file || (!reuse_blocks && !checksum),
             )?;
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
@@ -1200,9 +1196,7 @@ impl Worker {
             // Resume an owned output or a previous invocation's partial,
             // independently of the policy for reusing the final destination.
             if prepared.partial_size.is_some()
-                || (prepared.has_candidates
-                    && !reuse_blocks
-                    && (!self.opts.checksum || !final_is_file))
+                || (prepared.has_candidates && !reuse_blocks && (!checksum || !final_is_file))
             {
                 if size == 0 {
                     // Discovery can report a donor without creating our output.
@@ -1220,7 +1214,7 @@ impl Worker {
             if !inplace
                 && reuse_blocks
                 && final_is_file
-                && !self.opts.checksum
+                && !checksum
                 && !self.bandwidth_limited_remote_source()
                 && size > 0
             {
@@ -1237,7 +1231,7 @@ impl Worker {
             if !reuse_blocks {
                 // An explicit checksum may still establish a complete match.
                 // A differing final file contributes no blocks to the output.
-                if self.opts.checksum && final_is_file {
+                if checksum && final_is_file {
                     // Same-host files were probed before the copy decision;
                     // remote copies and empty files compare here.
                     if !known_different {
@@ -2834,6 +2828,7 @@ impl Worker {
         let result = match job.dst_entry.as_deref() {
             Some(destination)
                 if !self.opts.checksum
+                    && !self.opts.hash_or_copy
                     && self
                         .opts
                         .metadata_matches(&job.rel_bytes, &job.entry, destination) =>

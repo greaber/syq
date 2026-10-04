@@ -381,6 +381,9 @@ pub struct DifferingRead {
     pub attempt: u32,
     pub len: u32,
     pub expected: Vec<ContentDigest>,
+    /// Report only which blocks match, without the others' contents: a
+    /// differing file is then copied whole another way.
+    pub compare_only: bool,
 }
 
 /// Which blocks of one `DifferingRead` matched, the others' contents

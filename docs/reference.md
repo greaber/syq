@@ -337,11 +337,16 @@ recovery entries that need inspection before removal.
 ## Check file contents
 
 Syq normally skips files whose size and modification time match. Use `--hash`
-to compare their contents instead:
+to compare their contents instead; a file whose contents already match is left
+alone:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
 ```
+
+`--hash-or-copy` also checks files whose size and time match, but copies a file
+instead of comparing it when that is faster, so files that already match may
+be rewritten.
 
 Use [per-file expected hashes in mappings](mappings.md#the-format) to require
 known contents, including when reusing destination bytes.

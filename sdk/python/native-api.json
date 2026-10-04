@@ -41,6 +41,7 @@
         "receiver-max-bytes",
         "receiver-receipt",
         "hash",
+        "hash-or-copy",
         "if-exists",
         "only-existing",
         "no-compress",

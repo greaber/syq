@@ -284,9 +284,8 @@ fn transfer_strategies_select_payloads_for_local_and_remote_replacements() {
                             (stat("bytes transferred: "), stat("bytes unchanged: "))
                         };
                         // Replaced files up to 64 MiB are compared in 64 KiB
-                        // blocks; explicit checksums take the per-file path's
-                        // 4 MiB blocks.
-                        let (transferred, unchanged) = if transferred < 12 << 20 && !hash {
+                        // blocks, with or without an explicit content check.
+                        let (transferred, unchanged) = if transferred < 12 << 20 {
                             (64 << 10, (12 << 20) - (64 << 10))
                         } else {
                             (transferred, unchanged)
@@ -735,6 +734,7 @@ fn ordinary_range_errors_do_not_poison_the_next_auto_streamed_file() {
                 ],
             )
             .env("SYQ_DEBUG", "1")
+            .env("SYQ_TEST_PER_FILE_COMPARISON", "1")
             .env(
                 if failure == "read" {
                     "SYQ_TEST_FAIL_READ_RANGE_NAME"

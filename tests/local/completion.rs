@@ -1764,6 +1764,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "--as",
                     &t.s("out"),
                 ])
+                .env("SYQ_TEST_PER_FILE_COMPARISON", "1")
                 .env(ready_env, &ready)
                 .env(continue_env, &continuation)
                 // This barrier covers the second complete copy, including
@@ -1795,6 +1796,7 @@ fn concurrent_identical_and_different_copies_publish_complete_files() {
                     "--as",
                     &t.s("out"),
                 ])
+                .env("SYQ_TEST_PER_FILE_COMPARISON", "1")
                 .run()
                 .unwrap();
             let second_published = fs::read(t.path("out"));

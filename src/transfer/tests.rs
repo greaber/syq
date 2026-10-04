@@ -425,6 +425,7 @@ fn pipeline_worker(
         hardlink_completions: Mutex::new(Default::default()),
         devices: false,
         checksum: false,
+        hash_or_copy: false,
         precise_mtime: true,
         inplace: false,
         same_host: false,
