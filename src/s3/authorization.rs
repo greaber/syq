@@ -702,7 +702,8 @@ pub(crate) async fn connect(
     if let Some(authorization) = &args.storage_authorization {
         return Ok(Some(authorization.clone()));
     }
-    let crate::cli::AuthFrom::Return(name) = &args.auth_from else {
+    let crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) = &args.auth_from
+    else {
         return Ok(None);
     };
     anyhow::ensure!(

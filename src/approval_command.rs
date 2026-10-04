@@ -86,6 +86,19 @@ pub(crate) fn check_copy(
     ensure_same(request, &derived)
 }
 
+/// Validate the authorizer chosen on the requesting host. An omitted or `auto`
+/// flag can select this registered receiving name without consulting this
+/// machine's preferences; an explicit name must match the addressed receiver.
+pub(crate) fn check_authorizer(command: &[Vec<u8>], receiver: &str) -> Result<()> {
+    let args = parse(command)?;
+    anyhow::ensure!(
+        matches!(args.auth_from, crate::cli::AuthFrom::Auto)
+            || matches!(&args.auth_from, crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) if name == receiver),
+        "the requesting command authorizes from a different machine"
+    );
+    Ok(())
+}
+
 /// Storage authorization. The server may take the endpoint from its
 /// environment when the command does not name one. A pathname source is a
 /// stream upload when it is a pipe on the server, so either reading matches.
@@ -116,7 +129,7 @@ fn check_storage_as(
         .as_ref()
         .context("storage requests must name s3://")?;
     anyhow::ensure!(
-        matches!(&args.auth_from, crate::cli::AuthFrom::Return(name) if name == receiver),
+        matches!(&args.auth_from, crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) if name == receiver),
         "the requesting command authorizes from a different machine"
     );
     let mut derived = match &args.descriptor_copy {

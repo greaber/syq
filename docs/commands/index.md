@@ -23,6 +23,7 @@ syq --self-update
 | Command | Purpose |
 |---|---|
 | [`cp`](cp.md) | Copy files and directories, optionally removing destination-only files |
+| [`ssh`](ssh.md) | Open an SSH shell or command using laptop authorization |
 | [`exec`](exec.md) | Run a command on a named receiving machine after local approval |
 | [`rm`](rm.md) | Remove selected files and directory trees |
 | [`clean-partials`](clean-partials.md) | Delete syq partial files in directory trees |

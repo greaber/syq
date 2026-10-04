@@ -518,7 +518,7 @@ pub(crate) fn named_authority(
     }
     for path in [
         crate::destination::receiver_identity_directory()?,
-        crate::receive_service::config_path()?
+        crate::receive_service::config_path(&crate::persistence::Domain::default())?
             .parent()
             .unwrap()
             .to_path_buf(),

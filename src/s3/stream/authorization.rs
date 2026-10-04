@@ -260,7 +260,8 @@ pub(super) async fn connect(
     target: &str,
     existence: crate::cli::Existence,
 ) -> Result<Option<Arc<Authorization>>> {
-    let crate::cli::AuthFrom::Return(name) = &args.auth_from else {
+    let crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) = &args.auth_from
+    else {
         return Ok(None);
     };
     crate::s3::authorization::connect_request(name, request(args, options, target, existence))

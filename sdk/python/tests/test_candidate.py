@@ -289,6 +289,25 @@ class CandidateCompatibilityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(result.stderr)
 
+    def test_scoped_custom_shell_is_rejected_by_native_parser_before_launch(self) -> None:
+        for asynchronous in (False, True):
+            with self.subTest(asynchronous=asynchronous), resolved_temporary_directory() as temporary:
+                root = Path(temporary)
+                shell = root / "custom-shell"
+                shell.write_text("#!/bin/sh\ntouch shell-ran\nexit 0\n", encoding="utf-8")
+                shell.chmod(0o755)
+                client = (syq.AsyncClient if asynchronous else syq.Client)(
+                    executable=EXECUTABLE, process_cwd=root)
+                with self.assertRaises(syq.SyqProtocolError) as failed:
+                    result = client.cp("source", from_="server", as_="destination",
+                                       pscope=root / "scope", rsh=os.fspath(shell))
+                    if asynchronous:
+                        asyncio.run(result)
+                self.assertEqual(failed.exception.returncode, 2)
+                self.assertIn(b"--pscope requires the default ssh", failed.exception.stderr)
+                self.assertFalse((root / "shell-ran").exists())
+                self.assertFalse((root / "destination").exists())
+
     def test_candidate_remote_to_remote_copy_can_keep_results_local(self) -> None:
         assert EXECUTABLE is not None
         with resolved_temporary_directory() as temporary_directory:

@@ -44,6 +44,7 @@ RUN apt-get update \
         dbus \
         libnotify-bin \
         fish \
+        git \
         iptables \
         netcat-openbsd \
         openssh-client \
@@ -88,8 +89,13 @@ COPY tests/real-ssh/test-completion-display.py /usr/local/libexec/syq-test-compl
 COPY tests/real-ssh/test-receive-notifications.py /usr/local/libexec/syq-test-receive-notifications.py
 
 COPY tests/real-ssh/test-forward-copy.py /usr/local/libexec/syq-test-forward-copy.py
+COPY tests/real-ssh/test-pull-copy.py /usr/local/libexec/syq-test-pull-copy.py
 
 COPY tests/real-ssh/test-return-exec.py /usr/local/libexec/syq-test-return-exec.py
+COPY tests/real-ssh/test-return-ssh.py /usr/local/libexec/syq-test-return-ssh.py
+COPY tests/real-ssh/test-ssh-tools.py /usr/local/libexec/syq-test-ssh-tools.py
+COPY tests/real-ssh/test-provider-ssh.py /usr/local/libexec/syq-test-provider-ssh.py
+COPY tests/real-ssh/test-peer-bridge.py /usr/local/libexec/syq-test-peer-bridge.py
 
 COPY tests/real-ssh/test-receive-profiles.py /usr/local/libexec/syq-test-receive-profiles.py
 

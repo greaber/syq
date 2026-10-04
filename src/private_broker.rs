@@ -26,10 +26,9 @@ fn register_signal_cleanup(path: &Path) -> Result<()> {
         .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
         .clone();
     let result = SIGNAL_CLEANUP_THREAD.get_or_init(|| {
-        let mut signals = signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGINT,
-            signal_hook::consts::SIGTERM,
-        ])?;
+        let mut signals = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
+            signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM])
+        })?;
         let cleanup_paths = Arc::clone(&paths);
         thread::Builder::new()
             .name("syq-broker-signal-cleanup".into())

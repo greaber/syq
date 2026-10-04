@@ -26,8 +26,8 @@ ALL_TOOLING = "package installer benchmark release orchestration focused branch 
 DOCUMENTATION_PATHS = "docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md"
 REAL_SSH = {
     "real-ssh-core": {"suite": "core", "profile": "default"},
-    # The one-session profile changes only the destination's sshd, so it skips
-    # the cases that never contact the destination.
+    # Omit unaffected cases and workflows that require concurrent sessions
+    # on one connection; both remain covered by the default profile.
     "real-ssh-max-sessions-1": {"suite": "core", "profile": "max-sessions-1",
                                 "skip": "tests/real-ssh/max-sessions-1.skip"},
     "real-ssh-metadata": {"suite": "metadata", "profile": "default"},

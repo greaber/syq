@@ -438,7 +438,7 @@ mod tests {
             assert_eq!(json["kind"], "command");
             assert!(json.get("destination").is_none());
             assert!(summary
-                .description(str::to_owned)
+                .description(&crate::persistence::Domain::default(), str::to_owned)
                 .contains("Runs as your local user"));
             assert!(!root.path().join("marker").exists());
             assert!(receiver

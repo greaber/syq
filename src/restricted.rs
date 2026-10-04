@@ -39,8 +39,12 @@ mod grant;
 mod install;
 mod keys;
 mod receiver;
+pub(crate) mod source;
 mod ssh;
 mod statefs;
+mod temporary_key;
+
+pub(crate) use temporary_key::TemporaryKey;
 
 pub(crate) use authority::*;
 use enroll::*;

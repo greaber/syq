@@ -1867,15 +1867,16 @@ fn pscope_is_shared_by_transfer_surfaces_and_refuses_unrelated_directories() {
     let map = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["map", "--pscope"])
         .arg(&scope)
-        .args(["--src", &t.s("src/a")])
+        .args(["--src", "src/a"])
+        .current_dir(&t.0)
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .run()
         .unwrap();
-    assert!(!map.status.success());
-    assert!(
-        stderr_of(&map).contains("unexpected argument '--pscope'"),
-        "{}",
-        stderr_of(&map)
-    );
+    assert_output_ok(&map);
+    let entry: serde_json::Value = serde_json::from_slice(&map.stdout).unwrap();
+    assert_eq!(entry["src"]["encoding"], "utf-8");
+    assert_eq!(entry["src"]["value"], "src/a");
 
     let victim = t.path("victim");
     fs::create_dir(&victim).unwrap();

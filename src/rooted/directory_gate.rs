@@ -4,7 +4,8 @@
 //! the open root's identity with the validated parent spelling: separate roots
 //! for the same inode share admission, but different descendant aliases may
 //! miss that optimization. Path resolution and publication checks remain with
-//! the caller, and a permit must not span data writes or metadata inspection.
+//! the caller. Copying permits must not span data writes or metadata inspection;
+//! deletion batches may validate each entry while holding their turn.
 //!
 //! A single operation takes a permit for its one syscall. A batch takes a
 //! turn instead and changes many entries before the next contender wakes, so
@@ -48,14 +49,14 @@ struct State {
     waiting: usize,
 }
 
-struct Gate {
+pub(crate) struct Gate {
     state: Mutex<State>,
     available: Condvar,
     limit: usize,
 }
 
 impl Gate {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             state: Mutex::default(),
             available: Condvar::new(),
@@ -63,7 +64,7 @@ impl Gate {
         }
     }
 
-    fn acquire(self: &Arc<Self>) -> Permit {
+    pub(crate) fn acquire(self: &Arc<Self>) -> Permit {
         let mut state = self.state.lock().unwrap();
         while state.active == self.limit {
             state.waiting += 1;
@@ -76,7 +77,7 @@ impl Gate {
     }
 }
 
-pub(super) struct Permit(Option<Arc<Gate>>);
+pub(crate) struct Permit(Option<Arc<Gate>>);
 
 impl Drop for Permit {
     fn drop(&mut self) {
@@ -111,6 +112,7 @@ impl Drop for Turn {
 struct Registry {
     gates: HashMap<Directory, Weak<Gate>>,
     sweep_at: usize,
+    limit: usize,
 }
 
 impl Registry {
@@ -118,6 +120,7 @@ impl Registry {
         Self {
             gates: HashMap::new(),
             sweep_at: 1024,
+            limit: MUTATORS,
         }
     }
 
@@ -130,7 +133,7 @@ impl Registry {
             .get(&key)
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
-                let gate = Arc::new(Gate::new(MUTATORS));
+                let gate = Arc::new(Gate::new(self.limit));
                 self.gates.insert(key, Arc::downgrade(&gate));
                 gate
             })
@@ -180,6 +183,27 @@ pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
     // The caller keeps its root descriptor alive throughout the operation,
     // preventing root inode reuse while a permit or its waiter is live.
     // Never hold the registry lock while waiting or performing filesystem I/O.
+    gate.acquire()
+}
+
+/// Small-file deletion keeps a few syscalls active while other callers park.
+/// Its callers retain the root and release a turn before taking another one.
+#[cfg(target_os = "linux")]
+pub(crate) fn deletion(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    let gate = REGISTRY
+        .get_or_init(|| {
+            Mutex::new(Registry {
+                limit: 4,
+                ..Registry::new()
+            })
+        })
+        .lock()
+        .unwrap()
+        .gate(Directory {
+            root,
+            parents: parents.to_vec(),
+        });
     gate.acquire()
 }
 

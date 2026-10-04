@@ -2014,54 +2014,92 @@ fn native_remote_exact_bare_home_expands_before_identity_check() {
 }
 
 #[test]
-fn explicit_pscope_is_refused_for_remote_coordinators() {
-    let t = Tmp::new();
-    fs::create_dir(t.runtime()).unwrap();
-    let scope = ephemeral_scope(&t);
-    let scope = scope.to_str().unwrap();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "rsync",
-            "-a",
-            "--syq-pscope",
-            scope,
-            "hostA:src/",
-            "hostB:dst/",
-            "--no-progress",
-        ])
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.runtime())
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("source and destination cannot both be remote"));
-
-    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "cp",
-            "--pscope",
-            scope,
-            "--from",
-            "hostA",
-            "--srcs-in",
-            "src",
-            "--to",
-            "hostB",
-            "--coordinate-at",
-            "dst",
-            "--into",
-            "dst",
-            "-q",
-        ])
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.runtime())
-        .run()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = stderr_of(&out);
-    assert!(stderr.contains("remote transfer coordinator"), "{stderr}");
-    assert!(stderr.contains("--coordinate-at local"), "{stderr}");
+fn explicit_pscope_stays_local_to_direct_remote_coordinators() {
+    for coordinator in ["src", "dst"] {
+        let t = Tmp::new();
+        fs::create_dir(t.runtime()).unwrap();
+        let scope = ephemeral_scope(&t);
+        let ssh = fake_ssh(&t);
+        fs::create_dir_all(t.path("remote-bin")).unwrap();
+        std::os::unix::fs::symlink(&ssh, t.path("remote-bin/ssh")).unwrap();
+        write(&t.path("src/file"), b"direct scoped copy");
+        // The fresh scope must not borrow the global authorization preference.
+        write(
+            &t.path("config/syq/auth-from.json"),
+            br#"{"default":"@missing"}"#,
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--pscope"])
+            .arg(&scope)
+            .args([
+                "--peer-auth",
+                "own-credentials",
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--coordinate-at",
+                coordinator,
+                "--no-tcp",
+                "--performance-tuning=workers=1",
+                "--from",
+                "hostA",
+                "--srcs-in",
+                &t.s("src"),
+                "--to",
+                "hostB",
+                "--into",
+                &t.s("dst"),
+                "--no-progress",
+            ])
+            .env("HOME", t.path("home"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/file")), b"direct scoped copy");
+        assert!(!stderr_of(&output).contains("relaying data"));
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        let launch = log.lines().next().unwrap();
+        let endpoint = if coordinator == "src" {
+            "hostA"
+        } else {
+            "hostB"
+        };
+        let (local_options, remote_command) =
+            launch.split_once(&format!("-- {endpoint} ")).unwrap();
+        assert!(local_options.contains("ControlMaster=auto"), "{log}");
+        assert!(local_options.contains(scope.to_str().unwrap()), "{log}");
+        assert!(remote_command.contains("--delegated-operands-b64"), "{log}");
+        assert!(!remote_command.contains("--pscope"), "{log}");
+        assert!(!remote_command.contains(scope.to_str().unwrap()), "{log}");
+        assert!(
+            log.lines()
+                .skip(1)
+                .all(|line| !line.contains(scope.to_str().unwrap())),
+            "{log}"
+        );
+        let records: Vec<_> = fs::read_dir(&scope)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(records[0].path()).unwrap()).unwrap();
+        assert_eq!(record["host"], endpoint);
+    }
 }
 
 #[test]
