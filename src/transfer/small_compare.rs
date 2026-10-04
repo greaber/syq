@@ -49,11 +49,10 @@ pub(super) enum Compared {
     ResumePartial,
     /// The file could not be compared or patched: replace it whole.
     Differs,
-    /// The destination, which had `links` names when it was hashed, no
-    /// longer met the patch's target condition, as when keeping another name
-    /// of the same file changed it: compare it again, under a fresh
-    /// condition.
-    StaleCondition { links: u64 },
+    /// The destination no longer met the patch's target condition, as when
+    /// keeping another name of the same file changed it: compare it again,
+    /// under a fresh condition.
+    StaleCondition,
     /// The destination already held the source's contents, but keeping it
     /// failed: a file error, as for a content-identical per-file finish.
     KeepFailed(WireError),
@@ -70,11 +69,10 @@ enum Stage {
 struct PendingRead {
     /// Its position in the batch.
     file: usize,
-    /// The destination's block hashes, and the fingerprint and link count
-    /// of the file they came from.
+    /// The destination's block hashes, and the fingerprint of the file they
+    /// came from.
     expected: Vec<ContentDigest>,
     basis: Option<FileFingerprint>,
-    links: u64,
     /// The comparison only decides whether the file is unchanged.
     compare_only: bool,
 }
@@ -86,9 +84,8 @@ struct Group {
     files: Vec<usize>,
     /// Files sent to be read.
     reads: Vec<PendingRead>,
-    /// Files sent to be published: the bytes sent and reused, and the link
-    /// count of the file they replace.
-    published: Vec<(usize, u64, u64, u64)>,
+    /// Files sent to be published, and the bytes sent and reused.
+    published: Vec<(usize, u64, u64)>,
 }
 
 impl Worker {
@@ -152,19 +149,21 @@ impl Worker {
                     self.sched.jobs.lock().unwrap()[i].compared = true;
                     self.sched.requeue(i);
                 }
-                Some(Compared::StaleCondition { links }) => {
+                Some(Compared::StaleCondition) => {
                     // Keeping or replacing each other name of the
-                    // destination changes the change time its condition
-                    // holds, once, and so can leave this name's condition
-                    // stale once. Comparing it again as many times as the
-                    // file has names lets every name be kept; a file that
-                    // goes stale more often than that is replaced whole.
+                    // destination in this copy changes the change time its
+                    // condition holds, once, and so can leave this name's
+                    // condition stale once. Comparing it again as many times
+                    // as this copy has names of the file lets every name be
+                    // kept, and leaves one comparison for a change from
+                    // outside. A file that goes stale more often, as one
+                    // that keeps changing does, is replaced whole. Names of
+                    // it outside this copy do not count.
                     let mut jobs = self.sched.jobs.lock().unwrap();
+                    let names = jobs.destination_names(i);
                     let job = &mut jobs[i];
-                    let links = u32::try_from(links).unwrap_or(u32::MAX);
-                    job.destination_links = job.destination_links.max(links);
                     job.recompared = job.recompared.saturating_add(1);
-                    job.compared = job.recompared > job.destination_links;
+                    job.compared = job.recompared > names;
                     drop(jobs);
                     self.sched.requeue(i);
                 }
@@ -330,7 +329,7 @@ impl Worker {
                 let mut reads = Vec::new();
                 for (&i, existing) in group.files.iter().zip(existing) {
                     let job = &jobs[i];
-                    let (expected, basis, links) = match existing {
+                    let (expected, basis) = match existing {
                         Ok(ExistingHashes { partials: true, .. }) => {
                             outcomes[i] = Some(Compared::ResumePartial);
                             continue;
@@ -338,10 +337,9 @@ impl Worker {
                         Ok(ExistingHashes {
                             fingerprint,
                             hashes,
-                            links,
                             ..
                         }) if hashes.len() as u64 <= job.entry.size.div_ceil(block) => {
-                            (hashes, fingerprint, links)
+                            (hashes, fingerprint)
                         }
                         _ => continue,
                     };
@@ -360,7 +358,6 @@ impl Worker {
                         file: i,
                         expected,
                         basis,
-                        links,
                         compare_only,
                     });
                 }
@@ -383,7 +380,6 @@ impl Worker {
                         file: i,
                         expected,
                         basis,
-                        links,
                         compare_only,
                     },
                     differing,
@@ -450,7 +446,7 @@ impl Worker {
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
                     });
-                    group.published.push((i, sent, reused, links));
+                    group.published.push((i, sent, reused));
                 }
                 Ok(
                     (!patches.is_empty())
@@ -481,7 +477,7 @@ impl Worker {
         if patched.len() != group.published.len() {
             return;
         }
-        for (&(i, sent, reused, links), patched) in group.published.iter().zip(patched) {
+        for (&(i, sent, reused), patched) in group.published.iter().zip(patched) {
             outcomes[i] = Some(match patched {
                 Ok(SmallPatched {
                     kept: true,
@@ -500,7 +496,7 @@ impl Worker {
                 Err(SmallPatchError {
                     stale_condition: true,
                     ..
-                }) => Compared::StaleCondition { links },
+                }) => Compared::StaleCondition,
                 Err(_) => Compared::Differs,
             });
         }
@@ -535,7 +531,7 @@ impl Worker {
             Compared::SourceChanged(_)
             | Compared::ResumePartial
             | Compared::Differs
-            | Compared::StaleCondition { .. } => unreachable!("these files are requeued"),
+            | Compared::StaleCondition => unreachable!("these files are requeued"),
         }
     }
 

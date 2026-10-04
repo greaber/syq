@@ -3191,7 +3191,6 @@ impl Planner<'_> {
                 compared: false,
                 resume_partial: false,
                 recompared: 0,
-                destination_links: 0,
                 src,
                 source,
                 dst,

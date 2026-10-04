@@ -4336,6 +4336,7 @@ fn copy_through_restricted_receiver(
     workers: usize,
     before_patch: impl Fn() + Send + Sync + 'static,
 ) -> (usize, usize) {
+    use std::os::unix::fs::MetadataExt;
     let sched = Arc::new(Sched::new(512, 8192));
     let mut entries = std::collections::HashMap::new();
     for &(name, mtime) in files {
@@ -4354,6 +4355,9 @@ fn copy_through_restricted_receiver(
         job.dst_entry = Some(Entry {
             size: existing.len(),
             mtime: 0,
+            dev: existing.dev(),
+            ino: existing.ino(),
+            nlink: existing.nlink(),
             ..job.entry.clone()
         });
         entries.insert(job.src.clone(), job.entry.clone());
@@ -4496,13 +4500,30 @@ fn linked_destination(root: &std::path::Path, names: usize, contents: &[u8]) -> 
     (names, std::fs::metadata(&first).unwrap().ino())
 }
 
+/// Give the destination file `name` `count` more names outside the copy, as
+/// a backup snapshot tree gives its files.
+fn link_outside(root: &std::path::Path, name: &str, count: usize) {
+    let outside = root.join("snapshots");
+    std::fs::create_dir_all(&outside).unwrap();
+    for i in 0..count {
+        std::fs::hard_link(
+            root.join("target").join(name),
+            outside.join(format!("{name}.{i}")),
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
     use std::os::unix::fs::MetadataExt;
-    for (count, workers) in [(3, 1), (5, 1), (3, 3), (5, 3)] {
+    for (count, workers, outside) in [(3, 1, 0), (5, 1, 0), (3, 3, 0), (5, 3, 0), (3, 3, 16)] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
         let (names, inode) = linked_destination(root, count, b"same");
+        // Names outside the copy are never kept or replaced, so they leave
+        // no condition stale.
+        link_outside(root, &names[0], outside);
         // Each name has a source time of its own, so keeping each name sets
         // new times on the file they all share. That changes its change
         // time, once the clock has moved on, and leaves the conditions of
@@ -4515,7 +4536,7 @@ fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
         let (hashed, whole) = copy_through_restricted_receiver(root, &files, workers, || {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
-        let case = format!("{count} names, {workers} workers");
+        let case = format!("{count} names, {workers} workers, {outside} outside");
         for name in &names {
             let path = root.join("target").join(name);
             assert_eq!(
@@ -4577,4 +4598,47 @@ fn a_restricted_receiver_replaces_a_linked_destination_that_keeps_changing() {
         assert_eq!(hashed, count + 1, "{count}");
         assert_ne!(whole, 0, "{count}");
     }
+}
+
+#[test]
+fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_the_copy() {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let contents: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    // Two of the file's twenty names are in the copy.
+    let (names, _) = linked_destination(root, 2, &contents);
+    link_outside(root, &names[0], 18);
+    let first = root.join("target").join(&names[0]);
+    assert_eq!(std::fs::metadata(&first).unwrap().nlink(), 20);
+    // Every patch finds the file's second block rewritten after the receiver
+    // authorized it.
+    let shared = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&first)
+        .unwrap();
+    let writes = std::sync::atomic::AtomicU8::new(0);
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_str(), 1_600_000_000))
+        .collect();
+    let (hashed, whole) = copy_through_restricted_receiver(root, &files, 1, move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let write = writes.fetch_add(1, Relaxed).wrapping_add(1);
+        shared.write_all_at(&[write; 16], block as u64).unwrap();
+    });
+    for name in &names {
+        let path = root.join("target").join(name);
+        assert_eq!(std::fs::read(&path).unwrap(), contents, "{name}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mtime(),
+            1_600_000_000,
+            "{name}"
+        );
+    }
+    // Compared again once for each name in the copy, not for each of the
+    // file's names, the names are then copied whole.
+    assert_eq!(hashed, 3);
+    assert_ne!(whole, 0);
 }
