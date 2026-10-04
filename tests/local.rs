@@ -1016,8 +1016,6 @@ mod map;
 mod metadata;
 #[path = "local/persistence.rs"]
 mod persistence;
-#[path = "local/ssh_persistence.rs"]
-mod ssh_persistence;
 #[path = "local/progress.rs"]
 mod progress;
 #[path = "local/receiving.rs"]
@@ -1034,6 +1032,8 @@ mod rm;
 mod selection;
 #[path = "local/sparse.rs"]
 mod sparse;
+#[path = "local/ssh_persistence.rs"]
+mod ssh_persistence;
 #[path = "local/tuning.rs"]
 mod tuning;
 
