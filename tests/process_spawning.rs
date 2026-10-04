@@ -1,4 +1,5 @@
 //! All subprocess APIs share the same macOS pipe-creation lock.
+#[allow(dead_code)] // This target exercises only part of the shared process API.
 #[path = "../src/process.rs"]
 mod process;
 #[path = "support/temp.rs"]

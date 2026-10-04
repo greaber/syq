@@ -921,6 +921,9 @@ ssh destination '
 
 python3 /usr/local/libexec/syq-test-restricted-mapping.py
 
+printf 'case: receiver keys preserve login key protection\n'
+python3 /usr/local/libexec/syq-test-receiver-keys.py
+
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
 

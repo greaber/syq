@@ -23,6 +23,7 @@ fn host_policy(user: &str, name: &str, key: KeyData) -> HostPolicy {
         known_hosts_name: name.into(),
         host_key_algorithms: vec![algorithm],
         required_rsa_size: 1024,
+        agent_socket: None,
     }
 }
 
@@ -1183,19 +1184,22 @@ fn certificate_signature_reaches_real_ambient_agent_but_never_private_enrollment
 }
 
 #[test]
-fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
+fn configured_peer_agent_forwards_only_advertised_fully_bound_signatures() {
     let temp = crate::test_support::tempdir().unwrap();
     let ambient_socket = temp.path().join("ambient.sock");
     let (identity_private, identity) = key(23);
     let (ambient, requests) = fake_ambient(&ambient_socket, identity_private.clone());
+    let coordinator_socket = temp.path().join("coordinator.sock");
+    let (coordinator_identity, _) = key(20);
+    let (coordinator_agent, coordinator_requests) =
+        fake_ambient(&coordinator_socket, coordinator_identity);
     let (source_private, source) = key(21);
     let (destination_private, destination) = key(22);
-    let broker = ConstrainedAgentBroker::start_with_ambient_socket(
-        ambient_socket,
-        policy(source.clone(), destination.clone()),
-        TEST_BROKER_CONNECTIONS,
-    )
-    .unwrap();
+    let mut policy = policy(source.clone(), destination.clone());
+    policy.coordinator.as_mut().unwrap().agent_socket = Some(coordinator_socket.clone());
+    policy.peer.agent_socket = Some(ambient_socket);
+    let broker = ConstrainedAgentBroker::start(policy.clone(), TEST_BROKER_CONNECTIONS).unwrap();
+    assert_eq!(broker.ambient_socket(), coordinator_socket);
     let mut client = UnixStream::connect(broker.socket_path()).unwrap();
 
     let source_bind = bind_request(binding(&source_private, source, b"source-session", true));
@@ -1206,6 +1210,7 @@ fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
         panic!("expected identities response")
     };
     assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].credential.key_data(), &identity);
     assert!(identities[0].comment.is_empty());
     assert_eq!(requests.recv().unwrap(), source_bind);
     assert_eq!(requests.recv().unwrap(), vec![11]);
@@ -1251,6 +1256,15 @@ fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
     drop(client);
     drop(broker);
     ambient.join().unwrap();
+    // Wake the untouched coordinator fixture so it can finish without any
+    // authentication request ever reaching it through the forwarded broker.
+    drop(UnixStream::connect(&coordinator_socket).unwrap());
+    coordinator_agent.join().unwrap();
+    assert!(coordinator_requests.try_recv().is_err());
+
+    policy.peer.agent_socket = None;
+    let error = ConstrainedAgentBroker::start(policy, TEST_BROKER_CONNECTIONS).unwrap_err();
+    assert!(error.to_string().contains("peer host"), "{error:#}");
 }
 
 #[test]
@@ -1470,4 +1484,129 @@ fn broker_advertises_and_signs_only_the_enrollment_key() {
         Response::ExtensionFailure
     ));
     assert_closed(&mut client);
+}
+
+#[test]
+fn selected_agent_backend_never_exposes_another_identity() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let socket = temp.path().join("ambient.sock");
+    let (transport, public) = key(63);
+    let (ambient, requests) = fake_ambient(&socket, transport);
+    let (source_private, source) = key(61);
+    let (destination_private, destination) = key(62);
+    let broker = ConstrainedAgentBroker::start_with_backend(
+        socket.clone(),
+        SigningBackend::SelectedAgent {
+            socket,
+            key: public.clone(),
+        },
+        policy(source.clone(), destination.clone()),
+        TEST_BROKER_CONNECTIONS,
+    )
+    .unwrap();
+    let mut client = UnixStream::connect(broker.socket_path()).unwrap();
+    let source_bind = bind_request(binding(&source_private, source, b"source-selected", true));
+    let destination_bind = bind_request(binding(
+        &destination_private,
+        destination.clone(),
+        b"destination-selected",
+        false,
+    ));
+    for message in [&source_bind, &destination_bind] {
+        write_frame(&mut client, message).unwrap();
+        assert!(matches!(read_response(&mut client), Response::Success));
+    }
+    write_frame(&mut client, &[11]).unwrap();
+    let Response::IdentitiesAnswer(identities) = read_response(&mut client) else {
+        panic!("expected enrollment identity")
+    };
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].credential.key_data(), &public);
+    assert!(
+        requests.try_recv().is_err(),
+        "enumerating the dedicated key contacted the ambient agent"
+    );
+    let request = sign_request(
+        b"destination-selected",
+        b"backup",
+        b"publickey-hostbound-v00@openssh.com",
+        public.clone(),
+        &destination,
+    );
+    let data = request.data.clone();
+    write_frame(&mut client, &encode_request(Request::SignRequest(request))).unwrap();
+    let Response::SignResponse(signature) = read_response(&mut client) else {
+        panic!("expected signature")
+    };
+    public.verify(&data, &signature).unwrap();
+    assert_eq!(requests.recv().unwrap(), source_bind);
+    assert_eq!(requests.recv().unwrap(), destination_bind);
+    assert_eq!(requests.recv().unwrap()[0], 13);
+    let (_, other) = key(64);
+    let forbidden = sign_request(
+        b"destination-selected",
+        b"backup",
+        b"publickey-hostbound-v00@openssh.com",
+        other,
+        &destination,
+    );
+    write_frame(
+        &mut client,
+        &encode_request(Request::SignRequest(forbidden)),
+    )
+    .unwrap();
+    assert!(matches!(read_response(&mut client), Response::Failure));
+    assert_closed(&mut client);
+    drop(broker);
+    ambient.join().unwrap();
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn private_rsa_signing_supports_both_sha2_algorithms() {
+    let key: PrivateKey =
+        ssh_key::private::RsaKeypair::random(&mut ssh_key::rand_core::OsRng, 3072)
+            .unwrap()
+            .into();
+    for flags in [2, 4] {
+        let signature = sign_private_key(&key, b"RSA authentication fixture", flags).unwrap();
+        key.public_key()
+            .key_data()
+            .verify(b"RSA authentication fixture", &signature)
+            .unwrap();
+    }
+    assert!(sign_private_key(&key, b"SHA1 forbidden", 0).is_err());
+    assert!(sign_private_key(&key, b"invalid flags", 6).is_err());
+}
+
+#[test]
+fn identity_agent_configuration_overrides_the_ambient_socket() {
+    let environment = |name: &str| match name {
+        "SSH_AUTH_SOCK" => Some(OsString::from("/tmp/ambient-agent")),
+        "FIXTURE_AGENT" => Some(OsString::from("/tmp/selected-agent")),
+        _ => None,
+    };
+    for (config, expected) in [
+        ("user fixture\n", Some("/tmp/ambient-agent")),
+        ("identityagent SSH_AUTH_SOCK\n", Some("/tmp/ambient-agent")),
+        (
+            "identityagent $FIXTURE_AGENT\n",
+            Some("/tmp/selected-agent"),
+        ),
+        (
+            "identityagent /tmp/explicit-agent\n",
+            Some("/tmp/explicit-agent"),
+        ),
+        ("identityagent none\n", None),
+        ("identityagent $MISSING\n", None),
+    ] {
+        assert_eq!(
+            agent_socket_from_config(config.as_bytes(), environment).unwrap(),
+            expected.map(PathBuf::from)
+        );
+    }
+    assert_eq!(
+        agent_socket_from_config(b"identityagent /tmp/explicit-agent\n", |_| None).unwrap(),
+        Some(PathBuf::from("/tmp/explicit-agent"))
+    );
 }
