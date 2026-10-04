@@ -135,6 +135,12 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
 /// clones the file it replaces rather than writing every block.
 const CLONE_MIN_REUSED: u64 = 1 << 20;
 
+/// A stage of at least this many bytes is allocated before it is written,
+/// as a whole-file partial is. Otherwise a filesystem with delayed
+/// allocation, such as ext4, allocates and writes it back inside the rename
+/// that replaces a file with it.
+const PREALLOCATE_MIN_STAGE: u64 = 1 << 20;
+
 /// What the receiver does with one patch: keep the file it replaces, or
 /// stage it for publication.
 enum PatchStep<'a> {
@@ -611,6 +617,7 @@ impl FsOps {
             && fingerprint(&source.old.metadata()?) == source.basis;
         if !cloned {
             file.set_len(0)?;
+            self.preallocate_stage(stage, patch.len)?;
             let data = assemble(Some(&source.old), self.hash_policy.algorithm, patch)?;
             return match unobserved {
                 None => observed_write(&self.operation, file, &data, 0, self.sparse),
@@ -653,6 +660,20 @@ impl FsOps {
         } else {
             file.set_len(patch.len)?;
         }
+        Ok(())
+    }
+
+    /// Allocate a stage of `len` bytes before it is written, as a
+    /// whole-file partial is, unless it is small or sparse. NFS grows it
+    /// with its writes instead.
+    fn preallocate_stage(&self, stage: &SmallStage, len: u64) -> Result<()> {
+        if self.sparse || len < PREALLOCATE_MIN_STAGE {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        super::partial::preallocate_new_file_on(&stage.file, stage.created.dev(), len)?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = stage;
         Ok(())
     }
 
@@ -912,6 +933,7 @@ impl FsOps {
             if stage.reused {
                 stage.file.set_len(0)?;
             }
+            self.preallocate_stage(stage, put.data.len() as u64)?;
             match unobserved {
                 None => observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse),
                 Some(bytes) => write_data(&stage.file, &put.data, 0, self.sparse).inspect(|()| {
@@ -989,6 +1011,43 @@ mod tests {
 
     fn entries(directory: &Path) -> usize {
         fs::read_dir(directory).unwrap().count()
+    }
+
+    /// A patch publishing `new` in blocks of `block` bytes, reusing each
+    /// block whose hash `hashed` holds at its index.
+    fn patch_from(
+        name: &str,
+        new: &[u8],
+        block: u64,
+        hashed: &ExistingHashes,
+        algorithm: crate::hashing::HashAlgorithm,
+    ) -> SmallPatch {
+        let mut reuse = Vec::new();
+        let mut data = Vec::new();
+        for (index, chunk) in new.chunks(block as usize).enumerate() {
+            let hash = algorithm.hash(chunk);
+            if hashed.hashes.get(index) == Some(&hash) {
+                reuse.push(Some(hash));
+            } else {
+                reuse.push(None);
+                data.extend_from_slice(chunk);
+            }
+        }
+        SmallPatch {
+            path: name.as_bytes().to_vec(),
+            copy_id: [4; 16],
+            len: new.len() as u64,
+            block,
+            reuse,
+            hash: content_digest(&data),
+            data,
+            basis: hashed.fingerprint,
+            meta: put(name, b"").meta,
+            flags: 0,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        }
     }
 
     #[test]
@@ -1185,6 +1244,78 @@ mod tests {
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
             assert_eq!(entries(directory), 2);
         }
+    }
+
+    /// Run `f` with this thread's preallocations failing for a full disk.
+    #[cfg(target_os = "linux")]
+    fn without_space<R>(f: impl FnOnce() -> R) -> R {
+        super::super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+        let result = f();
+        super::super::partial::FALLOCATE_ERRNO.set(None);
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn large_stages_are_allocated_before_they_are_written() {
+        // A stage of `PREALLOCATE_MIN_STAGE` bytes or more is allocated
+        // before it is written, as a whole-file partial is, so a filesystem
+        // with delayed allocation does not write it back inside the rename
+        // that publishes it. Here the disk is full, so allocating fails the
+        // file. Sparse stages and small ones are not allocated.
+        let full = |error: &WireError| {
+            error.raw_os_error == Some(libc::ENOSPC) && error.message.contains("preallocate")
+        };
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let mut ops = receiver(directory);
+        let large = vec![7; PREALLOCATE_MIN_STAGE as usize];
+        let small = &large[1..];
+        let results =
+            without_space(|| ops.put_small_batch(&[put("large", &large), put("small", small)]));
+        assert!(results[0].as_ref().is_err_and(full), "{:?}", results[0]);
+        assert_eq!(results[1], Ok(None));
+        ops.sparse = true;
+        let results = without_space(|| ops.put_small_batch(&[put("sparse", &large)]));
+        assert_eq!(results[0], Ok(None));
+        ops.sparse = false;
+        // A failed file leaves its sidecar for the next attempt to reuse.
+        for (name, published) in [("large", false), ("small", true), ("sparse", true)] {
+            assert_eq!(directory.join(name).exists(), published, "{name}");
+        }
+
+        // A patch reusing too little to clone the file it replaces is
+        // assembled, and its stage allocated as well.
+        let block = MIN_HASH_BLOCK_BYTES;
+        let len = 32 * block;
+        let dense: Vec<u8> = (0..len).map(|i| (i % 251) as u8 | 1).collect();
+        fs::write(directory.join("assembled"), &dense).unwrap();
+        let hashed = ops.hash_existing_batch(
+            block,
+            &[ExistingRead {
+                path: b"assembled".to_vec(),
+                len,
+                condition: TargetCondition::Any,
+                guard: None,
+            }],
+        );
+        let mut rewritten = dense.clone();
+        rewritten[..20 * block as usize].fill(0);
+        let algorithm = ops.hash_policy.algorithm;
+        let patch = patch_from(
+            "assembled",
+            &rewritten,
+            block,
+            hashed[0].as_ref().unwrap(),
+            algorithm,
+        );
+        let results = without_space(|| ops.patch_small_batch(&[patch])).unwrap();
+        assert!(
+            results[0].as_ref().is_err_and(|error| full(&error.error)),
+            "{:?}",
+            results[0]
+        );
+        assert_eq!(fs::read(directory.join("assembled")).unwrap(), dense);
     }
 
     #[test]

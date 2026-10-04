@@ -328,15 +328,7 @@ impl FsOps {
         }
         #[cfg(target_os = "linux")]
         {
-            let dev = file.metadata()?.dev();
-            let key = file_system_key(file, dev);
-            let traits = file_system_traits(file, key);
-            #[cfg(debug_assertions)]
-            let traits = FileSystemTraits {
-                is_nfs: traits.is_nfs || std::env::var_os("SYQ_TEST_DESTINATION_NFS").is_some(),
-                ..traits
-            };
-            preallocate_new_file(file, size, traits)
+            preallocate_new_file_on(file, file.metadata()?.dev(), size)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -3386,6 +3378,19 @@ pub(super) fn fail_partial_chmod_for_test() -> Result<()> {
     Ok(())
 }
 
+/// Preallocate a new file on device `dev`, as `preallocate_new_file` does
+/// on that device's filesystem.
+#[cfg(target_os = "linux")]
+pub(super) fn preallocate_new_file_on(file: &File, dev: u64, size: u64) -> Result<()> {
+    let traits = file_system_traits(file, file_system_key(file, dev));
+    #[cfg(debug_assertions)]
+    let traits = FileSystemTraits {
+        is_nfs: traits.is_nfs || std::env::var_os("SYQ_TEST_DESTINATION_NFS").is_some(),
+        ..traits
+    };
+    preallocate_new_file(file, size, traits)
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits) -> Result<()> {
     if size == 0 {
@@ -3417,8 +3422,20 @@ pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Fails the preallocations this thread makes with this error, as
+    /// `SYQ_TEST_FALLOCATE_ERRNO` does for a whole process.
+    pub(super) static FALLOCATE_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 pub(super) fn test_fallocate_errno() -> Option<i32> {
+    #[cfg(test)]
+    if let Some(errno) = FALLOCATE_ERRNO.get() {
+        return Some(errno);
+    }
     let value = std::env::var_os("SYQ_TEST_FALLOCATE_ERRNO")?;
     match value.to_string_lossy().as_ref() {
         "unsupported" => Some(libc::EOPNOTSUPP),
