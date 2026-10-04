@@ -1914,16 +1914,33 @@ fn probe_reachable_probes_each_socket_address_once() {
         .to_socket_addrs()
         .map(|mut it| it.any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST))
         .unwrap_or(false);
-    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = accepted.clone();
-    std::thread::spawn(move || {
-        while let Ok((_stream, _)) = listener.accept() {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    listener.set_nonblocking(true).unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let acceptor = std::thread::spawn(move || {
+        let mut accepted = 0;
+        loop {
+            match listener.accept() {
+                Ok((_, peer)) => {
+                    accepted += 1;
+                    let _ = accepted_tx.send(peer);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match stop_rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        _ => break,
+                    }
+                }
+                Err(error) => panic!("accept probe: {error}"),
+            }
         }
+        accepted
     });
     let candidate = |address: &str| TcpCandidate {
         address: address.to_string(),
-        speed_mbps: 0,
+        // Equal known speeds make every candidate relevant, so probing waits
+        // for them all instead of returning after the first reachable one.
+        speed_mbps: 1,
         source: DataAddressSource::RemoteInterface,
         reachable: None,
         selected: false,
@@ -1933,12 +1950,38 @@ fn probe_reachable_probes_each_socket_address_once() {
         candidate("localhost"),
         candidate("127.0.0.1"),
     ];
-    probe_reachable(&mut candidates, port).unwrap();
+    let probed = probe_reachable(&mut candidates, port);
+    // Queue a marker after the probes, then wait until the acceptor reaches
+    // it. Stopping after the first acceptance could miss a duplicate probe
+    // whose completed connection was not yet ready to accept.
+    let drained = (|| -> anyhow::Result<()> {
+        let marker = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], port)),
+            std::time::Duration::from_secs(60),
+        )?;
+        let marker_peer = marker.local_addr()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!remaining.is_zero(), "marker connection was not accepted");
+            match accepted_rx.recv_timeout(remaining.min(std::time::Duration::from_secs(1))) {
+                Ok(peer) if peer == marker_peer => return Ok(()),
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!("waiting for probe acceptor to reach marker {marker_peer}");
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })();
+    drop(stop_tx);
+    let accepted = acceptor.join().unwrap();
+    probed.unwrap();
+    drained.unwrap();
     assert_eq!(candidates[0].reachable, Some(true));
     assert_eq!(candidates[2].reachable, Some(true));
     assert_eq!(candidates[1].reachable, Some(via_localhost));
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(accepted, 2);
 }
 
 /// Replay socket-probe completions in a fixed order without depending on the

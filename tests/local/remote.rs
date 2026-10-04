@@ -9,7 +9,13 @@ fn confinement_remote_command(t: &Tmp, tcp: bool) -> Command {
     command
         .arg("-e")
         .arg(rsh)
-        .args(["--syq-no-bootstrap", "--performance-tuning", "workers=1"])
+        .args([
+            "--syq-no-bootstrap",
+            "--performance-tuning",
+            "workers=1",
+            "--syq-tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+        ])
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
