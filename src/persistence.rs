@@ -521,7 +521,7 @@ fn closing_scope_error(scope: &Path) -> anyhow::Error {
         None => "finish its cleanup by repeating `syq persist off` with the original `--pscope` argument".into(),
     };
     anyhow::anyhow!(
-        "persistence scope {} is closing; {recovery}",
+        "persistence scope is closing: {}; {recovery}",
         scope.display()
     )
 }
