@@ -745,6 +745,7 @@ exit 255
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
+    let started = std::time::Instant::now();
     let mut pool = process_group::ProcessGroup::spawn(&mut command).unwrap();
     // Observe retries, then stop the pool. A fixed eight-second lifetime made
     // the count depend on SSH startup and scheduling delays. The exact retry
@@ -753,6 +754,10 @@ exit 255
         "two refused pool sessions",
         std::time::Duration::from_secs(60),
         || fs::read_to_string(t.path("rsh.log")).is_ok_and(|log| log.lines().count() >= 2),
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(5),
+        "a refused session retried without the failure backoff"
     );
     fs::remove_file(scope.join("cm-00112233aabbccdd.pool")).unwrap();
     wait_for(

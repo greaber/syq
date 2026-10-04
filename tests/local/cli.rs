@@ -1545,7 +1545,10 @@ fn stream_previews_and_results_do_not_consume_payload() {
         let mut report_at = 1;
         while child.try_wait().unwrap().is_none() {
             let seconds = start.elapsed().as_secs();
-            if seconds >= 10 {
+            // A regression that opens the unwritten FIFO blocks indefinitely.
+            // Leave room for helper startup under concurrent suite load; the
+            // assertions below, not elapsed time, establish preview behavior.
+            if seconds >= 60 {
                 unsafe {
                     libc::kill(-(child.id() as i32), libc::SIGKILL);
                 }
