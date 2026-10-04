@@ -333,6 +333,9 @@ impl FsOps {
                 // and anything else, or an open the kernel refused, takes
                 // the checked reuse that ranged writes apply.
                 self.uncache_rooted(&target.root, relative);
+                if creates_foreign_owners(target.root.identity().dev) {
+                    return self.checked_small_stage(&target.root, relative, label, mode);
+                }
                 match self.open_or_create_write_only_partial(&target.root, relative, mode) {
                     Ok((file, created)) if is_fresh_partial(&created, mode) => {
                         Ok(Some((file, created, None)))

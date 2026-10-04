@@ -96,7 +96,10 @@ impl FsOps {
         let mut repaired_permissions = false;
         if create_if_missing {
             match self.create_partial_rooted(root, relative, create_mode) {
-                Ok(file) => return Ok(Some((file, None))),
+                Ok(file) => {
+                    note_created_owner(&file.metadata()?);
+                    return Ok(Some((file, None)));
+                }
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
             }
@@ -240,7 +243,10 @@ impl FsOps {
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
                 None => match self.create_partial_rooted(root, relative, create_mode) {
-                    Ok(file) => return Ok(Some((file, None))),
+                    Ok(file) => {
+                        note_created_owner(&file.metadata()?);
+                        return Ok(Some((file, None)));
+                    }
                     Err(error)
                         if error
                             .downcast_ref::<io::Error>()
@@ -490,16 +496,19 @@ impl FsOps {
                     // whose final mode lacks it.
                     let staged = mode | 0o600;
                     self.uncache_rooted(&target.root, relative);
-                    match self.open_or_create_write_only_partial(&target.root, relative, staged) {
-                        Ok((file, created))
-                            if is_fresh_partial(&created, staged)
-                                && created.mode() & 0o600 == 0o600 =>
+                    if !creates_foreign_owners(target.root.identity().dev) {
+                        match self.open_or_create_write_only_partial(&target.root, relative, staged)
                         {
-                            return Ok(Some((file, None, Some(created))));
+                            Ok((file, created))
+                                if is_fresh_partial(&created, staged)
+                                    && created.mode() & 0o600 == 0o600 =>
+                            {
+                                return Ok(Some((file, None, Some(created))));
+                            }
+                            Ok(_) => {}
+                            Err(error) if existing_leaf_refused(&error) => {}
+                            Err(error) => return Err(error),
                         }
-                        Ok(_) => {}
-                        Err(error) if existing_leaf_refused(&error) => {}
-                        Err(error) => return Err(error),
                     }
                 }
                 self.open_private_partial_rooted(
@@ -3089,6 +3098,29 @@ pub(super) fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Devices where a file this process has just created exclusively reports
+/// another owner: sshfs without uid mapping, squashed NFS, a CIFS mount with
+/// a forced uid. Ownership cannot show there that a sidecar opened without
+/// exclusive creation is new, so sidecars are created exclusively from the
+/// start instead of after that check has failed.
+fn foreign_owner_devices() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static DEVICES: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    DEVICES.get_or_init(Default::default)
+}
+
+pub(super) fn creates_foreign_owners(dev: u64) -> bool {
+    foreign_owner_devices().lock().unwrap().contains(&dev)
+}
+
+fn note_created_owner(metadata: &fs::Metadata) {
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        foreign_owner_devices()
+            .lock()
+            .unwrap()
+            .insert(metadata.dev());
+    }
 }
 
 // Ownership is required when adopting a leftover, before chmod or writes.
