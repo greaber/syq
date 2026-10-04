@@ -933,7 +933,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1",
+            "workers=1,copy-path=ranges",
             "--no-whole-file",
             "--resource-limits",
             "bandwidth=1G",
@@ -954,7 +954,7 @@ fn final_hash_and_partial_seed_use_one_inode_snapshot() {
     let second = syq(&[
         "-a",
         "--performance-tuning",
-        "workers=1",
+        "workers=1,copy-path=ranges",
         "--no-whole-file",
         "--resource-limits",
         "bandwidth=1G",
@@ -987,7 +987,7 @@ fn retained_basis_growth_is_not_treated_as_an_exact_match() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1",
+            "workers=1,copy-path=ranges",
             "--no-whole-file",
             "--resource-limits",
             "bandwidth=1G",
@@ -1035,7 +1035,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
         .args([
             "-a",
             "--performance-tuning",
-            "workers=1",
+            "workers=1,copy-path=ranges",
             "--no-whole-file",
             "--resource-limits",
             "bandwidth=1G",
@@ -1056,7 +1056,7 @@ fn content_identical_basis_never_mixes_contents_and_metadata() {
     let second = syq(&[
         "-a",
         "--performance-tuning",
-        "workers=1",
+        "workers=1,copy-path=ranges",
         "--no-whole-file",
         "--resource-limits",
         "bandwidth=1G",
@@ -1550,7 +1550,10 @@ fn vanished_source_is_not_published_on_any_filesystem_route() {
                 }
                 let partials = partial_files(&t.path("dst"));
                 assert!(partials.len() <= 1, "{route}: {partials:?}");
-                if size == 8 << 20 {
+                // The per-file path leaves the copied contents for a later
+                // resume. A replaced file this size is instead compared and
+                // assembled in a group, which writes nothing before publishing.
+                if size == 8 << 20 && !existing {
                     assert_eq!(partials.len(), 1, "{route}");
                 }
                 for partial in partials {
@@ -1655,6 +1658,8 @@ fn changed_source_retry_uses_unpublished_partial_as_block_basis() {
             "-a",
             "--stats",
             "--no-whole-file",
+            "--performance-tuning",
+            "copy-path=ranges",
             "--resource-limits",
             "bandwidth=1G",
             "--no-progress",

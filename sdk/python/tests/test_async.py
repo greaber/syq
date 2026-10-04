@@ -294,6 +294,12 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(stream.cwd, home / "selected")
 
+    async def test_cp_forwards_hash_or_copy(self) -> None:
+        await self.client.cp("source", into="destination", hash_or_copy=True)
+        argv = self.argv()
+        self.assertIn("--hash-or-copy", argv)
+        self.assertNotIn("--hash", argv)
+
     async def test_cp_forwards_transfer_strategy(self) -> None:
         await self.client.cp("source", into="destination", transfer_strategy="aligned-block")
         argv = self.argv()

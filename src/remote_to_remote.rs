@@ -976,6 +976,9 @@ fn run_remote(
     if !args.compress {
         remote.push("--no-compress".into());
     }
+    if args.hash_or_copy && !args.checksum {
+        remote.push("--hash-or-copy".into());
+    }
     if args.checksum {
         if args.hash_algorithm == crate::hashing::HashAlgorithm::Blake3 {
             remote.push("--hash".into());

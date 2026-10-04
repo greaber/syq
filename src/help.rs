@@ -296,7 +296,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         "copy_metadata" | "sparse" | "open_noatime" | "follow" | "follow_src" | "follow_dst" => {
             ("Metadata and symlinks", 3)
         }
-        "integrity_checking_arg" | "hash" => ("Verification", 4),
+        "integrity_checking_arg" | "hash" | "hash_or_copy" => ("Verification", 4),
         "auth_from"
         | "rsh"
         | "syq_path"

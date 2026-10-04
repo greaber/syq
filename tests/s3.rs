@@ -4860,6 +4860,32 @@ fn server_copy_rejects_metadata_headers_before_requests() {
 }
 
 #[test]
+fn server_copy_rejects_content_hash_options_before_requests() {
+    let server = Server::start("ok");
+    let temp = crate::test_support::tempdir().unwrap();
+    // S3 treats --hash-or-copy as --hash, which would read object contents.
+    for option in ["--hash", "--hash-or-copy"] {
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://source",
+                "data",
+                "--to",
+                "s3://bucket",
+                "--as",
+                "out",
+                option,
+            ],
+        );
+        let text = output_text(&output);
+        assert_eq!(output.status.code(), Some(2), "{option}: {text}");
+        assert!(text.contains("stay server-side"), "{option}: {text}");
+    }
+    assert_eq!(server.requests.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn server_copy_never_reads_or_relays_object_contents() {
     for fault in [
         "server-copy",

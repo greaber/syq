@@ -33,6 +33,8 @@ pub const MIN_HASH_BLOCK_BYTES: u64 = 64 * 1024;
 pub const MAX_HASH_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
 const HASH_RESPONSE_BYTES_PER_ENTRY: u64 = 32;
 const HASH_RESPONSE_OVERHEAD: u64 = 24;
+/// One file's fingerprint and framing in an `ExistingHashes` response.
+const EXISTING_HASHES_OVERHEAD: u64 = 64;
 const COMPRESS_MIN: usize = 512;
 const WIRE_PREAMBLE_MAGIC: &[u8; 8] = b"SYQWIRE\0";
 const WIRE_PREAMBLE_FIXED_LEN: usize = WIRE_PREAMBLE_MAGIC.len() + 2;
@@ -64,6 +66,35 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
     entries
         .checked_mul(HASH_RESPONSE_BYTES_PER_ENTRY)
         .and_then(|bytes| bytes.checked_add(HASH_RESPONSE_OVERHEAD))
+        .is_some_and(|bytes| bytes < MAX_FRAME as u64)
+}
+
+/// Largest file one `SmallPatch` may describe: as large as a whole patch
+/// batch (`patch_batch_fits`).
+pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;
+
+/// Whether a `PatchSmallBatch` of files of these lengths stays within what a
+/// receiver builds in memory before publishing any of them: `MAX_READ_BYTES`
+/// in all. The lengths count reused blocks, which cost the request almost
+/// nothing.
+pub(crate) fn patch_batch_fits(lens: impl IntoIterator<Item = u64>) -> bool {
+    lens.into_iter().fold(0, u64::saturating_add) <= MAX_READ_BYTES
+}
+
+/// Whether hashing existing files of these lengths in `block` byte blocks
+/// fits one `ExistingHashes` response, as `hash_response_fits` does for the
+/// hashes of one file.
+pub(crate) fn existing_hashes_fit(block: u64, lens: impl IntoIterator<Item = u64>) -> bool {
+    if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
+        return false;
+    }
+    lens.into_iter()
+        .try_fold(HASH_RESPONSE_OVERHEAD, |bytes, len| {
+            len.div_ceil(block)
+                .checked_mul(HASH_RESPONSE_BYTES_PER_ENTRY + 1)
+                .and_then(|hashes| hashes.checked_add(EXISTING_HASHES_OVERHEAD))
+                .and_then(|file| bytes.checked_add(file))
+        })
         .is_some_and(|bytes| bytes < MAX_FRAME as u64)
 }
 
@@ -339,6 +370,112 @@ pub struct SmallPut {
     /// The sender saw a file at this path while planning. The receiver only
     /// schedules by it: what publication does is decided by `condition`.
     pub replaces: bool,
+}
+
+/// An existing file's identity and change time. Any later write to the
+/// file, or change of its metadata, changes the fingerprint.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub ctime: i64,
+    pub ctime_nsec: u32,
+}
+
+/// One existing destination file to hash in blocks, up to the length of the
+/// source that would replace it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExistingRead {
+    pub path: PathBytes,
+    pub len: u64,
+    pub condition: TargetCondition,
+    pub guard: Option<ContainerGuard>,
+}
+
+/// The comparison hashes of the blocks an existing file holds whole, and
+/// the fingerprint of the file they were read from, if there is one.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExistingHashes {
+    pub fingerprint: Option<FileFingerprint>,
+    pub hashes: Vec<ContentDigest>,
+    /// Earlier runs left partial copies of this file to resume from.
+    pub partials: bool,
+}
+
+/// One source file to read, returning only the blocks whose comparison
+/// hashes differ from `expected`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DifferingRead {
+    pub path: PathBytes,
+    pub source: Option<RegisteredPath>,
+    pub attempt: u32,
+    pub len: u32,
+    pub expected: Vec<ContentDigest>,
+    /// Report only which blocks match, without the others' contents: a
+    /// differing file is then copied whole another way.
+    pub compare_only: bool,
+}
+
+/// Which blocks of one `DifferingRead` matched, the others' contents
+/// concatenated with their payload hash, and the source's metadata rechecked
+/// after reading.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DifferingBlocks {
+    pub source: Option<Entry>,
+    pub matching: Vec<bool>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: ContentDigest,
+}
+
+/// A file published whole from new contents and blocks of the file it
+/// replaces. Block `i` comes from the existing destination when `reuse[i]`
+/// holds its comparison hash, and otherwise from the next bytes of `data`.
+/// When every block is reused and the existing file still has the `basis`
+/// fingerprint, or hashes as `reuse` again, that file is kept and only its
+/// metadata is set.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallPatch {
+    pub path: PathBytes,
+    pub copy_id: CopyId,
+    pub len: u64,
+    pub block: u64,
+    pub reuse: Vec<Option<ContentDigest>>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    /// Payload hash of `data`.
+    pub hash: ContentDigest,
+    pub basis: Option<FileFingerprint>,
+    pub meta: Meta,
+    pub flags: u8,
+    /// Metadata flags for keeping the existing file.
+    pub unchanged_flags: u8,
+    pub condition: TargetCondition,
+    pub guard: Option<ContainerGuard>,
+}
+
+/// The outcome of one file of a patch batch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmallPatched {
+    /// The existing file already held these contents and was kept.
+    pub kept: bool,
+    /// The kept or published inode, when the flags asked for it.
+    pub identity: Option<(u64, u64)>,
+}
+
+/// Why one file of a patch batch failed.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmallPatchError {
+    pub error: WireError,
+    /// The existing file already held the patch's contents, and only
+    /// keeping it, by setting its metadata, failed. Nothing was published in
+    /// its place, and copying it again would rewrite the same contents.
+    pub matched: bool,
+    /// The file no longer met the patch's target condition, so nothing was
+    /// kept or written. Compared again, under a fresh condition, it may
+    /// still be kept or patched.
+    pub stale_condition: bool,
 }
 
 /// Contents and integrity hash for one successful `SmallRead`.
@@ -1094,6 +1231,22 @@ pub enum WireRequest<Data> {
     CreateSendBudget {
         rate: u64,
     },
+    /// Hash the blocks of existing destination files with the comparison
+    /// algorithm.
+    HashExistingBatch {
+        block: u64,
+        files: Vec<ExistingRead>,
+    },
+    /// Read source files, returning only the blocks that differ from the
+    /// destination's hashes.
+    ReadDifferingBatch {
+        block: u64,
+        reads: Vec<DifferingRead>,
+    },
+    /// Publish files assembled from new contents and verified blocks of the
+    /// files they replace, as `PutSmallBatch` publishes whole files, or keep
+    /// those that already match.
+    PatchSmallBatch(Vec<SmallPatch>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1253,6 +1406,7 @@ impl Request {
                 | Request::StopReadStream
                 | Request::ShrinkReadStream { .. }
                 | Request::ReadSmallBatch(_)
+                | Request::ReadDifferingBatch { .. }
                 | Request::FileHash { .. }
                 | Request::TransportStats
                 | Request::Shutdown
@@ -1390,6 +1544,9 @@ pub enum Response {
     SendBudget(crate::descriptor_broker::DescriptorTicket),
     /// Aggregate ignore exclusions, sent once before ScanDone when nonzero.
     ScanIgnoredCount(u64),
+    ExistingHashes(Vec<std::result::Result<ExistingHashes, WireError>>),
+    DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
+    PatchedBatch(Vec<std::result::Result<SmallPatched, SmallPatchError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1532,6 +1689,7 @@ impl SizeHint for Request {
             Request::DescriptorCopy(_)
             | Request::WriteRange { .. }
             | Request::PutSmallBatch(_)
+            | Request::PatchSmallBatch(_)
             | Request::CopySmallFiles(_)
             | Request::SeedBasis { .. } => MAX_FRAME,
             _ => MAX_METADATA_FRAME,
@@ -1545,6 +1703,29 @@ impl SizeHint for Request {
             } => path.len() + final_ranges.as_ref().map_or(0, |ranges| ranges.len() * 16) + 128,
             Request::ReadSmallBatch(reads) => {
                 reads.iter().map(|read| read.path.len() + 16).sum::<usize>() + 16
+            }
+            Request::HashExistingBatch { files, .. } => {
+                files.iter().map(|file| file.path.len() + 96).sum::<usize>() + 16
+            }
+            Request::ReadDifferingBatch { reads, .. } => {
+                reads
+                    .iter()
+                    .map(|read| read.path.len() + read.expected.len() * 33 + 64)
+                    .sum::<usize>()
+                    + 16
+            }
+            Request::PatchSmallBatch(patches) => {
+                patches
+                    .iter()
+                    .map(|patch| {
+                        patch.data.len()
+                            + patch.reuse.len() * 33
+                            + patch.path.len()
+                            + patch.meta.size_hint()
+                            + 128
+                    })
+                    .sum::<usize>()
+                    + 16
             }
             Request::PutSmallBatch(puts) => {
                 puts.iter()
@@ -1613,6 +1794,8 @@ impl SizeHint for Response {
             Response::HelloOk { .. } => MAX_HANDSHAKE_FRAME,
             Response::Block { .. }
             | Response::SmallBlocks(_)
+            | Response::ExistingHashes(_)
+            | Response::DifferingBlocks(_)
             | Response::Hashes(_)
             | Response::HeldHashes { .. }
             | Response::SeededBasis(_) => MAX_FRAME,
@@ -1630,6 +1813,31 @@ impl SizeHint for Response {
                             block.data.len()
                                 + block.source.as_ref().map_or(1, Entry::size_hint)
                                 + 40
+                        }
+                        Err(error) => error.len() + 8,
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
+            Response::ExistingHashes(files) => {
+                files
+                    .iter()
+                    .map(|file| match file {
+                        Ok(file) => file.hashes.len() * 33 + 64,
+                        Err(error) => error.message.len() + 16,
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
+            Response::DifferingBlocks(files) => {
+                files
+                    .iter()
+                    .map(|file| match file {
+                        Ok(file) => {
+                            file.data.len()
+                                + file.matching.len()
+                                + file.source.as_ref().map_or(1, Entry::size_hint)
+                                + 48
                         }
                         Err(error) => error.len() + 8,
                     })

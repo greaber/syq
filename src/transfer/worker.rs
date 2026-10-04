@@ -154,7 +154,9 @@ impl Worker {
             Item::File(idx) => {
                 let progress = self.progress.clone();
                 let _copying = progress.copying_interval();
-                if self.fast_eligible(idx) {
+                if self.compare_candidate(idx) {
+                    self.compare_small_batch(idx)?;
+                } else if self.fast_eligible(idx) {
                     let first_bytes = self.job(idx).entry.size;
                     let target = self
                         .sched
@@ -283,30 +285,82 @@ impl Worker {
             && j.entry.size <= fast_file_size_limit(&self.opts, self.bwlimit.as_deref())
             && jobs
                 .destination(idx)
-                .is_none_or(|existing| self.replaces_without_comparison(j, existing))
+                .is_none_or(|existing| self.replaces_in_batch(j, existing))
             && (!self.opts.inplace || j.inplace)
             // A restricted receiver's in-place grant refuses batched
             // publication.
             && !(self.opts.restricted_receiver && self.opts.inplace)
     }
 
-    /// An existing file whose contents this copy would replace without
-    /// reading them can take the same batch as a new file. Comparison, block
-    /// reuse, protected contents, conditional placement and hardlink
-    /// representatives keep the per-file path, which inspects the destination
-    /// before deciding what to write.
-    fn replaces_without_comparison(&self, job: &FileJobData, existing: &Entry) -> bool {
-        let inspects_destination = self.opts.protects_existing_contents()
-            || self.opts.checksum
-            || self.opts.restricted_receiver
-            || (self.opts.hardlinks && job.entry.nlink > 1)
-            || self
-                .opts
-                .transfer_strategy
-                .reuse_destination_blocks(self.opts.same_host);
+    /// An existing file can take the same batch as a new file when this copy
+    /// replaces it whole. With block reuse, that is once the file is known to
+    /// share nothing with its destination: it was compared first
+    /// (`compare_candidate`), or it is a single block whose size changed.
+    /// Explicit comparison, protected contents, conditional placement,
+    /// hardlink representatives and files too large to compare in groups
+    /// keep the per-file path, which inspects the destination before
+    /// deciding what to write.
+    fn replaces_in_batch(&self, job: &FileJobData, existing: &Entry) -> bool {
+        let inspects_destination = self.inspects_destination(job)
+            || (!job.compared
+                && (self.compares_first(job, existing)
+                    || (self.reuses_blocks_for(job, Some(existing))
+                        && job.entry.size > self.compare_group_limits().0)));
         existing.kind == Kind::File
             && job.target_condition == TargetCondition::Any
             && !inspects_destination
+    }
+
+    fn inspects_destination(&self, job: &FileJobData) -> bool {
+        job.resume_partial
+            || self.opts.protects_existing_contents()
+            || (self.opts.hardlinks && job.entry.nlink > 1)
+    }
+
+    pub(super) fn reuses_blocks_for(&self, job: &FileJobData, existing: Option<&Entry>) -> bool {
+        self.opts.reuses_blocks(job.entry.size, existing)
+    }
+
+    /// Whether to compare a file with its destination before copying it:
+    /// with block reuse, when the destination can hold any of its blocks
+    /// (its size matches, or the file spans more than one comparison block);
+    /// with --hash, when the destination could be identical (its size
+    /// matches).
+    fn compares_first(&self, job: &FileJobData, existing: &Entry) -> bool {
+        let same_size = existing.size == job.entry.size;
+        existing.kind == Kind::File
+            && ((self.reuses_blocks_for(job, Some(existing))
+                && (same_size || job.entry.size > self.patch_block()))
+                || (self.opts.checksum && same_size))
+    }
+
+    /// A replaced file small enough to compare in groups is compared before
+    /// any contents are sent, in pipelined groups (see `small_compare`): the
+    /// destination keeps a file that already matches and is sent only the
+    /// blocks it lacks. Under a bandwidth limit this costs only hashes for
+    /// unchanged files, and elsewhere it saves sending and rewriting them.
+    pub(super) fn compare_candidate(&self, idx: usize) -> bool {
+        // Tests of the per-file comparison path select it with this.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_PER_FILE_COMPARISON").is_some() {
+            return false;
+        }
+        let jobs = self.sched.jobs.lock().unwrap();
+        let j = &jobs[idx];
+        !j.compared
+            && !self.opts.dry_run
+            && j.attempt == 0
+            && !self.opts.has_expected_for(j)
+            && !self.opts.tuning.force_ranges()
+            && j.entry.size <= self.compare_group_limits().0
+            // In place, only the blocks that differ are written; that is the
+            // per-file path.
+            && !self.opts.inplace
+            && j.target_condition == TargetCondition::Any
+            && !self.inspects_destination(j)
+            && jobs
+                .destination(idx)
+                .is_some_and(|existing| self.compares_first(j, existing))
     }
 
     pub(super) fn fail_small_batch(
@@ -803,41 +857,7 @@ impl Worker {
             let published = match result {
                 SmallPutResult::Published(identity) => identity,
                 SmallPutResult::SourceChanged(now) => {
-                    if let (Some(e), true, true) = (
-                        *now,
-                        j.attempt + 1 < MAX_ATTEMPTS,
-                        j.target_condition == TargetCondition::Any,
-                    ) {
-                        if !self.opts.quiet {
-                            self.progress.eprintln(&format!(
-                                "syq: {}: changed during transfer, retrying",
-                                j.rel
-                            ));
-                        }
-                        let mut all = self.sched.jobs.lock().unwrap();
-                        let job = &mut all[*idx];
-                        self.progress.bytes_total.fetch_sub(j.entry.size, Relaxed);
-                        self.progress.bytes_total.fetch_add(e.size, Relaxed);
-                        job.entry = Entry {
-                            path: job.entry.path.clone(),
-                            ..e
-                        };
-                        job.attempt += 1;
-                        drop(all);
-                        self.sched.requeue(*idx);
-                    } else {
-                        self.progress.error(&format!(
-                            "syq: {}: source changed during transfer (or vanished)",
-                            j.rel
-                        ));
-                        self.emit_file_result_failed(
-                            j,
-                            "yes",
-                            None,
-                            "source changed during transfer (or vanished)",
-                        );
-                        self.sched.fail_file(*idx);
-                    }
+                    self.retry_changed_small(*idx, j, *now);
                     continue;
                 }
             };
@@ -868,6 +888,47 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// A small file whose source changed after it was planned: retry it with
+    /// the source's new metadata, or report it when it vanished or has no
+    /// attempts left.
+    pub(super) fn retry_changed_small(&self, idx: usize, j: &WorkerJob, now: Option<Entry>) {
+        if let (Some(e), true, true) = (
+            now,
+            j.attempt + 1 < MAX_ATTEMPTS,
+            j.target_condition == TargetCondition::Any,
+        ) {
+            if !self.opts.quiet {
+                self.progress.eprintln(&format!(
+                    "syq: {}: changed during transfer, retrying",
+                    j.rel
+                ));
+            }
+            let mut all = self.sched.jobs.lock().unwrap();
+            let job = &mut all[idx];
+            self.progress.bytes_total.fetch_sub(j.entry.size, Relaxed);
+            self.progress.bytes_total.fetch_add(e.size, Relaxed);
+            job.entry = Entry {
+                path: job.entry.path.clone(),
+                ..e
+            };
+            job.attempt += 1;
+            drop(all);
+            self.sched.requeue(idx);
+        } else {
+            self.progress.error(&format!(
+                "syq: {}: source changed during transfer (or vanished)",
+                j.rel
+            ));
+            self.emit_file_result_failed(
+                j,
+                "yes",
+                None,
+                "source changed during transfer (or vanished)",
+            );
+            self.sched.fail_file(idx);
+        }
     }
 
     pub(super) fn file_error(&mut self, idx: usize, e: anyhow::Error) -> Result<()> {
@@ -990,10 +1051,10 @@ impl Worker {
         // an explicit --inplace transfer until that checked update; an
         // existing target is still updated through its held inode at finalize.
         let inplace = job.inplace;
-        let reuse_blocks = self
-            .opts
-            .transfer_strategy
-            .reuse_destination_blocks(self.opts.same_host);
+        // A file a grouped comparison already found different, or could not
+        // patch, is copied whole without comparing it again.
+        let reuse_blocks = !job.compared && self.reuses_blocks_for(&job, job.dst_entry.as_deref());
+        let checksum = self.opts.checksum && !job.compared;
         let final_file = job
             .dst_entry
             .as_deref()
@@ -1006,7 +1067,7 @@ impl Worker {
         // file finishes through its retained inode. Remote copies keep their
         // single exchange below.
         let mut known_different = false;
-        if self.opts.checksum && self.opts.same_host && !reuse_blocks && size > 0 {
+        if checksum && self.opts.same_host && !reuse_blocks && size > 0 {
             if let Some(existing) = final_file {
                 let matched = existing.size == size
                     && match self.matches_final_windows(&job) {
@@ -1103,26 +1164,24 @@ impl Worker {
             // below is reused rather than hashing the contents a second time.
             // A file the equality probe above found different is not compared
             // again.
-            let inplace_ranges = if inplace
-                && final_is_file
-                && (reuse_blocks || (self.opts.checksum && !known_different))
-            {
-                let diff = self.diff_final_and_hold(&job)?;
-                if diff.ranges.is_empty() && diff.held_len == Some(size) {
-                    self.finish_matched_basis(idx, &job)?;
-                    return Ok((vec![], false));
-                }
-                Some(diff.ranges)
-            } else {
-                None
-            };
+            let inplace_ranges =
+                if inplace && final_is_file && (reuse_blocks || (checksum && !known_different)) {
+                    let diff = self.diff_final_and_hold(&job)?;
+                    if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                        self.finish_matched_basis(idx, &job)?;
+                        return Ok((vec![], false));
+                    }
+                    Some(diff.ranges)
+                } else {
+                    None
+                };
 
             // One receiver turn now both observes resumable state and prepares
             // it. When a final-file basis exists, leave an absent sidecar
             // absent until the content comparison shows a difference.
             let prepared = self.prepare_file(
                 &job,
-                inplace || !final_is_file || (!reuse_blocks && !self.opts.checksum),
+                inplace || !final_is_file || (!reuse_blocks && !checksum),
             )?;
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
@@ -1139,9 +1198,7 @@ impl Worker {
             // Resume an owned output or a previous invocation's partial,
             // independently of the policy for reusing the final destination.
             if prepared.partial_size.is_some()
-                || (prepared.has_candidates
-                    && !reuse_blocks
-                    && (!self.opts.checksum || !final_is_file))
+                || (prepared.has_candidates && !reuse_blocks && (!checksum || !final_is_file))
             {
                 if size == 0 {
                     // Discovery can report a donor without creating our output.
@@ -1159,7 +1216,7 @@ impl Worker {
             if !inplace
                 && reuse_blocks
                 && final_is_file
-                && !self.opts.checksum
+                && !checksum
                 && !self.bandwidth_limited_remote_source()
                 && size > 0
             {
@@ -1176,7 +1233,7 @@ impl Worker {
             if !reuse_blocks {
                 // An explicit checksum may still establish a complete match.
                 // A differing final file contributes no blocks to the output.
-                if self.opts.checksum && final_is_file {
+                if checksum && final_is_file {
                     // Same-host files were probed before the copy decision;
                     // remote copies and empty files compare here.
                     if !known_different {
@@ -2662,7 +2719,7 @@ impl Worker {
         Ok(true)
     }
 
-    fn complete_file(&self, job: WorkerJob, matched: bool) -> Result<()> {
+    pub(super) fn complete_file(&self, job: WorkerJob, matched: bool) -> Result<()> {
         if matched {
             self.progress.files_total.fetch_sub(1, Relaxed);
             self.progress.files_unchanged.fetch_add(1, Relaxed);
@@ -2696,10 +2753,14 @@ impl Worker {
     // Keep digest reads in workers so one large file cannot stall directory
     // planning. A failed check takes the normal repair path; publication still
     // validates the expected digest. Explicit --hash continues to compare both
-    // endpoints regardless of matching metadata or an expected digest.
+    // endpoints regardless of matching metadata or an expected digest. A
+    // hardlink representative without an expected digest is otherwise kept
+    // on matching size and time alone, which --hash-or-copy does not trust.
     pub(super) fn try_expected_match(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
         let expected = self.opts.expected_hashes_for(job);
-        if expected.is_none() && !(self.opts.hardlinks && job.entry.nlink > 1) {
+        if expected.is_none()
+            && !(self.opts.hardlinks && job.entry.nlink > 1 && !self.opts.hash_or_copy)
+        {
             return Ok(false);
         }
         let Some(destination) = job.dst_entry.as_deref() else {
@@ -2772,7 +2833,7 @@ impl Worker {
         let job = self.job(idx);
         let result = match job.dst_entry.as_deref() {
             Some(destination)
-                if !self.opts.checksum
+                if self.opts.trusts_size_and_time()
                     && self
                         .opts
                         .metadata_matches(&job.rel_bytes, &job.entry, destination) =>

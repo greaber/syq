@@ -148,8 +148,8 @@ Syq uses stored size/time, whole-file hashes, provider checksums, or ETags to
 identify matching contents. Otherwise, the default policy replaces the destination.
 Use `--if-exists=error-if-different` to reject copies whose contents cannot be
 established as matching. Syq does not
-download both bodies to compare them on this route. `--hash` and expected hashes
-are unsupported.
+download both bodies to compare them on this route. `--hash`, `--hash-or-copy`,
+and expected hashes are unsupported.
 
 ## Authorize from your laptop
 
