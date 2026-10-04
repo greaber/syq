@@ -571,16 +571,30 @@ impl FsOps {
                 }
             }
         }
-        stages.retain(|(index, stage)| {
+        // Writing data and metadata needs no directory turn. On a network
+        // filesystem each step waits a round trip, so the files of a run
+        // are written in parallel.
+        let write = |(index, stage): &(usize, SmallStage)| {
             let source = sources.get(*index).and_then(Option::as_ref);
-            match self.write_small_stage(&puts[*index], source, stage) {
+            self.write_small_stage(&puts[*index], source, stage)
+        };
+        let network = stages.len() > 1 && on_network_file_system(&stages[0].1.file);
+        let written: Vec<Result<()>> = if network {
+            use rayon::prelude::*;
+            metadata_pool().install(|| stages.par_iter().map(write).collect())
+        } else {
+            stages.iter().map(write).collect()
+        };
+        let mut written = written.into_iter();
+        stages.retain(
+            |(index, _)| match written.next().expect("one result per stage") {
                 Ok(()) => true,
                 Err(error) => {
                     results[*index] = Err(wire_error(&error));
                     false
                 }
-            }
-        });
+            },
+        );
         let mut published = Vec::with_capacity(stages.len());
         {
             // Replacing files contends across the whole filesystem on some

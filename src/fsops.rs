@@ -170,6 +170,9 @@ pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileSystemTraits {
     is_nfs: bool,
+    /// NFS, SMB, Ceph, or a FUSE mount such as sshfs: each operation waits
+    /// for a network round trip.
+    network: bool,
     synchronous: bool,
     measured_local_source: bool,
     local_userspace_copy: bool,
@@ -308,6 +311,15 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
+            network: [
+                libc::NFS_SUPER_MAGIC as u32,
+                libc::FUSE_SUPER_MAGIC as u32,
+                libc::SMB_SUPER_MAGIC as u32,
+                0xfe53_4d42, // SMB2
+                0xff53_4d42, // CIFS
+                0x00c3_6400, // Ceph
+            ]
+            .contains(&file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
             // tmpfs also provides a real cross-filesystem control for this path.
@@ -379,6 +391,25 @@ fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
 fn unsupported_copy_pairs() -> &'static Mutex<HashSet<(FileSystemKey, FileSystemKey)>> {
     static PAIRS: OnceLock<Mutex<HashSet<(FileSystemKey, FileSystemKey)>>> = OnceLock::new();
     PAIRS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether `file` lies on a network filesystem.
+fn on_network_file_system(file: &File) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_NETWORK_FILESYSTEM").is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        file.metadata().is_ok_and(|metadata| {
+            file_system_traits(file, file_system_key(file, metadata.dev())).network
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        false
+    }
 }
 
 /// One file of a small copy, staged but not yet published.
