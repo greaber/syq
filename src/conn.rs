@@ -363,6 +363,9 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::destination::ssh::workers::AuthorizationError>())
         || message.contains("build identity mismatch")
         || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
         || message.contains("unexpected handshake response")
@@ -462,6 +465,7 @@ pub struct RemoteConn {
     rpc_observation: Option<RpcObservation>,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
     child: Option<Child>,
+    approved_login: Option<crate::destination::ssh::workers::Guard>,
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
@@ -651,6 +655,7 @@ impl RemoteConn {
             transport_stop: None,
             observation,
             child: None,
+            approved_login: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
             rx: Some(rx),
             reader: Some(reader),
@@ -690,6 +695,9 @@ impl RemoteConn {
 
     fn io_err(&mut self, e: anyhow::Error) -> anyhow::Error {
         self.dead = true;
+        // The watcher may signal this child. Stop it before try_wait can reap
+        // the process and allow the kernel to reuse its PID.
+        self.approved_login.take();
         let detail = format!("{e:#}");
         // If the child has exited (or does so shortly), that's usually the
         // more useful error. A multiplexed SSH refusal in particular must win
@@ -1116,6 +1124,7 @@ impl Drop for RemoteConn {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
         self.rx.take();
+        self.approved_login.take();
         if let Some(child) = &mut self.child {
             let _ = child.wait();
         }
@@ -1433,7 +1442,10 @@ impl RemoteSpec {
                 _ => None,
             };
             if let Some((multiplexer, master)) = multiplex {
-                if master && multiplexer.persistent {
+                if multiplexer.existing_only {
+                    cmd.args(["-o", "ControlMaster=no", "-S"])
+                        .arg(crate::persistence::openssh_control_path(&multiplexer.path));
+                } else if master && multiplexer.persistent {
                     // Reuse across runs: become the master only if no live
                     // one exists, and linger after this run so the next one
                     // skips the handshake.
@@ -1509,6 +1521,10 @@ impl RemoteSpec {
             host: self.host.clone(),
             port: self.port,
             program: self.program_command(&["--server".into()]),
+            ignore_ssh_config: self
+                .ssh_multiplexer
+                .as_ref()
+                .is_some_and(|mux| mux.existing_only),
         }
     }
 
@@ -1577,6 +1593,21 @@ impl RemoteSpec {
         }
         let conn = self.take_pooled_control(compress);
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
+    }
+
+    pub(crate) fn approved_helper_command(
+        &self,
+        args: &[String],
+    ) -> Result<(crate::destination::ssh::workers::Login, Command)> {
+        let authorization = self
+            .ssh_multiplexer
+            .as_ref()
+            .and_then(|mux| mux.approved_workers.as_ref())
+            .context("independent helper needs an approved account")?;
+        let login = authorization.begin()?;
+        let mut command = login.command()?;
+        command.arg(self.session_command(args));
+        Ok((login, command))
     }
 
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
@@ -1834,6 +1865,7 @@ impl RemoteSpec {
                 transport_stop: None,
                 observation,
                 child: None,
+                approved_login: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
                 rx: Some(rx),
                 reader: Some(reader),
@@ -1875,7 +1907,21 @@ impl RemoteSpec {
                 server_args.push(format!("--restricted-worker={ticket}"));
             }
         }
-        let mut cmd = if let Some(approved) = &self.forwarded {
+        let login = if matches!(role, ConnectionRole::Control) {
+            None
+        } else {
+            self.ssh_multiplexer
+                .as_ref()
+                .and_then(|mux| mux.approved_workers.as_ref())
+                .map(|authorization| authorization.begin())
+                .transpose()?
+        };
+        let mut cmd = if let Some(login) = &login {
+            let mut command = login.command()?;
+            command.arg(self.session_command(&server_args));
+            std::os::unix::process::CommandExt::process_group(&mut command, 0);
+            command
+        } else if let Some(approved) = &self.forwarded {
             approved.ssh_command()?
         } else if self.local_process {
             let mut command = Command::new(std::env::current_exe()?);
@@ -1902,8 +1948,9 @@ impl RemoteSpec {
             command.arg(remote_command);
             command
         };
+        let independent_approved = login.is_some();
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(
-            if classify_ssh_failure && !self.local_process {
+            if (classify_ssh_failure || independent_approved) && !self.local_process {
                 Stdio::piped()
             } else {
                 Stdio::inherit()
@@ -1916,6 +1963,15 @@ impl RemoteSpec {
                 format!("spawn {:?}", self.rsh[0])
             }
         })?;
+        let approved_login = match login.map(|login| login.watch(child.id())).transpose() {
+            Ok(guard) => guard,
+            Err(error) => {
+                // No watcher owns the newly created worker's process group.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let ssh_failure = child.stderr.take().map(ssh_auth::capture);
         let stdin = child.stdin.take().unwrap();
         let pacing = (!matches!(role, ConnectionRole::Control))
@@ -1956,6 +2012,7 @@ impl RemoteSpec {
             transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: Some(child),
+            approved_login,
             w: FrameWriter::new(writer, compress),
             rx: Some(rx),
             reader: Some(reader),
@@ -1985,6 +2042,12 @@ impl RemoteSpec {
             });
             if let Some(ssh_error) = error.downcast_mut::<SshConnectError>() {
                 ssh_error.failure = failure;
+            }
+            if independent_approved && is_ssh_authorization_fallback_error(&error) {
+                // Authentication/policy refusal cannot improve on retry. In
+                // particular, do not request the same hardware signature six
+                // times after a permanent host or key failure.
+                return crate::destination::ssh::workers::AuthorizationError(error).into();
             }
             error
         })?;
@@ -2353,6 +2416,7 @@ impl RemoteSpec {
             transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: None,
+            approved_login: None,
             w: FrameWriter::new(Box::new(writer), compress),
             rx: Some(rx),
             reader: Some(reader),

@@ -124,13 +124,19 @@ reuse account access selected through an authorization provider. Its prompt
 grants the account's authority, not permission for only the displayed operation. Remote
 path completion uses existing approval and never prompts for access.
 
-SSH data through one approved account connection shares the server's session
-limit with its control connection and any other tools using that login. Leave
-room for the control session when choosing a worker ceiling with
-`--resource-limits workers=N`. A server configured with `MaxSessions 1` can use
-TCP data, but cannot open the concurrent SSH data workers needed by larger
-copies or byte streams. Syq does not bypass the selected approval with another
-SSH login when the session limit is reached.
+When TCP is unavailable or you use `--no-tcp`, data workers open independent
+SSH connections under the same account permission. They keep the selected
+account, trusted host keys, and route. Your authorization provider must remain
+available, but workers never request another syq approval: missing or withdrawn
+permission stops the copy. An agent that requires confirmation or a hardware-key
+touch can require it for each connection. TCP workers do not need these extra
+SSH authentications.
+
+As with ordinary persistence, syq keeps a helper session ready for remote path
+completion. A warm lookup uses one network round trip for names and metadata.
+That ready helper occupies one session on the shared connection; shells and
+other tools using the same connection still share its server session limit.
+Independent SSH data workers do not occupy sessions on that shared connection.
 
 `syq persist ssh-config HOST [--auth-from auto|ssh|@NAME|HOST]` prints a standalone
 OpenSSH configuration for one existing approved login. Use it with `ssh`,

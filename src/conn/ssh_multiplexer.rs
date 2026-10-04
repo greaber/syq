@@ -11,6 +11,11 @@ pub(crate) struct SshMultiplexer {
     /// A managed persistence scope keeps its control master alive, so later
     /// syq runs in that scope skip the SSH handshake.
     pub(super) persistent: bool,
+    /// An approved account owns this master. Only attach to it; never create,
+    /// replace, or authenticate a master through the ordinary SSH path.
+    pub(super) existing_only: bool,
+    pub(super) approved_workers:
+        Option<std::sync::Arc<crate::destination::ssh::workers::Authorization>>,
     pub(super) idle_timeout: &'static str,
     pub(super) automatic_receiving: bool,
     /// Pool spares open sessions with syq's own fixed options, so the pool
@@ -315,6 +320,8 @@ impl SshMultiplexer {
             path,
             domain: None,
             persistent: false,
+            existing_only: false,
+            approved_workers: None,
             idle_timeout: "no",
             automatic_receiving: false,
             session_pool: false,
@@ -342,12 +349,35 @@ impl SshMultiplexer {
             path,
             domain: Some(domain),
             persistent: true,
+            existing_only: false,
+            approved_workers: None,
             idle_timeout: if global { "yes" } else { "300" },
             automatic_receiving: ssh.is_none(),
             session_pool: ssh.is_none(),
             reuse_for_workers: AtomicBool::new(false),
             workers_rejected: AtomicBool::new(false),
         })
+    }
+
+    /// Share ready helpers on an already validated account connection. The
+    /// caller retains the approved connection's strict SSH options in `rsh`.
+    pub(crate) fn approved(
+        control: &std::path::Path,
+        workers: Option<std::sync::Arc<crate::destination::ssh::workers::Authorization>>,
+    ) -> Self {
+        Self {
+            _directory: None,
+            path: control.into(),
+            domain: None,
+            persistent: true,
+            existing_only: true,
+            approved_workers: workers,
+            idle_timeout: "no",
+            automatic_receiving: false,
+            session_pool: true,
+            reuse_for_workers: AtomicBool::new(false),
+            workers_rejected: AtomicBool::new(false),
+        }
     }
 
     /// The explicit connect command starts receiving once and propagates setup errors.

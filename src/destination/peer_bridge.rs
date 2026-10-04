@@ -127,9 +127,14 @@ fn remote_spec(args: &Args, location: &Location, cached: &Cached) -> Result<Remo
     location.user = cached.endpoint().user.clone();
     location.host = Some(cached.endpoint().host.clone());
     location.port = cached.endpoint().port;
-    let Endpoint::Remote(spec) = crate::transfer::endpoint(&location, &options)? else {
+    let Endpoint::Remote(mut spec) = crate::transfer::endpoint(&location, &options)? else {
         unreachable!()
     };
+    let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
+    spec.ssh_multiplexer = Some(Arc::new(crate::conn::SshMultiplexer::approved(
+        cached.control(),
+        Some(cached.worker_authorization(&domain)?),
+    )));
     Ok(spec)
 }
 
@@ -279,6 +284,15 @@ impl Selection {
         let peer_policy = self.peer.peer()?;
         let coordinator = remote_spec(args, &sources[0], &self.coordinator)?;
         let peer_spec = remote_spec(args, destination, &self.peer)?;
+        // These helpers have a different protocol from the prepared --server
+        // session. Release that idle session before occupying the account's
+        // control channel, including servers with MaxSessions=1.
+        crate::session_pool::stop(self.coordinator.control())
+            .context("release the prepared source helper for peer coordination")?;
+        if self.peer.control() != self.coordinator.control() {
+            crate::session_pool::stop(self.peer.control())
+                .context("release the prepared destination helper for peer coordination")?;
+        }
         let (secret, recipient_public_key) = crate::receipt::generate_recipient()?;
         let policy = crate::receipt::ReceiptPolicy {
             required: true,

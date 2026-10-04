@@ -266,12 +266,18 @@ def main():
                 print("case: saved provider choices support terse commands and copies", flush=True)
                 source("syq", "persist", "auth-from", "provider", "--for", TARGET)
                 assert "SAVED_OK" in execute("ssh", TARGET, "--", "printf SAVED_OK")
-                payload = "provider-copy-data\n" * 8192
+                payload = "provider-copy-data\n" * 131072
                 source("python3", "-c", "from pathlib import Path; import sys; "
                        "Path(sys.argv[1]).write_text(sys.stdin.read())", source_root + "/payload", data=payload)
+                # The file exceeds the small-file control path. Both
+                # directions need independent authenticated data sessions,
+                # including in the MaxSessions=1 profile, with no new prompt.
                 execute("cp", source_root + "/payload", "--to", TARGET, "--as", destination_root + "/copied",
-                        "--performance-tuning", "workers=1", "--no-progress")
+                        "--no-tcp", "--performance-tuning", "workers=2", "--no-progress")
                 assert remote("destination", "cat", destination_root + "/copied") == payload
+                execute("cp", "--from", TARGET, destination_root + "/copied", "--as", source_root + "/roundtrip",
+                        "--no-tcp", "--performance-tuning", "workers=2", "--no-progress")
+                assert source("cat", source_root + "/roundtrip") == payload
 
                 print("case: requester scopes keep provider preferences and connections separate", flush=True)
                 scope = source("syq", "persist", "on", "--ephemeral").strip()

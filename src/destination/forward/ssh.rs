@@ -213,21 +213,52 @@ pub(in crate::destination) fn setup_over_spec(
     public_key: &str,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
-    let (_child, reply) = ForwardChild::over_spec(
-        spec,
-        "--return-ssh-setup",
-        &SetupRequest {
-            identity: crate::identity::build().into(),
-            ticket: ticket.into(),
-            public_key: canonical_key(public_key)?,
-        },
-        Instant::now() + SETUP_TIMEOUT,
-        cancelled,
-    ).context("set up direct SSH data workers; the approved destination connection must allow a second concurrent SSH session (sshd MaxSessions >= 2); direct TCP does not need that session")?;
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let request = SetupRequest {
+        identity: crate::identity::build().into(),
+        ticket: ticket.into(),
+        public_key: canonical_key(public_key)?,
+    };
+    anyhow::ensure!(!cancelled(), "peer copy closed before SSH setup");
+    // The receiver already established this exact helper. A separate approved
+    // login leaves its control channel available on MaxSessions=1 servers.
+    // Keep the authorization alive until the owned child has been closed; the
+    // existing bounded I/O observes cancellation without a second PID watcher.
+    let (login, command) = spec.approved_helper_command(&["--return-ssh-setup".into()])?;
+    let cancelled = || cancelled() || login.cancelled();
     anyhow::ensure!(
-        matches!(reply, Reply::Ready),
-        "invalid peer SSH setup response"
+        !cancelled() && Instant::now() < deadline,
+        "peer copy closed during SSH setup"
     );
+    let mut child = ForwardChild::spawn_command(command)?;
+    let reply = (|| {
+        write_message(
+            &mut DeadlineIo {
+                inner: child.child.stdin.as_mut().unwrap(),
+                deadline,
+                cancelled: Some(&cancelled),
+            },
+            &request,
+        )?;
+        read_message::<Reply>(&mut DeadlineIo {
+            inner: child.child.stdout.as_mut().unwrap(),
+            deadline,
+            cancelled: Some(&cancelled),
+        })
+    })();
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            let _ = child.wait_for_exit(deadline, &cancelled);
+            return Err(error)
+                .with_context(|| format!("set up direct SSH data workers: {}", child.errors()));
+        }
+    };
+    match reply {
+        Reply::Ready => {}
+        Reply::Error(error) => bail!("remote copy helper refused SSH setup: {error}"),
+        _ => bail!("invalid peer SSH setup response"),
+    }
     anyhow::ensure!(!cancelled(), "peer copy closed during SSH setup");
     Ok(())
 }

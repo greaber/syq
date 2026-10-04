@@ -389,18 +389,8 @@ def main():
             finish(process, output)
         assert_results("tcp")
 
-        if os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1":
-            print("case: MaxSessions=1 supports TCP and diagnoses the SSH setup limit", flush=True)
-            with copying("max-sessions", ("--no-tcp",)) as (process, output):
-                diagnostic = finish(process, output, success=False)
-                assert "MaxSessions >= 2" in diagnostic, diagnostic
-            remote("destination", "test ! -e " + shlex.quote(c + "/max-sessions"))
-            assert digest("destination", c + "/tcp") == expected
-            assert fingerprint("source") == b_keys
-            wait_for("failed SSH setup key cleanup", lambda: fingerprint("destination") == c_keys)
-            no_pending()
-            return
-
+        # SSH setup authenticates independently from A to C. MaxSessions=1
+        # therefore runs these same direct, restricted B-to-C worker cases.
         print("case: blocked TCP falls back to direct restricted SSH with saved providers", flush=True)
         for host in ("source", "destination"):
             requester("persist", "auth-from", "@laptop", "--for", host)

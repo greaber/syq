@@ -173,6 +173,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: Some(rx),
         reader: None,
@@ -712,6 +713,7 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
         rx: Some(rx),
         reader: None,
@@ -986,6 +988,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         reader: Some(reader),
@@ -1041,6 +1044,7 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(socket), false),
         rx: Some(rx),
         reader: Some(reader),
@@ -1088,6 +1092,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
+        approved_login: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: None,
         reader: None,
@@ -1142,6 +1147,7 @@ fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
+        approved_login: None,
         w: FrameWriter::new(Box::new(stdin), false),
         rx: None,
         reader: None,
@@ -1272,6 +1278,7 @@ fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
             transport_stop: None,
             observation: Default::default(),
             child: None,
+            approved_login: None,
             w: FrameWriter::new(Box::new(writer), false),
             rx: Some(rx),
             reader: Some(reader),
@@ -1349,6 +1356,7 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
             transport_stop: None,
             observation: Default::default(),
             child: None,
+            approved_login: None,
             w: FrameWriter::new(Box::new(Vec::new()), false),
             rx: Some(rx),
             reader: Some(reader),
@@ -1827,6 +1835,40 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
 }
 
 #[test]
+fn approved_pool_attachment_preserves_the_master_and_never_creates_one() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let control = directory.path().join("master");
+    std::fs::write(&control, b"owned by the account keeper").unwrap();
+    let mut spec = RemoteSpec::local_receiver(true);
+    spec.local_process = false;
+    spec.rsh = vec![
+        "ssh".into(),
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "PubkeyAuthentication=no".into(),
+        "-o".into(),
+        "ProxyCommand=false".into(),
+    ];
+    spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer::approved(
+        &control, None,
+    )));
+    let command = spec.ssh_command(SshConnection::Control, false);
+    let args: Vec<_> = command.get_args().collect();
+    assert!(args.iter().any(|arg| *arg == "ControlMaster=no"));
+    assert!(!args
+        .iter()
+        .any(|arg| *arg == "ControlMaster=auto" || *arg == "ControlMaster=yes"));
+    assert!(args.iter().any(|arg| *arg == "PubkeyAuthentication=no"));
+    assert_eq!(
+        std::fs::read(control).unwrap(),
+        b"owned by the account keeper"
+    );
+    assert!(spec.pool_endpoint().ignore_ssh_config);
+    assert!(!spec.ssh_multiplexer.as_ref().unwrap().automatic_receiving);
+}
+
+#[test]
 fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
     let mut spec = RemoteSpec::local_receiver(false);
     spec.rsh = vec!["ssh".into()];
@@ -1845,6 +1887,8 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
         _directory: None,
         path: PathBuf::from("/tmp/syq-test-socket"),
         persistent: true,
+        existing_only: false,
+        approved_workers: None,
         idle_timeout: "300",
         automatic_receiving: false,
         session_pool: true,
@@ -1870,6 +1914,8 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         _directory: None,
         path,
         persistent: true,
+        existing_only: false,
+        approved_workers: None,
         idle_timeout: "300",
         automatic_receiving: false,
         session_pool: true,
@@ -2106,6 +2152,7 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
         transport_stop: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(std::io::sink()), false),
         rx: Some(rx),
         reader: Some(reader),
@@ -2373,6 +2420,7 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
         rpc_observation: None,
         observation: Default::default(),
         child: None,
+        approved_login: None,
         w: FrameWriter::new(Box::new(client.try_clone().unwrap()), false),
         rx: Some(rx),
         reader: Some(reader),

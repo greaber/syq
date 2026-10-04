@@ -55,6 +55,9 @@ pub(crate) struct PoolEndpoint {
     pub host: String,
     pub port: Option<u16>,
     pub program: String,
+    /// Approved account sessions use only their pinned master, with no local
+    /// SSH configuration applied a second time to the resolved endpoint.
+    pub ignore_ssh_config: bool,
 }
 
 /// A session handed over by the pool: the ssh client's three pipes. The
@@ -166,6 +169,9 @@ pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if endpoint.ignore_ssh_config {
+        command.arg("--no-ssh-config");
+    }
     // SAFETY: setsid takes no arguments, touches no memory, and is safe to
     // call between fork and exec. It detaches the pool from the terminal so
     // a Ctrl-C or hangup meant for the command never reaches it.
@@ -272,8 +278,14 @@ pub(crate) fn stop(control: &Path) -> Result<()> {
             Ok(metadata) if metadata.is_dir() => {
                 bail!("refusing to remove unexpected directory {}", path.display())
             }
-            Ok(_) => fs::remove_file(&path)
-                .with_context(|| format!("remove session pool file {}", path.display()))?,
+            Ok(_) => match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("remove session pool file {}", path.display()));
+                }
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
         }
@@ -316,6 +328,10 @@ enum Verdict {
 
 /// `syq --session-pool CONTROL USER HOST PORT PROGRAM`: the pool process.
 pub(crate) fn run(argv: &[OsString]) -> Result<()> {
+    let (argv, ignore_ssh_config) = match argv.split_last() {
+        Some((last, rest)) if last == "--no-ssh-config" => (rest, true),
+        _ => (argv, false),
+    };
     let [control, user, host, port, program] = argv else {
         bail!("session pool takes exactly control-socket, user, host, port, and program arguments");
     };
@@ -337,6 +353,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
             Some(port.parse().context("session pool port")?)
         },
         program: text(program)?,
+        ignore_ssh_config,
     };
     let scope = control
         .parent()
@@ -346,6 +363,14 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
         // Another pool serves this endpoint.
         return Ok(());
     };
+    // ensure runs in the background. Scope shutdown may have overtaken it
+    // before it acquired this lock; do not start helpers after retirement.
+    if scope.join(crate::receive_service::CLOSING).exists()
+        || (endpoint.ignore_ssh_config
+            && !fs::symlink_metadata(&control).is_ok_and(|meta| meta.file_type().is_socket()))
+    {
+        return Ok(());
+    }
     let socket = socket_path(&control);
     match fs::symlink_metadata(&socket) {
         Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&socket)
@@ -423,6 +448,14 @@ impl Pool {
     }
 
     fn housekeeping(&mut self) -> Verdict {
+        if (self.endpoint.ignore_ssh_config && !self.control.exists())
+            || self
+                .control
+                .parent()
+                .is_some_and(|scope| scope.join(crate::receive_service::CLOSING).exists())
+        {
+            return Verdict::Exit;
+        }
         for index in (0..self.spares.len()).rev() {
             if matches!(self.spares[index].child.try_wait(), Ok(Some(_))) {
                 self.spares.remove(index);
@@ -462,6 +495,9 @@ impl Pool {
     /// not carry the user's agent, display, or forwardings to the remote.
     fn ssh(&self) -> Command {
         let mut command = Command::new("ssh");
+        if self.endpoint.ignore_ssh_config {
+            command.args(["-F", "/dev/null"]);
+        }
         command
             .arg("-o")
             .arg("ControlMaster=no")

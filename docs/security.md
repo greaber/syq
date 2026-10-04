@@ -258,7 +258,9 @@ consistency, and durability considerations are covered in
 ## Persistent connections
 
 A persistent SSH login lets processes running as your local user access the
-server without another key touch or agent approval. This access remains
+server without another key touch or agent approval. Independent SSH data
+connections authenticate separately, even when syq account permission already
+covers them; your agent may require confirmation for each one. This access remains
 available even with receiving turned off. `syq persist off` closes the default
 domain's persistent connections, including receiving; add `--pscope PATH` to
 close an explicit domain instead.

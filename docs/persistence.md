@@ -70,8 +70,9 @@ the laptop must still be available to authorize them. See
 [account permission controls](persistence-reference.md#account-permissions).
 
 The approved connection is reused by `ssh`, `cp`, `rsync`, `rm`, `map`, and
-`clean-partials`. Completion uses existing connections without requesting
-approval. This reuse works independently of ordinary persistence and does not
+`clean-partials`. SSH data workers authenticate separate connections under the
+same permission, so transfers can use multiple network streams. Completion
+reuses ready helpers without requesting approval. This reuse works independently of ordinary persistence and does not
 enable receiving on the server. To prepare a connection before using it, run
 `syq persist connect hostB --auth-from @laptop`.
 See the [SSH authorization requirements](commands/ssh.md#account-access-requires-approval).

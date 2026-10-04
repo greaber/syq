@@ -150,10 +150,13 @@ pub(crate) struct LocalRequest {
     command: Vec<Vec<u8>>,
     cwd: String,
     expected: ResolvedPolicy,
+    /// Worker logins may consume existing authority, but never ask for more.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    existing_account_only: bool,
 }
 
 impl LocalRequest {
-    fn into_request(self) -> Result<(Request, LocalTarget)> {
+    fn into_request(self) -> Result<(Request, LocalTarget, bool)> {
         self.target.validate()?;
         anyhow::ensure!(
             self.expected.endpoint == self.target.endpoint,
@@ -167,6 +170,7 @@ impl LocalRequest {
                 Some(self.expected),
             ),
             self.target,
+            self.existing_account_only,
         ))
     }
 }
@@ -446,6 +450,45 @@ pub(crate) fn authorize_expected(
     expected: &ResolvedPolicy,
     local: &ssh::local_config::LocalPlan,
 ) -> Result<Session> {
+    authorize_expected_inner(
+        domain,
+        request,
+        command,
+        provider_binding,
+        expected,
+        local,
+        false,
+    )
+}
+
+pub(crate) fn authorize_worker_expected(
+    domain: &Domain,
+    request: &ssh::SessionRequest,
+    command: Vec<Vec<u8>>,
+    provider_binding: &str,
+    expected: &ResolvedPolicy,
+    local: &ssh::local_config::LocalPlan,
+) -> Result<Session> {
+    authorize_expected_inner(
+        domain,
+        request,
+        command,
+        provider_binding,
+        expected,
+        local,
+        true,
+    )
+}
+
+fn authorize_expected_inner(
+    domain: &Domain,
+    request: &ssh::SessionRequest,
+    command: Vec<Vec<u8>>,
+    provider_binding: &str,
+    expected: &ResolvedPolicy,
+    local: &ssh::local_config::LocalPlan,
+    existing_account_only: bool,
+) -> Result<Session> {
     let target = LocalTarget::from_plan(local)?;
     anyhow::ensure!(
         target.requested == request.destination,
@@ -464,11 +507,14 @@ pub(crate) fn authorize_expected(
         command,
         cwd: crate::approval_command::current_directory(),
         expected: expected.clone(),
+        existing_account_only,
     };
-    crate::output::diagnostic!(
-        "syq: requesting SSH account access from {}; approve on that machine",
-        request.provider.label()
-    );
+    if !existing_account_only {
+        crate::output::diagnostic!(
+            "syq: requesting SSH account access from {}; approve on that machine",
+            request.provider.label()
+        );
+    }
     let (mut stream, reply) = match &request.provider {
         Provider::Return(name) => {
             let registration = load_registration(name)?;
@@ -805,6 +851,39 @@ impl<'a> AccountApproval<'a> {
     }
 }
 
+fn approve_account(
+    context: &AuthorizationContext<'_>,
+    request: &Request,
+    permission: &AccountApproval,
+    generation: u64,
+    existing_account_only: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let key = permission.id();
+    let session_approved = context
+        .session_grants
+        .lock()
+        .unwrap()
+        .get(&key)
+        .is_some_and(|approved_generation| *approved_generation == generation);
+    if !session_approved && !permission.remembered(context.approvals)? {
+        anyhow::ensure!(!existing_account_only,
+                "SSH account permission ended before a data connection could start; retry the command to request account access");
+        let decision = permission.request(context, request, cancelled)?;
+        if cancelled() {
+            bail!("SSH request disconnected before authorization");
+        }
+        if decision == AccountDecision::Session {
+            context
+                .session_grants
+                .lock()
+                .unwrap()
+                .insert(key, generation);
+        }
+    }
+    Ok(())
+}
+
 /// The caller authenticates the transport, tracks its streams and captures a
 /// live session generation before entering. The broker never trusts requested
 /// pins: resolve again, compare the expectation, and sign only for that policy.
@@ -815,7 +894,7 @@ pub(crate) fn authorize_and_relay(
     generation: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
-    authorize_and_relay_inner(context, request, None, stream, generation, cancelled)
+    authorize_and_relay_inner(context, request, None, false, stream, generation, cancelled)
 }
 
 pub(crate) fn authorize_local_and_relay(
@@ -825,11 +904,12 @@ pub(crate) fn authorize_local_and_relay(
     generation: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let (request, target) = request.into_request()?;
+    let (request, target, existing_account_only) = request.into_request()?;
     authorize_and_relay_inner(
         context,
         request,
         Some(target),
+        existing_account_only,
         stream,
         generation,
         cancelled,
@@ -840,15 +920,22 @@ fn authorize_and_relay_inner(
     context: AuthorizationContext<'_>,
     request: Request,
     local_target: Option<LocalTarget>,
+    existing_account_only: bool,
     mut stream: TrackedStream,
     generation: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     request.validate(&context.origin)?;
-    let request_lock = context
-        .request_lock
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))?;
+    // Existing-grant workers cannot open UI and need no approval serialization.
+    // Their independent host-policy checks and agent sessions can run in parallel.
+    let request_lock = (!existing_account_only)
+        .then(|| {
+            context
+                .request_lock
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("another request is awaiting approval"))
+        })
+        .transpose()?;
     let count = context.active_count.fetch_add(1, Ordering::AcqRel);
     struct Slot<'a>(&'a AtomicU64);
     impl Drop for Slot<'_> {
@@ -858,7 +945,7 @@ fn authorize_and_relay_inner(
     }
     let _slot = Slot(context.active_count);
     if count >= 64 {
-        bail!("too many active approved SSH connections");
+        bail!("too many active approved SSH connections (limit 64 per authorization session); reduce the worker count or finish another transfer");
     }
     if cancelled() {
         bail!("SSH request disconnected before authorization");
@@ -879,26 +966,14 @@ fn authorize_and_relay_inner(
             policy.pinned_host_key_fingerprints(),
         )?;
         let permission = AccountApproval::new(&context.origin, destination)?;
-        let key = permission.id();
-        let session_approved = context
-            .session_grants
-            .lock()
-            .unwrap()
-            .get(&key)
-            .is_some_and(|approved_generation| *approved_generation == generation);
-        if !session_approved && !permission.remembered(context.approvals)? {
-            let decision = permission.request(&context, &request, cancelled)?;
-            if cancelled() {
-                bail!("SSH request disconnected before authorization");
-            }
-            if decision == AccountDecision::Session {
-                context
-                    .session_grants
-                    .lock()
-                    .unwrap()
-                    .insert(key, generation);
-            }
-        }
+        approve_account(
+            &context,
+            &request,
+            &permission,
+            generation,
+            existing_account_only,
+            cancelled,
+        )?;
     } else {
         // Legacy requests are accepted only through the return adapter and
         // retain their explicit one-login/reusable-login approval wording.
@@ -979,7 +1054,7 @@ impl Receiver {
     }
 
     pub(super) fn authorize_ssh(&self, request: Request, stream: TrackedStream) -> Result<()> {
-        self.authorize_ssh_inner(request, None, stream)
+        self.authorize_ssh_inner(request, None, false, stream)
     }
 
     pub(super) fn authorize_local_ssh(
@@ -987,14 +1062,15 @@ impl Receiver {
         request: LocalRequest,
         stream: TrackedStream,
     ) -> Result<()> {
-        let (request, target) = request.into_request()?;
-        self.authorize_ssh_inner(request, Some(target), stream)
+        let (request, target, existing_account_only) = request.into_request()?;
+        self.authorize_ssh_inner(request, Some(target), existing_account_only, stream)
     }
 
     fn authorize_ssh_inner(
         &self,
         request: Request,
         target: Option<LocalTarget>,
+        existing_account_only: bool,
         stream: TrackedStream,
     ) -> Result<()> {
         let context = AuthorizationContext {
@@ -1022,7 +1098,15 @@ impl Receiver {
                 || self.generation.load(Ordering::Acquire) != generation
                 || requester_closed(&socket)
         };
-        authorize_and_relay_inner(context, request, target, stream, generation, &cancelled)
+        authorize_and_relay_inner(
+            context,
+            request,
+            target,
+            existing_account_only,
+            stream,
+            generation,
+            &cancelled,
+        )
     }
 }
 
@@ -1194,6 +1278,89 @@ mod tests {
     }
 
     #[test]
+    fn worker_authorization_never_queues_a_missing_or_expired_account_grant() {
+        // Persistence scopes must fit OpenSSH's socket-path limit even though
+        // this approval test does not itself open an SSH socket.
+        let temporary = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        crate::persistence::initialize_scope(temporary.path()).unwrap();
+        let approvals = Queue::new(Domain::select(Some(temporary.path())).unwrap());
+        let identity = provider_identity();
+        let lock = Mutex::new(());
+        let _other_approval = lock.lock().unwrap();
+        let grants = Mutex::new(HashMap::new());
+        let count = AtomicU64::new(0);
+        let context = AuthorizationContext {
+            origin: AuthorizationOrigin::Provider {
+                profile: "provider",
+                identity: &identity,
+            },
+            approvals: &approvals,
+            notifications: crate::receive_approval::Notifications::Off,
+            request_lock: &lock,
+            active_count: &count,
+            session_grants: &grants,
+        };
+        let resolved = policy(1);
+        let permission = AccountApproval::new(
+            &context.origin,
+            AccountIdentity::new(
+                resolved.endpoint.clone(),
+                vec![ssh_key::Fingerprint::Sha256([8; 32]).to_string()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let request = Request::account(resolved.endpoint, vec![], String::new(), None);
+        for granted in [None, Some(4), Some(5)] {
+            if let Some(generation) = granted {
+                grants.lock().unwrap().insert(permission.id(), generation);
+            }
+            let result = approve_account(&context, &request, &permission, 5, true, &|| false);
+            assert_eq!(result.is_ok(), granted == Some(5));
+            if let Err(error) = result {
+                assert!(error.to_string().contains("permission ended"));
+            }
+            assert!(approvals.snapshots().is_empty());
+        }
+    }
+
+    #[test]
+    fn worker_request_flag_is_explicit_and_old_local_requests_remain_normal() {
+        let resolved = policy(1);
+        let mut request = LocalRequest {
+            target: LocalTarget {
+                requested: resolved.endpoint.clone(),
+                endpoint: resolved.endpoint.clone(),
+                host_key_alias: None,
+            },
+            command: vec![],
+            cwd: String::new(),
+            expected: resolved,
+            existing_account_only: false,
+        };
+        let old = serde_json::to_value(&request).unwrap();
+        assert!(old.get("existing_account_only").is_none());
+        assert!(
+            !serde_json::from_value::<LocalRequest>(old)
+                .unwrap()
+                .existing_account_only
+        );
+        request.existing_account_only = true;
+        let new = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            new.get("existing_account_only"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            serde_json::from_value::<LocalRequest>(new)
+                .unwrap()
+                .into_request()
+                .unwrap()
+                .2
+        );
+    }
+
+    #[test]
     fn expected_resolution_rejects_account_pin_or_algorithm_changes() {
         let resolved = policy(1);
         assert!(resolved.check_expected(None).is_ok());
@@ -1356,13 +1523,16 @@ mod tests {
             command: Vec::new(),
             cwd: "/tmp".into(),
             expected: expected.clone(),
+            existing_account_only: false,
         })
         .unwrap();
         assert!(serde_json::from_slice::<Request>(&encoded).is_err());
-        let (request, decoded) = serde_json::from_slice::<LocalRequest>(&encoded)
-            .unwrap()
-            .into_request()
-            .unwrap();
+        let (request, decoded, existing_account_only) =
+            serde_json::from_slice::<LocalRequest>(&encoded)
+                .unwrap()
+                .into_request()
+                .unwrap();
+        assert!(!existing_account_only);
         assert_eq!(decoded, target);
         assert_eq!(request.target, target.endpoint);
         assert!(request.mode == Mode::Account);
@@ -1372,7 +1542,8 @@ mod tests {
             target: target.clone(),
             command: Vec::new(),
             cwd: String::new(),
-            expected: changed
+            expected: changed,
+            existing_account_only: false,
         }
         .into_request()
         .is_err());

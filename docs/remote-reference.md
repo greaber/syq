@@ -213,9 +213,10 @@ connection requirements. `--coordinate-at local` can reuse approved access to
 each endpoint and explicitly relays file data through the invoking machine.
 
 The source's SSH server must permit remote Unix-socket forwarding. SSH fallback
-also needs two simultaneous sessions on the destination's approved connection
-(`sshd MaxSessions` of at least 2); direct TCP data does not need the second
-session. The socket
+opens a separate approved login to set up the copy's restricted data workers;
+it does not need a second session on the destination's existing connection.
+An agent that requires a hardware-key touch can require another touch for that
+login. The socket
 carries control, metadata, and worker setup; payload goes directly between the
 source and destination. The invoking machine's `ProxyJump` route can
 reach the control endpoints, but does not provide a data route between the

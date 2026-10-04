@@ -13,6 +13,7 @@ mod master_lifetime;
 pub(crate) mod persistent;
 pub(crate) mod provider;
 pub(crate) mod resolution;
+pub(crate) mod workers;
 
 #[derive(Parser)]
 #[command(

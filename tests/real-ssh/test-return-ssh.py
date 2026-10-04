@@ -157,10 +157,47 @@ def interactive_shell():
             os.waitpid(child, 0)
 
 
-def source_run(args, success=True, *, stdin=None, tcp=False):
-    environment = native_path + (" SYQ_TEST_REQUIRE_TCP=1" if tcp else "")
+def source_run(args, success=True, *, stdin=None, tcp=False, trace=None):
+    # Trace transfer children only. The command/terminal cancellation cases
+    # above continue to exercise native OpenSSH without a tracing parent.
+    environment = native_path if trace is None else "PATH=/usr/local/bin:/usr/bin:/bin"
+    if tcp:
+        environment += " SYQ_TEST_REQUIRE_TCP=1"
+    if trace is not None:
+        environment += " SYQ_REAL_SSH_TRACE_FILE=" + shlex.quote(trace)
     return run("ssh", "source", "exec env " + environment + " " + shlex.join(["syq", *args]),
                success=success, stdin=stdin)
+
+
+def assert_copy_transports(trace, independent, *, expect_control=False):
+    text = run("ssh", "source", "if test -f " + shlex.quote(trace)
+               + "; then cat " + shlex.quote(trace) + "; fi")
+    events = [dict(field.split("=", 1) for field in line.split("\t"))
+              for line in text.splitlines()]
+    starts = [event for event in events if event["phase"] == "start"
+              and event["host"] == "destination"]
+    workers = [event for event in starts if event["control_master"] == "no"
+               and event["control_path"] == "none"]
+    if not independent:
+        assert not workers, ("TCP data opened an independent SSH login", events)
+        return
+    ended = {event["pid"] for event in events if event["phase"] == "end"
+             and event["status"] == "0"}
+    pids = {event["pid"] for event in workers}
+    assert len(pids) >= 2 and pids <= ended, ("missing successful independent SSH workers", events)
+    if expect_control:
+        controls = [event for event in starts if event["control_socket"] == "present"]
+        assert controls and events.index(controls[0]) < events.index(workers[0]), events
+    active, peak = set(), 0
+    for event in events:
+        if event["pid"] in pids:
+            if event["phase"] == "start":
+                active.add(event["pid"])
+                peak = max(peak, len(active))
+            else:
+                active.remove(event["pid"])
+    assert peak >= 2 and not active, ("independent SSH workers did not overlap and exit", events)
+    assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 
 
 def persistent_connect(allow=True, ask=False):
@@ -216,33 +253,41 @@ def persistent_cases(expected):
     assert source_run(["ssh", "destination", "--", "hostname"]).encode() == expected
     source_run(["ssh", "--auth-from", "auto", "destination", "--", "hostname"], success=False)
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
-    single_session = os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1"
-    transport = [] if single_session else ["--no-tcp"]
-    rsync_transport = [] if single_session else ["--syq-no-tcp"]
-    print("case: reusable account approval supports", "TCP" if single_session else "SSH-only",
-          "uploads and downloads", flush=True)
+    transport = ["--no-tcp"]
+    rsync_transport = ["--syq-no-tcp"]
+    print("case: reusable account approval supports independent SSH uploads and downloads",
+          "including MaxSessions=1", flush=True)
     copy_root = run("ssh", "destination", "mktemp -d /tmp/syq-account-copy.XXXXXX").strip()
     try:
-        run("ssh", "source", "dd if=/dev/urandom of=" + shlex.quote(root + "/data") + " bs=1M count=3 status=none")
-        source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/data", *transport], tcp=single_session)
-        source_run(["cp", "--from", "destination", copy_root + "/data", "--as", root + "/roundtrip", *transport], tcp=single_session)
+        run("ssh", "source", "dd if=/dev/urandom of=" + shlex.quote(root + "/data") + " bs=1M count=8 status=none")
+        # A modest bandwidth cap keeps both workers active long enough for
+        # the trace to prove overlapping native connections, not just retries.
+        workers = ["--performance-tuning", "workers=2", "--resource-limits", "bandwidth=2M"]
+        upload_trace, download_trace = root + "/upload.trace", root + "/download.trace"
+        source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/data",
+                    *transport, *workers], trace=upload_trace)
+        assert_copy_transports(upload_trace, True, expect_control=True)
+        source_run(["cp", "--from", "destination", copy_root + "/data", "--as", root + "/roundtrip",
+                    *transport, *workers], trace=download_trace)
+        assert_copy_transports(download_trace, True)
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/roundtrip"))
+        print("case: encrypted TCP workers need no additional SSH authentication", flush=True)
+        tcp_trace = root + "/tcp.trace"
+        source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/tcp-data",
+                    "--performance-tuning", "workers=2"], tcp=True, trace=tcp_trace)
+        assert_copy_transports(tcp_trace, False)
+        run("ssh", "destination", "cmp " + shlex.quote(copy_root + "/data") + " " + shlex.quote(copy_root + "/tcp-data"))
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
         mapping = source_run(["map", "--from", "destination", "-C", copy_root, "data"])
         assert len(mapping.splitlines()) == 1, mapping
-        source_run(["rsync", "-a", *rsync_transport, root + "/data", "destination:" + copy_root + "/rsync-data"], tcp=single_session)
-        source_run(["rsync", "-a", *rsync_transport, "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"], tcp=single_session)
+        source_run(["rsync", "-a", *rsync_transport, root + "/data", "destination:" + copy_root + "/rsync-data"])
+        source_run(["rsync", "-a", *rsync_transport, "--syq-auth-from", "@laptop", "destination:" + copy_root + "/rsync-data", root + "/rsync-roundtrip"])
         run("ssh", "source", "cmp " + shlex.quote(root + "/data") + " " + shlex.quote(root + "/rsync-roundtrip"))
         stream_data = "stream through approved SSH\n"
         source_run(["cp", "--src-fd", "0", "--to", "destination", "--as", copy_root + "/stream",
-                    *transport, "--auth-from", "@laptop"], stdin=stream_data, tcp=single_session)
-        assert source_run(["cp", "--from", "destination", copy_root + "/stream", "--as-fd", "1", *transport],
-                          tcp=single_session) == stream_data
-        if single_session:
-            print("case: MaxSessions=1 SSH-only account copy fails without requesting more authority", flush=True)
-            source_run(["cp", root + "/data", "--to", "destination", "--as", copy_root + "/ssh-refused",
-                        "--no-tcp", "--auth-from", "@laptop", "--performance-tuning", "workers=1"], success=False)
-            run("ssh", "destination", "test ! -e " + shlex.quote(copy_root + "/ssh-refused"))
-            assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+                    *transport, "--auth-from", "@laptop"], stdin=stream_data)
+        assert source_run(["cp", "--from", "destination", copy_root + "/stream", "--as-fd", "1",
+                           *transport]) == stream_data
         source_run(["clean-partials", "--on", "destination", copy_root, "--auth-from", "@laptop"])
         run("ssh", "destination", "test -f " + shlex.quote(copy_root + "/data"))
         source_run(["rm", "--on", "destination", copy_root + "/rsync-data", "--auth-from", "@laptop"])
@@ -523,9 +568,9 @@ def cold_copy_and_remembered_cases(expected):
     source_run(["persist", "auth-from", "@laptop", "--for", "destination"])
     remote_root = run("ssh", "destination", "mktemp -d /tmp/syq-cold-account.XXXXXX").strip()
     try:
-        data = "cold account copy\n"
+        data = "cold account copy\n" * 65536
         run("ssh", "source", "cat > " + shlex.quote(root + "/cold"), stdin=data)
-        transport = [] if os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1" else ["--no-tcp"]
+        transport = ["--no-tcp", "--performance-tuning", "workers=2"]
         args = ["syq", "cp", root + "/cold", "--to", "destination", "--as", remote_root + "/data",
                 "--inplace", "--syq-path", "/usr/local/bin/syq", *transport]
         process = subprocess.Popen(["ssh", "source", "exec env " + native_path + " " + shlex.join(args)],

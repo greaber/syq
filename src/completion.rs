@@ -1794,7 +1794,7 @@ fn connect_completion_endpoint(
         );
         // These options require the existing approved master. Neither the
         // completion helper nor a disappearing socket may start a new login.
-        None
+        Some(Arc::new(SshMultiplexer::approved(cached.control(), None)))
     } else {
         if let AuthFrom::Provider(provider) = auth_from {
             bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint_label(&endpoint), endpoint_label(&endpoint));

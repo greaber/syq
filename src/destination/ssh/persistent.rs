@@ -243,8 +243,47 @@ fn validate_record(domain: &Domain, record: &Record) -> Result<()> {
     Ok(())
 }
 
-pub(crate) struct Cached(Record);
+pub(crate) struct Cached(
+    Record,
+    Option<std::sync::Arc<super::workers::Authorization>>,
+);
 impl Cached {
+    /// Only an actual operation freezes worker authorization. Lookup-only
+    /// completion/export paths never connect to the authorization provider.
+    pub(crate) fn worker_authorization(
+        &self,
+        domain: &Domain,
+    ) -> Result<std::sync::Arc<super::workers::Authorization>> {
+        let workers = self
+            .1
+            .as_ref()
+            .context("approved account has no data-worker authorization context")?;
+        anyhow::ensure!(
+            workers.belongs_to(domain),
+            "approved worker authorization belongs to another persistence scope"
+        );
+        Ok(workers.clone())
+    }
+
+    fn with_workers(
+        mut self,
+        domain: &Domain,
+        request: SessionRequest,
+        selected: &resolution::Selection,
+        generation: String,
+        proxy: Option<String>,
+    ) -> Result<Self> {
+        self.1 = Some(std::sync::Arc::new(super::workers::Authorization::new(
+            domain,
+            request,
+            selected,
+            generation,
+            proxy,
+            self.0.control.clone(),
+        )?));
+        Ok(self)
+    }
+
     pub(crate) fn control(&self) -> &Path {
         &self.0.control
     }
@@ -393,7 +432,7 @@ fn active_record(domain: &Domain, record: Record) -> Result<Option<Cached>> {
     {
         return Ok(None);
     }
-    Ok(Some(Cached(record)))
+    Ok(Some(Cached(record, None)))
 }
 
 /// Look up only the account authority selected by command policy. Native
@@ -498,11 +537,12 @@ fn connect_local(domain: &Domain, authorizer: &Provider, local: LocalPlan) -> Re
         None
     };
     let plan = resolution::select(domain, &request, local, proxy)?;
-    if let Some(cached) = cached_selected(domain, authorizer, &request.destination, &plan.selected)?
-    {
-        return Ok(cached);
-    }
     let selected = plan.selected.clone();
+    let generation = plan.generation.clone();
+    let proxy = plan.proxy.clone();
+    if let Some(cached) = cached_selected(domain, authorizer, &request.destination, &selected)? {
+        return cached.with_workers(domain, request, &selected, generation, proxy);
+    }
     if let Err(error) = start(domain, request.clone(), plan) {
         if let Err(invalidation) = resolution::invalidate(domain, &request, &selected) {
             crate::output::diagnostic!("syq: warning: cannot clear failed SSH policy metadata ({invalidation:#}); retry after removing the stale cache");
@@ -510,7 +550,8 @@ fn connect_local(domain: &Domain, authorizer: &Provider, local: LocalPlan) -> Re
         return Err(error);
     }
     cached_selected(domain, authorizer, &request.destination, &selected)?
-        .context("approved SSH account connection ended before use")
+        .context("approved SSH account connection ended before use")?
+        .with_workers(domain, request, &selected, generation, proxy)
 }
 
 fn export_selected(
@@ -640,11 +681,6 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
             let Some(record) = read_record(&path)? else {
                 return Ok(());
             };
-            match record.control.symlink_metadata() {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error.into()),
-            }
             // Generation cancellation may already have made the keeper remove
             // this socket and scope while off was inspecting its index record.
             if !mark_closing(domain, &record)? {
@@ -1099,6 +1135,9 @@ fn keeper(startup: Startup) -> Result<()> {
         active: true,
     });
     let mut master = foreground::ForegroundChild::spawn(&mut master, &signals)?;
+    // Declared after the child so early returns stop prepared helpers before
+    // dropping the foreground master (or the daemon guard below it).
+    let mut pool = KeeperPool::new(&record.control);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if signals.received.load(Ordering::Acquire) != 0
@@ -1188,11 +1227,38 @@ fn keeper(startup: Startup) -> Result<()> {
         }
         signals.wait(POLL)?;
     }
-    master.stop(libc::SIGTERM)?;
-    if let Some(daemon) = &mut daemon {
-        daemon.stop()?;
+    let pool_result = pool.stop();
+    let master_result = master.stop(libc::SIGTERM);
+    let daemon_result = daemon.as_mut().map_or(Ok(()), DaemonMaster::stop);
+    // A broken pool must not leave an approved login alive.
+    master_result?;
+    daemon_result?;
+    pool_result
+}
+
+struct KeeperPool<'a> {
+    control: &'a Path,
+    active: bool,
+}
+impl<'a> KeeperPool<'a> {
+    fn new(control: &'a Path) -> Self {
+        Self {
+            control,
+            active: true,
+        }
     }
-    Ok(())
+
+    fn stop(&mut self) -> Result<()> {
+        if std::mem::take(&mut self.active) {
+            cleanup::stop_pool(self.control)?;
+        }
+        Ok(())
+    }
+}
+impl Drop for KeeperPool<'_> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 /// An explicit-domain master daemonizes so OpenSSH can count idle channels.
@@ -1218,6 +1284,14 @@ impl Drop for DaemonMaster<'_> {
 }
 
 fn close_master(record: &Record) -> Result<()> {
+    let pool_result = cleanup::stop_pool(&record.control);
+    let master_result = retire_master(record);
+    // Evaluate both before returning either error: pool failure cannot retain
+    // the account connection, and a missing master may still have a stale pool.
+    master_result.and(pool_result)
+}
+
+fn retire_master(record: &Record) -> Result<()> {
     if !record.control.exists() {
         return Ok(());
     }
