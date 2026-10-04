@@ -1084,6 +1084,7 @@ fn named_tcp_workers_connect_concurrently() {
     let start = Arc::new(std::sync::Barrier::new(8));
     let threads = (0..8)
         .map(|_| {
+            let tcp = Arc::clone(&spec.tcp);
             let endpoint = crate::conn::Endpoint::Remote(spec.clone());
             let start = Arc::clone(&start);
             std::thread::spawn(move || {
@@ -1093,7 +1094,11 @@ fn named_tcp_workers_connect_concurrently() {
                     .unwrap();
                 assert!(
                     worker.transport_stats().is_some(),
-                    "worker fell back to SSH"
+                    "worker fell back to SSH: {:?}",
+                    tcp.lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|info| info.failure.as_deref())
                 );
                 worker
             })
