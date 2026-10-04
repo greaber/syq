@@ -1009,7 +1009,7 @@ fn staging_recovery_preserves_patch_sources() {
                 "-a",
                 "--no-progress",
                 "--no-whole-file",
-                "--performance-tuning=workers=2,batch-files=8",
+                "--performance-tuning=workers=2,batch-files=8,batch-bytes=64M",
                 &t.s("src/"),
                 &t.s("dst/"),
             ])
