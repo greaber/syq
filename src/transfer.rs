@@ -2308,7 +2308,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
-                    if !gate.connection_needed(id) {
+                    // A worker still connecting when every file is finished
+                    // is no longer joined, so it stops quietly.
+                    if !gate.connection_needed(id) || sched.finished() {
                         gate.mark_absent(id);
                         return Ok(());
                     }
@@ -2350,6 +2352,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                                 );
                             }
                             return if gate.allowed(id) { Err(error) } else { Ok(()) };
+                        }
+                        Err(_) if sched.finished() => {
+                            gate.mark_absent(id);
+                            return Ok(());
                         }
                         Err(error) => {
                             failures += 1;
