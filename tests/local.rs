@@ -3,6 +3,7 @@
 #[allow(dead_code)]
 #[path = "../src/process.rs"]
 mod process;
+#[allow(dead_code)] // This test crate uses only the polling process-group API.
 #[path = "../src/process_group.rs"]
 mod process_group;
 use crate::process::CommandExt as _;
