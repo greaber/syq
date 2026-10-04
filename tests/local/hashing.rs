@@ -1002,3 +1002,76 @@ fn hash_or_copy_dry_run_lists_what_the_copy_would_write() {
         assert_eq!(shown.contains("same0"), !remote, "remote={remote}: {shown}");
     }
 }
+
+/// Hard-linked source names with new contents, over hard-linked destination
+/// names of the same size and modification time that hold other contents.
+fn stale_linked_pair(t: &Tmp) {
+    write(&t.path("src/a"), b"new contents");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    write(&t.path("dst/a"), b"bad contents");
+    fs::hard_link(t.path("dst/a"), t.path("dst/b")).unwrap();
+    set_mtime(&t.path("src/a"), 1_600_000_000);
+    set_mtime(&t.path("dst/a"), 1_600_000_000);
+}
+
+fn assert_linked_pair(t: &Tmp, contents: &[u8]) {
+    for name in ["a", "b"] {
+        assert_eq!(read(&t.path(&format!("dst/{name}"))), contents, "{name}");
+    }
+    assert_eq!(
+        fs::metadata(t.path("dst/a")).unwrap().ino(),
+        fs::metadata(t.path("dst/b")).unwrap().ino()
+    );
+}
+
+#[test]
+fn hash_or_copy_repairs_hard_links_whose_size_and_time_match() {
+    for remote in [false, true] {
+        let t = Tmp::new();
+        stale_linked_pair(&t);
+        let out = copy_tree(&t, remote, "-naHIv", &[]);
+        assert_output_ok(&out);
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The preview links the second name to a rewritten first one.
+        assert!(shown.contains("link "), "remote={remote}: {shown}");
+        assert_linked_pair(&t, b"bad contents");
+        let out = copy_tree(&t, remote, "-aHI", &[]);
+        assert_output_ok(&out);
+        assert_linked_pair(&t, b"new contents");
+    }
+    let t = Tmp::new();
+    stale_linked_pair(&t);
+    let (source, destination) = (t.s("src"), t.s("dst"));
+    let native = |extra: &[&str]| {
+        let mut args = vec![
+            "cp",
+            "--hash-or-copy",
+            "--copy-metadata=hardlinks,mtime",
+            "--srcs-in",
+            &source,
+            "--into-existing",
+            &destination,
+        ];
+        args.extend(extra);
+        run_native_ok(&args);
+    };
+    let results = t.s("preview.ndjson");
+    native(&["--dry-run", "--results", &results]);
+    let terminal: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&results)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(terminal["files_transferred"], 2, "{terminal}");
+    assert_eq!(terminal["files_unchanged"], 0, "{terminal}");
+    assert_linked_pair(&t, b"bad contents");
+    native(&[]);
+    assert_linked_pair(&t, b"new contents");
+}

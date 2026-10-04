@@ -2753,10 +2753,14 @@ impl Worker {
     // Keep digest reads in workers so one large file cannot stall directory
     // planning. A failed check takes the normal repair path; publication still
     // validates the expected digest. Explicit --hash continues to compare both
-    // endpoints regardless of matching metadata or an expected digest.
+    // endpoints regardless of matching metadata or an expected digest. A
+    // hardlink representative without an expected digest is otherwise kept
+    // on matching size and time alone, which --hash-or-copy does not trust.
     pub(super) fn try_expected_match(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
         let expected = self.opts.expected_hashes_for(job);
-        if expected.is_none() && !(self.opts.hardlinks && job.entry.nlink > 1) {
+        if expected.is_none()
+            && !(self.opts.hardlinks && job.entry.nlink > 1 && !self.opts.hash_or_copy)
+        {
             return Ok(false);
         }
         let Some(destination) = job.dst_entry.as_deref() else {
@@ -2829,8 +2833,7 @@ impl Worker {
         let job = self.job(idx);
         let result = match job.dst_entry.as_deref() {
             Some(destination)
-                if !self.opts.checksum
-                    && !self.opts.hash_or_copy
+                if self.opts.trusts_size_and_time()
                     && self
                         .opts
                         .metadata_matches(&job.rel_bytes, &job.entry, destination) =>

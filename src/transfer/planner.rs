@@ -1868,8 +1868,10 @@ impl Planner<'_> {
             );
             return;
         }
-        let trusts_size_and_time = !opts.checksum && !opts.hash_or_copy;
-        if same && trusts_size_and_time && (opts.dry_run || opts.expected_for(&dst_rel).is_none()) {
+        if same
+            && opts.trusts_size_and_time()
+            && (opts.dry_run || opts.expected_for(&dst_rel).is_none())
+        {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
@@ -1914,9 +1916,7 @@ impl Planner<'_> {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
             self.progress.bytes_unchanged.fetch_add(e.size, Relaxed);
         } else if opts.dry_run
-            && (opts.checksum
-                || opts.protects_existing_contents()
-                || (opts.hash_or_copy && opts.reuses_blocks(e.size, dst_entry.as_ref())))
+            && opts.previews_by_comparing(e.size, dst_entry.as_ref())
             && dst_entry
                 .as_ref()
                 .is_some_and(|d| d.kind == Kind::File && d.size == e.size)

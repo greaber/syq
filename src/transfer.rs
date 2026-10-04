@@ -214,6 +214,22 @@ impl Opts {
         }
     }
 
+    /// Whether a destination whose size and modification time match its
+    /// source counts as unchanged. --hash and --hash-or-copy both stop
+    /// trusting them.
+    fn trusts_size_and_time(&self) -> bool {
+        !self.checksum && !self.hash_or_copy
+    }
+
+    /// Whether a dry run compares an existing file of the same size to
+    /// learn whether the copy would change it, because the copy would
+    /// compare it too.
+    fn previews_by_comparing(&self, size: u64, existing: Option<&Entry>) -> bool {
+        self.checksum
+            || self.protects_existing_contents()
+            || (self.hash_or_copy && self.reuses_blocks(size, existing))
+    }
+
     fn adaptive_ranges(&self) -> bool {
         !self.same_host
             && !self.block_explicit

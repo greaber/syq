@@ -87,7 +87,8 @@ impl Planner<'_> {
             }
             let compare_before_link = self.opts.protects_existing_contents()
                 && destination.as_ref().is_some_and(|d| {
-                    self.opts.checksum || !self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)
+                    !self.opts.trusts_size_and_time()
+                        || !self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)
                 });
             group.followers.push(Follower {
                 compare_before_link,
@@ -109,14 +110,19 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         } else if self.opts.dry_run
-            && (!(self.opts.checksum || self.opts.protects_existing_contents())
+            && (!self
+                .opts
+                .previews_by_comparing(leaf.e.size, destination.as_ref())
                 || destination
                     .as_ref()
                     .is_none_or(|d| d.kind != Kind::File || d.size != leaf.e.size))
         {
-            let matched = destination
-                .as_ref()
-                .is_some_and(|d| self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d));
+            // A copy that would not compare the file rewrites it unless its
+            // size and time are trusted.
+            let matched = self.opts.trusts_size_and_time()
+                && destination
+                    .as_ref()
+                    .is_some_and(|d| self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d));
             if matched {
                 self.progress.files_unchanged.fetch_add(1, Relaxed);
                 self.progress
