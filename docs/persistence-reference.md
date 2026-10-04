@@ -60,9 +60,11 @@ it alongside `persistence.json`. Older syq versions ignore it. Unversioned files
 and `"version": 1` are supported; edits preserve additional top-level fields and
 do not add a version to unversioned files. Invalid choices and unsupported
 versions report the file's path without changing it. Repair the file or pass
-`--auth-from` explicitly to bypass it for one command. Setting or resetting a
-choice preserves the other saved choices, so neither can repair an unreadable
-file. To discard all saved choices, remove that file yourself.
+`--auth-from` explicitly (`--syq-auth-from` for rsync) to bypass it for one command.
+Setting or resetting a choice preserves the other saved choices, so neither can
+repair an unreadable file. To discard all saved choices, remove that file yourself. The configuration
+directory may be a symlink to a directory you own; `auth-from.json` itself must
+be a regular file, not a symlink.
 
 ## Approved account connections
 
@@ -189,9 +191,14 @@ syq persist receive permissions remove PERMISSION_ID
 
 `--remember` is accepted only for account-access requests. Removing a remembered
 permission makes future authentication requests ask again. Existing authenticated
-connections may continue. Session permission ends when the laptop's receiving
-connection closes. Stopping receiving prevents further authorization through
-that connection; [account access](security.md#ssh-account-access) explains its limits.
+connections may continue, including new commands using an existing connection.
+To close syq's owned connections, run `syq persist off` on the requesting machine,
+with `--pscope PATH` if they belong to an explicit domain. Run
+`syq persist receive off` on the authorizing machine to end session permission
+and prevent further authorization, selecting its domain with `--pscope` when needed.
+Neither action guarantees termination of already running remote commands or
+detached processes; stop those on the destination when necessary. See
+[account access](security.md#ssh-account-access) for the limits of account approval.
 
 Remembered permissions belong to the authorizing laptop's selected domain and
 are stored separately from receiving settings. They are not inherited by a new
@@ -429,7 +436,10 @@ then removes its settings and remembered permissions. The path cannot be reused
 after cleanup; create a new domain. Other domains are unchanged. Default
 `persist off` closes default-domain connections but preserves its saved settings
 and remembered permissions. Idle connection expiry alone does not remove a
-domain's settings.
+domain's settings. Temporary scopes and their remembered permissions can also
+be lost when the system cleans its runtime or temporary directory, including at
+reboot. A scope stored in a durable location may survive, but its SSH connections
+must be reopened.
 
 ## Setup and recovery
 

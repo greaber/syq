@@ -125,15 +125,27 @@ fn attach_in(domain: &Domain, profile: Option<&str>) -> Result<Attachment> {
     })
 }
 
+/// Verify forwarding reaches this exact provider service without opening an
+/// attachment, resolving policy, or requesting account approval.
+pub(crate) fn probe_forwarded(stream: UnixStream) -> Result<()> {
+    let stream = forwarded_handshake(stream)?;
+    stream.shutdown(std::net::Shutdown::Both)?;
+    Ok(())
+}
+
+fn forwarded_handshake(stream: UnixStream) -> Result<UnixStream> {
+    handshake(stream, false).context(
+        "could not open the SSH authorization provider service; check that receiving is running there and sshd permits local forwarding with AllowTcpForwarding and AllowStreamLocalForwarding set to local or yes",
+    )
+}
+
 /// Use the same exact-build protocol over an already connected SSH Unix forward.
 pub(crate) fn open_forwarded(
     stream: UnixStream,
     session: &str,
     operation: SessionRequest,
 ) -> Result<UnixStream> {
-    let stream = handshake(stream, false).context(
-        "could not open the SSH authorization provider service; check that receiving is running there and sshd permits local forwarding with AllowTcpForwarding and AllowStreamLocalForwarding set to local or yes",
-    )?;
+    let stream = forwarded_handshake(stream)?;
     send_operation(stream, session, operation)
 }
 fn send_operation(
@@ -936,8 +948,7 @@ mod tests {
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, Domain, Preferences) {
-        let root = fs::canonicalize("/tmp").unwrap();
-        let directory = tempfile::tempdir_in(root).unwrap();
+        let directory = crate::test_support::short_tempdir().unwrap();
         let path = directory.path().join("domain");
         crate::persistence::initialize_scope(&path).unwrap();
         let domain = Domain::select(Some(&path)).unwrap();
@@ -989,6 +1000,41 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_readiness_only_exchanges_hello_without_creating_authority() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain).unwrap());
+        let (client, server) = pair(&service);
+        let serving = service.clone();
+        let worker = std::thread::spawn(move || serving.handle(server));
+        probe_forwarded(client).unwrap();
+        // The deliberate EOF occurs where an Access operation would start.
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)));
+        let state = service.snapshot(None);
+        assert!(state
+            .profiles
+            .iter()
+            .all(|profile| profile.sessions == 0 && profile.pending.is_empty()));
+        service.close();
+    }
+
+    #[test]
+    fn forwarded_readiness_rejects_a_denied_or_unresponsive_channel() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server.shutdown(std::net::Shutdown::Both).unwrap();
+        let error = probe_forwarded(client).unwrap_err();
+        assert!(error.to_string().contains("sshd permits local forwarding"));
+
+        let (client, _silent_server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error = probe_forwarded(client).unwrap_err();
+        assert!(error.to_string().contains("provider service"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn provider_build_mismatch_names_both_builds_and_matching_restart() {
         let (client, mut server) = UnixStream::pair().unwrap();
         let reply = std::thread::spawn(move || {
@@ -1005,9 +1051,9 @@ mod tests {
             )
             .unwrap();
         });
-        let error = handshake(client, false).unwrap_err();
+        let error = probe_forwarded(client).unwrap_err();
         reply.join().unwrap();
-        let error = error.to_string();
+        let error = format!("{error:#}");
         assert!(error.contains("provider-other-build"));
         assert!(error.contains(crate::identity::build()));
         assert!(error.contains("install the same syq build on the requester and provider"));

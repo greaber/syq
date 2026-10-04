@@ -178,7 +178,7 @@ fn path(domain: &Domain) -> Result<PathBuf> {
 fn read(path: &Path) -> Result<Config> {
     read_inner(path).with_context(|| {
         format!(
-            "read saved authorization choice from {}; repair this file or pass --auth-from explicitly",
+            "read saved authorization choice from {}; repair this file or pass --auth-from explicitly (--syq-auth-from for rsync)",
             path.display(),
         )
     })
@@ -235,6 +235,15 @@ pub(crate) fn resolve(domain: &Domain, host: &str, explicit: Option<AuthFrom>) -
     load(domain)?.selected(host)
 }
 
+pub(crate) fn selected_context<T>(result: Result<T>, mode: &AuthFrom, explicit: bool) -> Result<T> {
+    match mode {
+        AuthFrom::Provider(provider) if !explicit => result.with_context(|| {
+            format!("authorization provider {provider} comes from the saved auth-from choice")
+        }),
+        _ => result,
+    }
+}
+
 pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     if args.auth_from_explicit || args.s3.is_some() {
         return Ok(());
@@ -278,10 +287,36 @@ fn update_inner(
     if create_parent {
         std::fs::create_dir_all(parent).context("create authorization configuration directory")?;
     }
+    let linked = std::fs::symlink_metadata(parent)?.file_type().is_symlink();
+    // Resolve a user-selected configuration directory once. File symlinks
+    // remain disallowed, and reading, locking and publishing use this parent.
+    let parent = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "resolve authorization configuration directory {}",
+            parent.display()
+        )
+    })?;
+    let path = parent.join(
+        path.file_name()
+            .context("authorization configuration filename missing")?,
+    );
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent).with_context(|| format!("open authorization configuration directory {}; use a real directory, not a symlink", parent.display()))?;
+        .open(&parent)
+        .with_context(|| {
+            format!(
+                "open authorization configuration directory {}",
+                parent.display()
+            )
+        })?;
+    if linked {
+        anyhow::ensure!(
+            directory.metadata()?.uid() == unsafe { libc::geteuid() },
+            "symlinked authorization configuration directory must be owned by this user: {}",
+            parent.display()
+        );
+    }
     // A read-modify-write changes one override while preserving concurrent
     // changes made by another `persist auth-from` command.
     loop {
@@ -293,7 +328,7 @@ fn update_inner(
             return Err(error).context("lock authorization configuration");
         }
     }
-    let mut config = read(path)?;
+    let mut config = read(&path)?;
     match (host, value) {
         (None, value) => config.default = value.map(spelling),
         (Some(host), Some(value)) => {
@@ -303,12 +338,12 @@ fn update_inner(
             config.hosts.remove(host);
         }
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
     serde_json::to_writer_pretty(&mut temporary, &config)?;
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary
-        .persist(path)
+        .persist(&path)
         .map_err(|error| error.error)
         .context("write authorization preferences")?;
     Ok(config)
@@ -520,6 +555,66 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved, original);
         }
+    }
+
+    #[test]
+    fn linked_config_directory_updates_target_but_file_links_stay_rejected() {
+        let root = crate::test_support::tempdir().unwrap();
+        let target = root.path().join("owned-config");
+        std::fs::create_dir(&target).unwrap();
+        let linked = root.path().join("config");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        let path = linked.join("auth-from.json");
+        update(&path, Some("backup"), Some(&AuthFrom::Ssh), true).unwrap();
+        update(
+            &path,
+            None,
+            Some(&AuthFrom::Provider(Provider::Return("laptop".into()))),
+            true,
+        )
+        .unwrap();
+        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            read(&target.join("auth-from.json"))
+                .unwrap()
+                .selected("backup")
+                .unwrap(),
+            AuthFrom::Ssh
+        );
+        assert_eq!(
+            read(&path).unwrap().selected("other").unwrap(),
+            AuthFrom::Provider(Provider::Return("laptop".into()))
+        );
+
+        let actual = target.join("saved.json");
+        std::fs::rename(&path, &actual).unwrap();
+        let original = std::fs::read(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, &path).unwrap();
+        assert!(read(&path).is_err());
+        assert!(update(&path, None, Some(&AuthFrom::Auto), true).is_err());
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&actual).unwrap(), original);
+    }
+
+    #[test]
+    fn saved_provider_error_context_preserves_typed_failure() {
+        let mode = AuthFrom::Provider(Provider::Return("laptop".into()));
+        let error = selected_context::<()>(
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()),
+            &mode,
+            false,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider @laptop comes from the saved"));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        let explicit =
+            selected_context::<()>(Err(anyhow::anyhow!("original")), &mode, true).unwrap_err();
+        assert_eq!(explicit.to_string(), "original");
     }
 
     #[test]

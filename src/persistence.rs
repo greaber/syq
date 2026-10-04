@@ -32,7 +32,7 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Manage persistent SSH connections, receiving, and return destinations",
-    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from PROVIDER, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. Explicit scopes isolate connections, receiving profiles, authorization preferences, and permissions. Create one with on --ephemeral and select it for any persistence operation with --pscope. Idle SSH connections in ephemeral scopes expire; closing a scope stops its services and removes its settings."
+    long_about = "Manage reusable SSH connections, helper sessions, and background receiving. Receiving requires local approval for each copy by default; configure or disable it with syq persist receive. Use syq persist connect HOST to connect without copying files and wait for receiving. With --auth-from PROVIDER, prepare an approved account login without enabling ordinary persistence or receiving. Later commands can request the same account access directly. Durable connections have no idle expiry. The durable setting applies to later syq transfer commands. Explicit scopes isolate connections, receiving profiles, authorization preferences, and permissions. Create one with on --ephemeral and select it with --pscope; persist destinations always lists shared receiving names. Idle SSH connections in ephemeral scopes expire; closing a scope stops its services and removes its settings."
 )]
 struct PersistCommand {
     /// Select an isolated persistence domain instead of the default domain
@@ -184,7 +184,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     full_argv.extend_from_slice(argv);
     let matches = command_for_help()
         .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| error.exit());
+        .unwrap_or_else(|error| crate::receive_service::option_migration_hint(error).exit());
     let command = PersistCommand::from_arg_matches(&matches)?;
     crate::fsops::reserve_startup_descriptors();
     let domain = Domain::select(command.pscope.as_deref())?;
@@ -208,8 +208,9 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                 .as_deref()
                 .map(crate::cli::parse_auth_from)
                 .transpose()?;
-            let authorizer = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
-            if let crate::cli::AuthFrom::Provider(authorizer) = authorizer {
+            let explicit_mode = explicit.is_some();
+            let mode = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
+            if let crate::cli::AuthFrom::Provider(authorizer) = &mode {
                 let explicit_timeout = matches.subcommand_matches("connect").is_some_and(|args| {
                     args.value_source("timeout") == Some(clap::parser::ValueSource::CommandLine)
                 });
@@ -227,7 +228,11 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     authorizer.label().into(),
                     host.into(),
                 ])?;
-                crate::destination::ssh::persistent::connect(&domain, request)?;
+                crate::auth_from::selected_context(
+                    crate::destination::ssh::persistent::connect(&domain, request),
+                    &mode,
+                    explicit_mode,
+                )?;
             } else {
                 connect_domain(
                     &domain,

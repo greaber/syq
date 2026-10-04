@@ -1468,6 +1468,47 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     }
 }
 
+pub(crate) fn option_migration_hint(mut error: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if error.kind() != ErrorKind::UnknownArgument {
+        return error;
+    }
+    let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg) else {
+        return error;
+    };
+    let option = argument.split('=').next().unwrap_or(argument);
+    let replacement = match option {
+        "--server" => "--connection",
+        "--all-servers" => "--all-connections",
+        _ => return error,
+    };
+    let hint = format!(
+        "the receiving option {option} was renamed to {replacement}; use `syq persist receive on {replacement}`"
+    );
+    let mut suggestions = match error.remove(ContextKind::Suggested) {
+        Some(ContextValue::StyledStrs(suggestions)) => suggestions,
+        _ => Vec::new(),
+    };
+    suggestions.push(hint.into());
+    error.insert(
+        ContextKind::Suggested,
+        ContextValue::StyledStrs(suggestions),
+    );
+    error
+}
+
+fn permission_account_label(
+    identity: &crate::receive_approval::accounts::AccountIdentity,
+) -> String {
+    let trusted = identity.label();
+    let route = identity.route_label();
+    if trusted == route {
+        trusted
+    } else {
+        format!("{trusted} (route {route})")
+    }
+}
+
 pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i32> {
     match command.action {
         Action::On(options) => configure(domain, options)?,
@@ -1503,8 +1544,8 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                         crate::output::human_stdout!(
                             "{}  {} -> {} (receiving profile @{})",
                             item.id,
-                            item.permission.source.label(),
-                            item.permission.destination.label(),
+                            permission_account_label(&item.permission.source),
+                            permission_account_label(&item.permission.destination),
                             item.permission.profile
                         );
                     }
@@ -1513,7 +1554,7 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                             "{}  {} -> {} (provider profile {})",
                             item.id,
                             item.permission.provider.label(),
-                            item.permission.destination.label(),
+                            permission_account_label(&item.permission.destination),
                             item.permission.profile
                         );
                     }
@@ -1730,6 +1771,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removed_connection_flags_report_migration_without_accepting_aliases() {
+        use clap::Parser;
+        for (args, replacement) in [
+            (vec!["receive", "on", "--server", "example"], "--connection"),
+            (vec!["receive", "on", "--server=example"], "--connection"),
+            (vec!["receive", "on", "--all-servers"], "--all-connections"),
+        ] {
+            let error = super::ReceiveCommand::try_parse_from(args).unwrap_err();
+            let error = super::option_migration_hint(error);
+            assert_eq!(error.exit_code(), 2);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("was renamed to {replacement}")),
+                "{error}"
+            );
+        }
+        let error =
+            super::ReceiveCommand::try_parse_from(["receive", "on", "--unrelated"]).unwrap_err();
+        assert!(!super::option_migration_hint(error)
+            .to_string()
+            .contains("was renamed"));
+    }
+
+    #[test]
     fn profile_server_scope_matches_only_the_locally_selected_endpoint() {
         let mut settings = default_settings(&Domain::default()).unwrap();
         assert!(settings.allows_server("work"));
@@ -1891,8 +1957,7 @@ mod tests {
     #[test]
     fn receiving_domains_have_fresh_disabled_and_independent_profiles() {
         // Socket paths must fit even when the platform's ambient TMPDIR is long.
-        let root = std::fs::canonicalize("/tmp").unwrap();
-        let temporary = tempfile::tempdir_in(root).unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let first_path = temporary.path().join("first");
         let second_path = temporary.path().join("second");
         for path in [&first_path, &second_path] {

@@ -4,8 +4,6 @@
 # needs their setup, plus workflows that require concurrent shared sessions.
 # These cases still run in the default profile. New cases run in both unless
 # listed here with a shared-session requirement or no destination interaction.
-# The approved peer bridge holds C's control while opening SSH worker setup.
-direct three-server copies use approved account connections
 privileged copies keep root security checks
 ephemeral connect only reuses forward SSH and leaves receiving off
 return copies await local approval and denial leaves no destination

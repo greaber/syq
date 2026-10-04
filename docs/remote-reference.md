@@ -213,12 +213,13 @@ coordination, and other peer-auth modes keep their separate
 connection requirements. `--coordinate-at local` can reuse approved access to
 each endpoint and explicitly relays file data through the invoking machine.
 
-The source's SSH server must permit remote Unix-socket forwarding. SSH worker
-setup opens a short helper session on the destination's approved connection.
-It shares the server's session limit with the copy's control connection, ready
-helpers, and other tools using that login. The forwarded socket carries
-control, metadata, and worker setup; payload goes directly between the
-source and destination. The invoking machine's `ProxyJump` route can
+The source's SSH server must permit remote Unix-socket forwarding. Before opening
+the copy's controls, syq releases idle prepared helpers on both approved
+connections. A TCP copy needs one free SSH session on each connection; SSH worker
+setup needs a second free session on the destination's connection. Other active
+operations keep their sessions and can exhaust the server's limit. The forwarded
+socket carries control, metadata, and worker setup; payload goes directly between
+the source and destination. The invoking machine's `ProxyJump` route can
 reach the control endpoints, but does not provide a data route between the
 servers. Data workers still need to reach the peer directly. Disabled forwarding is an error and never selects a
 payload relay. Syq creates a receiver for this copy over the destination's

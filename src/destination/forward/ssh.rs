@@ -185,26 +185,46 @@ struct SetupRequest {
 
 /// Entered with the laptop's own SSH authentication, never the copy key.
 pub(super) fn setup() -> Result<i32> {
-    let result = (|| {
+    let request: Result<SetupRequest> = (|| {
         let mut input = File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
         let request: SetupRequest = read_message(&mut DeadlineIo {
             inner: &mut input,
             deadline: Instant::now() + TIMEOUT,
             cancelled: None,
         })?;
+        Ok(request)
+    })();
+    let reply = match request {
+        Ok(request) => setup_reply(request),
+        Err(error) => Reply::RetryableError(format!("{error:#}")),
+    };
+    write_message(&mut std::io::stdout(), &reply)?;
+    Ok(0)
+}
+
+fn setup_reply(request: SetupRequest) -> Reply {
+    let validated = (|| -> Result<_> {
         anyhow::ensure!(
             request.identity == crate::identity::build(),
             "copy SSH setup build mismatch"
         );
-        let mut socket = Ticket::decode(&request.ticket)?.connect()?;
-        write_message(&mut socket, &canonical_key(&request.public_key)?)?;
-        read_socket_message::<Reply>(&mut socket, TIMEOUT)
+        Ok((
+            Ticket::decode(&request.ticket)?,
+            canonical_key(&request.public_key)?,
+        ))
     })();
-    match result {
-        Ok(reply) => write_message(&mut std::io::stdout(), &reply)?,
-        Err(error) => write_message(&mut std::io::stdout(), &Reply::Error(format!("{error:#}")))?,
-    }
-    Ok(0)
+    let (ticket, public_key) = match validated {
+        Ok(validated) => validated,
+        Err(error) => return Reply::Error(format!("{error:#}")),
+    };
+    let result = (|| -> Result<Reply> {
+        let mut socket = ticket.connect()?;
+        write_message(&mut socket, &public_key)?;
+        read_socket_message(&mut socket, TIMEOUT)
+    })();
+    // Only an explicit destination reply is a refusal. I/O may fail after
+    // installation succeeded, so retry it with the same per-copy public key.
+    result.unwrap_or_else(|error| Reply::RetryableError(format!("{error:#}")))
 }
 
 pub(in crate::destination) fn setup_over_spec(
@@ -224,7 +244,7 @@ pub(in crate::destination) fn setup_over_spec(
     // Its separate helper channel shares that master's ordinary session limit.
     let (_child, reply) =
         ForwardChild::over_spec(spec, "--return-ssh-setup", &request, deadline, cancelled)
-            .context("set up direct SSH data workers over the approved account connection")?;
+            .context("set up direct SSH data workers over the approved account connection (destination sshd MaxSessions >= 2 is required beside the copy control session)")?;
     anyhow::ensure!(
         matches!(reply, Reply::Ready),
         "invalid peer SSH setup response"
@@ -502,6 +522,9 @@ impl Receiver {
                     Reply::Error(error) => Ok(Err(format!(
                         "destination refused SSH data transport: {error}"
                     ))),
+                    Reply::RetryableError(error) => {
+                        Err(super::super::ssh_auth::RetryableSetupError(error).into())
+                    }
                     _ => bail!("invalid copy SSH setup response"),
                 }
             })();
@@ -855,6 +878,95 @@ mod tests {
         assert!(memo
             .resolve("different", || panic!("different key started setup"))
             .is_err());
+    }
+
+    #[test]
+    fn setup_helper_keeps_lost_reply_retryable_and_forwards_explicit_refusal() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        let secret = random_token().unwrap();
+        let expected = secret.clone();
+        let broker =
+            PrivateBroker::start_managed(config("syq-setup-test-", 1), move |mut socket, _| {
+                authenticate(&mut socket, &expected).unwrap();
+                let public: String =
+                    read_socket_message(&mut socket.try_clone().unwrap(), TIMEOUT).unwrap();
+                let mut seen = requests.lock().unwrap();
+                seen.push(public);
+                // Installation can succeed before its reply is lost. The next
+                // attempt must reach the same broker with the same key.
+                match seen.len() {
+                    1 => {}
+                    2 => write_message(&mut socket, &Reply::Ready).unwrap(),
+                    _ => write_message(
+                        &mut socket,
+                        &Reply::Error("destination refused installation".into()),
+                    )
+                    .unwrap(),
+                }
+            })
+            .unwrap();
+        let ticket = Ticket {
+            socket: broker.socket_path().into(),
+            secret,
+        }
+        .encode()
+        .unwrap();
+        let request = || SetupRequest {
+            identity: crate::identity::build().into(),
+            ticket: ticket.clone(),
+            public_key: public_key(1),
+        };
+        assert!(matches!(setup_reply(request()), Reply::RetryableError(_)));
+        assert!(matches!(setup_reply(request()), Reply::Ready));
+        assert!(
+            matches!(setup_reply(request()), Reply::Error(message) if message == "destination refused installation")
+        );
+        let mut invalid = request();
+        invalid.identity = "wrong build".into();
+        assert!(
+            matches!(setup_reply(invalid), Reply::Error(message) if message.contains("build mismatch"))
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![public_key(1); 3]);
+    }
+
+    #[test]
+    fn return_setup_preserves_busy_retry_and_memoized_refusal_across_rpc() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) =
+            crate::destination::tests::broker(root.path(), Approval::Always);
+        let guard = SessionGuard::insert(&receiver, "backup".into(), "unused".into(), 0).unwrap();
+        let session = receiver.forward_sessions.lock().unwrap()[&guard.token()].clone();
+        let mut setup = session.setup.lock().unwrap();
+        let attempt = || {
+            exchange(
+                &registration,
+                Message::ForwardSsh {
+                    token: guard.token(),
+                    public_key: public_key(1),
+                },
+                TIMEOUT,
+                Some(TIMEOUT),
+            )
+            .err()
+            .unwrap()
+        };
+        let busy = attempt();
+        assert!(
+            busy.is::<super::super::ssh_auth::RetryableSetupError>(),
+            "{busy:#}"
+        );
+        assert!(!super::super::peer_bridge::is_setup_refusal(&busy));
+        setup.completed = Some((public_key(1), Err("destination home is unwritable".into())));
+        drop(setup);
+        for _ in 0..2 {
+            let refused = attempt();
+            assert!(
+                super::super::peer_bridge::is_setup_refusal(&refused),
+                "{refused:#}"
+            );
+            assert!(refused.to_string().contains("unwritable"));
+        }
     }
 
     #[test]

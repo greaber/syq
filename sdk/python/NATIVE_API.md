@@ -104,7 +104,7 @@ In addition to the shared arguments above, it accepts:
 | `s3_header` | Iterable of `"NAME: VALUE"` strings; applied before signing every request |
 | `s3_write_header` | Iterable of `"NAME: VALUE"` strings; applied only to requests that create or replace objects |
 | `coordinate_at`, `rsh`, `peer_auth` | Coordinator, SSH command, and peer authentication strings |
-| `pscope` | Existing ephemeral scope path for forward SSH connection reuse |
+| `pscope` | Existing persistence domain for connections and saved authorization choices |
 | `syq_path` | Remote executable path |
 | `no_bootstrap`, `no_tcp_encryption`, `no_tcp` | Boolean remote/transport controls |
 | `tcp_ports`, `tcp_congestion` | Port range and congestion-control strings |
@@ -123,15 +123,17 @@ endpoints use server-side copying within the same service; content verification
 options that require reading object bodies are rejected. SSH/S3 combinations
 are not supported. S3 results use `EndpointKind.S3`.
 
-`pscope` selects an isolated scope for reusing SSH connections. For return
-copies or commands, use `syq persist connect server` and omit `pscope`. See
+`pscope` selects an isolated domain for local connections, receiving settings,
+and saved authorization choices. Return copies and commands can use it too;
+receiving names advertised by other machines remain shared. See
 [persistence in scripts](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes)
 for setup and cleanup, and
 [Compatibility](https://greaber.github.io/syq/python-operations.html#compatibility)
 for executable selection.
 
-Typed SSH-to-SSH copies use an enrolled receiver, existing approved account
-connections to both endpoints, or `coordinate_at="local"`. With `dry_run=True`, they require
+Typed SSH-to-SSH copies use an enrolled receiver, approved account access to
+both endpoints, or `coordinate_at="local"`. Selecting an authorization provider
+requests account connections when needed. With `dry_run=True`, they require
 `coordinate_at="local"`. Use `run` for detached commands and human output options.
 
 `IgnoreFrom(path)` is a frozen dataclass holding a rule-file path (`str`,

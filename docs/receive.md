@@ -196,8 +196,9 @@ See [`syq ssh`](commands/ssh.md) for commands, terminals, and requirements.
 ## Use an SSH authorization provider
 
 An ordinary SSH server can supply authorization instead of a connected laptop.
-On the provider, load the destination keys into its local SSH agent and enable
-receiving from that environment:
+Install the same syq build on the requesting machine and provider. On the provider,
+load the destination keys into its local SSH agent and enable receiving from that
+environment:
 
 ```sh
 syq persist receive on --notify off
@@ -220,6 +221,10 @@ Later commands reuse both connections; `persist connect` is optional.
 Your agent is not forwarded, and commands and file data travel directly to hostB.
 The provider's SSH server must allow local forwarding: both
 `AllowTcpForwarding` and `AllowStreamLocalForwarding` must allow `local` or `yes`.
+The login key must permit forwarding too: `restrict` or `no-port-forwarding`
+in its `authorized_keys` entry blocks this connection unless forwarding is
+explicitly enabled. After updating syq, run `syq persist receive on` locally on
+the provider to restart its service with the matching build.
 Syq uses the provider's first configured receiving profile in its default
 persistence domain; that profile must be enabled. Remote profile and domain
 selection are not supported. See [provider selection](persistence-reference.md#approved-account-connections)
@@ -239,11 +244,10 @@ syq cp results --to hostB --into /archive --auth-from @laptop
 syq cp --from hostB /archive/results --into . --auth-from @laptop
 ```
 
-Selecting `@laptop` asks for access to hostB's account on first use. The prompt
-permits arbitrary commands and file access as that account. **Allow** covers
-later copies and commands while the laptop's receiving connection to hostA
-remains open; **Remember** permits future logins for the same accounts.
-[Manage those permissions on the laptop](persistence-reference.md#account-permissions).
+Selecting `@laptop` asks for access to hostB's account on first use. The approval
+permits arbitrary commands and file access as that account. See
+[account permissions](persistence-reference.md#account-permissions) for the
+approval's lifetime and how to manage it on the laptop.
 
 Uploads and downloads reuse the approved login and support `--no-tcp`, helper
 overrides, and `--inplace`. File data travels directly between the servers.

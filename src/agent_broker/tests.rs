@@ -243,7 +243,7 @@ fn configuration_failure_keeps_ssh_error_without_debug_trace() {
             "-c",
             "printf '%s' \"$1\" > \"$2\"",
             "write-ssh",
-            "#!/bin/sh\nprintf '%s\n' 'debug1: Reading configuration data /private/config' 'debug2: checking match' '/private/config line 7: Bad configuration option: misspelled' 'debug3: final pass' >&2\nexit 255\n",
+            "#!/bin/sh\nprintf '%s\n' 'OpenSSH_9.6p1, OpenSSL 3.0.13' 'debug1: Reading configuration data /private/config' 'debug2: checking match' '/private/config line 7: Bad configuration option: misspelled' 'debug3: final pass' >&2\nexit 255\n",
         ])
         .arg(&ssh)
         .capture_output()

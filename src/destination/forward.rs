@@ -781,7 +781,7 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
     resolve_destination(home, None, path)
 }
 
-fn receive(metadata_control: bool) -> Result<i32> {
+fn receive() -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
@@ -815,9 +815,7 @@ fn receive(metadata_control: bool) -> Result<i32> {
             return Err(error);
         }
     };
-    let _lifetime = metadata_control
-        .then(|| crate::server::ControlLifetime::watch(&input, authority.clone()))
-        .transpose()?;
+    let _lifetime = crate::server::ControlLifetime::watch(&input, authority.clone())?;
     let workers = ssh::Server::start(authority.clone())?;
     let mut approved = approved;
     approved.token = workers.ticket()?;
@@ -831,8 +829,8 @@ fn receive(metadata_control: bool) -> Result<i32> {
             START_TIMEOUT,
             Duration::from_secs(10),
         ),
+        std::io::stdout().lock(),
         pending,
-        metadata_control,
     );
     authority.close_control();
     drop(workers);
@@ -933,8 +931,7 @@ fn read_source_hostname(
 
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
-        "--return-receiver" if argv.len() == 2 => Some(receive(false)),
-        "--peer-receiver" if argv.len() == 2 => Some(receive(true)),
+        "--return-receiver" | "--peer-receiver" if argv.len() == 2 => Some(receive()),
         "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
         "--return-ssh-worker" if argv.len() == 3 => Some(
             argv[2]

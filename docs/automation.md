@@ -403,6 +403,20 @@ them as shell input. The displayed command does not restrict an SSH account
 approval. Use an up-to-date syq binary to inspect and approve
 requests, and handle unknown kinds without treating them as copy requests.
 
+## Remembered account permissions
+
+`syq persist receive permissions list --json` prints an array of objects with
+`id` and `permission`. Use the ID with `persist receive permissions remove`.
+Select the authorizing domain with `--pscope PATH` for both operations.
+
+Return-channel permissions contain `profile`, `source`, and `destination`.
+Ordinary-provider permissions contain `profile`, `provider`, and `destination`.
+The nested account and provider identities have the same fields documented
+[above](#connection-status). There is no separate `kind` field: distinguish the
+permission types by `source` or `provider`. Entries describe remembered
+permissions, not live connections; removing one does not close an authenticated
+connection. See [account permissions](persistence-reference.md#account-permissions).
+
 ## Retry failed mapping entries
 
 Add `--results r.ndjson` to record outcomes in a fresh file outside the copy

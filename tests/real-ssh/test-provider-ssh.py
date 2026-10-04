@@ -70,7 +70,7 @@ def no_pending(environment):
 
 
 @contextlib.contextmanager
-def provider_sshd(root, public_key, provider_environment):
+def provider_sshd(root, public_key, provider_environment, unix_forwarding="local"):
     """Only this disposable listener permits local Unix forwarding.
 
     The normal runner/source sshd stays remote-only; destination forwarding
@@ -96,7 +96,7 @@ def provider_sshd(root, public_key, provider_environment):
         "UseDNS no", "AllowAgentForwarding no",
         # OpenSSH 9.2 initializes shared local-forward permissions from the
         # TCP flag; denying it also denies Unix socket connections.
-        "AllowTcpForwarding local", "AllowStreamLocalForwarding local",
+        "AllowTcpForwarding local", "AllowStreamLocalForwarding " + unix_forwarding,
         "X11Forwarding no", "PermitTTY no",
         "MaxSessions " + str(max_sessions), "LogLevel VERBOSE",
         # OpenSSH uses only the first SetEnv directive. Both variables must
@@ -110,7 +110,7 @@ def provider_sshd(root, public_key, provider_environment):
     environment.pop("SSH_AGENT_PID", None)
     effective = run("/usr/sbin/sshd", "-T", "-f", str(config), env=environment)
     policy = dict(line.split(" ", 1) for line in effective.splitlines() if " " in line)
-    for name, expected in {"allowtcpforwarding": "local", "allowstreamlocalforwarding": "local",
+    for name, expected in {"allowtcpforwarding": "local", "allowstreamlocalforwarding": unix_forwarding,
                            "allowagentforwarding": "no", "disableforwarding": "no"}.items():
         assert policy.get(name) == expected, (name, policy.get(name), expected)
     with (root / "sshd.log").open("w+") as log:
@@ -356,6 +356,38 @@ def main():
                 scopes.remove(proxy_scope)
                 source("syq", "persist", "off")
                 no_pending(provider_environment)
+
+                print("case: denied Unix forwarding never publishes a ready provider", flush=True)
+                denied_root = root / "denied"
+                denied_root.mkdir(mode=0o700)
+                with provider_sshd(denied_root, public_key, provider_environment,
+                                   unix_forwarding="no") as (denied_port, denied_key):
+                    denied_hosts = source_root + "/denied-known-hosts"
+                    source("python3", "-c", "from pathlib import Path; import sys; "
+                           "Path(sys.argv[1]).write_text(sys.stdin.read())", denied_hosts,
+                           data="[{}]:{} {}".format(address, denied_port, denied_key))
+                    denied_config = ("Host denied-provider\n  HostName {}\n  Port {}\n  User syq\n"
+                                     "  IdentityFile {}\n  IdentityAgent none\n  IdentitiesOnly yes\n"
+                                     "  BatchMode yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {}\n"
+                                     "  GlobalKnownHostsFile /dev/null\n  UpdateHostKeys no\n").format(
+                                         address, denied_port, source_root + "/provider_key", denied_hosts)
+                    source("python3", "-c", "from pathlib import Path; import sys; p=Path.home()/'.ssh/config'; "
+                           "p.write_text(sys.stdin.read()+p.read_text())", data=denied_config)
+                    denied_scope = source("syq", "persist", "on", "--ephemeral").strip()
+                    scopes.append(denied_scope)
+                    text = execute("persist", "connect", TARGET, "--pscope", denied_scope,
+                                   "--auth-from", "denied-provider", allow=False)
+                    assert "sshd permits local forwarding" in text, text
+                    # A local -O forward listener alone is not readiness. In
+                    # the old flow the later Resolve failed but the keeper's
+                    # published ticket and provider record stayed reusable.
+                    records = json.loads(source("python3", "-c",
+                        "from pathlib import Path; import json,sys; "
+                        "print(json.dumps([p.name for p in (Path(sys.argv[1])/'provider-links-v1').glob('*.json')]))",
+                        denied_scope))
+                    assert records == [], records
+                    source("syq", "persist", "--pscope", denied_scope, "off")
+                    scopes.remove(denied_scope)
                 print("Ordinary SSH provider passed", flush=True)
     finally:
         actions = [("requester scope", lambda scope=scope: source("syq", "persist", "--pscope", scope, "off"))

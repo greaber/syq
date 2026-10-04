@@ -363,6 +363,9 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || crate::destination::peer_bridge::is_setup_refusal(error)
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::destination::SshWorkersUnavailable>())
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
             .chain()
@@ -2908,6 +2911,9 @@ impl Endpoint {
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
+                            }
+                            if spec.forwarded.as_ref().is_some_and(|copy| !copy.has_ssh()) {
+                                return Err(e).context(crate::destination::SshWorkersUnavailable);
                             }
                             let mut g = spec.tcp.lock().unwrap();
                             let mut warning = None;

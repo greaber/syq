@@ -89,10 +89,16 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
         anyhow::ensure!(!authorized, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh and --detach are not supported");
         return Ok(None);
     }
-    let coordinator =
-        ssh::persistent::select_or_connect(&domain, &requested(source), &source_mode)?;
-    let peer =
-        ssh::persistent::select_or_connect(&domain, &requested(destination), &destination_mode)?;
+    let coordinator = crate::auth_from::selected_context(
+        ssh::persistent::select_or_connect(&domain, &requested(source), &source_mode),
+        &source_mode,
+        args.auth_from_explicit,
+    )?;
+    let peer = crate::auth_from::selected_context(
+        ssh::persistent::select_or_connect(&domain, &requested(destination), &destination_mode),
+        &destination_mode,
+        args.auth_from_explicit,
+    )?;
     match (coordinator, peer) {
         (Some(coordinator), Some(peer)) => Ok(Some(Selection {
             coordinator: Arc::new(coordinator),
@@ -264,6 +270,11 @@ impl Selection {
             !args.no_tcp_encryption,
             "restricted peer copies require encrypted TCP or SSH"
         );
+        // Bridge controls need their own helper sessions. Release only idle
+        // spares; handed-off sessions and their approved masters stay alive.
+        for control in [self.coordinator.control(), self.peer.control()] {
+            crate::session_pool::stop(control).context("release idle helpers for peer copy")?;
+        }
         let peer_policy = self.peer.peer()?;
         let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
         let coordinator = super::account_copy::approved_connection(

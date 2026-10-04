@@ -63,11 +63,10 @@ syq ssh hostB
 syq persist off
 ```
 
-The first SSH command asks for access to the destination account. **Allow** covers
-later commands and copies while the laptop's receiving connection to this
-server stays open. **Remember** also permits future logins for these accounts;
-the laptop must still be available to authorize them. See
-[account permission controls](persistence-reference.md#account-permissions).
+The first SSH command asks for access to the destination account, including
+arbitrary commands and file access. See
+[account permissions](persistence-reference.md#account-permissions) to choose
+how long that approval lasts and manage it on the laptop.
 
 The approved connection is reused by `ssh`, `cp`, `rsync`, `rm`, `map`, and
 `clean-partials`. SSH data workers authenticate separate connections under the
