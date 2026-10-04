@@ -68,6 +68,67 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
     (first.root.identity() == other.root.identity() && directory == other_directory).then_some(name)
 }
 
+/// A patch reuses at least this much, and half its file, before its stage
+/// clones the file it replaces rather than writing every block.
+const CLONE_MIN_REUSED: u64 = 1 << 20;
+
+/// The file a patch reuses blocks of, opened and fingerprinted when the
+/// patch arrived.
+pub(super) struct PatchSource<'a> {
+    old: File,
+    basis: FileFingerprint,
+    patch: &'a SmallPatch,
+}
+
+fn try_clone_basis(old: &File, stage: &File, len: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        super::basis_copy::try_clone(old, stage, len)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (old, stage, len);
+        false
+    }
+}
+
+/// The whole contents a patch describes: its new blocks, and the reused
+/// blocks of `old`, each of which must still hash as compared.
+fn assemble(
+    old: Option<&File>,
+    algorithm: crate::hashing::HashAlgorithm,
+    patch: &SmallPatch,
+) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(patch.len as usize);
+    let mut taken = 0;
+    for (index, reuse) in patch.reuse.iter().enumerate() {
+        let off = index as u64 * patch.block;
+        let len = patch.block.min(patch.len - off) as usize;
+        match (reuse, old) {
+            (Some(expected), Some(old)) => {
+                data.resize(off as usize + len, 0);
+                let block = &mut data[off as usize..];
+                let complete = read_exact_or_short(old, off, block)?;
+                if !complete || algorithm.hash(block) != *expected {
+                    bail!("the destination changed after it was compared");
+                }
+            }
+            _ => {
+                let new = patch
+                    .data
+                    .get(taken..taken + len)
+                    .context("patch contents end early")?;
+                data.extend_from_slice(new);
+                taken += len;
+            }
+        }
+    }
+    if taken != patch.data.len() {
+        bail!("patch contents run past the file");
+    }
+    Ok(data)
+}
+
 fn fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
     FileFingerprint {
         dev: metadata.dev(),
@@ -238,47 +299,32 @@ impl FsOps {
             patches.len()
         ];
         let mut puts = Vec::new();
+        let mut sources = Vec::new();
         let mut positions = Vec::new();
         for (position, patch) in patches.iter().enumerate() {
-            match self.keep_patched(patch) {
-                Ok(Some(identity)) => {
+            let staged = self.keep_patched(patch).and_then(|kept| match kept {
+                Some(identity) => Ok(Err(identity)),
+                None => self.stage_patch(patch).map(Ok),
+            });
+            match staged {
+                Ok(Ok((put, source))) => {
+                    puts.push(put);
+                    sources.push(source);
+                    positions.push(position);
+                }
+                Ok(Err(identity)) => {
                     results[position] = Ok(SmallPatched {
                         kept: true,
                         identity,
-                    });
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    results[position] = Err(wire_error(&error));
-                    continue;
-                }
-            }
-            match self.assemble_patch(patch) {
-                Ok(data) => {
-                    let hash = if self.hash_policy.transfer_integrity {
-                        self.observed_payload_hash(&data)
-                    } else {
-                        [0; 32]
-                    };
-                    puts.push(SmallPut {
-                        path: patch.path.clone(),
-                        copy_id: patch.copy_id,
-                        data,
-                        hash,
-                        meta: patch.meta.clone(),
-                        flags: patch.flags,
-                        inplace: false,
-                        condition: patch.condition,
-                        guard: patch.guard.clone(),
-                        replaces: true,
-                    });
-                    positions.push(position);
+                    })
                 }
                 Err(error) => results[position] = Err(wire_error(&error)),
             }
         }
-        for (position, result) in positions.into_iter().zip(self.put_small_batch(&puts)) {
+        for (position, result) in positions
+            .into_iter()
+            .zip(self.put_small_sources(&puts, &sources))
+        {
             results[position] = result.map(|identity| SmallPatched {
                 kept: false,
                 identity,
@@ -318,7 +364,15 @@ impl FsOps {
         )
     }
 
-    fn assemble_patch(&mut self, patch: &SmallPatch) -> Result<Vec<u8>> {
+    /// The put that publishes a patch, and the file whose blocks it reuses.
+    /// With enough of a file reused, the stage clones that file and writes
+    /// only the differing blocks over it, when the filesystem can clone.
+    /// Otherwise the put carries the whole file, its reused blocks read and
+    /// checked here.
+    fn stage_patch<'a>(
+        &mut self,
+        patch: &'a SmallPatch,
+    ) -> Result<(SmallPut, Option<PatchSource<'a>>)> {
         let blocks = block_count(patch.len, patch.block)?;
         if patch.reuse.len() != blocks || patch.len > MAX_READ_BYTES {
             bail!("invalid patch of {} bytes", patch.len);
@@ -341,38 +395,100 @@ impl FsOps {
         } else {
             None
         };
-        let algorithm = self.hash_policy.algorithm;
-        let mut data = Vec::with_capacity(patch.len as usize);
-        let mut taken = 0;
-        for (index, reuse) in patch.reuse.iter().enumerate() {
-            let off = index as u64 * patch.block;
-            let len = patch.block.min(patch.len - off) as usize;
-            match (reuse, &old) {
-                (Some(expected), Some(old)) => {
-                    data.resize(off as usize + len, 0);
-                    let block = &mut data[off as usize..];
-                    let complete = read_exact_or_short(old, off, block)?;
-                    if !complete || algorithm.hash(block) != *expected {
-                        bail!("the destination changed after it was compared");
-                    }
-                }
-                _ => {
-                    let new = patch
-                        .data
-                        .get(taken..taken + len)
-                        .context("patch contents end early")?;
-                    data.extend_from_slice(new);
-                    taken += len;
-                }
+        let put = |data: Vec<u8>, hash| SmallPut {
+            path: patch.path.clone(),
+            copy_id: patch.copy_id,
+            data,
+            hash,
+            meta: patch.meta.clone(),
+            flags: patch.flags,
+            inplace: false,
+            condition: patch.condition,
+            guard: patch.guard.clone(),
+            replaces: true,
+        };
+        let reused = patch.len - patch.data.len() as u64;
+        let clones = reused >= CLONE_MIN_REUSED && reused * 2 >= patch.len;
+        if let (Some(old), Some(basis), true) = (&old, patch.basis, clones) {
+            if fingerprint(&old.metadata()?) == basis {
+                let hash = if self.hash_policy.transfer_integrity {
+                    self.observed_payload_hash(&[])
+                } else {
+                    [0; 32]
+                };
+                let source = PatchSource {
+                    old: old.try_clone()?,
+                    basis,
+                    patch,
+                };
+                return Ok((put(Vec::new(), hash), Some(source)));
             }
         }
-        if taken != patch.data.len() {
-            bail!("patch contents run past the file");
+        let data = assemble(old.as_ref(), self.hash_policy.algorithm, patch)?;
+        let hash = if self.hash_policy.transfer_integrity {
+            self.observed_payload_hash(&data)
+        } else {
+            [0; 32]
+        };
+        Ok((put(data, hash), None))
+    }
+
+    /// Write a cloning patch's stage: the file it replaces, cloned, with the
+    /// differing blocks written over it. When the file cannot be cloned, or
+    /// changed after it was hashed, the stage holds the assembled file
+    /// instead, its reused blocks read and checked again.
+    fn write_patch_stage(&self, source: &PatchSource<'_>, stage: &SmallStage) -> Result<()> {
+        let patch = source.patch;
+        let file = &stage.file;
+        file.set_len(0)?;
+        let cloned = try_clone_basis(&source.old, file, source.basis.len)
+            && fingerprint(&source.old.metadata()?) == source.basis;
+        if !cloned {
+            file.set_len(0)?;
+            let data = assemble(Some(&source.old), self.hash_policy.algorithm, patch)?;
+            return observed_write(&self.operation, file, &data, 0, self.sparse)
+                .with_context(|| format!("write {}", stage.label.display()));
         }
-        Ok(data)
+        let writing = self
+            .operation
+            .span(crate::transfer_observations::Stage::DestinationWrite);
+        let mut taken = 0;
+        for (index, reuse) in patch.reuse.iter().enumerate() {
+            if reuse.is_some() {
+                continue;
+            }
+            let off = index as u64 * patch.block;
+            let len = patch.block.min(patch.len - off) as usize;
+            let bytes = &patch.data[taken..taken + len];
+            // Old bytes lie under these blocks: zeros must replace them.
+            if self.sparse {
+                crate::sparse::write_at(file, bytes, off, true)
+            } else {
+                file.write_all_at(bytes, off)
+            }
+            .with_context(|| format!("write {} @{off}", stage.label.display()))?;
+            taken += len;
+        }
+        writing.bytes(taken as u64);
+        if self.sparse {
+            crate::sparse::set_len(file, patch.len)?;
+        } else {
+            file.set_len(patch.len)?;
+        }
+        Ok(())
     }
 
     pub(super) fn put_small_batch(&mut self, puts: &[SmallPut]) -> Vec<SmallOutcome> {
+        self.put_small_sources(puts, &[])
+    }
+
+    /// Publish `puts`, writing those with a patch source from the file it
+    /// patches rather than from their data.
+    fn put_small_sources(
+        &mut self,
+        puts: &[SmallPut],
+        sources: &[Option<PatchSource<'_>>],
+    ) -> Vec<SmallOutcome> {
         let mut results: Vec<SmallOutcome> = vec![Ok(None); puts.len()];
         let mut carried = None;
         let mut next = 0;
@@ -419,7 +535,7 @@ impl FsOps {
                 }
                 run.push((index, target));
             }
-            self.put_small_run(puts, run, &mut results);
+            self.put_small_run(puts, sources, run, &mut results);
         }
         results
     }
@@ -435,6 +551,7 @@ impl FsOps {
     fn put_small_run(
         &mut self,
         puts: &[SmallPut],
+        sources: &[Option<PatchSource<'_>>],
         run: Vec<(usize, RootedTarget)>,
         results: &mut [SmallOutcome],
     ) {
@@ -454,15 +571,16 @@ impl FsOps {
                 }
             }
         }
-        stages.retain(
-            |(index, stage)| match self.write_small_stage(&puts[*index], stage) {
+        stages.retain(|(index, stage)| {
+            let source = sources.get(*index).and_then(Option::as_ref);
+            match self.write_small_stage(&puts[*index], source, stage) {
                 Ok(()) => true,
                 Err(error) => {
                     results[*index] = Err(wire_error(&error));
                     false
                 }
-            },
-        );
+            }
+        });
         let mut published = Vec::with_capacity(stages.len());
         {
             // Replacing files contends across the whole filesystem on some
@@ -546,18 +664,27 @@ impl FsOps {
         Ok(Some((file, metadata, basis_size)))
     }
 
-    pub(super) fn write_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
+    pub(super) fn write_small_stage(
+        &self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+        stage: &SmallStage,
+    ) -> Result<()> {
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SMALL_STAGE_READY_FILE",
             "SYQ_TEST_SMALL_STAGE_CONTINUE_FILE",
             "small-file stage before data",
         )?;
-        if stage.reused {
-            stage.file.set_len(0)?;
+        if let Some(source) = source {
+            self.write_patch_stage(source, stage)?;
+        } else {
+            if stage.reused {
+                stage.file.set_len(0)?;
+            }
+            observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
+                .with_context(|| format!("write {}", stage.label.display()))?;
         }
-        observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
-            .with_context(|| format!("write {}", stage.label.display()))?;
         check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
@@ -746,6 +873,81 @@ mod tests {
         assert!(results[2].is_err(), "{:?}", results[2]);
         assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
         assert_eq!(entries(directory), 3);
+    }
+
+    #[test]
+    fn a_mostly_reused_patch_overwrites_a_clone_of_the_file_it_replaces() {
+        let block = MIN_HASH_BLOCK_BYTES;
+        for sparse in [false, true] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..32 * block).map(|i| (i % 249) as u8 | 1).collect();
+            let mut new = old.clone();
+            // Zeros must replace the old bytes even where writes make holes.
+            new[5 * block as usize..6 * block as usize].fill(0);
+            new[20 * block as usize] ^= 0xff;
+            new.extend_from_slice(b"tail");
+            for name in ["file", "raced"] {
+                fs::write(directory.join(name), &old).unwrap();
+            }
+            let mut ops = receiver(directory);
+            ops.sparse = sparse;
+            let algorithm = ops.hash_policy.algorithm;
+            let read = |name: &str| ExistingRead {
+                path: name.as_bytes().to_vec(),
+                len: new.len() as u64,
+                condition: TargetCondition::Any,
+                guard: None,
+            };
+            let hashed = ops.hash_existing_batch(block, &[read("file"), read("raced")]);
+            let patch = |name: &str, hashed: &ExistingHashes| {
+                let mut reuse = Vec::new();
+                let mut data = Vec::new();
+                for (index, chunk) in new.chunks(block as usize).enumerate() {
+                    let hash = algorithm.hash(chunk);
+                    if hashed.hashes.get(index) == Some(&hash) {
+                        reuse.push(Some(hash));
+                    } else {
+                        reuse.push(None);
+                        data.extend_from_slice(chunk);
+                    }
+                }
+                SmallPatch {
+                    path: name.as_bytes().to_vec(),
+                    copy_id: [4; 16],
+                    len: new.len() as u64,
+                    block,
+                    reuse,
+                    hash: content_digest(&data),
+                    data,
+                    basis: hashed.fingerprint,
+                    meta: put(name, b"").meta,
+                    flags: 0,
+                    unchanged_flags: 0,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                }
+            };
+            let patches = [
+                patch("file", hashed[0].as_ref().unwrap()),
+                patch("raced", hashed[1].as_ref().unwrap()),
+            ];
+            assert_eq!(patches[0].data.len() as u64, 2 * block + 4);
+            // A reused block of "raced" changes after it was hashed.
+            let mut raced = old.clone();
+            raced[0] ^= 1;
+            fs::write(directory.join("raced"), &raced).unwrap();
+            let results = ops.patch_small_batch(&patches);
+            assert!(results[0].is_ok(), "{:?}", results[0]);
+            assert_eq!(
+                fs::read(directory.join("file")).unwrap(),
+                new,
+                "sparse {sparse}"
+            );
+            assert!(results[1].is_err(), "{:?}", results[1]);
+            assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
+            assert_eq!(entries(directory), 2);
+        }
     }
 
     #[test]
@@ -941,12 +1143,12 @@ mod tests {
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(!stage.reused);
-        ops.write_small_stage(&file, &stage).unwrap();
+        ops.write_small_stage(&file, None, &stage).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(stage.reused);
-        ops.write_small_stage(&file, &stage).unwrap();
+        ops.write_small_stage(&file, None, &stage).unwrap();
         ops.publish_small_stage(&file, &stage).unwrap();
         assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
         assert_eq!(

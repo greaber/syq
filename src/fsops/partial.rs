@@ -1756,7 +1756,7 @@ impl FsOps {
             };
         }
         let stage = self.create_small_stage(put, rooted)?;
-        self.write_small_stage(put, &stage)?;
+        self.write_small_stage(put, None, &stage)?;
         self.publish_small_stage(put, &stage)?;
         self.finish_small_stage(put, stage)
     }
