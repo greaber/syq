@@ -1062,8 +1062,13 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
         identity: (meta.dev(), meta.ino()),
     };
     let shutdown = Arc::new(AtomicBool::new(false));
-    let sigint = signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.clone())?;
-    let sigterm = signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())?;
+    let _signals = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
+        let mut registrations = crate::process::signals::Registrations::default();
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            registrations.push(signal_hook::flag::register(signal, shutdown.clone())?);
+        }
+        Ok(registrations)
+    })?;
     let result = (|| {
         let mut workers = Vec::<ProfileWorker>::new();
         let mut config = preferences(domain)?;
@@ -1137,8 +1142,6 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
         drop(workers);
         Ok(())
     })();
-    signal_hook::low_level::unregister(sigint);
-    signal_hook::low_level::unregister(sigterm);
     result
 }
 

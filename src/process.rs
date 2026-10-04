@@ -4,6 +4,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 #[path = "process_group.rs"]
 pub(crate) mod group;
 
+#[path = "process_signals.rs"]
+pub(crate) mod signals;
+
 /// Serialize non-atomic close-on-exec setup with child launches on Darwin.
 /// The operation must only create/protect descriptors or launch a process;
 /// do not hold this guard while waiting for peer I/O or child completion.

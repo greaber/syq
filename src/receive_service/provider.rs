@@ -893,27 +893,25 @@ fn wait_for_event(listener: &UnixListener, wake: &mut UnixStream) -> Result<()> 
         }
     }
 }
-struct SignalWake(Vec<signal_hook::SigId>);
+struct SignalWake {
+    _registrations: crate::process::signals::Owned<crate::process::signals::Registrations>,
+}
 impl SignalWake {
     fn new(stop: Arc<AtomicBool>, sender: &UnixStream) -> Result<Self> {
-        let mut registrations = Self(Vec::new());
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            registrations
-                .0
-                .push(signal_hook::flag::register(signal, stop.clone())?);
-            registrations.0.push(signal_hook::low_level::pipe::register(
-                signal,
-                sender.try_clone()?,
-            )?);
-        }
-        Ok(registrations)
-    }
-}
-impl Drop for SignalWake {
-    fn drop(&mut self) {
-        for registration in &self.0 {
-            signal_hook::low_level::unregister(*registration);
-        }
+        let registrations = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
+            let mut registrations = crate::process::signals::Registrations::default();
+            for signal in [libc::SIGINT, libc::SIGTERM] {
+                registrations.push(signal_hook::flag::register(signal, stop.clone())?);
+                registrations.push(signal_hook::low_level::pipe::register(
+                    signal,
+                    sender.try_clone()?,
+                )?);
+            }
+            Ok(registrations)
+        })?;
+        Ok(Self {
+            _registrations: registrations,
+        })
     }
 }
 

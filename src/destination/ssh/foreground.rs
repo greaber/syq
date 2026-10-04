@@ -17,33 +17,37 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(in crate::destination) struct Signals {
     pub(in crate::destination) received: Arc<AtomicUsize>,
-    registrations: Vec<signal_hook::SigId>,
+    _registrations: crate::process::signals::Owned<crate::process::signals::Registrations>,
     wake: UnixStream,
 }
 impl Signals {
     pub(in crate::destination) fn new() -> std::io::Result<Self> {
         let (wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
         wake.set_nonblocking(true)?;
-        let mut guard = Self {
-            received: Arc::new(AtomicUsize::new(0)),
-            registrations: Vec::new(),
+        let received = Arc::new(AtomicUsize::new(0));
+        let registrations =
+            crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], || {
+                let mut registrations = crate::process::signals::Registrations::default();
+                for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    registrations.push(signal_hook::flag::register_usize(
+                        signal,
+                        received.clone(),
+                        signal as usize,
+                    )?);
+                }
+                for signal in [libc::SIGCHLD, libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    registrations.push(signal_hook::low_level::pipe::register(
+                        signal,
+                        sender.try_clone()?,
+                    )?);
+                }
+                Ok(registrations)
+            })?;
+        let guard = Self {
+            received,
+            _registrations: registrations,
             wake,
         };
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            guard.registrations.push(signal_hook::flag::register_usize(
-                signal,
-                guard.received.clone(),
-                signal as usize,
-            )?);
-        }
-        for signal in [libc::SIGCHLD, libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-            guard
-                .registrations
-                .push(signal_hook::low_level::pipe::register(
-                    signal,
-                    sender.try_clone()?,
-                )?);
-        }
         Ok(guard)
     }
 
@@ -77,13 +81,6 @@ impl Signals {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
-        }
-    }
-}
-impl Drop for Signals {
-    fn drop(&mut self) {
-        for registration in &self.registrations {
-            signal_hook::low_level::unregister(*registration);
         }
     }
 }

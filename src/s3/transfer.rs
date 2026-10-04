@@ -230,13 +230,13 @@ impl Engine {
     }
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let work = self.clone().copy();
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut signals = crate::process::signals::interrupt_and_terminate()?;
+        let (sigint, terminate) = &mut *signals;
         tokio::pin!(work);
         let outage = self.outage.clone();
         let interrupted = tokio::select! {
             result = &mut work => return result,
-            _ = tokio::signal::ctrl_c() => Some("interrupted"),
+            _ = sigint.recv() => Some("interrupted"),
             _ = terminate.recv() => Some("terminated"),
             _ = outage.stopped() => None,
         };
