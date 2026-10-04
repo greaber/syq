@@ -935,19 +935,21 @@ fn hash_compares_files_in_groups_and_rewrites_only_those_that_differ() {
 }
 
 #[test]
-fn hash_or_copy_compares_or_copies_whichever_is_faster() {
-    for remote in [false, true] {
+fn hash_or_copy_compares_where_the_transfer_strategy_compares() {
+    for (remote, extra) in [(false, &[][..]), (true, &[]), (false, &["--no-W"])] {
         let t = Tmp::new();
         let inodes = equal_metadata_tree(&t, 1);
-        let out = copy_tree(&t, remote, "-aI", &[]);
+        let out = copy_tree(&t, remote, "-aI", extra);
         assert_output_ok(&out);
         assert_same_tree(&t.path("src"), &t.path("dst"));
-        // Remote copies compare a file whose size is unchanged and keep it
-        // when it matches; a local copy is faster than reading both files.
+        // By default, remote copies compare a file whose size is unchanged
+        // and keep it when it matches, and local copies copy it. Choosing
+        // block reuse locally compares it too.
+        let compares = remote || !extra.is_empty();
         let kept = fs::metadata(t.path("dst/same0")).unwrap().ino() == inodes[0];
-        assert_eq!(kept, remote, "remote={remote}");
+        assert_eq!(kept, compares, "remote={remote} {extra:?}");
         let observed = tuning_observed(&out);
-        assert_eq!(observed["compared_files"], if remote { 2 } else { 0 });
+        assert_eq!(observed["compared_files"], if compares { 2 } else { 0 });
     }
     // An explicit content check wins: identical files are never rewritten.
     let t = Tmp::new();

@@ -424,7 +424,7 @@ pub struct Args {
     /// Skip quick check; compare file contents block by block and repair differences
     #[arg(short = 'c', long)]
     pub checksum: bool,
-    /// Don't skip files whose size and modification time match; compare or copy each one, whichever is faster
+    /// Don't skip files whose size and modification time match; compare those that block reuse would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest
     #[arg(short = 'I', long = "ignore-times")]
     pub hash_or_copy: bool,
     /// Algorithm for file content comparisons and optional transfer checks
@@ -1251,7 +1251,7 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
-    /// Like --hash, but copy a file instead of comparing it when copying is faster, so identical files may be rewritten
+    /// Like --hash, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten
     #[arg(long, conflicts_with = "hash")]
     hash_or_copy: bool,
     /// Choose a file transfer strategy (default: locality)

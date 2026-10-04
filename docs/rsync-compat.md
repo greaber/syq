@@ -29,8 +29,9 @@ suggested by the destination timestamp; see [timestamp matching](reference.md#ch
 Use `-c` to compare contents when size and timestamp match; source timestamps
 are preserved, so ordinary clock skew does not require the source timestamp
 to be newer. `-I` (`--ignore-times`) also stops skipping those files, but
-compares or copies each one, whichever is faster, so files that already match
-may be rewritten.
+compares only those that block reuse would compare (by default, remote copies
+of files whose size is unchanged) and copies the rest whole, so files that
+already match may be rewritten.
 
 Without `-p`, existing files keep their destination permissions. On Linux, new
 files use the source permission bits limited by the destination parent's default

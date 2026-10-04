@@ -86,7 +86,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | Argument / option | Meaning |
 |---|---|
 | `--hash` | Hash existing source and destination files instead of trusting size and modification time |
-| `--hash-or-copy` | Like --hash, but copy a file instead of comparing it when copying is faster, so identical files may be rewritten |
+| `--hash-or-copy` | Like --hash, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten |
 | `--integrity-checking <KEY=VALUE,...>` | [Payload checks](../integrity-checking.md) |
 
 <a id="ssh-and-transport"></a>

@@ -344,9 +344,12 @@ alone:
 syq cp --hash --srcs-in project --into backup
 ```
 
-`--hash-or-copy` also checks files whose size and time match, but copies a file
-instead of comparing it when that is faster, so files that already match may
-be rewritten.
+`--hash-or-copy` also checks files whose size and time match, but compares
+only the files that the [transfer strategy](#choose-a-transfer-strategy) would
+compare and copies the rest whole, so files that already match may be
+rewritten. With the default strategy, that means comparing files whose size is
+unchanged when a syq endpoint is remote, and copying every file on the same
+machine.
 
 Use [per-file expected hashes in mappings](mappings.md#the-format) to require
 known contents, including when reusing destination bytes.

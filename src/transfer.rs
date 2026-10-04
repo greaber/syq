@@ -155,8 +155,8 @@ pub struct Opts {
     hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
     pub devices: bool,
     pub checksum: bool,
-    /// Don't trust matching size and time, but copy a file instead of
-    /// comparing it when copying is faster.
+    /// Don't trust matching size and time, but compare only the files block
+    /// reuse would compare, and copy the rest.
     pub hash_or_copy: bool,
     pub precise_mtime: bool,
     pub inplace: bool,
