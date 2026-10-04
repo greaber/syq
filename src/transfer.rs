@@ -2856,6 +2856,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         prepared_anchor = Some(anchor);
         prepared_filesystem = Some(filesystem);
         selection
+    } else if use_operator_anchor && allow_missing && dst.is_remote() && !args.existing {
+        let (selection, filesystem) = check_missing_destination(
+            &mut *dst_ctl,
+            &operator_directory,
+            opts.operator_symlink_policy,
+        )?;
+        prepared_filesystem = Some(filesystem);
+        selection
     } else if use_operator_anchor {
         check_operator_directory(
             &mut *dst_ctl,
@@ -2900,6 +2908,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             dst_initially_missing = false;
             dst_existed = true;
             dst_entry_is_dir = true;
+            // Inspected as missing; an existing directory is checked for
+            // emptiness instead.
+            prepared_filesystem = None;
         }
     }
     // A missing target, or an existing empty container, has no destination
@@ -4660,6 +4671,39 @@ fn prepare_existing_destination(
         other => bail!("unexpected response {other:?}"),
     };
     Ok((selection, filesystem, anchor))
+}
+
+/// Select a missing remote destination's directory and inspect its
+/// filesystem in one network turn. Both are read-only, and the receiver
+/// inspects the directory the selection retained.
+fn check_missing_destination(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+) -> Result<(Option<DirectoryAnchor>, Option<DestinationFilesystemInfo>)> {
+    conn.send(Request::CheckOperatorDirectory {
+        path: path.to_vec(),
+        allow_missing: true,
+        symlink_policy,
+    })?;
+    conn.send(Request::DestinationFilesystemInfo {
+        check_empty: false,
+        target: None,
+    })?;
+    // Drain both replies even when the selection fails: pooled control
+    // sessions must never keep an unread response from a preceding copy.
+    let selection = conn.recv();
+    let filesystem = conn.recv();
+    let selection = match ok(selection?, "operator path")? {
+        Response::DirectorySelection(selection) => selection,
+        other => bail!("unexpected response {other:?}"),
+    };
+    let filesystem = match filesystem? {
+        Response::DestinationFilesystemInfo(info) => Some(info),
+        Response::EndpointError(_) | Response::Err(_) => None,
+        other => bail!("unexpected response {other:?}"),
+    };
+    Ok((selection, filesystem))
 }
 
 fn ancestor_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
