@@ -153,13 +153,14 @@ may omit time spent before the handoff.
 For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).
 
-For SSH copies, `--auth-from @NAME` selects that receiving machine.
+For SSH copies, `--auth-from @NAME` selects that receiving machine; an ordinary
+SSH endpoint selects an [SSH authorization provider](receive.md#use-an-ssh-authorization-provider).
 An existing [approved account connection](persistence-reference.md#approved-account-connections)
 for the same authorizer and endpoint supplies full account access without
-another prompt. Otherwise an ordinary copy requests account access on the
-laptop. Allow covers the current receiving connection; Remember also permits
-future logins for that source and destination account pair. Explicit receiver
-receipt requests keep per-copy authorization.
+another prompt. Otherwise an ordinary copy requests account access from the
+provider. See [account permissions](persistence-reference.md#account-permissions)
+for Allow and Remember. With `@NAME`, explicit receiver receipt requests keep
+per-copy authorization; ordinary SSH providers do not support that route.
 `--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
@@ -196,10 +197,12 @@ but automatic selection uses ordinary SSH, where it resolves to `/archive`.
 A direct copy between two other servers can request or reuse
 [approved account connections](persistence-reference.md#approved-account-connections)
 to both endpoints. Each endpoint uses its saved authorization choice unless
-`--auth-from` overrides it. `auto` selects existing approvals first;
-`--auth-from @NAME` requests access to both accounts through that name as
-needed. Each laptop prompt grants the named account's authority. To prepare
-connections in advance, use `syq persist connect ENDPOINT --auth-from @NAME`.
+`--auth-from` overrides it. Both endpoints must select an authorization provider
+for this route; `auto` and `ssh` use native authentication regardless of existing
+approvals. `--auth-from @NAME` or `--auth-from PROVIDER_HOST` requests access to
+both accounts through that provider as needed. Each prompt grants the named
+account's authority. To prepare connections in advance, use
+`syq persist connect ENDPOINT --auth-from PROVIDER`.
 
 This route uses the default source coordinator or `--coordinate-at src`, with
 `--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,

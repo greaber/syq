@@ -52,7 +52,7 @@ enum PersistAction {
     Receive(crate::receive_service::ReceiveCommand),
     /// Inspect named return destinations available to this server account
     Destinations(crate::destination::Destinations),
-    /// Connect with native SSH, or request reusable account access through an authorization provider
+    /// Connect with native SSH or request approved account access
     Connect {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,

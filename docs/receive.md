@@ -215,7 +215,12 @@ asks for destination-account approval. Inspect and approve requests there with
 `syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
 Later commands reuse both connections; `persist connect` is optional.
 Your agent is not forwarded, and commands and file data travel directly to hostB.
-The provider's SSH server must allow Unix-socket forwarding.
+The provider's SSH server must allow local forwarding: both
+`AllowTcpForwarding` and `AllowStreamLocalForwarding` must allow `local` or `yes`.
+Syq uses the provider's first configured receiving profile in its default
+persistence domain; that profile must be enabled. Remote profile and domain
+selection are not supported. See [provider selection](persistence-reference.md#approved-account-connections)
+for how this differs from a local `--pscope`.
 
 This uses a full SSH login to the provider account. Anyone who can log in to
 that account can use its credentials independently of syq's approval controls.

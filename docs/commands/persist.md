@@ -15,7 +15,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist ssh-config`](#syq-persist-ssh-config) | Export native OpenSSH configuration for one already approved account connection |
 | [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
 | [`persist destinations`](#syq-persist-destinations) | Inspect or recover named return destinations |
-| [`persist connect`](#syq-persist-connect) | Connect with native SSH, or request reusable account access with --auth-from @NAME |
+| [`persist connect`](#syq-persist-connect) | Connect with native SSH, or request reusable account access through an authorization |
 | [`persist on`](#syq-persist-on) | Enable persistent connections for later syq commands |
 | [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
@@ -41,14 +41,14 @@ Choose or show [authorization defaults](../persistence-reference.md#authorizatio
 
 <!-- CLI: persist auth-from -->
 ```text
-syq persist auth-from [OPTIONS] [auto|ssh|@NAME]
+syq persist auth-from [OPTIONS] [auto|ssh|@NAME|HOST]
 ```
 
 **Arguments**
 
 | Argument / option | Meaning |
 |---|---|
-| `[auto\|ssh\|@NAME]` | Authorization for later commands; omit to show saved defaults |
+| `[auto\|ssh\|@NAME\|HOST]` | Authorization for later commands; omit to show saved defaults |
 
 **Options**
 
@@ -80,7 +80,7 @@ syq persist ssh-config [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME>` | Select existing approval; omitted uses the saved preference, then auto |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Select existing approval; omitted uses the saved preference, then auto |
 | `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 
 <!-- /CLI -->
@@ -156,7 +156,7 @@ syq persist receive approve [OPTIONS] <ID>
 | Argument / option | Meaning |
 |---|---|
 | `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
-| `--remember` | Remember this SSH account permission for future receiving connections |
+| `--remember` | Remember this SSH account permission for future receiving connections or provider logins |
 
 <!-- /CLI -->
 
@@ -195,7 +195,7 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 
 | Command | Purpose |
 |---|---|
-| [`persist receive permissions list`](#syq-persist-receive-permissions-list) | Show remembered source-to-destination SSH account permissions |
+| [`persist receive permissions list`](#syq-persist-receive-permissions-list) | Show remembered SSH account permissions |
 | [`persist receive permissions remove`](#syq-persist-receive-permissions-remove) | Stop future authentications; already authenticated sessions may continue |
 
 **Options**
@@ -472,7 +472,7 @@ syq persist connect [OPTIONS] <HOST>
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME>` | Authorize a reusable destination-account login through a receiving machine |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorize a reusable destination-account login through @NAME or an SSH provider |
 | `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a matching helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a matching helper |

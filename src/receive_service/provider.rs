@@ -131,7 +131,10 @@ pub(crate) fn open_forwarded(
     session: &str,
     operation: SessionRequest,
 ) -> Result<UnixStream> {
-    send_operation(handshake(stream, false)?, session, operation)
+    let stream = handshake(stream, false).context(
+        "could not open the SSH authorization provider service; check that receiving is running there and sshd permits local forwarding with AllowTcpForwarding and AllowStreamLocalForwarding set to local or yes",
+    )?;
+    send_operation(stream, session, operation)
 }
 fn send_operation(
     mut stream: UnixStream,

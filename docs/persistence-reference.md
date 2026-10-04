@@ -28,7 +28,8 @@ syq persist auth-from --reset
 `@laptop` goes straight to that machine without first trying the server's SSH
 credentials. If it is unavailable or refuses the request, the command fails.
 New authorization still needs its normal approval; existing account access can
-be reused.
+be reused. An ordinary SSH endpoint such as `alice@provider:2222` instead
+connects to that account as an [authorization provider](receive.md#use-an-ssh-authorization-provider).
 `ssh` uses the server's own access and ignores approved account connections.
 `auto` starts with native SSH regardless of existing approved account connections.
 Eligible native copies can ask an available receiving machine after an SSH
@@ -48,10 +49,11 @@ add `--for HOST` to show that host's effective choice.
 Defaults apply to `syq ssh`, copies using approved account connections, and the
 SSH endpoints of `rsync`, `rm`, `map`, and `clean-partials`. A copy explicitly
 using `--coordinate-at local` selects access separately for each endpoint.
-Selecting `@NAME` or an ordinary provider endpoint lets a command request account access when it has no approved
-connection. `persist connect --auth-from @NAME` can prepare that access in
-advance. Custom `--rsh` routes, copies to receiving names, and object storage
-keep their own authentication. An explicit scope uses its own saved choices.
+Selecting `@NAME` or an ordinary provider endpoint lets a command request
+account access when it has no approved connection.
+`persist connect HOST --auth-from PROVIDER` can prepare that access in advance.
+Custom `--rsh` routes, copies to receiving names, and object storage keep their
+own authentication. An explicit scope uses its own saved choices.
 The setting works independently of whether native SSH persistence is enabled.
 It is saved in `auth-from.json` in the selected domain; the default domain keeps
 it alongside `persistence.json`. Older syq versions ignore it. Unversioned files
@@ -66,16 +68,25 @@ file. To discard all saved choices, remove that file yourself.
 
 Commands selecting `@NAME` or an ordinary SSH provider request an approved
 account connection when needed.
-`syq persist connect HOST --auth-from @NAME` prepares the same connection in
+`syq persist connect HOST --auth-from PROVIDER` prepares the same connection in
 advance. Neither operation enables ordinary persistence or receiving on `HOST`.
 `--pscope` selects the domain that owns the connection. Helper overrides do not
 apply in this mode; `--timeout` is for native receiving setup and is rejected
 when account authorization is selected explicitly or through a saved choice.
 Readiness means the approved SSH connection accepts sessions.
 
+An ordinary SSH provider uses its default persistence domain and first
+configured receiving profile, which must be enabled. There is no selector for
+another remote profile or domain. A local `--pscope` selects this machine's
+preferences, provider connections, and approved destination connections; it
+does not select a domain on the provider. The provider resolves destination
+aliases through its own SSH configuration.
+
 `persist status --json` adds an `authorized_ssh` array alongside the usual
-`connections`. Each entry contains the authorizer name, requested and resolved
-endpoints, `control` socket path, and `connected` state.
+`connections`. Each entry contains the `authorizer`, requested and resolved
+endpoints, `control` socket path, and `connected` state. `authorizer` is a name
+string for `@NAME`, or an object containing an `ssh` endpoint for an ordinary
+SSH provider.
 
 The selected provider's SSH configuration determines the destination account,
 host, port, and trusted host keys. Syq caches that resolution separately from
@@ -95,22 +106,23 @@ A closed connection can request another login under the current session or
 remembered permission. A failure after execution starts ends that command
 without retrying it.
 
-Copies selecting the matching `@NAME`, explicitly or through a saved choice,
-can reuse the login, including SSH data in either direction with `--no-tcp`. Copies between this machine and one
-server use full account access without a per-copy grant; asking for a receiver
-receipt selects per-copy authorization instead. Direct copies between two other
+Copies selecting the matching provider, explicitly or through a saved choice,
+can reuse the login, including SSH data in either direction with `--no-tcp`.
+Copies between this machine and one server use full account access without a
+per-copy grant. With `@NAME`, asking for a receiver receipt selects per-copy
+authorization instead; ordinary SSH providers do not support that route. Direct copies between two other
 servers can use approved connections to both endpoints and give the source only
 [this copy's destination access](remote-reference.md#approved-account-copies).
 An explicit `--coordinate-at local` can also reuse account connections for both
 endpoints. An explicit scope selects account connections in that domain.
 Custom shell routes and detached copies keep their separate connection requirements.
-Without an approved login, `@NAME` requests account access. With `auto`,
+Without an approved login, the selected provider requests account access. With `auto`,
 eligible native copies can use restricted per-copy approval after a native SSH
 failure.
 
 `rsync`, `rm`, `map`, `clean-partials`, and descriptor copies also request or
-reuse account access selected through an authorization provider. Its prompt grants the
-account's authority, not permission for only the displayed operation. Remote
+reuse account access selected through an authorization provider. Its prompt
+grants the account's authority, not permission for only the displayed operation. Remote
 path completion uses existing approval and never prompts for access.
 
 SSH data through one approved account connection shares the server's session
@@ -125,8 +137,8 @@ SSH login when the session limit is reached.
 OpenSSH configuration for one existing approved login. Use it with `ssh`,
 `scp`, or `sftp` through `-F FILE`, or with Git and rsync's SSH command option.
 The endpoint must match the user, host spelling, and port used to open
-the approved connection; the configuration then supplies the laptop-resolved host,
-account, and port. It never requests approval or opens a login. Native-only
+the approved connection; the configuration then supplies the host, account,
+and port resolved by the provider. It never requests approval or opens a login. Native-only
 `ssh` selection cannot export approved account access.
 
 The exported configuration is a snapshot. Its socket is bound to the resolved
@@ -156,6 +168,12 @@ the source. **Remember** saves that permission for later connections through
 the same profile. Both accounts, resolved endpoints, and trusted host keys are
 part of the permission; changing them requires approval again. Permission is
 shared by processes running as the requesting account.
+
+With an ordinary SSH provider, **Allow** lasts for the current connection to
+that provider account. **Remember** permits later logins to the provider to
+authorize the destination through the same receiving profile. Syq does not
+verify which source machine opened that login; see
+[provider trust](security.md#ordinary-ssh-authorization-providers).
 
 For a pending account request, use the desktop controls or decide locally:
 

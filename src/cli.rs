@@ -398,7 +398,7 @@ pub struct Args {
     /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
-    /// Override saved authorization with auto, native SSH (ssh), or an approved account connection (@NAME). When omitted, use the saved choice, then auto
+    /// Override saved authorization with auto, native SSH (ssh), or an authorization provider (@NAME or HOST). When omitted, use the saved choice, then auto
     #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from, default_value = "auto", hide_default_value = true)]
     pub(crate) auth_from: AuthFrom,
     /// Use this exact syq executable on the remote instead of the managed helper

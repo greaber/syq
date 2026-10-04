@@ -29,7 +29,7 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 
 | Argument / option | Meaning |
 |---|---|
-| `--auth-from <auto\|ssh\|@NAME>` | Authorization source; omitted uses the saved preference, then native SSH |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Authorization source; omitted uses the saved preference, then native SSH |
 | `--pscope <PATH>` | Use connections and authorization preferences from this persistence scope |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |
@@ -102,5 +102,5 @@ A failed login or command is never retried through a receiving machine.
 Use `--auth-from @NAME` or save that preference to ask your laptop directly.
 An ordinary SSH endpoint, such as `--auth-from alice@provider:2222`, instead
 opens a connection to an [SSH authorization provider](../receive.md#use-an-ssh-authorization-provider).
-A laptop-authorized invocation opens or reuses an approved account connection.
+With either provider, syq opens or reuses an approved account connection.
 You do not need to run `persist connect` first.

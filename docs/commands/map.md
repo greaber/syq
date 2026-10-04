@@ -56,7 +56,7 @@ syq map [OPTIONS] --srcs-in DIR
 | `--rsh <COMMAND>` | Remote shell command (default: ssh). An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run |
 | `--syq-path <PATH>` | Use this remote syq executable instead of installing a helper |
 | `--no-bootstrap` | Use syq on the remote PATH instead of installing a helper |
-| `--auth-from <auto\|ssh\|@NAME>` | Use an approved SSH account connection, or native SSH authentication |
+| `--auth-from <auto\|ssh\|@NAME\|HOST>` | Use an approved SSH account connection, or native SSH authentication |
 | `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## Object storage
