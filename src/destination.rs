@@ -1462,6 +1462,55 @@ fn ssh_command(endpoint: &crate::persistence::EndpointRecord) -> Command {
     }
     cmd
 }
+fn pin_receiving_source(
+    command: &mut Command,
+    policy: &crate::agent_broker::HostPolicy,
+    hosts: &Path,
+) -> Result<crate::receive_approval::AccountIdentity> {
+    let identity = crate::receive_approval::AccountIdentity::new(
+        crate::cli::NativeEndpoint {
+            user: Some(policy.login_user.clone()),
+            host: policy.connection_host().into(),
+            port: Some(policy.port()),
+        },
+        policy.pinned_host_key_fingerprints(),
+    )?;
+    anyhow::ensure!(
+        hosts
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(byte)),
+        "account approval requires a temporary path without SSH expansion tokens or whitespace"
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(hosts)?;
+    // Keep the native lookup spelling (configured HostKeyAlias, otherwise the
+    // resolved host and port). A synthetic alias would also alter SSH's %k.
+    file.write_all(policy.native_known_hosts()?.as_bytes())?;
+    command.args(["-l", &policy.login_user, "-p", &policy.port().to_string()]);
+    for option in [
+        format!("Hostname={}", policy.connection_host()),
+        "StrictHostKeyChecking=yes".into(),
+        "VerifyHostKeyDNS=no".into(),
+        "KnownHostsCommand=none".into(),
+        "NoHostAuthenticationForLocalhost=no".into(),
+        format!("UserKnownHostsFile={}", hosts.display()),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "UpdateHostKeys=no".into(),
+        "CheckHostIP=no".into(),
+        format!("HostKeyAlgorithms={}", policy.host_key_algorithms()),
+    ] {
+        command.args(["-o", &option]);
+    }
+    Ok(identity)
+}
+
 pub(crate) fn serve_background(
     config: crate::receive_service::Settings,
     spec: crate::receive_service::ServiceSpec,
@@ -1557,43 +1606,8 @@ pub(crate) fn serve_background(
                     Instant::now() + Duration::from_secs(30),
                     &|| stop.load(Ordering::Acquire),
                 )?;
-                let identity = crate::receive_approval::AccountIdentity::new(
-                    crate::cli::NativeEndpoint {
-                        user: Some(policy.login_user.clone()),
-                        host: policy.connection_host().into(),
-                        port: Some(policy.port()),
-                    },
-                    policy.pinned_host_key_fingerprints(),
-                )?;
                 let hosts = broker.socket_path().with_file_name("source-known-hosts");
-                anyhow::ensure!(hosts.as_os_str().as_bytes().iter().all(|byte|
-                    byte.is_ascii_alphanumeric() || b"/._-+:@,=".contains(byte)),
-                    "account approval requires a temporary path without SSH expansion tokens or whitespace");
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(&hosts)?;
-                file.write_all(policy.known_hosts("syq-approved-source")?.as_bytes())?;
-                // Command-line settings take precedence over the user's config.
-                command.args(["-l", &policy.login_user, "-p", &policy.port().to_string()]);
-                for option in [
-                    format!("Hostname={}", policy.connection_host()),
-                    "StrictHostKeyChecking=yes".into(),
-                    "VerifyHostKeyDNS=no".into(),
-                    "KnownHostsCommand=none".into(),
-                    "HostKeyAlias=syq-approved-source".into(),
-                    format!("UserKnownHostsFile={}", hosts.display()),
-                    "GlobalKnownHostsFile=/dev/null".into(),
-                    "UpdateHostKeys=no".into(),
-                    "CheckHostIP=no".into(),
-                    format!("HostKeyAlgorithms={}", policy.host_key_algorithms()),
-                ] {
-                    command.args(["-o", &option]);
-                }
-                Ok(identity)
+                pin_receiving_source(&mut command, &policy, &hosts)
             })();
             *receiver.account_source.lock().unwrap() = source_identity.map_err(|error|
                 format!("cannot identify the requesting SSH account for account approval: {error:#}; trust this source's plain SSH host key on the laptop and reconnect"));

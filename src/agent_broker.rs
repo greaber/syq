@@ -116,6 +116,12 @@ impl HostPolicy {
         Ok(lines)
     }
 
+    /// Pin a native connection without replacing its HostKeyAlias and changing
+    /// the meaning of %k in configured identity/certificate/transport paths.
+    pub(crate) fn native_known_hosts(&self) -> Result<String> {
+        self.known_hosts(&self.known_hosts_name)
+    }
+
     fn authorizes_binding(&self, binding: &SessionBind) -> bool {
         key_is_cryptographically_verifiable(&binding.host_key)
             && signature_algorithm_is_cryptographically_verifiable(&binding.signature.algorithm())

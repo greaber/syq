@@ -4,6 +4,126 @@ use crate::conn::Conn;
 use crate::proto::{Request, Response};
 
 #[test]
+fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
+    use ssh_agent_lib::ssh_key::{private::Ed25519Keypair, PrivateKey};
+    use std::os::unix::fs::PermissionsExt;
+
+    let client = PrivateKey::new(Ed25519Keypair::from_seed(&[41; 32]).into(), "").unwrap();
+    let ca = PrivateKey::new(Ed25519Keypair::from_seed(&[42; 32]).into(), "").unwrap();
+    let host = PrivateKey::new(Ed25519Keypair::from_seed(&[43; 32]).into(), "").unwrap();
+    let mut certificate = ssh_agent_lib::ssh_key::certificate::Builder::new(
+        vec![0; 16],
+        client.public_key().key_data().clone(),
+        0,
+        u32::MAX.into(),
+    )
+    .unwrap();
+    certificate.valid_principal("account").unwrap();
+    let certificate = certificate.sign(&ca).unwrap().to_openssh().unwrap();
+
+    for alias in [Some("stable-source"), None] {
+        let root = crate::test_support::tempdir().unwrap();
+        let requested = "source-alias";
+        let token = alias.unwrap_or(requested);
+        let lookup = alias.unwrap_or("[127.0.0.1]:2200");
+        let identity = root.path().join(format!("{token}.pub"));
+        let cert = root.path().join(format!("{token}-cert.pub"));
+        let known_hosts = root.path().join("known_hosts");
+        let config = root.path().join("config");
+        let ssh = root.path().join("ssh");
+        let ssh_keygen = root.path().join("ssh-keygen");
+        fs::write(&identity, client.public_key().to_openssh().unwrap()).unwrap();
+        fs::write(&cert, &certificate).unwrap();
+        fs::write(
+            &known_hosts,
+            format!("{lookup} {}\n", host.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        let mut contents = format!(
+            "Host {requested}\n HostName 127.0.0.1\n User account\n Port 2200\n IdentityFile {}/%k.pub\n CertificateFile {}/%k-cert.pub\n IdentitiesOnly yes\n UserKnownHostsFile {}\n GlobalKnownHostsFile none\n HostKeyAlgorithms ssh-ed25519\n NoHostAuthenticationForLocalhost yes\n ProxyCommand false\n",
+            root.path().display(), root.path().display(), known_hosts.display()
+        );
+        if let Some(alias) = alias {
+            contents.push_str(&format!(" HostKeyAlias {alias}\n"));
+        }
+        fs::write(&config, contents).unwrap();
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi\ndone\nexec ssh -F {} \"$@\"\n",
+                shell_words::quote(config.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::write(&ssh_keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
+        for program in [&ssh, &ssh_keygen] {
+            fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let policy = crate::agent_broker::resolve_host_policy_at_bounded(
+            ssh.to_str().unwrap(),
+            None,
+            requested,
+            None,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+        )
+        .unwrap();
+        let pins = root.path().join("pinned-hosts");
+        let mut command = Command::new("ssh");
+        command.args(["-vvv", "-F"]).arg(&config);
+        let account = pin_receiving_source(&mut command, &policy, &pins).unwrap();
+        assert_eq!(account.endpoint.user.as_deref(), Some("account"));
+        assert_eq!(account.endpoint.host, "127.0.0.1");
+        assert_eq!(account.endpoint.port, Some(2200));
+        assert_eq!(account.host_keys, policy.pinned_host_key_fingerprints());
+        command.args(["--", requested]);
+        let capture = |command: &mut Command| {
+            crate::process::capture_output_bounded(
+                command,
+                Instant::now() + Duration::from_secs(5),
+                &|| false,
+                64 * 1024,
+            )
+            .unwrap()
+        };
+        // ProxyCommand exits locally. The actual OpenSSH startup still expands
+        // and loads both credentials; no SSH server or authentication is needed.
+        let output = capture(&mut command);
+        assert!(!output.status.success());
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        for (kind, path) in [("identity", &identity), ("certificate", &cert)] {
+            let prefix = format!("debug1: {kind} file {} type ", path.display());
+            let loaded = diagnostics
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("configured {kind} was not selected: {diagnostics}"));
+            assert_ne!(
+                loaded, "-1",
+                "configured {kind} was not loaded: {diagnostics}"
+            );
+        }
+        let mut search = Command::new("ssh-keygen");
+        search.args(["-F", lookup, "-f"]).arg(&pins);
+        assert!(capture(&mut search).status.success());
+
+        let mut effective = Command::new("ssh");
+        effective.args(["-G", "-F"]).arg(&config);
+        pin_receiving_source(&mut effective, &policy, &pins).unwrap();
+        effective.args(["--", requested]);
+        let output = capture(&mut effective);
+        assert!(output.status.success());
+        let config = String::from_utf8(output.stdout).unwrap();
+        assert!(config
+            .lines()
+            .any(|line| line == "nohostauthenticationforlocalhost no"));
+        assert!(config
+            .lines()
+            .any(|line| line == "stricthostkeychecking true"));
+        assert!(!config.contains("syq-approved-source"));
+    }
+}
+
+#[test]
 fn approved_source_uses_its_control_channel_without_a_native_ssh_pool() {
     let directory = crate::test_support::tempdir().unwrap();
     let mut args = args(directory.path(), "target");
