@@ -144,39 +144,6 @@ impl Actor {
             stage: stage as usize,
         }
     }
-    /// Count `share` of the time since `start` as `stage`, with `bytes`; the
-    /// rest stays with the current state. This records work that other
-    /// threads did for the owning thread, which alone switches states.
-    pub(crate) fn split_since(&self, start: Instant, stage: Stage, share: f64, bytes: u64) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return;
-        }
-        let start = start.saturating_duration_since(self.start).as_nanos();
-        self.split_at(
-            start.min(u64::MAX as u128) as u64,
-            self.now(),
-            stage,
-            share,
-            bytes,
-        );
-    }
-    fn split_at(&self, start: u64, now: u64, stage: Stage, share: f64, bytes: u64) {
-        self.sequence.fetch_add(1, Ordering::AcqRel);
-        let state = self.state.load(Ordering::Relaxed) as usize;
-        let since = self.since.swap(now, Ordering::Relaxed);
-        // Time before the last transition already counts toward another
-        // state, so only the time since then can move.
-        let moved = (now.saturating_sub(start.max(since)) as f64 * share.clamp(0.0, 1.0)) as u64;
-        if state != 0 {
-            self.times[state].fetch_add(
-                now.saturating_sub(since).saturating_sub(moved),
-                Ordering::Relaxed,
-            );
-        }
-        self.times[stage as usize].fetch_add(moved, Ordering::Relaxed);
-        self.bytes[stage as usize].fetch_add(bytes, Ordering::Relaxed);
-        self.sequence.fetch_add(1, Ordering::Release);
-    }
     fn snapshot_with_clock(&self, clock: impl Fn() -> u64) -> ActorSnapshot {
         loop {
             let before = self.sequence.load(Ordering::Acquire);
@@ -1121,24 +1088,28 @@ mod tests {
         assert_eq!(sample.times[Stage::Work as usize], 200);
     }
     #[test]
-    fn a_split_interval_moves_its_share_out_of_the_current_state() {
+    fn a_sample_during_a_parallel_write_phase_is_never_retracted() {
+        // The calling thread spans the phase in which other threads write
+        // for it, so samples taken during it already count it as writing.
         let actor = Actor::new("filesystem");
         actor.transition(Stage::Handling as u64, 100);
-        // Other threads wrote for this one from 300 to 700, half the time.
-        actor.split_at(300, 700, Stage::DestinationWrite, 0.5, 42);
-        let sample = actor.snapshot_at(800);
-        assert_eq!(sample.state, Stage::Handling as usize);
-        assert_eq!(sample.times[Stage::Handling as usize], 500);
-        assert_eq!(sample.times[Stage::DestinationWrite as usize], 200);
-        assert_eq!(sample.bytes[Stage::DestinationWrite as usize], 42);
-        // An interval reaching back past a transition moves only the time
-        // since it.
-        actor.transition(Stage::Work as u64, 900);
-        actor.split_at(850, 1_000, Stage::DestinationWrite, 1.0, 0);
-        let sample = actor.snapshot_at(1_000);
-        assert_eq!(sample.times[Stage::Handling as usize], 600);
-        assert_eq!(sample.times[Stage::Work as usize], 0);
-        assert_eq!(sample.times[Stage::DestinationWrite as usize], 300);
+        let before = actor.snapshot_at(200);
+        let handling = actor.transition(Stage::DestinationWrite as u64, 300);
+        let during = actor.snapshot_at(700);
+        actor.transition(handling, 1_100);
+        let after = actor.snapshot_at(1_200);
+        assert_eq!(during.times[Stage::DestinationWrite as usize], 400);
+        assert_eq!(after.times[Stage::DestinationWrite as usize], 800);
+        assert_eq!(after.times[Stage::Handling as usize], 300);
+        for (old, new, wall) in [(&before, &during, 500), (&during, &after, 500)] {
+            assert!(old
+                .times
+                .iter()
+                .zip(&new.times)
+                .all(|(old, new)| old <= new));
+            let activity: u64 = new.times.iter().zip(&old.times).map(|(n, o)| n - o).sum();
+            assert_eq!(activity, wall);
+        }
     }
     #[test]
     fn nested_operation_restores_the_callers_state_on_error() {

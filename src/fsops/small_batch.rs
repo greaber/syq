@@ -6,7 +6,6 @@
 use super::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError>;
 
@@ -87,47 +86,6 @@ fn start_thread<'scope, R: Send + 'scope>(
         return Err(io::Error::from_raw_os_error(libc::EAGAIN));
     }
     std::thread::Builder::new().spawn_scoped(scope, work)
-}
-
-/// Data writes made on threads that cannot record observations: their time
-/// and bytes, and the time the threads spent on the files they wrote.
-#[derive(Default)]
-pub(super) struct OffThreadWrites {
-    writing: AtomicU64,
-    busy: AtomicU64,
-    bytes: AtomicU64,
-}
-
-fn nanos_since(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
-impl OffThreadWrites {
-    /// Count the time `work` takes as busy.
-    fn busy<R>(&self, work: impl FnOnce() -> R) -> R {
-        let started = Instant::now();
-        let result = work();
-        self.busy.fetch_add(nanos_since(started), Ordering::Relaxed);
-        result
-    }
-
-    /// Count the time a data write takes, and its bytes if it succeeds.
-    fn write(&self, bytes: usize, write: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
-        let started = Instant::now();
-        let result = write();
-        self.writing
-            .fetch_add(nanos_since(started), Ordering::Relaxed);
-        if result.is_ok() {
-            self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-        }
-        result
-    }
-
-    /// The share of the busy time spent writing data.
-    fn share(&self) -> f64 {
-        let busy = self.busy.load(Ordering::Relaxed).max(1);
-        self.writing.load(Ordering::Relaxed) as f64 / busy as f64
-    }
 }
 
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
@@ -260,24 +218,21 @@ impl FsOps {
         // filesystem each step waits a round trip, so the files of a run
         // are written on threads of their own: every worker's runs proceed
         // at once, as when each worker wrote its files in turn. Only this
-        // thread records observations, so it counts the time the threads
-        // took as writing in the share they spent in data writes.
+        // thread records observations, so the whole phase, metadata
+        // included, counts as writing.
         let network = stages.first().is_some_and(|(_, stage)| {
             stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
         });
         let written: Vec<Result<()>> = if network {
-            let started = Instant::now();
-            let writes = OffThreadWrites::default();
+            let writing = self
+                .operation
+                .span(crate::transfer_observations::Stage::DestinationWrite);
+            let bytes = AtomicU64::new(0);
             let this = &*self;
             let written = on_threads(stages.iter().collect(), |(index, stage)| {
-                writes.busy(|| this.write_small_stage(&puts[*index], stage, Some(&writes)))
+                this.write_small_stage(&puts[*index], stage, Some(&bytes))
             });
-            self.operation.split_since(
-                started,
-                crate::transfer_observations::Stage::DestinationWrite,
-                writes.share(),
-                writes.bytes.into_inner(),
-            );
+            writing.bytes(bytes.into_inner());
             written
         } else {
             stages
@@ -387,12 +342,13 @@ impl FsOps {
     }
 
     /// Write a staged file's data and metadata. The data write is observed,
-    /// or counted in `writes` on a thread that cannot record observations.
+    /// or, on a thread that cannot record observations, its bytes are added
+    /// to `unobserved` once written, whatever the metadata step does.
     pub(super) fn write_small_stage(
         &self,
         put: &SmallPut,
         stage: &SmallStage,
-        writes: Option<&OffThreadWrites>,
+        unobserved: Option<&AtomicU64>,
     ) -> Result<()> {
         #[cfg(debug_assertions)]
         test_race_barrier(
@@ -403,10 +359,10 @@ impl FsOps {
         if stage.reused {
             stage.file.set_len(0)?;
         }
-        match writes {
+        match unobserved {
             None => observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse),
-            Some(writes) => writes.write(put.data.len(), || {
-                write_data(&stage.file, &put.data, 0, self.sparse)
+            Some(bytes) => write_data(&stage.file, &put.data, 0, self.sparse).inspect(|()| {
+                bytes.fetch_add(put.data.len() as u64, Ordering::Relaxed);
             }),
         }
         .with_context(|| format!("write {}", stage.label.display()))?;

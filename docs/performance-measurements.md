@@ -47,11 +47,13 @@ include worker IDs to distinguish connections. Their fractions use each actor's
 own observed time; do not add fractions across actors or to worker fractions.
 
 `source_read` measures demand-read syscalls, including reads used to hash existing destination data; `hashing` measures
-content hashing; `destination_write` measures write syscalls. `filesystem_copy`
-keeps a combined measurement where filesystem copy operations do not separate reads
-and writes. `handling` covers remaining filesystem request work. Server
-`request_wait` covers its request queue and `response_send` covers serialization
-and writing replies. Server idleness does not by itself prove a transport limit.
+content hashing; `destination_write` measures write syscalls, and on a network
+filesystem, where a batch's small files are written in parallel, it also includes
+setting their metadata. `filesystem_copy` keeps a combined measurement where
+filesystem copy operations do not separate reads and writes. `handling` covers
+remaining filesystem request work. Server `request_wait` covers its request queue
+and `response_send` covers serialization and writing replies. Server idleness
+does not by itself prove a transport limit.
 
 `prefetch_advice` measures Linux read-ahead advice calls; its `bytes` are requested
 bytes, not bytes physically read. `prefetch_fence` measures waiting for outstanding
