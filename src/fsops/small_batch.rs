@@ -16,58 +16,82 @@ const BURST: usize = 64;
 // may translate their exhaustion to EPERM. Learn only for this process. A
 // failed create gets one retry after the staged files have been closed; all
 // checks and atomic publication still run on that retry.
-static STAGING_WIDTH: AtomicUsize = AtomicUsize::new(BURST);
-
-#[derive(Default)]
+const REDUCED: usize = 1 << (usize::BITS - 1);
 struct StagingAdmission {
-    active: usize,
-    reduced: bool,
+    // The high bit stops new bursts; the other bits count admitted bursts.
+    state: AtomicUsize,
+    wait: Mutex<()>,
+    drained: std::sync::Condvar,
 }
-static STAGING_ADMISSION: std::sync::Mutex<StagingAdmission> =
-    std::sync::Mutex::new(StagingAdmission {
-        active: 0,
-        reduced: false,
-    });
-static STAGING_DRAINED: std::sync::Condvar = std::sync::Condvar::new();
-struct StagingBurst;
-impl StagingBurst {
-    fn enter() -> Option<Self> {
-        let mut state = STAGING_ADMISSION.lock().unwrap();
-        if state.reduced {
-            while state.active != 0 {
-                state = STAGING_DRAINED.wait(state).unwrap();
-            }
-            None
-        } else {
-            state.active += 1;
-            Some(Self)
+impl StagingAdmission {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            wait: Mutex::new(()),
+            drained: std::sync::Condvar::new(),
         }
     }
-    fn reduce() {
-        STAGING_ADMISSION.lock().unwrap().reduced = true;
-        STAGING_WIDTH.store(1, Ordering::Relaxed);
+    fn width(&self) -> usize {
+        if self.state.load(Ordering::Relaxed) & REDUCED == 0 {
+            BURST
+        } else {
+            1
+        }
+    }
+    fn enter(&self) -> Option<StagingBurst<'_>> {
+        // The healthy path does not take a process-wide mutex. Admission and
+        // reduction use one atomic so no new burst can slip past a reduction.
+        let mut state = self.state.load(Ordering::Relaxed);
+        while state & REDUCED == 0 {
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(StagingBurst(self)),
+                Err(current) => state = current,
+            }
+        }
+        let mut wait = self.wait.lock().unwrap();
+        while self.state.load(Ordering::Acquire) != REDUCED {
+            wait = self.drained.wait(wait).unwrap();
+        }
+        None
+    }
+    fn reduce(&self) {
+        let before = self.state.fetch_or(REDUCED, Ordering::AcqRel);
+        if before & REDUCED == 0 && crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq: reducing small-file staging after descriptor pressure"
+            );
+        }
     }
 }
-impl Drop for StagingBurst {
+static STAGING_ADMISSION: StagingAdmission = StagingAdmission::new();
+struct StagingBurst<'a>(&'a StagingAdmission);
+impl Drop for StagingBurst<'_> {
     fn drop(&mut self) {
-        let mut state = STAGING_ADMISSION.lock().unwrap();
-        state.active -= 1;
-        if state.active == 0 {
-            STAGING_DRAINED.notify_all();
+        if self.0.state.fetch_sub(1, Ordering::AcqRel) == REDUCED + 1 {
+            // Pair with the waiter's condition check to avoid a missed wake.
+            let _wait = self.0.wait.lock().unwrap();
+            self.0.drained.notify_all();
         }
     }
 }
 
-fn retry_stage_open(error: &anyhow::Error) -> bool {
-    error
+fn retry_stage_open(error: &anyhow::Error, network: impl FnOnce() -> bool) -> bool {
+    let errno = error
         .chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(|error| {
-            matches!(
-                error.raw_os_error(),
-                Some(libc::EMFILE | libc::ENFILE | libc::EPERM)
-            )
-        })
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error);
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE) => true,
+        // SSHFS can translate the server's EMFILE to EPERM. Inspect only on
+        // failure: local permission errors should not shrink future batches.
+        Some(libc::EPERM) => network(),
+        _ => false,
+    }
 }
 /// Threads a run writes and closes its files on, on a network filesystem.
 /// Creating and renaming stay one at a time per directory, so a few threads
@@ -743,7 +767,7 @@ impl FsOps {
                 next += 1;
                 continue;
             }
-            let reserved = ReservedDescriptors::up_to(STAGING_WIDTH.load(Ordering::Relaxed) - 1);
+            let reserved = ReservedDescriptors::up_to(STAGING_ADMISSION.width() - 1);
             let mut run: Vec<(usize, RootedTarget)> = Vec::with_capacity(1 + reserved.0);
             // A run stays in one directory and names each target once: a
             // repeated target would share its sidecar with the earlier one.
@@ -801,7 +825,7 @@ impl FsOps {
         let Some((_, first)) = run.first() else {
             return;
         };
-        let Some(burst) = StagingBurst::enter() else {
+        let Some(burst) = STAGING_ADMISSION.enter() else {
             for (index, _) in run {
                 results[index] = self
                     .put_small_with_source(
@@ -835,8 +859,20 @@ impl FsOps {
                 };
                 match created {
                     Ok(stage) => stages.push((index, stage)),
-                    Err(error) if retry_stage_open(&error) => {
-                        StagingBurst::reduce();
+                    Err(error)
+                        if retry_stage_open(&error, || {
+                            if let Some((_, stage)) = stages.first() {
+                                on_network_file_system(&stage.file, stage.created.dev())
+                            } else {
+                                root.resolve_parent(&directory).ok().is_some_and(|parent| {
+                                    parent.directory().metadata().ok().is_some_and(|meta| {
+                                        on_network_file_system(parent.directory(), meta.dev())
+                                    })
+                                })
+                            }
+                        }) =>
+                    {
+                        STAGING_ADMISSION.reduce();
                         retry.push(index);
                         retry.extend(remaining.map(|(index, _)| index));
                         break;
@@ -921,7 +957,7 @@ impl FsOps {
         if !retry.is_empty() {
             // Other workers must publish and close their existing bursts too.
             // They never wait while holding a burst or directory turn.
-            drop(StagingBurst::enter());
+            drop(STAGING_ADMISSION.enter());
         }
         for index in retry {
             results[index] = self
@@ -1074,6 +1110,49 @@ impl FsOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_reduction_drains_admitted_bursts_before_retry() {
+        let admission = StagingAdmission::new();
+        let first = admission.enter().unwrap();
+        let second = admission.enter().unwrap();
+        assert_eq!(admission.width(), BURST);
+        admission.reduce();
+        assert_eq!(admission.width(), 1);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let admission = &admission;
+            let waiter = scope.spawn(move || {
+                assert!(admission.enter().is_none());
+                tx.send(()).unwrap();
+            });
+            drop(first);
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            drop(second);
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            waiter.join().unwrap();
+        });
+        assert!(admission.enter().is_none());
+    }
+
+    #[test]
+    fn staging_permission_recovery_requires_network_filesystem() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let error = io::Error::from_raw_os_error(errno).into();
+            assert!(retry_stage_open(&error, || panic!(
+                "no filesystem query needed"
+            )));
+        }
+        let permission = io::Error::from_raw_os_error(libc::EPERM).into();
+        assert!(!retry_stage_open(&permission, || false));
+        assert!(retry_stage_open(&permission, || true));
+        let denied = io::Error::from_raw_os_error(libc::EACCES).into();
+        assert!(!retry_stage_open(&denied, || panic!(
+            "no filesystem query needed"
+        )));
+    }
 
     fn put(path: &str, data: &[u8]) -> SmallPut {
         SmallPut {

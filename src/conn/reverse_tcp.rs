@@ -46,6 +46,7 @@ impl RemoteSpec {
                 spec.diagnostics.lock().unwrap().tcp_probe_time = Some((start, Instant::now()));
                 result
             })
+            .map_err(crate::resources::allocation_error)
             .context("start reverse TCP probe")?;
         Ok(PendingTcpSetup {
             pacing: None,

@@ -962,12 +962,19 @@ struct ConnectionPlan {
     keep: usize,
 }
 
+struct DescriptorNotice {
+    limit: usize,
+    announced: std::sync::atomic::AtomicBool,
+    report: Box<dyn Fn() + Send + Sync>,
+}
+
 /// The worker lifecycle shared by the tuner and workers. `active` controls who
 /// may take work; `connect_target` controls who should establish or recover a
 /// connection. The ordinary-copy driver separately controls which parked
 /// connections to keep. Slot state distinguishes ready, retiring and failed
 /// connections, so a retiring connection cannot be mistaken for a ready one.
 pub struct Gate {
+    descriptor_notice: std::sync::OnceLock<DescriptorNotice>,
     resource_limit: AtomicUsize,
     active: AtomicUsize,
     connect_target: AtomicUsize,
@@ -1003,6 +1010,7 @@ fn grow_to(slots: &mut Vec<Slot>, n: usize) {
 impl Gate {
     pub fn new(active: usize) -> Arc<Self> {
         Arc::new(Gate {
+            descriptor_notice: std::sync::OnceLock::new(),
             resource_limit: AtomicUsize::new(usize::MAX),
             active: AtomicUsize::new(active),
             connect_target: AtomicUsize::new(active),
@@ -1053,11 +1061,31 @@ impl Gate {
     }
 
     pub fn set_active(&self, n: usize) {
+        self.notice_descriptors(n);
         let _g = self.slots.lock().unwrap();
         let n = n.min(self.resource_limit());
         self.active.store(n, Relaxed);
         self.connect_target.fetch_max(n, Relaxed);
         self.cv.notify_all();
+    }
+
+    pub fn limit_descriptors(&self, limit: usize, report: impl Fn() + Send + Sync + 'static) {
+        let _ = self.descriptor_notice.set(DescriptorNotice {
+            limit,
+            announced: std::sync::atomic::AtomicBool::new(false),
+            report: Box::new(report),
+        });
+        self.limit_resources(limit);
+    }
+
+    fn notice_descriptors(&self, requested: usize) {
+        if let Some(notice) = self.descriptor_notice.get() {
+            // Policy stops growing at its ceiling. Reaching it is enough to
+            // report it, even when no subsequent request exceeds the ceiling.
+            if requested >= notice.limit && !notice.announced.swap(true, Relaxed) {
+                (notice.report)();
+            }
+        }
     }
 
     pub fn resource_limit(&self) -> usize {
@@ -1108,6 +1136,7 @@ impl Gate {
     /// Reserve absent slots through `n`. Workers start timing with
     /// `mark_warming` when they can connect, after any wait for planning.
     pub fn begin_warming(&self, n: usize) -> Vec<usize> {
+        self.notice_descriptors(n);
         let mut slots = self.slots.lock().unwrap();
         let n = n.min(self.resource_limit());
         grow_to(&mut slots, n);

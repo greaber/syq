@@ -408,9 +408,7 @@ impl std::fmt::Display for WorkerInitializationError {
 impl std::error::Error for WorkerInitializationError {}
 
 pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<WorkerInitializationError>())
+    error.is::<WorkerInitializationError>()
 }
 
 /// A worker handshake rejection that tests inject.
@@ -613,7 +611,7 @@ fn spawn_observed_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
-) -> std::io::Result<ObservedReader> {
+) -> Result<ObservedReader> {
     // Control requests also pipeline up to the default depth. Keeping that
     // capacity prevents a sequential helper blocking on replies while its
     // coordinator is still sending requests (including large path batches).
@@ -622,45 +620,47 @@ fn spawn_observed_reader(
     );
     let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
     let receipts = batch_receipts.clone();
-    let reader = std::thread::Builder::new().spawn(move || {
-        let mut r = FrameReader::new(input);
-        r.set_limit(MAX_HANDSHAKE_FRAME);
-        let hello = r
-            .read_budgeted_with_start::<Response>()
-            .map(ReceivedResponse::from_frame);
-        // Make the same acceptance check as receive_hello before allowing the
-        // background reader to allocate any ordinary data frame. This also
-        // covers pooled sessions, whose Hello was sent by another process.
-        let accepted = matches!(&hello, Ok(message)
-            if matches!(&message.value, Response::HelloOk { identity, .. }
-                if identity == crate::identity::build()));
-        if tx.send(hello).is_err() || !accepted {
-            return;
-        }
-        r.set_limit(MAX_FRAME);
-        loop {
-            let msg = r
+    let reader = std::thread::Builder::new()
+        .spawn(move || {
+            let mut r = FrameReader::new(input);
+            r.set_limit(MAX_HANDSHAKE_FRAME);
+            let hello = r
                 .read_budgeted_with_start::<Response>()
                 .map(ReceivedResponse::from_frame);
-            if let Ok(message) = &msg {
-                if let Response::TransportStats(stats) = &message.value {
-                    if let Some(value) = &stats.observation {
-                        let mut value = value.clone();
-                        value.tcp = stats.tcp.clone();
-                        observation.update(value);
+            // Make the same acceptance check as receive_hello before allowing the
+            // background reader to allocate any ordinary data frame. This also
+            // covers pooled sessions, whose Hello was sent by another process.
+            let accepted = matches!(&hello, Ok(message)
+            if matches!(&message.value, Response::HelloOk { identity, .. }
+                if identity == crate::identity::build()));
+            if tx.send(hello).is_err() || !accepted {
+                return;
+            }
+            r.set_limit(MAX_FRAME);
+            loop {
+                let msg = r
+                    .read_budgeted_with_start::<Response>()
+                    .map(ReceivedResponse::from_frame);
+                if let Ok(message) = &msg {
+                    if let Response::TransportStats(stats) = &message.value {
+                        if let Some(value) = &stats.observation {
+                            let mut value = value.clone();
+                            value.tcp = stats.tcp.clone();
+                            observation.update(value);
+                        }
+                        if !stats.solicited {
+                            continue;
+                        }
                     }
-                    if !stats.solicited {
-                        continue;
-                    }
+                    receipts.response(&message.value);
                 }
-                receipts.response(&message.value);
+                let failed = msg.is_err();
+                if tx.send(msg).is_err() || failed {
+                    break;
+                }
             }
-            let failed = msg.is_err();
-            if tx.send(msg).is_err() || failed {
-                break;
-            }
-        }
-    })?;
+        })
+        .map_err(crate::resources::allocation_error)?;
     Ok((rx, reader, batch_receipts))
 }
 
@@ -749,6 +749,7 @@ impl RemoteConn {
             .spawn(move || {
                 let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
             })
+            .map_err(crate::resources::allocation_error)
             .context("start pooled stderr reader")?;
         Ok(RemoteConn {
             batch_receipts,
@@ -2158,13 +2159,16 @@ impl RemoteSpec {
                 Stdio::inherit()
             },
         );
-        let mut child = cmd.spawn_guarded().with_context(|| {
-            if self.local_process {
-                "spawn local receiver".to_string()
-            } else {
-                format!("spawn {:?}", self.rsh[0])
-            }
-        })?;
+        let mut child = cmd
+            .spawn_guarded()
+            .map_err(crate::resources::allocation_error)
+            .with_context(|| {
+                if self.local_process {
+                    "spawn local receiver".to_string()
+                } else {
+                    format!("spawn {:?}", self.rsh[0])
+                }
+            })?;
         let approved_login = match login.map(|login| login.watch(child.id())).transpose() {
             Ok(guard) => guard,
             Err(error) => {
@@ -2179,7 +2183,8 @@ impl RemoteSpec {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(error).context("start SSH stderr reader");
+                return Err(crate::resources::allocation_error(error))
+                    .context("start SSH stderr reader");
             }
         };
         let stdin = child.stdin.take().unwrap();
@@ -2221,7 +2226,7 @@ impl RemoteSpec {
                     drop(writer);
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(error.into());
+                    return Err(error);
                 }
             };
         let conn = RemoteConn {
@@ -2456,6 +2461,7 @@ impl RemoteSpec {
                     Some((start, std::time::Instant::now()));
                 result
             })
+            .map_err(crate::resources::allocation_error)
             .context("start TCP address probe")?;
         Ok(PendingTcpSetup {
             pacing,
@@ -2791,6 +2797,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
                     .unwrap_or_default();
                 let _ = tx.send((i, addrs));
             })
+            .map_err(crate::resources::allocation_error)
             .context("start TCP address resolver")?;
     }
     drop(resolved_tx);
@@ -2837,6 +2844,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
             .spawn(move || {
                 let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
             })
+            .map_err(crate::resources::allocation_error)
             .context("start TCP address probe")?;
     }
     drop(tx);
@@ -3195,11 +3203,24 @@ impl Endpoint {
                         unreachable!("destination workers require an isolated receiver")
                     }
                     ConnectionRole::SourceWorker { roots, .. } => {
-                        conn.ops.initialize_sources(&roots).map_err(|error| {
-                            WorkerInitializationError(format!(
-                                "initialize local source worker: {error:#}"
-                            ))
-                        })?
+                        let mut initialize = || -> Result<()> {
+                            #[cfg(debug_assertions)]
+                            {
+                                static REFUSED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if std::env::var_os("SYQ_TEST_LOCAL_SOURCE_EMFILE_ONCE").is_some()
+                                    && !REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    return Err(
+                                        std::io::Error::from_raw_os_error(libc::EMFILE).into()
+                                    );
+                                }
+                            }
+                            conn.ops.initialize_sources(&roots)
+                        };
+                        initialize().context(WorkerInitializationError(
+                            "initialize local source worker".into(),
+                        ))?
                     }
                     ConnectionRole::StreamWorker { ticket, settings } => {
                         conn.ops.initialize_stream(&ticket, settings)?

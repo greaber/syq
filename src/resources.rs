@@ -40,17 +40,39 @@ impl Descriptors {
     }
 }
 
+/// EAGAIN means resource exhaustion at a thread/process spawn, but may mean
+/// a timeout on socket I/O. Preserve that distinction at the allocation site.
+#[derive(Debug)]
+struct AllocationRefused;
+impl std::fmt::Display for AllocationRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("resource allocation refused")
+    }
+}
+impl std::error::Error for AllocationRefused {}
+
+pub(crate) fn allocation_error(error: std::io::Error) -> anyhow::Error {
+    let temporary = error.raw_os_error() == Some(libc::EAGAIN);
+    let error = anyhow::Error::from(error);
+    if temporary {
+        error.context(AllocationRefused)
+    } else {
+        error
+    }
+}
+
 /// Classify on the endpoint that owns errno; remote errno numbers are not portable.
 pub(crate) fn exhausted(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .any(|error| {
-            matches!(
-                error.raw_os_error(),
-                Some(libc::EMFILE | libc::ENFILE | libc::EAGAIN | libc::ENOMEM)
-            )
-        })
+    error.is::<AllocationRefused>()
+        || error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .any(|error| {
+                matches!(
+                    error.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+                )
+            })
 }
 
 /// Pools are an optimization. A failed build must leave the caller able to
@@ -78,6 +100,25 @@ pub(crate) fn optional_pool(name: &'static str, threads: usize) -> Option<rayon:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_pressure_is_distinct_from_socket_timeout() {
+        let errno = || std::io::Error::from_raw_os_error(libc::EAGAIN);
+        assert!(!exhausted(
+            &anyhow::Error::from(errno()).context("read handshake")
+        ));
+        assert!(exhausted(
+            &allocation_error(errno()).context("start reader")
+        ));
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
+            assert!(exhausted(
+                &anyhow::Error::from(std::io::Error::from_raw_os_error(code)).context("open file")
+            ));
+        }
+        assert!(!exhausted(&allocation_error(
+            std::io::Error::from_raw_os_error(libc::EACCES)
+        )));
+    }
 
     #[test]
     fn descriptor_admission_leaves_room_for_staging_and_control() {

@@ -2627,3 +2627,15 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     drop(requests);
     drop(conn);
 }
+
+#[test]
+fn local_worker_initialization_preserves_descriptor_exhaustion() {
+    let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE)).context(
+        WorkerInitializationError("initialize local source worker".into()),
+    );
+    assert!(is_worker_initialization_error(&error));
+    assert!(crate::resources::exhausted(&error));
+    let rejection: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
+    assert!(is_worker_initialization_error(&rejection));
+    assert!(!crate::resources::exhausted(&rejection));
+}

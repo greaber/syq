@@ -1020,6 +1020,11 @@ fn staging_recovery_preserves_patch_sources() {
         }
         let out = command.run().unwrap();
         assert_output_ok(&out);
+        assert!(
+            stderr_of(&out).contains("reducing small-file staging"),
+            "{}",
+            stderr_of(&out)
+        );
         assert_eq!(tuning_observed(&out)["patched_files"], 8);
         for index in 0..8 {
             assert_eq!(read(&t.path(&format!("dst/f{index}"))), source);

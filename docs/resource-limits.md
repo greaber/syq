@@ -57,11 +57,11 @@ resources. Syq reports these reductions; raising an endpoint's operating-system
 limit can allow more concurrency. Fixed worker settings still report failures
 when their requested resources are unavailable.
 
-Metadata processing falls back to sequential work if its thread pool cannot
-start. Small-file staging reduces its open-file burst after an open failure
-that may indicate descriptor exhaustion, then retries once after existing
-bursts finish. Persistent failures remain errors. These measures do not reserve
-memory or disk space, or guarantee success under every resource limit.
+Copies can also continue with less parallel work when threads or file handles
+are scarce. On Linux, this includes retrying small-file creation once on network
+or FUSE mounts that report descriptor shortages as permission errors. Persistent
+failures remain errors. Syq does not reserve memory or disk space, or guarantee
+success under every resource limit.
 
 [Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
 still apply. S3 ceilings constrain the route's normal automatic range without
