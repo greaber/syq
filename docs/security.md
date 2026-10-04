@@ -259,15 +259,24 @@ consistency, and durability considerations are covered in
 
 A persistent SSH login lets processes running as your local user access the
 server without another key touch or agent approval. This access remains
-available even with receiving turned off. `syq persist off` closes the
-persistent connections, including receiving.
+available even with receiving turned off. `syq persist off` closes the default
+domain's persistent connections, including receiving; add `--pscope PATH` to
+close an explicit domain instead.
+
+Domains separate syq's connections, saved authorization choices, receiving
+profiles, and remembered account permissions. They share your OS account's SSH
+configuration, keys, agents, and receiver identity. They are not a security
+boundary between processes running as that account. Closing an explicit domain
+also removes its saved policy; closing the default domain preserves its policy.
 
 ## Receivers
 
 With receiving enabled, servers you have persistent connections to can request
 copies to or commands on your machine, SSH account access on another server,
-or authorization for copies to or from another server or object storage. Receiving is configured separately and defaults to enabled. `syq persist receive off`
-disables these requests while keeping SSH reuse.
+or authorization for copies to or from another server or object storage.
+Receiving is configured separately. It defaults to enabled in the default
+domain and disabled in a fresh explicit domain. `syq persist receive off`
+disables these requests in the selected domain while keeping SSH reuse.
 
 Requests from a server are subject to local approval:
 
@@ -284,7 +293,8 @@ authorizations, that is the syq command the server ran, including options from
 its environment variables; your laptop derives what it enforces from that
 command and rejects a request that does not match. It cannot prove who typed
 the command. Approving a copy does not approve a later
-command. By default, every connected server can use every enabled profile.
+command. By default, every connected server in a domain can use that domain's
+enabled profiles.
 A profile's optional `--connection` list limits which locally selected SSH
 connections may use it. Within each allowed server account, all processes
 share this authority; choosing a different profile name does not isolate them.
@@ -366,7 +376,8 @@ account permission. Explicit restricted-copy grants retain their own scope.
 
 **Allow** approves the source-account/destination-account pair for the current
 laptop-to-source receiving connection. **Remember** permits future authentications
-through the same profile while the laptop is available. The permission binds
+through the same profile in the same authorizing domain while the laptop is
+available. The permission binds
 resolved accounts and endpoints to the laptop's trusted plain SSH host keys;
 changed identities require fresh approval. The source connection is pinned to
 that identity when it starts. Unsupported source identity lookup does not affect

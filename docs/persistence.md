@@ -27,8 +27,8 @@ other than `ssh`, connect with that command each time instead.
 Persistence also speeds up [remote path completion](install.md#shell-completion):
 completion reuses the open connection, avoiding a new SSH login for each lookup.
 
-Receiving starts automatically with persistent connections unless you have
-turned it off. It lets connected servers request file copies to your machine,
+In the default persistence domain, receiving starts automatically with persistent
+connections unless you have turned it off. It lets connected servers request file copies to your machine,
 commands on it, and authorization for copies between servers,
 with approval on your machine. See [Use your laptop from a server](receive.md)
 for setup and approval controls.
@@ -40,7 +40,10 @@ is no longer available. See [Persistent connections](security.md#persistent-conn
 for the security implications.
 
 Inspect connections with `syq persist status`. Close them, including receiving
-connections, with `syq persist off`.
+connections, with `syq persist off`. This keeps your saved settings. For an
+independent set of connections and settings, create an
+[isolated domain](persistence-reference.md#isolated-script-scopes) and pass its
+path with `--pscope`; fresh domains start with receiving off.
 
 Receiving reconnects after a network interruption or laptop sleep; native SSH
 connections reopen on their next use. An interrupted copy still needs to be
@@ -58,7 +61,7 @@ syq ssh hostB
 syq persist off
 ```
 
-The first command asks for access to the destination account. **Allow** covers
+The first SSH command asks for access to the destination account. **Allow** covers
 later commands and copies while the laptop's receiving connection to this
 server stays open. **Remember** also permits future logins for these accounts;
 the laptop must still be available to authorize them. See

@@ -97,6 +97,12 @@ right contents. See [A compromised source server](security.md#a-compromised-sour
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
+Persistence can reuse an eligible native SSH connection from the invoking
+machine to the coordinating server. Connections forwarding a constrained or
+full SSH agent remain attached to the individual copy. Selecting `--pscope`
+changes only local persistence; it does not pass that local path to another
+server or change the file-data route.
+
 The authentication broker allows 129 simultaneous clients by default. An
 explicit worker count or ceiling changes this to that count plus one control
 connection; restricted copies remain capped at 129 clients.
@@ -159,7 +165,7 @@ These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
 Per-copy SSH authorization through a receiving machine does not support `--detach`, custom
-`--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
+`--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
 or `--coordinate-at`, or `--no-tcp-encryption`. Uploads send file data directly from
 source to destination over encrypted TCP, falling back to SSH between those same
 servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
@@ -197,8 +203,9 @@ connections in advance, use `syq persist connect ENDPOINT --auth-from @NAME`.
 
 This route uses the default source coordinator or `--coordinate-at src`, with
 `--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,
-and receiver receipts. Custom `--rsh`, explicit `--pscope`, detached copies,
-destination coordination, and other peer-auth modes keep their separate
+and receiver receipts. `--pscope` selects approved connections and authorization
+choices in that local domain. Custom `--rsh`, detached copies, destination
+coordination, and other peer-auth modes keep their separate
 connection requirements. `--coordinate-at local` can reuse approved access to
 each endpoint and explicitly relays file data through the invoking machine.
 

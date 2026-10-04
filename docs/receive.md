@@ -23,27 +23,27 @@ It needs no SSH server, public address, or incoming network port.
 
 ## Set up receiving
 
-Receiving starts automatically when syq opens a persistent SSH connection,
-unless you have turned it off or restricted its profiles to other servers.
-To enable persistence and connect to a server now, run this on your laptop
-with syq installed on both machines:
+Run this on your laptop with syq installed on both machines:
 
 ```sh
-syq persist connect server
+syq persist receive on --connection server
 ```
 
-This opens the connection and waits until receiving is ready. An ordinary
-`ssh server` session does not enable receiving. If you already have a persistent
-connection to this server, you do not need to connect again. For example, after
-`syq persist on`, a syq copy or remote path completion can open that connection.
-If you previously turned receiving off, run `syq persist receive on` first.
+This enables persistence, saves the server as this profile's allowed connection,
+and waits until receiving is ready. Repeat `--connection` to allow and connect
+several endpoints. A later `syq persist receive on` reconnects the saved list.
+With no saved list, it uses tracked connections and future syq connections;
+an ordinary `ssh server` session does not enable receiving.
 
 By default, your receiving name is your laptop's short hostname, and downloads
-and commands start in your home directory. `connect` prints the receiving name.
-The examples below use `@laptop`; replace it with your own name.
+and commands start in your home directory. The command prints the receiving
+name. The examples below use `@laptop`; replace it with your own name.
 
-Once `connect` finishes, you can close that terminal and make requests from any
-shell on the server, including an existing tmux session.
+You can close that terminal and make requests from any shell on the server,
+including an existing tmux session. In the default persistence domain, receiving
+also starts automatically with persistent connections unless you have turned it
+off or restricted the profile. Fresh [isolated domains](persistence-reference.md#isolated-script-scopes)
+start with receiving off; add `--pscope PATH` to configure and manage one.
 
 ### Optional name and directory
 
@@ -52,11 +52,11 @@ directory, run these commands on your laptop:
 
 ```sh
 mkdir -p ~/Downloads/server
-syq persist receive on --name laptop --cwd ~/Downloads/server
+syq persist receive on --name laptop --cwd ~/Downloads/server --connection server
 ```
 
-Here, `receive on` configures the profile; it is not required to use the default
-settings. `--cwd` sets the starting directory for downloads and commands.
+This configures the profile and connects it. `--cwd` sets the starting directory
+for downloads and commands. Omitted settings retain their saved values.
 
 ## Copy files to your laptop
 
@@ -130,7 +130,7 @@ Downloads confined to that directory need no approval; downloads elsewhere ask.
 `--root`, if configured, remains a hard boundary even with approval.
 Automatic approval trusts all processes running as the connected server accounts,
 including for overwrites inside that directory. You can
-[limit a profile to particular servers](persistence-reference.md#choose-allowed-connections).
+[limit a profile to particular connections](persistence-reference.md#choose-allowed-connections).
 
 Commands on your laptop, restricted copies between servers, and storage
 authorization require their own approval. SSH account access can use a current

@@ -341,8 +341,9 @@ messages may change at any time.
 
 ## Connection status
 
-`syq persist status --json` reports the persistence setting, scope, and endpoints
-without starting connections. Endpoint states are `starting`, `connecting`,
+`syq persist status --json` reports the selected domain's persistence setting,
+scope, and endpoints without starting connections. Add `--pscope PATH` to inspect
+an explicit domain. Endpoint states are `starting`, `connecting`,
 `ready`, `reconnecting`, `failed`, or `inactive`. Each entry also reports whether
 SSH is connected and the receiving state and errors. A connection opened by an
 `--rsh` ssh command with its own options lists them in `ssh_options`, with
@@ -358,7 +359,7 @@ failure, and each entry's
 
 `persist receive status --json` reports each profile's `cwd`, `cwd_explicit`,
 `root`, `auto_approve_root`, and `servers`. An empty list means all
-connections. A null automatic approval root means every download asks.
+connections in that domain. A null automatic approval root means every download asks.
 Connection entries list only profiles allowed on that endpoint.
 
 Command approvals in `syq persist receive pending --json` use `kind: "command"`
