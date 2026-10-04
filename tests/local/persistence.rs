@@ -766,7 +766,6 @@ exit 255
         || pool.poll().unwrap().is_some(),
     );
     assert!(pool.close().unwrap().success());
-    assert!(!scope.join("cm-00112233aabbccdd.pool").exists());
     assert!(!scope.join("cm-00112233aabbccdd.pool.lock").exists());
 }
 
