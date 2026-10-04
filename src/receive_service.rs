@@ -1473,11 +1473,21 @@ pub(crate) fn option_migration_hint(argv: &[OsString], mut error: clap::Error) -
     if error.kind() != ErrorKind::UnknownArgument {
         return error;
     }
-    // Let clap identify subcommands, including global options before/after
-    // them. An operand named "receive" must not select receiving diagnostics.
+    let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg) else {
+        return error;
+    };
+    let option = argument.split('=').next().unwrap_or(argument);
+    // Parse the valid prefix using the actual grammar. clap's ignore_errors
+    // can discard the nested command that encountered the invalid argument.
+    let Some(index) = argv.iter().position(|value| {
+        value
+            .to_str()
+            .is_some_and(|value| value.split('=').next() == Some(option))
+    }) else {
+        return error;
+    };
     let receiving = crate::persistence::command_for_help()
-        .ignore_errors(true)
-        .try_get_matches_from(argv)
+        .try_get_matches_from(&argv[..index])
         .ok()
         .is_some_and(|matches| {
             matches
@@ -1487,10 +1497,6 @@ pub(crate) fn option_migration_hint(argv: &[OsString], mut error: clap::Error) -
     if !receiving {
         return error;
     }
-    let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg) else {
-        return error;
-    };
-    let option = argument.split('=').next().unwrap_or(argument);
     let replacement = match option {
         "--server" => "--connection",
         "--all-servers" => "--all-connections",

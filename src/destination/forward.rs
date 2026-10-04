@@ -1237,7 +1237,11 @@ mod tests {
         let started = Instant::now();
         let thread =
             std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
-        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        // read_exact retries EINTR from signal tests sharing this process.
+        assert_eq!(
+            client.read_exact(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
         // Keep B's read/upload side alive even though C disappeared.
         assert!(!thread.join().unwrap().unwrap());
         assert!(started.elapsed() < Duration::from_secs(4));

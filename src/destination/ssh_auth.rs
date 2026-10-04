@@ -36,7 +36,6 @@ pub(crate) fn retryable_setup_error(error: &anyhow::Error) -> bool {
                         | std::io::ErrorKind::Interrupted
                         | std::io::ErrorKind::ConnectionRefused
                         | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
                         | std::io::ErrorKind::BrokenPipe
                         | std::io::ErrorKind::UnexpectedEof
                 )
