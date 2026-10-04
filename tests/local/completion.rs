@@ -1614,6 +1614,35 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
+    // A host inventory entry must remain an SSH provider, never become an
+    // invented @receiving-name when completing that separate namespace.
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+        "",
+    )
+    .unwrap()
+    .public_key()
+    .to_openssh()
+    .unwrap();
+    write(
+        &t.path("home/.ssh/known_hosts"),
+        format!("ssh-fixture-authorization.invalid {key}\n").as_bytes(),
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "source", "--auth-from", "ssh-fixture-"],
+        &["ssh-fixture-authorization.invalid"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "cp", "source", "--auth-from", "alice@ssh-fixture-"],
+        &["alice@ssh-fixture-authorization.invalid"],
+    );
+    assert_completion_candidates(
+        &t,
+        &["syq", "persist", "auth-from", "@"],
+        &["@laptop", "@ssh"],
+    );
     assert_authorization_candidates(&t, &["syq", "persist", "auth-from", "ss"], &["ssh"]);
     assert_authorization_candidates(&t, &["syq", "persist", "auth-from", "@lap"], &["@laptop"]);
     assert_authorization_candidates(&t, &["syq", "persist", "auth-from", "au"], &["auto"]);

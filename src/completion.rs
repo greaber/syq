@@ -2164,6 +2164,11 @@ fn endpoint_candidates(
     syntax: EndpointSyntax,
     explicit_scope: Option<&str>,
 ) -> Vec<Candidate> {
+    // A leading @ selects a registered receiving name, never an empty SSH
+    // username. Do not turn ordinary host inventory into receiving names.
+    if current.starts_with(b"@") {
+        return Vec::new();
+    }
     let typed = std::str::from_utf8(current).unwrap_or_default();
     let typed_user = typed.rsplit_once('@').map(|(user, _)| user);
     let mut endpoints = Vec::new();
