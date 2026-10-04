@@ -2009,14 +2009,79 @@ fn completion_cache_skips_repeated_hosts_and_replaces_damaged_files() {
     assert_eq!(listed.stdout, b"fake.example\n");
 }
 
-// A recorded approved master with a fake SSH liveness/configuration check.
+// A recorded approved master with an owned live socket for readiness probes;
+// the fake SSH command handles configuration and session execution.
+struct ApprovedCompletionListener {
+    stop: std::os::unix::net::UnixStream,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApprovedCompletionListener {
+    fn bind(path: &Path) -> Self {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stop, cancelled) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || loop {
+            let mut events = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: cancelled.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let result = unsafe { libc::poll(events.as_mut_ptr(), events.len() as _, -1) };
+            if result < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            assert!(result > 0, "poll completion fixture listener");
+            if events[1].revents != 0 {
+                break;
+            }
+            // Readiness probes only connect. Drain them so a long test does
+            // not fill the socket backlog or need a fake ssh -O check.
+            match listener.accept() {
+                Ok((probe, _)) => drop(probe),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("accept completion readiness probe: {error}"),
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for ApprovedCompletionListener {
+    fn drop(&mut self) {
+        self.stop.shutdown(std::net::Shutdown::Both).unwrap();
+        self.worker.take().unwrap().join().unwrap();
+    }
+}
 const APPROVED_LOCAL_CONFIG: &str =
     "user approved\nhostname resolved.example\nport 2222\nhostkeyalgorithms ssh-ed25519\n";
-fn approved_completion_master(t: &Tmp, authorizer: &str) -> PathBuf {
+fn approved_completion_master(t: &Tmp, authorizer: &str) -> (PathBuf, ApprovedCompletionListener) {
     approved_completion_master_in(t, authorizer, None)
 }
 
-fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path>) -> PathBuf {
+fn approved_completion_master_in(
+    t: &Tmp,
+    authorizer: &str,
+    domain: Option<&Path>,
+) -> (PathBuf, ApprovedCompletionListener) {
     let scope = ephemeral_scope(t);
     let parent = domain.unwrap_or_else(|| scope.parent().unwrap());
     let approved = parent.join(format!("approved-{authorizer}"));
@@ -2035,7 +2100,7 @@ fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
     }
-    let _listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
+    let listener = ApprovedCompletionListener::bind(&control);
     #[derive(serde::Serialize)]
     struct Endpoint<'a> {
         user: Option<&'a str>,
@@ -2147,7 +2212,7 @@ fn approved_completion_master_in(t: &Tmp, authorizer: &str, domain: Option<&Path
         "selected": selected, "checked": now, "attempted": now});
     write(&path, &serde_json::to_vec(&entry).unwrap());
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-    control
+    (control, listener)
 }
 
 fn approved_completion_fixture(t: &Tmp) {
@@ -2181,7 +2246,7 @@ fn approved_completion_command(t: &Tmp, words: &[&str]) -> Command {
 fn approved_completion_respects_authorization_for_source_and_destination_paths() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
-    let control = approved_completion_master(&t, "laptop");
+    let (control, _master) = approved_completion_master(&t, "laptop");
     let path = format!("{}/n", t.s("remote-home/data"));
     for source in [false, true] {
         for mode in [None, Some("auto"), Some("@laptop"), Some("ssh")] {
@@ -2318,7 +2383,7 @@ fn approved_completion_respects_authorization_for_source_and_destination_paths()
 fn approved_completion_keeps_cached_policy_read_only_and_provider_bound() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
-    let control = approved_completion_master(&t, "laptop");
+    let (control, _master) = approved_completion_master(&t, "laptop");
     let directory = control
         .parent()
         .unwrap()
@@ -2394,7 +2459,7 @@ fn approved_completion_keeps_cached_policy_read_only_and_provider_bound() {
 fn ordinary_provider_completion_never_establishes_a_provider_or_native_fallback() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
-    approved_completion_master(&t, "laptop");
+    let _master = approved_completion_master(&t, "laptop");
     let path = format!("{}/n", t.s("remote-home/data"));
     let remote_path = format!("backup:{path}");
     for saved in [false, true] {
@@ -2458,7 +2523,7 @@ fn ordinary_provider_completion_never_establishes_a_provider_or_native_fallback(
 fn approved_completion_selected_and_unselected_masters_keep_their_routes() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
-    let control = approved_completion_master(&t, "laptop");
+    let (control, _master) = approved_completion_master(&t, "laptop");
     let path = format!("{}/n", t.s("remote-home/data"));
     let words = |mode| {
         vec![
@@ -2523,20 +2588,33 @@ fn approved_completion_selected_and_unselected_masters_keep_their_routes() {
     );
     fs::remove_file(t.path("rsh.log")).unwrap();
 
-    fs::remove_file(control).unwrap();
-    let output = approved_completion_command(&t, &words("@laptop"))
-        .run()
-        .unwrap();
-    assert_output_ok(&output);
-    assert!(output.stdout.is_empty());
-    assert!(!t.path("rsh.log").exists());
+    drop(_master);
+    assert!(
+        control.exists(),
+        "stopped master should leave a stale socket"
+    );
+    for missing in [false, true] {
+        if missing {
+            fs::remove_file(&control).unwrap();
+        }
+        let output = approved_completion_command(&t, &words("@laptop"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no live approved account connection"),
+            "missing={missing}: {output:?}"
+        );
+        assert!(!t.path("rsh.log").exists());
+    }
 }
 
 #[test]
 fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
-    approved_completion_master(&t, "laptop");
+    let _master = approved_completion_master(&t, "laptop");
     write(
         &t.path("config/syq/auth-from.json"),
         br#"{"default":"@missing"}"#,
@@ -2597,9 +2675,9 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
 fn approved_completion_uses_only_selected_domain_preferences_and_accounts() {
     let t = Tmp::new();
     approved_completion_fixture(&t);
-    let global = approved_completion_master(&t, "laptop");
+    let (global, _global_master) = approved_completion_master(&t, "laptop");
     let scope = ephemeral_scope(&t);
-    let scoped = approved_completion_master_in(&t, "laptop", Some(&scope));
+    let (scoped, _scoped_master) = approved_completion_master_in(&t, "laptop", Some(&scope));
     write(
         &t.path("config/syq/auth-from.json"),
         br#"{"default":"@missing"}"#,
@@ -2684,19 +2762,16 @@ fn approved_completion_auto_ignores_malformed_optional_state() {
     ] {
         let t = Tmp::new();
         approved_completion_fixture(&t);
-        let index = if damaged != "persistence-without-index" {
-            let control = approved_completion_master(&t, "laptop");
-            Some(
-                control
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .join("authorized-ssh-v1"),
-            )
-        } else {
-            None
-        };
+        let master = (damaged != "persistence-without-index")
+            .then(|| approved_completion_master(&t, "laptop"));
+        let index = master.as_ref().map(|(control, _listener)| {
+            control
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("authorized-ssh-v1")
+        });
         if damaged == "unrelated-index" {
             let path = index.as_ref().unwrap().join("unrelated.json");
             write(&path, b"{");
