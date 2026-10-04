@@ -333,7 +333,9 @@ other SSH logins reopen on their next use. Syq installs no login service, so
 connect again after reboot. Copies are not queued or retried automatically.
 
 Use `syq persist receive wait server --timeout 30` to wait without starting or
-restarting a connection. On the server:
+restarting a connection. `syq ssh` can open or reuse a persistent SSH login,
+but does not start receiving; use a file operation or `persist connect` for that.
+On the server:
 
 ```sh
 syq persist destinations list

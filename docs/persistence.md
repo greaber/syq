@@ -27,8 +27,10 @@ other than `ssh`, connect with that command each time instead.
 Persistence also speeds up [remote path completion](install.md#shell-completion):
 completion reuses the open connection, avoiding a new SSH login for each lookup.
 
-In the default persistence domain, receiving starts automatically with persistent
-connections unless you have turned it off. It lets connected servers request file copies to your machine,
+In the default persistence domain, copies, remote file operations, and
+`persist connect` start receiving automatically unless you have turned it off.
+`syq ssh` reuses persistent connections but does not start receiving itself.
+Receiving lets connected servers request file copies to your machine,
 commands on it, and authorization for copies between servers,
 with approval on your machine. See [Use your laptop from a server](receive.md)
 for setup and approval controls.
