@@ -1382,7 +1382,10 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     let responder = std::thread::spawn(move || {
         let mut messages = Vec::new();
         for _ in 0..10 {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // The client first tries SSH, and later exercises commands that
+            // must not contact this listener at all. Their process startup
+            // time is not part of the authorization-ordering assertion.
+            let deadline = Instant::now() + Duration::from_secs(60);
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
                 match listener.accept() {

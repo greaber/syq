@@ -1,6 +1,19 @@
 use super::*;
 use std::time::Duration;
 
+#[cfg(debug_assertions)]
+fn paced_bytes(t: &Tmp) -> usize {
+    let events = match fs::read_to_string(t.path("paced")) {
+        Ok(events) => events,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("read pacing events: {error}"),
+    };
+    events
+        .lines()
+        .map(|line| line.parse::<usize>().unwrap())
+        .sum()
+}
+
 fn command(t: &Tmp, mode: u8, pull: bool, rate: &str) -> Command {
     let mut cmd = automatic_command(t, mode, pull, rate);
     cmd.arg("--performance-tuning=workers=4");
@@ -110,8 +123,8 @@ fn network_compression_is_charged_after_compressing() {
         write(&t.path("src"), &vec![b'x'; 4 << 20]);
         let mut cmd = command(&t, mode, pull, "1M");
         cmd.arg("--performance-tuning=bw-pacing=average")
-            .args(paths(&t, pull, false));
-        let start = std::time::Instant::now();
+            .args(paths(&t, pull, false))
+            .env("SYQ_TEST_PACED_BYTES", t.path("paced"));
         let out = cmd.run().unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
@@ -119,10 +132,17 @@ fn network_compression_is_charged_after_compressing() {
             stderr_of(&out).matches("bw-pacing has no effect").count(),
             1
         );
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "logical bytes appear to be paced: {out:?}"
-        );
+        // Measure what the budget charged, independently of process startup
+        // and scheduler delays. Include TCP, SSH, and partial-TCP fallback.
+        #[cfg(debug_assertions)]
+        {
+            let charged = paced_bytes(&t);
+            assert!(charged > 0, "compressed data bypassed pacing: {out:?}");
+            assert!(
+                charged < 64 * 1024,
+                "paced {charged} bytes for compressible data: {out:?}"
+            );
+        }
     }
 }
 
@@ -222,8 +242,8 @@ fn declining_small_copy_leaves_control_traffic_unpaced() {
     let t = Tmp::new();
     let mut sources = Vec::new();
     // Each file exceeds the small-copy ceiling but the destination already
-    // matches. No data should move; long names make the later stat/planning
-    // requests alone take much longer than the deadline if control is paced.
+    // matches. No data should move. Long names exercise substantial control
+    // traffic, whose actual budget charges must remain zero.
     for n in 0..64 {
         let name = format!("{n:02}-{}", "x".repeat(160));
         for directory in ["src", "dst"] {
@@ -242,14 +262,17 @@ fn declining_small_copy_leaves_control_traffic_unpaced() {
     let mut cmd = command(&t, 1, false, "1"); // 1 KiB/s
     let child = cmd
         .arg("--no-compress")
+        .env("SYQ_TEST_PACED_BYTES", t.path("paced"))
         .args(&sources)
         .args(["--to", "127.0.0.1", "--into", &t.s("dst")])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let out = wait_for_child_output(child, Duration::from_secs(8));
+    let out = wait_for_child_output(child, Duration::from_secs(60));
     assert_output_ok(&out);
+    #[cfg(debug_assertions)]
+    assert_eq!(paced_bytes(&t), 0, "control traffic was paced: {out:?}");
     assert_eq!(tuning_observed(&out)["native_small_copies"], 0, "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("128 MiB unchanged (64 files)"),

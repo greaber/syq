@@ -287,6 +287,9 @@ impl Worker {
                 .destination(idx)
                 .is_none_or(|existing| self.replaces_in_batch(j, existing))
             && (!self.opts.inplace || j.inplace)
+            // A restricted receiver's in-place grant refuses batched
+            // publication.
+            && !(self.opts.restricted_receiver && self.opts.inplace)
     }
 
     /// An existing file can take the same batch as a new file when this copy

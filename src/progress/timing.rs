@@ -182,13 +182,26 @@ mod tests {
         assert_eq!(measured.planning_ms, Some(27_000));
         assert_eq!(measured.transfer_ms, Some(20_000));
         assert_eq!(measured.finalization_ms, Some(2_000));
-        // A live guard contributes through the snapshot boundary too.
-        let live = clock.planning.begin();
-        let now = Instant::now();
-        let spans = clock.planning.spans(origin, now);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans.last().unwrap().1, now);
-        drop(live);
         assert_eq!(clock.snapshot(origin, None).total_ms, 50_000);
+    }
+
+    #[test]
+    fn live_measurements_use_the_snapshot_boundary_even_on_the_same_clock_tick() {
+        let origin = Instant::now() - Duration::from_secs(60);
+        let at = |n| origin + Duration::from_secs(n);
+        let measurement = Measurement::default();
+        measurement.record((at(18), at(35)));
+        measurement.record((at(30), at(45)));
+        let live = measurement.begin();
+        // Control both timestamps: consecutive Instant::now() calls can be equal.
+        // The guard stays open while snapshots move from its start into its work.
+        measurement.0.lock().unwrap()[live.index].0 = at(47);
+        assert_eq!(measurement.spans(origin, at(47)), vec![(at(18), at(45))]);
+        assert_eq!(
+            measurement.spans(origin, at(50)),
+            vec![(at(18), at(45)), (at(47), at(50))]
+        );
+        assert_eq!(measurement.spans(at(48), at(50)), vec![(at(48), at(50))]);
+        drop(live);
     }
 }

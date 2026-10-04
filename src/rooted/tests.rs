@@ -184,16 +184,44 @@ fn apfs_clone_refuses_compression_added_after_source_snapshot() {
     let t = TestDir::new("clone-raced-compression");
     let original = t.path().join("original");
     let compressed = t.path().join("compressed");
-    let data = b"compressible test data\n".repeat(250_000);
+    let data = b"compressible test data\n".repeat(1_000);
     fs::write(&original, &data).unwrap();
     let snapshot = fs::metadata(&original).unwrap();
-    assert!(Command::new("/usr/bin/ditto")
-        .arg("--hfsCompression")
-        .arg(&original)
-        .arg(&compressed)
-        .status_guarded()
-        .unwrap()
-        .success());
+    // Build one inline zlib-compressed block explicitly: ditto may succeed
+    // without choosing compression. The decmpfs header stores little-endian
+    // magic, type 3 (data in the xattr), and logical size, followed by zlib.
+    // Large resource-fork compression is covered by the integration tests.
+    let mut encoded = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoded.write_all(&data).unwrap();
+    let mut attribute = 0x636d7066u32.to_le_bytes().to_vec();
+    attribute.extend_from_slice(&3u32.to_le_bytes());
+    attribute.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    attribute.extend_from_slice(&encoded.finish().unwrap());
+    assert!(data.len() <= 65536 && attribute.len() <= 3802);
+    let file = File::create(&compressed).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"com.apple.decmpfs".as_ptr(),
+                attribute.as_ptr().cast(),
+                attribute.len(),
+                0,
+                0,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        unsafe { libc::fchflags(file.as_raw_fd(), libc::UF_COMPRESSED) },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    drop(file);
+    assert_eq!(fs::read(&compressed).unwrap(), data);
     let source = File::open(&compressed).unwrap();
     assert_ne!(
         source.metadata().unwrap().st_flags() & libc::UF_COMPRESSED,
@@ -1204,6 +1232,20 @@ fn adopted_operator_descriptor_stays_stable_and_can_be_enumerated_repeatedly() {
     assert_eq!(first, [b"first".to_vec(), b"second".to_vec()]);
     assert_eq!(second, first);
     assert!(root.metadata(&relative(b"replacement")).is_err());
+}
+
+#[test]
+fn an_open_directory_is_empty_until_any_entry_appears() {
+    let t = TestDir::new("emptiness");
+    fs::create_dir(t.path().join("d")).unwrap();
+    let root = Root::open(t.path()).unwrap();
+    let directory = root.open_directory(&relative(b"d")).unwrap();
+    assert!(root.open_directory_is_empty(&directory).unwrap());
+    fs::write(t.path().join("d/.hidden"), b"").unwrap();
+    assert!(!root.open_directory_is_empty(&directory).unwrap());
+    fs::remove_file(t.path().join("d/.hidden")).unwrap();
+    fs::create_dir(t.path().join("d/sub")).unwrap();
+    assert!(!root.open_directory_is_empty(&directory).unwrap());
 }
 
 #[test]

@@ -491,6 +491,11 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
+    /// Names asked about so far in each directory of the destination, to
+    /// decide when one is worth listing before its stats; `None` once it has
+    /// been listed or turned out not to be on NFS.
+    #[cfg(target_os = "linux")]
+    listing_requests: HashMap<PathBytes, Option<usize>>,
 }
 
 struct ComparisonWindow {
@@ -692,6 +697,8 @@ impl FsOps {
             allow_unconfined_source_paths: false,
             destination_root: None,
             destination_prefix: None,
+            #[cfg(target_os = "linux")]
+            listing_requests: HashMap::new(),
         }
     }
 
@@ -1826,6 +1833,8 @@ impl FsOps {
         self.held_basis.take();
         self.destination_prefix = Some(request_prefix.to_vec());
         self.destination_root = Some(root);
+        #[cfg(target_os = "linux")]
+        self.listing_requests.clear();
         Ok(())
     }
 
@@ -1931,9 +1940,7 @@ impl FsOps {
     /// namespace replacement cannot redirect the read outside the capability.
     fn selected_directory_empty(directory: &File) -> Option<bool> {
         let root = Root::from_directory(directory.try_clone().ok()?).ok()?;
-        root.read_open_directory(directory)
-            .ok()
-            .map(|entries| entries.is_empty())
+        root.open_directory_is_empty(directory).ok()
     }
 
     fn destination_relative(&self, path: &[u8]) -> Result<PathBytes> {
@@ -2488,6 +2495,8 @@ impl FsOps {
             if follow {
                 return vec![None; paths.len()];
             }
+            #[cfg(target_os = "linux")]
+            list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
             return parallel_map_init(
                 paths,
                 || None,
@@ -2729,6 +2738,125 @@ struct HeldMetadataParent {
     root: Arc<Root>,
     path: PathBytes,
     directory: File,
+}
+
+/// A directory is listed before its entries are stat'ed once at least this
+/// many of them have been asked about.
+#[cfg(target_os = "linux")]
+const LISTING_MIN_NAMES: usize = 16;
+/// A listing costs the client a few microseconds for every entry it reads,
+/// about what a lookup costs per name when lookups run in parallel on a
+/// fast network, so a directory is listed only when its size says it is
+/// not much larger than the names asked about so far: at most this many
+/// bytes per name plus one block, against 25 to 60 bytes per entry on most
+/// filesystems.
+#[cfg(target_os = "linux")]
+const LISTING_BYTES_PER_NAME: u64 = 256;
+#[cfg(target_os = "linux")]
+const LISTING_SLACK_BYTES: u64 = 4 << 10;
+/// Whatever size the filesystem reports (ZFS reports its entry count), the
+/// listing stops after this many entries per name, enough to reach the end
+/// of any directory the size allows.
+#[cfg(target_os = "linux")]
+const LISTING_ENTRIES_PER_NAME: usize = 16;
+/// Directories remembered for listing before the record starts over.
+#[cfg(target_os = "linux")]
+const LISTING_DIRECTORIES_MAX: usize = 1 << 16;
+
+/// Count the given relative paths into `requests` by parent directory, and
+/// return the directories now asked about often enough to be listed, each
+/// with this batch's first path in it and the names asked about so far.
+/// Absolute paths are left to the stat itself.
+#[cfg(target_os = "linux")]
+fn directories_to_list<'a>(
+    paths: &'a [PathBytes],
+    requests: &mut HashMap<PathBytes, Option<usize>>,
+) -> Vec<(&'a [u8], &'a [u8], usize)> {
+    let mut batch: HashMap<&[u8], (&[u8], usize)> = HashMap::new();
+    for path in paths {
+        if path.starts_with(b"/") {
+            continue;
+        }
+        let parent = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(separator) => &path[..separator],
+            None => &b""[..],
+        };
+        batch.entry(parent).or_insert((path.as_slice(), 0)).1 += 1;
+    }
+    if requests.len() > LISTING_DIRECTORIES_MAX {
+        requests.clear();
+    }
+    let mut candidates = Vec::new();
+    for (parent, (first, names)) in batch {
+        let Some(asked) = requests.entry(parent.to_vec()).or_insert(Some(0)) else {
+            continue;
+        };
+        *asked += names;
+        if *asked >= LISTING_MIN_NAMES {
+            candidates.push((parent, first, *asked));
+        }
+    }
+    candidates
+}
+
+/// List each NFS directory that enough of the paths about to be stat'ed
+/// are in. The first stat of a name that another process created makes the
+/// NFS client confirm the entry with the server, one LOOKUP per name; a
+/// listing confirms every entry it reads in one request per few hundred and
+/// leaves their stats to the client's cache. A local filesystem answers
+/// either from memory, so only NFS directories are listed. A listing tells
+/// the client nothing about names that do not exist, so a directory is
+/// listed only when the first requested name is there. Each directory is
+/// listed at most once per destination.
+#[cfg(target_os = "linux")]
+fn list_nfs_directories_before_stats(
+    root: &Arc<Root>,
+    paths: &[PathBytes],
+    requests: &mut HashMap<PathBytes, Option<usize>>,
+) {
+    let candidates = directories_to_list(paths, requests);
+    // Whether the directory is settled: listed, or not on NFS.
+    let list = |(parent, first, names): &(&[u8], &[u8], usize)| -> bool {
+        let Ok(relative) = RelativePath::new(parent) else {
+            return true;
+        };
+        let Ok(directory) = root.open_directory(&relative) else {
+            return false;
+        };
+        let Ok((_, traits)) = directory_file_system(&directory) else {
+            return false;
+        };
+        if !traits.is_nfs {
+            return true;
+        }
+        let Ok(metadata) = directory.metadata() else {
+            return false;
+        };
+        let expected = LISTING_BYTES_PER_NAME.saturating_mul(*names as u64);
+        if metadata.len() > expected.saturating_add(LISTING_SLACK_BYTES) {
+            return false;
+        }
+        let Ok(first) = RelativePath::new(first) else {
+            return false;
+        };
+        if !matches!(root.metadata_optional(&first), Ok(Some(_))) {
+            return false;
+        }
+        let _ =
+            root.walk_open_directory(&directory, names.saturating_mul(LISTING_ENTRIES_PER_NAME));
+        true
+    };
+    let settled: Vec<bool> = if candidates.len() < 2 {
+        candidates.iter().map(list).collect()
+    } else {
+        use rayon::prelude::*;
+        metadata_pool().install(|| candidates.par_iter().map(list).collect())
+    };
+    for ((parent, _, _), settled) in candidates.iter().zip(settled) {
+        if settled {
+            requests.insert(parent.to_vec(), None);
+        }
+    }
 }
 
 fn stat_with_parent(
