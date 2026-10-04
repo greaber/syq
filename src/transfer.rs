@@ -1466,8 +1466,6 @@ struct DestinationAnchor {
     dev: u64,
     ino: u64,
 }
-/// A data worker's slot and its thread.
-type WorkerThread = (usize, std::thread::JoinHandle<Result<()>>);
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 type SourceRootsSlot = std::sync::Arc<std::sync::OnceLock<Vec<RegisteredSourceRoot>>>;
 
@@ -2214,7 +2212,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let source_roots: SourceRootsSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor_required = args.restricted_grant.is_none();
-    let workers: Arc<Mutex<Vec<WorkerThread>>> = Arc::new(Mutex::new(Vec::new()));
+    let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let connect_after_file_plan = Arc::new(AtomicBool::new(false));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
@@ -2308,8 +2307,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
-                    // A worker still connecting when every file is finished
-                    // is no longer joined, so it stops quietly.
+                    // Once every file is finished, a connection, or a retry,
+                    // would have nothing to do.
                     if !gate.connection_needed(id) || sched.finished() {
                         gate.mark_absent(id);
                         return Ok(());
@@ -2353,6 +2352,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             }
                             return if gate.allowed(id) { Err(error) } else { Ok(()) };
                         }
+                        // The copy no longer needs this connection: a retry
+                        // would only delay its end.
                         Err(_) if sched.finished() => {
                             gate.mark_absent(id);
                             return Ok(());
@@ -2464,7 +2465,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                 }
             });
-            workers.lock().unwrap().push((id, h));
+            workers.lock().unwrap().push(h);
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
@@ -3430,13 +3431,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !opts.inplace
         && (!destination_anchor_required || destination_anchor.get().is_some())
     {
-        // Every selected regular file is work for a fresh destination. One
-        // worker connects once planning sees one, while the control
-        // connection creates directories; the usual startup decision still
-        // chooses how many more to start. For an existing destination the
-        // file may turn out unchanged, so the worker starts early only when
-        // it needs no new login, and a copy with nothing to send does not
-        // wait for it.
+        // One worker connects while planning finishes; the usual startup
+        // decision still chooses how many more to start. Every selected
+        // regular file is work for a fresh destination, so the worker
+        // connects once planning sees one, while the control connection
+        // creates directories. An existing destination may already hold the
+        // file, so there the worker connects only once planning queues a file
+        // to send, and starts early only when it needs no new login. A copy
+        // with nothing to send then opens no data connection.
         connect_after_file_plan.store(true, Relaxed);
         gate.set_active(1);
         for id in gate.begin_warming(1) {
@@ -3909,13 +3911,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
-        for (id, w) in batch {
-            // Once every file is finished, a worker still connecting has
-            // nothing to do. Leave it behind rather than let its setup delay
-            // the end of the copy; the process exit closes its connection.
-            if !w.is_finished() && sched.finished() && gate.warming(id) {
-                continue;
-            }
+        for w in batch {
             match w.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {

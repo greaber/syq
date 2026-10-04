@@ -603,52 +603,101 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
     assert!(partial_files(&t.0).is_empty());
 }
 
-/// A worker that starts connecting before planning ends is not waited for
-/// when planning finds nothing to send.
+/// For an existing destination, the worker that connects during planning
+/// waits until planning queues a file to send, so an unchanged copy opens no
+/// worker connection. No copy leaves private temporary directories behind.
 #[cfg(debug_assertions)]
 #[test]
-fn a_copy_with_nothing_to_send_does_not_wait_for_an_early_worker() {
-    let t = Tmp::new();
-    let rsh = fake_rsh(&t);
-    for name in ["a", "b"] {
-        for side in ["src", "dst"] {
-            let path = t.path(&format!("{side}/{name}"));
-            write(&path, name.as_bytes());
-            set_mtime(&path, 1_600_000_000);
+fn an_early_worker_connects_only_for_a_file_to_send() {
+    for (tcp, changed) in [(true, false), (true, true), (false, false), (false, true)] {
+        let case = format!("tcp={tcp} changed={changed}");
+        let t = Tmp::new();
+        for name in ["a", "b", "c"] {
+            for side in ["src", "dst"] {
+                let path = t.path(&format!("{side}/{name}"));
+                write(&path, name.as_bytes());
+                set_mtime(&path, 1_600_000_000);
+            }
         }
+        if changed {
+            write(&t.path("src/b"), b"changed");
+            set_mtime(&t.path("src/b"), 1_600_000_000);
+        }
+        // Both ends create their private directories here. It is short
+        // enough for the sockets inside them.
+        let temporary = t.runtime();
+        fs::create_dir(&temporary).unwrap();
+        let mut command = if tcp {
+            let mut command = compat_command();
+            command
+                .arg("-e")
+                .arg(fake_rsh(&t))
+                .arg("--rsync-path")
+                .arg(env!("CARGO_BIN_EXE_syq"))
+                .args([
+                    "--syq-tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "-a",
+                    "--no-progress",
+                ])
+                .arg(format!("{}/", t.s("src")))
+                .arg(format!("127.0.0.1:{}/", t.s("dst")));
+            command
+        } else {
+            // Over SSH, the first worker is a channel on the copy's own
+            // connection, so it too connects early.
+            let ssh = fake_ssh(&t);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command
+                .args(["cp", "--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-tcp"])
+                .args(["-q", "--srcs-in"])
+                .arg(t.path("src"))
+                .args(["--to", "fake.example", "--into"])
+                .arg(t.path("dst"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+                );
+            command
+        };
+        let started = t.path("worker-started");
+        let events = t.path("worker-events");
+        let out = command
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("TMPDIR", &temporary)
+            .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/b")), read(&t.path("src/b")), "{case}");
+        let connected = fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("connected "))
+            .count();
+        assert_eq!(started.exists(), changed, "{case}: {out:?}");
+        assert_eq!(connected > 0, changed, "{case}: {out:?}");
+        // A leaked directory stays; a helper's own cleanup may trail its exit.
+        let leftovers = || {
+            fs::read_dir(&temporary)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("syq-"))
+                .collect::<Vec<_>>()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut left = leftovers();
+        while !left.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            left = leftovers();
+        }
+        assert!(left.is_empty(), "{case}: left {left:?}: {out:?}");
     }
-    let waiting = t.path("worker-zero-waiting");
-    let started = std::time::Instant::now();
-    let out = compat_command()
-        .arg("-e")
-        .arg(&rsh)
-        .arg("--rsync-path")
-        .arg(env!("CARGO_BIN_EXE_syq"))
-        .args([
-            "--syq-tcp-ports",
-            EPHEMERAL_TCP_PORTS,
-            "-a",
-            "--no-progress",
-        ])
-        .arg(format!("{}/", t.s("src")))
-        .arg(format!("127.0.0.1:{}/", t.s("dst")))
-        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
-        .env("FAKE_RSH_LOG", t.path("rsh.log"))
-        .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_CACHE_HOME", t.path("cache"))
-        // Hold the first worker before it connects, past the end of the copy.
-        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &waiting)
-        .env("SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE", t.path("never"))
-        .run()
-        .unwrap();
-    assert_output_ok(&out);
-    assert!(waiting.exists(), "no worker started early: {out:?}");
-    // The held worker would keep the copy waiting for a minute.
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(30),
-        "{out:?}"
-    );
 }
 
 #[test]

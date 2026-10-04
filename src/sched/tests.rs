@@ -652,6 +652,19 @@ fn eager_connections_wait_for_a_planned_file_and_skip_empty_scans() {
     };
     empty.scan_done();
     assert!(!waiter.join().unwrap());
+
+    // Planning anticipates no work for an existing destination, whose files
+    // may be unchanged; its first queued file wakes the waiter instead.
+    let queued = Arc::new(Sched::new(64, 128));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let sched = queued.clone();
+        std::thread::spawn(move || tx.send(sched.wait_for_anticipated_file_work()).unwrap())
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    queued.push_file(test_job(b"source", 4096));
+    assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    waiter.join().unwrap();
 }
 
 #[test]

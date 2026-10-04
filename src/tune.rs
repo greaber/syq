@@ -1099,16 +1099,6 @@ impl Gate {
         self.record_slot(id, "ready");
     }
 
-    /// Whether a worker is still setting up its connections. Once every file
-    /// is finished, such a worker has no work to do.
-    pub fn warming(&self, id: usize) -> bool {
-        self.slots
-            .lock()
-            .unwrap()
-            .get(id)
-            .is_some_and(|slot| slot.phase == SlotPhase::Warming)
-    }
-
     /// Begin connection setup, preserving the start across retries/backoff.
     pub fn mark_warming(&self, id: usize) {
         let mut slots = self.slots.lock().unwrap();
