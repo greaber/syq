@@ -6,7 +6,10 @@ use crate::process::CommandExt as _;
 use ssh_key::{Algorithm, PublicKey};
 use zeroize::Zeroizing;
 
+mod agent;
 mod wrapping;
+
+use agent::has_key as agent_has_key;
 
 pub(crate) enum EnrollmentSigningKey {
     Private(PrivateKey),
@@ -237,26 +240,6 @@ pub(super) fn configure_key_agent(
         Some(provider.to_owned())
     };
     Ok(())
-}
-
-fn agent_has_key(socket: &Path, key: &PublicKey) -> Result<bool> {
-    let output = Command::new("ssh-add")
-        .arg("-L")
-        .env("SSH_AUTH_SOCK", socket)
-        .capture_output()
-        .context("list SSH agent keys")?;
-    match output.status.code() {
-        Some(0) => Ok(std::str::from_utf8(&output.stdout)
-            .context("SSH agent public keys are not UTF-8")?
-            .lines()
-            .filter_map(|line| PublicKey::from_openssh(line).ok())
-            .any(|candidate| candidate.key_data() == key.key_data())),
-        Some(1) => Ok(false),
-        _ => bail!(
-            "cannot query SSH agent: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    }
 }
 
 /// OpenSSH 8.9 verifies SSHSIG cryptography but does not enforce FIDO user
