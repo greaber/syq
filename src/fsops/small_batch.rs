@@ -5,12 +5,17 @@
 //! inode metadata are written between the two bursts, outside any turn.
 use super::*;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError>;
 
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
+
+/// Threads a run writes and closes its files on, on a network filesystem.
+/// Creating and renaming stay one at a time per directory, so a few threads
+/// keep the rest shorter than the creates.
+const PARALLEL_WRITES: usize = 8;
 
 /// A small file's private sidecar between its creation and publication.
 pub(super) struct SmallStage {
@@ -23,6 +28,64 @@ pub(super) struct SmallStage {
     /// from the create's reply; it decides the metadata step and gives the
     /// published identity, which a rename does not change.
     created: fs::Metadata,
+}
+
+/// Apply `each` to `items` on up to `PARALLEL_WRITES` threads, in order.
+/// This thread runs the first part, as it would otherwise only wait, and
+/// any part whose thread the system refuses to start.
+fn on_threads<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let per_thread = items.len().div_ceil(PARALLEL_WRITES).max(1);
+    let mut parts = Vec::new();
+    let mut items = items.into_iter().peekable();
+    while items.peek().is_some() {
+        parts.push(Mutex::new(Some(
+            items.by_ref().take(per_thread).collect::<Vec<_>>(),
+        )));
+    }
+    let Some((first, rest)) = parts.split_first() else {
+        return Vec::new();
+    };
+    // Whichever thread runs a part takes it. A thread that could not start
+    // never took its part, so this thread finds it still there.
+    let run = |part: &Mutex<Option<Vec<T>>>| {
+        let part = part.lock().unwrap().take().unwrap_or_default();
+        part.into_iter().map(&each).collect::<Vec<_>>()
+    };
+    let run = &run;
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = rest
+            .iter()
+            .map(|part| start_thread(scope, move || run(part)).ok())
+            .collect();
+        let mut results = run(first);
+        for (part, thread) in rest.iter().zip(threads) {
+            results.extend(match thread {
+                Some(thread) => thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                None => run(part),
+            });
+        }
+        results
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Refuses the threads this thread starts, as a process limit would.
+    static REFUSE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Start `work` on a thread of `scope`, unless the system refuses one.
+fn start_thread<'scope, R: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    work: impl FnOnce() -> R + Send + 'scope,
+) -> io::Result<std::thread::ScopedJoinHandle<'scope, R>> {
+    #[cfg(test)]
+    if REFUSE_THREADS.get() {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, work)
 }
 
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
@@ -151,8 +214,35 @@ impl FsOps {
                 }
             }
         }
+        // Writing data and metadata needs no directory turn. On a network
+        // filesystem each step waits a round trip, so the files of a run
+        // are written on threads of their own: every worker's runs proceed
+        // at once, as when each worker wrote its files in turn. Only this
+        // thread records observations, so the whole phase, metadata
+        // included, counts as writing.
+        let network = stages.first().is_some_and(|(_, stage)| {
+            stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
+        });
+        let written: Vec<Result<()>> = if network {
+            let writing = self
+                .operation
+                .span(crate::transfer_observations::Stage::DestinationWrite);
+            let bytes = AtomicU64::new(0);
+            let this = &*self;
+            let written = on_threads(stages.iter().collect(), |(index, stage)| {
+                this.write_small_stage(&puts[*index], stage, Some(&bytes))
+            });
+            writing.bytes(bytes.into_inner());
+            written
+        } else {
+            stages
+                .iter()
+                .map(|(index, stage)| self.write_small_stage(&puts[*index], stage, None))
+                .collect()
+        };
+        let mut written = written.into_iter();
         stages.retain(
-            |(index, stage)| match self.write_small_stage(&puts[*index], stage) {
+            |(index, _)| match written.next().expect("one result per stage") {
                 Ok(()) => true,
                 Err(error) => {
                     results[*index] = Err(wire_error(&error));
@@ -177,10 +267,21 @@ impl FsOps {
                 }
             }
         }
-        for (index, stage) in published {
-            results[index] = self
+        // Closing a file is a round trip on NFS too, so on a network
+        // filesystem the files are finished and closed on threads as well.
+        let finish = |(index, stage): (usize, SmallStage)| {
+            let result = self
                 .finish_small_stage(&puts[index], stage)
                 .map_err(|error| wire_error(&error));
+            (index, result)
+        };
+        let finished = if network {
+            on_threads(published, finish)
+        } else {
+            published.into_iter().map(finish).collect()
+        };
+        for (index, result) in finished {
+            results[index] = result;
         }
     }
 
@@ -240,7 +341,15 @@ impl FsOps {
         Ok(Some((file, metadata, basis_size)))
     }
 
-    pub(super) fn write_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
+    /// Write a staged file's data and metadata. The data write is observed,
+    /// or, on a thread that cannot record observations, its bytes are added
+    /// to `unobserved` once written, whatever the metadata step does.
+    pub(super) fn write_small_stage(
+        &self,
+        put: &SmallPut,
+        stage: &SmallStage,
+        unobserved: Option<&AtomicU64>,
+    ) -> Result<()> {
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SMALL_STAGE_READY_FILE",
@@ -250,8 +359,13 @@ impl FsOps {
         if stage.reused {
             stage.file.set_len(0)?;
         }
-        observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
-            .with_context(|| format!("write {}", stage.label.display()))?;
+        match unobserved {
+            None => observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse),
+            Some(bytes) => write_data(&stage.file, &put.data, 0, self.sparse).inspect(|()| {
+                bytes.fetch_add(put.data.len() as u64, Ordering::Relaxed);
+            }),
+        }
+        .with_context(|| format!("write {}", stage.label.display()))?;
         check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
@@ -516,12 +630,12 @@ mod tests {
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(!stage.reused);
-        ops.write_small_stage(&file, &stage).unwrap();
+        ops.write_small_stage(&file, &stage, None).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(stage.reused);
-        ops.write_small_stage(&file, &stage).unwrap();
+        ops.write_small_stage(&file, &stage, None).unwrap();
         ops.publish_small_stage(&file, &stage).unwrap();
         assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
         assert_eq!(
@@ -749,6 +863,39 @@ mod tests {
             (published.mtime(), published.mtime_nsec()),
             (1_000_000_000, 123_456_789)
         );
+    }
+
+    #[test]
+    fn parts_keep_their_order_when_threads_are_refused() {
+        // This thread runs the first part itself, and every part when no
+        // thread starts; a panic in any part reaches the caller.
+        let caller = std::thread::current().id();
+        let first_part = 20usize.div_ceil(PARALLEL_WRITES);
+        for refused in [false, true] {
+            REFUSE_THREADS.set(refused);
+            let ran = on_threads((0..20).collect(), |i: usize| {
+                (i, std::thread::current().id())
+            });
+            REFUSE_THREADS.set(false);
+            let order: Vec<_> = ran.iter().map(|(i, _)| *i).collect();
+            assert_eq!(order, (0..20).collect::<Vec<_>>(), "refused={refused}");
+            for (i, thread) in ran {
+                assert_eq!(
+                    thread == caller,
+                    refused || i < first_part,
+                    "refused={refused} item {i}"
+                );
+            }
+            for panicking in [0, 19] {
+                REFUSE_THREADS.set(refused);
+                let outcome = std::panic::catch_unwind(|| {
+                    on_threads((0..20).collect(), |i: usize| assert_ne!(i, panicking))
+                });
+                REFUSE_THREADS.set(false);
+                assert!(outcome.is_err(), "refused={refused} item {panicking}");
+            }
+        }
+        assert!(on_threads(Vec::<usize>::new(), |i| i).is_empty());
     }
 
     #[test]

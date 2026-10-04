@@ -1088,6 +1088,30 @@ mod tests {
         assert_eq!(sample.times[Stage::Work as usize], 200);
     }
     #[test]
+    fn a_sample_during_a_parallel_write_phase_is_never_retracted() {
+        // The calling thread spans the phase in which other threads write
+        // for it, so samples taken during it already count it as writing.
+        let actor = Actor::new("filesystem");
+        actor.transition(Stage::Handling as u64, 100);
+        let before = actor.snapshot_at(200);
+        let handling = actor.transition(Stage::DestinationWrite as u64, 300);
+        let during = actor.snapshot_at(700);
+        actor.transition(handling, 1_100);
+        let after = actor.snapshot_at(1_200);
+        assert_eq!(during.times[Stage::DestinationWrite as usize], 400);
+        assert_eq!(after.times[Stage::DestinationWrite as usize], 800);
+        assert_eq!(after.times[Stage::Handling as usize], 300);
+        for (old, new, wall) in [(&before, &during, 500), (&during, &after, 500)] {
+            assert!(old
+                .times
+                .iter()
+                .zip(&new.times)
+                .all(|(old, new)| old <= new));
+            let activity: u64 = new.times.iter().zip(&old.times).map(|(n, o)| n - o).sum();
+            assert_eq!(activity, wall);
+        }
+    }
+    #[test]
     fn nested_operation_restores_the_callers_state_on_error() {
         let actor = Actor::new("worker");
         let outer = actor.span(Stage::Work);

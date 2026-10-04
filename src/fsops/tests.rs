@@ -508,6 +508,25 @@ fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for(
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn directories_are_listed_only_when_their_size_and_space_fit_the_names() {
+    // Sizes and occupied blocks measured for directories of 36-byte names.
+    let listed = |names, size, bytes: u64| small_enough_to_list(names, size, bytes / 512);
+    // ZFS reports entry counts as sizes; the occupied space tells a large
+    // directory from a small one.
+    assert!(listed(16, 130, 8_704), "ZFS, 128 entries");
+    assert!(!listed(64, 2_002, 41_472), "ZFS, 2,000 entries");
+    assert!(listed(128, 2_002, 41_472), "ZFS, 2,000 entries");
+    assert!(!listed(64, 20_002, 2_122_240), "ZFS, 20,000 entries");
+    // XFS and ext4 sizes are bytes, and decide for small directories.
+    assert!(listed(16, 8_192, 12_288), "XFS, 128 entries");
+    assert!(!listed(64, 98_304, 135_168), "XFS, 2,000 entries");
+    assert!(listed(512, 98_304, 135_168), "XFS, 2,000 entries");
+    assert!(!listed(16, 12_288, 12_288), "ext4, 128 entries");
+    assert!(listed(512, 135_168, 139_264), "ext4, 2,000 entries");
+}
+
 #[test]
 fn payload_integrity_checks_are_explicit() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
