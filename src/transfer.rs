@@ -4238,8 +4238,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
-    src_ctl.detach();
-    dst_ctl.detach();
+    // A finished connection need not wait for its helper to exit, except
+    // where the helper listens on the only TCP port the next copy may use.
+    if tcp_ports.is_none_or(|(lo, hi)| lo != hi) {
+        src_ctl.detach();
+        dst_ctl.detach();
+    }
     Ok(exit_code)
 }
 
