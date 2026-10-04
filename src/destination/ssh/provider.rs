@@ -171,6 +171,17 @@ fn try_lock(file: &File) -> Result<bool> {
     }
     Err(error.into())
 }
+fn lock_is_available(lock: File) -> Result<bool> {
+    if !try_lock(&lock)? {
+        return Ok(false);
+    }
+    // A concurrent fork can inherit this open-file description. Closing our
+    // descriptor alone would leave that child holding the temporary probe lock.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(true)
+}
 fn read_record(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
     if !owned_directory(&index(domain))? {
         return Ok(None);
@@ -267,7 +278,7 @@ fn existing(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
         Err(error) if missing(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if try_lock(&lock)? {
+    if lock_is_available(lock)? {
         return Ok(None);
     }
     let metadata = match fs::symlink_metadata(record.forwarded()) {
@@ -1105,6 +1116,30 @@ mod tests {
         assert_eq!(after, before);
         assert!(!index(&domain).exists());
         assert!(!domain.approved_index_path().exists());
+    }
+
+    #[test]
+    fn availability_probe_releases_lock_with_shared_descriptor_alive() {
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("provider.lock");
+        let probe = lock_file(&path, true).unwrap();
+        // A cloned descriptor shares flock ownership just as an inherited one
+        // does, without needing a concurrent fork to reproduce the race.
+        let inherited = probe.try_clone().unwrap();
+        assert!(lock_is_available(probe).unwrap());
+        let keeper = lock_file(&path, false).unwrap();
+        let acquired = try_lock(&keeper).unwrap();
+        let available_while_owned = lock_is_available(lock_file(&path, false).unwrap()).unwrap();
+        assert_eq!(unsafe { libc::flock(keeper.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(inherited);
+        assert!(
+            acquired,
+            "probe lock survived through its shared descriptor"
+        );
+        assert!(
+            !available_while_owned,
+            "probe released another owner's lock"
+        );
     }
 
     #[test]
