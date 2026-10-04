@@ -1904,6 +1904,12 @@ impl RestrictedAuthority {
         if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
             bail!("small-file publication does not match the signed publication policy");
         }
+        // The receiver builds every file of the batch in memory, reused
+        // blocks included, which a repeated path and copy ID would not
+        // otherwise hold back.
+        if !proto::patch_batch_fits(patches.iter().map(|patch| patch.len)) {
+            bail!("small-file patch batch describes more file bytes than the protocol allows");
+        }
         if let Some(limit) = &self.file_data_limit {
             let bytes = patches.iter().try_fold(0u64, |total, patch| {
                 total

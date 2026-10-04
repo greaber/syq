@@ -21,7 +21,11 @@ const COMPARE_GROUP_FILES: usize = 256;
 const COMPARE_GROUP_BYTES: u64 = 16 << 20;
 /// Files up to this size are compared and patched in groups. A larger file
 /// takes the per-file path, whose ranges several workers can share.
-const PATCH_MAX_FILE: u64 = 64 << 20;
+const PATCH_MAX_FILE: u64 = crate::proto::MAX_PATCH_FILE_BYTES;
+// A group of several files stays within what a receiver patches in one
+// batch (`proto::patch_batch_fits`); only a single file may exceed it, up to
+// `PATCH_MAX_FILE`.
+const _: () = assert!(COMPARE_GROUP_BYTES <= crate::proto::MAX_READ_BYTES);
 /// Comparison block of the grouped path unless one is configured. A small
 /// edit then costs this much, not a whole default comparison block.
 const PATCH_BLOCK: u64 = crate::proto::MIN_HASH_BLOCK_BYTES;

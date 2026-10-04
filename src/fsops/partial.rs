@@ -2952,7 +2952,7 @@ impl FsOps {
                 self.hash_existing_batch(*block, files),
             )),
             Request::PatchSmallBatch(patches) => {
-                Ok(Response::PatchedBatch(self.patch_small_batch(patches)))
+                self.patch_small_batch(patches).map(Response::PatchedBatch)
             }
             Request::PutSmallBatch(puts) => {
                 let results = self.put_small_batch(puts);

@@ -153,7 +153,7 @@ fn block_count(len: u64, block: u64) -> Result<usize> {
 /// trust its coordinator, so a malformed patch fails its own file before
 /// anything is kept, cloned or written.
 fn check_patch_layout(patch: &SmallPatch) -> Result<()> {
-    if patch.len > MAX_READ_BYTES {
+    if patch.len > MAX_PATCH_FILE_BYTES {
         bail!("invalid patch of {} bytes", patch.len);
     }
     let blocks = block_count(patch.len, patch.block)?;
@@ -320,10 +320,15 @@ impl FsOps {
     /// A reused block must still hash as compared; otherwise that file fails
     /// and nothing of it is written. A patch that reuses every block of an
     /// existing file whose fingerprint is unchanged keeps that file instead.
+    /// Each file is built in memory until the batch is published, so a batch
+    /// describing more than the protocol allows is refused whole.
     pub(super) fn patch_small_batch(
         &mut self,
         patches: &[SmallPatch],
-    ) -> Vec<std::result::Result<SmallPatched, WireError>> {
+    ) -> Result<Vec<std::result::Result<SmallPatched, WireError>>> {
+        if !patch_batch_fits(patches.iter().map(|patch| patch.len)) {
+            bail!("small-file patch batch describes more file bytes than the protocol allows");
+        }
         let mut results = vec![
             Ok(SmallPatched {
                 kept: false,
@@ -365,7 +370,7 @@ impl FsOps {
                 identity,
             });
         }
-        results
+        Ok(results)
     }
 
     /// Keep the existing file a patch would reproduce whole: every block is
@@ -873,21 +878,23 @@ mod tests {
         fs::write(directory.join("raced"), &raced).unwrap();
         let mut same_patch = patch("same", 3 * block, reuse_all.clone(), Vec::new());
         same_patch.basis = same.fingerprint;
-        let results = ops.patch_small_batch(&[
-            same_patch,
-            patch(
-                "edited",
-                longer,
-                vec![reuse_all[0], reuse_all[1], None, None],
-                new_tail,
-            ),
-            patch(
-                "raced",
-                3 * block,
-                vec![reuse_all[0], None, None],
-                old[block as usize..].to_vec(),
-            ),
-        ]);
+        let results = ops
+            .patch_small_batch(&[
+                same_patch,
+                patch(
+                    "edited",
+                    longer,
+                    vec![reuse_all[0], reuse_all[1], None, None],
+                    new_tail,
+                ),
+                patch(
+                    "raced",
+                    3 * block,
+                    vec![reuse_all[0], None, None],
+                    old[block as usize..].to_vec(),
+                ),
+            ])
+            .unwrap();
         // The unchanged file is kept with the new times; the edited one is
         // published from two reused blocks and the new tail.
         assert_eq!(
@@ -979,7 +986,7 @@ mod tests {
             let mut raced = old.clone();
             raced[0] ^= 1;
             fs::write(directory.join("raced"), &raced).unwrap();
-            let results = ops.patch_small_batch(&patches);
+            let results = ops.patch_small_batch(&patches).unwrap();
             assert!(results[0].is_ok(), "{:?}", results[0]);
             assert_eq!(
                 fs::read(directory.join("file")).unwrap(),
@@ -1062,16 +1069,61 @@ mod tests {
                 malformed(&|patch| patch.reuse.insert(0, patch.reuse[0])),
             ];
             for patch in patches {
-                let results = ops.patch_small_batch(std::slice::from_ref(&patch));
+                let results = ops.patch_small_batch(std::slice::from_ref(&patch)).unwrap();
                 assert!(results[0].is_err(), "{blocks} blocks: {:?}", results[0]);
                 assert_eq!(fs::read(directory.join("file")).unwrap(), old);
                 assert_eq!(entries(directory), 1, "{blocks} blocks");
             }
-            let results = ops.patch_small_batch(&[valid]);
+            let results = ops.patch_small_batch(&[valid]).unwrap();
             assert!(results[0].is_ok(), "{blocks} blocks: {:?}", results[0]);
             assert_eq!(fs::read(directory.join("file")).unwrap(), new);
             assert_eq!(entries(directory), 1);
         }
+    }
+
+    #[test]
+    fn a_patch_batch_describing_too_much_is_refused_before_anything_is_built() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let block = MIN_HASH_BLOCK_BYTES;
+        let len = 40 << 20;
+        // Every block reused: the request is small, but the receiver would
+        // build each file it describes in memory.
+        let patch = SmallPatch {
+            path: b"file".to_vec(),
+            copy_id: [6; 16],
+            len,
+            block,
+            reuse: vec![Some([0; 32]); (len / block) as usize],
+            hash: content_digest(&[]),
+            data: Vec::new(),
+            basis: None,
+            meta: put("file", b"").meta,
+            flags: 0,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let mut ops = receiver(directory);
+        let error = ops
+            .patch_small_batch(&[patch.clone(), patch.clone()])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("more file bytes than the protocol"),
+            "{error}"
+        );
+        // A batch of one file may describe a whole group file. This one
+        // fails alone: there is no file to reuse blocks from.
+        let results = ops.patch_small_batch(&[patch]).unwrap();
+        assert!(results[0].is_err());
+        assert_eq!(entries(directory), 0);
+        let half = MAX_READ_BYTES / 2;
+        assert!(patch_batch_fits([half, half]));
+        assert!(!patch_batch_fits([half, half + 1]));
+        assert!(patch_batch_fits([MAX_PATCH_FILE_BYTES]));
+        assert!(!patch_batch_fits([MAX_PATCH_FILE_BYTES + 1]));
     }
 
     #[test]
@@ -1108,7 +1160,7 @@ mod tests {
             condition: TargetCondition::Any,
             guard: None,
         };
-        let results = ops.patch_small_batch(&[patch]);
+        let results = ops.patch_small_batch(&[patch]).unwrap();
         assert!(results[0].is_err(), "{:?}", results[0]);
         assert_eq!(fs::read(directory.join("file")).unwrap(), old);
         assert_eq!(entries(directory), 1);

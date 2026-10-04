@@ -5230,6 +5230,44 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
 }
 
 #[test]
+fn grouped_patch_batches_are_bounded_by_the_file_bytes_they_describe() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 128 << 20);
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let len = 40 << 20;
+    // Each patch reuses every block, so it carries no data, and repeating
+    // the same path and copy ID declares its size only once.
+    let patch = || {
+        small_patch(
+            &target.join("file"),
+            len,
+            block,
+            vec![Some([0; 32]); (len / block) as usize],
+            b"",
+        )
+    };
+    let mut repeated = Request::PatchSmallBatch(vec![patch(), patch()]);
+    assert_eq!(
+        authority
+            .authorize(&mut repeated, false)
+            .unwrap_err()
+            .to_string(),
+        "small-file patch batch describes more file bytes than the protocol allows"
+    );
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, 0);
+    // A batch of one file may describe a whole group file.
+    let mut single = Request::PatchSmallBatch(vec![patch()]);
+    let settlement = authority.authorize(&mut single, false).unwrap();
+    authority.settle(
+        settlement,
+        &proto::Response::Err("no file to reuse blocks from".into()),
+    );
+}
+
+#[test]
 fn grouped_patch_receipts_record_kept_published_and_failed_files() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
