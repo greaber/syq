@@ -24,6 +24,7 @@ pub(super) struct Failure {
     // Counts bulk operations; SDK transport retries remain internal.
     pub attempts: u64,
     bulk_retry: bool,
+    throttled: bool,
 }
 impl Failure {
     fn new(message: String, code: Option<&str>, status: Option<u16>) -> Self {
@@ -35,6 +36,7 @@ impl Failure {
             os_kind,
             attempts: 1,
             bulk_retry: false,
+            throttled: super::retry::throttled(code, status),
         }
     }
     pub fn preserved_marker() -> Self {
@@ -48,6 +50,7 @@ impl Failure {
             os_kind: None,
             attempts: 0,
             bulk_retry: false,
+            throttled: false,
         }
     }
 }
@@ -84,6 +87,7 @@ pub(super) struct Deleter<'a> {
     pub bucket: &'a str,
     pub concurrency: crate::deletion::Concurrency,
     pub individual: bool,
+    pub retries: u32,
 }
 impl Deleter<'_> {
     pub async fn run<T>(
@@ -163,7 +167,7 @@ impl Deleter<'_> {
         let mut outcomes = self.batch_once(targets).await;
         // The SDK retries request-level failures. Errors carried inside an HTTP
         // success need their own bounded retries; never resend successful keys.
-        for attempt in 2..=3 {
+        for attempt in 2..=u64::from(self.retries) + 1 {
             let retry: Vec<_> = outcomes
                 .iter()
                 .enumerate()
@@ -181,12 +185,13 @@ impl Deleter<'_> {
             if let Err(error) = check() {
                 return (outcomes, Some(error));
             }
-            let base = 100u64 << (attempt - 2);
-            let mut jitter = [0; 8];
-            // Jitter is best effort; unavailable entropy must not prevent cleanup.
-            let _ = getrandom::fill(&mut jitter);
-            let delay = base + u64::from_ne_bytes(jitter) % base;
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            let throttled = retry.iter().any(|&i| {
+                outcomes[i]
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.throttled)
+            });
+            tokio::time::sleep(super::retry::delay((attempt - 2) as u32, throttled)).await;
             if let Err(error) = check() {
                 return (outcomes, Some(error));
             }

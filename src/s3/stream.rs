@@ -1209,7 +1209,7 @@ async fn read_part(
         let mut response = match result {
             Ok(response) => response,
             Err(e) if super::transfer::retryable(&e) && attempt < plan.options.retries => {
-                super::backoff(attempt).await;
+                super::retry::after_error(attempt, &e).await;
                 continue;
             }
             Err(e) => return Err(e.into_service_error()).context("download stream part"),
