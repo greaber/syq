@@ -63,9 +63,14 @@ fn failure_classification(
         Some("InvalidArgument" | "InvalidRequest" | "InvalidBucketName") => {
             ("usage", "no", Some("invalid_input"))
         }
-        Some("SlowDown" | "Throttling" | "ThrottlingException" | "RequestTimeout") => {
-            ("transport", "yes", None)
-        }
+        Some(
+            "SlowDown"
+            | "Throttling"
+            | "ThrottlingException"
+            | "RequestTimeout"
+            | "InternalError"
+            | "ServiceUnavailable",
+        ) => ("transport", "yes", None),
         _ => match status {
             Some(403) => ("io", "no", Some("permission_denied")),
             Some(429 | 500 | 502 | 503 | 504) => ("transport", "yes", None),

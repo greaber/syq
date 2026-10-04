@@ -240,6 +240,8 @@ impl HttpConnector for BulkResponses {
             let code = match key.as_str() {
                 "denied" => Some("AccessDenied"),
                 "busy" => Some("SlowDown"),
+                "unavailable" => Some("ServiceUnavailable"),
+                "internal" if attempt == 1 => Some("InternalError"),
                 "once" if version == "v1" && attempt == 1 => Some("SlowDown"),
                 _ => None,
             };
@@ -302,6 +304,8 @@ async fn bulk_retries_only_transient_failed_versions_and_bounds_attempts() {
         ("once", "v2"),
         ("denied", "v1"),
         ("busy", "v1"),
+        ("internal", "v1"),
+        ("unavailable", "v1"),
     ]
     .into_iter()
     .map(|(key, version)| Target {
@@ -321,7 +325,7 @@ async fn bulk_retries_only_transient_failed_versions_and_bounds_attempts() {
         )
         .await
         .unwrap();
-    assert_eq!(outcomes.len(), 5);
+    assert_eq!(outcomes.len(), items.len());
     assert_eq!(
         outcomes
             .iter()
@@ -336,13 +340,34 @@ async fn bulk_retries_only_transient_failed_versions_and_bounds_attempts() {
     assert_eq!((denied.attempts, denied.retryable), (1, "no"));
     let busy = outcomes[4].1.as_ref().unwrap_err();
     assert_eq!((busy.attempts, busy.retryable), (3, "yes"));
+    assert_eq!(outcomes[5].1.as_ref().unwrap(), &2);
+    let unavailable = outcomes[6].1.as_ref().unwrap_err();
+    assert_eq!((unavailable.attempts, unavailable.retryable), (3, "yes"));
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
     assert_eq!(
-        calls[1],
-        vec![("once".into(), "v1".into()), ("busy".into(), "v1".into())]
+        calls[0],
+        items
+            .iter()
+            .map(|target| (target.key.clone(), target.version.clone().unwrap()))
+            .collect::<Vec<_>>()
     );
-    assert_eq!(calls[2], vec![("busy".into(), "v1".into())]);
+    assert_eq!(
+        calls[1],
+        vec![
+            ("once".into(), "v1".into()),
+            ("busy".into(), "v1".into()),
+            ("internal".into(), "v1".into()),
+            ("unavailable".into(), "v1".into()),
+        ]
+    );
+    assert_eq!(
+        calls[2],
+        vec![
+            ("busy".into(), "v1".into()),
+            ("unavailable".into(), "v1".into())
+        ]
+    );
 }
 
 #[tokio::test(start_paused = true)]
