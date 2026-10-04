@@ -172,7 +172,9 @@ those source credentials and creates no approval request. The automatic cached
 helper case still needs just one destination SSH connection. The checks cover local approval despite automatic local receiving, denial,
 direct TCP, cached and missing helper startup, a second approval during slow
 SSH setup, preview/verification, protected destination authority files,
-unreachable data ports, and revocation followed by an approved retry.
+unreachable data ports falling back to direct SSH, explicit SSH data with temporary
+forced keys, key cleanup preserving unrelated authorized_keys contents, and
+revocation followed by an approved retry.
 
 The benchmark-script integration checks run separately:
 

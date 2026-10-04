@@ -188,7 +188,8 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
             let ticker = progress.spawn_ticker();
             let result = runtime.block_on(async {
             let cancelled = Arc::new(AtomicBool::new(false));
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut signals = crate::process::signals::interrupt_and_terminate()?;
+        let (sigint, term) = &mut *signals;
             let entries = stream::iter(manifest.callbacks).map(|entry| {
                 let cancelled = cancelled.clone();
                 let channel = channel.clone();
@@ -221,7 +222,7 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                 }
             }).buffer_unordered(args.stream_concurrency);
             tokio::pin!(entries);
-            let signal = async { tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} } };
+            let signal = async { tokio::select! { _ = sigint.recv() => {}, _ = term.recv() => {} } };
             tokio::pin!(signal);
             loop {
                 let next = tokio::select! {

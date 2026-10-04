@@ -407,7 +407,7 @@ fn persist_connect_failure_announces_policy_and_status_survives_bad_receive_sett
 }
 
 #[test]
-fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
+fn persist_connect_domains_isolate_receiving_and_report_setup_errors_once() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
     let ssh = fake_ssh(&t);
@@ -428,23 +428,19 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
         }
         cmd.run().unwrap()
     };
-    // Invalid preferences must not affect a forward-only script scope.
+    // Invalid global preferences must not affect a fresh explicit domain.
     let receive = t.path("config/syq/receive.json");
     write(&receive, b"not json");
     fs::set_permissions(&receive, fs::Permissions::from_mode(0o600)).unwrap();
     let scope = ephemeral_scope(&t);
     let output = connect(Some(&scope), "rsh.log");
     assert_output_ok(&output);
-    assert!(String::from_utf8_lossy(&output.stdout)
-        .contains("ready; ephemeral scopes do not support receiving"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ready"));
     assert!(!t.path("config/syq/persistence.json").exists());
     assert_eq!(read(&receive), b"not json");
-    assert!(fs::read_dir(&scope).unwrap().all(|entry| !entry
-        .unwrap()
-        .file_name()
-        .as_encoded_bytes()
-        .windows(5)
-        .any(|s| s == b".recv")));
+    let settings: serde_json::Value =
+        serde_json::from_slice(&read(&scope.join("receive.json"))).unwrap();
+    assert_eq!(settings["profiles"][0]["enabled"], false);
     let log = fs::read_to_string(t.path("rsh.log")).unwrap();
     assert!(log.contains("ControlPersist=300"), "{log}");
     assert!(!log.contains("ControlPersist=yes"), "{log}");
@@ -454,10 +450,7 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
         .unwrap();
     assert_output_ok(&output);
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("ephemeral scope; receiving not supported"),
-        "{text}"
-    );
+    assert!(text.contains("receiving disabled"), "{text}");
     assert!(
         text.contains(&format!(
             "run syq persist connect test-server --pscope {}",
@@ -492,11 +485,8 @@ fn persist_connect_scopes_skip_receiving_and_setup_errors_are_reported_once() {
     // Only this invocation can write to the rejection log.
     let rejected = connect(Some(global), "rejected-rsh.log");
     assert!(!rejected.status.success());
-    assert!(stderr_of(&rejected).contains("without --pscope"));
-    assert!(
-        !t.path("rejected-rsh.log").exists(),
-        "invalid scope reached SSH"
-    );
+    assert!(stderr_of(&rejected).contains("expected ident"));
+    assert_eq!(read(&receive), b"not json");
     assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
 }
 
@@ -678,7 +668,7 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
             .capture_output()
@@ -700,10 +690,8 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     );
     assert!(defaults["settings"]["root"].is_null());
     assert!(!t.path("config").exists(), "status created configuration");
-    assert!(
-        !t.path("runtime").exists(),
-        "status created a runtime scope"
-    );
+    assert!(!t.runtime().exists(), "status created a runtime scope");
+    fs::create_dir(t.runtime()).unwrap();
     assert_output_ok(&run(&[
         "persist",
         "receive",
@@ -746,7 +734,9 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
     assert!(status()["settings"]["auto_approve_root"].is_null());
     assert_output_ok(&run(&["persist", "receive", "off"]));
     assert_eq!(status()["settings"]["enabled"], false);
-    assert!(!t.path("config/syq/persistence.json").exists());
+    let persistence: serde_json::Value =
+        serde_json::from_slice(&read(&t.path("config/syq/persistence.json"))).unwrap();
+    assert_eq!(persistence["enabled"], true);
     assert_eq!(
         fs::metadata(t.path("config/syq/receive.json"))
             .unwrap()
@@ -770,16 +760,20 @@ fn receiving_preferences_are_durable_default_on_and_distinguish_cwd_from_root() 
 #[test]
 fn receiving_automatic_cwd_and_server_scope_are_independent() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     fs::create_dir_all(t.path("root/inbox")).unwrap();
     fs::create_dir_all(t.path("root/explicit")).unwrap();
+    write(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\necho fixture connection unavailable >&2\nexit 42\n");
+    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(["persist", "receive"])
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("PATH", format!("{}:/usr/bin:/bin", t.path("bin").display()))
             .current_dir(t.path(""))
             .capture_output()
             .unwrap()
@@ -789,15 +783,28 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
         assert_output_ok(&output);
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["settings"].clone()
     };
-    assert_output_ok(&run(&[
+    let configured = |args: &[&str]| {
+        let output = run(args);
+        if state()["servers"].as_array().unwrap().is_empty() {
+            assert_output_ok(&output);
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                stderr_of(&output).contains("receiving settings saved"),
+                "{}",
+                stderr_of(&output)
+            );
+        }
+    };
+    configured(&[
         "on",
         "--auto-approve-root",
         "root/inbox",
-        "--server",
+        "--connection",
         "work",
-        "--server",
+        "--connection",
         "alice@lab:2222",
-    ]));
+    ]);
     assert_eq!(state()["cwd"], t.s("root/inbox"));
     assert_eq!(state()["cwd_explicit"], false);
     assert_eq!(
@@ -805,22 +812,17 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
         serde_json::json!(["work", "alice@lab:2222"])
     );
     assert!(!run(&["wait", "other", "--timeout", "1"]).status.success());
-    assert_output_ok(&run(&["on", "--root", "root"]));
+    configured(&["on", "--root", "root"]);
     assert_eq!(state()["cwd"], t.s("root"));
-    assert_output_ok(&run(&["on", "--cwd", "root/explicit"]));
+    configured(&["on", "--cwd", "root/explicit"]);
     assert_eq!(state()["root"], t.s("root"));
-    assert_output_ok(&run(&["on", "--no-auto-approve-root"]));
+    configured(&["on", "--no-auto-approve-root"]);
     assert_eq!(state()["cwd"], t.s("root/explicit"));
-    assert_output_ok(&run(&[
-        "on",
-        "--auto-cwd",
-        "--auto-approve-root",
-        "root/inbox",
-    ]));
+    configured(&["on", "--auto-cwd", "--auto-approve-root", "root/inbox"]);
     assert_eq!(state()["cwd"], t.s("root"));
-    assert_output_ok(&run(&["on", "--no-root"]));
+    configured(&["on", "--no-root"]);
     assert_eq!(state()["cwd"], t.s("root/inbox"));
-    assert_output_ok(&run(&["on", "--no-auto-approve-root", "--all-servers"]));
+    configured(&["on", "--no-auto-approve-root", "--all-connections"]);
     assert_eq!(
         state()["cwd"],
         fs::canonicalize(t.path("")).unwrap().to_str().unwrap()
@@ -829,7 +831,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
     let before = fs::read(t.path("config/syq/receive.json")).unwrap();
     for args in [
         vec!["on", "--auto-approve-root", "missing"],
-        vec!["on", "--server", ""],
+        vec!["on", "--connection", ""],
         vec!["on", "--cwd", ".", "--root", "root"],
         vec!["on", "--auto-approve-root", "/"],
         vec!["on", "--approve", "always"],
@@ -988,6 +990,7 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
 #[test]
 fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     let path = t.path("config/syq/receive.json");
     // Exact output of the PR #233 binary at 34eba8d, not regenerated by this writer.
     let old = include_bytes!("../fixtures/receive-v2.json");
@@ -998,7 +1001,7 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .capture_output()
             .unwrap()
@@ -1029,12 +1032,14 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
     assert_eq!(migrated["version"], 5);
     assert!(migrated["profiles"][0]["auto_approve_root"].is_null());
     assert_eq!(migrated["profiles"][0]["notifications"], "desktop");
-    assert!(!t.path("config/syq/persistence.json").exists());
+    let persistence: serde_json::Value =
+        serde_json::from_slice(&read(&t.path("config/syq/persistence.json"))).unwrap();
+    assert_eq!(persistence["enabled"], true);
     assert_output_ok(&run(&["persist", "receive", "off"]));
 }
 
 #[test]
-fn return_via_rejects_unsupported_routes_and_never_falls_back_to_ssh() {
+fn return_via_requires_approval_and_rejects_unsupported_routes() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
     write(
@@ -1337,10 +1342,11 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
     let t = Tmp::new();
+    fs::create_dir(t.path("runtime")).unwrap();
     write(&t.path("source"), b"payload");
     write(
         &t.path("bin/ssh"),
-        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
+        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nif [ \"$1\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nhostkeyalgorithms ssh-ed25519\\n'; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     let mut paths = vec![t.path("bin")];
@@ -1379,9 +1385,22 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     let listener = UnixListener::bind(&socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let ssh_marker = t.path("ssh-used");
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+        "",
+    )
+    .unwrap()
+    .public_key()
+    .to_openssh()
+    .unwrap();
+    let resolved = serde_json::json!({
+        "endpoint": {"user": "fixture-user", "host": "resolved-backup", "port": 2222},
+        "host_algorithms": "ssh-ed25519",
+        "known_hosts": format!("syq-approved-peer {key}\n"),
+    });
     let responder = std::thread::spawn(move || {
         let mut messages = Vec::new();
-        for _ in 0..10 {
+        for _ in 0..12 {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
@@ -1413,19 +1432,51 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
             let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
             socket.read_exact(&mut bytes).unwrap();
             let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            let response = if envelope["message"] == "Ping" {
+            let responses = if envelope["message"] == "Ping" {
                 assert!(ssh_marker.exists(), "discovery preceded the SSH attempt");
-                serde_json::json!("Ready")
+                vec![serde_json::json!("Ready")]
+            } else if let Some(target) = envelope["message"].get("ResolveLocalSsh") {
+                assert_eq!(
+                    target,
+                    &serde_json::json!({
+                        "requested": {"user": null, "host": "backup", "port": null},
+                        "endpoint": {"user": "fixture-user", "host": "resolved-backup", "port": 2222},
+                        "host_key_alias": null,
+                    }),
+                    "{envelope}"
+                );
+                assert!(
+                    !ssh_marker.exists(),
+                    "explicit account resolution tried native SSH"
+                );
+                vec![serde_json::json!("Ready"), resolved.clone()]
+            } else if let Some(account) = envelope["message"].get("LocalSsh") {
+                assert_eq!(
+                    account["target"]["requested"]["host"], "backup",
+                    "{envelope}"
+                );
+                assert_eq!(
+                    account["target"]["endpoint"], resolved["endpoint"],
+                    "{envelope}"
+                );
+                assert_eq!(account["expected"], resolved, "{envelope}");
+                assert!(
+                    !ssh_marker.exists(),
+                    "explicit account selection tried native SSH"
+                );
+                vec![serde_json::json!({"Error": "account denied by fixture"})]
             } else {
                 assert!(envelope["message"].get("Forward").is_some(), "{envelope}");
-                serde_json::json!({"Error": "copy denied by fixture"})
+                vec![serde_json::json!({"Error": "copy denied by fixture"})]
             };
             messages.push(envelope);
-            let bytes = serde_json::to_vec(&response).unwrap();
-            socket
-                .write_all(&(bytes.len() as u32).to_be_bytes())
-                .unwrap();
-            socket.write_all(&bytes).unwrap();
+            for response in responses {
+                let bytes = serde_json::to_vec(&response).unwrap();
+                socket
+                    .write_all(&(bytes.len() as u32).to_be_bytes())
+                    .unwrap();
+                socket.write_all(&bytes).unwrap();
+            }
         }
         messages
     });
@@ -1488,7 +1539,6 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     // Unsupported options and explicit SSH never ask a receiving machine.
     for extra in [
         vec!["--auth-from", "ssh"],
-        vec!["--no-tcp"],
         vec!["--copy-metadata", "ownership"],
         vec!["--inplace"],
         vec!["--prune", "--into", "out"],
@@ -1506,7 +1556,12 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         fs::remove_file(t.path("ssh-used")).unwrap();
     }
     let selected = run(&["cp", "source", "--to", "backup", "--auth-from", "@z-other"]);
-    assert!(stderr_of(&selected).contains("copy denied by fixture"));
+    assert!(!selected.status.success());
+    assert!(
+        stderr_of(&selected).contains("account denied by fixture"),
+        "{}",
+        stderr_of(&selected)
+    );
     assert!(!t.path("ssh-used").exists());
 
     // Captured from the unchanged released v0.4.0 SDK, not this CLI/SDK writer.
@@ -1537,7 +1592,13 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         "--into",
         "out",
     ]);
-    assert!(stderr_of(&explicit).contains("copy denied by fixture"));
+    assert!(!explicit.status.success());
+    assert!(
+        stderr_of(&explicit).contains("account denied by fixture"),
+        "{}",
+        stderr_of(&explicit)
+    );
+    assert!(!t.path("ssh-used").exists());
     let messages = responder.join().unwrap();
     assert_eq!(messages[0]["secret"], "laptop");
     assert_eq!(messages[0]["message"], "Ping");
@@ -1551,8 +1612,18 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         assert_eq!(pair[0]["message"], "Ping");
         assert!(pair[1]["message"].get("Forward").is_some());
     }
-    assert_eq!(messages[8]["secret"], "z-other");
-    assert_eq!(messages[9]["secret"], "ssh");
+    for (pair, name) in messages[8..12].chunks_exact(2).zip(["z-other", "ssh"]) {
+        assert_eq!(pair[0]["secret"], name);
+        assert_eq!(pair[1]["secret"], name);
+        assert_eq!(
+            pair[0]["message"]["ResolveLocalSsh"]["requested"]["host"],
+            "backup"
+        );
+        assert_eq!(
+            pair[1]["message"]["LocalSsh"]["target"]["endpoint"],
+            pair[0]["message"]["ResolveLocalSsh"]["endpoint"]
+        );
+    }
     // The registry remains, but every socket is now unavailable. Discovery
     // must allow ordinary SSH instead of treating stale names as reservations.
     let offline = run(&["cp", "source", "--to", "backup"]);
@@ -1581,13 +1652,14 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
 #[test]
 fn receiving_profiles_preserve_independent_settings_and_select_names() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     fs::create_dir(t.path("project")).unwrap();
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
             .capture_output()
@@ -1660,6 +1732,7 @@ fn receiving_profiles_preserve_independent_settings_and_select_names() {
 #[test]
 fn receiving_profiles_reject_explicit_files_without_overwriting_saved_settings() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     fs::create_dir(t.path("project")).unwrap();
     fs::write(t.path("file"), b"not a directory").unwrap();
     let run = |args: &[&str]| {
@@ -1668,7 +1741,7 @@ fn receiving_profiles_reject_explicit_files_without_overwriting_saved_settings()
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .current_dir(t.path(""))
             .capture_output()
@@ -1698,6 +1771,7 @@ fn receiving_profiles_reject_explicit_files_without_overwriting_saved_settings()
 #[test]
 fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     let path = t.path("config/syq/receive.json");
     // Captured from the released v0.5.1 executable, not generated by this writer.
     let old = include_bytes!("../fixtures/receive-v3-v0.5.1.json");
@@ -1708,7 +1782,7 @@ fn receiving_profiles_migrate_unchanged_v051_preferences_and_reject_duplicates()
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .capture_output()
             .unwrap()
@@ -1801,11 +1875,11 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
         .find_map(|line| line.strip_prefix("scope: ").map(PathBuf::from))
         .unwrap();
     // Keep the real supervisor running without starting any SSH workers.
-    assert_output_ok(
-        &command(&["persist", "receive", "on", "--server", "other.invalid"])
-            .run()
-            .unwrap(),
-    );
+    assert_output_ok(&command(&["persist", "receive", "on"]).run().unwrap());
+    let settings_path = t.path("config/syq/receive.json");
+    let mut settings: serde_json::Value = serde_json::from_slice(&read(&settings_path)).unwrap();
+    settings["profiles"][0]["servers"] = serde_json::json!(["other.invalid"]);
+    fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
     let identity = command(&["--build-identity"]).run().unwrap();
     assert_output_ok(&identity);
     let identity = String::from_utf8(identity.stdout).unwrap();

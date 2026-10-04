@@ -166,6 +166,38 @@ fn unusable_explicit_scope_is_an_error() {
     assert!(stderr.contains("open persistence directory"), "{stderr}");
     assert!(!t.path("dst").exists());
     assert!(!t.path("rsh.log").exists());
+
+    fs::create_dir(t.runtime()).unwrap();
+    let closing = ephemeral_scope(&t);
+    write(&closing.join(".syq-persistence-closing"), b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--auth-from", "ssh", "--pscope"])
+        .arg(&closing)
+        .arg(t.path("src"))
+        .args(["--to", "fake", "--into"])
+        .arg(t.path("dst"))
+        .args(["--no-bootstrap", "--no-progress"])
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("scope is closing"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        !t.path("rsh.log").exists(),
+        "closing scope opened a native connection"
+    );
+    assert_output_ok(
+        &persistence_command(&t, &["off", "--pscope", closing.to_str().unwrap()])
+            .run()
+            .unwrap(),
+    );
 }
 
 /// An --rsh ssh command shares and persists connections like the default ssh.
@@ -531,6 +563,78 @@ fn persistence_policy_and_ephemeral_scopes_have_separate_lifecycles() {
     assert!(String::from_utf8_lossy(&status.stdout).contains("is off"));
 }
 
+#[test]
+fn persistence_domains_isolate_preferences_receiving_and_cleanup() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let first = ephemeral_scope(&t);
+    let second = ephemeral_scope(&t);
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .env("HOME", t.path(""))
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["auth-from", "@global-provider"]));
+    let original_global = read(&t.path("config/syq/auth-from.json"));
+    assert_output_ok(&run(&[
+        "--pscope",
+        first.to_str().unwrap(),
+        "auth-from",
+        "@job-provider",
+    ]));
+    let fresh = run(&["auth-from", "--pscope", second.to_str().unwrap()]);
+    assert_output_ok(&fresh);
+    assert_eq!(fresh.stdout, b"default: auto\n");
+    let selected = run(&["auth-from", "--pscope", first.to_str().unwrap()]);
+    assert_output_ok(&selected);
+    assert_eq!(selected.stdout, b"default: @job-provider\n");
+    write(&t.path("unusable-global-runtime"), b"not a directory");
+    let independent = persistence_command(&t, &["auth-from", "--pscope", first.to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", t.path("unusable-global-runtime"))
+        .run()
+        .unwrap();
+    assert_output_ok(&independent);
+    assert_eq!(independent.stdout, b"default: @job-provider\n");
+    let inactive = run(&[
+        "--pscope",
+        second.to_str().unwrap(),
+        "receive",
+        "status",
+        "--json",
+    ]);
+    assert_output_ok(&inactive);
+    let inactive: serde_json::Value = serde_json::from_slice(&inactive.stdout).unwrap();
+    assert_eq!(inactive["settings"]["enabled"], false);
+    assert_output_ok(&run(&[
+        "receive",
+        "on",
+        "--pscope",
+        first.to_str().unwrap(),
+        "--name",
+        "job",
+        "--notify",
+        "off",
+    ]));
+    assert!(first.join("receive.json").is_file());
+    assert!(!second.join("receive.json").exists());
+    assert!(!t.path("config/syq/receive.json").exists());
+    assert_eq!(read(&t.path("config/syq/auth-from.json")), original_global);
+    // A default-domain shutdown must not find or remove either explicit domain.
+    assert_output_ok(&run(&["off"]));
+    assert!(first.exists());
+    assert!(second.exists());
+    assert_output_ok(&run(&["--pscope", first.to_str().unwrap(), "off"]));
+    assert!(!first.exists());
+    assert!(second.exists());
+    assert_eq!(read(&t.path("config/syq/auth-from.json")), original_global);
+    let closed = run(&["--pscope", first.to_str().unwrap(), "auth-from"]);
+    assert!(!closed.status.success());
+    assert!(!stderr_of(&closed).contains("global-provider"));
+    assert_output_ok(&run(&["off", "--pscope", second.to_str().unwrap()]));
+    assert!(!second.exists());
+}
+
 /// The session pool's own ssh invocations, as the fake logs them: a master
 /// check, or a spare opened with every authentication method disabled.
 fn pool_lines(log: &str) -> (Vec<&str>, Vec<&str>) {
@@ -861,7 +965,7 @@ fn session_pool_stays_empty_without_a_live_master() {
 }
 
 #[test]
-fn remote_coordinator_does_not_resolve_local_persistence() {
+fn native_remote_coordinator_uses_only_its_local_optional_persistence() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
     write(&t.path("config/syq/persistence.json"), b"not valid JSON");
@@ -903,7 +1007,16 @@ exit 23
     let output = run();
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert!(t.path("ssh-called").exists());
-    assert!(!stderr_of(&output).contains("persistence configuration"));
+    assert!(
+        stderr_of(&output).contains("cannot use persistent SSH connections"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("continuing without persistence"),
+        "{}",
+        stderr_of(&output)
+    );
 
     let enabled = persistence_command(&t, &["on"]).run().unwrap();
     assert_output_ok(&enabled);
@@ -915,12 +1028,21 @@ exit 23
         .unwrap();
     let output = run();
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let records: Vec<serde_json::Value> = fs::read_dir(&global_scope)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]["host"], "hostA",
+        "only the invoking machine's coordinator connection belongs in its domain"
+    );
     assert!(
-        fs::read_dir(&global_scope)
-            .unwrap()
-            .flatten()
-            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".json")),
-        "remote-coordinator handoff recorded inactive local endpoints"
+        !stderr_of(&output).contains("cannot use persistent SSH connections"),
+        "{}",
+        stderr_of(&output)
     );
     assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
 }
@@ -1102,4 +1224,173 @@ exit 0
             .run()
             .unwrap(),
     );
+}
+
+#[test]
+fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
+    let t = Tmp::new();
+    // Unchanged persistence format from released v0.7.1. An older binary
+    // ignores auth-from.json and can still read its own settings unchanged.
+    let old = b"{\"enabled\":false}\n";
+    write(&t.path("config/syq/persistence.json"), old);
+    let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();
+    assert_output_ok(&run(&["auth-from", "@laptop"]));
+    assert_output_ok(&run(&["auth-from", "ssh", "--for", "backup"]));
+    let shown = run(&["auth-from"]);
+    assert_output_ok(&shown);
+    assert_eq!(
+        String::from_utf8(shown.stdout).unwrap(),
+        "default: @laptop\nbackup: ssh\n"
+    );
+    assert_eq!(read(&t.path("config/syq/persistence.json")), old);
+    assert_output_ok(&run(&["status"]));
+    assert_output_ok(&run(&["auth-from", "--reset", "--for", "backup"]));
+    let shown = run(&["auth-from", "--for", "backup"]);
+    assert_eq!(
+        String::from_utf8(shown.stdout).unwrap(),
+        "backup: @laptop (default)\n"
+    );
+    assert_output_ok(&run(&["auth-from", "--reset"]));
+    assert_eq!(
+        String::from_utf8(run(&["auth-from"]).stdout).unwrap(),
+        "default: auto\n"
+    );
+    assert!(!run(&["auth-from", "ssh", "--reset"]).status.success());
+}
+
+#[test]
+fn persist_connect_rejects_explicit_receiving_timeout_with_saved_account_authorization() {
+    let t = Tmp::new();
+    let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();
+    assert_output_ok(&run(&["auth-from", "@laptop"]));
+    for timeout in ["1", "30"] {
+        let output = run(&["connect", "backup", "--timeout", timeout]);
+        assert!(!output.status.success());
+        let error = stderr_of(&output);
+        assert!(
+            error.contains("--timeout applies only to native SSH receiving setup"),
+            "{error}"
+        );
+        assert!(
+            error.contains("selected authorization uses @laptop"),
+            "{error}"
+        );
+    }
+    assert_output_ok(&run(&["auth-from", "--reset"]));
+    assert_output_ok(&run(&["auth-from", "@other", "--for", "backup"]));
+    let output = run(&["connect", "alice@backup:2222", "--timeout", "30"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("selected authorization uses @other"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !t.runtime().exists(),
+        "refusal must happen before opening a connection"
+    );
+}
+
+#[test]
+fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state() {
+    let t = Tmp::new();
+    write(&t.path("source"), b"payload");
+    executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_7.4p1 >&2; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\necho 'Permission denied (publickey).' >&2\nexit 255\n");
+    let mut paths = vec![t.path("bin")];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let paths = std::env::join_paths(paths).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("PATH", &paths)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .capture_output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["persist", "auth-from", "@missing"]));
+    let output = run(&["cp", "source", "--to", "backup"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("missing"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    assert_output_ok(&run(&["persist", "auth-from", "ssh", "--for", "backup"]));
+    assert!(!run(&["cp", "source", "--to", "user@backup:2222"])
+        .status
+        .success());
+    assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+    fs::remove_file(t.path("ssh-used")).unwrap();
+    write(&t.path("config/syq/auth-from.json"), b"future schema");
+    let output = run(&["cp", "source", "--to", "backup"]);
+    assert!(
+        stderr_of(&output).contains("pass --auth-from explicitly"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    for mode in ["auto", "ssh"] {
+        let output = run(&["cp", "source", "--to", "backup", "--auth-from", mode]);
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(t.path("ssh-used")).unwrap(), "connect\n");
+        fs::remove_file(t.path("ssh-used")).unwrap();
+    }
+    let output = run(&["cp", "source", "--to", "backup", "--auth-from", "@other"]);
+    assert!(
+        stderr_of(&output).contains("other"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("ssh-used").exists());
+    // Routes that do not use return authorization do not read these settings.
+    let output = run(&["cp", "source", "--as", "local-copy"]);
+    assert_output_ok(&output);
+    let output = run(&["cp", "source", "--to", "backup", "--rsh", "ssh"]);
+    assert!(!output.status.success());
+    assert!(t.path("ssh-used").exists());
+    assert!(!stderr_of(&output).contains("authorization choice"));
+}
+
+#[test]
+fn scoped_off_closes_native_connections_despite_damaged_account_state() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let scope = ephemeral_scope(&t);
+    let key = "cm-4adf1f61aa19aead";
+    write(
+        &scope.join(format!("{key}.json")),
+        br#"{"user":"alice","host":"example","port":2222}"#,
+    );
+    let _master = std::os::unix::net::UnixListener::bind(scope.join(key)).unwrap();
+    let index = scope.join("authorized-ssh-v1");
+    fs::create_dir(&index).unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
+    let damaged = index.join(format!("{}.json", "a".repeat(64)));
+    write(&damaged, b"not valid JSON");
+    fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600)).unwrap();
+    executable(
+        &t.path("close-bin/ssh"),
+        br#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_CLOSE_LOG"
+exit 0
+"#,
+    );
+    let output = persistence_command(&t, &["off", "--pscope", scope.to_str().unwrap()])
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("close-bin")))
+        .env("FAKE_CLOSE_LOG", t.path("close.log"))
+        .run()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "damaged state must remain visible"
+    );
+    let log = fs::read_to_string(t.path("close.log")).unwrap();
+    assert!(log.contains("-O exit"), "{log}");
+    assert!(log.contains("-- example"), "{log}");
+    assert_eq!(read(&damaged), b"not valid JSON");
 }

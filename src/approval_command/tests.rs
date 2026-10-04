@@ -18,6 +18,25 @@ fn home_is_shortened_only_as_a_path_prefix() {
 fn command(args: &[&str]) -> Vec<Vec<u8>> {
     args.iter().map(|arg| arg.as_bytes().to_vec()).collect()
 }
+#[test]
+fn receiving_authorizer_checks_the_command_without_local_preferences() {
+    let omitted = command(&["cp", "results", "--to", "backup"]);
+    check_authorizer(&omitted, "laptop").unwrap();
+    for (mode, accepted) in [
+        ("auto", true),
+        ("@laptop", true),
+        ("ssh", false),
+        ("@other", false),
+    ] {
+        let selected = command(&["cp", "results", "--to", "backup", "--auth-from", mode]);
+        assert_eq!(
+            check_authorizer(&selected, "laptop").is_ok(),
+            accepted,
+            "{mode}"
+        );
+    }
+}
+
 fn policy() -> crate::receipt::ReceiptPolicy {
     let (_, public) = crate::receipt::generate_recipient().unwrap();
     crate::receipt::ReceiptPolicy {

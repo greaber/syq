@@ -146,7 +146,7 @@ fn validate_ed25519_blob(mut blob: &[u8]) -> Result<()> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedKeyEntry {
-    id: EnrollmentId,
+    marker: String,
     key: EnrollmentPublicKey,
     line: String,
 }
@@ -162,7 +162,7 @@ impl AuthorizedKeyEntry {
             id.marker()
         );
         Ok(Self {
-            id,
+            marker: id.marker(),
             key: key.clone(),
             line,
         })
@@ -172,8 +172,37 @@ impl AuthorizedKeyEntry {
         &self.line
     }
 
+    /// A temporary key can enter only one live copy's worker socket. Its
+    /// marker is separate from durable receiver enrollments.
+    pub(crate) fn copy_worker(
+        id: EnrollmentId,
+        receiver_path: &Path,
+        ticket: &str,
+        key: &EnrollmentPublicKey,
+    ) -> Result<Self> {
+        let receiver = safe_receiver_path(receiver_path)?;
+        if ticket.is_empty()
+            || !ticket
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            bail!("invalid copy worker admission");
+        }
+        let marker = format!("syq-copy-worker-{id}");
+        let command = format!("{receiver} --return-ssh-worker {ticket}");
+        let line = format!(
+            "restrict,command=\"{command}\" {} {} {marker}",
+            key.algorithm, key.blob
+        );
+        Ok(Self {
+            marker,
+            key: key.clone(),
+            line,
+        })
+    }
+
     pub fn marker(&self) -> String {
-        self.id.marker()
+        self.marker.clone()
     }
 }
 
@@ -191,9 +220,9 @@ fn safe_receiver_path(path: &Path) -> Result<String> {
         .to_str()
         .context("restricted receiver path is not valid UTF-8")?;
     if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+        })
     {
         bail!("restricted receiver path contains shell-sensitive characters");
     }
@@ -552,6 +581,18 @@ mod tests {
         assert!(entry
             .line()
             .ends_with(" syq-enrollment:00112233445566778899aabbccddeeff"));
+    }
+
+    #[test]
+    fn copy_worker_accepts_installed_source_build_path() {
+        let entry = AuthorizedKeyEntry::copy_worker(
+            id(),
+            Path::new("/home/backup/.cache/syq/v0.7.1+dev.source.123/syq"),
+            "ticket",
+            &key(),
+        )
+        .unwrap();
+        assert!(entry.line().starts_with("restrict,command=\"/home/backup/.cache/syq/v0.7.1+dev.source.123/syq --return-ssh-worker ticket\""));
     }
 
     #[test]

@@ -27,8 +27,10 @@ other than `ssh`, connect with that command each time instead.
 Persistence also speeds up [remote path completion](install.md#shell-completion):
 completion reuses the open connection, avoiding a new SSH login for each lookup.
 
-Receiving starts automatically with persistent connections unless you have
-turned it off. It lets connected servers request file copies to your machine,
+In the default persistence domain, copies, remote file operations, and
+`persist connect` start receiving automatically unless you have turned it off.
+`syq ssh` reuses persistent connections but does not start receiving itself.
+Receiving lets connected servers request file copies to your machine,
 commands on it, and authorization for copies between servers,
 with approval on your machine. See [Use your laptop from a server](receive.md)
 for setup and approval controls.
@@ -40,11 +42,63 @@ is no longer available. See [Persistent connections](security.md#persistent-conn
 for the security implications.
 
 Inspect connections with `syq persist status`. Close them, including receiving
-connections, with `syq persist off`.
+connections, with `syq persist off`. This keeps your saved settings. For an
+independent set of connections and settings, create an
+[isolated domain](persistence-reference.md#isolated-script-scopes) and pass its
+path with `--pscope`; fresh domains start with receiving off.
 
-Receiving reconnects after a network interruption or laptop sleep; other SSH
+Receiving reconnects after a network interruption or laptop sleep; native SSH
 connections reopen on their next use. An interrupted copy still needs to be
 rerun to resume. After rebooting, run `syq persist connect server` again.
+
+## Reuse laptop-authorized account access
+
+On a server connected to your laptop, select it for authorization and start work:
+
+```sh
+syq persist auth-from @laptop
+syq ssh hostB -- hostname
+syq cp report --to hostB --as report
+syq ssh hostB
+syq persist off
+```
+
+The first SSH command asks for access to the destination account. **Allow** covers
+later commands and copies while the laptop's receiving connection to this
+server stays open. **Remember** also permits future logins for these accounts;
+the laptop must still be available to authorize them. See
+[account permission controls](persistence-reference.md#account-permissions).
+
+The approved connection is reused by `ssh`, `cp`, `rsync`, `rm`, `map`, and
+`clean-partials`. Completion uses existing connections without requesting
+approval. This reuse works independently of ordinary persistence and does not
+enable receiving on the server. To prepare a connection before using it, run
+`syq persist connect hostB --auth-from @laptop`.
+See the [SSH authorization requirements](commands/ssh.md#account-access-requires-approval).
+
+For ordinary SSH tools, export a configuration on the server:
+
+```sh
+syq persist ssh-config hostB > hostB.ssh
+ssh -F hostB.ssh hostB hostname
+scp -F hostB.ssh report hostB:report
+sftp -F hostB.ssh hostB
+GIT_SSH_COMMAND='ssh -F hostB.ssh' git clone hostB:project.git
+rsync -e 'ssh -F hostB.ssh' report hostB:report
+```
+
+The configuration uses this approved account connection and needs no forwarded
+agent. It fails if the connection closes or the requested host, account, or
+port changes. Export again after approving a replacement connection. Use the
+configuration's absolute path when a tool runs from a different directory.
+Syq does not edit your SSH configuration.
+
+`syq persist off` closes the server's approved connections. It does not remove
+permissions on the laptop: a later command can request another login under the
+same session or remembered permission. Ending the laptop's receiving connection
+ends its session permissions; reconnecting asks again unless you chose Remember.
+See [SSH account access](security.md#ssh-account-access) for the authority granted
+and the limits of stopping access.
 
 See [Persistence details](persistence-reference.md) for troubleshooting,
 upgrading, and isolated connections for scripts, or [`syq persist`](commands/persist.md)

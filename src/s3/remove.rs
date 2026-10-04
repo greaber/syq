@@ -509,12 +509,12 @@ pub(super) fn run(args: Args) -> Result<i32> {
             }
             Ok::<_, anyhow::Error>(())
         };
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut signals = crate::process::signals::interrupt_and_terminate()?;
+        let (sigint, terminate) = &mut *signals;
         tokio::pin!(work);
         tokio::select! {
             result = &mut work => result,
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 cancelled.store(true, Relaxed);
                 if deleting.get() {
                     let _ = work.await;

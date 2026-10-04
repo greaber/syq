@@ -312,7 +312,11 @@ state = json.load(open("/tmp/syq-ephemeral-connected.json"))
 connection = next(c for c in state["connections"] if c["endpoint"] == "source")
 assert connection["state"] == "ready" and connection["ssh_connected"], connection
 assert connection["receiving_enabled"] is False and connection["receiving"] is None, connection
-assert not any(".recv" in p.name for p in Path(state["scope"]).iterdir()), state
+# Endpoint records let a later receive-on start without another connect.
+# Receiving is disabled: no profile is running and no listener exists.
+assert connection["receiving_profiles"] == [], connection
+entries = [p.name for p in Path(state["scope"]).iterdir()]
+assert not any(name.endswith(".recv") for name in entries), entries
 PYEPHEMERAL
 syq persist status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["enabled"] is False'
 syq persist off --pscope "$ephemeral_connect_scope"
@@ -467,6 +471,21 @@ python3 /usr/local/libexec/syq-test-forward-copy.py
 
 printf 'case: remote commands run through the return connection\n'
 python3 /usr/local/libexec/syq-test-return-exec.py
+
+printf 'case: source copies authorized through the return connection\n'
+python3 /usr/local/libexec/syq-test-pull-copy.py
+
+printf 'case: direct SSH sessions authorized through the return connection\n'
+python3 /usr/local/libexec/syq-test-return-ssh.py
+
+printf 'case: native tools reuse laptop-approved account connections\n'
+python3 /usr/local/libexec/syq-test-ssh-tools.py
+
+printf 'case: ordinary SSH provider account access without agent forwarding\n'
+python3 /usr/local/libexec/syq-test-provider-ssh.py
+
+printf 'case: direct three-server copies use approved account connections\n'
+python3 /usr/local/libexec/syq-test-peer-bridge.py
 
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py

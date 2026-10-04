@@ -341,9 +341,23 @@ fn print_benchmark_observations(opts: &Opts) {
 }
 
 pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
+    if let Some(spec) = crate::destination::account_copy::operation(loc, args)? {
+        return Ok(Endpoint::Remote(spec));
+    }
     Ok(match &loc.host {
         None => Endpoint::local(),
         Some(h) => {
+            let forwarded = args.return_source.clone().or_else(|| {
+                args.named_receipt
+                    .as_ref()
+                    .filter(|_| {
+                        matches!(
+                            args.auth_from,
+                            crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(_))
+                        )
+                    })
+                    .and_then(|receipt| receipt.connection.clone())
+            });
             let rsh = parse_rsh(&args.rsh)?;
             if loc.port.is_some() && args.rsh.is_some() && !rsh[0].ends_with("ssh") {
                 bail!(
@@ -373,7 +387,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                     }
                 }),
             };
-            let ssh_multiplexer = match sharing {
+            let ssh_multiplexer = match sharing.filter(|_| forwarded.is_none()) {
                 None => None,
                 // A restricted grant keeps a private connection for this run.
                 Some(_) if args.restricted_grant.is_some() => {
@@ -433,7 +447,8 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 port: loc.port,
                 rsh,
                 syq_path: args.syq_path.clone(),
-                bootstrap_helper: args.restricted_grant.is_none()
+                bootstrap_helper: forwarded.is_none()
+                    && args.restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
                 restricted_grant: args.restricted_grant.clone(),
@@ -444,10 +459,7 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 tcp: Default::default(),
                 diagnostics: Default::default(),
                 primed_control: Default::default(),
-                forwarded: args
-                    .named_receipt
-                    .clone()
-                    .filter(|_| matches!(args.auth_from, crate::cli::AuthFrom::Return(_))),
+                forwarded,
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
             })
         }
@@ -764,7 +776,7 @@ pub(crate) fn connect_for_authorization(
     Ok(connection)
 }
 
-fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
+pub(crate) fn distinct_native_sources(sources: &[Location]) -> Vec<Location> {
     let mut seen = std::collections::HashSet::new();
     sources
         .iter()
@@ -1493,13 +1505,16 @@ fn handle_tcp_setup_error(
             )
         });
     }
-    if spec.forwarded.is_some() {
+    if args
+        .return_source
+        .as_ref()
+        .is_some_and(|source| !source.has_ssh())
+    {
         sched.abort();
         progress.stop();
-        return Err(error).with_context(|| {
-            let reason = "return authorization requires direct encrypted TCP data connections";
-            format!("{}: {reason}", spec.label())
-        });
+        return Err(error).context(
+            "approved source requires direct TCP; SSH source authorization is unavailable",
+        );
     }
     if !args.quiet || debug() {
         let congestion_note =
@@ -1771,11 +1786,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "--detach and --peer-auth apply only to a direct copy between two different remote endpoints"
         );
     }
-    if args.pscope_explicit && coordinator_is_remote {
-        bail!(
-            "--pscope is not supported with a remote transfer coordinator; use --coordinate-at local to keep the reusable connections on this machine"
-        );
-    }
     if args.restricted_grant.is_some()
         && (args.no_tcp_encryption || original_srcs[0].is_remote() || !dst.is_remote())
     {
@@ -1831,9 +1841,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             }
         }
     }
-    // A remote coordinator owns both SSH edges. Hand off before constructing
-    // local endpoints so the invoking machine neither reads its persistence
-    // policy nor creates records for connections it will never open.
+    // A remote coordinator owns the data route. Its launcher selects persistence
+    // only for the invoking machine's connection to that coordinator.
     if coordinator_is_remote {
         // The remote coordinator parses its own immutable input. Release this
         // process's preflight entries before waiting for the remote copy.
@@ -1881,9 +1890,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bail!("--coordinate-at currently applies only to copies between two remote endpoints");
     }
     let prepared_source = args.prepared_source.take();
-    let src_ep = match &prepared_source {
-        Some(source) => source.endpoint.clone(),
-        None => endpoint(&srcs[0], &args)?,
+    let src_ep = match args.direct_source.take() {
+        Some(spec) => Endpoint::Remote(*spec),
+        None => match &prepared_source {
+            Some(source) => source.endpoint.clone(),
+            None => endpoint(&srcs[0], &args)?,
+        },
     };
     let mut dst_ep = match args.direct_destination.take() {
         Some(spec) => Endpoint::Remote(*spec),
@@ -2526,7 +2538,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Signed/named routes keep their separately authorized resource policy.
     let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
         Endpoint::Remote(spec) => {
-            spec.local_process || (spec.restricted_grant.is_none() && spec.forwarded.is_none())
+            spec.local_process
+                || (spec.restricted_grant.is_none()
+                    && (spec.forwarded.is_none() || args.return_source.is_some()))
         }
         _ => true,
     });
@@ -4438,14 +4452,15 @@ fn check_operator_directory_ancestry(
     }
 }
 
-fn register_source_roots(
-    conn: &mut dyn Conn,
+/// The same source selection drives ordinary registration and laptop approval.
+pub(crate) fn source_registration(
     sources: &[Location],
     args: &Args,
-    shared_workers: usize,
-    independent_handoff_workers: usize,
-) -> Result<Vec<RegisteredSourceRoot>> {
-    let source_is_local = !sources.iter().any(Location::is_remote);
+) -> (
+    SourceRootBase,
+    Vec<SourceRootSelection>,
+    OperatorSymlinkPolicy,
+) {
     let base = if let Some(path) = &args.native_source_root {
         SourceRootBase {
             path: Some(path.clone()),
@@ -4468,11 +4483,26 @@ fn register_source_roots(
                 || source.follows_root(args.follows_native_source_paths()),
         })
         .collect();
+    (
+        base,
+        selections,
+        source_operator_symlink_policy(args, !sources.iter().any(Location::is_remote)),
+    )
+}
+
+fn register_source_roots(
+    conn: &mut dyn Conn,
+    sources: &[Location],
+    args: &Args,
+    shared_workers: usize,
+    independent_handoff_workers: usize,
+) -> Result<Vec<RegisteredSourceRoot>> {
+    let (base, selections, symlink_policy) = source_registration(sources, args);
     match ok(
         conn.call(Request::RegisterSourceRoots {
             base,
             selections,
-            symlink_policy: source_operator_symlink_policy(args, source_is_local),
+            symlink_policy,
             allow_unconfined_paths: false,
             shared_workers,
             independent_handoff_workers,

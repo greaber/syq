@@ -1,6 +1,8 @@
 //! All subprocess APIs share the same macOS pipe-creation lock.
 #[path = "../src/process.rs"]
 mod process;
+#[path = "support/temp.rs"]
+mod test_support;
 use process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};

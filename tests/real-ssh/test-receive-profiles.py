@@ -20,6 +20,13 @@ def receive(*args, **kwargs):
     return run("syq", "persist", "receive", *args, **kwargs)
 
 
+def restrict_to_unavailable(*args, env=None):
+    # Port 1 is closed in the isolated lab. The new list is saved and applied
+    # before connecting fails, so the previous server loses profile access.
+    result = receive("on", *args, "--connection", "127.0.0.1:1", env=env, ok=False)
+    assert result.returncode != 0 and "receiving settings saved" in result.stderr, result
+
+
 def state(env=None):
     return json.loads(receive("status", "--json", env=env).stdout)
 
@@ -102,7 +109,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     inbox = root / "inbox"
     inbox.mkdir()
     receive("on", "--name", "inbox", "--auto-approve-root", str(inbox),
-            "--server", "source", "--notify", "off")
+            "--connection", "source", "--notify", "off")
     receive("wait", "source", "--name", "inbox", "--timeout", "30")
     automatic = start_copy("inbox", "automatic")
     processes.append(automatic)
@@ -133,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     waiting = start_copy("inbox", "requires-approval")
     processes.append(waiting)
     pending(1)
-    receive("on", "--name", "inbox", "--server", "another-server")
+    restrict_to_unavailable("--name", "inbox")
     finish(waiting, success=False)
     assert not any(p["settings"]["name"] == "inbox"
                    for c in state()["connections"] for p in c["profiles"])
@@ -141,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     unavailable = start_copy("inbox", "unavailable")
     processes.append(unavailable)
     finish(unavailable, success=False)
-    receive("on", "--name", "inbox", "--all-servers")
+    receive("on", "--name", "inbox", "--all-connections")
     receive("wait", "source", "--name", "inbox", "--timeout", "30")
     restored = start_copy("inbox", "inbox/restored")
     processes.append(restored)
@@ -161,6 +168,21 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     (root / "release").touch()
     finish(command)
 
+    print("case: receive on connects an explicit domain without persist connect", flush=True)
+    scope = run("syq", "persist", "on", "--ephemeral").stdout.strip()
+    try:
+        run("syq", "persist", "--pscope", scope, "receive", "on", "--name", "isolated-inbox",
+            "--connection", "source", "--auto-approve-root", str(inbox), "--notify", "off")
+        isolated = start_copy("isolated-inbox", "isolated")
+        processes.append(isolated)
+        finish(isolated)
+        assert (inbox / "isolated").read_bytes() == b"return\n"
+        assert not any(p["name"] == "isolated-inbox" for p in state()["profiles"])
+        run("syq", "persist", "--pscope", scope, "receive", "off")
+        assert profile("laptop")["connection"]["ssh_pid"] == original
+    finally:
+        run("syq", "persist", "--pscope", scope, "off")
+
     print("case: two clients can receive; duplicate name fails only that profile", flush=True)
     (root / "runtime").mkdir(mode=0o700)
     other_home = root / "other-home"
@@ -171,10 +193,10 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
     try:
         # First-ever connection while every profile excludes the server. Later
         # permission changes must activate receiving without another connect.
-        for allow in [("--server", "source"), ("--all-servers",)]:
+        for allow in [("--connection", "source"), ("--all-connections",)]:
             print(f"case: first-time receiving activation with {allow[0]}", flush=True)
-            receive("on", "--name", "other-client", "--root", str(other_root),
-                    "--server", "another-server", "--notify", "off", env=other_env)
+            restrict_to_unavailable("--name", "other-client", "--root", str(other_root),
+                                    "--notify", "off", env=other_env)
             run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env)
             connection = next(c for c in json.loads(run("syq", "persist", "status", "--json", env=other_env).stdout)["connections"]
                               if c["endpoint"] == "source")
@@ -185,7 +207,7 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
             receive("wait", "source", "--name", "other-client", "--timeout", "10", env=other_env)
             # Remove the connection and its service record before the next case.
             run("syq", "persist", "off", env=other_env)
-        receive("on", "--name", "other-client", "--all-servers", env=other_env)
+        receive("on", "--name", "other-client", "--all-connections", env=other_env)
         receive("on", "--name", "laptop", "--root", str(other_root), "--notify", "off", env=other_env)
         receive("on", "--name", "other-client", "--root", str(other_root), "--notify", "off", "--auto-approve-root", str(other_root), env=other_env)
         conflict = run("syq", "persist", "connect", "source", "--timeout", "30", env=other_env, ok=False)
@@ -204,13 +226,13 @@ with tempfile.TemporaryDirectory(prefix="syq-profiles-") as directory:
         receive("remove", "laptop", env=other_env)
         run("syq", "persist", "connect", "source", env=other_env)
         # An SSH connection with no allowed receiving profiles is still usable.
-        receive("on", "--name", "other-client", "--server", "another-server", env=other_env)
+        restrict_to_unavailable("--name", "other-client", env=other_env)
         run("syq", "persist", "connect", "source", "--timeout", "2", env=other_env)
         connection = next(c for c in json.loads(run("syq", "persist", "status", "--json", env=other_env).stdout)["connections"]
                           if c["endpoint"] == "source")
         assert connection["receiving_enabled"] is False, connection
         assert connection["state"] == "ready", connection
-        receive("on", "--name", "other-client", "--server", "source", env=other_env)
+        receive("on", "--name", "other-client", "--connection", "source", env=other_env)
         receive("wait", "source", "--name", "other-client", "--timeout", "30", env=other_env)
     finally:
         run("syq", "persist", "off", env=other_env)

@@ -97,6 +97,12 @@ right contents. See [A compromised source server](security.md#a-compromised-sour
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
+Persistence can reuse an eligible native SSH connection from the invoking
+machine to the coordinating server. Connections forwarding a constrained or
+full SSH agent remain attached to the individual copy. Selecting `--pscope`
+changes only local persistence; it does not pass that local path to another
+server or change the file-data route.
+
 The authentication broker allows 129 simultaneous clients by default. An
 explicit worker count or ceiling changes this to that count plus one control
 connection; restricted copies remain capped at 129 clients.
@@ -107,8 +113,9 @@ To make hostB pull from hostA using credentials already on hostB:
 syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to hostB --into /archive
 ```
 
-There is no restricted source receiver, so direct pulls require one of these
-alternatives to the default authentication.
+Destination-coordinated remote-to-remote copies require one of these
+alternatives to the default authentication. A copy started in a server shell
+can instead request the source-read authorization described below.
 
 ## Detached copies
 
@@ -124,9 +131,12 @@ still be running. The coordinating server needs `/bin/kill` and either
 
 ## Authorization selection
 
-For `syq cp` with local sources and an SSH destination, `--auth-from auto`
-(the default) first uses the source machine's SSH access, including existing
-connections. SSH keeps its normal prompts and configured timeouts. If SSH
+For `syq cp` between this machine and one SSH server, omitted `--auth-from`
+uses your [saved authorization choice](persistence-reference.md#authorization-defaults),
+or `auto` if none is set. `--auth-from auto` tries this machine's native SSH
+access, regardless of existing approved account connections.
+SSH keeps its normal prompts and configured
+timeouts. If SSH
 reports rejected credentials, a host-key verification failure, an unresolved
 hostname, or a refused connection, syq tries live receiving machines in
 alphabetical order, allowing up to two seconds for each reply. The receiving
@@ -143,22 +153,78 @@ may omit time spent before the handoff.
 For object-storage copies and removal, explicit `--auth-from @NAME` uses
 [storage authorization](object-storage.md#authorize-from-your-laptop).
 
-For SSH copies, `--auth-from @NAME` requires that receiving machine
-to authorize the copy. `--auth-from ssh` uses the source machine's SSH access.
+For SSH copies, `--auth-from @NAME` selects that receiving machine; an ordinary
+SSH endpoint selects an [SSH authorization provider](receive.md#use-an-ssh-authorization-provider).
+An existing [approved account connection](persistence-reference.md#approved-account-connections)
+for the same authorizer and endpoint supplies full account access without
+another prompt. Otherwise an ordinary copy requests account access from the
+provider. See [account permissions](persistence-reference.md#account-permissions)
+for Allow and Remember. With `@NAME`, explicit receiver receipt requests keep
+per-copy authorization; ordinary SSH providers do not support that route.
+`--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
-SSH authorization through a receiving machine does not support `--detach`, custom
-`--rsh` or `--syq-path`, `--no-bootstrap`, `--pscope`, alternative `--peer-auth`
-or `--coordinate-at`, `--no-tcp`, or `--no-tcp-encryption`. It requires direct encrypted
-TCP from source to destination. Destination completion does not request
-permission through a receiving machine. With `auto` or `ssh`, completion uses
-the source's own SSH access and does not fall back to a receiving machine.
+Per-copy SSH authorization through a receiving machine does not support `--detach`, custom
+`--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
+or `--coordinate-at`, or `--no-tcp-encryption`. Uploads send file data directly from
+source to destination over encrypted TCP, falling back to SSH between those same
+servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
+key already trusted by the authorizing machine and writable
+`~/.ssh/authorized_keys` on the destination. Syq temporarily adds a key that can
+join only this approved copy, then removes it when the copy closes. The source
+receives no laptop credentials or general SSH access. Remote path completion
+can reuse existing account approval from the selected authorizer, but never
+requests approval itself. `auto` and `ssh` completion use native SSH.
 
-On this route, quoted `~` and `~/archive` select the destination account's home
+For restricted per-copy downloads (`--from HOST` to this machine), approval grants read access
+to the displayed source files and directory trees. `--src-non-dir` grants only
+that entry; directory selectors grant their trees. An untyped source grants
+the entry or tree according to its type on the source. Filters narrow the copy,
+but do not narrow the approved tree. Symlinks follow the command's selection
+rules; the source helper enforces them and refuses writes. File data requires
+encrypted direct TCP, with no SSH fallback or relay through the laptop.
+`--no-tcp` and descriptor streams are unsupported on this per-copy route.
+Account approval supports SSH-only downloads without this TCP requirement.
+
+For per-copy uploads, quoted `~` and `~/archive` select the destination account's home
 directory. Use `./~/archive` for a literal directory called `~`. Avoid
 `~//archive`: explicit receiving authorization keeps it under the home directory,
 but automatic selection uses ordinary SSH, where it resolves to `/archive`.
+
+## Approved account copies
+
+A direct copy between two other servers can request or reuse
+[approved account connections](persistence-reference.md#approved-account-connections)
+to both endpoints. Each endpoint uses its saved authorization choice unless
+`--auth-from` overrides it. Both endpoints must select an authorization provider
+for this route; `auto` and `ssh` use native authentication regardless of existing
+approvals. `--auth-from @NAME` or `--auth-from PROVIDER_HOST` requests access to
+both accounts through that provider as needed. Each prompt grants the named
+account's authority. To prepare connections in advance, use
+`syq persist connect ENDPOINT --auth-from PROVIDER`.
+
+This route uses the default source coordinator or `--coordinate-at src`, with
+`--peer-auth restricted`. It supports `--no-tcp`, helper overrides, mappings,
+and receiver receipts. `--pscope` selects approved connections and authorization
+choices in that local domain. Custom `--rsh`, detached copies, destination
+coordination, and other peer-auth modes keep their separate
+connection requirements. `--coordinate-at local` can reuse approved access to
+each endpoint and explicitly relays file data through the invoking machine.
+
+The source's SSH server must permit remote Unix-socket forwarding. SSH fallback
+also needs two simultaneous sessions on the destination's approved connection
+(`sshd MaxSessions` of at least 2); direct TCP data does not need the second
+session. The socket
+carries control, metadata, and worker setup; payload goes directly between the
+source and destination. The invoking machine's `ProxyJump` route can
+reach the control endpoints, but does not provide a data route between the
+servers. Data workers still need to reach the peer directly. Disabled forwarding is an error and never selects a
+payload relay. Syq creates a receiver for this copy over the destination's
+approved account connection; durable receiver enrollment is unnecessary.
+The destination's [restricted-copy limits](#limits-and-unsupported-options)
+and [signed results](#signed-results) still apply. Helpers must match the
+invoking build; normal bootstrap installs them unless disabled.
 
 ## Verification
 

@@ -773,7 +773,7 @@ impl RemoteConn {
                     Ok(value) => break Ok(value),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        break Err(std::sync::mpsc::RecvError)
+                        break Err(std::sync::mpsc::RecvError);
                     }
                 }
             }
@@ -1314,7 +1314,7 @@ pub struct RemoteSpec {
     /// still filling its pipeline. Readers also reserve the default depth
     /// for pipelined control lookups.
     pub(crate) read_ahead: usize,
-    pub(crate) forwarded: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
+    pub(crate) forwarded: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
 }
 
 #[derive(Debug, Default)]
@@ -1525,6 +1525,7 @@ impl RemoteSpec {
         if !multiplexer.persistent
             || !multiplexer.session_pool
             || self.local_process
+            || self.forwarded.is_some()
             || self.restricted_grant.is_some()
             || !self
                 .rsh
@@ -1546,7 +1547,9 @@ impl RemoteSpec {
                 }
                 self.record_peer(&conn);
                 if multiplexer.automatic_receiving {
-                    crate::receive_service::ensure(&multiplexer.path, self);
+                    if let Some(domain) = &multiplexer.domain {
+                        crate::receive_service::ensure(domain, &multiplexer.path, self);
+                    }
                 }
                 Some(conn)
             }
@@ -1579,6 +1582,14 @@ impl RemoteSpec {
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
         let mut command = self.ssh_command(SshConnection::Independent, false);
         command.arg(self.program_command(args));
+        command
+    }
+
+    /// Launch a coordinator on this local connection's selected master. Its
+    /// rebuilt remote command does not inherit the local persistence domain.
+    pub(crate) fn coordinator_command(&self, remote_command: &str) -> Command {
+        let mut command = self.ssh_command(SshConnection::Control, false);
+        command.arg(remote_command);
         command
     }
 
@@ -1761,7 +1772,7 @@ impl RemoteSpec {
                 // Don't retry what won't change: a missing binary or an
                 // incompatible protocol/build identity.
                 Err(e) if attempt + 1 == attempts || is_non_retryable_connect_error(&e) => {
-                    return Err(e)
+                    return Err(e);
                 }
                 Err(e) => {
                     let limit = if limited {
@@ -1799,10 +1810,9 @@ impl RemoteSpec {
         // Recompressing forwarded blocks here adds CPU work to downloads.
         let compress = compress && !self.local_process;
         let return_stream = if let Some(approved) = &self.forwarded {
-            if !matches!(role, ConnectionRole::Control) {
-                bail!("copies via a return connection require encrypted TCP workers");
-            }
-            Some(approved.take_control()?)
+            matches!(role, ConnectionRole::Control)
+                .then(|| approved.take_control())
+                .transpose()?
         } else if crate::destination::is_named(&self.restricted_grant) {
             Some(crate::destination::connect(
                 self.restricted_grant.as_deref().unwrap(),
@@ -1842,7 +1852,11 @@ impl RemoteSpec {
             return Ok(conn);
         }
         let mut server_args = vec!["--server".into()];
-        if let Some(grant) = &self.restricted_grant {
+        if let Some(grant) = self
+            .restricted_grant
+            .as_ref()
+            .filter(|_| self.forwarded.is_none())
+        {
             if matches!(role, ConnectionRole::Control) {
                 server_args.push(format!("--restricted-grant={grant}"));
             } else {
@@ -1861,7 +1875,9 @@ impl RemoteSpec {
                 server_args.push(format!("--restricted-worker={ticket}"));
             }
         }
-        let mut cmd = if self.local_process {
+        let mut cmd = if let Some(approved) = &self.forwarded {
+            approved.ssh_command()?
+        } else if self.local_process {
             let mut command = Command::new(std::env::current_exe()?);
             // The same executable receives, so this internal flag is always
             // understood; it keeps the data listener on loopback.
@@ -1994,7 +2010,9 @@ impl RemoteSpec {
                 if multiplexer.persistent && multiplexer.session_pool {
                     crate::session_pool::ensure(&multiplexer.path, &self.pool_endpoint());
                     if multiplexer.automatic_receiving {
-                        crate::receive_service::ensure(&multiplexer.path, self);
+                        if let Some(domain) = &multiplexer.domain {
+                            crate::receive_service::ensure(domain, &multiplexer.path, self);
+                        }
                     }
                 }
             }
@@ -2199,27 +2217,46 @@ impl RemoteSpec {
     }
 
     /// The real host name behind an ssh config alias.
-    fn resolved_hostname(&self) -> Option<String> {
+    pub(crate) fn resolved_hostname(&self) -> Option<String> {
+        if let Some(host) = self
+            .forwarded
+            .as_ref()
+            .and_then(|connection| connection.data_hostname())
+        {
+            return Some(host.to_owned());
+        }
         if !self.rsh[0].ends_with("ssh") {
             return Some(self.host.clone());
         }
-        let out = Command::new(&self.rsh[0])
+        let out = self.ssh_hostname_command().capture_output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .find_map(|l| l.strip_prefix("hostname "))
+            .map(|h| h.trim().to_string())
+            .or_else(|| Some(self.host.clone()))
+    }
+
+    /// Read the effective SSH configuration without opening a connection.
+    /// Callers that own a setup deadline can supervise this command themselves.
+    pub(crate) fn ssh_hostname_command(&self) -> Command {
+        let mut command = Command::new(&self.rsh[0]);
+        command
             .args(&self.rsh[1..])
             .arg("-G")
+            .args(
+                self.user
+                    .as_ref()
+                    .map(|user| vec!["-l".to_owned(), user.clone()])
+                    .unwrap_or_default(),
+            )
             .args(
                 self.port
                     .map(|port| vec!["-p".to_owned(), port.to_string()])
                     .unwrap_or_default(),
             )
             .arg("--")
-            .arg(&self.host)
-            .capture_output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.lines()
-            .find_map(|l| l.strip_prefix("hostname "))
-            .map(|h| h.trim().to_string())
-            .or_else(|| Some(self.host.clone()))
+            .arg(&self.host);
+        command
     }
 
     /// Open one data connection, spreading successive connections across the
@@ -2409,7 +2446,9 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
         };
         resolved[i] = addrs;
         if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
-            bail!("TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})");
+            bail!(
+                "TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})"
+            );
         }
     }
 
@@ -2590,7 +2629,7 @@ impl TcpInfo {
                     Err(error) if is_tcp_congestion_error(&error) => {
                         return Err(error).with_context(|| {
                             format!("could not configure the connecting data socket to {sa}")
-                        })
+                        });
                     }
                     Err(e) => last = anyhow!("{}: {e}", data_address(addr, self.port)),
                 }
@@ -2664,7 +2703,7 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
             )
         }
         Ok(Response::Err(error)) if worker => {
-            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into())
+            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into());
         }
         Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
         Ok(other) if worker => {
@@ -2680,7 +2719,7 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
         ),
         Err(e) => {
             return Err(e)
-                .with_context(|| format!("could not start the remote syq on {}", conn.label))
+                .with_context(|| format!("could not start the remote syq on {}", conn.label));
         }
     }
     Ok(conn)
@@ -2807,15 +2846,9 @@ impl Endpoint {
                             if is_tcp_congestion_error(&e)
                                 || is_worker_initialization_error(&e) =>
                         {
-                            return Err(e)
+                            return Err(e);
                         }
                         Err(e) => {
-                            if spec.forwarded.is_some() {
-                                return Err(e).with_context(|| {
-                                    let reason = "TCP data connection failed; return authorization requires direct encrypted TCP and cannot fall back to SSH data";
-                                    format!("{}: {reason}", spec.label())
-                                });
-                            }
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
@@ -2830,7 +2863,11 @@ impl Endpoint {
                                         let congestion_note = tcp_congestion_fallback_note(
                                             info.congestion_control.as_deref(),
                                         );
-                                        warning = Some(format!("syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})", spec.label(), info.port));
+                                        warning = Some(format!(
+                                            "syq: {}: data over ssh (TCP port {} stopped answering: {e:#}{congestion_note})",
+                                            spec.label(),
+                                            info.port
+                                        ));
                                     }
                                 }
                             }
@@ -2840,11 +2877,6 @@ impl Endpoint {
                             }
                         }
                     }
-                }
-                if spec.forwarded.is_some() {
-                    let reason =
-                        "return authorization has no authorized encrypted TCP data connection";
-                    bail!("{}: {reason}", spec.label());
                 }
                 Ok(Box::new(spec.connect_with_role(
                     compress,

@@ -23,6 +23,8 @@ class _Connection:
     s3_region: str | None = None
     s3_profile: str | None = None
     s3_header: Iterable[str] | None = None
+    auth_from: str | None = None
+    pscope: PathArgument | None = None
 
     def __post_init__(self) -> None:
         if self.s3_header is not None:
@@ -72,6 +74,8 @@ class _ContextMapping:
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
     ) -> None:
         if cwd is not None and root is not None:
             raise SyqInvocationError("cwd and root are mutually exclusive")
@@ -79,7 +83,7 @@ class _ContextMapping:
             _map_stream_cwd(None, None, root if root is not None else cwd, None, from_),
             from_,
             root is not None, follow_src,
-            _Connection(rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header),
+            _Connection(rsh, syq_path, no_bootstrap, s3_endpoint, s3_region, s3_profile, s3_header, auth_from, pscope),
         )
 
     @property
@@ -155,11 +159,13 @@ class Mapping(_ContextMapping, Iterable[MappingEntry]):
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
     ) -> None:
         super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src,
                          rsh=rsh, syq_path=syq_path, no_bootstrap=no_bootstrap,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header)
+                         s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from, pscope=pscope)
         self._entries = entries
 
     def __iter__(self) -> Iterator[MappingEntry]:
@@ -191,11 +197,13 @@ class AsyncMapping(_ContextMapping, AsyncIterable[MappingEntry]):
         s3_region: str | None = None,
         s3_profile: str | None = None,
         s3_header: Iterable[str] | None = None,
+        auth_from: str | None = None,
+        pscope: PathArgument | None = None,
     ) -> None:
         super().__init__(from_=from_, cwd=cwd, root=root, follow_src=follow_src,
                          rsh=rsh, syq_path=syq_path, no_bootstrap=no_bootstrap,
                          s3_endpoint=s3_endpoint, s3_region=s3_region,
-                         s3_profile=s3_profile, s3_header=s3_header)
+                         s3_profile=s3_profile, s3_header=s3_header, auth_from=auth_from, pscope=pscope)
         self._entries = entries
 
     def __aiter__(self) -> AsyncIterator[MappingEntry]:

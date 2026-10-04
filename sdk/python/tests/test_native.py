@@ -544,6 +544,26 @@ class NativeClientTests(unittest.TestCase):
         self.assertIn("--dry-run", argv)
         self.assertNotIn("--coordinate-at", argv)
 
+    def test_ssh_account_authorization_for_removal_and_mapping(self) -> None:
+        self.client.rm("file", on="server", auth_from="@laptop")
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        with self.client.map("file", from_="server", auth_from="@laptop", pscope="scope") as stream:
+            list(stream)
+        self.assertEqual(self.argv()[0], "map")
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        with self.client.map("file", from_="server", auth_from="@laptop", pscope="scope") as stream:
+            transformed = stream.transform(lambda entry: entry)
+            with self.assertRaisesRegex(syq.SyqInvocationError, "auth_from"):
+                self.client.cp(mapping=transformed, into="output", auth_from="@other")
+            with self.assertRaisesRegex(syq.SyqInvocationError, "pscope"):
+                self.client.cp(mapping=transformed, into="output", pscope="other")
+            self.client.cp(mapping=transformed, into="output")
+        self.assertEqual(self.argv()[self.argv().index("--auth-from") + 1], "@laptop")
+        self.assertEqual(self.argv()[self.argv().index("--pscope") + 1], "scope")
+        for endpoint in (None, "s3://bucket"):
+            with self.assertRaisesRegex(syq.SyqInvocationError, "SSH source"):
+                self.client.map("file", from_=endpoint, auth_from="@laptop")
+
     def test_s3_removal_arguments_and_validation(self) -> None:
         self.client.rm("key", on="s3://bucket", auth_from="@laptop", s3_all_versions=True, s3_endpoint="http://localhost:9000", s3_header=["X-Test: yes"])
         argv = self.argv()
@@ -810,7 +830,7 @@ class NativeClientTests(unittest.TestCase):
     def test_remote_map_keeps_endpoint_and_base_through_transform(self) -> None:
         with self.client.map(from_="source", srcs_in="photos", cwd="~/data",
                              include=["mtime", "kind"], no_bootstrap=True,
-                             rsh="ssh -F source-config", syq_path="~/bin/syq") as stream:
+                             rsh="ssh -F source-config", pscope="scope", syq_path="~/bin/syq") as stream:
             transformed = stream.transform(lambda entry: entry).transform(lambda entry: entry)
             self.assertEqual(transformed.from_, "source")
             self.assertEqual(transformed.cwd, "~/data/photos")
@@ -822,6 +842,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertIn("--no-bootstrap", argv)
         self.assertIn("ssh -F source-config", argv)
         self.assertIn("~/bin/syq", argv)
+        self.assertEqual(argv[argv.index("--pscope") + 1], "scope")
 
     def test_mapping_connection_options_are_captured_and_conflicts_rejected(self) -> None:
         configured = dict(s3_endpoint="http://source.invalid", s3_region="region-a",
@@ -913,10 +934,6 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", receiver_receipt="full")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--peer-auth"):
             self.client.cp("source", into="target", peer_auth="agent")
-        with self.assertRaisesRegex(syq.SyqInvocationError, "--pscope"):
-            self.client.cp(
-                "source", into="target", pscope="scope", rsh="ssh"
-            )
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):

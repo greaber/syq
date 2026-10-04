@@ -1480,8 +1480,8 @@ fn captured_commands_bound_both_streams_and_feed_input() {
 fn remote_download_report_frames_manifest_and_digest() {
     let digest = "a".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\nsyq-helper-manifest-data:  \"schema\": 1\nsyq-helper-manifest-data:}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
+    );
     let report = read_remote_download_report(&mut bytes.as_bytes())
         .unwrap()
         .unwrap();
@@ -1503,8 +1503,8 @@ fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
     let spoofed = "a".repeat(64);
     let actual = "b".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"schema\":1}}\nsyq-helper-manifest-data:syq-helper-manifest-end\nsyq-helper-manifest-data:syq-helper-sha256:{spoofed}\nsyq-helper-manifest-end\nsyq-helper-sha256:{actual}\nsyq-helper-report-end\n"
+    );
     let report = read_remote_download_report(&mut bytes.as_bytes())
         .unwrap()
         .unwrap();
@@ -1523,8 +1523,8 @@ fn remote_download_report_keeps_injected_markers_inside_the_manifest() {
 fn remote_download_report_rejects_data_after_the_digest() {
     let digest = "a".repeat(64);
     let bytes = format!(
-            "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
-        );
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nunexpected\nsyq-helper-report-end\n"
+    );
     let error = read_remote_download_report(&mut bytes.as_bytes()).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -1841,6 +1841,7 @@ fn verbose_ssh_is_limited_to_nonpersistent_unrestricted_helpers() {
     assert!(!verbose(&spec, true));
     spec.restricted_grant = None;
     spec.ssh_multiplexer = Some(std::sync::Arc::new(SshMultiplexer {
+        domain: None,
         _directory: None,
         path: PathBuf::from("/tmp/syq-test-socket"),
         persistent: true,
@@ -1865,6 +1866,7 @@ fn persistent_control_path_is_one_byte_exact_openssh_argument() {
         b"/tmp/scope with space/%h/non-utf8-\xff/socket".to_vec(),
     ));
     let multiplexer = SshMultiplexer {
+        domain: None,
         _directory: None,
         path,
         persistent: true,

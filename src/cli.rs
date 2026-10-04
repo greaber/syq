@@ -170,16 +170,24 @@ pub struct Args {
     pub(crate) s3_remove: crate::s3::RemoveFlags,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
+    /// Approved account pair selected once for a direct peer copy.
+    #[arg(skip)]
+    pub(crate) peer_bridge: Option<std::sync::Arc<crate::destination::peer_bridge::Selection>>,
     /// Destination SSH connection opened while choosing automatic authorization.
     #[arg(skip)]
     pub(crate) direct_destination: Option<Box<crate::conn::RemoteSpec>>,
+    /// Source SSH connection opened while choosing automatic authorization.
+    #[arg(skip)]
+    pub(crate) direct_source: Option<Box<crate::conn::RemoteSpec>>,
+    #[arg(skip)]
+    pub(crate) return_source: Option<std::sync::Arc<crate::destination::ReturnConnection>>,
     /// Local source work overlapped with the automatic authorization SSH attempt.
     #[arg(skip)]
     pub(crate) prepared_source: Option<std::sync::Arc<crate::transfer::PreparedSource>>,
     #[arg(skip)]
     pub(crate) named_receipt: Option<std::sync::Arc<crate::destination::NamedReceipt>>,
     #[arg(skip)]
-    pub(crate) auth_from: AuthFrom,
+    pub(crate) auth_from_explicit: bool,
     /// Which public command produced this execution request.
     #[arg(skip)]
     pub interface: Interface,
@@ -441,6 +449,9 @@ pub struct Args {
     /// Remote shell command (default: ssh); controls agent forwarding when set. An ssh command keeps shared and persistent connections unless its options configure connection sharing; -v shares them only within the run
     #[arg(short = 'e', long = "rsh", value_name = "COMMAND")]
     pub rsh: Option<String>,
+    /// Override saved authorization with auto, native SSH (ssh), or an authorization provider (@NAME or HOST). When omitted, use the saved choice, then auto
+    #[arg(long = "syq-auth-from", value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from, default_value = "auto", hide_default_value = true)]
+    pub(crate) auth_from: AuthFrom,
     /// Use this exact syq executable on the remote instead of the managed helper
     #[arg(long = "rsync-path", value_name = "PATH")]
     pub syq_path: Option<String>,
@@ -468,7 +479,7 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command
+    /// Syq extension: use an isolated persistence domain created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command
     #[arg(long = "syq-pscope", value_name = "PATH")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
@@ -508,9 +519,11 @@ pub struct Args {
     pub copy_if: Option<String>,
     #[arg(skip)]
     pub expressions: crate::expression::Policy,
-    /// Native copy inputs are read only after selecting the executing build.
+    /// Copy inputs are read only after selecting the executing build.
     #[arg(skip)]
     pending_ignore_inputs: Vec<IgnoreInput>,
+    #[arg(skip)]
+    pending_files_from: bool,
 
     /// Delete extraneous files from the destination directories (paths the source does not
     /// have). Deletion happens after the transfer and is skipped entirely if the source scan
@@ -742,16 +755,32 @@ impl Args {
     }
 
     pub(crate) fn read_copy_inputs(&mut self) -> Result<()> {
-        if !self.pending_ignore_inputs.is_empty() {
-            self.ignore_lines = read_ignore_inputs(
-                std::mem::take(&mut self.pending_ignore_inputs),
+        let (policy, option) = if self.interface == Interface::Rsync {
+            (
+                rsync_operator_symlink_policy(self.insecure_links),
+                "--syq-ignore-from",
+            )
+        } else {
+            (
                 if self.native_follow {
                     OperatorSymlinkPolicy::FollowAll
                 } else {
                     OperatorSymlinkPolicy::Refuse
                 },
                 "--ignore-from",
+            )
+        };
+        if !self.pending_ignore_inputs.is_empty() {
+            self.ignore_lines = read_ignore_inputs(
+                std::mem::take(&mut self.pending_ignore_inputs),
+                policy,
+                option,
             )?;
+        }
+        if self.pending_files_from {
+            self.files_from_lines =
+                read_files_from(self.files_from.as_ref().unwrap(), self.from0, policy)?;
+            self.pending_files_from = false;
         }
         Ok(())
     }
@@ -913,8 +942,9 @@ impl Args {
             .and_then(|limits| limits.workers)
             .unwrap_or(usize::MAX);
         // Removing the tuner's default ceiling does not expand signed
-        // receiver authority. The receiver still enforces its specific grant.
-        if self.restricted_grant.is_some() {
+        // receiver or approved source authority. Each endpoint still enforces
+        // its particular grant; cached full-account SSH has no such ceiling.
+        if self.restricted_grant.is_some() || self.return_source.is_some() {
             requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))
         } else {
             requested
@@ -957,6 +987,8 @@ impl Args {
 }
 
 fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
+    args.auth_from_explicit =
+        matches.value_source("auth_from") == Some(clap::parser::ValueSource::CommandLine);
     args.apply_advanced()?;
     args.block_size_explicit =
         matches.value_source("block_size") == Some(clap::parser::ValueSource::CommandLine);
@@ -973,17 +1005,8 @@ fn finish_parse(mut args: Args, matches: &clap::ArgMatches) -> Result<Args> {
         .map(crate::bwlimit::parse_rate)
         .transpose()?
         .unwrap_or(0);
-    let symlink_policy = rsync_operator_symlink_policy(args.insecure_links);
-    args.ignore_lines = ordered_ignore_lines(
-        &args.ignore,
-        &args.ignore_from,
-        matches,
-        symlink_policy,
-        "--syq-ignore-from",
-    )?;
-    if let Some(f) = &args.files_from {
-        args.files_from_lines = read_files_from(f, args.from0, symlink_policy)?;
-    }
+    args.pending_ignore_inputs = ordered_ignore_inputs(&args.ignore, &args.ignore_from, matches);
+    args.pending_files_from = args.files_from.is_some();
     Ok(args)
 }
 
@@ -1042,20 +1065,6 @@ fn ordered_ignore_inputs(
     }
     items.sort_by_key(|(index, _)| *index);
     items.into_iter().map(|(_, item)| item).collect()
-}
-
-fn ordered_ignore_lines(
-    ignore: &[String],
-    ignore_from: &[OsString],
-    matches: &clap::ArgMatches,
-    symlink_policy: OperatorSymlinkPolicy,
-    ignore_from_name: &str,
-) -> Result<Vec<String>> {
-    read_ignore_inputs(
-        ordered_ignore_inputs(ignore, ignore_from, matches),
-        symlink_policy,
-        ignore_from_name,
-    )
 }
 
 fn read_ignore_inputs(
@@ -1350,37 +1359,27 @@ struct NativeRemoteHelperArgs {
     no_bootstrap: bool,
 }
 
-/// A process-local choice of authority; no credentials or durable preferences.
+/// A choice of authority; it contains no credentials.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AuthFrom {
     #[default]
     Auto,
     Ssh,
-    Return(String),
+    Provider(crate::auth_from::Provider),
 }
 
-impl AuthFrom {
-    fn receiving(value: &str) -> Result<Self> {
-        let name = value
-            .strip_prefix('@')
-            .ok_or_else(|| anyhow::anyhow!("receiver references require @NAME"))?;
-        crate::destination::validate_name(name)?;
-        Ok(Self::Return(name.to_owned()))
-    }
-}
-
-fn parse_auth_from(value: &str) -> Result<AuthFrom> {
+pub(crate) fn parse_auth_from(value: &str) -> Result<AuthFrom> {
     match value {
         "auto" => Ok(AuthFrom::Auto),
         "ssh" => Ok(AuthFrom::Ssh),
-        _ => AuthFrom::receiving(value),
+        _ => crate::auth_from::Provider::parse(value).map(AuthFrom::Provider),
     }
 }
 
 #[derive(clap::Args, Debug, Default)]
 struct NativeRemoteArgs {
-    /// Use local SSH first, then an available receiving machine for credential, host-key, hostname, or refused-connection errors (auto); require local SSH (ssh) or authorize through @NAME (also S3 copies)
-    #[arg(long, value_name = "auto|ssh|@NAME", value_parser = parse_auth_from)]
+    /// Override saved authorization: try native SSH (auto), require native SSH (ssh), or authorize through @NAME or an SSH host (@NAME also supports S3 copies). Eligible native copies can request laptop authorization after SSH failure
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     /// Choose the endpoint that runs the coordinator
     #[arg(long, value_enum, default_value_t = CoordinateAt::Auto, help_heading = REMOTE_TO_REMOTE_HEADING)]
@@ -1548,7 +1547,7 @@ struct NativeCopyCommand {
     copy: NativeCopyFields,
     #[command(flatten)]
     remote: NativeRemoteArgs,
-    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// After copying, remove target-only objects in mapped directory scopes;
@@ -1637,6 +1636,12 @@ struct NativeMapCommand {
     rsh: Option<String>,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     #[command(flatten)]
     s3: crate::s3::Flags,
     #[command(flatten)]
@@ -1656,8 +1661,8 @@ struct NativeMapCommand {
     override_usage = "syq rm [OPTIONS] PATH...\n       syq rm [OPTIONS] --srcs-in DIR"
 )]
 struct NativeRmCommand {
-    /// Request storage authorization from a connected receiving machine
-    #[arg(long, value_name = "@NAME", value_parser = parse_auth_from)]
+    /// Use approved SSH account access, or request S3 authorization from a receiving machine
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
     #[command(flatten)]
     s3: crate::s3::Flags,
@@ -1671,7 +1676,7 @@ struct NativeRmCommand {
     helper: NativeRemoteHelperArgs,
     #[command(flatten)]
     results_output: NativeResultsArgs,
-    /// Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral`
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
 }
@@ -1701,6 +1706,12 @@ struct CleanPartialsCommand {
     operational: NativeOperationalArgs,
     #[command(flatten)]
     helper: NativeRemoteHelperArgs,
+    /// Use an approved SSH account connection, or native SSH authentication
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
+    /// Use an isolated persistence domain created by `syq persist on --ephemeral`
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
     #[command(flatten)]
     results_output: NativeResultsArgs,
 }
@@ -1714,6 +1725,9 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         .unwrap_or_else(|error| error.exit());
     let parsed = CleanPartialsCommand::from_arg_matches(&matches)?;
     let endpoint = parse_native_endpoint(parsed.on.as_deref())?;
+    if endpoint.is_none() && parsed.auth_from.is_some() {
+        bail!("--auth-from requires an SSH removal endpoint");
+    }
     if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
         bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
     }
@@ -1727,6 +1741,9 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         parsed.results_output,
     )?;
     args.clean_partials = true;
+    args.pscope = parsed.pscope;
+    args.auth_from_explicit = parsed.auth_from.is_some();
+    args.auth_from = parsed.auth_from.unwrap_or_default();
     args.locations = parsed
         .trees
         .into_iter()
@@ -2252,9 +2269,14 @@ fn parse_descriptor_copy(
     crate::descriptor_copy::validate_controls(&mut args)?;
     apply_native_remote(&mut args, parsed.remote)?;
     if args.s3.is_none()
+        && !args
+            .descriptor_copy
+            .as_ref()
+            .and_then(|plan| plan.location.as_ref())
+            .is_some_and(Location::is_remote)
         && matches.value_source("auth_from") == Some(clap::parser::ValueSource::CommandLine)
     {
-        bail!("--auth-from with descriptor copies requires an S3 endpoint");
+        bail!("--auth-from with descriptor copies requires an SSH or S3 endpoint");
     }
     Ok(args)
 }
@@ -2553,6 +2575,9 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     } else {
         parse_native_endpoint(parsed.from.as_deref())?
     };
+    if endpoint.is_none() && parsed.auth_from.is_some() {
+        bail!("--auth-from requires an SSH source for map");
+    }
     if endpoint.is_none()
         && (parsed.rsh.is_some() || parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap)
     {
@@ -2617,6 +2642,9 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
 
     let mut args = native_engine_defaults();
     args.interface = Interface::NativeMap;
+    args.pscope = parsed.pscope;
+    args.auth_from_explicit = parsed.auth_from.is_some();
+    args.auth_from = parsed.auth_from.unwrap_or_default();
     args.placement = placement;
     args.locations = locations;
     args.native_map_cwd = map_cwd;
@@ -2691,9 +2719,6 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .as_deref()
         .filter(|s| s.starts_with("s3://"));
     let s3 = crate::s3::Options::parse(parsed.s3, s3_endpoint, None, &matches)?;
-    if parsed.auth_from.is_some() && s3.is_none() {
-        bail!("--auth-from for rm requires --on s3://BUCKET");
-    }
     if s3.is_some() && parsed.selection.follow_src {
         bail!("--follow-src is not supported for S3 removal; object keys have no parent symlinks");
     }
@@ -2713,6 +2738,9 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     } else {
         parse_native_endpoint(parsed.selection.from.as_deref())?
     };
+    if endpoint.is_none() && s3.is_none() && parsed.auth_from.is_some() {
+        bail!("--auth-from requires an SSH or S3 removal endpoint");
+    }
     if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
         bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
     }
@@ -2749,6 +2777,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     }
     args.s3 = s3;
     args.s3_remove = parsed.s3_remove;
+    args.auth_from_explicit = parsed.auth_from.is_some();
     args.auth_from = parsed.auth_from.unwrap_or_default();
     args.native_follow = parsed.selection.follow;
     args.native_follow_src = parsed.selection.follow_src;
@@ -3057,6 +3086,7 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
             "--detach cannot be combined with --peer-auth broker or full-agent; a brokered or forwarded agent exists only while syq stays attached"
         );
     }
+    args.auth_from_explicit = remote.auth_from.is_some();
     args.auth_from = remote.auth_from.unwrap_or_default();
     args.coordinate_at = remote.coordinate_at;
     args.rsh = remote.rsh;
@@ -3128,7 +3158,7 @@ pub(crate) fn native_basename(path: &[u8]) -> Option<&[u8]> {
     (!name.is_empty() && name != b"." && name != b"..").then_some(name)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NativeEndpoint {
     pub(crate) user: Option<String>,
     pub(crate) host: String,

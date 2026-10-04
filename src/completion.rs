@@ -6,7 +6,7 @@
 //! the other shells pass their already-tokenized words. All command awareness,
 //! endpoint selection, and local/remote directory discovery remains in Rust.
 
-use crate::cli::{parse_native_endpoint, NativeEndpoint};
+use crate::cli::{parse_native_endpoint, AuthFrom, NativeEndpoint};
 use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
 use crate::proto::{CompletionEntry, OperatorSymlinkPolicy, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
@@ -593,7 +593,7 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "exec" | "tuning-cache" | "_ls" => {
+        "completion" | "persist" | "receiver" | "exec" | "ssh" | "tuning-cache" | "_ls" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
@@ -739,6 +739,7 @@ fn bash_replacement_candidates(
 fn root_candidates(current: &[u8]) -> Vec<Candidate> {
     [
         "cp",
+        "ssh",
         "exec",
         "rm",
         "clean-partials",
@@ -766,6 +767,7 @@ fn public_command(name: &str) -> Option<clap::Command> {
         "completion" => Some(command_for_help()),
         "persist" => Some(crate::persistence::command_for_help()),
         "receiver" => Some(crate::help::receiver()),
+        "ssh" => Some(crate::destination::ssh::command_for_help()),
         "exec" => Some(crate::destination::exec::command_for_help()),
         "--self-update" => Some(crate::help::lifecycle()),
         "tuning-cache" => Some(crate::tune::history::command_for_help()),
@@ -873,7 +875,11 @@ fn management_candidates(
     }
     match (command, meta.get_name()) {
         ("completion", "forget") => Ok(endpoint_candidates(current, EndpointSyntax::Native, None)),
-        ("persist", "connect") => Ok(endpoint_candidates(
+        ("persist", "auth-from") => Ok(auth_from_candidates(
+            current,
+            pscope_from_args(command, args),
+        )),
+        ("persist", "connect" | "ssh-config") => Ok(endpoint_candidates(
             current,
             EndpointSyntax::Native,
             pscope_from_args(command, args),
@@ -888,14 +894,37 @@ fn management_candidates(
                 .map(Candidate::text)
                 .collect())
         }
-        ("persist", "remove") if args.first().is_some_and(|arg| arg == b"receive") => {
-            Ok(crate::receive_service::profile_names()
+        ("persist", "remove")
+            if args.first().is_some_and(|arg| arg == b"receive")
+                && args.get(1).is_some_and(|arg| arg == b"permissions") =>
+        {
+            let domain =
+                crate::persistence::Domain::select(pscope_from_args(command, args).map(Path::new))?;
+            let accounts = crate::receive_approval::accounts::list(&domain)
+                .unwrap_or_default()
                 .into_iter()
+                .map(|item| item.id);
+            let providers = crate::receive_approval::provider_accounts::list(&domain)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.id);
+            Ok(accounts
+                .chain(providers)
                 .map(String::into_bytes)
-                .filter(|name| name.starts_with(current))
+                .filter(|id| id.starts_with(current))
                 .map(Candidate::text)
                 .collect())
         }
+        ("persist", "remove") if args.first().is_some_and(|arg| arg == b"receive") => Ok(
+            crate::receive_service::profile_names(&crate::persistence::Domain::select(
+                pscope_from_args(command, args).map(Path::new),
+            )?)
+            .into_iter()
+            .map(String::into_bytes)
+            .filter(|name| name.starts_with(current))
+            .map(Candidate::text)
+            .collect(),
+        ),
         ("receiver", "enroll") => Ok(endpoint_candidates(current, EndpointSyntax::Rsync, None)),
         _ => Ok(Vec::new()),
     }
@@ -1276,6 +1305,13 @@ fn value_completion(
     command_meta: &clap::Command,
 ) -> Option<ValueCompletion> {
     let known = match command {
+        "ssh" => match option {
+            b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
+            _ => None,
+        },
         "exec" => match option {
             b"--on" => Some(ValueCompletion::ReturnName),
             _ => None,
@@ -1300,6 +1336,7 @@ fn value_completion(
             _ => None,
         },
         "rm" | "clean-partials" => match option {
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--results" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1315,6 +1352,10 @@ fn value_completion(
             _ => None,
         },
         "map" => match option {
+            b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
             b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
@@ -1327,6 +1368,7 @@ fn value_completion(
             _ => None,
         },
         "persist" => match option {
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--name" => Some(ValueCompletion::ReceivingProfile),
             b"--pscope" | b"--cwd" | b"-C" | b"--root" => Some(ValueCompletion::LocalPath {
                 directories_only: true,
@@ -1338,6 +1380,7 @@ fn value_completion(
             _ => None,
         },
         "rsync" => match option {
+            b"--syq-auth-from" => Some(ValueCompletion::AuthFrom),
             b"--files-from" | b"--syq-ignore-from" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1380,21 +1423,18 @@ fn complete_value(
     kind: ValueCompletion,
 ) -> Result<Vec<Candidate>> {
     match kind {
-        ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names()
-            .into_iter()
-            .map(String::into_bytes)
-            .filter(|name| name.starts_with(current))
-            .map(Candidate::text)
-            .collect()),
-        ValueCompletion::AuthFrom => Ok([b"auto".to_vec(), b"ssh".to_vec()]
-            .into_iter()
-            .filter(|value| value.starts_with(current))
-            .map(Candidate::text)
-            .chain(
-                return_name_candidates(current)
-                    .filter(|candidate| candidate.value != b"auto" && candidate.value != b"ssh"),
-            )
-            .collect()),
+        ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names(
+            &crate::persistence::Domain::select(pscope_from_args(command, args).map(Path::new))?,
+        )
+        .into_iter()
+        .map(String::into_bytes)
+        .filter(|name| name.starts_with(current))
+        .map(Candidate::text)
+        .collect()),
+        ValueCompletion::AuthFrom => Ok(auth_from_candidates(
+            current,
+            pscope_from_args(command, args),
+        )),
         ValueCompletion::ReturnName => Ok(return_name_candidates(current).collect()),
         ValueCompletion::NamedOrSshDestination => {
             let mut candidates = endpoint_candidates(
@@ -1516,12 +1556,6 @@ fn complete_path_for(
             path_policy(command, args, false, true),
         ));
     };
-    let authorizer = find_option_value(args, b"--auth-from");
-    if authorizer.is_some_and(|value| value != "auto" && value != "ssh") {
-        // Completion uses local SSH for auto/ssh, but never requests approval
-        // or falls back to a receiving machine.
-        return Ok(Vec::new());
-    }
     if endpoint.host.starts_with('@') {
         return Ok(Vec::new());
     }
@@ -1650,7 +1684,7 @@ fn remote_path_candidates(
     base: Option<SourceBase<'_>>,
     policy: PathCompletionPolicy,
 ) -> Result<Vec<Candidate>> {
-    if has_explicit_rsh(command, args) {
+    if has_explicit_rsh(command, args) || endpoint.host.starts_with('@') {
         return Ok(Vec::new());
     }
     let (directory, typed_directory, prefix) = split_path(current);
@@ -1675,6 +1709,20 @@ fn remote_path_candidates(
         },
     );
     let pscope = pscope_from_args(command, args).map(PathBuf::from);
+    let explicit = find_option_bytes(
+        args,
+        if command == "rsync" {
+            b"--syq-auth-from"
+        } else {
+            b"--auth-from"
+        },
+    )
+    .map(std::str::from_utf8)
+    .transpose()?
+    .map(crate::cli::parse_auth_from)
+    .transpose()?;
+    let domain = crate::persistence::Domain::select(pscope.as_deref())?;
+    let auth_from = crate::auth_from::resolve(&domain, &endpoint.host, explicit)?;
     let endpoint_for_thread = endpoint.clone();
     let directory_for_thread = directory.path;
     let root_for_thread = directory.confined_root;
@@ -1683,7 +1731,8 @@ fn remote_path_candidates(
     std::thread::spawn(move || {
         let connection = connect_completion_endpoint(
             endpoint_for_thread,
-            pscope.as_deref(),
+            &domain,
+            auth_from,
             syq_path,
             no_bootstrap,
         );
@@ -1736,44 +1785,81 @@ fn remote_path_candidates(
 }
 
 fn connect_completion_endpoint(
-    endpoint: NativeEndpoint,
-    pscope: Option<&Path>,
+    mut endpoint: NativeEndpoint,
+    domain: &crate::persistence::Domain,
+    auth_from: AuthFrom,
     syq_path: Option<String>,
     no_bootstrap: bool,
 ) -> Result<RemoteConn> {
-    let multiplexer = match crate::persistence::scope_for_implicit_ssh(pscope)? {
-        Some(scope) => Arc::new(SshMultiplexer::persistent(
-            &scope,
-            endpoint.user.as_deref(),
-            &endpoint.host,
-            endpoint.port,
-            None,
-        )?),
-        None => Arc::new(SshMultiplexer::new()?),
+    let cached = crate::destination::ssh::persistent::select_cached(domain, &endpoint, &auth_from)?;
+    let mut rsh = vec!["ssh".into()];
+    let ssh_multiplexer = if let Some(cached) = cached {
+        endpoint = cached.endpoint().clone();
+        rsh.extend(
+            cached
+                .options()
+                .into_iter()
+                .map(|option| {
+                    option
+                        .into_string()
+                        .map_err(|_| anyhow!("approved SSH option is not UTF-8"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        // These options require the existing approved master. Neither the
+        // completion helper nor a disappearing socket may start a new login.
+        None
+    } else {
+        if let AuthFrom::Provider(provider) = auth_from {
+            bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint_label(&endpoint), endpoint_label(&endpoint));
+        }
+        let persistent = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())
+            .and_then(|scope| {
+                scope
+                    .map(|scope| {
+                        SshMultiplexer::persistent(
+                            &scope,
+                            endpoint.user.as_deref(),
+                            &endpoint.host,
+                            endpoint.port,
+                            None,
+                        )
+                    })
+                    .transpose()
+            });
+        let persistent = match persistent {
+            Ok(multiplexer) => multiplexer,
+            Err(error) if domain.is_default() => {
+                crate::output::diagnostic!("syq: warning: cannot use persistent SSH connections ({error:#}); continuing without persistence");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        Some(Arc::new(match persistent {
+            Some(multiplexer) => multiplexer,
+            None => SshMultiplexer::new()?,
+        }))
     };
+    for option in [
+        "BatchMode=yes",
+        "ConnectTimeout=3",
+        "ConnectionAttempts=1",
+        "ServerAliveInterval=5",
+        "ServerAliveCountMax=1",
+    ] {
+        rsh.extend(["-o".into(), option.into()]);
+    }
     let spec = RemoteSpec {
         local_process: false,
         user: endpoint.user,
         host: endpoint.host,
         port: endpoint.port,
-        rsh: vec![
-            "ssh".into(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=3".into(),
-            "-o".into(),
-            "ConnectionAttempts=1".into(),
-            "-o".into(),
-            "ServerAliveInterval=5".into(),
-            "-o".into(),
-            "ServerAliveCountMax=1".into(),
-        ],
+        rsh,
         syq_path: syq_path.clone(),
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
         restricted_grant: None,
         helper_install: Default::default(),
-        ssh_multiplexer: Some(multiplexer),
+        ssh_multiplexer,
         quiet: true,
         pacing: Default::default(),
         tcp: Default::default(),
@@ -2059,11 +2145,30 @@ fn path_candidates_from_entries(
     candidates
 }
 
+fn auth_from_candidates(current: &[u8], explicit_scope: Option<&str>) -> Vec<Candidate> {
+    [b"auto".to_vec(), b"ssh".to_vec()]
+        .into_iter()
+        .filter(|value| value.starts_with(current))
+        .map(Candidate::text)
+        .chain(return_name_candidates(current))
+        .chain(endpoint_candidates(
+            current,
+            EndpointSyntax::Native,
+            explicit_scope,
+        ))
+        .collect()
+}
+
 fn endpoint_candidates(
     current: &[u8],
     syntax: EndpointSyntax,
     explicit_scope: Option<&str>,
 ) -> Vec<Candidate> {
+    // A leading @ selects a registered receiving name, never an empty SSH
+    // username. Do not turn ordinary host inventory into receiving names.
+    if current.starts_with(b"@") {
+        return Vec::new();
+    }
     let typed = std::str::from_utf8(current).unwrap_or_default();
     let typed_user = typed.rsplit_once('@').map(|(user, _)| user);
     let mut endpoints = Vec::new();

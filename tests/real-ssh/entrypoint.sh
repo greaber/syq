@@ -44,6 +44,25 @@ runner() {
     test -r /run/lab/id_ed25519
     install -d -m 0700 -o syq -g syq /home/syq/.ssh
     install -m 0600 -o syq -g syq /run/lab/id_ed25519 /home/syq/.ssh/id_ed25519
+    # Bind-mounted ownership comes from the runner host and may match another
+    # container account. Only root may traverse the original private-key mount;
+    # the laptop account uses its correctly owned installed copy above.
+    chown root:root /run/lab
+    chmod 0700 /run/lab
+    if [ "${SYQ_REAL_SSH_SUITE:-core}" = core ]; then
+        # A separate unprivileged requester on the runner gives bridge tests
+        # four roles without another container or access to the laptop's key.
+        install -d -m 0755 /run/sshd
+        ssh-keygen -y -f /home/syq/.ssh/id_ed25519 > /etc/ssh/lab_authorized_keys
+        chmod 0644 /etc/ssh/lab_authorized_keys
+        ssh-keygen -q -t ed25519 -N '' -f /run/sshd/ssh_host_ed25519_key
+        sed 's/ListenAddress 0.0.0.0/ListenAddress 127.0.0.1/' \
+            /etc/ssh/sshd_config > /run/sshd/requester_config
+        printf 'AllowTcpForwarding remote\nAllowStreamLocalForwarding remote\n' \
+            > /etc/ssh/sshd_config.d/00-return.conf
+        /usr/sbin/sshd -t -f /run/sshd/requester_config
+        /usr/sbin/sshd -e -f /run/sshd/requester_config
+    fi
     exec runuser -u syq -- env \
         HOME=/home/syq \
         LOGNAME=syq \
