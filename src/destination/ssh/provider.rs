@@ -971,7 +971,7 @@ mod tests {
         let physical = tempfile::Builder::new()
             .prefix("provider-")
             .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in(&scope)
+            .tempdir_in(domain.runtime_path())
             .unwrap();
         let mut owner = OpenOptions::new()
             .write(true)
