@@ -2614,8 +2614,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 return Ok(code);
             }
             SmallCopy::Declined => {
-                let _setup = progress.clock.setup.begin();
-                configure_hashing(&mut *dst_ctl, opts.hash_policy)?;
+                dst_ctl.send_expecting_ok(
+                    Request::ConfigureHashing(opts.hash_policy),
+                    "configure hashing",
+                )?;
             }
             SmallCopy::Reconnect => {
                 let _setup = progress.clock.setup.begin();
