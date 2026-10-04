@@ -120,7 +120,12 @@ exit 17
         .stderr(Stdio::piped());
     // Keep the group leader unreaped until cleanup, so even a regression with
     // an inherited pipe cannot leak the disposable background writer.
-    let mut group = process_group::ProcessGroup::spawn(&mut command).unwrap();
+    let mut group = {
+        let _spawning = PROCESS_IMAGE_LOCK
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        process_group::ProcessGroup::spawn(&mut command).unwrap()
+    };
     let mut stdout = group.child.stdout.take().unwrap();
     let mut stderr = group.child.stderr.take().unwrap();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
