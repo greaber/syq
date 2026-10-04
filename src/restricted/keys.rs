@@ -137,7 +137,7 @@ fn ensure_agent_key(
         "an SSH agent is required to unlock this receiver key; configure IdentityAgent or start an agent and retry",
     )?.to_path_buf();
     if !agent_has_key(&socket, public)? {
-        // ssh-add uses the existing key's normal passphrase/PIN prompt. Syq
+        // ssh-add uses the existing key's normal passphrase prompt. Syq
         // neither reads that passphrase nor asks for a receiver passphrase.
         let mut command = Command::new("ssh-add");
         if let Some(provider) = provider {
@@ -630,7 +630,37 @@ pub(super) fn generate_matching_key(
             "generated receiver key",
             128 * 1024,
         )?);
-        PrivateKey::from_openssh(&encoded)?
+        let key = PrivateKey::from_openssh(&encoded)?;
+        // Probe through the same agent used by copies, using only the public
+        // file so ssh-keygen cannot fall back to signing the handle directly.
+        // A terminal PIN prompt during key creation does not establish that
+        // an already-running agent has a working askpass program.
+        let socket = ensure_agent_key(
+            template.agent.as_deref(),
+            &path,
+            key.public_key(),
+            template.provider.as_deref(),
+        )?;
+        let signature = agent_signature(
+            key.public_key(),
+            &path.with_extension("pub"),
+            &socket,
+            "syq-receiver-key-check-v1@greaber.github",
+            id.to_string().as_bytes(),
+        );
+        if signature.is_err() {
+            // No durable handle or remote authorization exists yet. Remove
+            // the failed probe's identity before discarding its handle.
+            let _ = Command::new("ssh-add")
+                .arg("-d")
+                .arg(path.with_extension("pub"))
+                .env("SSH_AUTH_SOCK", &socket)
+                .capture_output();
+        }
+        signature.context(
+            "the SSH agent cannot sign with the new hardware receiver key; if it requires a PIN, configure a working SSH_ASKPASS program for the agent and retry; the receiver was not installed",
+        )?;
+        key
     };
     let public = key.public_key().clone();
     // Software keys are wrapped before any durable write. Only FIDO handles

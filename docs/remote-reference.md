@@ -27,7 +27,11 @@ New enrollments match the SSH key that authenticated setup. Ed25519 stays
 Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
 Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
 hardware-backed key with the same effective touch and PIN requirements;
-creating that key can still require touching the device.
+creating and checking that key can require touching the device. Syq checks
+that the destination's selected SSH agent can sign before installing the key.
+PIN-protected keys need a working `SSH_ASKPASS` program in that agent's
+environment; the agent cannot use syq's terminal for its PIN prompt. Enrollment
+stops before installation if the signing check fails.
 
 For a passphrase-protected Ed25519 or RSA login, the receiver key is encrypted
 using a secret derived through the login key's SSH agent. There is no new

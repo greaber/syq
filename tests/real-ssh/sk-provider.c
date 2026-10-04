@@ -13,6 +13,10 @@
 #include <unistd.h>
 
 uint32_t sk_api_version(void) { return SSH_SK_VERSION_MAJOR; }
+static int pin_required(uint8_t flags, const char *pin) {
+    return (flags & SSH_SK_USER_VERIFICATION_REQD) &&
+        (!pin || strcmp(pin, "fixture-unlock") != 0);
+}
 static int unavailable(void) {
     const char *path = getenv("SYQ_TEST_SK_UNAVAILABLE");
     return path && access(path, F_OK) == 0;
@@ -21,8 +25,9 @@ static int unavailable(void) {
 int sk_enroll(uint32_t alg, const uint8_t *challenge, size_t challenge_len,
     const char *application, uint8_t flags, const char *pin,
     struct sk_option **options, struct sk_enroll_response **out) {
-    (void)challenge; (void)challenge_len; (void)application; (void)pin; (void)options;
+    (void)challenge; (void)challenge_len; (void)application; (void)options;
     if (unavailable()) return SSH_SK_ERR_DEVICE_NOT_FOUND;
+    if (pin_required(flags, pin)) return SSH_SK_ERR_PIN_REQUIRED;
     struct sk_enroll_response *r = calloc(1, sizeof(*r));
     if (!r) return SSH_SK_ERR_GENERAL;
     r->flags = flags;
@@ -62,8 +67,9 @@ int sk_sign(uint32_t alg, const uint8_t *data, size_t data_len,
     const char *application, const uint8_t *handle, size_t handle_len,
     uint8_t flags, const char *pin, struct sk_option **options,
     struct sk_sign_response **out) {
-    (void)pin; (void)options;
+    (void)options;
     if (unavailable()) return SSH_SK_ERR_DEVICE_NOT_FOUND;
+    if (pin_required(flags, pin)) return SSH_SK_ERR_PIN_REQUIRED;
     const unsigned char *cursor = handle;
     EVP_PKEY *key = d2i_AutoPrivateKey(NULL, &cursor, (long)handle_len);
     struct sk_sign_response *r = calloc(1, sizeof(*r));
