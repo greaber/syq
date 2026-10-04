@@ -914,8 +914,9 @@ fn socket_is_live(path: &Path) -> bool {
 }
 
 /// A fast local readiness check, without spawning SSH or waiting for a full
-/// listen queue. Busy is an error, not evidence that a socket is stale: the
-/// existing native cleanup predicate above must not unlink a busy master.
+/// listen queue. An explicit busy error is not evidence that a socket is
+/// stale, so native cleanup keeps its separate predicate above. Some systems
+/// (including Darwin) report refused for both full and abandoned sockets.
 pub(crate) fn socket_is_ready(path: &Path) -> std::io::Result<bool> {
     let socket = crate::process::with_inheritance_guard(|| {
         socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)

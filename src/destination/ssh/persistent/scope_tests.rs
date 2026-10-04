@@ -87,9 +87,11 @@ fn scoped_records_cannot_borrow_another_scope_or_legacy_generation() {
 }
 
 #[test]
-fn warm_account_lookup_checks_local_readiness_without_replacing_a_busy_master() {
-    let root = crate::test_support::tempdir().unwrap();
-    let domain = domain(root.path(), "scope");
+fn warm_account_lookup_checks_local_socket_readiness() {
+    // Nested scopes and OpenSSH's socket suffix exceed Darwin's ambient
+    // TMPDIR path budget; use the same short root as other scoped socket tests.
+    let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+    let domain = domain(root.path(), "a");
     let record = new_record(&domain);
     let control = record.control.clone();
     let generation = ensure_generation(&domain).unwrap();
@@ -102,41 +104,73 @@ fn warm_account_lookup_checks_local_readiness_without_replacing_a_busy_master() 
         control: control.clone(),
     };
     assert!(active_record(&domain, record()).unwrap().is_none());
-    let listener =
-        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
-    listener
-        .bind(&socket2::SockAddr::unix(&control).unwrap())
-        .unwrap();
-    listener.listen(1).unwrap();
+    let listen = || {
+        let listener =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        listener
+            .bind(&socket2::SockAddr::unix(&control).unwrap())
+            .unwrap();
+        listener.listen(1).unwrap();
+        listener
+    };
+    let listener = listen();
     assert!(active_record(&domain, record()).unwrap().is_some());
+    drop(listener);
+    fs::remove_file(&control).unwrap();
+    let listener = listen();
     let started = Instant::now();
-    let mut full = false;
+    let mut clients = Vec::new();
+    let mut saturated = None;
     for _ in 0..128 {
-        match crate::persistence::socket_is_ready(&control) {
-            Ok(true) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                full = true;
+        let client =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        client.set_nonblocking(true).unwrap();
+        match client.connect(&socket2::SockAddr::unix(&control).unwrap()) {
+            Ok(()) => clients.push(client),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionRefused
+                ) || error.raw_os_error() == Some(libc::EINPROGRESS) =>
+            {
+                saturated = Some(error);
                 break;
             }
-            other => panic!("unexpected local socket readiness: {other:?}"),
+            other => panic!("unexpected local socket connect: {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(2));
     }
-    assert!(full, "fixture listen queue did not fill");
-    let error = active_record(&domain, record())
-        .err()
-        .expect("busy master must not reconnect");
-    assert!(
-        error.to_string().contains("temporarily unavailable"),
-        "{error:#}"
-    );
+    let saturated = saturated.expect("fixture listen queue did not fill");
+    assert!(!clients.is_empty());
+    // Keep connected clients alive: closed, unaccepted connections do not
+    // occupy the listen queue consistently across operating systems.
+    if saturated.kind() == std::io::ErrorKind::ConnectionRefused {
+        // Darwin reports the same errno for a full queue and a stale socket.
+        // Preserve its previous refused-connection behavior, without claiming
+        // that the local readiness check can distinguish those cases.
+        assert!(!crate::persistence::socket_is_ready(&control).unwrap());
+        assert!(active_record(&domain, record()).unwrap().is_none());
+    } else {
+        assert!(crate::persistence::socket_is_ready(&control).is_err());
+        let error = active_record(&domain, record())
+            .err()
+            .expect("busy master must not reconnect");
+        assert!(
+            error.to_string().contains("temporarily unavailable"),
+            "{error:#}"
+        );
+    }
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(control.exists(), "busy master path must remain intact");
+    assert!(
+        control.exists(),
+        "unavailable master path must remain intact"
+    );
     drop(listener);
     assert!(control.exists());
     assert!(active_record(&domain, record()).unwrap().is_none());
     fs::remove_file(&control).unwrap();
     assert!(active_record(&domain, record()).unwrap().is_none());
+    drop(clients);
 }
 
 #[test]

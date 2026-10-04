@@ -387,7 +387,7 @@ fn active_record(domain: &Domain, record: Record) -> Result<Option<Cached>> {
     }
     // Authority was checked above. The actual SSH command remains mux-only;
     // a dead or replaced master cannot trigger authentication or a retry.
-    // A busy listener is not stale and must not trigger a replacement login.
+    // When the OS reports busy distinctly from refused, do not replace the login.
     if !crate::persistence::socket_is_ready(&record.control)
         .context("approved SSH master is temporarily unavailable; retry the command")?
     {

@@ -1795,25 +1795,51 @@ mod tests {
         let root = crate::test_support::tempdir().unwrap();
         let path = root.path().join("master");
         assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
-        let listener =
-            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
-        listener
-            .bind(&socket2::SockAddr::unix(&path).unwrap())
-            .unwrap();
-        listener.listen(1).unwrap();
+        let listen = || {
+            let listener =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            listener
+                .bind(&socket2::SockAddr::unix(&path).unwrap())
+                .unwrap();
+            listener.listen(1).unwrap();
+            listener
+        };
+        let listener = listen();
         assert!(crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        drop(listener);
+        fs::remove_file(&path).unwrap();
+        let listener = listen();
         let deadline = Instant::now() + Duration::from_secs(2);
-        // Connects fill this unserviced listener's bounded backlog.
+        let mut clients = Vec::new();
+        let mut full = false;
         for _ in 0..128 {
-            if !crate::persistence::socket_is_ready(&path).unwrap_or(false) {
-                assert!(Instant::now() < deadline);
-                drop(listener);
-                assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
-                return;
+            let client =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            client.set_nonblocking(true).unwrap();
+            match client.connect(&socket2::SockAddr::unix(&path).unwrap()) {
+                Ok(()) => clients.push(client),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionRefused
+                    ) || error.raw_os_error() == Some(libc::EINPROGRESS) =>
+                {
+                    full = true;
+                    break;
+                }
+                other => panic!("unexpected local socket connect: {other:?}"),
             }
             assert!(Instant::now() < deadline);
         }
-        panic!("local listen queue did not fill");
+        assert!(full, "local listen queue did not fill");
+        assert!(!clients.is_empty());
+        // Retain queued clients so Darwin and Linux exercise the same actual
+        // saturation. Darwin may report refused rather than WouldBlock.
+        assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        assert!(Instant::now() < deadline);
+        drop(listener);
+        assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
+        drop(clients);
     }
 
     #[test]
