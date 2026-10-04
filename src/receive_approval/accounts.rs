@@ -177,15 +177,30 @@ pub(crate) fn list(domain: &Domain) -> Result<Vec<RememberedPermission>> {
     Ok(read(&path(domain)?)?.permissions)
 }
 pub(crate) fn remember(domain: &Domain, permission: &AccountPermission) -> Result<()> {
-    update(&path(domain)?, Some(permission), None)
+    update_domain(domain, Some(permission), None)
 }
 pub(crate) fn remove(domain: &Domain, id: &str) -> Result<()> {
     anyhow::ensure!(
         id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "use the complete permission ID from syq persist receive permissions list"
     );
-    update(&path(domain)?, None, Some(id))
+    update_domain(domain, None, Some(id))
 }
+fn update_domain(
+    domain: &Domain,
+    add: Option<&AccountPermission>,
+    remove: Option<&str>,
+) -> Result<()> {
+    let path = path(domain)?;
+    if domain.is_default() {
+        fs::create_dir_all(
+            path.parent()
+                .context("account permission directory missing")?,
+        )?;
+    }
+    update(&path, add, remove)
+}
+
 struct PermissionLock(std::fs::File);
 impl Drop for PermissionLock {
     fn drop(&mut self) {
@@ -201,7 +216,6 @@ fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) ->
     let parent = path
         .parent()
         .context("account permission directory missing")?;
-    fs::create_dir_all(parent)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)

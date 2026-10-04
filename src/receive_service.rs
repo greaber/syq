@@ -405,12 +405,16 @@ fn validate_settings(settings: &Settings) -> Result<()> {
 fn save_settings(domain: &Domain, settings: &Preferences) -> Result<()> {
     validate_preferences(settings)?;
     let path = config_path(domain)?;
-    fs::create_dir_all(path.parent().unwrap())?;
+    if domain.is_default() {
+        fs::create_dir_all(path.parent().unwrap())?;
+    }
     atomic_json(&path, settings)
 }
 fn settings_lock(domain: &Domain) -> Result<File> {
     let path = config_path(domain)?.with_file_name("receive.lock");
-    fs::create_dir_all(path.parent().unwrap())?;
+    if domain.is_default() {
+        fs::create_dir_all(path.parent().unwrap())?;
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
