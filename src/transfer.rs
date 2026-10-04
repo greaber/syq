@@ -499,13 +499,15 @@ fn open_control_connection(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> 
 
 pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
     let mut connection = open_control_connection(ep, args)?;
-    configure_hashing(
-        &mut *connection,
-        crate::hashing::HashPolicy {
+    // The reply carries nothing but success: check it with the next one
+    // rather than spending a round trip on it.
+    connection.send_expecting_ok(
+        Request::ConfigureHashing(crate::hashing::HashPolicy {
             algorithm: args.hash_algorithm,
             transfer_integrity: args.transfer_integrity,
             transfer_hash_type: args.transfer_hash_type,
-        },
+        }),
+        "configure hashing",
     )?;
     configure_preservation(
         &mut *connection,
@@ -529,12 +531,12 @@ fn configure_preservation(
     destination: bool,
 ) -> Result<()> {
     if selection.any() || selection.open_noatime || sparse {
-        ok(
-            connection.call(Request::ConfigurePreservation {
+        connection.send_expecting_ok(
+            Request::ConfigurePreservation {
                 selection,
                 sparse,
                 destination,
-            })?,
+            },
             "configure inode metadata preservation",
         )?;
     }
@@ -1481,6 +1483,11 @@ fn handle_tcp_setup_error(
         progress.stop();
         return Err(error).context("TCP data transport required by test");
     }
+    if crate::conn::is_deferred_request_error(&error) {
+        sched.abort();
+        progress.stop();
+        return Err(error);
+    }
     if crate::conn::is_tcp_congestion_error(&error) {
         sched.abort();
         progress.stop();
@@ -2424,6 +2431,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     match result {
                         Ok(()) => {
                             gate.mark_absent(id);
+                            worker.src.detach();
+                            worker.dst.detach();
                             return Ok(());
                         }
                         Err(error) if dropped => {
@@ -2600,6 +2609,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
                     );
                 }
+                src_ctl.detach();
+                dst_ctl.detach();
                 return Ok(code);
             }
             SmallCopy::Declined => {
@@ -4131,6 +4142,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
+    src_ctl.detach();
+    dst_ctl.detach();
     Ok(exit_code)
 }
 
