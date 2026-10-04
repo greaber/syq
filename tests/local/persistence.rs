@@ -965,7 +965,7 @@ fn session_pool_stays_empty_without_a_live_master() {
 }
 
 #[test]
-fn remote_coordinator_does_not_resolve_local_persistence() {
+fn native_remote_coordinator_uses_only_its_local_optional_persistence() {
     let t = Tmp::new();
     fs::create_dir(t.runtime()).unwrap();
     write(&t.path("config/syq/persistence.json"), b"not valid JSON");
@@ -1007,7 +1007,16 @@ exit 23
     let output = run();
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
     assert!(t.path("ssh-called").exists());
-    assert!(!stderr_of(&output).contains("persistence configuration"));
+    assert!(
+        stderr_of(&output).contains("cannot use persistent SSH connections"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("continuing without persistence"),
+        "{}",
+        stderr_of(&output)
+    );
 
     let enabled = persistence_command(&t, &["on"]).run().unwrap();
     assert_output_ok(&enabled);
@@ -1019,12 +1028,21 @@ exit 23
         .unwrap();
     let output = run();
     assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let records: Vec<serde_json::Value> = fs::read_dir(&global_scope)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]["host"], "hostA",
+        "only the invoking machine's coordinator connection belongs in its domain"
+    );
     assert!(
-        fs::read_dir(&global_scope)
-            .unwrap()
-            .flatten()
-            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".json")),
-        "remote-coordinator handoff recorded inactive local endpoints"
+        !stderr_of(&output).contains("cannot use persistent SSH connections"),
+        "{}",
+        stderr_of(&output)
     );
     assert_output_ok(&persistence_command(&t, &["off"]).run().unwrap());
 }

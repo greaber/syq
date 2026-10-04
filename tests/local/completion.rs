@@ -2252,10 +2252,8 @@ fn approved_completion_keeps_explicit_scope_and_remote_shell_meanings() {
                 // A global approved connection cannot satisfy an explicit
                 // authorizer in a fresh scope, and must not trigger native login.
                 let mut explicit = words.clone();
-                explicit.splice(
-                    explicit.len() - 1..explicit.len() - 1,
-                    ["--auth-from", "@laptop"],
-                );
+                // Keep --into adjacent to its path in the destination case.
+                explicit.splice(2..2, ["--auth-from", "@laptop"]);
                 let output = approved_completion_command(&t, &explicit).run().unwrap();
                 assert_output_ok(&output);
                 assert!(output.stdout.is_empty(), "{output:?}");
