@@ -31,12 +31,19 @@ impl RequestReader {
         tcp_socket: Option<TcpStream>,
         named_socket: Option<std::os::unix::net::UnixStream>,
         disconnected: Arc<std::sync::atomic::AtomicBool>,
+        source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let thread = std::thread::spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
             let failed = msg.is_err();
             if failed {
+                // The control operation may still be busy, including blocked
+                // on its response. Revoke shared TCP read authority before
+                // waiting for that operation to consume the disconnect.
+                if let Some(source) = &source_control {
+                    source.close();
+                }
                 disconnected.store(true, std::sync::atomic::Ordering::Release);
             }
             if tx.send(msg).is_err() || failed {
@@ -823,7 +830,11 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // joined by the guard on every exit path.
     r.set_limit(MAX_FRAME);
     let telemetry_socket = tcp_socket.as_ref().and_then(|s| s.try_clone().ok());
-    let reader = RequestReader::spawn(r, tcp_socket, named_socket, disconnected);
+    let source_control = source_authority
+        .as_ref()
+        .filter(|_| matches!(role, ConnectionRole::Control))
+        .cloned();
+    let reader = RequestReader::spawn(r, tcp_socket, named_socket, disconnected, source_control);
     let server_actor = ops.observations.actor("server");
     let mut w = ObservedWriter {
         compress: w.compress,

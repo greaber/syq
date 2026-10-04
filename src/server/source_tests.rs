@@ -109,6 +109,13 @@ struct SourceServer {
 
 impl SourceServer {
     fn new(policy: SourcePolicy) -> Self {
+        Self::with_writer(policy, |socket| socket)
+    }
+
+    fn with_writer<W: Write + Send + 'static>(
+        policy: SourcePolicy,
+        writer: impl FnOnce(UnixStream) -> W + Send + 'static,
+    ) -> Self {
         let authority = SourceAuthority::new(policy).unwrap();
         let session = DescriptorSessionSlot::default();
         let (client, server) = UnixStream::pair().unwrap();
@@ -123,7 +130,7 @@ impl SourceServer {
         let thread = std::thread::spawn(move || {
             run_authorized_source(
                 server.try_clone().unwrap(),
-                server,
+                writer(server),
                 source,
                 descriptors,
                 None,
@@ -507,4 +514,144 @@ fn approved_source_ssh_worker_uses_approved_budget_even_when_ticket_is_omitted()
     // leave an unpaced writer that can return file data anyway.
     assert!(worker.reader.read_msg::<Response>().is_err());
     server.control.shutdown();
+}
+
+#[test]
+fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy() {
+    use std::sync::{atomic::AtomicBool, atomic::Ordering, mpsc};
+
+    struct PausedWriter {
+        inner: UnixStream,
+        armed: Arc<AtomicBool>,
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Write for PausedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.armed.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.inner.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let temporary = crate::test_support::tempdir().unwrap();
+    let file = temporary.path().join("file");
+    fs::write(&file, b"approved").unwrap();
+    let mut policy = source_policy(&file);
+    policy.tcp = Some(crate::restricted::source::SourceTcpPolicy {
+        port_lo: 0,
+        port_hi: 0,
+        congestion_control: None,
+    });
+    let register = registration(&policy);
+    let armed = Arc::new(AtomicBool::new(false));
+    let pause = armed.clone();
+    let (entered, waiting) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let mut server = SourceServer::with_writer(policy, move |inner| PausedWriter {
+        inner,
+        armed: pause,
+        entered,
+        release: released,
+    });
+    let roots = server.register(register);
+    let source = roots[0].selection.clone();
+    let role = ConnectionRole::SourceWorker {
+        roots,
+        send_budget: None,
+    };
+    // An individual worker's EOF must not revoke the control's authority.
+    let (mut worker, hello) = server.worker(role.clone());
+    assert!(matches!(hello, Response::HelloOk { .. }));
+    worker.shutdown();
+    assert!(server.authority.is_open());
+
+    let key = vec![19; crate::tcp_records::KEY_LEN];
+    let token = vec![23; 16];
+    let Response::TcpListening { port, .. } = server.control.request(Request::TcpListen {
+        key: Some(key.clone()),
+        token: token.clone(),
+        port_lo: 0,
+        port_hi: 0,
+        congestion_control: None,
+        send_rate: None,
+    }) else {
+        panic!("approved listener did not start")
+    };
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket.write_all(&7u32.to_be_bytes()).unwrap();
+    let mut writer = FrameWriter::new(
+        RecordWriter::new(socket.try_clone().unwrap(), Some(Cipher::new(&key, 7, 1))),
+        false,
+    );
+    let mut reader = FrameReader::new(RecordReader::new(
+        socket.try_clone().unwrap(),
+        Some(Cipher::new(&key, 7, 2)),
+    ));
+    writer
+        .write_msg(&Request::Hello {
+            identity: crate::identity::build().into(),
+            compress: false,
+            debug: false,
+            token,
+            role: role.clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    writer.write_msg(&read(Some(source.clone()), 8)).unwrap();
+    assert!(
+        matches!(reader.read_msg::<Response>().unwrap(), Response::Block { data, .. } if data == b"approved")
+    );
+
+    armed.store(true, Ordering::Release);
+    server
+        .control
+        .writer
+        .write_msg(&Request::TransportStats)
+        .unwrap();
+    waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+    server
+        .control
+        .socket
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut report = Instant::now() + Duration::from_secs(1);
+    while server.authority.is_open() {
+        assert!(
+            Instant::now() < deadline,
+            "source authority stayed open while control was busy"
+        );
+        if Instant::now() >= report {
+            eprintln!("source disconnect fixture: control is busy; authority is still open");
+            report += Duration::from_secs(1);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!server.control.thread.as_ref().unwrap().is_finished());
+    assert!(
+        !server.session.is_closed(),
+        "control must still own its session"
+    );
+    assert!(server.authority.acquire(&role, false).is_err());
+    writer.write_msg(&read(Some(source), 8)).unwrap();
+    // The existing encrypted data worker must return no more file payload.
+    assert!(reader.read_msg::<Response>().is_err());
+    release.send(()).unwrap();
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
 }

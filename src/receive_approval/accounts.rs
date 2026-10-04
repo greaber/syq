@@ -341,7 +341,9 @@ mod tests {
 
     #[test]
     fn remembered_permissions_belong_only_to_the_authorizing_domain() {
-        let temporary = crate::test_support::tempdir().unwrap();
+        // Socket paths must fit even when the platform's ambient TMPDIR is long.
+        let root = std::fs::canonicalize("/tmp").unwrap();
+        let temporary = tempfile::tempdir_in(root).unwrap();
         let first_path = temporary.path().join("first");
         let second_path = temporary.path().join("second");
         for path in [&first_path, &second_path] {

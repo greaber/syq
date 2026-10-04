@@ -92,6 +92,15 @@ fn path(domain: &Domain) -> Result<PathBuf> {
 }
 
 fn read(path: &Path) -> Result<Config> {
+    read_inner(path).with_context(|| {
+        format!(
+            "read saved authorization choice from {}; repair this file or pass --auth-from explicitly",
+            path.display(),
+        )
+    })
+}
+
+fn read_inner(path: &Path) -> Result<Config> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -130,13 +139,7 @@ fn load(domain: &Domain) -> Result<Config> {
     if domain.is_default() && crate::persistence::config_path().is_none() {
         return Ok(Config::default());
     }
-    let path = path(domain)?;
-    read(&path).with_context(|| {
-        format!(
-        "read saved authorization choice from {}; repair this file or pass --auth-from explicitly",
-        path.display(),
-    )
-    })
+    read(&path(domain)?)
 }
 
 /// Explicit flags bypass disk reads, including `auto`. Preference lookup uses
@@ -170,6 +173,16 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
 }
 
 fn update(
+    path: &Path,
+    host: Option<&str>,
+    value: Option<&AuthFrom>,
+    create_parent: bool,
+) -> Result<Config> {
+    update_inner(path, host, value, create_parent)
+        .with_context(|| format!("update saved authorization choice in {}", path.display()))
+}
+
+fn update_inner(
     path: &Path,
     host: Option<&str>,
     value: Option<&AuthFrom>,
@@ -298,13 +311,41 @@ mod tests {
         let root = crate::test_support::tempdir().unwrap();
         let path = root.path().join("auth-from.json");
         for data in [
+            "{",
             r#"{"default":"laptop"}"#,
             r#"{"hosts":{"user@host":"ssh"}}"#,
             r#"{"future":true}"#,
         ] {
             std::fs::write(&path, data).unwrap();
-            assert!(update(&path, None, Some(&AuthFrom::Auto), true).is_err());
+            let errors = [
+                read(&path).err().unwrap(),
+                update(&path, None, Some(&AuthFrom::Auto), true)
+                    .err()
+                    .unwrap(),
+                update(&path, None, None, true).err().unwrap(),
+                update(&path, Some("backup"), None, true).err().unwrap(),
+            ];
+            for error in errors {
+                let detail = format!("{error:#}");
+                assert!(detail.contains(path.to_str().unwrap()), "{detail}");
+                assert!(detail.contains("repair this file"), "{detail}");
+                assert!(detail.contains("pass --auth-from explicitly"), "{detail}");
+            }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), data);
         }
+    }
+
+    #[test]
+    fn update_directory_errors_name_the_preferences_file() {
+        let root = crate::test_support::tempdir().unwrap();
+        let parent = root.path().join("config");
+        std::fs::write(&parent, "not a directory").unwrap();
+        let path = parent.join("auth-from.json");
+        let error = update(&path, None, Some(&AuthFrom::Ssh), true)
+            .err()
+            .unwrap();
+        let detail = format!("{error:#}");
+        assert!(detail.contains(path.to_str().unwrap()), "{detail}");
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "not a directory");
     }
 }

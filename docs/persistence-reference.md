@@ -53,8 +53,10 @@ keep their own authentication. An explicit scope uses its own saved choices.
 The setting works independently of whether native SSH persistence is enabled.
 It is saved in `auth-from.json` in the selected domain; the default domain keeps
 it alongside `persistence.json`. Older syq versions ignore it. If it is
-unreadable or has an unknown format, repair the file or pass `--auth-from`
-explicitly for that command.
+unreadable or has an unknown format, the error names the file to repair.
+You can pass `--auth-from` explicitly to bypass it for one command. Setting or
+resetting a choice preserves the other saved choices, so neither can repair an
+unreadable file. To discard all saved choices, remove that file yourself.
 
 ## Approved account connections
 
