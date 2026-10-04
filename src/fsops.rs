@@ -1751,9 +1751,10 @@ impl FsOps {
             | Request::ValidateDigest { guard, .. }
             | Request::Canonicalize { guard, .. } => guard.is_some(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_some()),
-            Request::ReplaceSmallBatch(entries) => {
-                entries.iter().any(|entry| entry.put.guard.is_some())
+            Request::HashExistingBatch { files, .. } => {
+                files.iter().any(|file| file.guard.is_some())
             }
+            Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_some()),
             _ => false,
         };
         if has_guard {
@@ -1782,9 +1783,10 @@ impl FsOps {
             | Request::WriteRange { guard, .. }
             | Request::Finalize { guard, .. } => guard.is_none(),
             Request::PutSmallBatch(puts) => puts.iter().any(|put| put.guard.is_none()),
-            Request::ReplaceSmallBatch(entries) => {
-                entries.iter().any(|entry| entry.put.guard.is_none())
+            Request::HashExistingBatch { files, .. } => {
+                files.iter().any(|file| file.guard.is_none())
             }
+            Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_none()),
             Request::CopyLocal { .. } => true,
             _ => false,
         };
@@ -2102,17 +2104,29 @@ impl FsOps {
                     map(&mut read.path)?;
                 }
             }
+            Request::ReadDifferingBatch { reads, .. } => {
+                for read in reads {
+                    map(&mut read.path)?;
+                }
+            }
+            Request::PatchSmallBatch(patches) => {
+                for patch in patches {
+                    if patch.guard.is_none() {
+                        map(&mut patch.path)?;
+                    }
+                }
+            }
+            Request::HashExistingBatch { files, .. } => {
+                for file in files {
+                    if file.guard.is_none() {
+                        map(&mut file.path)?;
+                    }
+                }
+            }
             Request::PutSmallBatch(puts) => {
                 for put in puts {
                     if put.guard.is_none() {
                         map(&mut put.path)?;
-                    }
-                }
-            }
-            Request::ReplaceSmallBatch(entries) => {
-                for entry in entries {
-                    if entry.put.guard.is_none() {
-                        map(&mut entry.put.path)?;
                     }
                 }
             }

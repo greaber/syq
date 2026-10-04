@@ -459,7 +459,6 @@ fn pipeline_worker(
         progress: Progress::new(false, false, None),
         opts,
         bwlimit: None,
-        bandwidth_capped: false,
         gate: Gate::new(1),
         observation: None,
         benchmark: Default::default(),

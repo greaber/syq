@@ -32,6 +32,7 @@ mod diagnostics;
 mod dry_run;
 mod hardlinks;
 mod planner;
+mod small_compare;
 mod work_budget;
 mod worker;
 
@@ -2390,7 +2391,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         } else {
                             bwlimit.clone()
                         },
-                        bandwidth_capped: bwlimit.is_some(),
                         gate: gate.clone(),
                         observation: None,
                         benchmark: Default::default(),

@@ -50,6 +50,12 @@ pub struct FileJobData {
     /// Compare bounded windows against the prepared private output.
     pub compare_ranges: bool,
     pub compare_final: bool,
+    /// A small destination was compared with this source and differs: the
+    /// copy replaces it whole instead of comparing it again.
+    pub compared: bool,
+    /// Earlier runs left partial copies of this file: it takes the per-file
+    /// path, which resumes from them.
+    pub resume_partial: bool,
     pub src: PathBytes,
     /// Descriptor-session authority corresponding to `src`. Source workers,
     /// and Linux destination workers using CopyLocal, claim its root during

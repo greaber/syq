@@ -24,7 +24,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers; route-specific receiver limits also apply |
-| `comparison-block-size` | 4 MiB | 64 KiB through 64 MiB; filesystem copies only |
+| `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, or experimental `streaming` / `auto-streaming` |
@@ -192,18 +192,22 @@ hashes, payload checks and publication-recovery checks stay in effect. Partial-f
 in every mode: matching bytes from interrupted copies can still be reused,
 even with `whole-file`. The setting controls reuse of the final destination, not partials.
 
-With block reuse enabled, files with identical contents can finish without
-rewriting data even when their metadata differs. Files no larger than one
-comparison block (4 MiB by default) travel in batches with other small files,
-and the receiving side compares each with the file it would replace: one that
-already matches is kept, and only its metadata is updated. Its contents still
-cross the network, but it costs no comparison round trip of its own. Under a
-bandwidth limit, small files are compared before their contents are sent, as
-larger files are. For larger files, a difference near the end can add almost
-a full extra read of both files before copying. An output already
-being written by the current run resumes before that probe.
-Leftover partials from earlier runs do not bypass checking whether the completed
-file already matches.
+With block reuse enabled, a replaced file of up to 64 MiB is compared before
+any of its contents are sent, together with other files. The receiving side
+hashes the file it would replace in 64 KiB blocks, the sending side reads the
+source once and sends only the blocks that differ, and the receiving side
+builds the new file from those and its own matching blocks, checking each
+again as it reads it. A file whose contents already match is kept, and only
+its metadata is updated. Comparing a batch of files costs about one round trip,
+however many files it holds.
+
+Larger files, `--inplace` updates and explicit `--hash` comparisons are
+compared one file at a time, in comparison blocks of 4 MiB by default. For
+those, a difference near the end can add almost a full extra read of both
+files before copying. An output already being written by the current run
+resumes before that probe. Leftover partials from earlier runs do not bypass
+checking whether the completed file already matches, and a file with leftover
+partials takes this path so that it can resume from them.
 
 Changed files still use atomic replacement unless `--inplace` is selected.
 Reflinks can reduce replacement writes on supporting filesystems; otherwise the
@@ -324,11 +328,10 @@ Remote copies batch new files up to the smaller of `request-size` and
 batch files up to 64 KiB. Larger limits allow more data to be held in memory;
 interrupted whole-file copies restart from the beginning. A file that already exists at the destination joins a batch when syq
 replaces it without reading it first, as same-machine copies do by default.
-With block reuse, a file no larger than one comparison block also joins a
-batch unless a bandwidth limit applies, and the receiving side compares it
-there. Larger files with block reuse, files checked with `--hash`, files
-protected by an `--if-exists` policy, and preserved hard links are handled one
-at a time. On macOS, files above the batching
+With block reuse, replaced files of up to 64 MiB are compared and sent in
+batches as described above. Larger files with block reuse, files checked with
+`--hash`, files protected by an `--if-exists` policy, and preserved hard links
+are handled one at a time. On macOS, files above the batching
 limit can use APFS cloning. That limit is the smallest of the comparison block
 size, `batch-bytes`, and `request-size`.
 

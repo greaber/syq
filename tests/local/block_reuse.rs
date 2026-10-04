@@ -263,9 +263,17 @@ fn local_default_replaces_blocks_and_on_overrides_whole_file_copy() {
             let out = cmd.run().unwrap();
             assert_output_ok(&out);
             assert_eq!(read(&t.path("dst")), source);
+            // With block reuse, a file this size is patched in a group, or
+            // in place on the per-file path.
+            let observed = tuning_observed(&out);
+            let grouped = reuse == Some("aligned-block") && !inplace;
+            assert_eq!(observed["patched_files"], u64::from(grouped));
             assert_eq!(
-                tuning_observed(&out)["range_requests"],
-                if reuse == Some("aligned-block") { 1 } else { 2 }
+                observed["range_requests"],
+                match reuse {
+                    Some("aligned-block") => u64::from(inplace),
+                    _ => 2,
+                }
             );
             assert_eq!(tuning_observed(&out)["local_whole_files"], 0);
             assert!(stderr_of(&out).contains(if reuse == Some("aligned-block") {
@@ -324,7 +332,7 @@ fn remote_defaults_reuse_blocks_for_push_and_pull() {
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
-fn small_replacements_are_batched_and_files_that_already_match_are_kept() {
+fn small_replacements_are_compared_in_batches_and_files_that_already_match_are_kept() {
     // Local copies with reuse forced on, then remote push and pull, where
     // reuse is the default.
     for remote in [None, Some(false), Some(true)] {
@@ -402,6 +410,86 @@ fn small_replacements_are_batched_and_files_that_already_match_are_kept() {
     }
 }
 
+#[test]
+fn bandwidth_limited_copies_send_only_the_small_files_that_differ() {
+    let t = Tmp::new();
+    let mut same = Vec::new();
+    for n in 0..16 {
+        let contents = prng(64 << 10, 7000 + n);
+        let (src, dst) = (format!("src/same{n}"), format!("dst/same{n}"));
+        write(&t.path(&src), &contents);
+        write(&t.path(&dst), &contents);
+        set_mtime(&t.path(&dst), 1);
+        let inode = fs::metadata(t.path(&dst)).unwrap().ino();
+        same.push((src, dst, inode));
+    }
+    write(&t.path("src/changed"), b"new");
+    write(&t.path("dst/changed"), b"old");
+    set_mtime(&t.path("dst/changed"), 1);
+    let rsh = fake_rsh(&t);
+    let start = std::time::Instant::now();
+    // 1 KiB/s: sending the matching files would take over 16 minutes.
+    let out = remote_syq_command(
+        &t,
+        &rsh,
+        &[
+            "-a",
+            "--bwlimit=1",
+            "--rsync-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--syq-no-bootstrap",
+            &t.s("src/"),
+            &format!("fake:{}", t.s("dst/")),
+        ],
+    )
+    .run()
+    .unwrap();
+    assert_output_ok(&out);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "{out:?}"
+    );
+    for (src, dst, inode) in same {
+        assert_eq!(read(&t.path(&dst)), read(&t.path(&src)));
+        assert_eq!(fs::metadata(t.path(&dst)).unwrap().ino(), inode);
+    }
+    assert_eq!(read(&t.path("dst/changed")), b"new");
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[test]
+fn a_leftover_partial_sends_a_replaced_file_to_the_resuming_path() {
+    let t = Tmp::new();
+    let source = prng(8 << 20, 871);
+    let mut old = source.clone();
+    old[..4 << 20].fill(b'x');
+    write(&t.path("src"), &source);
+    write(&t.path("dst"), &old);
+    set_mtime(&t.path("dst"), 1);
+    // An interrupted earlier run left the new first half.
+    write(&t.path(".dst.syq-tmp.abcdefghijklmnop"), &source[..4 << 20]);
+    let out = compat_command()
+        .args([
+            "-a",
+            "--no-progress",
+            "--performance-tuning=workers=1",
+            "--no-whole-file",
+            &t.s("src"),
+            &t.s("dst"),
+        ])
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), source);
+    // Compared in a group, then copied on the per-file path, which resumes
+    // from partials.
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["compared_files"], 1);
+    assert_eq!(observed["patched_files"], 0);
+    assert!(observed["range_requests"].as_u64().unwrap() > 0);
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn a_small_destination_that_grows_while_compared_is_replaced_not_kept() {
@@ -472,7 +560,8 @@ fn on_keeps_whole_file_copy_for_fresh_files_in_a_mixed_batch() {
         assert_eq!(read(&t.path("dst/fresh")), source);
         assert_eq!(read(&t.path("dst/existing")), source);
         assert_eq!(tuning_observed(&out)["local_whole_files"], 1);
-        assert_eq!(tuning_observed(&out)["range_requests"], 1);
+        assert_eq!(tuning_observed(&out)["range_requests"], 0);
+        assert_eq!(tuning_observed(&out)["patched_files"], 1);
         assert!(partial_files(&t.path("dst")).is_empty());
     }
 }
@@ -497,7 +586,7 @@ fn pipeline_restarts_after_mismatch_and_skips_identical_contents() {
             .args([
                 "-a",
                 "--no-progress",
-                "--performance-tuning=workers=1",
+                "--performance-tuning=workers=1,copy-path=ranges",
                 "--no-whole-file",
                 &t.s("src"),
                 &t.s("dst"),
@@ -544,7 +633,7 @@ fn pipeline_handles_final_mutation_after_staging() {
     let mut child = compat_command()
         .args([
             "-a",
-            "--performance-tuning=workers=1",
+            "--performance-tuning=workers=1,copy-path=ranges",
             "--no-whole-file",
             &t.s("src"),
             &t.s("dst"),
@@ -633,7 +722,7 @@ fn pipeline_recovers_dropped_write_with_matching_prefix() {
         &[
             "-a",
             "--stats",
-            "--performance-tuning=pipeline-depth=4",
+            "--performance-tuning=pipeline-depth=4,copy-path=ranges",
             &t.s("src"),
             &format!("fake:{}/file", t.s("dst")),
         ],
