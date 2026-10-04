@@ -284,6 +284,48 @@ def persistent_cases(expected):
     source_run(["persist", "off"])
 
 
+
+def scoped_account_cases(expected):
+    print("case: scoped account reuse and native config stay isolated from default connections", flush=True)
+    # The current laptop session has approved this account already. New local
+    # domains borrow that provider but create and own their own SSH connection.
+    assert source_run(["ssh", "destination", "--auth-from", "@laptop", "--", "hostname"]).encode() == expected
+    default = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+    assert len(default) == 1 and default[0]["connected"], default
+    scope = source_run(["persist", "on", "--ephemeral"]).strip()
+    config = root + "/scoped-ssh-config"
+    closed = False
+    try:
+        # Scoped saved authorization must win over the default domain's setting.
+        source_run(["persist", "auth-from", "ssh", "--for", "destination"])
+        source_run(["persist", "auth-from", "@laptop", "--for", "destination", "--pscope", scope])
+        assert json.loads(source_run(["persist", "status", "--json", "--pscope", scope]))["authorized_ssh"] == []
+        assert source_run(["ssh", "--pscope", scope, "destination", "--", "hostname"]).encode() == expected
+        scoped = json.loads(source_run(["persist", "status", "--json", "--pscope", scope]))["authorized_ssh"]
+        assert len(scoped) == 1 and scoped[0]["connected"], scoped
+        assert Path(scoped[0]["control"]).parent.parent == Path(scope), scoped
+        assert scoped[0]["control"] != default[0]["control"], (scoped, default)
+        exported = source_run(["persist", "ssh-config", "destination", "--pscope", scope])
+        run("ssh", "source", "cat > " + shlex.quote(config), stdin=exported)
+        native = shlex.join(["env", native_path, "ssh", "-F", config, "destination", "hostname"])
+        assert run("ssh", "source", native).encode() == expected
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+        source_run(["persist", "off", "--pscope", scope])
+        closed = True
+        # off waits for the keeper's native daemon and all scoped files, so the
+        # exported snapshot fails without fresh authentication or another prompt.
+        run("ssh", "source", "test ! -e " + shlex.quote(scope))
+        run("ssh", "source", native, success=False)
+        remaining = json.loads(source_run(["persist", "status", "--json"]))["authorized_ssh"]
+        assert {row["control"] for row in remaining} == {default[0]["control"]}, remaining
+        assert source_run(["ssh", "--auth-from", "@laptop", "destination", "--", "hostname"]).encode() == expected
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
+    finally:
+        source_run(["persist", "auth-from", "--for", "destination", "--reset"])
+        if not closed:
+            source_run(["persist", "off", "--pscope", scope])
+
+
 def persistent_crash():
     print("case: killing the keeper hangs up its active native master", flush=True)
     persistent_connect()
@@ -458,6 +500,7 @@ assert 'does not match' in reply['Error'], reply
             ready()
     assert execute(["hostname"], ask=True)[0] == expected
     persistent_cases(expected)
+    scoped_account_cases(expected)
     persistent_crash()
     cold_copy_and_remembered_cases(expected)
     print("Direct laptop-authorized SSH passed", flush=True)
