@@ -225,7 +225,7 @@ impl Engine {
                     local::key_path(&path)?;
                     found.push(Candidate {
                         depth: path.iter().filter(|&&b| b == b'/').count(),
-                        size: size as u64,
+                        size,
                         path,
                         key: Some(key),
                         identity: None,

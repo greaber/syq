@@ -205,9 +205,11 @@ async fn deletion_backoff_recovers_from_request_contention() {
     assert!(times[1] < times[0] * 0.85, "fixed/automatic: {times:?}");
 }
 
+type RequestedVersions = Vec<(String, String)>;
+
 #[derive(Clone, Debug)]
 struct BulkResponses {
-    calls: Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>,
+    calls: Arc<std::sync::Mutex<Vec<RequestedVersions>>>,
     transport_failure: bool,
 }
 
