@@ -75,6 +75,8 @@ ssh-agent-lib = { version = "0.6", default-features = false }
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
 tempfile = "3"
 signature = "2"
+rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
+sha2-compat = { package = "sha2", version = "0.10" }
 subtle = "2.6.1"
 signal-hook = "0.4.4"
 lz4 = "1.28.1"

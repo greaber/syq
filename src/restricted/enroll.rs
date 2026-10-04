@@ -1,5 +1,6 @@
 use super::*;
 use crate::process::CommandExt as _;
+use std::io::BufRead as _;
 
 pub(super) fn local_state_base() -> Result<PathBuf> {
     let (_, home) = current_account()?;
@@ -7,17 +8,7 @@ pub(super) fn local_state_base() -> Result<PathBuf> {
         .context("validate restricted enrollment state on the invoking machine")
 }
 
-pub(super) fn store_pending_enrollment(
-    pending: &PendingEnrollment,
-    private_key: &PrivateKey,
-) -> Result<PathBuf> {
-    let base = local_state_base()?;
-    let directory = base.join(pending.id.to_string());
-    ensure_directory(&directory, 0o700)?;
-    store_pending_files(&directory, pending, private_key)?;
-    Ok(directory)
-}
-
+#[cfg(test)]
 pub(super) fn store_pending_files(
     directory: &Path,
     pending: &PendingEnrollment,
@@ -73,7 +64,7 @@ pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>
         let Ok(metadata) = serde_json::from_slice::<LocalEnrollment>(&encoded) else {
             continue;
         };
-        if metadata.version == CONFIG_VERSION
+        if supported_config_version(metadata.version)
             && metadata.id.to_string() == entry.file_name().to_string_lossy()
         {
             enrollments.push((metadata, directory));
@@ -105,7 +96,7 @@ pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathB
         let Ok(metadata) = serde_json::from_slice::<PendingEnrollment>(&encoded) else {
             continue;
         };
-        if metadata.version == CONFIG_VERSION
+        if supported_config_version(metadata.version)
             && metadata.id.to_string() == entry.file_name().to_string_lossy()
         {
             enrollments.push((metadata, directory));
@@ -115,6 +106,7 @@ pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathB
     Ok(enrollments)
 }
 
+#[cfg(test)]
 pub(super) fn load_private_key(directory: &Path) -> Result<PrivateKey> {
     let encoded = delegation::read_private_regular(
         &directory.join("enrollment-key"),
@@ -385,8 +377,9 @@ pub(super) fn enroll(
     };
     let (pending, directory, private_key) = match (active, pending) {
         (Some((metadata, directory, _)), _) => {
-            let private_key = load_private_key(&directory)?;
+            let private_key = load_enrollment_public_key(&directory)?;
             let pending = PendingEnrollment {
+                security_key_flags: metadata.security_key_flags,
                 version: CONFIG_VERSION,
                 id: metadata.id,
                 host: metadata.host,
@@ -397,26 +390,16 @@ pub(super) fn enroll(
             (pending, directory, private_key)
         }
         (None, Some((pending, directory))) => {
-            let private_key = load_private_key(&directory)?;
+            let private_key = load_enrollment_public_key(&directory)?;
             (pending, directory, private_key)
         }
         (None, None) => {
-            let id = EnrollmentId::random();
-            let private_key = generate_enrollment_key(id)?;
-            let pending = PendingEnrollment {
-                version: CONFIG_VERSION,
-                id,
-                host: host.to_owned(),
-                port,
-                target_login: login.to_owned(),
-                requested_destination: requested_destination.to_owned(),
-            };
-            let directory = store_pending_enrollment(&pending, &private_key)?;
-            (pending, directory, private_key)
+            return create_enrollment(host, port, login, requested_destination, jump);
         }
     };
-    let public_key = private_key.public_key().to_openssh()?;
+    let public_key = private_key.to_openssh()?;
     let request = InstallRequest {
+        security_key_flags: pending.security_key_flags,
         version: CONFIG_VERSION,
         id: pending.id,
         target_login: login.to_owned(),
@@ -441,6 +424,7 @@ pub(super) fn enroll(
         }
     };
     let metadata = LocalEnrollment {
+        security_key_flags: pending.security_key_flags,
         version: CONFIG_VERSION,
         id: pending.id,
         host: host.to_owned(),
@@ -458,4 +442,218 @@ pub(super) fn enroll(
         directory,
         response.canonical_destination.into_bytes(),
     ))
+}
+
+/// Keep the login open while selecting and creating the credential. This is
+/// the authentication that installs the receiver, not a separate probe that
+/// could have selected a different key.
+fn create_enrollment(
+    host: &str,
+    port: Option<u16>,
+    login: &str,
+    destination: &str,
+    jump: Option<&SshEndpoint>,
+) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
+    let target = endpoint(login, host, port)?;
+    let id = EnrollmentId::random();
+    let direct = create_over_route(
+        &target,
+        EnrollmentRoute::Direct,
+        id,
+        host,
+        port,
+        login,
+        destination,
+    );
+    match (direct, jump) {
+        (Ok(enrollment), _) => Ok(enrollment),
+        (Err(error), Some(jump)) if is_enrollment_transport_failure(&error) => create_over_route(
+            &target,
+            EnrollmentRoute::ProxyJump { jump },
+            id,
+            host,
+            port,
+            login,
+            destination,
+        )
+        .with_context(|| format!("direct enrollment also failed: {error:#}")),
+        (Err(error), _) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_over_route(
+    target: &SshEndpoint,
+    route: EnrollmentRoute<'_>,
+    id: EnrollmentId,
+    host: &str,
+    port: Option<u16>,
+    login: &str,
+    destination: &str,
+) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
+    let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
+    let trace_path = temporary.path().join("ssh.log");
+    let stage = format!(".syq-receiver-{id}-{}", EnrollmentId::random());
+    let remote = format!(
+        "set -eu; uname -s; uname -m; if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi; IFS= read -r request; d=\"$HOME/.local/libexec\"; p=\"$d/{stage}\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"; printf '%s' \"$request\" | \"$p\" --restricted-install"
+    );
+    let mut command = Command::new("ssh");
+    command
+        .args(["-vvv", "-o", "FingerprintHash=sha256", "-E"])
+        .arg(&trace_path)
+        .args(enrollment::enrollment_ssh_args_raw(
+            target,
+            route.clone(),
+            &remote,
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut group = crate::process_group::ProcessGroup::spawn(&mut command)
+        .map_err(|error| enrollment_ssh_error(target, true, error))?;
+    let foreground = group
+        .foreground()
+        .context("give enrollment SSH access to the terminal")?;
+    let mut stdout = std::io::BufReader::new(
+        group
+            .child
+            .stdout
+            .take()
+            .context("enrollment SSH output missing")?,
+    );
+    let mut input = group
+        .child
+        .stdin
+        .take()
+        .context("enrollment SSH input missing")?;
+    let mut greeted = false;
+    let platform = (|| -> Result<_> {
+        // Any output, including an oversized or malformed first line, means
+        // the remote command started. Only an empty stream warrants waiting
+        // for SSH's transport-failure status before trying another route.
+        greeted = !std::io::BufRead::fill_buf(&mut stdout)?.is_empty();
+        let os = read_enrollment_line(&mut stdout)?;
+        let arch = read_enrollment_line(&mut stdout)?;
+        let length: usize = read_enrollment_line(&mut stdout)?
+            .parse()
+            .context("authorized_keys byte count")?;
+        if length > MAX_AUTHORIZED_KEYS {
+            bail!("authorized_keys is too large to inspect");
+        }
+        let mut authorized = vec![0u8; length];
+        stdout.read_exact(&mut authorized)?;
+        Ok((os, arch, authorized))
+    })();
+    drop(foreground);
+    let (os, arch, authorized) = match platform {
+        Ok(platform) => platform,
+        Err(error) => {
+            drop(input);
+            // Before a greeting, EOF means SSH failed to connect/authenticate.
+            // Malformed or excessive output after a greeting must be stopped
+            // rather than waiting while the SSH pipe could still be full.
+            let status = if greeted {
+                group.close()?
+            } else {
+                group.wait()?
+            };
+            return Err(enrollment_ssh_error(
+                target,
+                status.code() == Some(255),
+                error,
+            ));
+        }
+    };
+    let trace =
+        fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
+    let mut template = key_template(&trace, &authorized)?;
+    configure_key_agent(&mut template, target, route)?;
+    let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
+        .context("unsupported receiver platform")?;
+    let executable = management_executable(platform)?;
+    let pending = PendingEnrollment {
+        version: CONFIG_VERSION,
+        id,
+        host: host.to_owned(),
+        port,
+        target_login: login.to_owned(),
+        requested_destination: destination.to_owned(),
+        security_key_flags: template.security_key_flags,
+    };
+    let directory = local_state_base()?.join(id.to_string());
+    ensure_directory(&directory, 0o700)?;
+    let key = match generate_matching_key(&directory, id, &template) {
+        Ok(key) => key,
+        Err(error) => {
+            let _ = remove_empty_directory(&directory);
+            return Err(error);
+        }
+    };
+    atomic_write(
+        &directory,
+        "pending.json",
+        &serde_json::to_vec(&pending)?,
+        0o600,
+    )?;
+    let request = InstallRequest {
+        version: CONFIG_VERSION,
+        id,
+        target_login: login.to_owned(),
+        requested_destination: destination.to_owned(),
+        public_key: key.to_openssh()?,
+        security_key_flags: template.security_key_flags,
+    };
+    let write = (|| -> Result<()> {
+        serde_json::to_writer(&mut input, &request)?;
+        input.write_all(b"\n")?;
+        input.write_all(&executable)?;
+        Ok(())
+    })();
+    drop(input);
+    let mut response = Vec::new();
+    stdout
+        .take((MAX_STATE_FILE + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_STATE_FILE {
+        bail!("enrollment response too large");
+    }
+    let status = group.wait()?;
+    if !status.success() {
+        // Once a key is durable and installation has started, leave pending
+        // state for the ordinary enrollment retry; do not mint another key.
+        bail!("enrollment {id} remains pending after SSH installation failed ({status}); retry receiver enroll or revoke it");
+    }
+    write?;
+    let response: InstallResponse = serde_json::from_slice(&response)?;
+    if response.version != CONFIG_VERSION || response.id != id || response.target_login != login {
+        bail!("restricted enrollment response did not match the request");
+    }
+    let metadata = LocalEnrollment {
+        version: CONFIG_VERSION,
+        id,
+        host: host.to_owned(),
+        port,
+        target_login: login.to_owned(),
+        remote_home: response.remote_home,
+        requested_parent: response.requested_parent,
+        canonical_root: response.canonical_root,
+        receiver_path: response.receiver_path,
+        receipt_public_key: response.receipt_public_key,
+        security_key_flags: template.security_key_flags,
+    };
+    complete_local_enrollment(&directory, &metadata)?;
+    Ok((
+        metadata,
+        directory,
+        response.canonical_destination.into_bytes(),
+    ))
+}
+
+fn read_enrollment_line(input: &mut impl std::io::BufRead) -> Result<String> {
+    let mut line = String::new();
+    input.take(1024).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        bail!("incomplete receiver enrollment greeting");
+    }
+    Ok(line.trim().to_owned())
 }

@@ -23,9 +23,33 @@ Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
 
+New enrollments match the SSH key that authenticated setup. Ed25519 stays
+Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
+Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
+hardware-backed key with the same effective touch and PIN requirements;
+creating and checking that key can require touching the device. Syq checks
+that the destination's selected SSH agent can sign before installing the key.
+PIN-protected keys need a working `SSH_ASKPASS` program in that agent's
+environment; the agent cannot use syq's terminal for its PIN prompt. Enrollment
+stops before installation if the signing check fails.
+
+For a passphrase-protected Ed25519 or RSA login, the receiver key is encrypted
+using a secret derived through the login key's SSH agent. There is no new
+passphrase. If the login key is not loaded, `ssh-add` asks for its usual
+passphrase. Syq uses the agent selected by the destination's `IdentityAgent`
+setting, or `SSH_AUTH_SOCK` when that setting is absent. Losing that login key requires revoking and enrolling again through
+another login. Revocation itself does not need the receiver key unlocked.
+
+Automatic matching needs the login's local OpenSSH private-key file or FIDO
+handle, readable only by its owner (mode 0400 or 0600). Passphrase-protected ECDSA, encrypted FIDO handles, SSH certificates,
+password or multi-factor logins, and agent-only identities (including
+PIV/OpenPGP keys) are unsupported. For FIDO, the login key must have one matching
+entry in `~/.ssh/authorized_keys` so syq can read its server policy. Syq reports
+an error when it cannot preserve the key's protection.
+
 Repeating `enroll` updates the receiver to match your local build. A pending
-enrollment can be retried or revoked. Revoke and enroll again to rotate its
-receipt key. Revocation stops active receivers before removing their state;
+enrollment can be retried or revoked. Existing keys keep their protection;
+revoke and enroll again to adopt matching protection or rotate either key. Revocation stops active receivers before removing their state;
 see [access management](remote-to-remote.md#first-copy-and-access-management)
 for interruption and retry behavior.
 
@@ -96,6 +120,10 @@ right contents. See [A compromised source server](security.md#a-compromised-sour
 | `--peer-auth broker` | Your full destination-account authority, limited to that host and user |
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
+
+With `--peer-auth broker`, syq uses the coordinating host's configured
+`IdentityAgent` for the outer SSH connection and the peer host's configured
+agent for forwarded authentication. The two hosts can use separate agents.
 
 Persistence can reuse an eligible native SSH connection from the invoking
 machine to the coordinating server. Connections forwarding a constrained or
