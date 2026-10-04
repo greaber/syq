@@ -124,15 +124,30 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         !matches!(mode, AuthFrom::Return(_)),
         "laptop account authorization did not produce an SSH connection"
     );
+    let persistent =
+        crate::persistence::scope_for_implicit_ssh(domain.explicit_path()).and_then(|scope| {
+            scope
+                .map(|scope| {
+                    crate::persistence::prepare_endpoint(
+                        &scope,
+                        request.destination.user.as_deref(),
+                        &request.destination.host,
+                        request.destination.port,
+                        None,
+                    )
+                })
+                .transpose()
+        });
+    let control = match persistent {
+        Ok(control) => control,
+        Err(error) if scope.is_none() => {
+            crate::output::diagnostic!("syq: warning: cannot use persistent SSH connections ({error:#}); continuing without persistence");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let mut command = std::process::Command::new("ssh");
-    if let Some(scope) = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())? {
-        let control = crate::persistence::prepare_endpoint(
-            &scope,
-            request.destination.user.as_deref(),
-            &request.destination.host,
-            request.destination.port,
-            None,
-        )?;
+    if let Some(control) = &control {
         let persist = if domain.is_default() {
             "ControlPersist=yes"
         } else {
@@ -140,11 +155,17 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         };
         command
             .args(["-o", "ControlMaster=auto", "-o", persist, "-S"])
-            .arg(crate::persistence::openssh_control_path(&control));
+            .arg(crate::persistence::openssh_control_path(control));
     }
     command.args(request.ssh_arguments(&request.destination)?);
     // Native auth executes once: a failing command must never run again through a laptop.
-    foreground::run(&mut command, || false)
+    if control.is_some() {
+        // A newly created native master also inherits redirected stderr. Do
+        // not let it keep the caller's outer SSH connection or pipeline open.
+        foreground::run_cached(&mut command, || false)
+    } else {
+        foreground::run(&mut command, || false)
+    }
 }
 
 pub(crate) fn validate_endpoint(endpoint: &NativeEndpoint) -> Result<()> {

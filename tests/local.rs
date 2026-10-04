@@ -1016,6 +1016,8 @@ mod map;
 mod metadata;
 #[path = "local/persistence.rs"]
 mod persistence;
+#[path = "local/ssh_persistence.rs"]
+mod ssh_persistence;
 #[path = "local/progress.rs"]
 mod progress;
 #[path = "local/receiving.rs"]
