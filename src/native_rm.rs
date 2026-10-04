@@ -931,6 +931,9 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
         .len()
         .div_ceil(pool.limit.load(Ordering::Relaxed))
         .clamp(1, LEAF_BATCH_FILES);
+    // Tiny batches add coordination without amortizing it, especially on
+    // mounted filesystems. Keep small directories independently schedulable.
+    let batch_files = if batch_files >= 8 { batch_files } else { 1 };
     let mut leaves = Vec::with_capacity(batch_files);
     let mut bytes = 0u64;
     let flush = |leaves: &mut Vec<PinnedLeaf>| {
