@@ -7,7 +7,7 @@ use crate::proto::SizeHint;
 use crate::proto::*;
 use crate::remote_helper::{self, Target};
 use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -2706,11 +2706,13 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
             return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into());
         }
         Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
-        Ok(other) if worker => return Err(WorkerInitializationError(format!(
+        Ok(other) if worker => {
+            return Err(WorkerInitializationError(format!(
             "{}: unexpected handshake response {other:?}; remote syq may be a different version",
             conn.label
         ))
-        .into()),
+            .into())
+        }
         Ok(other) => bail!(
             "{}: unexpected handshake response {other:?}; remote syq may be a different version",
             conn.label
