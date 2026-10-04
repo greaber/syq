@@ -576,7 +576,8 @@ mod tests {
             let json = serde_json::to_value(&pending).unwrap();
             assert_eq!(json["kind"], "source");
             assert!(json.get("destination").is_none());
-            let description = pending.description(str::to_owned);
+            let description =
+                pending.description(&crate::persistence::Domain::default(), str::to_owned);
             assert!(description.contains("Filters narrow the copy"));
             assert!(description.contains("exact non-directory"));
             for old in [Kind::Copy, Kind::Command, Kind::Ssh, Kind::Storage] {

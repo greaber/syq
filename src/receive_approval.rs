@@ -432,7 +432,11 @@ impl Summary {
         format!("From: {}{command}\n{body}", self.from)
     }
     /// `server_input` styles arguments naming files that the server reads.
-    pub(crate) fn description(&self, server_input: impl Fn(&str) -> String) -> String {
+    pub(crate) fn description(
+        &self,
+        domain: &crate::persistence::Domain,
+        server_input: impl Fn(&str) -> String,
+    ) -> String {
         let question = match self.kind() {
             Kind::Source => "Allow these source reads once?",
             Kind::Copy => "Allow this copy once?",
@@ -440,19 +444,45 @@ impl Summary {
             Kind::Ssh | Kind::ProviderSsh => "Allow access to this SSH account?",
             Kind::Storage => "Authorize this storage access?",
         };
+        let command = self.approval_command(domain);
+        let approval = match &command {
+            Some(command) => format!("Local command: {command}"),
+            None => format!(
+                "Approve request {} using `syq persist receive approve`, with the same --pscope argument used to list it.",
+                crate::approval_command::display_arg(self.id.as_bytes())
+            ),
+        };
         let remember = if self.can_remember() {
-            format!(
-                "\nRemember this account permission: syq persist receive approve {} --remember",
-                self.id
-            )
+            match command {
+                Some(command) => {
+                    format!("\nRemember this account permission: {command} --remember")
+                }
+                None => "\nTo remember this account permission, also pass --remember.".into(),
+            }
         } else {
             String::new()
         };
         format!(
-            "{}\n\n{question}\nLocal command: syq persist receive approve {}{remember}",
+            "{}\n\n{question}\n{approval}{remember}",
             self.details_description(server_input),
-            self.id
         )
+    }
+
+    fn approval_command(&self, domain: &crate::persistence::Domain) -> Option<String> {
+        let mut command = "syq persist".to_owned();
+        if let Some(scope) = domain.explicit_path() {
+            // A lossy path could point at another domain. Non-UTF-8 scopes
+            // instead get instructions to repeat the caller's original flag.
+            command.push_str(&format!(
+                " --pscope {}",
+                shell_words::quote(scope.to_str()?)
+            ));
+        }
+        command.push_str(&format!(
+            " receive approve {}",
+            shell_words::quote(&self.id)
+        ));
+        Some(command)
     }
 }
 /// A server's working directory as sent, escaped here like any other remote
@@ -1493,6 +1523,57 @@ mod tests {
     }
 
     #[test]
+    fn approval_instructions_select_the_listed_domain_and_quote_its_path() {
+        use crate::persistence::Domain;
+        let mut summary = summary();
+        summary.details = Details::Ssh {
+            kind: SshKind::Ssh,
+            reusable: true,
+            destination: "alice@destination:22".into(),
+            permission: "account access".into(),
+            account: Some(account_permission()),
+        };
+        for domain in [
+            Domain::default(),
+            Domain::Explicit("/tmp/scope 'quoted' $(untrusted)".into()),
+        ] {
+            let description = summary.description(&domain, str::to_owned);
+            let mut expected = vec!["syq", "persist"];
+            if let Some(scope) = domain.explicit_path() {
+                expected.extend(["--pscope", scope.to_str().unwrap()]);
+            }
+            expected.extend(["receive", "approve", "request"]);
+            let approve = description
+                .lines()
+                .find_map(|line| line.strip_prefix("Local command: "))
+                .unwrap();
+            assert_eq!(shell_words::split(approve).unwrap(), expected);
+            if domain.is_default() {
+                assert_eq!(approve, "syq persist receive approve request");
+            }
+            let remember = description
+                .lines()
+                .find_map(|line| line.strip_prefix("Remember this account permission: "))
+                .unwrap();
+            expected.push("--remember");
+            assert_eq!(shell_words::split(remember).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn approval_instructions_do_not_render_a_lossy_scope_as_a_command() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec());
+        let domain = crate::persistence::Domain::Explicit(path.into());
+        let description = summary().description(&domain, str::to_owned);
+        assert!(description.contains("Approve request request"));
+        assert!(description.contains("same --pscope argument"));
+        assert!(!description.contains("Local command:"));
+        assert!(!description.contains("syq persist receive approve request"));
+        assert!(!description.contains('\u{fffd}'));
+    }
+
+    #[test]
     fn v0_6_0_pending_json_remains_compatible() {
         // Unchanged released copy/command envelopes; storage does not reuse
         // their kind or add fields to their serialized form.
@@ -1928,7 +2009,7 @@ mod tests {
             *max_delete = 2;
         }
         assert!(!summary.desktop_description(false).contains("deletions"));
-        let details = summary.description(str::to_owned);
+        let details = summary.description(&crate::persistence::Domain::default(), str::to_owned);
         assert!(details.contains("100 bytes, 3 entries; at most 2 deletions"));
         assert!(details.contains("not been inspected"));
     }
@@ -1960,7 +2041,7 @@ mod tests {
         assert!(pending
             .desktop_description(false)
             .contains("not permission for only"));
-        let details = pending.description(str::to_owned);
+        let details = pending.description(&crate::persistence::Domain::default(), str::to_owned);
         assert!(details.contains("alice@hostB:2222"));
         assert!(details.contains("full authority"));
         assert!(details.contains("directly between the servers"));
@@ -2016,7 +2097,8 @@ mod tests {
             assert!(desktop.contains("Remember also permits future authentications"));
             let decoded: Summary =
                 serde_json::from_value(serde_json::to_value(&pending).unwrap()).unwrap();
-            let details = decoded.description(str::to_owned);
+            let details =
+                decoded.description(&crate::persistence::Domain::default(), str::to_owned);
             assert!(details.contains("commands and copies"));
             assert!(details.contains("Remember also permits future authentications"));
             assert!(details.contains("already authenticated sessions may continue"));
@@ -2107,7 +2189,8 @@ mod tests {
             assert!(json.get("account").is_none());
             assert!(json["provider_account"].get("source").is_none());
             let decoded: Summary = serde_json::from_value(json).unwrap();
-            let details = decoded.description(str::to_owned);
+            let details =
+                decoded.description(&crate::persistence::Domain::default(), str::to_owned);
             assert!(details.contains("commands and copies"));
             assert!(details.contains("future SSH logins to this provider account"));
             assert!(details.contains("already authenticated sessions may continue"));

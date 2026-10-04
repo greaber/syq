@@ -1319,7 +1319,7 @@ fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> 
                     crate::output::human_stdout!(
                         "{}\n{}\nNotification: {}\n",
                         request.id,
-                        request.description(|word| if terminal {
+                        request.description(domain, |word| if terminal {
                             format!("\x1b[2m{word}\x1b[0m")
                         } else {
                             word.to_owned()

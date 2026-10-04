@@ -1306,7 +1306,8 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(5));
             };
-            let description = pending.description(str::to_owned);
+            let description =
+                pending.description(&crate::persistence::Domain::default(), str::to_owned);
             assert!(description.contains("backup"));
             assert!(description.contains("output"));
             assert!(description.contains("SSH access"));
