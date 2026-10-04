@@ -1174,7 +1174,11 @@ fn master_exit_command(socket: &Path, record: &EndpointRecord) -> Command {
 }
 
 pub(crate) fn command_for_help() -> clap::Command {
-    crate::help::configure(PersistCommand::command().bin_name("syq persist"))
+    let mut command = crate::help::configure(PersistCommand::command().bin_name("syq persist"));
+    // Help and completion inspect child commands independently of parsing.
+    // Propagate the shared domain selector before a child is extracted.
+    command.build();
+    command
 }
 
 #[cfg(test)]
@@ -1234,18 +1238,22 @@ mod tests {
         .unwrap();
         assert_eq!(request.destination.user.as_deref(), Some("alice"));
         assert_eq!(request.destination.port, Some(2222));
+        // Scope paths are requester-local metadata, not a dependency on the
+        // approving machine's filesystem.
+        let scoped = parse(&[
+            "persist",
+            "--pscope",
+            "/requester-only/scope",
+            "connect",
+            "alice@hostB:2222",
+            "--auth-from",
+            "@laptop",
+        ])
+        .unwrap();
+        assert_eq!(scoped.destination, request.destination);
         for args in [
             vec!["persist", "connect", "hostB"],
             vec!["persist", "connect", "hostB", "--auth-from", "@other"],
-            vec![
-                "persist",
-                "connect",
-                "hostB",
-                "--auth-from",
-                "@laptop",
-                "--pscope",
-                "/tmp/scope",
-            ],
             vec!["persist", "off"],
             vec!["ssh", "--auth-from", "@laptop", "hostB"],
         ] {

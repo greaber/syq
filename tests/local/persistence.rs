@@ -166,6 +166,38 @@ fn unusable_explicit_scope_is_an_error() {
     assert!(stderr.contains("open persistence directory"), "{stderr}");
     assert!(!t.path("dst").exists());
     assert!(!t.path("rsh.log").exists());
+
+    fs::create_dir(t.runtime()).unwrap();
+    let closing = ephemeral_scope(&t);
+    write(&closing.join(".syq-persistence-closing"), b"");
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--auth-from", "ssh", "--pscope"])
+        .arg(&closing)
+        .arg(t.path("src"))
+        .args(["--to", "fake", "--into"])
+        .arg(t.path("dst"))
+        .args(["--no-bootstrap", "--no-progress"])
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .run()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("scope is closing"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(
+        !t.path("rsh.log").exists(),
+        "closing scope opened a native connection"
+    );
+    assert_output_ok(
+        &persistence_command(&t, &["off", "--pscope", closing.to_str().unwrap()])
+            .run()
+            .unwrap(),
+    );
 }
 
 /// An --rsh ssh command shares and persists connections like the default ssh.
