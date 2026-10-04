@@ -528,8 +528,11 @@ fn create_over_route(
         .context("enrollment SSH input missing")?;
     let mut greeted = false;
     let platform = (|| -> Result<_> {
+        // Any output, including an oversized or malformed first line, means
+        // the remote command started. Only an empty stream warrants waiting
+        // for SSH's transport-failure status before trying another route.
+        greeted = !std::io::BufRead::fill_buf(&mut stdout)?.is_empty();
         let os = read_enrollment_line(&mut stdout)?;
-        greeted = true;
         let arch = read_enrollment_line(&mut stdout)?;
         let length: usize = read_enrollment_line(&mut stdout)?
             .parse()
@@ -623,9 +626,6 @@ fn create_over_route(
         bail!("enrollment {id} remains pending after SSH installation failed ({status}); retry receiver enroll or revoke it");
     }
     write?;
-    if response.len() > MAX_STATE_FILE {
-        bail!("enrollment response too large");
-    }
     let response: InstallResponse = serde_json::from_slice(&response)?;
     if response.version != CONFIG_VERSION || response.id != id || response.target_login != login {
         bail!("restricted enrollment response did not match the request");
