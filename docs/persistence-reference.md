@@ -180,10 +180,12 @@ can be saved.
 
 `receive on --name NAME` creates a profile or updates that name's settings;
 omitted options keep their saved values. It enables persistence in the selected
-domain and connects the profile's saved explicit endpoint list. With no list,
-it starts receiving on tracked connections and applies to future connections;
-it does not guess servers to contact. A connection failure leaves the settings
-saved and healthy connections running, but the command exits unsuccessfully.
+domain and connects the profile's saved explicit endpoint list, waiting for
+receiving to become ready. If a listed connection fails, the settings stay saved
+and healthy connections keep running, but the command exits unsuccessfully.
+With no list, it applies the profile to tracked and future connections without
+waiting for receiving to become ready; use `receive wait` when readiness matters.
+It does not guess servers to contact.
 Without `--name`, `receive on` updates the first saved profile, shown first by
 `receive status`. The initial hostname profile becomes a saved profile when
 persistence first connects; adding a new name then keeps that original profile.
