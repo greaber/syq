@@ -69,20 +69,16 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
         .is_some_and(|bytes| bytes < MAX_FRAME as u64)
 }
 
-/// Largest file one `SmallPatch` may describe.
-pub const MAX_PATCH_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest file one `SmallPatch` may describe: as large as a whole patch
+/// batch (`patch_batch_fits`).
+pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;
 
 /// Whether a `PatchSmallBatch` of files of these lengths stays within what a
 /// receiver builds in memory before publishing any of them: `MAX_READ_BYTES`
-/// in all, or a single file of up to `MAX_PATCH_FILE_BYTES`. The lengths
-/// count reused blocks, which cost the request almost nothing.
+/// in all. The lengths count reused blocks, which cost the request almost
+/// nothing.
 pub(crate) fn patch_batch_fits(lens: impl IntoIterator<Item = u64>) -> bool {
-    let (files, total) = lens
-        .into_iter()
-        .fold((0usize, 0u64), |(files, total), len| {
-            (files + 1, total.saturating_add(len))
-        });
-    total <= MAX_READ_BYTES || (files == 1 && total <= MAX_PATCH_FILE_BYTES)
+    lens.into_iter().fold(0, u64::saturating_add) <= MAX_READ_BYTES
 }
 
 /// Whether hashing existing files of these lengths in `block` byte blocks
