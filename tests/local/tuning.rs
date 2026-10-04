@@ -2488,7 +2488,7 @@ fn resource_pressure_keeps_copying_with_bounded_parallelism() {
     // Enough files to exercise workers instead of the small-copy shortcut.
     for index in 0..512 {
         write(
-            &t.path(&format!("source/f{index:04}")),
+            &t.path(&format!("source/d{}/f{index:04}", index % 8)),
             format!("content {index}").as_bytes(),
         );
     }
@@ -2518,11 +2518,13 @@ fn resource_pressure_keeps_copying_with_bounded_parallelism() {
         assert_output_ok(&output);
         for index in 0..512 {
             assert_eq!(
-                read(&t.path(&format!("{label}/f{index:04}"))),
+                read(&t.path(&format!("{label}/d{}/f{index:04}", index % 8))),
                 format!("content {index}").as_bytes()
             );
         }
-        assert!(partial_files(&t.path(label)).is_empty());
+        for directory in 0..8 {
+            assert!(partial_files(&t.path(&format!("{label}/d{directory}"))).is_empty());
+        }
     }
 }
 

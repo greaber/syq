@@ -16,7 +16,7 @@ impl Descriptors {
             return None;
         }
         Some(Self {
-            limit: limits.rlim_cur as u64,
+            limit: limits.rlim_cur,
             open: crate::fsops::current_open_descriptor_count(limits.rlim_cur).ok()? as u64,
         })
     }

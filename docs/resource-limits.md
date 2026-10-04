@@ -62,6 +62,7 @@ start. Small-file staging reduces its open-file burst after an open failure
 that may indicate descriptor exhaustion, then retries once after existing
 bursts finish. Persistent failures remain errors. These measures do not reserve
 memory or disk space, or guarantee success under every resource limit.
+
 [Restricted receiver limits](remote-reference.md#limits-and-unsupported-options)
 still apply. S3 ceilings constrain the route's normal automatic range without
 raising it. They are nested: object and per-object part counts also share the
