@@ -1,7 +1,7 @@
 use super::*;
 
-/// Check meaning as well as framing, against explicit fixture expectations in
-/// every backend format. The expected values never come from another adapter.
+/// Check meaning as well as framing against the same fixture expectations in
+/// every backend format.
 fn assert_completion_candidates(t: &Tmp, words: &[&str], expected: &[&str]) {
     for shell in ["bash", "zsh", "fish"] {
         let index = (words.len() - 1).to_string();
@@ -34,6 +34,42 @@ fn assert_completion_candidates(t: &Tmp, words: &[&str], expected: &[&str]) {
         expected.sort();
         assert_eq!(actual, expected, "{shell} {words:?}");
     }
+}
+
+/// Authorization choices include the native endpoint inventory. Query that
+/// inventory separately because system known_hosts is outside the fixture HOME;
+/// assert the complete union with fixed authorization choices, not a subset.
+fn assert_authorization_candidates(t: &Tmp, words: &[&str], choices: &[&str]) {
+    let prefix = words.last().unwrap();
+    let output = completion_command(
+        t,
+        &[
+            "__complete",
+            "fish",
+            "3",
+            "--",
+            "syq",
+            "persist",
+            "connect",
+            prefix,
+        ],
+    )
+    .current_dir(t.path(""))
+    .env("PATH", t.path("bin"))
+    .env("SYQ_COMPLETION_DEBUG", "1")
+    .run()
+    .unwrap();
+    assert_output_ok(&output);
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let inventory = String::from_utf8(output.stdout).unwrap();
+    let mut expected = inventory
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .chain(choices.iter().copied())
+        .collect::<Vec<_>>();
+    expected.sort();
+    expected.dedup();
+    assert_completion_candidates(t, words, &expected);
 }
 
 #[test]
@@ -1578,26 +1614,26 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "ss"], &["ssh"]);
-    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "@lap"], &["@laptop"]);
-    assert_completion_candidates(&t, &["syq", "persist", "auth-from", "au"], &["auto"]);
+    assert_authorization_candidates(&t, &["syq", "persist", "auth-from", "ss"], &["ssh"]);
+    assert_authorization_candidates(&t, &["syq", "persist", "auth-from", "@lap"], &["@laptop"]);
+    assert_authorization_candidates(&t, &["syq", "persist", "auth-from", "au"], &["auto"]);
     assert_completion_candidates(&t, &["syq", "persist", "auth-from", "--r"], &["--reset"]);
     assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-f"], &["--auth-from"]);
-    assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-from", "ss"], &["ssh"]);
+    assert_authorization_candidates(&t, &["syq", "cp", "source", "--auth-from", "ss"], &["ssh"]);
     assert_completion_candidates(
         &t,
         &["syq", "cp", "source", "--auth-from", "@ss"],
         &["@ssh"],
     );
-    assert_completion_candidates(&t, &["syq", "cp", "source", "--auth-from", "au"], &["auto"]);
+    assert_authorization_candidates(&t, &["syq", "cp", "source", "--auth-from", "au"], &["auto"]);
     for (command, flag) in [
         ("rm", "--auth-from"),
         ("map", "--auth-from"),
         ("clean-partials", "--auth-from"),
         ("rsync", "--syq-auth-from"),
     ] {
-        assert_completion_candidates(&t, &["syq", command, flag, "@lap"], &["@laptop"]);
-        assert_completion_candidates(&t, &["syq", command, flag, "ss"], &["ssh"]);
+        assert_authorization_candidates(&t, &["syq", command, flag, "@lap"], &["@laptop"]);
+        assert_authorization_candidates(&t, &["syq", command, flag, "ss"], &["ssh"]);
     }
     assert_completion_candidates(
         &t,
@@ -1660,13 +1696,13 @@ fn ssh_completion_offers_auth_modes_without_probing_destinations() {
     );
     fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_completion_candidates(&t, &["syq", "ss"], &["ssh"]);
-    assert_completion_candidates(
+    assert_authorization_candidates(
         &t,
         &["syq", "ssh", "--auth-from", ""],
         &["@laptop", "auto", "ssh"],
     );
-    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "auto"], &["auto"]);
-    assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "ssh"], &["ssh"]);
+    assert_authorization_candidates(&t, &["syq", "ssh", "--auth-from", "auto"], &["auto"]);
+    assert_authorization_candidates(&t, &["syq", "ssh", "--auth-from", "ssh"], &["ssh"]);
     assert_completion_candidates(&t, &["syq", "ssh", "--auth-from", "@laptop", "host"], &[]);
     assert_completion_candidates(
         &t,

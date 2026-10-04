@@ -1385,9 +1385,22 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     let listener = UnixListener::bind(&socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let ssh_marker = t.path("ssh-used");
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[9; 32]).into(),
+        "",
+    )
+    .unwrap()
+    .public_key()
+    .to_openssh()
+    .unwrap();
+    let resolved = serde_json::json!({
+        "endpoint": {"user": "fixture-user", "host": "resolved-backup", "port": 2222},
+        "host_algorithms": "ssh-ed25519",
+        "known_hosts": format!("syq-approved-peer {key}\n"),
+    });
     let responder = std::thread::spawn(move || {
         let mut messages = Vec::new();
-        for _ in 0..10 {
+        for _ in 0..12 {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut progress = Instant::now() + Duration::from_secs(5);
             let mut socket = loop {
@@ -1419,27 +1432,41 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
             let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
             socket.read_exact(&mut bytes).unwrap();
             let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            let response = if envelope["message"] == "Ping" {
+            let responses = if envelope["message"] == "Ping" {
                 assert!(ssh_marker.exists(), "discovery preceded the SSH attempt");
-                serde_json::json!("Ready")
+                vec![serde_json::json!("Ready")]
+            } else if let Some(target) = envelope["message"].get("ResolveSsh") {
+                assert_eq!(
+                    target,
+                    &serde_json::json!({"user": null, "host": "backup", "port": null}),
+                    "{envelope}"
+                );
+                assert!(
+                    !ssh_marker.exists(),
+                    "explicit account resolution tried native SSH"
+                );
+                vec![serde_json::json!("Ready"), resolved.clone()]
             } else if let Some(account) = envelope["message"].get("Ssh") {
                 assert_eq!(account["mode"], "Account", "{envelope}");
                 assert_eq!(account["target"]["host"], "backup", "{envelope}");
+                assert_eq!(account["expected"], resolved, "{envelope}");
                 assert!(
                     !ssh_marker.exists(),
                     "explicit account selection tried native SSH"
                 );
-                serde_json::json!({"Error": "account denied by fixture"})
+                vec![serde_json::json!({"Error": "account denied by fixture"})]
             } else {
                 assert!(envelope["message"].get("Forward").is_some(), "{envelope}");
-                serde_json::json!({"Error": "copy denied by fixture"})
+                vec![serde_json::json!({"Error": "copy denied by fixture"})]
             };
             messages.push(envelope);
-            let bytes = serde_json::to_vec(&response).unwrap();
-            socket
-                .write_all(&(bytes.len() as u32).to_be_bytes())
-                .unwrap();
-            socket.write_all(&bytes).unwrap();
+            for response in responses {
+                let bytes = serde_json::to_vec(&response).unwrap();
+                socket
+                    .write_all(&(bytes.len() as u32).to_be_bytes())
+                    .unwrap();
+                socket.write_all(&bytes).unwrap();
+            }
         }
         messages
     });
@@ -1575,10 +1602,11 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
         assert_eq!(pair[0]["message"], "Ping");
         assert!(pair[1]["message"].get("Forward").is_some());
     }
-    assert_eq!(messages[8]["secret"], "z-other");
-    assert_eq!(messages[9]["secret"], "ssh");
-    for request in &messages[8..10] {
-        assert_eq!(request["message"]["Ssh"]["mode"], "Account");
+    for (pair, name) in messages[8..12].chunks_exact(2).zip(["z-other", "ssh"]) {
+        assert_eq!(pair[0]["secret"], name);
+        assert_eq!(pair[1]["secret"], name);
+        assert_eq!(pair[0]["message"]["ResolveSsh"]["host"], "backup");
+        assert_eq!(pair[1]["message"]["Ssh"]["mode"], "Account");
     }
     // The registry remains, but every socket is now unavailable. Discovery
     // must allow ordinary SSH instead of treating stale names as reservations.

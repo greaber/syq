@@ -1272,7 +1272,7 @@ fn persist_connect_rejects_explicit_receiving_timeout_with_saved_account_authori
             "{error}"
         );
         assert!(
-            error.contains("saved authorization selects @laptop"),
+            error.contains("selected authorization uses @laptop"),
             "{error}"
         );
     }
@@ -1281,7 +1281,7 @@ fn persist_connect_rejects_explicit_receiving_timeout_with_saved_account_authori
     let output = run(&["connect", "alice@backup:2222", "--timeout", "30"]);
     assert!(!output.status.success());
     assert!(
-        stderr_of(&output).contains("saved authorization selects @other"),
+        stderr_of(&output).contains("selected authorization uses @other"),
         "{}",
         stderr_of(&output)
     );
