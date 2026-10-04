@@ -68,7 +68,310 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
     (first.root.identity() == other.root.identity() && directory == other_directory).then_some(name)
 }
 
+fn fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
+    FileFingerprint {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        len: metadata.len(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec() as u32,
+    }
+}
+
+/// How many comparison blocks of `block` bytes a file of `len` bytes has.
+fn block_count(len: u64, block: u64) -> Result<usize> {
+    if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
+        bail!("invalid comparison block size {block}");
+    }
+    usize::try_from(len.div_ceil(block)).context("comparison block count overflow")
+}
+
+/// Read `len` bytes at `off` into the start of `buffer`. Returns false when
+/// the file ends first.
+fn read_block(file: &File, off: u64, len: usize, buffer: &mut Vec<u8>) -> Result<bool> {
+    if buffer.len() < len {
+        buffer.resize(len, 0);
+    }
+    read_exact_or_short(file, off, &mut buffer[..len])
+}
+
+/// Fill `buffer` from `file` at `off`. Returns false when the file ends first.
+fn read_exact_or_short(file: &File, off: u64, buffer: &mut [u8]) -> Result<bool> {
+    match file.read_exact_at(buffer, off) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl FsOps {
+    /// Hash the blocks each existing destination holds whole, up to the
+    /// length of the source that would replace it. A target that is not an
+    /// existing regular file under the root and condition has no hashes.
+    pub(super) fn hash_existing_batch(
+        &mut self,
+        block: u64,
+        files: &[ExistingRead],
+    ) -> Vec<std::result::Result<ExistingHashes, WireError>> {
+        let mut buffer = Vec::new();
+        files
+            .iter()
+            .map(|file| {
+                self.hash_existing(block, file, &mut buffer)
+                    .map_err(|error| wire_error(&error))
+            })
+            .collect()
+    }
+
+    fn hash_existing(
+        &mut self,
+        block: u64,
+        read: &ExistingRead,
+        buffer: &mut Vec<u8>,
+    ) -> Result<ExistingHashes> {
+        let blocks = block_count(read.len, block)?;
+        let target = self.destination_mutation_target(&read.path, read.guard.as_ref())?;
+        let partials = !self.candidate_partials(&target).is_empty();
+        let Some(file) = target
+            .root
+            .open_regular_read(&target.relative)
+            .ok()
+            .filter(|file| require_open_target(file, &target.label, read.condition).is_ok())
+        else {
+            return Ok(ExistingHashes {
+                fingerprint: None,
+                hashes: Vec::new(),
+                partials,
+            });
+        };
+        let fingerprint = fingerprint(&file.metadata()?);
+        let algorithm = self.hash_policy.algorithm;
+        let mut hashes = Vec::with_capacity(blocks);
+        for index in 0..blocks as u64 {
+            let off = index * block;
+            let len = block.min(read.len - off) as usize;
+            if off + len as u64 > fingerprint.len || !read_block(&file, off, len, buffer)? {
+                break;
+            }
+            hashes.push(algorithm.hash(&buffer[..len]));
+        }
+        Ok(ExistingHashes {
+            fingerprint: Some(fingerprint),
+            hashes,
+            partials,
+        })
+    }
+
+    /// The existing regular file a small file would replace, opened for
+    /// reading under the destination root and the target's condition, or
+    /// None when there is no such file to compare with.
+    fn open_existing_small(
+        &mut self,
+        path: &[u8],
+        guard: Option<&ContainerGuard>,
+        condition: TargetCondition,
+    ) -> Result<Option<(RootedTarget, File)>> {
+        let target = self.destination_mutation_target(path, guard)?;
+        let Ok(file) = target.root.open_regular_read(&target.relative) else {
+            return Ok(None);
+        };
+        if require_open_target(&file, &target.label, condition).is_err() {
+            return Ok(None);
+        }
+        Ok(Some((target, file)))
+    }
+
+    /// Keep an existing file found to hold a small file's contents: set its
+    /// metadata through the descriptor its contents were read from, as a
+    /// content-identical per-file finish does. A writer that extended or
+    /// shrank it while it was compared makes it count as changed. Returns the
+    /// kept file's identity, or None when it must be replaced.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_open_small(
+        &mut self,
+        target: &RootedTarget,
+        file: &File,
+        len: u64,
+        meta: &Meta,
+        flags: u8,
+        guarded: bool,
+        condition: TargetCondition,
+    ) -> Result<Option<Option<(u64, u64)>>> {
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_SMALL_COMPARED_READY_FILE",
+            "SYQ_TEST_SMALL_COMPARED_CONTINUE_FILE",
+            "small-file comparison",
+        )?;
+        let current = file.metadata()?;
+        if current.len() != len {
+            return Ok(None);
+        }
+        set_meta_file_known(file, meta, flags, &current)
+            .with_context(|| format!("set metadata {}", target.label.display()))?;
+        if guarded || condition != TargetCondition::Any {
+            require_rooted_named_identity(
+                &target.root,
+                &target.relative,
+                &target.label,
+                file,
+                condition,
+            )?;
+        }
+        Ok(Some(published_identity(file, flags)?))
+    }
+
+    /// Publish each patch as `put_small_batch` publishes a whole file, from
+    /// its new contents and the blocks it reuses from the file it replaces.
+    /// A reused block must still hash as compared; otherwise that file fails
+    /// and nothing of it is written. A patch that reuses every block of an
+    /// existing file whose fingerprint is unchanged keeps that file instead.
+    pub(super) fn patch_small_batch(
+        &mut self,
+        patches: &[SmallPatch],
+    ) -> Vec<std::result::Result<SmallPatched, WireError>> {
+        let mut results = vec![
+            Ok(SmallPatched {
+                kept: false,
+                identity: None,
+            });
+            patches.len()
+        ];
+        let mut puts = Vec::new();
+        let mut positions = Vec::new();
+        for (position, patch) in patches.iter().enumerate() {
+            match self.keep_patched(patch) {
+                Ok(Some(identity)) => {
+                    results[position] = Ok(SmallPatched {
+                        kept: true,
+                        identity,
+                    });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    results[position] = Err(wire_error(&error));
+                    continue;
+                }
+            }
+            match self.assemble_patch(patch) {
+                Ok(data) => {
+                    let hash = if self.hash_policy.transfer_integrity {
+                        self.observed_payload_hash(&data)
+                    } else {
+                        [0; 32]
+                    };
+                    puts.push(SmallPut {
+                        path: patch.path.clone(),
+                        copy_id: patch.copy_id,
+                        data,
+                        hash,
+                        meta: patch.meta.clone(),
+                        flags: patch.flags,
+                        inplace: false,
+                        condition: patch.condition,
+                        guard: patch.guard.clone(),
+                        replaces: true,
+                    });
+                    positions.push(position);
+                }
+                Err(error) => results[position] = Err(wire_error(&error)),
+            }
+        }
+        for (position, result) in positions.into_iter().zip(self.put_small_batch(&puts)) {
+            results[position] = result.map(|identity| SmallPatched {
+                kept: false,
+                identity,
+            });
+        }
+        results
+    }
+
+    /// Keep the existing file a patch would reproduce whole: every block is
+    /// reused, and nothing has changed the file since it was hashed.
+    fn keep_patched(&mut self, patch: &SmallPatch) -> Result<Option<Option<(u64, u64)>>> {
+        let Some(basis) = patch.basis else {
+            return Ok(None);
+        };
+        if basis.len != patch.len
+            || !patch.data.is_empty()
+            || patch.reuse.iter().any(Option::is_none)
+        {
+            return Ok(None);
+        }
+        let Some((target, file)) =
+            self.open_existing_small(&patch.path, patch.guard.as_ref(), patch.condition)?
+        else {
+            return Ok(None);
+        };
+        if fingerprint(&file.metadata()?) != basis {
+            return Ok(None);
+        }
+        self.keep_open_small(
+            &target,
+            &file,
+            patch.len,
+            &patch.meta,
+            patch.unchanged_flags,
+            patch.guard.is_some(),
+            patch.condition,
+        )
+    }
+
+    fn assemble_patch(&mut self, patch: &SmallPatch) -> Result<Vec<u8>> {
+        let blocks = block_count(patch.len, patch.block)?;
+        if patch.reuse.len() != blocks || patch.len > MAX_READ_BYTES {
+            bail!("invalid patch of {} bytes", patch.len);
+        }
+        if self.hash_policy.transfer_integrity
+            && self.observed_payload_hash(&patch.data) != patch.hash
+        {
+            bail!("block hash mismatch on receive");
+        }
+        let old = if patch.reuse.iter().any(Option::is_some) {
+            let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;
+            Some(
+                target
+                    .root
+                    .open_regular_read(&target.relative)
+                    .with_context(|| {
+                        format!("open {} to reuse its blocks", target.label.display())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let algorithm = self.hash_policy.algorithm;
+        let mut data = Vec::with_capacity(patch.len as usize);
+        let mut taken = 0;
+        for (index, reuse) in patch.reuse.iter().enumerate() {
+            let off = index as u64 * patch.block;
+            let len = patch.block.min(patch.len - off) as usize;
+            match (reuse, &old) {
+                (Some(expected), Some(old)) => {
+                    data.resize(off as usize + len, 0);
+                    let block = &mut data[off as usize..];
+                    let complete = read_exact_or_short(old, off, block)?;
+                    if !complete || algorithm.hash(block) != *expected {
+                        bail!("the destination changed after it was compared");
+                    }
+                }
+                _ => {
+                    let new = patch
+                        .data
+                        .get(taken..taken + len)
+                        .context("patch contents end early")?;
+                    data.extend_from_slice(new);
+                    taken += len;
+                }
+            }
+        }
+        if taken != patch.data.len() {
+            bail!("patch contents run past the file");
+        }
+        Ok(data)
+    }
+
     pub(super) fn put_small_batch(&mut self, puts: &[SmallPut]) -> Vec<SmallOutcome> {
         let mut results: Vec<SmallOutcome> = vec![Ok(None); puts.len()];
         let mut carried = None;
@@ -199,6 +502,9 @@ impl FsOps {
                 // opened too: a new empty file of ours is used as created,
                 // and anything else, or an open the kernel refused, takes
                 // the checked reuse that ranged writes apply.
+                if creates_foreign_owners(target.root.identity().dev) {
+                    return self.checked_small_stage(&target.root, relative, label, mode);
+                }
                 self.uncache_rooted(&target.root, relative);
                 match self.open_or_create_write_only_partial(&target.root, relative, mode) {
                     Ok((file, created)) if is_fresh_partial(&created, mode) => {
@@ -321,6 +627,125 @@ mod tests {
 
     fn entries(directory: &Path) -> usize {
         fs::read_dir(directory).unwrap().count()
+    }
+
+    #[test]
+    fn existing_files_are_hashed_in_whole_blocks_and_patched_from_them() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let block = MIN_HASH_BLOCK_BYTES;
+        let blocks = |seed: u8, count: usize| -> Vec<u8> {
+            (0..count as u64 * block)
+                .map(|i| (i % 251) as u8 ^ seed)
+                .collect()
+        };
+        let old = blocks(0, 3);
+        for name in ["same", "edited", "raced"] {
+            fs::write(directory.join(name), &old).unwrap();
+        }
+        let mut ops = receiver(directory);
+        let algorithm = ops.hash_policy.algorithm;
+        let read = |name: &str, len| ExistingRead {
+            path: name.as_bytes().to_vec(),
+            len,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let longer = 3 * block + 10;
+        let hashed = ops.hash_existing_batch(
+            block,
+            &[
+                read("same", 3 * block),
+                read("edited", longer),
+                read("missing", 1),
+            ],
+        );
+        // A block the file holds only in part has no hash.
+        let expected: Vec<_> = old
+            .chunks(block as usize)
+            .map(|chunk| algorithm.hash(chunk))
+            .collect();
+        let same = hashed[0].as_ref().unwrap();
+        assert_eq!(same.hashes, expected);
+        assert_eq!(same.fingerprint.unwrap().len, old.len() as u64);
+        assert_eq!(hashed[1].as_ref().unwrap().hashes, expected);
+        let missing = hashed[2].as_ref().unwrap();
+        assert!(missing.fingerprint.is_none() && missing.hashes.is_empty() && !missing.partials);
+
+        let patch =
+            |name: &str, len, reuse: Vec<Option<ContentDigest>>, data: Vec<u8>| SmallPatch {
+                path: name.as_bytes().to_vec(),
+                copy_id: [3; 16],
+                len,
+                block,
+                reuse,
+                hash: content_digest(&data),
+                data,
+                basis: same.fingerprint,
+                meta: Meta {
+                    mtime: 1_234_567_890,
+                    ..put(name, b"").meta
+                },
+                flags: 0,
+                unchanged_flags: flags::TIMES,
+                condition: TargetCondition::Any,
+                guard: None,
+            };
+        let reuse_all: Vec<_> = expected.iter().copied().map(Some).collect();
+        let mut new_tail = vec![7u8; block as usize];
+        new_tail.extend_from_slice(b"0123456789");
+        let mut edited = old[..2 * block as usize].to_vec();
+        edited.extend_from_slice(&new_tail);
+        let inode = |name: &str| fs::metadata(directory.join(name)).unwrap().ino();
+        let before = (inode("same"), inode("edited"));
+        // Change a reused block of "raced" after it was hashed.
+        let mut raced = old.clone();
+        raced[5] ^= 1;
+        fs::write(directory.join("raced"), &raced).unwrap();
+        let mut same_patch = patch("same", 3 * block, reuse_all.clone(), Vec::new());
+        same_patch.basis = same.fingerprint;
+        let results = ops.patch_small_batch(&[
+            same_patch,
+            patch(
+                "edited",
+                longer,
+                vec![reuse_all[0], reuse_all[1], None, None],
+                new_tail,
+            ),
+            patch(
+                "raced",
+                3 * block,
+                vec![reuse_all[0], None, None],
+                old[block as usize..].to_vec(),
+            ),
+        ]);
+        // The unchanged file is kept with the new times; the edited one is
+        // published from two reused blocks and the new tail.
+        assert_eq!(
+            results[0],
+            Ok(SmallPatched {
+                kept: true,
+                identity: None
+            })
+        );
+        assert_eq!(inode("same"), before.0);
+        assert_eq!(
+            fs::metadata(directory.join("same")).unwrap().mtime(),
+            1_234_567_890
+        );
+        assert_eq!(
+            results[1],
+            Ok(SmallPatched {
+                kept: false,
+                identity: None
+            })
+        );
+        assert_ne!(inode("edited"), before.1);
+        assert_eq!(fs::read(directory.join("edited")).unwrap(), edited);
+        // A reused block that changed fails that file and writes nothing.
+        assert!(results[2].is_err(), "{:?}", results[2]);
+        assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
+        assert_eq!(entries(directory), 3);
     }
 
     #[test]

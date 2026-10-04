@@ -32,6 +32,7 @@ mod diagnostics;
 mod dry_run;
 mod hardlinks;
 mod planner;
+mod small_compare;
 mod work_budget;
 mod worker;
 

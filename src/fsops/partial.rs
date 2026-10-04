@@ -96,7 +96,10 @@ impl FsOps {
         let mut repaired_permissions = false;
         if create_if_missing {
             match self.create_partial_rooted(root, relative, create_mode) {
-                Ok(file) => return Ok(Some((file, None))),
+                Ok(file) => {
+                    note_created_owner(&file.metadata()?);
+                    return Ok(Some((file, None)));
+                }
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
             }
@@ -240,7 +243,10 @@ impl FsOps {
                 Some(_) => root.unlink(relative)?,
                 None if !create_if_missing => return Ok(None),
                 None => match self.create_partial_rooted(root, relative, create_mode) {
-                    Ok(file) => return Ok(Some((file, None))),
+                    Ok(file) => {
+                        note_created_owner(&file.metadata()?);
+                        return Ok(Some((file, None)));
+                    }
                     Err(error)
                         if error
                             .downcast_ref::<io::Error>()
@@ -490,16 +496,19 @@ impl FsOps {
                     // whose final mode lacks it.
                     let staged = mode | 0o600;
                     self.uncache_rooted(&target.root, relative);
-                    match self.open_or_create_write_only_partial(&target.root, relative, staged) {
-                        Ok((file, created))
-                            if is_fresh_partial(&created, staged)
-                                && created.mode() & 0o600 == 0o600 =>
+                    if !creates_foreign_owners(target.root.identity().dev) {
+                        match self.open_or_create_write_only_partial(&target.root, relative, staged)
                         {
-                            return Ok(Some((file, None, Some(created))));
+                            Ok((file, created))
+                                if is_fresh_partial(&created, staged)
+                                    && created.mode() & 0o600 == 0o600 =>
+                            {
+                                return Ok(Some((file, None, Some(created))));
+                            }
+                            Ok(_) => {}
+                            Err(error) if existing_leaf_refused(&error) => {}
+                            Err(error) => return Err(error),
                         }
-                        Ok(_) => {}
-                        Err(error) if existing_leaf_refused(&error) => {}
-                        Err(error) => return Err(error),
                     }
                 }
                 self.open_private_partial_rooted(
@@ -1494,30 +1503,88 @@ impl FsOps {
     }
 
     fn read_small_batch(&mut self, reads: &[SmallRead]) -> Result<Response> {
-        let total: u64 = reads.iter().map(|read| u64::from(read.len)).sum();
+        let blocks = self.read_small_sources(reads, |_, _, data, hash| SmallBlock {
+            source: None,
+            data,
+            hash,
+        })?;
+        Ok(Response::SmallBlocks(blocks))
+    }
+
+    /// Read each source whole and return only the blocks whose comparison
+    /// hashes differ from what the destination holds, so each source byte is
+    /// read once.
+    fn read_differing_batch(&mut self, block: u64, reads: &[DifferingRead]) -> Result<Response> {
+        if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
+            bail!("invalid comparison block size {block}");
+        }
+        let differing = self.read_small_sources(reads, |ops, read, contents, _| {
+            let mut matching = Vec::new();
+            let mut data = Vec::new();
+            for (index, chunk) in contents.chunks(block as usize).enumerate() {
+                let same = read.expected.get(index) == Some(&ops.hash_policy.algorithm.hash(chunk));
+                if !same {
+                    data.extend_from_slice(chunk);
+                }
+                matching.push(same);
+            }
+            let hash = ops.observed_payload_hash(&data);
+            DifferingBlocks {
+                source: None,
+                matching,
+                data,
+                hash,
+            }
+        })?;
+        Ok(Response::DifferingBlocks(differing))
+    }
+
+    /// Read each small source's ranges, convert their contents and payload
+    /// hash with `convert` as soon as they are read, and attach the source's
+    /// metadata rechecked after every read.
+    fn read_small_sources<R: SmallSourceRead, T: SmallSourceResult>(
+        &mut self,
+        reads: &[R],
+        mut convert: impl FnMut(&Self, &R, Vec<u8>, ContentDigest) -> T,
+    ) -> Result<Vec<std::result::Result<T, String>>> {
+        let total: u64 = reads
+            .iter()
+            .flat_map(|read| read.ranges())
+            .map(|(_, len)| u64::from(len))
+            .sum();
         if total > MAX_READ_BYTES {
             bail!("small-file batch requests {total} bytes, exceeding the {MAX_READ_BYTES}-byte protocol limit");
         }
         let mut blocks: Vec<_> = reads
             .iter()
             .map(|read| {
-                // Metadata is enough for an empty file, even with mode 000.
-                let result = if read.len == 0 {
-                    self.source_content_target(read.source.as_ref())
-                        .map(|_| (Vec::new(), self.observed_payload_hash(&[])))
-                } else {
-                    self.read_range(&read.path, read.source.as_ref(), read.attempt, 0, read.len)
+                let ranges = read.ranges();
+                let read_one = |ops: &mut Self, off: u64, len: u32| {
+                    ops.read_range(read.path(), read.source(), read.attempt(), off, len)
                         .and_then(|response| match response {
                             Response::Block { data, hash, .. } => Ok((data, hash)),
                             other => bail!("unexpected response {other:?}"),
                         })
                 };
+                let result = match ranges.as_slice() {
+                    // Metadata is enough for an empty file, even with mode 000.
+                    [] => self
+                        .source_content_target(read.source())
+                        .map(|_| (Vec::new(), self.observed_payload_hash(&[]))),
+                    [(off, len)] => read_one(self, *off, *len),
+                    _ => ranges
+                        .iter()
+                        .try_fold(Vec::new(), |mut data, &(off, len)| {
+                            data.extend(read_one(self, off, len)?.0);
+                            anyhow::Ok(data)
+                        })
+                        .map(|data| {
+                            let hash = self.observed_payload_hash(&data);
+                            (data, hash)
+                        }),
+                };
                 result
-                    .map(|(data, hash)| SmallBlock {
-                        source: None,
-                        data,
-                        hash,
-                    })
+                    .map(|(data, hash)| convert(self, read, data, hash))
                     .map_err(|error| errstr(&error))
             })
             .collect();
@@ -1535,25 +1602,25 @@ impl FsOps {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, read)| {
-                    (blocks[i].is_ok() && read.source.is_some() == registered).then_some(i)
+                    (blocks[i].is_ok() && read.source().is_some() == registered).then_some(i)
                 })
                 .collect();
             if indices.is_empty() {
                 continue;
             }
-            let paths: Vec<_> = indices.iter().map(|&i| reads[i].path.clone()).collect();
+            let paths: Vec<_> = indices.iter().map(|&i| reads[i].path().clone()).collect();
             let sources: Option<Vec<_>> = registered.then(|| {
                 indices
                     .iter()
-                    .map(|&i| reads[i].source.clone().unwrap())
+                    .map(|&i| reads[i].source().cloned().unwrap())
                     .collect()
             });
             let entries = self.stat_many_request(&paths, sources.as_deref(), false, None)?;
             for (i, entry) in indices.into_iter().zip(entries) {
-                blocks[i].as_mut().unwrap().source = entry;
+                blocks[i].as_mut().unwrap().set_source(entry);
             }
         }
-        Ok(Response::SmallBlocks(blocks))
+        Ok(blocks)
     }
 
     /// Write a whole small file through its private partial and atomically
@@ -2881,6 +2948,12 @@ impl FsOps {
                     CopyLocalOutcome::Copied => Response::Ok,
                     CopyLocalOutcome::Unsupported => Response::CopyLocalUnsupported,
                 }),
+            Request::HashExistingBatch { block, files } => Ok(Response::ExistingHashes(
+                self.hash_existing_batch(*block, files),
+            )),
+            Request::PatchSmallBatch(patches) => {
+                Ok(Response::PatchedBatch(self.patch_small_batch(patches)))
+            }
             Request::PutSmallBatch(puts) => {
                 let results = self.put_small_batch(puts);
                 if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {
@@ -2928,6 +3001,9 @@ impl FsOps {
                 ..
             } => self.read_range(path, source.as_ref(), *attempt, *off, *len),
             Request::ReadSmallBatch(reads) => self.read_small_batch(reads),
+            Request::ReadDifferingBatch { block, reads } => {
+                self.read_differing_batch(*block, reads)
+            }
             Request::WriteRange {
                 path,
                 inplace,
@@ -3086,6 +3162,29 @@ pub(super) fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Devices where a file this process has just created exclusively reports
+/// another owner: sshfs without uid mapping, squashed NFS, a CIFS mount with
+/// a forced uid. Ownership cannot show there that a sidecar opened without
+/// exclusive creation is new, so sidecars are created exclusively from the
+/// start instead of after that check has failed.
+fn foreign_owner_devices() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static DEVICES: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    DEVICES.get_or_init(Default::default)
+}
+
+pub(super) fn creates_foreign_owners(dev: u64) -> bool {
+    foreign_owner_devices().lock().unwrap().contains(&dev)
+}
+
+fn note_created_owner(metadata: &fs::Metadata) {
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        foreign_owner_devices()
+            .lock()
+            .unwrap()
+            .insert(metadata.dev());
+    }
 }
 
 // Ownership is required when adopting a leftover, before chmod or writes.
@@ -3543,6 +3642,70 @@ pub(super) fn published_identity(file: &File, flags: u8) -> Result<Option<(u64, 
 /// opened: a rename does not change it.
 pub(super) fn known_identity(metadata: &fs::Metadata, flags: u8) -> Option<(u64, u64)> {
     (flags & flags::REPORT_IDENTITY != 0).then(|| identity_of(metadata))
+}
+
+/// One file of a small source batch: what to read, and from where.
+trait SmallSourceRead {
+    fn path(&self) -> &PathBytes;
+    fn source(&self) -> Option<&RegisteredPath>;
+    fn attempt(&self) -> u32;
+    fn ranges(&self) -> Vec<(u64, u32)>;
+}
+
+impl SmallSourceRead for SmallRead {
+    fn path(&self) -> &PathBytes {
+        &self.path
+    }
+    fn source(&self) -> Option<&RegisteredPath> {
+        self.source.as_ref()
+    }
+    fn attempt(&self) -> u32 {
+        self.attempt
+    }
+    fn ranges(&self) -> Vec<(u64, u32)> {
+        if self.len == 0 {
+            Vec::new()
+        } else {
+            vec![(0, self.len)]
+        }
+    }
+}
+
+impl SmallSourceRead for DifferingRead {
+    fn path(&self) -> &PathBytes {
+        &self.path
+    }
+    fn source(&self) -> Option<&RegisteredPath> {
+        self.source.as_ref()
+    }
+    fn attempt(&self) -> u32 {
+        self.attempt
+    }
+    fn ranges(&self) -> Vec<(u64, u32)> {
+        if self.len == 0 {
+            Vec::new()
+        } else {
+            vec![(0, self.len)]
+        }
+    }
+}
+
+/// A small source read's result, which carries the source metadata
+/// rechecked after every file in its batch was read.
+trait SmallSourceResult {
+    fn set_source(&mut self, source: Option<Entry>);
+}
+
+impl SmallSourceResult for SmallBlock {
+    fn set_source(&mut self, source: Option<Entry>) {
+        self.source = source;
+    }
+}
+
+impl SmallSourceResult for DifferingBlocks {
+    fn set_source(&mut self, source: Option<Entry>) {
+        self.source = source;
+    }
 }
 
 fn identity_of(metadata: &fs::Metadata) -> (u64, u64) {

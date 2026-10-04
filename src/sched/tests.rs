@@ -5,6 +5,8 @@ pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
         data: FileJobData {
             compare_ranges: false,
             compare_final: false,
+            compared: false,
+            resume_partial: false,
             src: name.to_vec(),
             source: RegisteredPath::new(serde_json::from_str("0").unwrap(), name.to_vec()).unwrap(),
             dst: [name, b"-dst"].concat(),
@@ -236,6 +238,8 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
+                compared: false,
+                resume_partial: false,
                 src: b"src/file".to_vec(),
                 source: RegisteredPath::new(serde_json::from_str("0").unwrap(), b"file".to_vec())
                     .unwrap(),

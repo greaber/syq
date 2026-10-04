@@ -341,6 +341,94 @@ pub struct SmallPut {
     pub replaces: bool,
 }
 
+/// An existing file's identity and change time. Any later write to the
+/// file, or change of its metadata, changes the fingerprint.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub ctime: i64,
+    pub ctime_nsec: u32,
+}
+
+/// One existing destination file to hash in blocks, up to the length of the
+/// source that would replace it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExistingRead {
+    pub path: PathBytes,
+    pub len: u64,
+    pub condition: TargetCondition,
+    pub guard: Option<ContainerGuard>,
+}
+
+/// The comparison hashes of the blocks an existing file holds whole, and
+/// the fingerprint of the file they were read from, if there is one.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ExistingHashes {
+    pub fingerprint: Option<FileFingerprint>,
+    pub hashes: Vec<ContentDigest>,
+    /// Earlier runs left partial copies of this file to resume from.
+    pub partials: bool,
+}
+
+/// One source file to read, returning only the blocks whose comparison
+/// hashes differ from `expected`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DifferingRead {
+    pub path: PathBytes,
+    pub source: Option<RegisteredPath>,
+    pub attempt: u32,
+    pub len: u32,
+    pub expected: Vec<ContentDigest>,
+}
+
+/// Which blocks of one `DifferingRead` matched, the others' contents
+/// concatenated with their payload hash, and the source's metadata rechecked
+/// after reading.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DifferingBlocks {
+    pub source: Option<Entry>,
+    pub matching: Vec<bool>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub hash: ContentDigest,
+}
+
+/// A file published whole from new contents and blocks of the file it
+/// replaces. Block `i` comes from the existing destination when `reuse[i]`
+/// holds its comparison hash, and otherwise from the next bytes of `data`.
+/// When every block is reused and the existing file still has the `basis`
+/// fingerprint, that file is kept and only its metadata is set.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SmallPatch {
+    pub path: PathBytes,
+    pub copy_id: CopyId,
+    pub len: u64,
+    pub block: u64,
+    pub reuse: Vec<Option<ContentDigest>>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    /// Payload hash of `data`.
+    pub hash: ContentDigest,
+    pub basis: Option<FileFingerprint>,
+    pub meta: Meta,
+    pub flags: u8,
+    /// Metadata flags for keeping the existing file.
+    pub unchanged_flags: u8,
+    pub condition: TargetCondition,
+    pub guard: Option<ContainerGuard>,
+}
+
+/// The outcome of one file of a patch batch.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmallPatched {
+    /// The existing file already held these contents and was kept.
+    pub kept: bool,
+    /// The kept or published inode, when the flags asked for it.
+    pub identity: Option<(u64, u64)>,
+}
+
 /// Contents and integrity hash for one successful `SmallRead`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallBlock {
@@ -1092,6 +1180,22 @@ pub enum WireRequest<Data> {
     CreateSendBudget {
         rate: u64,
     },
+    /// Hash the blocks of existing destination files with the comparison
+    /// algorithm.
+    HashExistingBatch {
+        block: u64,
+        files: Vec<ExistingRead>,
+    },
+    /// Read source files, returning only the blocks that differ from the
+    /// destination's hashes.
+    ReadDifferingBatch {
+        block: u64,
+        reads: Vec<DifferingRead>,
+    },
+    /// Publish files assembled from new contents and verified blocks of the
+    /// files they replace, as `PutSmallBatch` publishes whole files, or keep
+    /// those that already match.
+    PatchSmallBatch(Vec<SmallPatch>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1251,6 +1355,7 @@ impl Request {
                 | Request::StopReadStream
                 | Request::ShrinkReadStream { .. }
                 | Request::ReadSmallBatch(_)
+                | Request::ReadDifferingBatch { .. }
                 | Request::FileHash { .. }
                 | Request::TransportStats
                 | Request::Shutdown
@@ -1388,6 +1493,9 @@ pub enum Response {
     SendBudget(crate::descriptor_broker::DescriptorTicket),
     /// Aggregate ignore exclusions, sent once before ScanDone when nonzero.
     ScanIgnoredCount(u64),
+    ExistingHashes(Vec<std::result::Result<ExistingHashes, WireError>>),
+    DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
+    PatchedBatch(Vec<std::result::Result<SmallPatched, WireError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1530,6 +1638,7 @@ impl SizeHint for Request {
             Request::DescriptorCopy(_)
             | Request::WriteRange { .. }
             | Request::PutSmallBatch(_)
+            | Request::PatchSmallBatch(_)
             | Request::CopySmallFiles(_)
             | Request::SeedBasis { .. } => MAX_FRAME,
             _ => MAX_METADATA_FRAME,
@@ -1543,6 +1652,29 @@ impl SizeHint for Request {
             } => path.len() + final_ranges.as_ref().map_or(0, |ranges| ranges.len() * 16) + 128,
             Request::ReadSmallBatch(reads) => {
                 reads.iter().map(|read| read.path.len() + 16).sum::<usize>() + 16
+            }
+            Request::HashExistingBatch { files, .. } => {
+                files.iter().map(|file| file.path.len() + 96).sum::<usize>() + 16
+            }
+            Request::ReadDifferingBatch { reads, .. } => {
+                reads
+                    .iter()
+                    .map(|read| read.path.len() + read.expected.len() * 33 + 64)
+                    .sum::<usize>()
+                    + 16
+            }
+            Request::PatchSmallBatch(patches) => {
+                patches
+                    .iter()
+                    .map(|patch| {
+                        patch.data.len()
+                            + patch.reuse.len() * 33
+                            + patch.path.len()
+                            + patch.meta.size_hint()
+                            + 128
+                    })
+                    .sum::<usize>()
+                    + 16
             }
             Request::PutSmallBatch(puts) => {
                 puts.iter()
@@ -1611,6 +1743,8 @@ impl SizeHint for Response {
             Response::HelloOk { .. } => MAX_HANDSHAKE_FRAME,
             Response::Block { .. }
             | Response::SmallBlocks(_)
+            | Response::ExistingHashes(_)
+            | Response::DifferingBlocks(_)
             | Response::Hashes(_)
             | Response::HeldHashes { .. }
             | Response::SeededBasis(_) => MAX_FRAME,
@@ -1628,6 +1762,31 @@ impl SizeHint for Response {
                             block.data.len()
                                 + block.source.as_ref().map_or(1, Entry::size_hint)
                                 + 40
+                        }
+                        Err(error) => error.len() + 8,
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
+            Response::ExistingHashes(files) => {
+                files
+                    .iter()
+                    .map(|file| match file {
+                        Ok(file) => file.hashes.len() * 33 + 64,
+                        Err(error) => error.message.len() + 16,
+                    })
+                    .sum::<usize>()
+                    + 16
+            }
+            Response::DifferingBlocks(files) => {
+                files
+                    .iter()
+                    .map(|file| match file {
+                        Ok(file) => {
+                            file.data.len()
+                                + file.matching.len()
+                                + file.source.as_ref().map_or(1, Entry::size_hint)
+                                + 48
                         }
                         Err(error) => error.len() + 8,
                     })

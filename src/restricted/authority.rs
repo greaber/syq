@@ -2630,8 +2630,13 @@ impl RestrictedAuthority {
             | Request::ShrinkReadStream { .. }
             | Request::StopReadStream
             | Request::ReadSmallBatch(_)
+            | Request::ReadDifferingBatch { .. }
             | Request::PrepareSmallFiles(_)
-            | Request::CopySmallFiles(_) => {
+            | Request::CopySmallFiles(_)
+            // Grants authorize keeping a content-identical file only through
+            // the checked per-file comparison and FinishBasis.
+            | Request::HashExistingBatch { .. }
+            | Request::PatchSmallBatch(_) => {
                 bail!("request is not valid on a command-restricted destination")
             }
             Request::ListDir { .. }

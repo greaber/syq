@@ -3181,6 +3181,8 @@ impl Planner<'_> {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
+                compared: false,
+                resume_partial: false,
                 src,
                 source,
                 dst,
