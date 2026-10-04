@@ -2619,26 +2619,8 @@ impl FsOps {
     /// parents come first), so they run in parallel too. Those that change
     /// directory entries share their directory between at most two threads.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
-        // SetMeta depends on the object existing, so create everything first,
-        // then apply metadata — otherwise a parallel SetMeta can beat its
-        // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
-        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
-        let is_guarded_create = |op: &Op| match op {
-            Op::Mkdir { condition, .. }
-            | Op::Symlink { condition, .. }
-            | Op::Mknod { condition, .. } => *condition != TargetCondition::Any,
-            _ => false,
-        };
-        let guarded_idx: Vec<usize> = (0..ops.len())
-            .filter(|&i| !is_meta(&ops[i]) && is_guarded_create(&ops[i]))
-            .collect();
-        let create_idx: Vec<usize> = (0..ops.len())
-            .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
-            .collect();
-        let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
-        let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         if ops
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
@@ -2660,6 +2642,24 @@ impl FsOps {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });
         }
+        // SetMeta depends on the object existing, so create everything first,
+        // then apply metadata — otherwise a parallel SetMeta can beat its
+        // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
+        let is_meta = |op: &Op| matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. });
+        let is_guarded_create = |op: &Op| match op {
+            Op::Mkdir { condition, .. }
+            | Op::Symlink { condition, .. }
+            | Op::Mknod { condition, .. } => *condition != TargetCondition::Any,
+            _ => false,
+        };
+        let guarded_idx: Vec<usize> = (0..ops.len())
+            .filter(|&i| !is_meta(&ops[i]) && is_guarded_create(&ops[i]))
+            .collect();
+        let create_idx: Vec<usize> = (0..ops.len())
+            .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
+            .collect();
+        let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
+        let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         let gres = parallel_map(&guarded_idx, |&i| {
             apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
                 .err()

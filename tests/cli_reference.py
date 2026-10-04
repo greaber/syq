@@ -133,7 +133,7 @@ def render(command, parsed, commands):
                     if flag == "--performance-tuning" and command == ("rm",):
                         body = "Fix deletion concurrency: [workers=N for filesystems or s3-requests=N for S3](../tuning.md#deletion)"
                     elif flag == "--performance-tuning" and command == ("clean-partials",):
-                        body = "Filesystem removal workers: [workers=N](../tuning.md#transfer-controls)"
+                        body = "Filesystem removal workers: [workers=N](../tuning.md#deletion)"
             # Some management arguments have no help string. Their usage and
             # command-specific prose supply meaning; never silently omit them.
             body = body or "See the command description above."
