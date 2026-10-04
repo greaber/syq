@@ -40,7 +40,7 @@ const RMDIR_RETRIES: usize = 3;
 // Share short sibling batches as copying does. Large files remain separate
 // jobs: their block reclamation can run outside the directory's inode lock.
 const LEAF_BATCH_FILES: usize = 64;
-const LEAF_BATCH_BYTES: u64 = 16 << 20;
+const LEAF_BATCH_BYTES: u64 = 256 << 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Identity {

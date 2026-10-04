@@ -4,7 +4,8 @@
 //! the open root's identity with the validated parent spelling: separate roots
 //! for the same inode share admission, but different descendant aliases may
 //! miss that optimization. Path resolution and publication checks remain with
-//! the caller, and a permit must not span data writes or metadata inspection.
+//! the caller. Copying permits must not span data writes or metadata inspection;
+//! deletion batches may validate each entry while holding their turn.
 //!
 //! A single operation takes a permit for its one syscall. A batch takes a
 //! turn instead and changes many entries before the next contender wakes, so
