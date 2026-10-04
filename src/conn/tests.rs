@@ -170,7 +170,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
     reader.join().unwrap(); // The following reply and EOF are already queued.
     let mut conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -710,7 +710,7 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
     let writes = Arc::new(AtomicUsize::new(0));
     let mut conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -985,7 +985,7 @@ fn hello_carries_destination_initialization_before_readiness() {
     );
     let conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -1041,7 +1041,7 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
     );
     let conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -1089,7 +1089,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         .unwrap();
     let mut conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
@@ -1144,7 +1144,7 @@ fn dropping_a_pipe_connection_closes_stdin_before_waiting_for_the_peer() {
     let stdin = child.stdin.take().unwrap();
     let conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: Some(child),
@@ -1275,7 +1275,7 @@ fn repeatedly_retiring_timed_out_tcp_connections_joins_their_readers() {
         );
         let mut connection = RemoteConn {
             batch_receipts: Default::default(),
-            expected_ok: Default::default(),
+            deferred: Default::default(),
             transport_stop: None,
             observation: Default::default(),
             child: None,
@@ -1353,7 +1353,7 @@ fn hostile_scan_cannot_deliver_excluded_entries_to_the_planner() {
         let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
         let mut remote = RemoteConn {
             batch_receipts: Default::default(),
-            expected_ok: Default::default(),
+            deferred: Default::default(),
             transport_stop: None,
             observation: Default::default(),
             child: None,
@@ -2109,7 +2109,7 @@ fn connection_replaying(responses: &[Response]) -> RemoteConn {
     let (rx, reader) = spawn_reader(Box::new(std::io::Cursor::new(bytes)), 4);
     let conn = RemoteConn {
         batch_receipts: Default::default(),
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         observation: Default::default(),
         child: None,
@@ -2195,6 +2195,69 @@ fn deferred_replies_are_checked_before_the_next_and_a_failure_sticks() {
         assert!(is_deferred_request_error(&error));
         assert_eq!(format!("{error:#}"), "second: cannot preserve");
     }
+}
+
+#[test]
+fn pending_replies_are_kept_while_later_replies_are_returned() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let stat = |count| Request::StatMany {
+        paths: vec![b"x".to_vec(); count],
+        sources: None,
+        follow: false,
+        guard: None,
+    };
+    let mut conn = connection_replaying(&[
+        Response::StatsMore(vec![None]),
+        Response::Stats(vec![None]),
+        Response::Ok,
+        Response::Err("first".into()),
+        Response::Err("second".into()),
+        Response::Err("own".into()),
+    ]);
+    let fragmented = conn.send_pending(stat(2)).unwrap();
+    conn.send_expecting_ok(configure(), "configure").unwrap();
+    let first = conn.send_pending(Request::Shutdown).unwrap();
+    let second = conn.send_pending(Request::Shutdown).unwrap();
+    // A reply taken out of order keeps the ones before it for later.
+    assert!(matches!(
+        conn.take_reply(second).unwrap(),
+        Response::Err(error) if error == "second"
+    ));
+    assert!(matches!(
+        conn.call(Request::Shutdown).unwrap(),
+        Response::Err(error) if error == "own"
+    ));
+    assert!(matches!(
+        conn.take_reply(fragmented).unwrap(),
+        Response::Stats(entries) if entries.len() == 2
+    ));
+    assert!(matches!(
+        conn.take_reply(first).unwrap(),
+        Response::Err(error) if error == "first"
+    ));
+
+    // A kept reply must still match its request's entry count.
+    let mut conn = connection_replaying(&[Response::Stats(vec![None])]);
+    let short = conn.send_pending(stat(2)).unwrap();
+    assert!(conn.take_reply(short).is_err());
+
+    // A reply kept before a failed deferred request is still returned; one
+    // sent after it reports that failure.
+    let mut conn = connection_replaying(&[
+        Response::Err("before".into()),
+        Response::Err("cannot preserve".into()),
+        Response::Ok,
+    ]);
+    let before = conn.send_pending(Request::Shutdown).unwrap();
+    conn.send_expecting_ok(configure(), "configure").unwrap();
+    let after = conn.send_pending(Request::Shutdown).unwrap();
+    let error = conn.take_reply(after).unwrap_err();
+    assert!(is_deferred_request_error(&error));
+    assert_eq!(format!("{error:#}"), "configure: cannot preserve");
+    assert!(matches!(
+        conn.take_reply(before).unwrap(),
+        Response::Err(error) if error == "before"
+    ));
 }
 
 /// Later sessions of a run skip `uname`, but the session pool's key must not
@@ -2403,7 +2466,7 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     let mut requests = FrameReader::new(peer);
     let mut conn = RemoteConn {
         batch_receipts,
-        expected_ok: Default::default(),
+        deferred: Default::default(),
         transport_stop: None,
         rpc_observation: None,
         observation: Default::default(),

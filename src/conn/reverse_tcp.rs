@@ -87,7 +87,7 @@ impl RemoteSpec {
                 compress,
             ),
             rx: Some(rx),
-            expected_ok: Default::default(),
+            deferred: Default::default(),
             reader: Some(reader),
             label: format!("{} (reverse tcp {})", self.label(), stream.peer_addr()?),
             dead: false,

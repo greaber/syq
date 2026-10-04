@@ -2625,30 +2625,31 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     let setup = progress.clock.setup.begin();
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
-    let mut pending_tcp_setups = Vec::new();
+    // The listener requests share a round trip with the destination root
+    // stat; their replies are read once the stat returns.
+    let mut requested_tcp_listeners = Vec::new();
     if let Some(ports) = tcp_ports {
-        for (ep, ctl) in [(&src_ep, &mut src_ctl), (&dst_ep, &mut dst_ctl)] {
+        for (source, ep, ctl) in [
+            (true, &src_ep, &mut src_ctl),
+            (false, &dst_ep, &mut dst_ctl),
+        ] {
             if let Endpoint::Remote(spec) = ep {
-                match spec.begin_tcp_setup(
+                match spec.request_tcp_listener(
                     &mut **ctl,
                     args.no_tcp_encryption,
                     ports,
                     args.tcp_congestion.as_deref(),
                     spec.pacing.lock().unwrap().clone(),
                 ) {
-                    Ok(pending) => pending_tcp_setups.push((spec.clone(), pending)),
+                    Ok(requested) => {
+                        requested_tcp_listeners.push((source, spec.clone(), requested))
+                    }
                     Err(error) => {
                         handle_tcp_setup_error(&args, spec, ports, error, &sched, &progress)?
                     }
                 }
             }
         }
-    }
-    if debug() {
-        crate::output::diagnostic!(
-            "syq: TCP route probes started at {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
     }
     drop(setup);
     let mut planning = Some(progress.clock.planning.begin());
@@ -2692,6 +2693,30 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "syq: destination stat complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+    let mut pending_tcp_setups = Vec::new();
+    if !requested_tcp_listeners.is_empty() {
+        let _setup = progress.clock.setup.begin();
+        for (source, spec, requested) in requested_tcp_listeners {
+            let ctl = if source { &mut src_ctl } else { &mut dst_ctl };
+            match spec.begin_requested_tcp_setup(&mut **ctl, requested) {
+                Ok(pending) => pending_tcp_setups.push((spec, pending)),
+                Err(error) => handle_tcp_setup_error(
+                    &args,
+                    &spec,
+                    tcp_ports.expect("a TCP listener request has a port range"),
+                    error,
+                    &sched,
+                    &progress,
+                )?,
+            }
+        }
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: TCP route probes started at {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
     }
     let mut dst_initially_missing = dst_root_entry.is_none();
     let mut dst_existed = dst_root_entry.is_some();
