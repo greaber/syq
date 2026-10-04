@@ -196,7 +196,7 @@ pub(super) fn setup() -> Result<i32> {
     })();
     let reply = match request {
         Ok(request) => setup_reply(request),
-        Err(error) => Reply::RetryableError(format!("{error:#}")),
+        Err(error) => setup_error_reply(error),
     };
     write_message(&mut std::io::stdout(), &reply)?;
     Ok(0)
@@ -222,9 +222,17 @@ fn setup_reply(request: SetupRequest) -> Reply {
         write_message(&mut socket, &public_key)?;
         read_socket_message(&mut socket, TIMEOUT)
     })();
-    // Only an explicit destination reply is a refusal. I/O may fail after
-    // installation succeeded, so retry it with the same per-copy public key.
-    result.unwrap_or_else(|error| Reply::RetryableError(format!("{error:#}")))
+    // A transport failure may follow successful installation. Retry only
+    // that uncertainty, with the same per-copy key; invalid replies are final.
+    result.unwrap_or_else(setup_error_reply)
+}
+
+fn setup_error_reply(error: anyhow::Error) -> Reply {
+    if super::super::ssh_auth::retryable_setup_error(&error) {
+        Reply::RetryableError(format!("{error:#}"))
+    } else {
+        Reply::Error(format!("{error:#}"))
+    }
 }
 
 pub(in crate::destination) fn setup_over_spec(
@@ -244,7 +252,7 @@ pub(in crate::destination) fn setup_over_spec(
     // Its separate helper channel shares that master's ordinary session limit.
     let (_child, reply) =
         ForwardChild::over_spec(spec, "--return-ssh-setup", &request, deadline, cancelled)
-            .context("set up direct SSH data workers over the approved account connection (destination sshd MaxSessions >= 2 is required beside the copy control session)")?;
+            .context("set up direct SSH data workers over the approved account connection")?;
     anyhow::ensure!(
         matches!(reply, Reply::Ready),
         "invalid peer SSH setup response"
@@ -478,10 +486,9 @@ impl Receiver {
             .get(&token)
             .cloned()
             .context("copy SSH authorization has closed or is unknown")?;
-        let mut setup = session
-            .setup
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("copy SSH setup is already running"))?;
+        let mut setup = session.setup.try_lock().map_err(|_| {
+            super::super::ssh_auth::RetryableSetupError("copy SSH setup is already running".into())
+        })?;
         let _channel = self.active_streams.track(stream.try_clone()?)?;
         let socket = stream.try_clone()?;
         let cancelled = || {
@@ -899,6 +906,10 @@ mod tests {
                 match seen.len() {
                     1 => {}
                     2 => write_message(&mut socket, &Reply::Ready).unwrap(),
+                    4 => {
+                        socket.write_all(&1u32.to_be_bytes()).unwrap();
+                        socket.write_all(b"{").unwrap();
+                    }
                     _ => write_message(
                         &mut socket,
                         &Reply::Error("destination refused installation".into()),
@@ -923,6 +934,10 @@ mod tests {
         assert!(
             matches!(setup_reply(request()), Reply::Error(message) if message == "destination refused installation")
         );
+        assert!(
+            matches!(setup_reply(request()), Reply::Error(_)),
+            "malformed replies must not be retried"
+        );
         let mut invalid = request();
         invalid.identity = "wrong build".into();
         assert!(
@@ -930,7 +945,7 @@ mod tests {
         );
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![canonical_key(&public_key(1)).unwrap(); 3]
+            vec![canonical_key(&public_key(1)).unwrap(); 4]
         );
     }
 
@@ -974,6 +989,29 @@ mod tests {
             );
             assert!(refused.to_string().contains("unwritable"));
         }
+    }
+
+    #[test]
+    fn return_setup_rejects_invalid_input_without_retrying_it() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, _receiver, registration, _) =
+            crate::destination::tests::broker(root.path(), Approval::Always);
+        let error = exchange(
+            &registration,
+            Message::ForwardSsh {
+                token: "unknown".into(),
+                public_key: "not a key".into(),
+            },
+            TIMEOUT,
+            Some(TIMEOUT),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            super::super::peer_bridge::is_setup_refusal(&error),
+            "{error:#}"
+        );
+        assert!(!super::super::ssh_auth::retryable_setup_error(&error));
     }
 
     #[test]

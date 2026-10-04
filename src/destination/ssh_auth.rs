@@ -20,6 +20,30 @@ impl std::fmt::Display for RetryableSetupError {
 }
 impl std::error::Error for RetryableSetupError {}
 
+/// Only transport uncertainty and explicit temporary refusals justify another
+/// setup attempt. Validation and protocol failures cannot improve on retry.
+pub(crate) fn retryable_setup_error(error: &anyhow::Error) -> bool {
+    if super::peer_bridge::is_setup_refusal(error) {
+        return false;
+    }
+    error.chain().any(|cause| {
+        cause.is::<RetryableSetupError>()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    })
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Mode {
     #[default]

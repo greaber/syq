@@ -1468,9 +1468,23 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     }
 }
 
-pub(crate) fn option_migration_hint(mut error: clap::Error) -> clap::Error {
+pub(crate) fn option_migration_hint(argv: &[OsString], mut error: clap::Error) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
     if error.kind() != ErrorKind::UnknownArgument {
+        return error;
+    }
+    // Let clap identify subcommands, including global options before/after
+    // them. An operand named "receive" must not select receiving diagnostics.
+    let receiving = crate::persistence::command_for_help()
+        .ignore_errors(true)
+        .try_get_matches_from(argv)
+        .ok()
+        .is_some_and(|matches| {
+            matches
+                .subcommand_matches("receive")
+                .is_some_and(|receive| receive.subcommand_matches("on").is_some())
+        });
+    if !receiving {
         return error;
     }
     let Some(ContextValue::String(argument)) = error.get(ContextKind::InvalidArg) else {
@@ -1772,14 +1786,30 @@ mod tests {
 
     #[test]
     fn removed_connection_flags_report_migration_without_accepting_aliases() {
-        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let argv: Vec<_> = std::iter::once("syq persist")
+                .chain(args.iter().copied())
+                .map(OsString::from)
+                .collect();
+            let error = crate::persistence::command_for_help()
+                .try_get_matches_from(&argv)
+                .unwrap_err();
+            super::option_migration_hint(&argv, error)
+        };
         for (args, replacement) in [
             (vec!["receive", "on", "--server", "example"], "--connection"),
             (vec!["receive", "on", "--server=example"], "--connection"),
             (vec!["receive", "on", "--all-servers"], "--all-connections"),
+            (
+                vec!["--pscope", "/scope", "receive", "on", "--server=example"],
+                "--connection",
+            ),
+            (
+                vec!["receive", "--pscope", "/scope", "on", "--server=example"],
+                "--connection",
+            ),
         ] {
-            let error = super::ReceiveCommand::try_parse_from(args).unwrap_err();
-            let error = super::option_migration_hint(error);
+            let error = parse(&args);
             assert_eq!(error.exit_code(), 2);
             assert!(
                 error
@@ -1788,11 +1818,15 @@ mod tests {
                 "{error}"
             );
         }
-        let error =
-            super::ReceiveCommand::try_parse_from(["receive", "on", "--unrelated"]).unwrap_err();
-        assert!(!super::option_migration_hint(error)
-            .to_string()
-            .contains("was renamed"));
+        for args in [
+            vec!["receive", "on", "--unrelated"],
+            vec!["status", "--server=x"],
+            vec!["connect", "receive", "--server=x"],
+            vec!["receive", "off", "--server=x"],
+        ] {
+            let error = parse(&args);
+            assert!(!error.to_string().contains("was renamed"), "{error}");
+        }
     }
 
     #[test]

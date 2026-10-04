@@ -56,15 +56,14 @@ Custom `--rsh` routes, copies to receiving names, and object storage keep their
 own authentication. An explicit scope uses its own saved choices.
 The setting works independently of whether native SSH persistence is enabled.
 It is saved in `auth-from.json` in the selected domain; the default domain keeps
-it alongside `persistence.json`. Older syq versions ignore it. Unversioned files
-and `"version": 1` are supported; edits preserve additional top-level fields and
-do not add a version to unversioned files. Invalid choices and unsupported
+it alongside `persistence.json`. Edits preserve additional saved fields. Invalid choices and unsupported
 versions report the file's path without changing it. Repair the file or pass
 `--auth-from` explicitly (`--syq-auth-from` for rsync) to bypass it for one command.
 Setting or resetting a choice preserves the other saved choices, so neither can
-repair an unreadable file. To discard all saved choices, remove that file yourself. The configuration
-directory may be a symlink to a directory you own; `auth-from.json` itself must
-be a regular file, not a symlink.
+repair an unreadable file. To discard all saved choices, remove that file yourself. The configuration directory and `auth-from.json` may be symlinks. The target
+file must exist, be owned by you, and not be writable by other users. Saving
+updates the target atomically and preserves the link; its directory must also
+be owned by you. A dangling link is an error, rather than a missing preference.
 
 ## Approved account connections
 

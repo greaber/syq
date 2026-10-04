@@ -472,8 +472,7 @@ impl ForwardChild {
                         && status
                             .as_ref()
                             .is_ok_and(|status| status.code() == Some(255))
-                        && spec
-                            .release_idle_helpers_after_startup_failure(status.as_ref().unwrap())?
+                        && spec.release_idle_helpers_after_startup_failure(status.as_ref().unwrap())
                     {
                         // The failed child has been closed. No copy data has
                         // been admitted before this setup reply and Hello.
@@ -490,9 +489,22 @@ impl ForwardChild {
                         installed = true;
                         continue;
                     }
-                    return Err(error).with_context(|| {
-                        format!("approved account helper failed: {}", child.errors())
-                    });
+                    let errors = child.errors();
+                    let error = if status.as_ref().is_ok_and(|s| s.code() == Some(255))
+                        && errors.contains("mux_client_request_session: session request failed:")
+                    {
+                        let error =
+                            super::ssh_auth::RetryableSetupError(format!("{error:#}")).into();
+                        if operation == "--return-ssh-setup" {
+                            anyhow::Error::context(error, "SSH session refused; destination sshd MaxSessions >= 2 is required beside the copy control session")
+                        } else {
+                            error
+                        }
+                    } else {
+                        error
+                    };
+                    return Err(error)
+                        .with_context(|| format!("approved account helper failed: {errors}"));
                 }
             }
         }
@@ -704,10 +716,10 @@ fn relay_inner(
     result
 }
 
-pub(super) struct DeadlineIo<'a, T> {
-    pub(super) inner: &'a mut T,
-    pub(super) deadline: Instant,
-    pub(super) cancelled: Option<&'a dyn Fn() -> bool>,
+pub(crate) struct DeadlineIo<'a, T> {
+    pub(crate) inner: &'a mut T,
+    pub(crate) deadline: Instant,
+    pub(crate) cancelled: Option<&'a dyn Fn() -> bool>,
 }
 impl<T: Read + AsRawFd> Read for DeadlineIo<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -1082,6 +1094,47 @@ mod tests {
             resolve_destination(&home, None, b"~/archive").unwrap().0,
             home.join("~/archive")
         );
+    }
+
+    #[test]
+    fn approved_setup_session_hint_only_follows_an_actual_session_refusal() {
+        for (message, operation, hint) in [
+            (
+                "mux_client_request_session: session request failed: Session open refused by peer",
+                "--return-ssh-setup",
+                true,
+            ),
+            (
+                "Permission denied (publickey).",
+                "--return-ssh-setup",
+                false,
+            ),
+            (
+                "mux_client_request_session: session request failed: Session open refused by peer",
+                "--peer-receiver",
+                false,
+            ),
+        ] {
+            let mut spec = crate::conn::RemoteSpec::local_receiver(false);
+            spec.local_process = false;
+            spec.rsh = vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s' '{}' >&2; exit 255", message),
+            ];
+            let error = ForwardChild::over_spec(
+                &spec,
+                operation,
+                &"setup",
+                Instant::now() + Duration::from_secs(3),
+                &|| false,
+            )
+            .err()
+            .unwrap();
+            let detail = format!("{error:#}");
+            assert!(detail.contains(message), "{detail}");
+            assert_eq!(detail.contains("MaxSessions >= 2"), hint, "{detail}");
+        }
     }
 
     #[test]

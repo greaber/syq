@@ -13,6 +13,7 @@ pub(crate) const LOCK_FILE: &str = "provider-v1.lock";
 const INTERNAL: &str = "--receive-provider-service";
 const PROTOCOL: u16 = 1;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const FORWARDED_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CLIENTS: usize = 256;
 
@@ -127,16 +128,33 @@ fn attach_in(domain: &Domain, profile: Option<&str>) -> Result<Attachment> {
 
 /// Verify forwarding reaches this exact provider service without opening an
 /// attachment, resolving policy, or requesting account approval.
-pub(crate) fn probe_forwarded(stream: UnixStream) -> Result<()> {
-    let stream = forwarded_handshake(stream)?;
+pub(crate) fn probe_forwarded(
+    stream: UnixStream,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let stream = forwarded_handshake(stream, deadline, Some(cancelled))?;
     stream.shutdown(std::net::Shutdown::Both)?;
     Ok(())
 }
 
-fn forwarded_handshake(stream: UnixStream) -> Result<UnixStream> {
-    handshake(stream, false).context(
+fn forwarded_handshake(
+    mut stream: UnixStream,
+    deadline: Instant,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<UnixStream> {
+    // This channel crosses SSH, unlike the local service socket. Use an
+    // absolute network deadline and retain timeouts for the next Access write.
+    stream.set_read_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+    stream.set_write_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+    exchange_hello(&mut crate::destination::DeadlineIo {
+        inner: &mut stream,
+        deadline: deadline.min(Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT),
+        cancelled,
+    }, false).context(
         "could not open the SSH authorization provider service; check that receiving is running there and sshd permits local forwarding with AllowTcpForwarding and AllowStreamLocalForwarding set to local or yes",
-    )
+    )?;
+    Ok(stream)
 }
 
 /// Use the same exact-build protocol over an already connected SSH Unix forward.
@@ -145,7 +163,7 @@ pub(crate) fn open_forwarded(
     session: &str,
     operation: SessionRequest,
 ) -> Result<UnixStream> {
-    let stream = forwarded_handshake(stream)?;
+    let stream = forwarded_handshake(stream, Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT, None)?;
     send_operation(stream, session, operation)
 }
 fn send_operation(
@@ -188,15 +206,19 @@ fn connect(domain: &Domain, control: bool) -> Result<UnixStream> {
 fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    exchange_hello(&mut stream, control)?;
+    Ok(stream)
+}
+fn exchange_hello(stream: &mut (impl Read + Write), control: bool) -> Result<()> {
     crate::destination::write_message(
-        &mut stream,
+        stream,
         &Hello {
             version: PROTOCOL,
             build: crate::identity::build().into(),
             control,
         },
     )?;
-    let reply: HelloReply = crate::destination::read_message(&mut stream)?;
+    let reply: HelloReply = crate::destination::read_message(stream)?;
     anyhow::ensure!(
         reply.version == PROTOCOL,
         "unsupported local provider protocol; restart receiving with its original syq build"
@@ -207,7 +229,7 @@ fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
         reply.build,
         crate::identity::build()
     );
-    Ok(stream)
+    Ok(())
 }
 fn query(domain: &Domain, operation: Control) -> Result<Snapshot> {
     let mut stream = connect(domain, true)?;
@@ -1006,7 +1028,7 @@ mod tests {
         let (client, server) = pair(&service);
         let serving = service.clone();
         let worker = std::thread::spawn(move || serving.handle(server));
-        probe_forwarded(client).unwrap();
+        probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false).unwrap();
         // The deliberate EOF occurs where an Access operation would start.
         let error = worker.join().unwrap().unwrap_err();
         assert!(error.chain().any(|cause| cause
@@ -1024,14 +1046,50 @@ mod tests {
     fn forwarded_readiness_rejects_a_denied_or_unresponsive_channel() {
         let (client, server) = UnixStream::pair().unwrap();
         server.shutdown(std::net::Shutdown::Both).unwrap();
-        let error = probe_forwarded(client).unwrap_err();
+        let error = probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap_err();
         assert!(error.to_string().contains("sshd permits local forwarding"));
 
         let (client, _silent_server) = UnixStream::pair().unwrap();
         let started = Instant::now();
-        let error = probe_forwarded(client).unwrap_err();
+        let error = probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap_err();
         assert!(error.to_string().contains("provider service"));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn forwarded_readiness_allows_ssh_latency_and_obeys_cancellation() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let responder = std::thread::spawn(move || {
+            let _: Hello = crate::destination::read_message(&mut server).unwrap();
+            // Longer than the local-only service timeout.
+            std::thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100));
+            crate::destination::write_message(
+                &mut server,
+                &HelloReply {
+                    version: PROTOCOL,
+                    build: crate::identity::build().into(),
+                },
+            )
+            .unwrap();
+        });
+        probe_forwarded(
+            client,
+            Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT,
+            &|| false,
+        )
+        .unwrap();
+        responder.join().unwrap();
+
+        let (client, _server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error =
+            probe_forwarded(client, started + FORWARDED_HANDSHAKE_TIMEOUT, &|| true).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionAborted)));
     }
 
     #[test]
@@ -1051,7 +1109,8 @@ mod tests {
             )
             .unwrap();
         });
-        let error = probe_forwarded(client).unwrap_err();
+        let error = probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap_err();
         reply.join().unwrap();
         let error = format!("{error:#}");
         assert!(error.contains("provider-other-build"));

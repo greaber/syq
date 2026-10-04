@@ -183,8 +183,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let mut full_argv = vec![OsString::from("syq persist")];
     full_argv.extend_from_slice(argv);
     let matches = command_for_help()
-        .try_get_matches_from(full_argv)
-        .unwrap_or_else(|error| crate::receive_service::option_migration_hint(error).exit());
+        .try_get_matches_from(&full_argv)
+        .unwrap_or_else(|error| {
+            crate::receive_service::option_migration_hint(&full_argv, error).exit()
+        });
     let command = PersistCommand::from_arg_matches(&matches)?;
     crate::fsops::reserve_startup_descriptors();
     let domain = Domain::select(command.pscope.as_deref())?;
@@ -1275,6 +1277,19 @@ pub(crate) fn command_for_help() -> clap::Command {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn closing_scope_removes_linked_preferences_without_removing_the_target() {
+        let root = crate::test_support::tempdir().unwrap();
+        let scope = root.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        let target = root.path().join("saved.json");
+        std::fs::write(&target, br#"{"default":"ssh"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, scope.join("auth-from.json")).unwrap();
+        close_scope(&scope).unwrap();
+        assert!(!scope.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), br#"{"default":"ssh"}"#);
+    }
 
     #[test]
     fn control_socket_budget_includes_openssh_temporary_suffix() {

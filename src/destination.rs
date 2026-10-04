@@ -31,6 +31,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
+pub(crate) use forward::DeadlineIo;
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod peer_bridge;
@@ -1266,12 +1267,12 @@ impl Receiver {
             Message::ForwardSsh { token, public_key } => {
                 self.forward_ssh(token, public_key, stream)
                     .map_err(|error| {
-                        if peer_bridge::is_setup_refusal(&error) {
-                            error
-                        } else {
+                        if ssh_auth::retryable_setup_error(&error) {
                             // A lost setup reply may follow a successful key install.
                             // Keep that uncertainty retryable across the return RPC.
                             ssh_auth::RetryableSetupError(format!("{error:#}")).into()
+                        } else {
+                            error
                         }
                     })
             }

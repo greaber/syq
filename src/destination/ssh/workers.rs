@@ -56,22 +56,7 @@ fn classify_setup_error(error: anyhow::Error) -> anyhow::Error {
     if error.chain().any(|cause| cause.is::<AuthorizationError>()) {
         return error;
     }
-    let transient = error.chain().any(|cause| {
-        cause.is::<ssh_auth::RetryableSetupError>()
-            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                )
-            })
-    });
-    if transient {
+    if ssh_auth::retryable_setup_error(&error) {
         error
     } else {
         AuthorizationError(error).into()

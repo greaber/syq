@@ -390,10 +390,10 @@ impl Selection {
                     }
                 })();
                 if let Err(error) = result {
-                    let reply = if is_setup_refusal(&error) {
-                        AdmissionReply::SshRefused(format!("{error:#}"))
-                    } else {
+                    let reply = if super::ssh_auth::retryable_setup_error(&error) {
                         AdmissionReply::Error(format!("{error:#}"))
+                    } else {
+                        AdmissionReply::SshRefused(format!("{error:#}"))
                     };
                     let _ = write_message(&mut stream, &reply);
                 }
@@ -422,13 +422,13 @@ fn cached_ssh_setup(
     public_key: &str,
     resolve: impl FnOnce() -> Result<forward::ssh::Peer>,
 ) -> Result<forward::ssh::Peer> {
-    let mut memo = setup
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("peer SSH setup is already active"))?;
+    let mut memo = setup.try_lock().map_err(|_| {
+        super::ssh_auth::RetryableSetupError("peer SSH setup is already active".into())
+    })?;
     memo.resolve(public_key, || match resolve() {
         Ok(peer) => Ok(Ok(peer)),
-        Err(error) if is_setup_refusal(&error) => Ok(Err(format!("{error:#}"))),
-        Err(error) => Err(error),
+        Err(error) if super::ssh_auth::retryable_setup_error(&error) => Err(error),
+        Err(error) => Ok(Err(format!("{error:#}"))),
     })
 }
 
@@ -477,7 +477,7 @@ impl Prepared {
                             .is_ok_and(|status| status.code() == Some(255))
                         && self
                             .coordinator
-                            .release_idle_helpers_after_startup_failure(status.as_ref().unwrap())?
+                            .release_idle_helpers_after_startup_failure(status.as_ref().unwrap())
                     {
                         // No CoordinatorStart (and therefore no copy command)
                         // has been sent. Retry only this failed SSH startup.
@@ -756,7 +756,7 @@ mod tests {
         let attempts = std::cell::Cell::new(0);
         let lost = cached_ssh_setup(&setup, "same-copy-key", || {
             attempts.set(attempts.get() + 1);
-            bail!("setup reply lost")
+            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
         })
         .unwrap_err();
         assert!(!is_setup_refusal(&lost));
@@ -776,11 +776,22 @@ mod tests {
         let another_copy = Mutex::new(forward::ssh::SetupMemo::default());
         let next = cached_ssh_setup(&another_copy, "new-copy-key", || {
             attempts.set(attempts.get() + 1);
-            bail!("new copy tried its own setup")
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
         })
         .unwrap_err();
         assert!(!is_setup_refusal(&next));
         assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn peer_ssh_setup_does_not_repeat_configuration_errors() {
+        let setup = Mutex::new(forward::ssh::SetupMemo::default());
+        let error =
+            cached_ssh_setup(&setup, "key", || bail!("invalid SSH configuration")).unwrap_err();
+        assert!(is_setup_refusal(&error));
+        let again = cached_ssh_setup(&setup, "key", || panic!("permanent failure was retried"))
+            .unwrap_err();
+        assert_eq!(again.to_string(), error.to_string());
     }
 
     #[test]

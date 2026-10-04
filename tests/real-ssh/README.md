@@ -94,9 +94,10 @@ profile: a ready helper would occupy the sole session needed by its later shell
 commands. The peer-copy case prewarms both approved connections in both profiles:
 a TCP copy can reclaim idle helpers after a session refusal, while the default
 profile checks that TCP and SSH copies preserve the same helpers for completion.
-Workflows that require
-concurrent sessions on one connection, including approved three-server SSH
-setup, run in the default profile and are listed in `max-sessions-1.skip`.
+The peer-copy case also checks that the one-session destination refuses SSH
+worker setup with a session-limit diagnostic. Other workflows requiring
+concurrent sessions run only in the default profile; those cases are listed in
+`max-sessions-1.skip`.
 
 The first build downloads the pinned Rust toolchain image, Debian packages, and
 Cargo dependencies. Test execution itself uses only the Compose project's

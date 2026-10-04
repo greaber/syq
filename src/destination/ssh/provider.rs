@@ -738,7 +738,26 @@ fn forward_service(record: &Record, remote: &Path) -> Result<()> {
     privatize_forwarded_socket(&record.directory)?;
     Ok(())
 }
+fn probe_forwarded(record: &Record, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    (|| -> Result<()> {
+        let socket = crate::process::with_inheritance_guard(|| {
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        })?;
+        socket.set_nonblocking(true)?;
+        socket.connect(&socket2::SockAddr::unix(record.forwarded())?)?;
+        socket.set_nonblocking(false)?;
+        service::probe_forwarded(socket.into(), deadline, cancelled)
+    })()
+    .with_context(|| {
+        format!(
+            "verify SSH authorization provider {} through its forwarded socket",
+            record.provider
+        )
+    })
+}
+
 fn keeper(startup: Startup) -> Result<()> {
+    let deadline = Instant::now() + SETUP;
     let domain = Domain::select(startup.scope.as_deref())?;
     validate_record(&domain, &startup.record.provider, &startup.record)?;
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
@@ -798,13 +817,7 @@ fn keeper(startup: Startup) -> Result<()> {
     // -O forward only creates the local listener. sshd can still deny the
     // remote Unix channel, so prove the existing service protocol end to end
     // before publishing a reusable binding or reporting successful setup.
-    let socket = crate::process::with_inheritance_guard(|| {
-        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-    })?;
-    socket.set_nonblocking(true)?;
-    socket.connect(&socket2::SockAddr::unix(owner.record.forwarded())?)?;
-    socket.set_nonblocking(false)?;
-    service::probe_forwarded(socket.into())?;
+    probe_forwarded(&owner.record, deadline, &cancelled)?;
     anyhow::ensure!(
         !cancelled(),
         "SSH provider setup cancelled before readiness"

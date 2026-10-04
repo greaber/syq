@@ -1796,19 +1796,25 @@ impl RemoteSpec {
     pub(crate) fn release_idle_helpers_after_startup_failure(
         &self,
         status: &std::process::ExitStatus,
-    ) -> Result<bool> {
+    ) -> bool {
         if status.code() != Some(255) {
-            return Ok(false);
+            return false;
         }
         let Some(multiplexer) = &self.ssh_multiplexer else {
-            return Ok(false);
+            return false;
         };
         if !multiplexer.existing_only || !crate::session_pool::is_running(&multiplexer.path) {
-            return Ok(false);
+            return false;
         }
-        crate::session_pool::stop(&multiplexer.path)
-            .context("release idle helpers after SSH session setup failed")?;
-        Ok(true)
+        if let Err(error) = crate::session_pool::stop(&multiplexer.path) {
+            // Recovery is best effort. The caller still reports the original
+            // startup failure, which explains why recovery was attempted.
+            crate::output::diagnostic!(
+                "syq: could not release idle helpers after SSH startup failed: {error:#}"
+            );
+            return false;
+        }
+        true
     }
 
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
