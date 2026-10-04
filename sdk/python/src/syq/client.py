@@ -512,8 +512,8 @@ def _append_remote_arguments(
                 "--coordinate-at must be auto, local, src, or dst"
             )
         argv.extend(("--coordinate-at", coordinate_at))
-    if pscope is not None and rsh is not None:
-        raise SyqInvocationError("--pscope cannot be used with --rsh")
+    # The native parser decides whether this SSH command supports persistence.
+    # Keeping its option grammar here too would reject valid scoped SSH routes.
     if rsh is not None:
         argv.extend(("--rsh", _text_arg(rsh, label="rsh")))
     if pscope is not None:

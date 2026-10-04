@@ -828,7 +828,7 @@ class NativeClientTests(unittest.TestCase):
     def test_remote_map_keeps_endpoint_and_base_through_transform(self) -> None:
         with self.client.map(from_="source", srcs_in="photos", cwd="~/data",
                              include=["mtime", "kind"], no_bootstrap=True,
-                             rsh="ssh -F source-config", syq_path="~/bin/syq") as stream:
+                             rsh="ssh -F source-config", pscope="scope", syq_path="~/bin/syq") as stream:
             transformed = stream.transform(lambda entry: entry).transform(lambda entry: entry)
             self.assertEqual(transformed.from_, "source")
             self.assertEqual(transformed.cwd, "~/data/photos")
@@ -840,6 +840,7 @@ class NativeClientTests(unittest.TestCase):
         self.assertIn("--no-bootstrap", argv)
         self.assertIn("ssh -F source-config", argv)
         self.assertIn("~/bin/syq", argv)
+        self.assertEqual(argv[argv.index("--pscope") + 1], "scope")
 
     def test_mapping_connection_options_are_captured_and_conflicts_rejected(self) -> None:
         configured = dict(s3_endpoint="http://source.invalid", s3_region="region-a",
@@ -931,10 +932,6 @@ class NativeClientTests(unittest.TestCase):
             self.client.cp("source", into="target", receiver_receipt="full")
         with self.assertRaisesRegex(syq.SyqInvocationError, "--peer-auth"):
             self.client.cp("source", into="target", peer_auth="agent")
-        with self.assertRaisesRegex(syq.SyqInvocationError, "--pscope"):
-            self.client.cp(
-                "source", into="target", pscope="scope", rsh="ssh"
-            )
         with self.assertRaisesRegex(ValueError, "relative"):
             syq.RelativePath("/absolute")
         with self.assertRaisesRegex(ValueError, "NUL"):

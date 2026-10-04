@@ -234,6 +234,14 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(syq.SyqInvocationError, "SSH source"):
                 self.client.map("file", from_=endpoint, auth_from="@laptop")
 
+    async def test_scoped_ssh_mapping_preserves_its_connection_options(self) -> None:
+        async with self.client.map("file", from_="server", rsh="ssh -F source-config",
+                                   pscope="scope") as stream:
+            await self.client.cp(mapping=stream.transform(lambda entry: entry), into="output")
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--rsh") + 1], "ssh -F source-config")
+        self.assertEqual(argv[argv.index("--pscope") + 1], "scope")
+
     async def test_remote_map_context_and_fields(self) -> None:
         stream = self.client.map(from_="s3://bucket", srcs_in="photos/", cwd="prefix",
                                  include=["s3_last_modified"], s3_region="region-a",
