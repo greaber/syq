@@ -306,6 +306,7 @@ impl Selection {
                 socket_name: "s",
                 listener_thread: "peer-bridge",
                 client_thread: "peer-control",
+                inline_on_thread_failure: false,
                 // Keep the existing control/setup headroom in addition to
                 // the coordinator's one long-lived lifetime connection.
                 max_connections: 4,
@@ -899,6 +900,7 @@ mod tests {
                     socket_name: "s",
                     listener_thread: "peer-life-test",
                     client_thread: "peer-life-client",
+                    inline_on_thread_failure: false,
                     max_connections: 1,
                     io_timeout: ADMISSION,
                 },

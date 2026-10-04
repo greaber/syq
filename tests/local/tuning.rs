@@ -2504,6 +2504,12 @@ fn resource_pressure_keeps_copying_with_bounded_parallelism() {
         ("fds", "", "", Some(96)),
         ("pools", "SYQ_TEST_NO_OPTIONAL_POOLS", "1", None),
         ("threads", "SYQ_TEST_WORKER_THREAD_LIMIT", "4", None),
+        (
+            "broker",
+            "SYQ_TEST_REFUSE_BROKER_THREAD",
+            "syq-fd-client",
+            None,
+        ),
         ("staging", "SYQ_TEST_STAGING_LIMIT", "3", None),
         ("initialize", "SYQ_TEST_LOCAL_SOURCE_EMFILE_ONCE", "1", None),
     ] {

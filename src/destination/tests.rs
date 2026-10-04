@@ -411,6 +411,7 @@ pub(super) fn broker(
             socket_name: "s",
             listener_thread: "named-test-listener",
             client_thread: "named-test-client",
+            inline_on_thread_failure: false,
             max_connections: 16,
             io_timeout: Duration::from_secs(2),
         },
