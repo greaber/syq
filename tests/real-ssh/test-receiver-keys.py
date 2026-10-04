@@ -128,6 +128,7 @@ def main():
     User syq
     IdentitiesOnly yes
     IdentityFile {key}
+    SecurityKeyProvider {provider}
     IdentityAgent $SYQ_TEST_IDENTITY_AGENT
     BatchMode yes
     StrictHostKeyChecking yes
