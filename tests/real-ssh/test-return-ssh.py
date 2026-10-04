@@ -39,12 +39,16 @@ def wait_for(description, predicate, timeout=10):
     raise AssertionError(("Timed out", description, "last state", state))
 
 
-def pending(allow=True, reusable=True, remember=False, target="syq@destination:22"):
+def pending(allow=True, reusable=True, remember=False, target="syq@destination", endpoint=None):
     items = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "15"))
     assert len(items) == 1, items
     request = items[0]
     assert request["kind"] == "ssh", request
     assert target == request["destination"], request
+    user, trusted_host = target.split("@", 1)
+    destination = request["account"]["destination"]
+    assert destination["trusted_host"] == trusted_host, request
+    assert destination["endpoint"] == (endpoint or {"user": user, "host": trusted_host, "port": 22}), request
     assert "full authority" in request["permission"], request
     assert request["reusable"] == reusable, request
     if reusable:
@@ -73,7 +77,7 @@ def source_command(command=(), *, tty=False, binary="/usr/local/bin/syq", target
 
 
 def execute(command, *, allow=True, status=0, data=b"", cancel=None, binary="/usr/local/bin/syq",
-            ask=False, remember=False, target="destination"):
+            ask=False, remember=False, target="destination", approval_target=None):
     with tempfile.TemporaryFile() as input_file, tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         input_file.write(data)
         input_file.seek(0)
@@ -81,7 +85,7 @@ def execute(command, *, allow=True, status=0, data=b"", cancel=None, binary="/us
                                    stdin=input_file, stdout=stdout, stderr=stderr, start_new_session=True)
         try:
             if ask:
-                pending(allow, remember=remember, target=target if "@" in target else "syq@" + target + ":22")
+                pending(allow, remember=remember, target=approval_target or "syq@" + target)
             if cancel:
                 wait_for("SSH command output", lambda: b"READY" in os.pread(stdout.fileno(), 4096, 0))
                 if cancel == "interrupt":
@@ -421,13 +425,13 @@ def requester_config_cases(expected):
                 "syq", "ssh", "--pscope", scope, "--auth-from", "@laptop", alias,
                 "--", "printf '%s ' \"$(id -un)\"; hostname"])
 
-        def invoke(*, approve=None, success=True):
+        def invoke(*, approve=None, endpoint=None, success=True):
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 process = subprocess.Popen(["ssh", "source", command()], stdout=stdout,
                                            stderr=stderr, start_new_session=True)
                 try:
                     if approve:
-                        pending(target=approve)
+                        pending(target=approve, endpoint=endpoint)
                     status = process.wait(timeout=30)
                     stdout.seek(0); stderr.seek(0)
                     out, err = stdout.read(), stderr.read()
@@ -464,7 +468,7 @@ def requester_config_cases(expected):
 
         try:
             configure("syq", "destination")
-            assert invoke(approve="syq@" + addresses["destination"] + ":22") == b"syq " + expected
+            assert invoke(approve="syq@destination", endpoint={"user": "syq", "host": addresses["destination"], "port": 22}) == b"syq " + expected
             calls = marker.read_bytes()
             assert calls, "cold authorization did not consult provider trust"
             for _ in range(2):
@@ -492,9 +496,9 @@ def requester_config_cases(expected):
             assert marker.read_bytes() == before, "cold completion contacted the provider"
             assert len(run("ssh", "source", "cat " + shlex.quote(local_marker))) > len(local_calls), "completion missed the local config change"
             no_pending()
-            assert invoke(approve="longhome@" + addresses["destination"] + ":22") == b"longhome " + expected
+            assert invoke(approve="longhome@destination", endpoint={"user": "longhome", "host": addresses["destination"], "port": 22}) == b"longhome " + expected
             configure("longhome", "source", trust=source_trust)
-            assert invoke(approve="longhome@" + addresses["source"] + ":22") == b"longhome " + source_name
+            assert invoke(approve="longhome@source", endpoint={"user": "longhome", "host": addresses["source"], "port": 22}) == b"longhome " + source_name
             assert invoke() == b"longhome " + source_name
             rows = json.loads(source_run(["persist", "status", "--pscope", scope, "--json"]))["authorized_ssh"]
             selected = {(row["endpoint"]["user"], row["endpoint"]["host"]) for row in rows if row["connected"]}
@@ -606,13 +610,14 @@ def cold_copy_and_remembered_cases(expected):
     permission_id = rows[0]["id"]
     assert rows[0]["permission"]["source"]["endpoint"]["user"] == "syq", rows
     assert rows[0]["permission"]["destination"]["endpoint"]["user"] == "syq", rows
+    assert rows[0]["permission"]["destination"]["trusted_host"] == "destination", rows
     assert rows[0]["permission"]["source"]["host_keys"] and rows[0]["permission"]["destination"]["host_keys"], rows
     try:
         reset_session()
         assert execute(["hostname"])[0] == expected
         assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
         # A destination login change never inherits the remembered account grant.
-        execute(["hostname"], target="root@destination:22", ask=True, allow=False, status=255)
+        execute(["hostname"], target="root@destination:22", approval_target="root@destination", ask=True, allow=False, status=255)
         run("syq", "persist", "receive", "permissions", "remove", permission_id)
         source_run(["persist", "off"])
         execute(["hostname"], ask=True, allow=False, status=255)
@@ -641,23 +646,29 @@ try:
     assert out == payload, len(out)
     assert err.endswith(b"error\x00\xff"), err
 
-    print("case: a forged SSH target cannot differ from the displayed command", flush=True)
+    print("case: obsolete SSH requests cannot disclose provider resolution or request approval", flush=True)
     run("ssh", "source", "python3 -", stdin='''
 import json, pathlib, socket, struct
 r = json.loads((pathlib.Path.home()/'.syq-destinations-v3/laptop.json').read_text())
 command = ['ssh','--auth-from','@laptop','destination','--','hostname']
-request = {'version':2,'identity':r['identity'],'secret':r['secret'],
-           'message':{'Ssh':{'target':{'user':None,'host':'source','port':None},
-                             'command':[list(a.encode()) for a in command],'cwd':'/tmp'}}}
-s = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(r['socket'])
-b = json.dumps(request).encode(); s.sendall(struct.pack('>I',len(b))+b)
-def exact(size):
-    data=b''
-    while len(data)<size:
-        part=s.recv(size-len(data)); assert part; data+=part
-    return data
-reply=json.loads(exact(struct.unpack('>I',exact(4))[0]))
-assert 'does not match' in reply['Error'], reply
+def request(message):
+    envelope = {'version':2,'identity':r['identity'],'secret':r['secret'],'message':message}
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(10); s.connect(r['socket'])
+        b=json.dumps(envelope).encode(); s.sendall(struct.pack('>I',len(b))+b)
+        def exact(size):
+            data=b''
+            while len(data)<size:
+                part=s.recv(size-len(data)); assert part; data+=part
+            return data
+        reply=json.loads(exact(struct.unpack('>I',exact(4))[0]))
+        kind=next(iter(message))
+        assert set(reply) == {'Error'}, reply
+        assert 'unknown variant `' + kind + '`' in reply['Error'], reply
+        assert s.recv(1) == b'', 'obsolete request returned more than its rejection'
+request({'Ssh':{'target':{'user':None,'host':'source','port':None},
+                'command':[list(a.encode()) for a in command],'cwd':'/tmp'}})
+request({'ResolveSsh':{'user':None,'host':'destination','port':None}})
 ''')
     assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == []
 

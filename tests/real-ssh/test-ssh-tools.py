@@ -34,7 +34,10 @@ def connect(*, ask=True):
             assert len(requests) == 1, requests
             request = requests[0]
             assert request["kind"] == "ssh" and request["reusable"], request
-            assert request["destination"] == "syq@destination:22", request
+            assert request["destination"] == "syq@destination", request
+            account = request["account"]["destination"]
+            assert account["trusted_host"] == "destination", request
+            assert account["endpoint"] == {"user": "syq", "host": "destination", "port": 22}, request
             assert "commands and copies" in request["permission"], request
             run("syq", "persist", "receive", "approve", request["id"])
         stdout, stderr = process.communicate(timeout=30)

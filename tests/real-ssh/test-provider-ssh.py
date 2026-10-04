@@ -158,7 +158,7 @@ def main():
             process = subprocess.Popen(["ssh", "source", command], stdin=subprocess.DEVNULL,
                                        stdout=output, stderr=output, start_new_session=True)
             try:
-                approvals = list(targets or [{"user": "syq", "host": "destination", "port": 22}]) if ask else []
+                approvals = list(targets or [({"user": "syq", "host": "destination", "port": 22}, "destination")]) if ask else []
                 while approvals:
                     items = json.loads(run("syq", "persist", "receive", "pending", "--json",
                                            "--wait", "--timeout", "15", env=provider_environment))
@@ -169,9 +169,13 @@ def main():
                     permission = item["provider_account"]
                     assert "source" not in permission, permission
                     assert permission["provider"]["user"] == "syq", permission
-                    endpoint = permission["destination"]["endpoint"]
-                    assert endpoint in approvals, (endpoint, approvals)
-                    approvals.remove(endpoint)
+                    destination = permission["destination"]
+                    endpoint = destination["endpoint"]
+                    expected = next((value for value in approvals if value[0] == endpoint), None)
+                    assert expected is not None, (endpoint, approvals)
+                    assert destination["trusted_host"] == expected[1], item
+                    assert item["destination"] == endpoint["user"] + "@" + expected[1], item
+                    approvals.remove(expected)
                     assert "commands and copies" in item["permission"], item
                     run("syq", "persist", "receive", "approve" if allow else "deny", item["id"],
                         env=provider_environment)
@@ -228,6 +232,7 @@ def main():
                        data="[{}]:{} {}".format(address, port, host_key))
                 prefix = ("Host provider\n  HostName {}\n  Port {}\n  User syq\n"
                           "  IdentityFile {}\n  IdentityAgent none\n  IdentitiesOnly yes\n"
+                          "  StreamLocalBindMask 0000\n"
                           "  BatchMode yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {}\n"
                           "  GlobalKnownHostsFile /dev/null\n  UpdateHostKeys no\n"
                           "Host {}\n  HostName destination\n  User syq\n  Port 22\n"
@@ -312,8 +317,8 @@ def main():
                 route_command = "printf 'ROUTE=%s\\n' \"$SSH_CONNECTION\""
                 route = execute("ssh", "--pscope", jump_scope, "--auth-from", "provider", via_jump,
                                 "--", route_command, ask=True,
-                                targets=[{"user": "syq", "host": address, "port": port},
-                                         {"user": "syq", "host": "destination", "port": 22}])
+                                targets=[({"user": "syq", "host": address, "port": port}, "[{}]:{}".format(address, port)),
+                                         ({"user": "syq", "host": "destination", "port": 22}, "destination")])
                 assert next(line for line in route.splitlines() if line.startswith("ROUTE=")).split()[0] == "ROUTE=" + address, route
                 rows = json.loads(source("syq", "persist", "status", "--pscope", jump_scope, "--json"))["authorized_ssh"]
                 assert {(row["endpoint"]["host"], row["endpoint"]["port"]) for row in rows if row["connected"]} == {

@@ -262,7 +262,10 @@ def approve_account(host, allow=True, *, ask=True):
             assert len(pending) == 1, pending
             request = pending[0]
             assert request["kind"] == "ssh" and request["reusable"], request
-            assert request["destination"] == "syq@" + host + ":22", request
+            assert request["destination"] == "syq@" + host, request
+            account = request["account"]["destination"]
+            assert account["trusted_host"] == host, request
+            assert account["endpoint"] == {"user": "syq", "host": host, "port": 22}, request
             assert "full authority" in request["permission"], request
             run("syq", "persist", "receive", "approve" if allow else "deny", request["id"])
         finish(process, output, success=allow)
