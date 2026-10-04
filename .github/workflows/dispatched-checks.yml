@@ -2,7 +2,8 @@ name: Dispatched checks
 
 # Sets the `dispatched-checks` status that branch protection requires on pull
 # requests: it fails while a check dispatched on the branch has failed and no
-# later run of it passed. The `merge-despite-failures` label overrides it.
+# later run passed or that exact failed job was explicitly resolved.
+# The `merge-despite-failures` label overrides it.
 # This workflow only reads GitHub state and writes commit statuses. It checks
 # out the default branch's tooling (or, when dispatched manually, the selected
 # ref) and never checks out or runs pull-request code.

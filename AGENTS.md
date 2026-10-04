@@ -178,7 +178,8 @@ the conversation instead.
   recently merged branches, as notes without failing; report them to the user
   even when the current task did not cause them. A failed check in a run
   dispatched on this branch makes it exit 1 until a later run of that check
-  passes. It lists the latest result of each check dispatched on the branch
+  passes or that exact failed job is explicitly resolved as described below.
+  It lists the latest result of each check dispatched on the branch
   and the runs still unfinished; report CI state from this output.
   `scripts/pr-checks.py <number>` lists the same for any pull request, open or
   merged, from any checkout. `--check` also runs the Rust baseline below, and
@@ -186,8 +187,10 @@ the conversation instead.
 - Pull requests do not start automated test workflows. The same failed
   dispatched checks fail the pull request's `dispatched-checks` status, which
   branch protection requires, so GitHub refuses the merge until a later run of
-  each failed check passes. Checks still running do not block. The
-  `merge-despite-failures` label overrides the status. The gate cannot tell
+  each failed check passes or its failure is explicitly resolved. Checks still
+  running do not block. Resolve individual mistaken or superseded checks using
+  the command under Verification; their original failures remain visible.
+  The `merge-despite-failures` label overrides all failures. The gate cannot tell
   who caused a failure, so it also blocks on failures that already happen on
   `master`. Adding the label is the user's decision: when a requested merge is
   blocked, report each failure, say whether `master` shows it too, and ask.
@@ -533,6 +536,29 @@ potential data loss, authorization, and compatibility failures targeted tests
 before merge. When CI fails, first distinguish product defects from test,
 fixture, and runner problems; investigate the failure rather than reflexively
 expanding the suite.
+
+Dispatching a check does not create a new product requirement. An agent may
+correct, replace, or remove a check it introduced by mistake and resolve that
+check's failure without asking, provided the actual requirements remain covered.
+Otherwise, an agent may resolve a failure without asking only when a suitable
+replacement run passed and its link is recorded. Without either basis, report
+the failure and ask the user before resolving it. Record why the failure no
+longer needs to block. Do not excuse an unfixed product defect or drop agreed
+coverage without the user's decision.
+
+Use the job ID at the end of its GitHub job URL:
+
+```bash
+GITHUB_REPOSITORY=greaber/syq scripts/dispatched-checks-status.py <pr> \
+  --resolve-job <job-id> --reason 'Why this failure no longer blocks' \
+  --replacement <https-url>
+```
+
+The reason is one line of at most 140 characters; the replacement URL is optional.
+This records a separate GitHub status with the author and time, then refreshes
+the gate. It covers only that PR and exact failed job, not other or future
+failures. The command needs permission to write commit statuses.
+Resolutions do not count as passing tests or release validation.
 
 Weigh cost as well as relevance. For changes to code, tooling, tests, or
 executable documentation, run `scripts/run-tooling-tests.py --quick` once on
