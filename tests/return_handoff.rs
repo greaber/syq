@@ -7,9 +7,11 @@ use crate::process::CommandExt as _;
 mod test_support;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 struct Fixture {
     temp: tempfile::TempDir,
@@ -39,16 +41,94 @@ impl Fixture {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
             .args(args)
             .current_dir(self.temp.path())
             .env("HOME", self.temp.path())
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
             .env("XDG_RUNTIME_DIR", self.temp.path().join("runtime"))
-            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .env("SYQ_NO_UPDATE_CHECK", "1");
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).capture_output().unwrap()
+    }
+
+    /// Automatic source authorization follows one native authentication refusal
+    /// and receiver discovery. Explicit @NAME now selects account authorization.
+    fn source_fallback(&self, args: &[&str]) -> Output {
+        let bin = self.temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(self.temp.path().join("runtime")).unwrap();
+        let ssh = bin.join("ssh");
+        fs::write(&ssh, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nprintf 'connect\\n' >> \"$HOME/ssh-used\"\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = UnixListener::bind(self.temp.path().join("absent.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let marker = self.temp.path().join("ssh-used");
+        let responder = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut progress = Instant::now() + Duration::from_secs(2);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "source fallback never sent its discovery Ping"
+                        );
+                        if Instant::now() >= progress {
+                            eprintln!("Waiting for source fallback discovery Ping");
+                            progress += Duration::from_secs(2);
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("source discovery failed: {error}"),
+                }
+            };
+            // BSD sockets may inherit the listener's nonblocking mode.
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut length = [0; 4];
+            socket.read_exact(&mut length).unwrap();
+            let length = u32::from_be_bytes(length) as usize;
+            assert!(length <= 4096, "oversized discovery envelope");
+            let mut bytes = vec![0; length];
+            socket.read_exact(&mut bytes).unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(envelope["message"], "Ping");
+            assert_eq!(
+                fs::read(&marker).unwrap(),
+                b"connect\n",
+                "discovery must follow exactly one native attempt"
+            );
+            let response = br#""Ready""#;
+            socket
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(response).unwrap();
+            // No copy/account authorization service is available: the handoff
+            // must finish its helper capability check before requesting either.
+        });
+        let output = self
+            .command(args)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .capture_output()
-            .unwrap()
+            .unwrap();
+        responder.join().unwrap();
+        assert_eq!(
+            fs::read(self.temp.path().join("ssh-used")).unwrap(),
+            b"connect\n"
+        );
+        output
     }
 
     fn script(&self, body: &str) -> String {
@@ -303,7 +383,7 @@ sys.exit(2)
 "#,
     );
     fixture.registration(&helper, "released-old-build");
-    let output = fixture.run(&[
+    let output = fixture.source_fallback(&[
         "cp",
         "--from",
         "backup",
@@ -312,7 +392,7 @@ sys.exit(2)
         "--as",
         "output",
         "--auth-from",
-        "@laptop",
+        "auto",
     ]);
     assert_failure(&output, "does not support source authorization");
     assert!(String::from_utf8_lossy(&output.stderr).contains("update syq"));
@@ -339,7 +419,7 @@ sys.exit(23)
 "#,
     );
     fixture.registration(&helper, "another-build");
-    let output = fixture.run(&[
+    let output = fixture.source_fallback(&[
         "cp",
         "--from",
         "backup",
@@ -348,7 +428,7 @@ sys.exit(23)
         "--as",
         "output",
         "--auth-from",
-        "@laptop",
+        "auto",
     ]);
     assert_eq!(output.status.code(), Some(23), "{output:?}");
 }
