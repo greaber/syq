@@ -12,6 +12,7 @@ mod compression;
 mod conn;
 mod copy_policy;
 mod delegation;
+mod deletion;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod descriptor_broker;
 mod descriptor_copy;

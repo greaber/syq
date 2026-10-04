@@ -823,14 +823,21 @@ impl Args {
             if self.s3.is_none() && tuning.has_s3_controls() {
                 bail!("S3 performance tuning requires an S3 endpoint");
             }
-            if self.rm
-                && tuning
-                    != (crate::transfer_tuning::TransferTuning {
+            if self.rm {
+                let allowed = if self.s3.is_some() {
+                    crate::transfer_tuning::TransferTuning {
+                        s3_requests: tuning.s3_requests,
+                        ..Default::default()
+                    }
+                } else {
+                    crate::transfer_tuning::TransferTuning {
                         workers: tuning.workers,
                         ..Default::default()
-                    })
-            {
-                bail!("removal supports only performance-tuning workers");
+                    }
+                };
+                if tuning != allowed {
+                    bail!("removal supports only performance-tuning workers for filesystems or s3-requests for S3");
+                }
             }
             if let Some(block) = tuning.comparison_block_size {
                 self.block_size = block;
@@ -1725,6 +1732,7 @@ fn parse_clean_partials(argv: &[OsString]) -> Result<Args> {
         parsed.operational,
         parsed.helper,
         parsed.results_output,
+        None,
     )?;
     args.clean_partials = true;
     args.locations = parsed
@@ -2702,12 +2710,6 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         ordered.len(),
         &ordered.iter().map(|(_, kind, _)| *kind).collect::<Vec<_>>(),
     )?;
-    if s3.is_some()
-        && matches.value_source("performance_tuning")
-            == Some(clap::parser::ValueSource::CommandLine)
-    {
-        bail!("--performance-tuning is not supported for S3 removal");
-    }
     let endpoint = if s3.is_some() {
         None
     } else {
@@ -2740,6 +2742,7 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         parsed.operational,
         parsed.helper,
         parsed.results_output,
+        s3.clone(),
     )?;
     args.locations = locations;
     if let Some(options) = &s3 {
@@ -2764,8 +2767,10 @@ fn native_removal_args(
     operational: NativeOperationalArgs,
     helper: NativeRemoteHelperArgs,
     results: NativeResultsArgs,
+    s3: Option<crate::s3::Options>,
 ) -> Result<Args> {
     let mut args = native_engine_defaults();
+    args.s3 = s3;
     args.interface = Interface::NativeRm;
     args.rm = true;
     args.native_rm_cwd = cwd.map(OsStringExt::into_vec);

@@ -130,8 +130,10 @@ def render(command, parsed, commands):
             for flag, link in GROUP_LINKS.items():
                 if signature.startswith(flag + " "):
                     body = link
-                    if flag == "--performance-tuning" and command in (("rm",), ("clean-partials",)):
-                        body = "Filesystem removal workers: [workers=N](../tuning.md#transfer-controls)"
+                    if flag == "--performance-tuning" and command == ("rm",):
+                        body = "Fix deletion concurrency: [workers=N for filesystems or s3-requests=N for S3](../tuning.md#deletion)"
+                    elif flag == "--performance-tuning" and command == ("clean-partials",):
+                        body = "Filesystem removal workers: [workers=N](../tuning.md#deletion)"
             # Some management arguments have no help string. Their usage and
             # command-specific prose supply meaning; never silently omit them.
             body = body or "See the command description above."

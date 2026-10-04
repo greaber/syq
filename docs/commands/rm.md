@@ -67,7 +67,7 @@ syq rm [OPTIONS] --srcs-in DIR
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#transfer-controls) |
+| `--performance-tuning <KEY=VALUE,...>` | Fix deletion concurrency: [workers=N for filesystems or s3-requests=N for S3](../tuning.md#deletion) |
 
 ## Progress and results
 
@@ -95,3 +95,7 @@ Named paths, `--src`, and `--src-non-dir` require non-directories. Use
 to remove its contents while keeping the directory. These directory selectors
 reject a final symlink even when following is enabled. All selections are
 checked before deletion begins. Filters are not supported.
+
+A concurrent rename can leave a selected directory at its new name even when
+removal succeeds. Avoid concurrent renames if all selected directories must
+be removed.

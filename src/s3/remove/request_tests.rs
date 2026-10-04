@@ -4,7 +4,7 @@ use aws_smithy_runtime_api::client::{
     orchestrator::{HttpRequest, HttpResponse},
 };
 use aws_smithy_types::body::SdkBody;
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 type RecordedRequest = (String, String, String);
 
@@ -85,11 +85,6 @@ async fn tigris_version_deletion_uses_individual_requests_and_other_deletion_sta
                     .collect::<Vec<_>>(),
             )
             .unwrap();
-            let tuning = super::super::tuning::Tuning::new(
-                args.s3.as_ref().unwrap(),
-                &args,
-                Arc::new(AtomicU64::new(u64::MAX)),
-            );
             for authorized in [false, true] {
                 let requests = Requests(Arc::new(Mutex::new(Vec::new())));
                 let transport = requests.clone();
@@ -120,7 +115,7 @@ async fn tigris_version_deletion_uses_individual_requests_and_other_deletion_sta
                 let deleter = delete::Deleter {
                     client: &client,
                     bucket: "bucket",
-                    budget: &tuning.requests,
+                    concurrency: crate::deletion::Concurrency::s3(&args),
                     individual: args
                         .s3_remove
                         .individual_deletes(args.s3.as_ref().unwrap(), authorized),

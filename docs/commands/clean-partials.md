@@ -50,7 +50,7 @@ syq clean-partials [OPTIONS] <TREE>...
 
 | Argument / option | Meaning |
 |---|---|
-| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#transfer-controls) |
+| `--performance-tuning <KEY=VALUE,...>` | Filesystem removal workers: [workers=N](../tuning.md#deletion) |
 
 ## Progress and results
 
