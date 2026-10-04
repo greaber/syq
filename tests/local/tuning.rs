@@ -2555,3 +2555,61 @@ fn resource_pressure_reports_essential_and_fixed_worker_failures() {
         assert!(!error.contains("panicked"), "{error}");
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_respects_remote_descriptor_budget_after_tcp_setup() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let script =
+        fs::read_to_string(&rsh)
+            .unwrap()
+            .replacen("#!/bin/sh\n", "#!/bin/sh\nulimit -n 128\n", 1);
+    fs::write(&rsh, script).unwrap();
+    for index in 0..512 {
+        write(
+            &t.path(&format!("source/f{index}")),
+            format!("file {index}").as_bytes(),
+        );
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("source"),
+            "--to",
+            "host",
+            "--into",
+            &t.s("destination"),
+            "--rsh",
+            rsh.to_str().unwrap(),
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "--no-progress",
+        ])
+        .env("SYQ_TUNING_CACHE", "")
+        .env("SYQ_TEST_REQUIRE_TCP", "1")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+    assert_output_ok(&output);
+    assert!(
+        stderr_of(&output).contains("open-file limits restrict this copy"),
+        "{}",
+        stderr_of(&output)
+    );
+    for index in 0..512 {
+        assert_eq!(
+            read(&t.path(&format!("destination/f{index}"))),
+            format!("file {index}").as_bytes()
+        );
+    }
+}

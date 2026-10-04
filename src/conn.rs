@@ -2172,7 +2172,14 @@ impl RemoteSpec {
                 return Err(error);
             }
         };
-        let ssh_failure = child.stderr.take().map(ssh_auth::capture);
+        let ssh_failure = match child.stderr.take().map(ssh_auth::capture).transpose() {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("start SSH stderr reader");
+            }
+        };
         let stdin = child.stdin.take().unwrap();
         let pacing = (!matches!(role, ConnectionRole::Control))
             .then(|| self.pacing.lock().unwrap().clone())
