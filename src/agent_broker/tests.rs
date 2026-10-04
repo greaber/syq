@@ -1184,19 +1184,22 @@ fn certificate_signature_reaches_real_ambient_agent_but_never_private_enrollment
 }
 
 #[test]
-fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
+fn configured_peer_agent_forwards_only_advertised_fully_bound_signatures() {
     let temp = crate::test_support::tempdir().unwrap();
     let ambient_socket = temp.path().join("ambient.sock");
     let (identity_private, identity) = key(23);
     let (ambient, requests) = fake_ambient(&ambient_socket, identity_private.clone());
+    let coordinator_socket = temp.path().join("coordinator.sock");
+    let (coordinator_identity, _) = key(20);
+    let (coordinator_agent, coordinator_requests) =
+        fake_ambient(&coordinator_socket, coordinator_identity);
     let (source_private, source) = key(21);
     let (destination_private, destination) = key(22);
-    let broker = ConstrainedAgentBroker::start_with_ambient_socket(
-        ambient_socket,
-        policy(source.clone(), destination.clone()),
-        TEST_BROKER_CONNECTIONS,
-    )
-    .unwrap();
+    let mut policy = policy(source.clone(), destination.clone());
+    policy.coordinator.as_mut().unwrap().agent_socket = Some(coordinator_socket.clone());
+    policy.peer.agent_socket = Some(ambient_socket);
+    let broker = ConstrainedAgentBroker::start(policy.clone(), TEST_BROKER_CONNECTIONS).unwrap();
+    assert_eq!(broker.ambient_socket(), coordinator_socket);
     let mut client = UnixStream::connect(broker.socket_path()).unwrap();
 
     let source_bind = bind_request(binding(&source_private, source, b"source-session", true));
@@ -1207,6 +1210,7 @@ fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
         panic!("expected identities response")
     };
     assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].credential.key_data(), &identity);
     assert!(identities[0].comment.is_empty());
     assert_eq!(requests.recv().unwrap(), source_bind);
     assert_eq!(requests.recv().unwrap(), vec![11]);
@@ -1252,6 +1256,15 @@ fn ambient_backend_forwards_only_advertised_fully_bound_signatures() {
     drop(client);
     drop(broker);
     ambient.join().unwrap();
+    // Wake the untouched coordinator fixture so it can finish without any
+    // authentication request ever reaching it through the forwarded broker.
+    drop(UnixStream::connect(&coordinator_socket).unwrap());
+    coordinator_agent.join().unwrap();
+    assert!(coordinator_requests.try_recv().is_err());
+
+    policy.peer.agent_socket = None;
+    let error = ConstrainedAgentBroker::start(policy, TEST_BROKER_CONNECTIONS).unwrap_err();
+    assert!(error.to_string().contains("peer host"), "{error:#}");
 }
 
 #[test]

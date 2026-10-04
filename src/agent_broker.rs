@@ -994,16 +994,19 @@ impl std::fmt::Debug for ConstrainedAgentBroker {
 }
 
 impl ConstrainedAgentBroker {
-    /// Start a peer-bound broker backed by the current SSH agent. This
+    /// Start a peer-bound broker backed by the peer's configured SSH agent. This
     /// is the native `--peer-auth broker` mode: signatures remain limited to
     /// the validated coordinator-to-peer session and login user.
     pub fn start(policy: BrokerPolicy, max_connections: usize) -> Result<Self> {
         let ambient = policy.coordinator.as_ref().unwrap_or(&policy.peer).agent_socket.clone().context(
             "the authenticating host has no configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
         )?;
+        let peer_agent = policy.peer.agent_socket.clone().context(
+            "authenticating to the peer host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
+        )?;
         Self::start_with_backend(
-            ambient.clone(),
-            SigningBackend::Ambient(ambient),
+            ambient,
+            SigningBackend::Ambient(peer_agent),
             policy,
             max_connections,
         )

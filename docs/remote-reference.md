@@ -121,6 +121,10 @@ right contents. See [A compromised source server](security.md#a-compromised-sour
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
+With `--peer-auth broker`, syq uses the coordinating host's configured
+`IdentityAgent` for the outer SSH connection and the peer host's configured
+agent for forwarded authentication. The two hosts can use separate agents.
+
 Persistence can reuse an eligible native SSH connection from the invoking
 machine to the coordinating server. Connections forwarding a constrained or
 full SSH agent remain attached to the individual copy. Selecting `--pscope`

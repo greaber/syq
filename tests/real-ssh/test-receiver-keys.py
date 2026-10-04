@@ -61,6 +61,26 @@ def enroll_interactively(arguments, environment, prompt=b'Enter passphrase for '
         os.close(terminal)
 
 
+def check_broker_agents(parent, login_entry, environment):
+    """Require each agent's own identity with either host coordinating."""
+    original = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout
+    try:
+        # The fixture's initial setup key otherwise also authenticates to the
+        # destination and would hide accidental use of the source's agent.
+        remote('cat > ~/.ssh/authorized_keys', input=(login_entry + '\n').encode())
+        run('ssh', 'source', 'true', env=environment)
+        remote('true', env=environment)
+        for coordinator in ('src', 'dst'):
+            destination = f'{parent}/broker-{coordinator}'
+            print(f'Checking distinct agents with {coordinator} coordinating', flush=True)
+            run('syq', 'cp', '--from', 'source', '/tmp/syq-real-ssh-key-source',
+                '--to', 'destination', '--as', destination, '--no-tcp', '--no-progress',
+                '--peer-auth', 'broker', '--coordinate-at', coordinator, env=environment)
+            assert remote('cat ' + shlex.quote(destination), stdout=subprocess.PIPE).stdout == b'matching-key-copy\n'
+    finally:
+        remote('cat > ~/.ssh/authorized_keys', input=original)
+
+
 def main():
     config = Path.home() / '.ssh/config'
     original = config.read_bytes()
@@ -215,6 +235,8 @@ Host source
                         '--to', 'destination', '--as', parent + '/copy', '--no-tcp', '--no-progress']
                 run(*copy, env=environment)
                 assert remote('cat ' + shlex.quote(parent + '/copy'), stdout=subprocess.PIPE).stdout == b'matching-key-copy\n'
+                if flags is not None and flags & 4:
+                    check_broker_agents(parent, entry, environment)
                 if flags is not None:
                     unavailable.touch()
                     failed = subprocess.run(copy, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
