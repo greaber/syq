@@ -119,7 +119,7 @@ pub(crate) fn remove(domain: &Domain, id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
     pub(super) fn permission() -> ProviderLoginPermission {
