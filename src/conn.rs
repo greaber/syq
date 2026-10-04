@@ -2968,6 +2968,20 @@ impl Endpoint {
         matches!(self, Endpoint::Remote(spec) if !spec.local_process)
     }
 
+    /// Whether a first data worker connects without a new login: in this
+    /// process, over the TCP data route, or as a channel on this copy's own
+    /// authenticated SSH connection.
+    pub(crate) fn first_worker_needs_no_login(&self) -> bool {
+        match self {
+            Endpoint::Local { .. } => true,
+            Endpoint::Remote(spec) => {
+                spec.local_process
+                    || spec.data_transport() != DataTransport::Ssh
+                    || spec.ssh_connection(true, true) == SshConnection::Worker
+            }
+        }
+    }
+
     pub fn has_data_server(&self) -> bool {
         matches!(self, Endpoint::Remote(_))
     }

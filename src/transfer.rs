@@ -1466,6 +1466,8 @@ struct DestinationAnchor {
     dev: u64,
     ino: u64,
 }
+/// A data worker's slot and its thread.
+type WorkerThread = (usize, std::thread::JoinHandle<Result<()>>);
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 type SourceRootsSlot = std::sync::Arc<std::sync::OnceLock<Vec<RegisteredSourceRoot>>>;
 
@@ -2212,8 +2214,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let source_roots: SourceRootsSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let destination_anchor_required = args.restricted_grant.is_none();
-    let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let workers: Arc<Mutex<Vec<WorkerThread>>> = Arc::new(Mutex::new(Vec::new()));
     let connect_after_file_plan = Arc::new(AtomicBool::new(false));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
@@ -2457,7 +2458,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                 }
             });
-            workers.lock().unwrap().push(h);
+            workers.lock().unwrap().push((id, h));
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
@@ -3413,7 +3414,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
         );
         workers_started.set(true);
-    } else if fresh_destination
+    } else if (fresh_destination
+        || (src_ep.first_worker_needs_no_login() && dst_ep.first_worker_needs_no_login()))
         && (src_ep.is_remote() || dst_ep.is_remote())
         && transport_setup.is_some()
         && !defer_destination_mutations
@@ -3425,7 +3427,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // Every selected regular file is work for a fresh destination. One
         // worker connects once planning sees one, while the control
         // connection creates directories; the usual startup decision still
-        // chooses how many more to start.
+        // chooses how many more to start. For an existing destination the
+        // file may turn out unchanged, so the worker starts early only when
+        // it needs no new login, and a copy with nothing to send does not
+        // wait for it.
         connect_after_file_plan.store(true, Relaxed);
         gate.set_active(1);
         for id in gate.begin_warming(1) {
@@ -3898,7 +3903,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
-        for w in batch {
+        for (id, w) in batch {
+            // Once every file is finished, a worker still connecting has
+            // nothing to do. Leave it behind rather than let its setup delay
+            // the end of the copy; the process exit closes its connection.
+            if !w.is_finished() && sched.finished() && gate.warming(id) {
+                continue;
+            }
             match w.join() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {

@@ -603,6 +603,54 @@ fn remote_retained_basis_handles_matching_and_changed_files() {
     assert!(partial_files(&t.0).is_empty());
 }
 
+/// A worker that starts connecting before planning ends is not waited for
+/// when planning finds nothing to send.
+#[cfg(debug_assertions)]
+#[test]
+fn a_copy_with_nothing_to_send_does_not_wait_for_an_early_worker() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    for name in ["a", "b"] {
+        for side in ["src", "dst"] {
+            let path = t.path(&format!("{side}/{name}"));
+            write(&path, name.as_bytes());
+            set_mtime(&path, 1_600_000_000);
+        }
+    }
+    let waiting = t.path("worker-zero-waiting");
+    let started = std::time::Instant::now();
+    let out = compat_command()
+        .arg("-e")
+        .arg(&rsh)
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--syq-tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "-a",
+            "--no-progress",
+        ])
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("127.0.0.1:{}/", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        // Hold the first worker before it connects, past the end of the copy.
+        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &waiting)
+        .env("SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE", t.path("never"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(waiting.exists(), "no worker started early: {out:?}");
+    // The held worker would keep the copy waiting for a minute.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();
