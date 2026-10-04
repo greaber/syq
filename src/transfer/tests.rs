@@ -87,6 +87,7 @@ struct PipelineState {
     tuning_snapshots: Vec<(crate::sched::TuningWork, bool)>,
     auto_ranges: bool,
     arrival_delay: Option<std::time::Duration>,
+    arrival_delays: std::collections::VecDeque<std::time::Duration>,
     early_range_acks: bool,
     steal_range_at: Option<(usize, Arc<Sched>)>,
     stolen_range: Option<RangeHandle>,
@@ -253,7 +254,12 @@ impl Conn for PipelineConn {
     }
     fn recv_with_arrival(&mut self) -> Result<(Response, std::time::Instant)> {
         let response = self.recv()?;
-        let delay = self.0.lock().unwrap().arrival_delay.unwrap_or_default();
+        let mut state = self.0.lock().unwrap();
+        let delay = state
+            .arrival_delays
+            .pop_front()
+            .or(state.arrival_delay)
+            .unwrap_or_default();
         Ok((response, std::time::Instant::now() + delay))
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -399,6 +405,7 @@ fn pipeline_worker(
         hardlink_expected_hashes: Default::default(),
         block: 512,
         block_explicit: false,
+        transfer_strategy: Default::default(),
         tuning: crate::transfer_tuning::TransferTuning {
             copy_path: (!streaming).then_some(crate::transfer_tuning::CopyPath::Ranges),
             pipeline_depth: (!streaming).then_some(4),
@@ -2572,7 +2579,7 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             opts.dst_remote = relay;
             opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
             if basis == "candidate-reuse-off" {
-                opts.tuning.block_reuse = Some(crate::transfer_tuning::BlockReuse::Off);
+                opts.transfer_strategy = crate::cli::TransferStrategy::WholeFile;
             }
             worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
             worker.progress.bytes_total.store(1536, Relaxed);
@@ -3705,6 +3712,20 @@ fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
 
 #[test]
 fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
+    check_adaptive_range_handoff(false, 5);
+}
+
+#[test]
+fn slow_ranges_become_shareable_before_draining_for_a_latency_check() {
+    check_adaptive_range_handoff(true, 5);
+}
+
+#[test]
+fn slow_ranges_keep_split_hints_current_while_draining() {
+    check_adaptive_range_handoff(true, 6);
+}
+
+fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
     let block = 4 << 20;
     let size = 16 << 20;
     let sched = Arc::new(Sched::new(block, 32 << 20));
@@ -3714,21 +3735,50 @@ fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
     let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
     let src = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
-        steal_range_at: Some((5, sched.clone())),
+        steal_range_at: Some((steal_at, sched.clone())),
         ..Default::default()
     }));
     let dst = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
         // Inject service time without a slow or timing-sensitive test.
         arrival_delay: Some(std::time::Duration::from_secs(1)),
+        // The second completion can reveal worse service during the drain.
+        arrival_delays: if steal_at == 6 {
+            [1, 4].map(std::time::Duration::from_secs).into()
+        } else {
+            Default::default()
+        },
         ..Default::default()
     }));
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
+    if recheck {
+        // The first slow completion makes a check due while three source
+        // requests are still outstanding. The peer tries to steal during
+        // that drain, before another read can publish a smaller split.
+        let mut budget = WorkBudget::ranges(block, std::time::Duration::from_millis(250), None);
+        budget.refreshed_latency(
+            std::time::Duration::from_millis(10),
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        );
+        worker.range_budget = Some(budget);
+    }
     let mut credited = 0;
     worker.transfer_range(&range, &mut credited).unwrap();
+    if recheck {
+        let state = src.lock().unwrap();
+        assert_eq!(
+            state.sent_at_receive[steal_at - 1],
+            7,
+            "no refill before the peer steals"
+        );
+        assert!(
+            matches!(state.requests[7], Request::ConfigureHashing(_)),
+            "the latency probe waits for all seven issued reads"
+        );
+    }
     let peer_range = src
         .lock()
         .unwrap()
@@ -3745,10 +3795,37 @@ fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
         ..Default::default()
     }));
     let mut peer = pipeline_worker(&sched, &peer_src, &peer_dst, false);
-    Arc::get_mut(&mut peer.opts).unwrap().block = block;
+    let expected_start = peer_range.lock().unwrap().split.unwrap().minimum / 2;
+    if steal_at == 6 {
+        assert!(
+            expected_start <= 128 << 10,
+            "the peer must inherit the smaller hint from the second slow completion: {expected_start}"
+        );
+    }
+    assert!(
+        expected_start < 1 << 20,
+        "the donor has measured slow service"
+    );
+    let opts = Arc::get_mut(&mut peer.opts).unwrap();
+    opts.block = block;
+    opts.tuning = Default::default();
     let mut peer_credited = 0;
     peer.transfer_range(&peer_range, &mut peer_credited)
         .unwrap();
+    let state = peer_src.lock().unwrap();
+    assert!(
+        matches!(state.requests.first(), Some(Request::ReadRange { len, .. })
+        if u64::from(*len) == expected_start)
+    );
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|r| matches!(r, Request::ReadRange { len, .. }
+        if u64::from(*len) > expected_start)),
+        "the faster peer grows beyond the hint"
+    );
+    drop(state);
     assert!(sched.range_done(&peer_range));
     assert!(matches!(sched.next(), Item::Exit));
     assert_eq!(credited + peer_credited, size);
@@ -3771,6 +3848,75 @@ fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
         end += len;
     }
     assert_eq!(end, size, "each byte written exactly once across the steal");
+}
+
+#[test]
+fn inherited_requests_preserve_worker_measurements_ceilings_and_overrides() {
+    use std::time::Duration;
+    for (mode, ceiling, expected) in [
+        ("fresh", 4 << 20, 64 << 10),
+        ("learned", 4 << 20, 512 << 10),
+        ("receiver", 32 << 10, 32 << 10),
+        ("explicit", 4 << 20, 2 << 20),
+    ] {
+        let size = 2 << 20;
+        let block = 4 << 20;
+        let sched = Arc::new(Sched::new(block, 32 << 20));
+        let idx = sched.push_file(pipeline_job(b"file", size));
+        sched.scan_done();
+        assert!(matches!(sched.next(), Item::File(_)));
+        let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
+        range.lock().unwrap().split = Some(crate::sched::RangeSplit {
+            block: 512,
+            minimum: 128 << 10,
+        });
+        let src = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let dst = Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        opts.tuning = Default::default();
+        if mode == "explicit" {
+            opts.tuning.pipeline_depth = Some(4);
+        }
+        if mode == "learned" {
+            worker.range_budget = Some(WorkBudget::ranges(
+                block,
+                Duration::from_millis(250),
+                Some(512 << 10),
+            ));
+        }
+        let mut credited = 0;
+        worker
+            .transfer_range_pipeline(&worker.job(idx), &range, &mut credited, ceiling, 4, 4)
+            .unwrap();
+        let source = src.lock().unwrap();
+        assert!(
+            matches!(source.requests.first(), Some(Request::ReadRange { len, .. })
+            if *len == expected),
+            "{mode}"
+        );
+        assert!(
+            source
+                .requests
+                .iter()
+                .all(|r| !matches!(r, Request::ReadRange { len, .. }
+            if u64::from(*len) > ceiling)),
+            "{mode}"
+        );
+        assert_eq!(source.requests.len(), source.received);
+        let destination = dst.lock().unwrap();
+        assert_eq!(destination.requests.len(), destination.received);
+        assert_eq!(credited, size);
+        assert!(sched.range_done(&range));
+        assert!(matches!(sched.next(), Item::Exit));
+    }
 }
 
 #[test]
@@ -3818,13 +3964,24 @@ fn explicit_range_controls_preserve_fixed_requests() {
 
 #[test]
 fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
-    for abort in [false, true] {
+    for (abort, starting_bytes) in [
+        (false, 1 << 20),
+        (true, 1 << 20),
+        (false, 64 << 10),
+        (true, 64 << 10),
+    ] {
         let block = 4 << 20;
         let sched = Arc::new(Sched::new(block, 32 << 20));
         let idx = sched.push_file(pipeline_job(b"file", 8 << 20));
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(_)));
         let range = sched.ranges_ready(idx, vec![(0, 8 << 20)]).unwrap();
+        if starting_bytes != 1 << 20 {
+            range.lock().unwrap().split = Some(crate::sched::RangeSplit {
+                block: 512,
+                minimum: 2 * starting_bytes,
+            });
+        }
         let src = Arc::new(Mutex::new(PipelineState {
             auto_ranges: true,
             ..Default::default()
@@ -3867,7 +4024,7 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
             let Item::Range(tail) = sched.next() else {
                 panic!("unread tail returned")
             };
-            assert_eq!(tail.lock().unwrap().pos, 4 * (1 << 20));
+            assert_eq!(tail.lock().unwrap().pos, 4 * starting_bytes);
             assert!(sched.range_done(&tail));
         }
     }
@@ -3896,7 +4053,7 @@ fn ordinary_range_latency_rechecks_preserve_ownership_on_stop() {
         let opts = Arc::get_mut(&mut worker.opts).unwrap();
         opts.block = block;
         opts.tuning = Default::default();
-        let mut budget = WorkBudget::ranges(block, Duration::from_millis(600));
+        let mut budget = WorkBudget::ranges(block, Duration::from_millis(600), None);
         budget.refreshed_latency(
             Duration::from_millis(150),
             Instant::now() - Duration::from_secs(60),

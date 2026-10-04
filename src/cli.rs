@@ -22,6 +22,48 @@ pub enum Placement {
     As,
 }
 
+/// How a filesystem copy transfers the contents of selected files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum TransferStrategy {
+    /// Copy selected files without comparing blocks in the final destination.
+    WholeFile,
+    /// Reuse matching blocks at the same offsets in the corresponding destination file.
+    AlignedBlock,
+    /// Use whole-file locally and aligned-block with a remote syq endpoint.
+    #[default]
+    Locality,
+}
+
+impl TransferStrategy {
+    pub(crate) fn reuse_destination_blocks(self, same_host: bool) -> bool {
+        match self {
+            Self::WholeFile => false,
+            Self::AlignedBlock => true,
+            Self::Locality => !same_host,
+        }
+    }
+
+    pub(crate) fn history_suffix(self, same_host: bool) -> String {
+        if self.reuse_destination_blocks(same_host)
+            == Self::default().reuse_destination_blocks(same_host)
+        {
+            String::new()
+        } else {
+            format!(";transfer-strategy={}", self.as_str())
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WholeFile => "whole-file",
+            Self::AlignedBlock => "aligned-block",
+            Self::Locality => "locality",
+        }
+    }
+}
+
+const TRANSFER_STRATEGY_HELP: &str = "Choose how filesystem copies transfer file contents: whole-file copies selected files without reusing blocks from the final destination; aligned-block reuses matching blocks at the same offsets in the corresponding destination file. locality (the default) uses whole-file for local copies, including mounted network filesystems, and aligned-block when a syq endpoint is remote. Size/time skips, explicit content checks, and partial-file resume apply to all strategies.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Existence {
     #[default]
@@ -331,6 +373,15 @@ pub struct Args {
     pub block_size: u64,
     #[arg(skip)]
     pub block_size_explicit: bool,
+    /// Normalized strategy, shared with native copies.
+    #[arg(skip)]
+    pub transfer_strategy: Option<TransferStrategy>,
+    /// Copy selected files whole; the default for local copies
+    #[arg(short = 'W', long, overrides_with_all = ["whole_file", "no_whole_file"])]
+    pub whole_file: bool,
+    /// Reuse matching blocks at the same offsets in the destination file; the default for remote copies
+    #[arg(long, visible_alias = "no-W", overrides_with_all = ["whole_file", "no_whole_file"])]
+    pub no_whole_file: bool,
     /// Override transfer internals for performance troubleshooting (normally automatic)
     #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
@@ -760,6 +811,11 @@ impl Args {
     }
 
     fn apply_advanced(&mut self) -> Result<()> {
+        if self.whole_file {
+            self.transfer_strategy = Some(TransferStrategy::WholeFile);
+        } else if self.no_whole_file {
+            self.transfer_strategy = Some(TransferStrategy::AlignedBlock);
+        }
         if !self.performance_tuning.is_empty() {
             self.tuning_options = Some(
                 self.performance_tuning
@@ -782,6 +838,13 @@ impl Args {
                     .join(",")
                     .parse()
                     .context("invalid --integrity-checking")?,
+            );
+        }
+
+        if self.transfer_strategy.is_some() {
+            anyhow::ensure!(
+                !self.rm && self.s3.is_none() && self.descriptor_copy.is_none(),
+                "--transfer-strategy requires a filesystem copy"
             );
         }
 
@@ -1194,6 +1257,9 @@ struct NativeCopyOperationalArgs {
     /// Hash existing source and destination files instead of trusting size and modification time
     #[arg(long)]
     hash: bool,
+    /// Choose a file transfer strategy (default: locality)
+    #[arg(long, value_enum, value_name = "STRATEGY", long_help = TRANSFER_STRATEGY_HELP)]
+    transfer_strategy: Option<TransferStrategy>,
     /// How to handle existing destination files; directories remain containers
     #[arg(long, value_enum, value_name = "POLICY", default_value_t = IfExists::Update)]
     if_exists: IfExists,
@@ -2903,6 +2969,7 @@ fn apply_native_copy_operational(
     let NativeCopyOperationalArgs {
         common,
         hash,
+        transfer_strategy,
         where_expression,
         copy_if,
         if_exists,
@@ -2929,6 +2996,7 @@ fn apply_native_copy_operational(
     args.receiver_max_entries = receiver_max_entries;
     args.receiver_max_bytes = receiver_max_bytes.as_deref().map(parse_size).transpose()?;
     args.checksum = hash;
+    args.transfer_strategy = transfer_strategy;
     args.if_exists = Some(if_exists);
     args.ignore_existing = if_exists == IfExists::Keep;
     anyhow::ensure!(

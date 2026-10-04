@@ -1072,6 +1072,9 @@ fn run_remote(
     if let Some(tuning) = args.tuning_options {
         remote.push(format!("--performance-tuning={tuning}"));
     }
+    if let Some(strategy) = args.transfer_strategy {
+        remote.push(format!("--transfer-strategy={}", strategy.as_str()));
+    }
     if args.stats {
         remote.push("--stats".into());
     }

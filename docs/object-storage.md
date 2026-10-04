@@ -201,6 +201,20 @@ Use `rm --s3-all-versions` to permanently remove selected versions and delete
 markers, or `--s3-version-id ID` for one version. Deleting a marker can reveal
 an older version. Preview version deletions with `--dry-run -v`.
 
+For Tigris endpoints at `t3.storage.dev` or under `tigris.dev`, syq sends
+permanent version deletions individually because Tigris's batch API ignores
+version IDs. Both flags can therefore take longer for large version histories.
+This exception applies only to these two flags.
+
+A custom proxy hostname that hides Tigris does not receive this exception.
+Batched requests can then leave versions intact and add delete markers that
+hide current objects; syq reports failure. Use a Tigris endpoint for permanent
+version deletion. To undo an unintended deletion, use your provider's version
+listing to identify the markers created by the failed attempt, then remove
+those markers with `--s3-version-id` through a Tigris endpoint. If you intended
+to purge all versions, rerun the original `--s3-all-versions` command through
+that endpoint; this also removes the extra markers.
+
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
 prefix trees and accept a trailing `/`. When deleting an exact directory-marker
 version, keep the trailing `/` in its key. An empty S3 source prefix is rejected

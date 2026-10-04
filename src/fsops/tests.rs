@@ -479,6 +479,35 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
     assert!(error.to_string().contains("is a directory"), "{error}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for() {
+    // Sixteen names in one directory make it worth a listing; fewer do not;
+    // absolute paths are left to the stat itself, and files at the root
+    // count for the root. The first requested name of each batch is what
+    // the listing is conditioned on.
+    let mut requests = HashMap::new();
+    let mut paths: Vec<PathBytes> = (0..16).map(|i| format!("d/f{i}").into_bytes()).collect();
+    paths.extend((0..15).map(|i| format!("e/f{i}").into_bytes()));
+    paths.extend((0..16).map(|i| format!("r{i}").into_bytes()));
+    paths.extend((0..20).map(|i| format!("/abs/f{i}").into_bytes()));
+    let mut listed = directories_to_list(&paths, &mut requests);
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![(&b""[..], &b"r0"[..], 16), (&b"d"[..], &b"d/f0"[..], 16)]
+    );
+
+    // Names count across batches: one more name in `e` makes sixteen. A
+    // directory that has been listed is not offered again.
+    requests.insert(b"d".to_vec(), None);
+    let paths: Vec<PathBytes> = vec![b"e/f15".to_vec(), b"d/f16".to_vec()];
+    assert_eq!(
+        directories_to_list(&paths, &mut requests),
+        vec![(&b"e"[..], &b"e/f15"[..], 16)]
+    );
+}
+
 #[test]
 fn payload_integrity_checks_are_explicit() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
@@ -1784,6 +1813,7 @@ fn small_copy_staging_failure_keeps_all_partials_for_retry() {
     let canonical = dir.path().canonicalize().unwrap();
     let prefix = canonical.as_os_str().as_bytes().to_vec();
     let request = SmallCopyRequest {
+        reuse_block_size: Some(4 << 20),
         if_exists: crate::cli::IfExists::Update,
         matching_flags: flags::TIMES,
         hash_policy: Default::default(),
@@ -1900,6 +1930,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
         let (files, contents) = files.into_iter().unzip();
         (
             SmallCopyRequest {
+                reuse_block_size: Some(4 << 20),
                 if_exists: crate::cli::IfExists::Update,
                 matching_flags: flags::TIMES,
                 hash_policy: Default::default(),
@@ -2025,6 +2056,7 @@ fn small_copy_publishes_regular_files_and_declines_other_types() {
 
 fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
     SmallCopyRequest {
+        reuse_block_size: Some(4 << 20),
         if_exists: crate::cli::IfExists::Update,
         matching_flags: flags::TIMES,
         hash_policy: crate::hashing::HashPolicy {
@@ -2057,6 +2089,44 @@ fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
             })
             .collect(),
     }
+}
+
+#[test]
+fn small_copy_declines_multiblock_reuse_before_preparing_any_output() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let prefix = dir.path().as_os_str().as_bytes();
+    fs::write(dir.path().join("existing"), b"old").unwrap();
+    let mut offer = offered_small_copy(prefix, &[b"new", b"existing"]);
+    offer.reuse_block_size = Some(64 << 10);
+    for file in &mut offer.files {
+        file.size = 200 << 10;
+    }
+    let mut operations = FsOps::new();
+    let response = operations.handle(&Request::PrepareSmallFiles(offer.clone()));
+    assert!(
+        matches!(
+            response,
+            Response::SmallFilesCopied(SmallCopyResponse {
+                outcome: SmallCopyOutcome::NeedsBlockReuse,
+                ..
+            })
+        ),
+        "{response:?}"
+    );
+    assert!(operations.destination_root.is_none());
+    assert!(operations.operator_selection.is_none());
+    assert!(operations.prepared_small_copy.is_none());
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(fs::read(dir.path().join("existing")).unwrap(), b"old");
+
+    // Declining leaves the same control session usable, and whole-file
+    // replacement can still request the payloads for the entire offer.
+    offer.reuse_block_size = None;
+    let response = operations.handle(&Request::PrepareSmallFiles(offer));
+    assert!(
+        matches!(response, Response::SmallFilesPrepared(ref needed) if needed == &[true, true]),
+        "{response:?}"
+    );
 }
 
 #[test]

@@ -662,6 +662,7 @@ def _copy_arguments(
     sparse: bool,
     inplace: bool,
     max_delete: int | None,
+    transfer_strategy: str | None = None,
     integrity_checking: str | None = None,
     allow_missing_placement: bool = False,
     mapping: bool = False,
@@ -754,6 +755,7 @@ def _copy_arguments(
         argv.append("--no-compress")
     _append_text(argv, "--resource-limits", resource_limits)
     _append_text(argv, "--performance-tuning", performance_tuning)
+    _append_text(argv, "--transfer-strategy", transfer_strategy)
     receiver_max_entries = _nonnegative_integer(
         receiver_max_entries, option="--receiver-max-entries"
     )
@@ -1266,6 +1268,7 @@ class Client:
         no_compress: bool = False,
         resource_limits: str | None = None,
         performance_tuning: str | None = None,
+        transfer_strategy: str | None = None,
         s3_endpoint: str | None = None,
         s3_region: str | None = None,
         s3_profile: str | None = None,
@@ -1347,6 +1350,7 @@ class Client:
             no_compress=no_compress,
             resource_limits=resource_limits,
             performance_tuning=performance_tuning,
+            transfer_strategy=transfer_strategy,
             receiver_max_entries=receiver_max_entries,
             receiver_max_bytes=receiver_max_bytes,
             receiver_receipt=receiver_receipt,

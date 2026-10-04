@@ -1207,6 +1207,20 @@ fn adopted_operator_descriptor_stays_stable_and_can_be_enumerated_repeatedly() {
 }
 
 #[test]
+fn an_open_directory_is_empty_until_any_entry_appears() {
+    let t = TestDir::new("emptiness");
+    fs::create_dir(t.path().join("d")).unwrap();
+    let root = Root::open(t.path()).unwrap();
+    let directory = root.open_directory(&relative(b"d")).unwrap();
+    assert!(root.open_directory_is_empty(&directory).unwrap());
+    fs::write(t.path().join("d/.hidden"), b"").unwrap();
+    assert!(!root.open_directory_is_empty(&directory).unwrap());
+    fs::remove_file(t.path().join("d/.hidden")).unwrap();
+    fs::create_dir(t.path().join("d/sub")).unwrap();
+    assert!(!root.open_directory_is_empty(&directory).unwrap());
+}
+
+#[test]
 fn descendant_traversal_needs_search_but_not_read_permission() {
     if unsafe { libc::geteuid() } == 0 {
         return;

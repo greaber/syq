@@ -1750,6 +1750,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
             "--max-delete=1",
             "--resource-limits=workers=2",
             "--performance-tuning=request-size=1M",
+            "--transfer-strategy=whole-file",
             "--into-existing",
             &t.s("dst"),
             "-q",
@@ -1783,6 +1784,7 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
         "--max-delete=1",
         "--resource-limits=workers=2",
         "--performance-tuning=request-size=1048576",
+        "--transfer-strategy=whole-file",
     ] {
         assert!(
             log.contains(option),
