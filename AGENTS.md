@@ -178,7 +178,8 @@ the conversation instead.
   recently merged branches, as notes without failing; report them to the user
   even when the current task did not cause them. A failed check in a run
   dispatched on this branch makes it exit 1 until a later run of that check
-  passes. It lists the latest result of each check dispatched on the branch
+  passes or that exact failed job is explicitly resolved as described below.
+  It lists the latest result of each check dispatched on the branch
   and the runs still unfinished; report CI state from this output.
   `scripts/pr-checks.py <number>` lists the same for any pull request, open or
   merged, from any checkout. `--check` also runs the Rust baseline below, and
@@ -186,8 +187,10 @@ the conversation instead.
 - Pull requests do not start automated test workflows. The same failed
   dispatched checks fail the pull request's `dispatched-checks` status, which
   branch protection requires, so GitHub refuses the merge until a later run of
-  each failed check passes. Checks still running do not block. The
-  `merge-despite-failures` label overrides the status. The gate cannot tell
+  each failed check passes or its failure is explicitly resolved. Checks still
+  running do not block. Resolve individual mistaken or superseded checks using
+  the command under Verification; their original failures remain visible.
+  The `merge-despite-failures` label overrides all failures. The gate cannot tell
   who caused a failure, so it also blocks on failures that already happen on
   `master`. Adding the label is the user's decision: when a requested merge is
   blocked, report each failure, say whether `master` shows it too, and ask.
@@ -503,7 +506,7 @@ and variability, and lengthen or repeat the test as needed to support the claim.
 
 ## Verification
 
-**Fix problems, don't skip work**: When a check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping.
+**Fix problems, don't skip work**: When a needed check, test, or verification step fails because a tool isn't installed or a dependency is missing, use the repository's pinned, project-local setup method and retry. Do not silently skip the step. Do not install or upgrade tools globally, use unpinned package sources, or change system configuration without explicit user approval. If the repository has no suitable local setup path or the remaining fix requires privileges or credentials, ask the user for help. This applies broadly — missing tools, broken environments, configuration issues, or any other blocker. The default is to fix the problem, not work around it by skipping. Mistaken or superseded checks can be resolved as described below.
 
 `scripts/setup.sh` is that setup. Run it without arguments to install the
 Rust toolchain from `rust-toolchain.toml` and the tools pinned in
@@ -533,6 +536,30 @@ potential data loss, authorization, and compatibility failures targeted tests
 before merge. When CI fails, first distinguish product defects from test,
 fixture, and runner problems; investigate the failure rather than reflexively
 expanding the suite.
+
+Dispatching a check does not create a new product requirement. Agents may
+correct, replace, or remove checks they introduced by mistake when the actual
+requirements remain covered. After investigating, they may resolve an exact
+failed job caused by a mistaken test/setup or superseded by suitable replacement
+evidence. Record why it no longer needs to block; link replacement evidence when
+there is any. Do not resolve an actual product defect or drop agreed coverage
+without the user's decision. No advance designation as an experiment is needed.
+
+Use the job ID at the end of its GitHub job URL:
+
+```bash
+GITHUB_REPOSITORY=greaber/syq scripts/dispatched-checks-status.py <pr> \
+  --resolve-job <job-id> --reason 'Why this failure no longer blocks' \
+  --replacement <https-url>
+```
+
+The reason is one line of at most 140 characters; the replacement URL is optional.
+This records a separate GitHub status with the author and time, then refreshes
+the gate. It covers only that PR and exact failed job, not other or future
+failures. `--reopen-job <job-id> --reason 'Why it still matters'` revokes a
+resolution. Both commands need permission to write commit statuses. Use tooling
+that includes this support; older versions still report resolved jobs as failures.
+Resolutions do not count as passing tests or release validation.
 
 Weigh cost as well as relevance. For changes to code, tooling, tests, or
 executable documentation, run `scripts/run-tooling-tests.py --quick` once on

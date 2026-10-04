@@ -4,8 +4,9 @@ A check is one job name in one workflow, and its result is that of its latest
 run that passed or failed. A failed check therefore stays failed until a
 later dispatched run of the same job on the branch passes, so running more
 checks or pushing commits does not hide it. Runs still in progress do not
-count as failures. Used by scripts/branch-status.py, scripts/pr-checks.py,
-and the dispatched-checks commit status on pull requests.
+count as failures. An explicit resolution excuses only one PR's exact failed
+job; its original conclusion remains visible. Used by scripts/branch-status.py,
+scripts/pr-checks.py, and the dispatched-checks commit status on pull requests.
 """
 from concurrent.futures import ThreadPoolExecutor
 
@@ -99,6 +100,7 @@ def check_results(runs, jobs):
                     latest.get(key, ({}, {}))[0].get("conclusion") not in DECISIVE)):
                 latest[key] = job, run
     return [{"workflow": workflow, "job": name, "conclusion": job.get("conclusion"),
+             "job_id": job.get("databaseId"),
              "head": run.get("headSha") or "", "url": job.get("url") or run.get("url")}
             for (workflow, name), (job, run) in latest.items()]
 
@@ -110,6 +112,48 @@ def failed_checks(runs, jobs):
             if entry["conclusion"] in FAILED]
 
 
+def unresolved(entry):
+    return entry["conclusion"] in FAILED and not entry.get("resolution")
+
+
+def resolution_context(number, job_id):
+    return f"dispatched-resolution/{number}/{job_id}"
+
+
+def apply_resolutions(repository, number, results):
+    """Attach resolutions without changing test conclusions. Commit statuses
+    preserve the reason, author, time, and optional replacement link. The latest
+    status for a PR/job wins; any state other than success reopens the failure.
+    Old tooling ignores these separate contexts and keeps reporting failures.
+    """
+    heads = sorted({entry["head"] for entry in results if number and unresolved(entry)
+                    and entry.get("job_id")})
+
+    def statuses(head):
+        pages = json_output("gh", "api", f"repos/{repository}/commits/{head}/statuses?per_page=100",
+                            "--paginate", "--slurp", status=2)
+        latest = {}
+        # GitHub returns newest first, including across pages.
+        for page in pages:
+            for entry in page:
+                latest.setdefault(entry["context"], entry)
+        return latest
+
+    by_head = dict(zip(heads, in_parallel([lambda head=head: statuses(head) for head in heads])))
+    annotated = []
+    for entry in results:
+        resolution = by_head.get(entry["head"], {}).get(
+            resolution_context(number, entry.get("job_id")), {})
+        reason = (resolution.get("description") or "").strip()
+        if unresolved(entry) and resolution.get("state") == "success" and reason:
+            entry = dict(entry, resolution={
+                "reason": reason, "replacement": resolution.get("target_url"),
+                "actor": (resolution.get("creator") or {}).get("login"),
+                "created_at": resolution.get("created_at"), "url": resolution.get("url")})
+        annotated.append(entry)
+    return annotated
+
+
 def running(runs):
     return sorted((run for run in runs if run.get("status") != "completed"),
                   key=lambda run: run.get("createdAt") or "")
@@ -119,9 +163,18 @@ def result_lines(results, active):
     """Report lines for check results and unfinished runs, failures first."""
     labels = {"success": "passed", "failure": "failed", "timed_out": "timed out",
               "in_progress": "running"}
-    ordered = sorted(results, key=lambda entry: entry["conclusion"] not in FAILED)
-    lines = [f"  {labels.get(entry['conclusion'], entry['conclusion']):<8} {entry['workflow']} "
-             f"{entry['job']} at {entry['head'][:7]}  {entry['url']}" for entry in ordered]
+    ordered = sorted(results, key=lambda entry: not unresolved(entry))
+    lines = []
+    for entry in ordered:
+        resolution = entry.get("resolution")
+        label = "resolved" if resolution else labels.get(entry["conclusion"], entry["conclusion"])
+        lines.append(f"  {label:<8} {entry['workflow']} {entry['job']} at {entry['head'][:7]}  "
+                     f"{entry['url']}")
+        if resolution:
+            lines.append(f"    {entry['conclusion']}; resolved by {resolution['actor']} at "
+                         f"{resolution['created_at']}: {resolution['reason']}")
+            if resolution.get("replacement"):
+                lines.append(f"    replacement: {resolution['replacement']}")
     lines += [f"  {labels.get(run.get('status'), run.get('status') or 'unknown'):<8} "
               f"{run['workflow']} at {(run.get('headSha') or '')[:7]}  {run.get('url')}"
               for run in active]

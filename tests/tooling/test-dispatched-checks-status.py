@@ -43,7 +43,19 @@ elif args[:3] == ["api", "--method", "POST"]:
     fields = dict(value.split("=", 1) for value in args[5::2])
     with open(data / "posted.jsonl", "a") as posted:
         posted.write(json.dumps({"endpoint": args[3], **fields}) + "\\n")
+    path = data / ("statuses-" + args[3].rsplit("/", 1)[1] + ".json")
+    statuses = json.loads(path.read_text()) if path.exists() else []
+    statuses.insert(0, dict(fields, creator={"login": "maintainer"},
+                           created_at="2026-02-04T00:00:00Z", url="https://api.example/status/1"))
+    path.write_text(json.dumps(statuses))
     print("{}")
+elif args[0] == "api" and "/commits/" in args[1]:
+    path = data / ("statuses-" + args[1].split("/commits/")[1].split("/")[0] + ".json")
+    if (data / "fail-status-read").exists():
+        sys.exit("simulated status read failure")
+    statuses = json.loads(path.read_text()) if path.exists() else []
+    assert "--paginate" in args and "--slurp" in args
+    print(json.dumps([statuses[:100], statuses[100:]]))
 else:
     sys.exit(f"unexpected fake gh invocation: {args}")
 """
@@ -78,9 +90,9 @@ class DispatchedChecksStatusTests(unittest.TestCase):
             "createdAt": created, "status": status, "conclusion": conclusion,
             "url": f"https://example.invalid/runs/{run_id}"})
         (self.data / f"jobs-{run_id}.json").write_text(json.dumps({"jobs": [
-            {"name": name, "conclusion": conclusion,
+            {"name": name, "conclusion": conclusion, "databaseId": run_id * 100 + index,
              "url": f"https://example.invalid/runs/{run_id}/{name}"}
-            for name, conclusion in jobs.items()]}))
+            for index, (name, conclusion) in enumerate(jobs.items())]}))
 
     def post(self, *args, event=None, expected=0):
         (self.data / "prs.json").write_text(json.dumps(self.prs))
@@ -168,6 +180,71 @@ class DispatchedChecksStatusTests(unittest.TestCase):
     def test_closed_pull_requests_are_skipped(self):
         self.prs[0]["state"] = "MERGED"
         self.assertEqual(self.post("7"), [])
+
+    def test_resolve_reopen_and_new_failures(self):
+        self.dispatch(80, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
+        replacement = "https://example.invalid/runs/81"
+        reason = "Runner cannot create loop devices; replacement passed"
+        resolution, gate = self.post("7", "--resolve-job", "8000", "--reason", reason,
+                                     "--replacement", replacement)
+        self.assertEqual(resolution, {
+            "endpoint": f"repos/{REPOSITORY}/statuses/{'b' * 40}",
+            "context": "dispatched-resolution/7/8000", "state": "success",
+            "description": reason, "target_url": replacement})
+        self.assertEqual(gate["state"], "success")
+        self.assertIn("1 resolved", gate["description"])
+        # Later gate evaluations retain the resolution without changing the job.
+        self.assertEqual(self.post("7")[0]["state"], "success")
+        self.assertEqual(json.loads((self.data / "jobs-80.json").read_text())["jobs"][0]
+                         ["conclusion"], "failure")
+        # Other failures remain blocking.
+        self.dispatch(81, "2026-02-02T00:00:00Z", {"rust": "failure"})
+        self.assertEqual(self.post("7")[0]["description"], "1 failed: ci.yml rust")
+        _, gate = self.post("7", "--reopen-job", "8000", "--reason", "Coverage still needed")
+        self.assertTrue(gate["description"].startswith("2 failed:"))
+        self.post("7", "--resolve-job", "8000", "--reason", reason)
+        # A rerun gets a new job ID even on the same SHA and with the same name.
+        self.dispatch(82, "2026-02-03T00:00:00Z", {"btrfs": "failure", "rust": "success"})
+        self.assertEqual(self.post("7")[0]["description"], "1 failed: ci.yml btrfs")
+
+    def test_resolution_is_scoped_to_pr_and_paginated_newest_wins(self):
+        self.dispatch(83, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
+        self.post("7", "--resolve-job", "8300", "--reason", "Mistaken fixture removed")
+        self.prs[0]["number"] = 8
+        self.assertEqual(self.post("8")[0]["state"], "failure")
+        self.prs[0]["number"] = 7
+        path = self.data / f"statuses-{'b' * 40}.json"
+        statuses = json.loads(path.read_text())
+        noise = [{"context": f"unrelated/{i}", "state": "success"} for i in range(101)]
+        path.write_text(json.dumps(noise + statuses))
+        self.assertEqual(self.post("7")[0]["state"], "success")
+        self.post("7", "--reopen-job", "8300", "--reason", "Wrong resolution")
+        self.assertEqual(self.post("7")[0]["state"], "failure")
+
+    def test_resolution_requires_reason_and_current_failed_job_of_open_pr(self):
+        self.dispatch(84, "2026-02-01T00:00:00Z", {"btrfs": "failure", "rust": "success"})
+        for options in (["--resolve-job", "8400"],
+                        ["--resolve-job", "8400", "--reason", " "],
+                        ["--resolve-job", "8400", "--reason", "x" * 141],
+                        ["--resolve-job", "8400", "--reason", "two\nlines"],
+                        ["--reason", "not an action"],
+                        ["--resolve-job", "-1", "--reason", "invalid id"]):
+            with self.subTest(options=options):
+                self.assertEqual(self.post("7", *options, expected=2), [])
+        for job in ("8401", "9999"):
+            self.assertEqual(self.post("7", "--resolve-job", job, "--reason", "not failed",
+                                       expected=1), [])
+        self.prs[0]["isCrossRepository"] = True
+        self.assertEqual(self.post("7", "--resolve-job", "8400", "--reason", "fork",
+                                   expected=1), [])
+        self.prs[0]["state"] = "MERGED"
+        self.assertEqual(self.post("7", "--resolve-job", "8400", "--reason", "closed",
+                                   expected=2), [])
+
+    def test_unreadable_resolutions_do_not_post_a_passing_gate(self):
+        self.dispatch(85, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
+        (self.data / "fail-status-read").touch()
+        self.assertEqual(self.post("7", expected=1), [])
 
 
 if __name__ == "__main__":

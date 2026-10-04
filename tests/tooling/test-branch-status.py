@@ -15,6 +15,10 @@ PR_CHECKS = SCRIPTS / "pr-checks.py"
 
 FAKE_GH = """#!/bin/sh
 case "$1:$2" in
+  api:repos/*/commits/*)
+    file="$SYQ_TEST_RUNS_DIR/statuses.json"
+    if [ -f "$file" ]; then cat "$file"; else echo '[[]]'; fi
+    ;;
   run:list)
     shift 2
     workflow=
@@ -147,9 +151,9 @@ class BranchStatusTests(unittest.TestCase):
         (self.runs / f"{workflow}.workflow_dispatch.json").write_text(
             json.dumps(self.dispatched[workflow]))
         (self.runs / f"jobs-{run_id}.json").write_text(json.dumps({"jobs": [
-            {"name": name, "conclusion": conclusion,
+            {"name": name, "conclusion": conclusion, "databaseId": run_id * 100 + index,
              "url": f"https://example.invalid/runs/{run_id}/{name}"}
-            for name, conclusion in jobs.items()]}))
+            for index, (name, conclusion) in enumerate(jobs.items())]}))
 
     def full_run(self, workflow, run_id, created, event="schedule", jobs=None):
         """Add a successful run on master with the given (default certified) jobs,
@@ -529,6 +533,40 @@ class BranchStatusTests(unittest.TestCase):
     def test_pr_checks_of_a_fork_lists_nothing(self):
         self.dispatch("ci.yml", 81, "2026-02-01T00:00:00Z", {"s3": "failure"})
         self.assertIn("unfinished runs):\n  none\n", self.pr_checks(isCrossRepository=True))
+
+    def test_resolutions_are_visible_in_both_reports_and_keep_the_failed_conclusion(self):
+        self.dispatch("focused-check.yml", 86, "2026-02-01T00:00:00Z", {"btrfs": "failure"})
+        resolution = {"context": "dispatched-resolution/7/8600", "state": "success",
+                      "description": "Mistaken runner setup; replacement passed",
+                      "creator": {"login": "maintainer"}, "created_at": "2026-02-02T00:00:00Z",
+                      "target_url": "https://example.invalid/replacement"}
+        (self.runs / "statuses.json").write_text(json.dumps([[resolution]]))
+        branch = json.loads(self.status("--json", pr=self.pr))
+        pr = json.loads(self.pr_checks("--json"))
+        self.assertEqual(branch["dispatched"]["results"], pr["results"])
+        self.assertEqual(branch["dispatched"]["failed"], [])
+        [entry] = pr["results"]
+        self.assertEqual(entry["conclusion"], "failure")
+        self.assertEqual(entry["resolution"]["reason"], resolution["description"])
+        self.assertEqual(entry["resolution"]["actor"], "maintainer")
+        for report in (self.status(pr=self.pr), self.pr_checks()):
+            self.assertIn("  resolved focused-check.yml btrfs", report)
+            self.assertIn("failure; resolved by maintainer at 2026-02-02", report)
+            self.assertIn(resolution["description"], report)
+            self.assertIn("replacement: https://example.invalid/replacement", report)
+        self.dispatch("ci.yml", 87, "2026-02-03T00:00:00Z", {"rust": "failure"})
+        self.assertIn("WARNING", self.status(pr=self.pr, expected=1))
+        self.assertEqual(json.loads(self.pr_checks("--json", expected=1))["exit_status"], 1)
+
+    def test_resolved_merged_failure_does_not_return_as_a_warning(self):
+        self.dispatch("focused-check.yml", 88, "2026-02-01T00:00:00Z", {"btrfs": "failure"},
+                      branch="merged-task")
+        self.merged = [{"number": 8, "url": "https://example.invalid/pull/8",
+                        "headRefName": "merged-task", "mergedAt": "2026-02-02T00:00:00Z"}]
+        (self.runs / "statuses.json").write_text(json.dumps([[{
+            "context": "dispatched-resolution/8/8800", "state": "success",
+            "description": "Mistaken fixture removed"}]]))
+        self.assertNotIn("NOTE: #8", self.status())
 
 
 if __name__ == "__main__":

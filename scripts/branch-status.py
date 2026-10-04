@@ -15,7 +15,8 @@ and GitHub state. With --check it also runs the fixed Rust baseline (fmt,
 clippy, unit tests) in this worktree.
 
 A job that failed in a run dispatched on this branch stays a failure until a
-later dispatched run of the same job on the branch passes. Runs still in
+later dispatched run of the same job on the branch passes or that exact failed
+job is explicitly resolved. Resolutions remain visible in the report. Runs in
 progress at a merge keep running, so a failure left on a merged branch is
 reported until the next successful full-suite run of that workflow on master.
 
@@ -34,9 +35,10 @@ import shutil
 import subprocess
 import sys
 
-from dispatched_checks import (BRANCH_WORKFLOWS, branch_runs, check_results, dispatched_runs,
-                               failed_checks, fetch_jobs, in_parallel, merged_from_branch,
-                               merged_pull_requests, result_lines, run_jobs, running, undecided)
+from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
+                               dispatched_runs, failed_checks, fetch_jobs, in_parallel,
+                               merged_from_branch, merged_pull_requests, result_lines, run_jobs,
+                               running, undecided, unresolved)
 from tooling import ToolError, json_output, output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -236,15 +238,18 @@ def report(json_report, check):
     # Every run on this branch is listed; merged branches only need their failures.
     jobs = fetch_jobs(REPOSITORY, own_runs + [run for _, pr_runs in merged_runs
                                               for run in undecided(pr_runs)])
-    branch_results = check_results(own_runs, jobs)
-    branch_failed = failed_checks(own_runs, jobs)
+    branch_results = apply_resolutions(REPOSITORY, pr["number"] if pr else None,
+                                      check_results(own_runs, jobs))
+    branch_failed = [entry for entry in branch_results if unresolved(entry)]
     branch_running = running(own_runs)
     for entry in branch_failed:
         warn(f"{entry['workflow']} {entry['job']} {entry['conclusion']} at {entry['head'][:7]} on "
              f"this branch, and no later run passed it {entry['url']}")
     merged_failed = []
     for merged_pr, pr_runs in merged_runs:
-        for entry in failed_checks(pr_runs, jobs):
+        for entry in apply_resolutions(REPOSITORY, merged_pr["number"], failed_checks(pr_runs, jobs)):
+            if not unresolved(entry):
+                continue
             merged_failed.append(dict(entry, number=merged_pr.get("number"),
                                       pull_request=merged_pr.get("url")))
             note(f"#{merged_pr.get('number')} merged with {entry['workflow']} {entry['job']} "
