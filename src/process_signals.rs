@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 struct State {
     signal: i32,
     owners: AtomicUsize,
-    fallback: OnceLock<io::Result<signal_hook::SigId>>,
+    fallback: OnceLock<io::Result<Option<signal_hook::SigId>>>,
 }
 impl State {
     const fn new(signal: i32) -> Self {
@@ -21,7 +21,7 @@ impl State {
             fallback: OnceLock::new(),
         }
     }
-    fn install(&'static self) -> io::Result<()> {
+    fn install(&'static self) -> io::Result<bool> {
         let result = self.fallback.get_or_init(|| {
             // Preserve inherited ignore/custom dispositions. signal-hook
             // already chains a previous custom handler; only an original
@@ -29,6 +29,11 @@ impl State {
             let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
             if unsafe { libc::sigaction(self.signal, std::ptr::null(), &mut previous) } < 0 {
                 return Err(io::Error::last_os_error());
+            }
+            // Leave SIG_IGN installed: replacing it with a caught handler
+            // would reset it to SIG_DFL when an owned child execs (nohup).
+            if previous.sa_sigaction == libc::SIG_IGN {
+                return Ok(None);
             }
             let default = previous.sa_sigaction == libc::SIG_DFL;
             // The action uses only atomics and signal-hook's signal-safe
@@ -39,9 +44,10 @@ impl State {
                         let _ = signal_hook::low_level::emulate_default_handler(self.signal);
                     }
                 })
+                .map(Some)
             }
         });
-        result.as_ref().map(|_| ()).map_err(|error| {
+        result.as_ref().map(Option::is_none).map_err(|error| {
             error
                 .raw_os_error()
                 .map(io::Error::from_raw_os_error)
@@ -52,6 +58,12 @@ impl State {
 static INTERRUPT: State = State::new(libc::SIGINT);
 static TERMINATE: State = State::new(libc::SIGTERM);
 static HANGUP: State = State::new(libc::SIGHUP);
+
+/// An inherited ignored hangup applies to the operation and its exec children.
+/// Callers must omit HUP listeners in this case, including wakeup-only handlers.
+pub(crate) fn inherited_hangup_is_ignored() -> io::Result<bool> {
+    HANGUP.install()
+}
 
 pub(crate) struct Owned<T> {
     listeners: T,
@@ -201,12 +213,15 @@ mod tests {
                 let flag = Arc::new(AtomicBool::new(false));
                 let owner = owned(&[libc::SIGHUP], || {
                     let mut registrations = Registrations::default();
-                    registrations.push(signal_hook::flag::register(libc::SIGHUP, flag.clone())?);
+                    if !inherited_hangup_is_ignored()? {
+                        registrations
+                            .push(signal_hook::flag::register(libc::SIGHUP, flag.clone())?);
+                    }
                     Ok(registrations)
                 })
                 .unwrap();
                 assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-                assert!(flag.load(Ordering::Acquire));
+                assert!(!flag.load(Ordering::Acquire));
                 drop(owner);
                 assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
                 drop(initial);

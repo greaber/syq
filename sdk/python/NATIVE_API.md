@@ -60,7 +60,7 @@ Use `src=["a", "b"]` for CLI `--srcs a b`, and likewise `src_non_dir` and `src_d
 | `cwd` | Source resolution base; may be remote for `cp` and `rm` |
 | `root` | Confine source resolution beneath this directory; requires relative selectors; conflicts with `cwd` |
 | `follow`, `follow_src` | Follow source symlinks; `follow` also enables destination following for `cp` |
-| `auth_from` | `"auto"`, `"ssh"`, or `"@NAME"`; `rm` and `map` reuse existing approved SSH account access; `cp` and S3 `rm` can request operation authorization |
+| `auth_from` | `"auto"`, `"ssh"`, `"@NAME"`, or an SSH provider endpoint; SSH operations request or reuse account access. S3 `cp` and `rm` can request operation authorization through `"@NAME"` |
 | `timeout` | Omitted: use client default; `None`: no timeout; number: timeout in seconds |
 
 Boolean flags default to `False`; other optional arguments default to `None`,
@@ -152,7 +152,7 @@ returns a `StreamReader`. `cwd` resolves relative sources; `root` also confines
 them. Choose at most one, as with `cp`. These bases belong to the source
 endpoint, independently of the client's local `process_cwd`. Both accept `rsh`,
 `syq_path`, `pscope`, `no_bootstrap`, `no_compress`, `no_tcp`, `no_tcp_encryption`,
-`tcp_ports`, `tcp_congestion`, `auth_from` (S3 or an already approved SSH account), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
+`tcp_ports`, `tcp_congestion`, `auth_from` (S3 authorization or requested/reused SSH account access), `s3_endpoint`, `s3_region`, `s3_profile`, `s3_header`,
 `performance_tuning`, `resource_limits`, `integrity_checking`, `if_exists`,
 `dry_run`, `stats`, `verbose`, `quiet`, `progress`, `no_progress`,
 and `timeout` with the same meanings as `cp`. `open_writer` also accepts

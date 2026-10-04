@@ -25,24 +25,27 @@ impl Signals {
         let (wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
         wake.set_nonblocking(true)?;
         let received = Arc::new(AtomicUsize::new(0));
-        let registrations =
-            crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], || {
-                let mut registrations = crate::process::signals::Registrations::default();
-                for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                    registrations.push(signal_hook::flag::register_usize(
-                        signal,
-                        received.clone(),
-                        signal as usize,
-                    )?);
-                }
-                for signal in [libc::SIGCHLD, libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                    registrations.push(signal_hook::low_level::pipe::register(
-                        signal,
-                        sender.try_clone()?,
-                    )?);
-                }
-                Ok(registrations)
-            })?;
+        let mut termination = vec![libc::SIGINT, libc::SIGTERM];
+        if !crate::process::signals::inherited_hangup_is_ignored()? {
+            termination.push(libc::SIGHUP);
+        }
+        let registrations = crate::process::signals::owned(&termination, || {
+            let mut registrations = crate::process::signals::Registrations::default();
+            for signal in termination.iter().copied() {
+                registrations.push(signal_hook::flag::register_usize(
+                    signal,
+                    received.clone(),
+                    signal as usize,
+                )?);
+            }
+            for signal in std::iter::once(libc::SIGCHLD).chain(termination.iter().copied()) {
+                registrations.push(signal_hook::low_level::pipe::register(
+                    signal,
+                    sender.try_clone()?,
+                )?);
+            }
+            Ok(registrations)
+        })?;
         let guard = Self {
             received,
             _registrations: registrations,
@@ -104,6 +107,43 @@ impl<'a> ForegroundChild<'a> {
             self.status = self.child.try_wait()?;
         }
         Ok(self.status)
+    }
+
+    fn follow_terminal_stop(&self) -> std::io::Result<()> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Consume only a stop notification; Child remains the sole owner of
+        // exit/reaping. OpenSSH's ~^Z stops its own PID, not the whole job.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WNOHANG,
+            )
+        } < 0
+        {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        if info.si_signo != 0 {
+            // Once both wrapper and SSH are stopped, the invoking shell can
+            // reclaim its terminal. On fg/bg it normally resumes the group;
+            // also resume SSH if only this wrapper received SIGCONT.
+            if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { libc::kill(self.child.id() as i32, libc::SIGCONT) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn stop(&mut self, signal: i32) -> std::io::Result<()> {
@@ -247,6 +287,9 @@ fn run_inner(
                 .context("stop revoked SSH session")?;
             bail!("SSH authorization was revoked or its receiving connection ended");
         }
+        child
+            .follow_terminal_stop()
+            .context("follow SSH terminal suspension")?;
         // SIGCHLD wakes completed commands immediately; only return-channel
         // revocation relies on the bounded timeout.
         signals
@@ -264,6 +307,168 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use std::process::Stdio;
+
+    const SUBPROCESS: &str = "SYQ_TEST_FOREGROUND_SIGNAL";
+    const SUBPROCESS_TEST: &str = "destination::ssh::foreground::tests::signal_subprocess";
+
+    fn subprocess(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", SUBPROCESS_TEST, "--nocapture"])
+            .env(SUBPROCESS, mode);
+        command
+    }
+
+    #[test]
+    fn signal_subprocess() {
+        let Ok(mode) = std::env::var(SUBPROCESS) else {
+            return;
+        };
+        match mode.as_str() {
+            "nohup" => {
+                let mut command = Command::new("sh");
+                command.args(["-c", "kill -HUP $PPID; kill -HUP $$; exit 17"]);
+                assert_eq!(run(&mut command, || false).unwrap(), 17);
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+            }
+            "terminal-child" => {
+                assert_eq!(unsafe { libc::isatty(libc::STDIN_FILENO) }, 1);
+                assert_eq!(unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) }, unsafe {
+                    libc::getpgrp()
+                });
+                // This is the same self-directed stop as OpenSSH's ~^Z.
+                assert_eq!(unsafe { libc::raise(libc::SIGTSTP) }, 0);
+            }
+            "terminal-wrapper" => {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) != libc::getpgrp() } {
+                    assert!(
+                        Instant::now() < deadline,
+                        "driver never selected the wrapper foreground group"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(run(&mut subprocess("terminal-child"), || false).unwrap(), 0);
+            }
+            "terminal-driver" => {
+                use std::os::unix::process::CommandExt as _;
+                let mut command = subprocess("terminal-wrapper");
+                command.stdout(Stdio::null()).stderr(Stdio::inherit());
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::signal(libc::SIGTSTP, libc::SIG_DFL) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let mut wrapper = crate::process::group::ProcessGroup::spawn(&mut command).unwrap();
+                let pid = wrapper.child.id() as i32;
+                fs::write(
+                    std::env::var("SYQ_TEST_FOREGROUND_PID").unwrap(),
+                    pid.to_string(),
+                )
+                .unwrap();
+                assert_eq!(unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, pid) }, 0);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    assert_eq!(
+                        unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                pid as libc::id_t,
+                                &mut info,
+                                libc::WSTOPPED | libc::WNOHANG,
+                            )
+                        },
+                        0
+                    );
+                    if info.si_signo != 0 {
+                        break;
+                    }
+                    assert!(
+                        wrapper.poll().unwrap().is_none(),
+                        "foreground wrapper exited without suspending"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "wrapper did not suspend after its SSH child stopped"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(unsafe { libc::kill(-pid, libc::SIGCONT) }, 0);
+                loop {
+                    if let Some(status) = wrapper.poll().unwrap() {
+                        assert!(status.success(), "resumed wrapper failed: {status}");
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "resumed wrapper did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            _ => panic!("unknown foreground signal fixture"),
+        }
+    }
+
+    #[test]
+    fn nohup_preserves_ignored_hangup_during_foreground_ownership_and_exec() {
+        let mut command = Command::new("nohup");
+        command
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", SUBPROCESS_TEST, "--nocapture"])
+            .env(SUBPROCESS, "nohup");
+        let output = crate::process::capture_output_bounded(
+            &mut command,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            64 * 1024,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "status={}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn terminal_child_suspension_stops_and_resumes_the_foreground_wrapper() {
+        let root = crate::test_support::tempdir().unwrap();
+        let pid_path = root.path().join("wrapper-pid");
+        let mut command = subprocess("terminal-driver");
+        command
+            .env("SYQ_TEST_FOREGROUND_PID", &pid_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let lifetime = super::super::master_lifetime::attach(&mut command).unwrap();
+        let mut driver = command.spawn_guarded().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = driver.try_wait().unwrap() {
+                assert!(status.success(), "terminal driver failed: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                // Dispose of the separately owned foreground group before its
+                // session leader on a fixture failure, including stopped jobs.
+                if let Ok(pid) = fs::read_to_string(&pid_path)
+                    .and_then(|s| s.parse::<i32>().map_err(std::io::Error::other))
+                {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                driver.kill().unwrap();
+                driver.wait().unwrap();
+                panic!("terminal suspension driver timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(lifetime);
+    }
 
     #[test]
     fn binary_input_eof_outputs_and_exit_status_reach_the_native_child() {

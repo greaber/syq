@@ -380,8 +380,10 @@ account permission. Explicit restricted-copy grants retain their own scope.
 laptop-to-source receiving connection. **Remember** permits future authentications
 through the same profile in the same authorizing domain while the laptop is
 available. The permission binds
-resolved accounts and endpoints to the laptop's trusted plain SSH host keys;
-changed identities require fresh approval. The source connection is pinned to
+the selected account and connection route to the provider's trusted host name and
+plain SSH host keys; changed identities require fresh approval. The approval
+identifies the host using the provider's trust lookup and shows the
+requester-supplied connection address separately. The source connection is pinned to
 that identity when it starts. Unsupported source identity lookup does not affect
 ordinary receiving, but account authorization requires a supported trusted identity.
 

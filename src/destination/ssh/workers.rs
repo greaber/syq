@@ -32,8 +32,9 @@ impl fmt::Debug for Authorization {
     }
 }
 
-/// Authorization failures are deterministic for this frozen copy selection.
-/// Connection retry code must not turn them into repeated provider requests.
+/// Definitive authorization failures for this frozen copy selection must not
+/// become repeated provider requests. Transient setup failures remain ordinary
+/// connection errors and use the existing bounded connection retry policy.
 #[derive(Debug)]
 pub(crate) struct AuthorizationError(pub(crate) anyhow::Error);
 impl fmt::Display for AuthorizationError {
@@ -48,6 +49,32 @@ impl fmt::Display for AuthorizationError {
 impl std::error::Error for AuthorizationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
+    }
+}
+
+fn classify_setup_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<AuthorizationError>()) {
+        return error;
+    }
+    let transient = error.chain().any(|cause| {
+        cause.is::<ssh_auth::RetryableSetupError>()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+    });
+    if transient {
+        error
+    } else {
+        AuthorizationError(error).into()
     }
 }
 
@@ -106,8 +133,7 @@ impl Authorization {
     }
 
     pub(crate) fn begin(&self) -> Result<Login> {
-        self.begin_inner()
-            .map_err(|error| AuthorizationError(error).into())
+        self.begin_inner().map_err(classify_setup_error)
     }
 
     fn begin_inner(&self) -> Result<Login> {
@@ -148,7 +174,14 @@ fn worker_command(
         .args(options)
         .args(["-o", crate::conn::CIPHERS])
         // Helper traffic is binary even if the alias normally opens a shell.
-        .args(["-o", "RemoteCommand=none", "-T", "--"])
+        .args([
+            "-o",
+            "ForkAfterAuthentication=no",
+            "-o",
+            "RemoteCommand=none",
+            "-T",
+            "--",
+        ])
         .arg(&local.requested.host);
     // Arbitrary ProxyCommand authentication stays local. The provider socket
     // appears only as OpenSSH's IdentityAgent option, never in its environment.
@@ -307,13 +340,16 @@ mod tests {
     #[test]
     fn independent_worker_keeps_alias_and_pinned_route_without_master_reuse() {
         let local = local();
+        let root = crate::test_support::tempdir().unwrap();
+        let config = root.path().join("config");
+        std::fs::write(&config, "Host *\n ForkAfterAuthentication yes\n").unwrap();
         let mut command = worker_command(
             &local,
             None,
             vec![
                 "-G".into(),
                 "-F".into(),
-                "/dev/null".into(),
+                config.into_os_string(),
                 "-o".into(),
                 "ControlMaster=no".into(),
                 "-o".into(),
@@ -335,6 +371,7 @@ mod tests {
             "port 2200",
             "controlmaster false",
             "requesttty false",
+            "forkafterauthentication no",
         ] {
             assert!(
                 resolved.lines().any(|value| value == line),
@@ -362,6 +399,52 @@ mod tests {
         assert!(command
             .get_args()
             .any(|arg| arg == "ProxyCommand=ssh -S /private/control -W '[target]:22' jump"));
+    }
+
+    #[test]
+    fn worker_setup_retries_transport_and_capacity_but_not_policy_or_cancellation() {
+        fn retryable(error: anyhow::Error) -> bool {
+            !classify_setup_error(error)
+                .chain()
+                .any(|cause| cause.is::<AuthorizationError>())
+        }
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error =
+                anyhow::Error::new(std::io::Error::from(kind)).context("provider transport setup");
+            assert!(retryable(error), "{kind:?}");
+        }
+        assert!(retryable(
+            ssh_auth::RetryableSetupError("capacity exhausted".into()).into()
+        ));
+        for message in [
+            "the account grant ended",
+            "provider configuration changed",
+            "SSH data authorization ended before use",
+        ] {
+            assert!(!retryable(anyhow::anyhow!(message)));
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidData,
+            // Bounded policy inspection uses this for explicit cancellation.
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(!retryable(std::io::Error::from(kind).into()), "{kind:?}");
+        }
+        // Once the helper has authenticated, cancellation stays definitive
+        // even if its error chain happens to include a transport error.
+        assert!(!retryable(
+            AuthorizationError(std::io::Error::from(std::io::ErrorKind::TimedOut).into()).into()
+        ));
     }
 
     fn exited_without_reaping(child: &std::process::Child) -> bool {

@@ -374,12 +374,23 @@ pub(crate) struct Session {
     setup: Mutex<SetupMemo>,
 }
 
+/// An explicit remote refusal cannot improve during this copy. Transport
+/// failures remain ordinary errors so a lost setup reply can be retried.
+#[derive(Debug)]
+pub(crate) struct SetupRefusal(pub(crate) String);
+impl std::fmt::Display for SetupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SetupRefusal {}
+
 #[derive(Default)]
-struct SetupMemo {
+pub(in crate::destination) struct SetupMemo {
     completed: Option<(String, std::result::Result<Peer, String>)>,
 }
 impl SetupMemo {
-    fn resolve(
+    pub(in crate::destination) fn resolve(
         &mut self,
         public_key: &str,
         setup: impl FnOnce() -> Result<std::result::Result<Peer, String>>,
@@ -392,7 +403,7 @@ impl SetupMemo {
         }
         let (selected, result) = self.completed.as_ref().unwrap();
         anyhow::ensure!(selected == public_key, "copy SSH key was already selected");
-        result.clone().map_err(anyhow::Error::msg)
+        result.clone().map_err(|error| SetupRefusal(error).into())
     }
 }
 

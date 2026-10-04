@@ -108,9 +108,9 @@ without retrying it.
 Copies selecting the matching provider, explicitly or through a saved choice,
 can reuse the login, including SSH data in either direction with `--no-tcp`.
 Copies between this machine and one server use full account access without a
-per-copy grant. With `@NAME`, asking for a receiver receipt selects per-copy
-authorization instead; ordinary SSH providers do not support that route. Direct copies between two other
-servers can use approved connections to both endpoints and give the source only
+per-copy grant. `--receiver-receipt` applies only to direct copies between two
+remote endpoints. Direct copies between two other servers can use approved
+connections to both endpoints and give the source only
 [this copy's destination access](remote-reference.md#approved-account-copies).
 An explicit `--coordinate-at local` can also reuse account connections for both
 endpoints. An explicit scope selects account connections in that domain.
@@ -132,8 +132,9 @@ permission stops the copy. An agent that requires confirmation or a hardware-key
 touch can require it for each connection. TCP workers do not need these extra
 SSH authentications.
 
-As with ordinary persistence, syq keeps a helper session ready for remote path
-completion. A warm lookup uses one network round trip for names and metadata.
+As with ordinary persistence, syq can prepare a helper after a remote operation
+or path completion, keeping it ready for the next operation. A warm completion
+lookup uses one network round trip for names and metadata.
 That ready helper occupies one session on the shared connection; shells and
 other tools using the same connection still share its server session limit.
 With `MaxSessions 1`, a ready helper leaves no session slot for a shell or
@@ -155,17 +156,7 @@ authentication. Export again after reconnecting. The output contains no private
 key; syq writes only a temporary socket alias inside the connection's scope.
 
 Connection records and resolution metadata live in the selected domain's
-runtime directory, separately from ordinary SSH connections. Existing
-connection records remain readable. Connections opened by older builds without
-provider binding remain visible and can be exported explicitly with `ssh-config`.
-Ordinary commands request a new bound login before reusing that access;
-completion waits until an ordinary command has prepared it.
-Use a current syq client to close these connections: older clients may not manage
-account connections opened while ordinary persistence is off.
-
-Copies between two other servers need the trusted host information saved with
-the approved connection. A connection opened by a build that did not save it
-still works for ordinary commands; reconnect it to use this copy route.
+runtime directory, separately from ordinary SSH connections.
 
 ## Account permissions
 
@@ -230,8 +221,8 @@ can be saved.
 
 `receive on --name NAME` creates a profile or updates that name's settings;
 omitted options keep their saved values. It enables persistence in the selected
-domain and applies the profile to active and future connections. Only endpoints
-supplied with `--connection` in this invocation are connected explicitly; the
+domain and applies the profile to allowed active and future connections. Only
+endpoints supplied with `--connection` in this invocation are connected explicitly; the
 command waits for receiving to become ready on those endpoints. If one fails,
 the settings stay saved and healthy connections keep running, but the command
 exits unsuccessfully. Without `--connection`, saved endpoints remain the

@@ -57,7 +57,7 @@ enum PersistAction {
         /// SSH endpoint ([USER@]HOST[:PORT]); receiving names are not accepted
         host: String,
         /// Authorize a reusable destination-account login through @NAME or an SSH provider
-        #[arg(long, value_name = "auto|ssh|@NAME|HOST", conflicts_with_all = ["syq_path", "no_bootstrap"])]
+        #[arg(long, value_name = "auto|ssh|@NAME|HOST")]
         auth_from: Option<String>,
         /// Use this remote syq executable instead of installing a matching helper
         #[arg(long, value_name = "PATH", conflicts_with = "no_bootstrap")]
@@ -66,7 +66,7 @@ enum PersistAction {
         #[arg(long)]
         no_bootstrap: bool,
         /// Wait this many seconds for receiving after SSH/helper setup
-        #[arg(long, default_value_t = 30, conflicts_with = "auth_from", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
     },
     /// Enable persistent connections for later syq commands
@@ -301,12 +301,17 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     if json {
                         println!(
                             "{}",
-                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": [], "authorized_ssh": authorized})
+                            serde_json::json!({"enabled": enabled, "scope": scope, "connections": [], "authorized_ssh": authorized.rows, "authorized_ssh_errors": authorized.errors})
                         );
                     } else {
                         crate::output::human_stdout!("connections: 0");
-                        crate::destination::ssh::persistent::print_status(&authorized);
+                        crate::destination::ssh::persistent::print_status(&authorized.rows);
                     }
+                    anyhow::ensure!(
+                        authorized.errors.is_empty(),
+                        "{}",
+                        authorized.errors.join("; ")
+                    );
                 }
                 Err(error) => {
                     return Err(error)
@@ -1017,8 +1022,14 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             serde_json::json!({
                 "enabled": domain.enabled()?,
                 "scope": scope, "connections": connections, "receiving_error": receiving_error,
-                "authorized_ssh": authorized_ssh,
+                "authorized_ssh": authorized_ssh.rows,
+                "authorized_ssh_errors": authorized_ssh.errors,
             })
+        );
+        anyhow::ensure!(
+            authorized_ssh.errors.is_empty(),
+            "{}",
+            authorized_ssh.errors.join("; ")
         );
         return Ok(());
     }
@@ -1027,7 +1038,7 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
         crate::output::human_stdout!("Receiving configuration failed: {error}");
     }
     crate::output::human_stdout!("connections: {}", connections.len());
-    crate::destination::ssh::persistent::print_status(&authorized_ssh);
+    crate::destination::ssh::persistent::print_status(&authorized_ssh.rows);
     for connection in connections {
         let mut line = format!("  {}", connection.endpoint);
         if !connection.ssh_options.is_empty() {
@@ -1078,6 +1089,11 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
         }
         crate::output::human_stdout!("{line}");
     }
+    anyhow::ensure!(
+        authorized_ssh.errors.is_empty(),
+        "{}",
+        authorized_ssh.errors.join("; ")
+    );
     Ok(())
 }
 

@@ -925,6 +925,17 @@ impl Queue {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
         let target = account.destination.label();
+        let removal = match self.domain.explicit_path() {
+            None => "syq persist receive permissions remove ID".into(),
+            Some(scope) => match scope.to_str() {
+                Some(scope) => format!(
+                    "syq persist --pscope {} receive permissions remove ID",
+                    shell_words::quote(scope)
+                ),
+                None => "syq persist receive permissions remove ID with the same --pscope argument"
+                    .into(),
+            },
+        };
         self.wait_decision(Summary {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
             from: format!("{:?}", from.to_string()), server: from.server.clone(),
@@ -934,10 +945,10 @@ impl Queue {
             preposition: "to", target: target.clone(),
             notes: vec![
                 "Allow grants account access until this laptop's receiving connection to the source ends. It is not limited to the displayed command.".into(),
-                "Remember also permits future authentications for these accounts through this receiving profile while the laptop is available. Remove it with syq persist receive permissions remove ID; already authenticated sessions may continue.".into(),
+                format!("Remember also permits future authentications for these accounts through this receiving profile while the laptop is available. Remove it with {removal}; already authenticated sessions may continue."),
             ],
-            details: Details::Ssh { kind: SshKind::Ssh, reusable: true, destination: target,
-                permission: format!("{} may use this destination account's full authority for commands and copies. Allow lasts until this laptop's receiving connection to the source ends. Remember also permits future authentications for these accounts through profile @{} while the laptop is available. Removing a remembered permission stops future authentications; already authenticated sessions may continue. Copy roots and limits do not apply. Session traffic travels directly between the servers.", account.source.label(), account.profile),
+            details: Details::Ssh { kind: SshKind::Ssh, reusable: true, destination: target.clone(),
+                permission: format!("Provider-trusted host: {}. Requester-supplied connection route: {}. {} may use this destination account's full authority for commands and copies. Allow lasts until this laptop's receiving connection to the source ends. Remember also permits future authentications for these accounts through profile @{} while the laptop is available. Removing a remembered permission stops future authentications; already authenticated sessions may continue. Copy roots and limits do not apply. Session traffic travels directly between the servers.", target, account.destination.route_label(), account.source.label(), account.profile),
                 account: Some(account.clone()),
             },
         }, notifications, TIMEOUT, cancelled)
@@ -958,7 +969,7 @@ impl Queue {
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
         let target = account.destination.label();
         let origin = account.provider.label();
-        let authority = "May use this destination account's full authority for commands and copies. Copy roots and limits do not apply; the displayed command is context, not a restriction.";
+        let authority = format!("Provider-trusted host: {target}. Requester-supplied connection route: {}. May use this destination account's full authority for commands and copies. Copy roots and limits do not apply; the displayed command is context, not a restriction.", account.destination.route_label());
         let allow = "Allow lasts for this provider-issued authorization session.";
         let remember = format!("Remember also permits future SSH logins to this provider account through profile @{} to request the same destination account. It does not identify a requesting source machine. Removing a remembered permission requires new approval for future authentications; already authenticated sessions may continue.", account.profile);
         let identity = format!(
@@ -966,7 +977,7 @@ impl Queue {
             account.provider.receiver_identity
         );
         let mut notes = vec![
-            authority.into(),
+            authority.clone(),
             allow.into(),
             remember.clone(),
             identity.clone(),
@@ -2079,6 +2090,59 @@ mod tests {
         };
         AccountPermission::new("laptop".into(), identity("source"), identity("destination"))
             .unwrap()
+    }
+
+    #[test]
+    fn account_prompt_uses_provider_trust_name_and_separately_identifies_requester_route() {
+        for provider in [false, true] {
+            let queue = Arc::new(Queue::default());
+            let waiter = queue.clone();
+            let task = std::thread::spawn(move || {
+                let mut account = account_permission();
+                account.destination.endpoint.host = "staging.example".into();
+                account.destination = account
+                    .destination
+                    .with_trusted_host("production.example")
+                    .unwrap();
+                if provider {
+                    let mut permission = provider_permission();
+                    permission.destination = account.destination;
+                    waiter.request_provider_account(
+                        &[],
+                        "",
+                        &permission,
+                        Notifications::Off,
+                        || false,
+                    )
+                } else {
+                    waiter.request_account(
+                        &requester(),
+                        &[],
+                        "",
+                        &account,
+                        Notifications::Off,
+                        || false,
+                    )
+                }
+            });
+            wait_pending(&queue);
+            let pending = queue.snapshots().pop().unwrap();
+            assert_eq!(pending.target, "alice@production.example");
+            assert!(pending
+                .desktop_description(false)
+                .contains("alice@production.example"));
+            let encoded = serde_json::to_value(&pending).unwrap();
+            assert_eq!(encoded["destination"], "alice@production.example");
+            let decoded: Summary = serde_json::from_value(encoded).unwrap();
+            let details =
+                decoded.description(&crate::persistence::Domain::default(), str::to_owned);
+            assert!(details.contains("Provider-trusted host: alice@production.example"));
+            assert!(
+                details.contains("Requester-supplied connection route: alice@staging.example:22")
+            );
+            queue.decide(&pending.id, false, pending.kind()).unwrap();
+            assert!(task.join().unwrap().is_err());
+        }
     }
 
     #[test]

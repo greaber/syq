@@ -304,8 +304,8 @@ results and payload/completion descriptors must differ.
 Filesystem streams use parallel data workers over SSH or encrypted TCP, with
 automatic worker tuning as in regular-file copies. They accept `workers`,
 `request-size`, `pipeline-depth`, and `bw-pacing` tuning; `workers=N` fixes the
-worker count, and `--no-tcp` keeps data on SSH. Laptop authorization uses an
-existing [approved account login](../persistence-reference.md#approved-account-connections);
+worker count, and `--no-tcp` keeps data on SSH. An authorization provider can
+request or reuse [account access](../persistence-reference.md#approved-account-connections);
 streams do not request per-copy SSH approval. S3 transfers one object using
 multipart controls; see [Descriptor copies](../object-storage.md#descriptor-copies).
 

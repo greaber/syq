@@ -48,8 +48,6 @@ enum Access {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum SessionRequest {
-    Resolve(crate::cli::NativeEndpoint),
-    Account(ssh_auth::Request),
     ResolveLocal(ssh_auth::LocalTarget),
     LocalAccount(ssh_auth::LocalRequest),
 }
@@ -193,7 +191,9 @@ fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
     );
     anyhow::ensure!(
         control || reply.build == crate::identity::build(),
-        "local provider build changed; run syq persist receive on locally to restart it"
+        "SSH authorization provider service uses build {}, but this requester/helper uses {}; install the same syq build on the requester and provider, then run syq persist receive on locally on the provider to restart its service",
+        reply.build,
+        crate::identity::build()
     );
     Ok(stream)
 }
@@ -505,12 +505,6 @@ impl Service {
                             ssh_auth::authorize_local_and_relay(
                                 context, request, tracked, 0, &cancelled,
                             )
-                        }
-                        SessionRequest::Resolve(target) => {
-                            ssh_auth::resolve_and_reply(&target, &mut stream, &cancelled)
-                        }
-                        SessionRequest::Account(request) => {
-                            ssh_auth::authorize_and_relay(context, request, tracked, 0, &cancelled)
                         }
                     }
                 })();
@@ -992,6 +986,32 @@ mod tests {
         assert_eq!(ticket.identity.user, "provider");
         assert!(service.open_identified(Some("missing"), identity).is_err());
         service.close();
+    }
+
+    #[test]
+    fn provider_build_mismatch_names_both_builds_and_matching_restart() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reply = std::thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _: Hello = crate::destination::read_message(&mut server).unwrap();
+            crate::destination::write_message(
+                &mut server,
+                &HelloReply {
+                    version: PROTOCOL,
+                    build: "provider-other-build".into(),
+                },
+            )
+            .unwrap();
+        });
+        let error = handshake(client, false).unwrap_err();
+        reply.join().unwrap();
+        let error = error.to_string();
+        assert!(error.contains("provider-other-build"));
+        assert!(error.contains(crate::identity::build()));
+        assert!(error.contains("install the same syq build on the requester and provider"));
+        assert!(error.contains("persist receive on locally on the provider"));
     }
 
     #[test]

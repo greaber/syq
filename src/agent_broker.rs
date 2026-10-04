@@ -59,6 +59,10 @@ pub struct HostPolicy {
 }
 
 impl HostPolicy {
+    pub(crate) fn trusted_host_name(&self) -> &str {
+        &self.known_hosts_name
+    }
+
     pub(crate) fn connection_host(&self) -> &str {
         &self.connection_host
     }

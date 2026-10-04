@@ -10,6 +10,16 @@ use crate::receive_approval::{AccountDecision, AccountIdentity, AccountPermissio
 const HOST_ALIAS: &str = "syq-approved-peer";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A setup refusal that can clear without changing the approved authority.
+#[derive(Debug)]
+pub(crate) struct RetryableSetupError(pub(crate) String);
+impl std::fmt::Display for RetryableSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for RetryableSetupError {}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Mode {
     #[default]
@@ -422,6 +432,7 @@ pub(crate) fn resolve(
     match reply {
         Reply::Ready => {}
         Reply::Error(message) => bail!(message),
+        Reply::RetryableError(message) => return Err(RetryableSetupError(message).into()),
         _ => bail!("unexpected SSH resolution response"),
     }
     let resolved: ResolvedPolicy = read_message(&mut DeadlineSocket {
@@ -545,6 +556,7 @@ fn authorize_expected_inner(
     match reply {
         Reply::Ready => {}
         Reply::Error(message) => bail!(message),
+        Reply::RetryableError(message) => return Err(RetryableSetupError(message).into()),
         _ => bail!("unexpected SSH approval response"),
     }
     let approved: ResolvedPolicy = read_message(&mut stream)?;
@@ -748,35 +760,14 @@ pub(crate) fn resolve_local_and_reply(
     write_message(writer, &resolved)
 }
 
-/// Resolve-only entry for authenticated adapters. This neither consults the
-/// approval queue nor admits an account session.
-pub(crate) fn resolve_target(
-    target: &NativeEndpoint,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<ResolvedPolicy> {
-    if cancelled() {
-        bail!("SSH resolution disconnected");
-    }
-    let resolved = ResolvedPolicy::from_policy(&resolve_policy(target, cancelled)?)?;
-    if cancelled() {
-        bail!("SSH resolution disconnected");
-    }
-    Ok(resolved)
-}
-
-/// Share the existing SSH reply framing with non-return transport adapters.
-pub(crate) fn resolve_and_reply(
-    target: &NativeEndpoint,
-    writer: &mut impl Write,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<()> {
-    let resolved = resolve_target(target, cancelled)?;
-    write_message(writer, &Reply::Ready)?;
-    write_message(writer, &resolved)
-}
-
 pub(crate) fn reply_error(writer: &mut impl Write, error: &anyhow::Error) -> Result<()> {
-    write_message(writer, &Reply::Error(format!("{error:#}")))
+    let message = format!("{error:#}");
+    let reply = if error.downcast_ref::<RetryableSetupError>().is_some() {
+        Reply::RetryableError(message)
+    } else {
+        Reply::Error(message)
+    };
+    write_message(writer, &reply)
 }
 
 enum AccountApproval<'a> {
@@ -887,6 +878,7 @@ fn approve_account(
 /// The caller authenticates the transport, tracks its streams and captures a
 /// live session generation before entering. The broker never trusts requested
 /// pins: resolve again, compare the expectation, and sign only for that policy.
+#[cfg(test)]
 pub(crate) fn authorize_and_relay(
     context: AuthorizationContext<'_>,
     request: Request,
@@ -945,7 +937,7 @@ fn authorize_and_relay_inner(
     }
     let _slot = Slot(context.active_count);
     if count >= 64 {
-        bail!("too many active approved SSH connections (limit 64 per authorization session); reduce the worker count or finish another transfer");
+        return Err(RetryableSetupError("too many active approved SSH connections (limit 64 per authorization session); reduce the worker count or finish another transfer".into()).into());
     }
     if cancelled() {
         bail!("SSH request disconnected before authorization");
@@ -964,7 +956,8 @@ fn authorize_and_relay_inner(
         let destination = AccountIdentity::new(
             approved.endpoint.clone(),
             policy.pinned_host_key_fingerprints(),
-        )?;
+        )?
+        .with_trusted_host(policy.trusted_host_name())?;
         let permission = AccountApproval::new(&context.origin, destination)?;
         approve_account(
             &context,
@@ -1009,11 +1002,6 @@ fn authorize_and_relay_inner(
 }
 
 impl Receiver {
-    pub(super) fn resolve_ssh(&self, target: NativeEndpoint, stream: TrackedStream) -> Result<()> {
-        ssh::validate_endpoint(&target)?;
-        self.resolve_ssh_with(target, stream, resolve_target)
-    }
-
     pub(super) fn resolve_local_ssh(
         &self,
         target: LocalTarget,
@@ -1051,10 +1039,6 @@ impl Receiver {
         }
         write_message(&mut stream, &Reply::Ready)?;
         write_message(&mut stream, &resolved)
-    }
-
-    pub(super) fn authorize_ssh(&self, request: Request, stream: TrackedStream) -> Result<()> {
-        self.authorize_ssh_inner(request, None, false, stream)
     }
 
     pub(super) fn authorize_local_ssh(
@@ -1181,6 +1165,32 @@ mod tests {
         let alias = temporary.path().join("alias");
         std::os::unix::fs::symlink(&directory, &alias).unwrap();
         assert!(read_existing_registration_at(&alias, "laptop").is_err());
+    }
+
+    #[test]
+    fn capacity_refusal_retains_retryability_in_wire_reply() {
+        let error = anyhow::Error::new(RetryableSetupError("temporary capacity".into()))
+            .context("authorize worker");
+        let mut wire = Vec::new();
+        reply_error(&mut wire, &error).unwrap();
+        let reply: Reply = read_message(&mut wire.as_slice()).unwrap();
+        assert!(
+            matches!(reply, Reply::RetryableError(message) if message.contains("temporary capacity"))
+        );
+        wire.clear();
+        reply_error(&mut wire, &anyhow::anyhow!("permission refused")).unwrap();
+        let reply: Reply = read_message(&mut wire.as_slice()).unwrap();
+        assert!(matches!(reply, Reply::Error(_)));
+    }
+
+    #[test]
+    fn obsolete_provider_selected_requests_are_not_accepted() {
+        for encoded in [
+            r#"{"ResolveSsh":{"user":null,"host":"private-alias","port":null}}"#,
+            r#"{"Ssh":{"target":{"user":null,"host":"private-alias","port":null},"command":[],"cwd":""}}"#,
+        ] {
+            assert!(serde_json::from_str::<Message>(encoded).is_err());
+        }
     }
 
     #[test]

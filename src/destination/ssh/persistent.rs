@@ -23,6 +23,11 @@ pub(crate) use cleanup::cleanup_domain;
 const INTERNAL: &str = "--approved-ssh-master";
 const POLL: Duration = Duration::from_millis(100);
 const GENERATION: &str = "account-generation";
+const MASTER_SESSION_OPTIONS: &[&str] = &[
+    "RemoteCommand=none",
+    "RequestTTY=no",
+    "ForkAfterAuthentication=no",
+];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +176,9 @@ fn index_path(domain: &Domain, authorizer: &str, destination: &NativeEndpoint) -
         .join(format!("{}.json", blake3::hash(&identity).to_hex())))
 }
 fn read_record(path: &Path) -> Result<Option<Record>> {
+    read_record_inner(path).with_context(|| format!("read SSH account record {}", path.display()))
+}
+fn read_record_inner(path: &Path) -> Result<Option<Record>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -612,38 +620,65 @@ pub(crate) struct Status {
     control: PathBuf,
     connected: bool,
 }
-pub(crate) fn status(domain: &Domain) -> Result<Vec<Status>> {
+#[derive(Default)]
+pub(crate) struct StatusSnapshot {
+    pub rows: Vec<Status>,
+    pub errors: Vec<String>,
+}
+pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
     if !domain.approved_index_path().exists() {
-        return Ok(Vec::new());
+        return Ok(StatusSnapshot::default());
     }
     let Some(directory) = existing_directory(domain)? else {
-        return Ok(Vec::new());
+        return Ok(StatusSnapshot::default());
     };
-    let mut rows = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
+    let mut snapshot = StatusSnapshot::default();
+    for entry in fs::read_dir(&directory)? {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                snapshot.errors.push(format!(
+                    "read SSH account index {}: {error}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
         if path.extension().is_none_or(|extension| extension != "json") {
             continue;
         }
-        let Some(record) = read_record(&path)? else {
-            continue;
-        };
-        if !record.control.exists() {
-            continue;
+        let result = (|| -> Result<Option<Status>> {
+            let Some(record) = read_record(&path)? else {
+                return Ok(None);
+            };
+            if !record.control.exists() {
+                return Ok(None);
+            }
+            validate_record(domain, &record)?;
+            let connected = live(&record);
+            Ok(Some(Status {
+                authorizer: record.authorizer,
+                requested: record.requested,
+                endpoint: record.endpoint,
+                control: record.control,
+                connected,
+            }))
+        })();
+        match result {
+            Ok(Some(row)) => snapshot.rows.push(row),
+            Ok(None) => {}
+            Err(error) => snapshot
+                .errors
+                .push(format!("SSH account record {}: {error:#}", path.display())),
         }
-        validate_record(domain, &record)?;
-        let connected = live(&record);
-        rows.push(Status {
-            authorizer: record.authorizer,
-            requested: record.requested,
-            endpoint: record.endpoint,
-            control: record.control,
-            connected,
-        });
     }
-    rows.sort_by_cached_key(|row| (row.authorizer.label(), row.requested.host.clone()));
-    Ok(rows)
+    snapshot
+        .rows
+        .sort_by_cached_key(|row| (row.authorizer.label(), row.requested.host.clone()));
+    snapshot.errors.sort();
+    Ok(snapshot)
 }
+
 pub(crate) fn print_status(rows: &[Status]) {
     for row in rows {
         crate::output::human_stdout!(
@@ -1103,14 +1138,11 @@ fn keeper(startup: Startup) -> Result<()> {
     master
         .args(["-M", "-N", "-S"])
         .arg(crate::persistence::openssh_control_path(&control))
-        .args([
-            "-o",
-            persist,
-            "-o",
-            "RemoteCommand=none",
-            "-o",
-            "RequestTTY=no",
-        ])
+        .args(["-o", persist]);
+    for option in MASTER_SESSION_OPTIONS {
+        master.args(["-o", *option]);
+    }
+    master
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1379,6 +1411,39 @@ mod scope_tests;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn owned_master_disables_configured_forking() {
+        let root = crate::test_support::tempdir().unwrap();
+        let config = root.path().join("config");
+        fs::write(
+            &config,
+            "Host *\n ForkAfterAuthentication yes\n RequestTTY force\n",
+        )
+        .unwrap();
+        let mut command = Command::new("ssh");
+        command.args(["-G", "-MN", "-F"]).arg(config);
+        for option in MASTER_SESSION_OPTIONS {
+            command.args(["-o", *option]);
+        }
+        let output = command.arg("host.invalid").capture_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            config
+                .lines()
+                .any(|line| line == "forkafterauthentication no"),
+            "{config}"
+        );
+        assert!(
+            config.lines().any(|line| line == "requesttty false"),
+            "{config}"
+        );
+    }
 
     #[test]
     fn native_selection_does_not_require_readable_account_records() {

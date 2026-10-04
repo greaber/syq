@@ -159,8 +159,9 @@ An existing [approved account connection](persistence-reference.md#approved-acco
 for the same authorizer and endpoint supplies full account access without
 another prompt. Otherwise an ordinary copy requests account access from the
 provider. See [account permissions](persistence-reference.md#account-permissions)
-for Allow and Remember. With `@NAME`, explicit receiver receipt requests keep
-per-copy authorization; ordinary SSH providers do not support that route.
+for Allow and Remember. `--receiver-receipt` applies only to direct copies
+between two remote endpoints; it does not select per-copy authorization for a
+copy between this machine and one SSH server.
 `--auth-from ssh` uses this machine's native SSH access and ignores account approvals.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.

@@ -1272,6 +1272,61 @@ fn auth_from_preferences_preserve_persistence_and_reset_individual_hosts() {
 }
 
 #[test]
+fn persist_connect_native_auth_modes_accept_helper_and_receiving_options() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("home")).unwrap();
+    fs::create_dir_all(t.path("remote-home")).unwrap();
+    t.expose_remote_syq();
+    fake_ssh(&t);
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .env("HOME", t.path("home"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("PATH", format!("{}:/usr/bin:/bin", t.path("bin").display()))
+            .env("SYQ_TEST_POOL_IDLE_SECS", "0")
+            .capture_output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["receive", "off"]));
+    assert_output_ok(&run(&["auth-from", "@laptop"]));
+    for mode in ["auto", "ssh"] {
+        for helper in [
+            vec!["--syq-path", env!("CARGO_BIN_EXE_syq")],
+            vec!["--no-bootstrap"],
+        ] {
+            let mut args = vec!["connect", "backup", "--auth-from", mode, "--timeout", "1"];
+            args.extend(helper);
+            let output = run(&args);
+            assert_output_ok(&output);
+            let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+            assert!(log.contains("backup") && log.contains("--server"), "{log}");
+            fs::remove_file(t.path("rsh.log")).unwrap();
+        }
+    }
+    for (options, expected) in [
+        (
+            vec!["--syq-path", "/custom/syq"],
+            "do not accept helper overrides",
+        ),
+        (vec!["--no-bootstrap"], "do not accept helper overrides"),
+        (
+            vec!["--timeout", "1"],
+            "--timeout applies only to native SSH receiving setup",
+        ),
+    ] {
+        let mut args = vec!["connect", "backup", "--auth-from", "@laptop"];
+        args.extend(options);
+        let output = run(&args);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(stderr_of(&output).contains(expected), "{output:?}");
+        assert!(!t.path("rsh.log").exists(), "provider refusal started SSH");
+    }
+    assert_output_ok(&run(&["off"]));
+}
+
+#[test]
 fn persist_connect_rejects_explicit_receiving_timeout_with_saved_account_authorization() {
     let t = Tmp::new();
     let run = |args: &[&str]| persistence_command(&t, args).capture_output().unwrap();

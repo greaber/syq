@@ -213,8 +213,6 @@ enum Message {
         challenge: String,
     },
     Exec(exec::ExecRequest),
-    ResolveSsh(crate::cli::NativeEndpoint),
-    Ssh(ssh_auth::Request),
     ResolveLocalSsh(ssh_auth::LocalTarget),
     LocalSsh(ssh_auth::LocalRequest),
     // Copy and storage requests carry the command that produced them. The
@@ -257,6 +255,7 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 enum Reply {
+    RetryableError(String),
     SourceApproved { data_hostname: Option<String> },
     ForwardSsh(forward::ssh::Peer),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
@@ -1225,8 +1224,6 @@ impl Receiver {
             Message::TcpProbe(request) => self.probe_tcp(request, stream),
             Message::TcpOpen(request) => self.open_tcp(request, stream),
             Message::Exec(request) => self.execute(request, stream),
-            Message::ResolveSsh(target) => self.resolve_ssh(target, stream),
-            Message::Ssh(request) => self.authorize_ssh(request, stream),
             Message::ResolveLocalSsh(target) => self.resolve_local_ssh(target, stream),
             Message::LocalSsh(request) => self.authorize_local_ssh(request, stream),
             Message::Storage {
@@ -1577,7 +1574,7 @@ pub(crate) fn serve_background(
             let writer = stream.try_clone();
             if let Err(error) = handler.handle(stream) {
                 if let Ok(mut writer) = writer {
-                    let _ = write_message(&mut writer, &Reply::Error(format!("{error:#}")));
+                    let _ = ssh_auth::reply_error(&mut writer, &error);
                 }
             }
         },

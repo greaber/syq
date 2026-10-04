@@ -28,6 +28,17 @@ const KEEPER: &str = "--ssh-provider-keeper";
 const ATTACH: &str = "--ssh-provider-attach";
 const INSTALL: &str = "--ssh-provider-install";
 const SETUP: Duration = Duration::from_secs(120);
+const MASTER_OPTIONS: &[&str] = &[
+    "ControlPersist=no",
+    "ForwardAgent=no",
+    "ClearAllForwardings=yes",
+    "PermitLocalCommand=no",
+    "RemoteCommand=none",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=3",
+    // Later -O forward commands use this master's bind policy.
+    "StreamLocalBindMask=0177",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -453,16 +464,8 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     master.args(["-a", "-x", "-T", "-M", "-N", "-f", "-S"]).arg(
         crate::persistence::openssh_control_path(&owner.record.control()),
     );
-    for option in [
-        "ControlPersist=no",
-        "ForwardAgent=no",
-        "ClearAllForwardings=yes",
-        "PermitLocalCommand=no",
-        "RemoteCommand=none",
-        "ServerAliveInterval=15",
-        "ServerAliveCountMax=3",
-    ] {
-        master.args(["-o", option]);
+    for option in MASTER_OPTIONS {
+        master.args(["-o", *option]);
     }
     master
         .args(endpoint_arguments(owner.record.endpoint()?))
@@ -663,7 +666,9 @@ fn keeper(startup: Startup) -> Result<()> {
     let hello = hello.map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         hello.build == crate::identity::build(),
-        "SSH provider attachment build differs"
+        "SSH provider attachment uses build {}, but requester uses {}; install the same syq build on both machines and restart receiving locally on the provider",
+        hello.build,
+        crate::identity::build()
     );
     validate_ticket(&hello.ticket)?;
     forward_service(&owner.record, &hello.socket)?;
@@ -932,6 +937,39 @@ mod tests {
                 port: Some(22),
             },
         }
+    }
+
+    #[test]
+    fn provider_master_pins_private_unix_forward_permissions() {
+        let root = crate::test_support::tempdir().unwrap();
+        let config = root.path().join("config");
+        fs::write(&config, "Host *\n StreamLocalBindMask 0000\n").unwrap();
+        let mut command = Command::new("ssh");
+        command.args(["-G", "-MNf", "-F"]).arg(config);
+        for option in MASTER_OPTIONS {
+            command.args(["-o", *option]);
+        }
+        let output = command.arg("host.invalid").capture_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            config
+                .lines()
+                .any(|line| line == "streamlocalbindmask 0177"),
+            "{config}"
+        );
+        // This provider launcher intentionally daemonizes; only its foreground
+        // helpers and approved-account master override configured forking.
+        assert!(
+            config
+                .lines()
+                .any(|line| line == "forkafterauthentication yes"),
+            "{config}"
+        );
     }
 
     #[test]

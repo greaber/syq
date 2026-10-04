@@ -79,7 +79,7 @@ From a third server, first request reusable account access to both endpoints:
 ```sh
 syq persist connect hostB --auth-from @laptop
 syq persist connect hostC --auth-from @laptop
-syq cp --from hostB --srcs-in data --to hostC --into /archive
+syq cp --from hostB --srcs-in data --to hostC --into /archive --auth-from @laptop
 ```
 
 Approve each account on the laptop. The requesting server has full access to

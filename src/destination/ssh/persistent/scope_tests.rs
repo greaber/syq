@@ -289,6 +289,34 @@ fn off_cleans_only_selected_stale_account_state_and_keeps_other_domains() {
 }
 
 #[test]
+fn status_keeps_valid_accounts_and_reports_bad_record_paths() {
+    // Nested approved scopes need a short root for OpenSSH's control suffix.
+    let root = tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap();
+    let domain = domain(root.path(), "a");
+    let record = new_record(&domain);
+    drop(UnixListener::bind(&record.control).unwrap());
+    let index = directory(&domain).unwrap();
+    let valid = index.join(format!("{}.json", "a".repeat(64)));
+    let invalid = index.join(format!("{}.json", "b".repeat(64)));
+    private_write(&valid, &serde_json::to_vec(&record).unwrap());
+    private_write(&invalid, b"{broken");
+    let snapshot = status(&domain).unwrap();
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.rows[0].control, record.control);
+    assert!(!snapshot.rows[0].connected);
+    assert_eq!(snapshot.errors.len(), 1);
+    assert!(snapshot.errors[0].contains(invalid.to_str().unwrap()));
+    assert!(snapshot.errors[0].contains("read SSH account record"));
+    // Off still signals incomplete cleanup, while invalidating approvals and
+    // closing the valid entry rather than stopping at the malformed record.
+    ensure_generation(&domain).unwrap();
+    let error = stop_all(&domain).unwrap_err();
+    assert!(format!("{error:#}").contains(invalid.to_str().unwrap()));
+    assert!(!generation_path(&domain).exists());
+    assert!(!record.control.exists());
+}
+
+#[test]
 fn cleanup_refuses_unrecognized_files_without_recursive_removal() {
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let domain = domain(root.path(), "a");

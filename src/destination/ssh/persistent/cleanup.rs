@@ -162,7 +162,9 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
                 .with_context(|| format!("parse approved SSH endpoint {}", control.display()))?;
             validate_pool_files(&control)?;
             controls.insert(control);
-        } else if let Some(hash) = name.strip_prefix("tool-") {
+        } else if let Some(hash) = name.strip_prefix("tool-").or_else(|| {
+            (name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit())).then_some(name)
+        }) {
             anyhow::ensure!(
                 !hash.is_empty()
                     && hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -332,6 +334,11 @@ mod tests {
         let control = registered_control(&scope);
         drop(UnixListener::bind(crate::session_pool::socket_path(&control)).unwrap());
         drop(pool_lock(&control));
+        // Both previously exported tool-* aliases and the shorter full-hash
+        // spelling remain owned by their recorded master.
+        for alias in ["tool-0123456789abcdef".to_owned(), "a".repeat(40)] {
+            std::os::unix::fs::symlink(control.file_name().unwrap(), scope.join(alias)).unwrap();
+        }
         cleanup_master(&scope).unwrap();
         assert!(!scope.exists());
     }

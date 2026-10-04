@@ -300,6 +300,39 @@ pub(crate) fn owned_name(name: &[u8]) -> Option<&[u8]> {
         .or_else(|| name.strip_suffix(SOCKET_SUFFIX))
 }
 
+/// Startup can exit before Pool exists. Own only this lock inode so every
+/// early return removes its file without deleting another pool's replacement.
+struct PoolLock {
+    file: File,
+    path: PathBuf,
+    identity: (u64, u64),
+}
+impl PoolLock {
+    fn new(control: &Path, file: File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            file,
+            path: lock_path(control),
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    fn remove_path(&self) {
+        if fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+impl Drop for PoolLock {
+    fn drop(&mut self) {
+        self.remove_path();
+        // A concurrent fork can retain this open file description until exec.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 struct Spare {
     child: Child,
     stdin: File,
@@ -313,7 +346,7 @@ struct Pool {
     socket: PathBuf,
     bound_ino: u64,
     listener: UnixListener,
-    _lock: File,
+    _lock: PoolLock,
     spares: Vec<Spare>,
     handed: Vec<Child>,
     last_handoff: Instant,
@@ -363,6 +396,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
         // Another pool serves this endpoint.
         return Ok(());
     };
+    let lock = PoolLock::new(&control, lock)?;
     // ensure runs in the background. Scope shutdown may have overtaken it
     // before it acquired this lock; do not start helpers after retirement.
     if scope.join(crate::receive_service::CLOSING).exists()
@@ -668,7 +702,7 @@ impl Pool {
                 let _ = fs::remove_file(&self.socket);
             }
         }
-        let _ = fs::remove_file(lock_path(&self.control));
+        self._lock.remove_path();
     }
 }
 
@@ -764,6 +798,69 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_scope() -> tempfile::TempDir {
+        let root = tempfile::Builder::new()
+            .prefix("")
+            .tempdir_in(crate::test_support::temp_dir())
+            .unwrap();
+        crate::persistence::initialize_scope(root.path()).unwrap();
+        root
+    }
+
+    #[test]
+    fn rejected_pool_startup_removes_only_its_owned_lock() {
+        for closing in [false, true] {
+            let root = startup_scope();
+            let control = root.path().join("cm-00112233aabbccdd");
+            if closing {
+                fs::write(root.path().join(crate::receive_service::CLOSING), b"").unwrap();
+            }
+            // A missing approved master and a closing scope both return before
+            // Pool exists. Neither may leave the directory nonempty at off.
+            run(&[
+                control.as_os_str().to_owned(),
+                "".into(),
+                "host.invalid".into(),
+                "".into(),
+                "syq --server".into(),
+                "--no-ssh-config".into(),
+            ])
+            .unwrap();
+            assert!(!lock_path(&control).exists());
+            assert!(!socket_path(&control).exists());
+        }
+    }
+
+    #[test]
+    fn failed_pool_startup_preserves_foreign_socket_entry_and_removes_lock() {
+        let root = startup_scope();
+        let control = root.path().join("cm-00112233aabbccdd");
+        let socket = socket_path(&control);
+        fs::write(&socket, b"keep").unwrap();
+        assert!(run(&[
+            control.as_os_str().to_owned(),
+            "".into(),
+            "host.invalid".into(),
+            "".into(),
+            "syq --server".into(),
+        ])
+        .is_err());
+        assert_eq!(fs::read(socket).unwrap(), b"keep");
+        assert!(!lock_path(&control).exists());
+    }
+
+    #[test]
+    fn pool_lock_drop_preserves_a_replaced_inode() {
+        let root = startup_scope();
+        let control = root.path().join("cm-00112233aabbccdd");
+        let held = PoolLock::new(&control, try_lock(&control, true).unwrap().unwrap()).unwrap();
+        let path = lock_path(&control);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"keep").unwrap();
+        drop(held);
+        assert_eq!(fs::read(path).unwrap(), b"keep");
+    }
 
     #[test]
     fn session_retry_waits_for_the_failure_backoff_boundary() {

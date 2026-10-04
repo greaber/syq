@@ -271,7 +271,7 @@ syq persist receive on [OPTIONS]
 | `--auto-approve-root <AUTO_APPROVE_ROOT>` | Automatically approve downloads confined to this directory |
 | `--pscope <PATH>` | Select an isolated persistence domain instead of the default domain |
 | `--no-auto-approve-root` | Require approval for every download again |
-| `--connection <ENDPOINT>` | Connect these SSH endpoints and limit this profile to them (repeat for several) |
+| `--connection <ENDPOINT>` | Replace the allowed connection list and connect these endpoints now (repeat for several)<br><br>Only endpoints supplied in this invocation are connected. Omitting this option keeps the saved restriction without dialing dormant endpoints. |
 | `--all-connections` | Make this profile available through every connected SSH account |
 | `--notify <NOTIFICATIONS>` | Show desktop prompts, or use only local pending/approve/deny commands<br><br>[possible values: desktop, off] |
 | `--name <NAME>` | Create or update this named profile; omitted means the first profile |

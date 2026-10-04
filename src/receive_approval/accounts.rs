@@ -19,6 +19,10 @@ const MAX_STATE: usize = 512 * 1024;
 pub(crate) struct AccountIdentity {
     pub endpoint: crate::cli::NativeEndpoint,
     pub host_keys: Vec<String>,
+    /// Provider-owned known-host lookup name, separate from the requester route.
+    /// Missing on older records; new approvals include it in their identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_host: Option<String>,
 }
 impl AccountIdentity {
     pub(crate) fn new(
@@ -30,11 +34,21 @@ impl AccountIdentity {
         let identity = Self {
             endpoint,
             host_keys,
+            trusted_host: None,
         };
         identity.validate()?;
         Ok(identity)
     }
+    pub(crate) fn with_trusted_host(mut self, host: &str) -> Result<Self> {
+        self.trusted_host = Some(host.into());
+        self.validate()?;
+        Ok(self)
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
+        if let Some(host) = &self.trusted_host {
+            crate::destination::ssh::validate_host_key_alias(host)?;
+        }
         crate::destination::ssh::validate_endpoint(&self.endpoint)?;
         anyhow::ensure!(
             self.endpoint
@@ -63,6 +77,13 @@ impl AccountIdentity {
         Ok(())
     }
     pub(crate) fn label(&self) -> String {
+        if let Some(host) = &self.trusted_host {
+            return format!("{}@{host}", self.endpoint.user.as_deref().unwrap_or(""));
+        }
+        self.route_label()
+    }
+
+    pub(crate) fn route_label(&self) -> String {
         let host = if self.endpoint.host.contains(':') {
             format!("[{}]", self.endpoint.host)
         } else {
@@ -353,6 +374,27 @@ mod tests {
             serde_json::to_string(&read(&path).unwrap()).unwrap(),
             original_state
         );
+    }
+
+    #[test]
+    fn verified_trust_name_requires_fresh_approval_without_reinterpreting_old_records() {
+        let old = permission();
+        let bytes = serde_json::to_vec(&old).unwrap();
+        let mut verified: AccountPermission = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(verified.id(), old.id());
+        verified.destination = verified
+            .destination
+            .with_trusted_host("production.example")
+            .unwrap();
+        assert_ne!(verified.id(), old.id());
+        assert_eq!(verified.destination.endpoint, old.destination.endpoint);
+        assert_eq!(verified.destination.host_keys, old.destination.host_keys);
+        let roundtrip: AccountPermission =
+            serde_json::from_slice(&serde_json::to_vec(&verified).unwrap()).unwrap();
+        assert_eq!(roundtrip, verified);
+        assert_eq!(verified.destination.label(), "alice@production.example");
+        verified.destination.trusted_host = Some("other.example".into());
+        assert_ne!(roundtrip.id(), verified.id());
     }
 
     #[test]

@@ -42,20 +42,16 @@ fn export(requested: &NativeEndpoint, endpoint: &NativeEndpoint, control: &Path)
     // %C includes the remote host, account and port. A literal ControlPath would
     // silently reuse the approved account even after a caller changed -l or -p.
     // Ask the installed OpenSSH to expand its own token instead of copying its
-    // hash algorithm. The alias is removed with its master's ephemeral scope.
-    let pattern = format!(
-        "{}/tool-%C",
-        super::openssh_control_path(scope)
-            .to_str()
-            .context("SSH config export requires a UTF-8 persistence path")?
-    );
+    // hash algorithm. Use just its full hash to leave room under Unix socket
+    // path limits. The alias is removed with its master's ephemeral scope.
+    let pattern = alias_pattern(scope)?;
     let config = render(requested, endpoint, &pattern)?;
     let alias = expanded_control(&pattern, endpoint)?;
     ensure!(
         alias.parent() == Some(scope)
-            && alias
-                .file_name()
-                .is_some_and(|name| name.as_bytes().starts_with(b"tool-")),
+            && alias.file_name().is_some_and(|name| {
+                name.as_bytes().len() == 40 && name.as_bytes().iter().all(u8::is_ascii_hexdigit)
+            }),
         "OpenSSH expanded its control path outside the approved scope"
     );
     super::validate_openssh_control_path(&alias)?;
@@ -78,6 +74,15 @@ fn export(requested: &NativeEndpoint, endpoint: &NativeEndpoint, control: &Path)
         Err(error) => return Err(error).context("create exported SSH socket alias"),
     }
     Ok(config)
+}
+
+fn alias_pattern(scope: &Path) -> Result<String> {
+    Ok(format!(
+        "{}/%C",
+        super::openssh_control_path(scope)
+            .to_str()
+            .context("SSH config export requires a UTF-8 persistence path")?
+    ))
 }
 
 fn expanded_control(pattern: &str, endpoint: &NativeEndpoint) -> Result<PathBuf> {
@@ -163,6 +168,30 @@ mod tests {
             user: Some("approved-user".into()),
             host: "example.invalid".into(),
             port: Some(2222),
+        }
+    }
+
+    #[test]
+    fn scoped_export_alias_fits_default_darwin_and_large_linux_uid_paths() {
+        for (scope, capacity) in [
+            (
+                "/private/tmp/syq-persist-501/domain-ABCDEF/approved-ABCDEF",
+                104,
+            ),
+            (
+                "/run/user/10000/syq-persist-10000/domain-ABCDEF/approved-ABCDEF",
+                108,
+            ),
+        ] {
+            let scope = Path::new(scope);
+            let pattern = alias_pattern(scope).unwrap();
+            let alias = expanded_control(&pattern, &endpoint()).unwrap();
+            assert_eq!(alias.parent(), Some(scope));
+            assert_eq!(alias.file_name().unwrap().as_bytes().len(), 40);
+            assert!(alias.as_os_str().len() < capacity, "{}", alias.display());
+            let mut other = endpoint();
+            other.user = Some("other-account".into());
+            assert_ne!(expanded_control(&pattern, &other).unwrap(), alias);
         }
     }
 

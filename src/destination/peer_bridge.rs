@@ -136,7 +136,24 @@ enum AdmissionReply {
     Control,
     Lifetime,
     Ssh(forward::ssh::Peer),
+    SshRefused(String),
     Error(String),
+}
+impl AdmissionReply {
+    fn ssh_result(self) -> Result<forward::ssh::Peer> {
+        match self {
+            Self::Ssh(peer) => Ok(peer),
+            Self::SshRefused(error) => Err(forward::ssh::SetupRefusal(error).into()),
+            Self::Error(error) => bail!("peer bridge: {error}"),
+            _ => bail!("invalid peer SSH reply"),
+        }
+    }
+}
+
+pub(crate) fn is_setup_refusal(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<forward::ssh::SetupRefusal>())
 }
 
 impl Ticket {
@@ -189,10 +206,7 @@ impl Ticket {
         let (_, reply) = self.connect(Action::Ssh {
             public_key: public_key.into(),
         })?;
-        let AdmissionReply::Ssh(peer) = reply else {
-            bail!("invalid peer SSH reply")
-        };
-        Ok(peer)
+        reply.ssh_result()
     }
 }
 
@@ -285,7 +299,7 @@ impl Selection {
         let secret_token = random_token()?;
         let admission_secret = secret_token.clone();
         let setup_ticket = approved.token.clone();
-        let setup_lock = Mutex::new(());
+        let setup = Mutex::new(forward::ssh::SetupMemo::default());
         let broker = PrivateBroker::start_managed(
             PrivateBrokerConfig {
                 directory_prefix: "syq-peer-",
@@ -356,22 +370,26 @@ impl Selection {
                                 public_key.len() <= 1024,
                                 "peer SSH public key is too long"
                             );
-                            let _setup = setup_lock
-                                .try_lock()
-                                .map_err(|_| anyhow::anyhow!("peer SSH setup is already active"))?;
-                            forward::ssh::setup_over_spec(
-                                &peer_spec,
-                                &setup_ticket,
-                                &public_key,
-                                &|| stopped.load(Ordering::Acquire),
-                            )?;
-                            write_message(&mut stream, &AdmissionReply::Ssh(peer_policy.clone()))
+                            let peer = cached_ssh_setup(&setup, &public_key, || {
+                                forward::ssh::setup_over_spec(
+                                    &peer_spec,
+                                    &setup_ticket,
+                                    &public_key,
+                                    &|| stopped.load(Ordering::Acquire),
+                                )?;
+                                Ok(peer_policy.clone())
+                            })?;
+                            write_message(&mut stream, &AdmissionReply::Ssh(peer))
                         }
                     }
                 })();
                 if let Err(error) = result {
-                    let _ =
-                        write_message(&mut stream, &AdmissionReply::Error(format!("{error:#}")));
+                    let reply = if is_setup_refusal(&error) {
+                        AdmissionReply::SshRefused(format!("{error:#}"))
+                    } else {
+                        AdmissionReply::Error(format!("{error:#}"))
+                    };
+                    let _ = write_message(&mut stream, &reply);
                 }
             },
         )?;
@@ -391,6 +409,21 @@ impl Selection {
             forwarding: Mutex::new(None),
         })
     }
+}
+
+fn cached_ssh_setup(
+    setup: &Mutex<forward::ssh::SetupMemo>,
+    public_key: &str,
+    resolve: impl FnOnce() -> Result<forward::ssh::Peer>,
+) -> Result<forward::ssh::Peer> {
+    let mut memo = setup
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("peer SSH setup is already active"))?;
+    memo.resolve(public_key, || match resolve() {
+        Ok(peer) => Ok(Ok(peer)),
+        Err(error) if is_setup_refusal(&error) => Ok(Err(format!("{error:#}"))),
+        Err(error) => Err(error),
+    })
 }
 
 fn hold_coordinator_lifetime(stream: &mut TrackedStream, stopped: &AtomicBool) -> Result<()> {
@@ -701,6 +734,56 @@ fn run_owned_coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_ssh_setup_retries_lost_reply_but_memoizes_explicit_refusal() {
+        let setup = Mutex::new(forward::ssh::SetupMemo::default());
+        let attempts = std::cell::Cell::new(0);
+        let lost = cached_ssh_setup(&setup, "same-copy-key", || {
+            attempts.set(attempts.get() + 1);
+            bail!("setup reply lost")
+        })
+        .unwrap_err();
+        assert!(!is_setup_refusal(&lost));
+        let refused = cached_ssh_setup(&setup, "same-copy-key", || {
+            attempts.set(attempts.get() + 1);
+            Err(forward::ssh::SetupRefusal("destination home is unwritable".into()).into())
+        })
+        .unwrap_err();
+        assert!(is_setup_refusal(&refused));
+        let repeated = cached_ssh_setup(&setup, "same-copy-key", || {
+            panic!("definitive refusal repeated remote setup")
+        })
+        .unwrap_err();
+        assert!(is_setup_refusal(&repeated));
+        assert_eq!(repeated.to_string(), refused.to_string());
+        assert_eq!(attempts.get(), 2);
+        let another_copy = Mutex::new(forward::ssh::SetupMemo::default());
+        let next = cached_ssh_setup(&another_copy, "new-copy-key", || {
+            attempts.set(attempts.get() + 1);
+            bail!("new copy tried its own setup")
+        })
+        .unwrap_err();
+        assert!(!is_setup_refusal(&next));
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn peer_ssh_reply_preserves_refusal_classification_across_wire() {
+        for (reply, permanent) in [
+            (
+                AdmissionReply::SshRefused("destination home is unwritable".into()),
+                true,
+            ),
+            (AdmissionReply::Error("setup reply lost".into()), false),
+        ] {
+            let bytes = serde_json::to_vec(&reply).unwrap();
+            let decoded: AdmissionReply = serde_json::from_slice(&bytes).unwrap();
+            let error = decoded.ssh_result().unwrap_err().context("connect worker");
+            assert_eq!(is_setup_refusal(&error), permanent, "{error:#}");
+        }
+    }
+
     #[test]
     fn coordinator_mapping_eof_preserves_binary_input_and_exit_status() {
         let (input, mut send) = crate::process::with_inheritance_guard(std::io::pipe).unwrap();

@@ -362,6 +362,7 @@ pub(crate) fn is_ssh_authorization_fallback_error(error: &anyhow::Error) -> bool
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
+        || crate::destination::peer_bridge::is_setup_refusal(error)
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
             .chain()

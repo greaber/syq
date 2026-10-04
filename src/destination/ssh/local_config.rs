@@ -59,7 +59,7 @@ impl LocalPlan {
         );
         visited.push(requested.clone());
         let mut command = Command::new("ssh");
-        command.args(["-G", "-vvv"]).env("LC_ALL", "C");
+        command.arg("-G").env("LC_ALL", "C");
         if let Some(user) = &requested.user {
             command.args(["-l", user]);
         }

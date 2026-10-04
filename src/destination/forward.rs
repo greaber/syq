@@ -378,6 +378,9 @@ impl ForwardChild {
                     return Ok((child, reply))
                 }
                 Ok(Reply::Error(error)) => bail!("destination refused the copy: {error}"),
+                Ok(Reply::RetryableError(error)) => {
+                    return Err(super::ssh_auth::RetryableSetupError(error).into());
+                }
                 Ok(
                     Reply::Ready
                     | Reply::Identity(_)
@@ -454,7 +457,15 @@ impl ForwardChild {
                 })
             })();
             match reply {
-                Ok(Reply::Error(error)) => bail!("remote copy helper refused setup: {error}"),
+                Ok(Reply::Error(error)) => {
+                    return Err(ssh::SetupRefusal(format!(
+                        "remote copy helper refused setup: {error}"
+                    ))
+                    .into());
+                }
+                Ok(Reply::RetryableError(error)) => {
+                    return Err(super::ssh_auth::RetryableSetupError(error).into());
+                }
                 Ok(reply) => return Ok((child, reply)),
                 Err(error) => {
                     let status = child.wait_for_exit(deadline, cancelled);
