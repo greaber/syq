@@ -2626,7 +2626,7 @@ fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
                 EPHEMERAL_TCP_PORTS,
                 "--no-progress",
             ])
-            .env("SYQ_TUNING_CACHE", "")
+            .env("SYQ_TUNING_CACHE", t.path("unused-tuning.json"))
             .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"))
