@@ -420,7 +420,15 @@ fn save_settings(domain: &Domain, settings: &Preferences) -> Result<()> {
     }
     atomic_json(&path, settings)
 }
-fn settings_lock(domain: &Domain) -> Result<File> {
+struct SettingsLock(File);
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        // A parallel fork retains the same open file description until exec.
+        // Release writer ownership now, even if that temporary copy survives.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+fn settings_lock(domain: &Domain) -> Result<SettingsLock> {
     let path = config_path(domain)?.with_file_name("receive.lock");
     if domain.is_default() {
         fs::create_dir_all(path.parent().unwrap())?;
@@ -440,7 +448,7 @@ fn settings_lock(domain: &Domain) -> Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!("receive preferences are being changed; retry shortly");
     }
-    Ok(file)
+    Ok(SettingsLock(file))
 }
 fn current_settings_exist(domain: &Domain) -> Result<bool> {
     let path = config_path(domain)?;
@@ -1840,6 +1848,41 @@ mod tests {
         drop(listener);
         assert!(!crate::persistence::socket_is_ready(&path).unwrap_or(false));
         drop(clients);
+    }
+
+    #[test]
+    fn receiving_writer_unlocks_while_an_inherited_description_remains_open() {
+        // A short basename leaves room for the domain's OpenSSH control suffix
+        // under Darwin's ambient temporary directory.
+        let temporary = tempfile::Builder::new()
+            .prefix("")
+            .tempdir_in(crate::test_support::temp_dir())
+            .unwrap();
+        crate::persistence::initialize_scope(temporary.path()).unwrap();
+        let domain = Domain::select(Some(temporary.path())).unwrap();
+        let writer = settings_lock(&domain).unwrap();
+        // dup and fork share the open file description that owns flock. This
+        // deterministically models another test between fork and close-on-exec.
+        let inherited = writer.0.try_clone().unwrap();
+        let error = settings_lock(&domain)
+            .err()
+            .expect("an active writer must still exclude a second writer");
+        assert!(error.to_string().contains("preferences are being changed"));
+        drop(writer);
+        let next = settings_lock(&domain)
+            .expect("a finished writer must release ownership before inherited copies close");
+        assert!(inherited.metadata().is_ok());
+        assert!(
+            settings_lock(&domain).is_err(),
+            "the next writer still owns the lock"
+        );
+        drop(inherited);
+        assert!(
+            settings_lock(&domain).is_err(),
+            "closing an old copy must not unlock a new writer"
+        );
+        drop(next);
+        assert!(settings_lock(&domain).is_ok());
     }
 
     #[test]
