@@ -147,6 +147,39 @@ fn block_count(len: u64, block: u64) -> Result<usize> {
     usize::try_from(len.div_ceil(block)).context("comparison block count overflow")
 }
 
+/// Check that a patch describes its file consistently: one reuse entry for
+/// each comparison block, and new data exactly as long as the blocks it does
+/// not reuse, the last of which may be short. A restricted receiver does not
+/// trust its coordinator, so a malformed patch fails its own file before
+/// anything is kept, cloned or written.
+fn check_patch_layout(patch: &SmallPatch) -> Result<()> {
+    if patch.len > MAX_READ_BYTES {
+        bail!("invalid patch of {} bytes", patch.len);
+    }
+    let blocks = block_count(patch.len, patch.block)?;
+    if patch.reuse.len() != blocks {
+        bail!(
+            "patch of {} bytes lists {} blocks, not {blocks}",
+            patch.len,
+            patch.reuse.len()
+        );
+    }
+    let new: u64 = patch
+        .reuse
+        .iter()
+        .enumerate()
+        .filter(|(_, reuse)| reuse.is_none())
+        .map(|(index, _)| patch.block.min(patch.len - index as u64 * patch.block))
+        .sum();
+    if patch.data.len() as u64 != new {
+        bail!(
+            "patch carries {} new bytes for blocks of {new} bytes",
+            patch.data.len()
+        );
+    }
+    Ok(())
+}
+
 /// Read `len` bytes at `off` into the start of `buffer`. Returns false when
 /// the file ends first.
 fn read_block(file: &File, off: u64, len: usize, buffer: &mut Vec<u8>) -> Result<bool> {
@@ -302,10 +335,12 @@ impl FsOps {
         let mut sources = Vec::new();
         let mut positions = Vec::new();
         for (position, patch) in patches.iter().enumerate() {
-            let staged = self.keep_patched(patch).and_then(|kept| match kept {
-                Some(identity) => Ok(Err(identity)),
-                None => self.stage_patch(patch).map(Ok),
-            });
+            let staged = check_patch_layout(patch)
+                .and_then(|()| self.keep_patched(patch))
+                .and_then(|kept| match kept {
+                    Some(identity) => Ok(Err(identity)),
+                    None => self.stage_patch(patch).map(Ok),
+                });
             match staged {
                 Ok(Ok((put, source))) => {
                     puts.push(put);
@@ -368,15 +403,11 @@ impl FsOps {
     /// With enough of a file reused, the stage clones that file and writes
     /// only the differing blocks over it, when the filesystem can clone.
     /// Otherwise the put carries the whole file, its reused blocks read and
-    /// checked here.
+    /// checked here. The patch's layout has been checked.
     fn stage_patch<'a>(
         &mut self,
         patch: &'a SmallPatch,
     ) -> Result<(SmallPut, Option<PatchSource<'a>>)> {
-        let blocks = block_count(patch.len, patch.block)?;
-        if patch.reuse.len() != blocks || patch.len > MAX_READ_BYTES {
-            bail!("invalid patch of {} bytes", patch.len);
-        }
         if self.hash_policy.transfer_integrity
             && self.observed_payload_hash(&patch.data) != patch.hash
         {
@@ -958,6 +989,88 @@ mod tests {
             assert!(results[1].is_err(), "{:?}", results[1]);
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
             assert_eq!(entries(directory), 2);
+        }
+    }
+
+    #[test]
+    fn a_malformed_patch_fails_its_file_and_leaves_nothing_behind() {
+        // A file large and reused enough to clone, and one assembled whole.
+        let block = MIN_HASH_BLOCK_BYTES;
+        for blocks in [32, 3] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..blocks * block).map(|i| (i % 249) as u8 | 1).collect();
+            let mut new = old.clone();
+            new[block as usize] ^= 0xff;
+            new.extend_from_slice(b"tail");
+            fs::write(directory.join("file"), &old).unwrap();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops
+                .hash_existing_batch(
+                    block,
+                    &[ExistingRead {
+                        path: b"file".to_vec(),
+                        len: new.len() as u64,
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    }],
+                )
+                .remove(0)
+                .unwrap();
+            let mut reuse = Vec::new();
+            let mut data = Vec::new();
+            for (index, chunk) in new.chunks(block as usize).enumerate() {
+                let hash = algorithm.hash(chunk);
+                if hashed.hashes.get(index) == Some(&hash) {
+                    reuse.push(Some(hash));
+                } else {
+                    reuse.push(None);
+                    data.extend_from_slice(chunk);
+                }
+            }
+            let valid = SmallPatch {
+                path: b"file".to_vec(),
+                copy_id: [5; 16],
+                len: new.len() as u64,
+                block,
+                reuse,
+                hash: content_digest(&data),
+                data,
+                basis: hashed.fingerprint,
+                meta: put("file", b"").meta,
+                flags: 0,
+                unchanged_flags: 0,
+                condition: TargetCondition::Any,
+                guard: None,
+            };
+            let malformed = |change: &dyn Fn(&mut SmallPatch)| {
+                let mut patch = valid.clone();
+                change(&mut patch);
+                patch.hash = content_digest(&patch.data);
+                patch
+            };
+            let patches = [
+                malformed(&|patch| {
+                    patch.data.pop();
+                }),
+                malformed(&|patch| patch.data.push(0)),
+                malformed(&|patch| patch.reuse.push(None)),
+                malformed(&|patch| {
+                    patch.reuse.pop();
+                }),
+                malformed(&|patch| patch.reuse.insert(0, patch.reuse[0])),
+            ];
+            for patch in patches {
+                let results = ops.patch_small_batch(std::slice::from_ref(&patch));
+                assert!(results[0].is_err(), "{blocks} blocks: {:?}", results[0]);
+                assert_eq!(fs::read(directory.join("file")).unwrap(), old);
+                assert_eq!(entries(directory), 1, "{blocks} blocks");
+            }
+            let results = ops.patch_small_batch(&[valid]);
+            assert!(results[0].is_ok(), "{blocks} blocks: {:?}", results[0]);
+            assert_eq!(fs::read(directory.join("file")).unwrap(), new);
+            assert_eq!(entries(directory), 1);
         }
     }
 
