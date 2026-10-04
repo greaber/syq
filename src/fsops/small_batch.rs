@@ -12,6 +12,11 @@ pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
 
+/// Threads a run writes and closes its files on, on a network filesystem.
+/// Creating and renaming stay one at a time per directory, so a few threads
+/// keep the rest shorter than the creates.
+const PARALLEL_WRITES: usize = 8;
+
 /// A small file's private sidecar between its creation and publication.
 pub(super) struct SmallStage {
     target: RootedTarget,
@@ -23,6 +28,31 @@ pub(super) struct SmallStage {
     /// from the create's reply; it decides the metadata step and gives the
     /// published identity, which a rename does not change.
     created: fs::Metadata,
+}
+
+/// Apply `each` to `items` on up to `PARALLEL_WRITES` threads, in order.
+fn on_threads<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let per_thread = items.len().div_ceil(PARALLEL_WRITES).max(1);
+    let mut parts = Vec::new();
+    let mut items = items.into_iter().peekable();
+    while items.peek().is_some() {
+        parts.push(items.by_ref().take(per_thread).collect::<Vec<_>>());
+    }
+    let each = &each;
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = parts
+            .into_iter()
+            .map(|part| scope.spawn(move || part.into_iter().map(each).collect::<Vec<_>>()))
+            .collect();
+        threads
+            .into_iter()
+            .flat_map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
 }
 
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
@@ -153,15 +183,34 @@ impl FsOps {
         }
         // Writing data and metadata needs no directory turn. On a network
         // filesystem each step waits a round trip, so the files of a run
-        // are written in parallel.
-        let write =
-            |(index, stage): &(usize, SmallStage)| self.write_small_stage(&puts[*index], stage);
-        let network = stages.len() > 1 && on_network_file_system(&stages[0].1.file);
+        // are written on threads of their own: every worker's runs proceed
+        // at once, as when each worker wrote its files in turn. Only this
+        // thread records observations, so the writes are one span.
+        let network = stages.first().is_some_and(|(_, stage)| {
+            stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
+        });
         let written: Vec<Result<()>> = if network {
-            use rayon::prelude::*;
-            metadata_pool().install(|| stages.par_iter().map(write).collect())
+            let writing = self
+                .operation
+                .span(crate::transfer_observations::Stage::DestinationWrite);
+            let this = &*self;
+            let written = on_threads(stages.iter().collect(), |(index, stage)| {
+                this.write_small_stage(&puts[*index], stage, false)
+            });
+            writing.bytes(
+                stages
+                    .iter()
+                    .zip(&written)
+                    .filter(|(_, result)| result.is_ok())
+                    .map(|((index, _), _)| puts[*index].data.len() as u64)
+                    .sum(),
+            );
+            written
         } else {
-            stages.iter().map(write).collect()
+            stages
+                .iter()
+                .map(|(index, stage)| self.write_small_stage(&puts[*index], stage, true))
+                .collect()
         };
         let mut written = written.into_iter();
         stages.retain(
@@ -190,10 +239,21 @@ impl FsOps {
                 }
             }
         }
-        for (index, stage) in published {
-            results[index] = self
+        // Closing a file is a round trip on NFS too, so on a network
+        // filesystem the files are finished and closed on threads as well.
+        let finish = |(index, stage): (usize, SmallStage)| {
+            let result = self
                 .finish_small_stage(&puts[index], stage)
                 .map_err(|error| wire_error(&error));
+            (index, result)
+        };
+        let finished = if network {
+            on_threads(published, finish)
+        } else {
+            published.into_iter().map(finish).collect()
+        };
+        for (index, result) in finished {
+            results[index] = result;
         }
     }
 
@@ -253,7 +313,14 @@ impl FsOps {
         Ok(Some((file, metadata, basis_size)))
     }
 
-    pub(super) fn write_small_stage(&self, put: &SmallPut, stage: &SmallStage) -> Result<()> {
+    /// Write a staged file's data and metadata. Unless `observe`, the caller
+    /// records the write: observations take one thread at a time.
+    pub(super) fn write_small_stage(
+        &self,
+        put: &SmallPut,
+        stage: &SmallStage,
+        observe: bool,
+    ) -> Result<()> {
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SMALL_STAGE_READY_FILE",
@@ -263,8 +330,12 @@ impl FsOps {
         if stage.reused {
             stage.file.set_len(0)?;
         }
-        observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
-            .with_context(|| format!("write {}", stage.label.display()))?;
+        if observe {
+            observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse)
+        } else {
+            write_data(&stage.file, &put.data, 0, self.sparse)
+        }
+        .with_context(|| format!("write {}", stage.label.display()))?;
         check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
@@ -529,12 +600,12 @@ mod tests {
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(!stage.reused);
-        ops.write_small_stage(&file, &stage).unwrap();
+        ops.write_small_stage(&file, &stage, true).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert!(stage.reused);
-        ops.write_small_stage(&file, &stage).unwrap();
+        ops.write_small_stage(&file, &stage, true).unwrap();
         ops.publish_small_stage(&file, &stage).unwrap();
         assert_eq!(ops.finish_small_stage(&file, stage).unwrap(), None);
         assert_eq!(

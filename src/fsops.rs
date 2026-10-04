@@ -393,21 +393,19 @@ fn unsupported_copy_pairs() -> &'static Mutex<HashSet<(FileSystemKey, FileSystem
     PAIRS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Whether `file` lies on a network filesystem.
-fn on_network_file_system(file: &File) -> bool {
+/// Whether `file`, on device `dev`, lies on a network filesystem.
+fn on_network_file_system(file: &File, dev: u64) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("SYQ_TEST_NETWORK_FILESYSTEM").is_some() {
         return true;
     }
     #[cfg(target_os = "linux")]
     {
-        file.metadata().is_ok_and(|metadata| {
-            file_system_traits(file, file_system_key(file, metadata.dev())).network
-        })
+        file_system_traits(file, file_system_key(file, dev)).network
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = file;
+        let _ = (file, dev);
         false
     }
 }
@@ -3050,14 +3048,19 @@ fn observed_write(
     sparse: bool,
 ) -> std::io::Result<()> {
     let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
-    if sparse {
-        crate::sparse::write_at(file, data, off, false)?;
-        crate::sparse::set_len(file, off + data.len() as u64)?;
-    } else {
-        file.write_all_at(data, off)?;
-    }
+    write_data(file, data, off, sparse)?;
     writing.bytes(data.len() as u64);
     Ok(())
+}
+
+/// `observed_write` for a caller that records the write itself.
+fn write_data(file: &File, data: &[u8], off: u64, sparse: bool) -> std::io::Result<()> {
+    if sparse {
+        crate::sparse::write_at(file, data, off, false)?;
+        crate::sparse::set_len(file, off + data.len() as u64)
+    } else {
+        file.write_all_at(data, off)
+    }
 }
 fn hash_reader_observed(
     reader: &mut impl Read,
