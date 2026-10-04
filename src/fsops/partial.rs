@@ -72,7 +72,7 @@ impl FsOps {
         Ok(file)
     }
 
-    fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
+    pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
             // A previously public inode may have readers with open descriptors.
