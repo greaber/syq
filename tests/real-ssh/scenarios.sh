@@ -312,9 +312,11 @@ state = json.load(open("/tmp/syq-ephemeral-connected.json"))
 connection = next(c for c in state["connections"] if c["endpoint"] == "source")
 assert connection["state"] == "ready" and connection["ssh_connected"], connection
 assert connection["receiving_enabled"] is False and connection["receiving"] is None, connection
-# A stopped service may leave its lock file, but no listener or service record.
-assert not any(p.name.endswith((".recv", ".recv-json"))
-               for p in Path(state["scope"]).iterdir()), state
+# Endpoint records let a later receive-on start without another connect.
+# Receiving is disabled: no profile is running and no listener exists.
+assert connection["receiving_profiles"] == [], connection
+entries = [p.name for p in Path(state["scope"]).iterdir()]
+assert not any(name.endswith(".recv") for name in entries), entries
 PYEPHEMERAL
 syq persist status --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["enabled"] is False'
 syq persist off --pscope "$ephemeral_connect_scope"
