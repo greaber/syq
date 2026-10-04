@@ -1820,6 +1820,22 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// A grouped comparison may use any block the protocol allows. The
+    /// grant's block applies to the per-file comparison; `HashWindow` already
+    /// returns hashes in blocks of any size, so these reveal nothing more.
+    pub(super) fn check_comparison_request(&self, block: u64, len: u64) -> Result<()> {
+        if !(proto::MIN_HASH_BLOCK_BYTES..=proto::MAX_HASH_BLOCK_BYTES).contains(&block) {
+            bail!("comparison block size is outside protocol limits");
+        }
+        if len > self.copy.limits.max_file_bytes {
+            bail!("signed grant per-file byte limit exceeded");
+        }
+        if !proto::hash_response_fits(block, len) {
+            bail!("hash response would exceed protocol limits");
+        }
+        Ok(())
+    }
+
     pub(super) fn charge_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
         self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
@@ -1902,9 +1918,7 @@ impl RestrictedAuthority {
             if self.expected_hash(&patch.path)?.is_some() {
                 bail!("expected-hash files require checked finalization");
             }
-            // Reused blocks are those the grant's comparison block divides
-            // the file into.
-            self.check_hash_request(patch.block, patch.len)?;
+            self.check_comparison_request(patch.block, patch.len)?;
             // Keeping the file may apply other times than publishing it,
             // but nothing else.
             if (patch.flags ^ patch.unchanged_flags) & !proto::flags::TIMES != 0 {
@@ -2490,7 +2504,7 @@ impl RestrictedAuthority {
             // hashes of the whole batch share one response.
             Request::HashExistingBatch { block, files } => {
                 for file in files.iter() {
-                    self.check_hash_request(*block, file.len)?;
+                    self.check_comparison_request(*block, file.len)?;
                 }
                 if !proto::existing_hashes_fit(*block, files.iter().map(|file| file.len)) {
                     bail!("hash response would exceed protocol limits");

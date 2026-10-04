@@ -1215,13 +1215,14 @@ set -eu
 root=/tmp/syq-real-ssh/grouped-source
 install -d "$root"
 for n in 1 2 3 4 5 6 7 8; do
-    head -c 65536 /dev/urandom >"$root/file-$n"
+    head -c 262144 /dev/urandom >"$root/file-$n"
 done
 EOF
 syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/grouped-source \
     --to destination --into /tmp/syq-real-ssh/grouped-destination
 # Change one byte of half the files and the time of every file, so that each
-# is compared: the receiver keeps the unchanged ones and patches the others.
+# is compared: the receiver keeps the unchanged ones and patches the others,
+# reusing all but the first 64 KiB block of each.
 ssh source sh -s <<'EOF'
 set -eu
 root=/tmp/syq-real-ssh/grouped-source
@@ -1244,6 +1245,7 @@ import json, sys
 from pathlib import Path
 records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
 assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
 operations = {
     record['dst']['value'].rsplit('/', 1)[-1]: (record['action'], record['disposition'])
     for record in records

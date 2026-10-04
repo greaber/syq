@@ -66,13 +66,9 @@ struct Group {
 }
 
 impl Worker {
-    /// An explicit comparison block size applies here too, as does the one
-    /// a restricted receiver's grant fixes.
+    /// An explicit comparison block size applies here too.
     pub(super) fn patch_block(&self) -> u64 {
-        if self.opts.block_explicit
-            || self.opts.tuning.comparison_block_size.is_some()
-            || self.opts.restricted_receiver
-        {
+        if self.opts.block_explicit || self.opts.tuning.comparison_block_size.is_some() {
             self.opts.block
         } else {
             self.opts.block.min(PATCH_BLOCK)

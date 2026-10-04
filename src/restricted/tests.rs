@@ -5028,6 +5028,17 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     authority.authorize(&mut allowed, false).unwrap();
     let mut allowed = patch(reused(&file));
     authority.authorize(&mut allowed, false).unwrap();
+    // The grouped comparison is not bound to the grant's block, which the
+    // per-file comparison uses.
+    assert_ne!(block, proto::MIN_HASH_BLOCK_BYTES);
+    let small = proto::MIN_HASH_BLOCK_BYTES;
+    let mut allowed = Request::HashExistingBatch {
+        block: small,
+        files: vec![existing_read(&file, 4)],
+    };
+    authority.authorize(&mut allowed, false).unwrap();
+    let mut allowed = patch(small_patch(&file, 4, small, vec![Some([0; 32])], b""));
+    authority.authorize(&mut allowed, false).unwrap();
 
     let mut altered = small_patch(&file, 4, block, vec![None], b"data");
     altered.flags = proto::flags::RECEIVER_MODE;
@@ -5040,10 +5051,10 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
         ),
         (
             Request::HashExistingBatch {
-                block: proto::MIN_HASH_BLOCK_BYTES,
+                block: 4096,
                 files: vec![existing_read(&file, 4)],
             },
-            "hash block size does not match the signed grant",
+            "comparison block size is outside protocol limits",
         ),
         (
             hash(vec![existing_read(&file, 1025)]),
@@ -5054,14 +5065,8 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
             "receiver mutation is outside the signed destination scopes",
         ),
         (
-            patch(small_patch(
-                &file,
-                4,
-                proto::MIN_HASH_BLOCK_BYTES,
-                vec![Some([0; 32])],
-                b"",
-            )),
-            "hash block size does not match the signed grant",
+            patch(small_patch(&file, 4, 4096, vec![Some([0; 32])], b"")),
+            "comparison block size is outside protocol limits",
         ),
         (
             patch(small_patch(&file, 1025, block, vec![Some([0; 32])], b"")),
@@ -5087,7 +5092,6 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     }
 
     // Each file's hashes may fit a response while the batch's do not.
-    authority.copy.limits.hash_block_bytes = proto::MIN_HASH_BLOCK_BYTES;
     authority.copy.limits.max_file_bytes = u64::MAX;
     let half = (proto::MAX_FRAME as u64 / 33 / 2 + 1) * proto::MIN_HASH_BLOCK_BYTES;
     let mut excessive = Request::HashExistingBatch {
@@ -5101,7 +5105,6 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
             .to_string(),
         "hash response would exceed protocol limits"
     );
-    authority.copy.limits.hash_block_bytes = block;
     authority.copy.limits.max_file_bytes = 1024;
 
     // Files with an expected hash keep checked finalization.
@@ -5156,8 +5159,7 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let mut authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 200_000, 4096);
-    authority.copy.limits.hash_block_bytes = proto::MIN_HASH_BLOCK_BYTES;
+    let authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 200_000, 4096);
     let block = proto::MIN_HASH_BLOCK_BYTES;
     let burst = authority.file_data_limit.as_ref().unwrap().burst_bytes() as usize;
     let len = block + 100;
