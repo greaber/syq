@@ -125,6 +125,12 @@ pub trait Conn: Send {
             }
         }
     }
+    /// Send a request whose reply must be `Ok` without waiting for it. The
+    /// reply is checked before the next one is returned, so a failure
+    /// surfaces there. A connection that cannot defer it waits here.
+    fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
+        ok(self.call(req)?, what).map(|_| ())
+    }
     fn call(&mut self, req: Request) -> Result<Response> {
         let expected = match &req {
             Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
@@ -182,6 +188,9 @@ pub trait Conn: Send {
     fn is_dead(&self) -> bool {
         false
     }
+    /// Close without waiting for the peer to exit. Every reply has been
+    /// consumed, so waiting would only delay the caller by a round trip.
+    fn detach(&mut self) {}
     /// Whether sending several requests before receiving their responses can
     /// overlap useful work. LocalConn executes requests synchronously, so
     /// queueing several block responses there only retains their buffers.
@@ -296,6 +305,34 @@ impl std::error::Error for TcpCongestionError {}
 
 pub(crate) fn is_tcp_congestion_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<TcpCongestionError>())
+}
+
+/// A request sent without waiting for its reply failed. Requests sent after
+/// it assumed it succeeded, so the connection refuses every later reply.
+#[derive(Debug)]
+pub(crate) struct DeferredRequestError(String);
+
+impl std::fmt::Display for DeferredRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeferredRequestError {}
+
+pub(crate) fn is_deferred_request_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<DeferredRequestError>())
+}
+
+/// Requests sent without waiting whose replies must be `Ok`.
+#[derive(Default)]
+struct ExpectedOk {
+    /// Oldest first. Their replies precede any other, and are checked
+    /// before it.
+    pending: std::collections::VecDeque<&'static str>,
+    failed: Option<String>,
 }
 
 pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
@@ -466,6 +503,7 @@ pub struct RemoteConn {
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
     rx: Option<std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>>,
+    expected_ok: ExpectedOk,
     reader: Option<std::thread::JoinHandle<()>>,
     label: String,
     dead: bool,
@@ -653,6 +691,7 @@ impl RemoteConn {
             child: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
             rx: Some(rx),
+            expected_ok: Default::default(),
             reader: Some(reader),
             label,
             dead: false,
@@ -676,7 +715,11 @@ impl RemoteConn {
         // clone. Bound the actual response wait instead. This connection is
         // retired immediately after collection, so a late reply cannot become
         // a response to a later request.
-        let peer = if self.dead || self.send(Request::TransportStats).is_err() {
+        // A deferred reply still pending would be read as this one.
+        let peer = if self.dead
+            || !self.expected_ok.pending.is_empty()
+            || self.send(Request::TransportStats).is_err()
+        {
             None
         } else {
             receive_transport_stats(self.rx.as_ref().expect("reader receiver present"), timeout)
@@ -747,6 +790,25 @@ impl RemoteConn {
     }
 
     fn receive_response(&mut self) -> Result<ReceivedResponse> {
+        self.check_expected_ok()?;
+        self.receive_next_response()
+    }
+
+    /// Consume the replies of requests sent without waiting, in order.
+    fn check_expected_ok(&mut self) -> Result<()> {
+        while let Some(what) = self.expected_ok.pending.pop_front() {
+            if let Err(error) = ok(self.receive_next_response()?.into_inner(), what) {
+                self.expected_ok.pending.clear();
+                self.expected_ok.failed = Some(format!("{error:#}"));
+            }
+        }
+        match &self.expected_ok.failed {
+            Some(failure) => Err(DeferredRequestError(failure.clone()).into()),
+            None => Ok(()),
+        }
+    }
+
+    fn receive_next_response(&mut self) -> Result<ReceivedResponse> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         let response = if let Some(stop) = &self.transport_stop {
             let rx = self
@@ -897,6 +959,11 @@ impl Conn for RemoteConn {
             _ => None,
         })
     }
+    fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
+        self.send(req)?;
+        self.expected_ok.pending.push_back(what);
+        Ok(())
+    }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)
     }
@@ -907,6 +974,9 @@ impl Conn for RemoteConn {
     }
     fn try_recv_with_arrival(&mut self) -> Option<Result<(Response, std::time::Instant)>> {
         use std::sync::mpsc::TryRecvError;
+        if let Err(error) = self.check_expected_ok() {
+            return Some(Err(error));
+        }
         let Some(rx) = &self.rx else {
             return Some(Err(anyhow!(
                 "response reader is collecting streaming writes"
@@ -932,6 +1002,7 @@ impl Conn for RemoteConn {
             self.write_stream.is_none(),
             "streaming writes are already active"
         );
+        self.check_expected_ok()?;
         self.batch_receipts.begin(progress).map(Some)
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -943,11 +1014,15 @@ impl Conn for RemoteConn {
     fn is_dead(&self) -> bool {
         self.dead
     }
+    fn detach(&mut self) {
+        self.detached = true;
+    }
     fn begin_streaming_writes(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.write_stream.is_none(),
             "streaming writes already active"
         );
+        self.check_expected_ok()?;
         self.write_stream = Some(crate::streaming::WriteReplies::spawn(
             self.rx.take().context("response reader missing")?,
         ));
@@ -1099,9 +1174,14 @@ impl Drop for RemoteConn {
         self.w = FrameWriter::new(Box::new(std::io::sink()), false);
         if self.detached {
             // Closing the pipes is the whole teardown: the remote exits on
-            // Shutdown or EOF, and waiting for its exit status would cost
-            // the round trip the pool exists to save.
+            // Shutdown or EOF, and waiting for its exit status would cost a
+            // round trip. Reap our ssh client, if any, once it exits.
             self.rx.take();
+            if let Some(mut child) = self.child.take() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
             return;
         }
         // Sending Shutdown asks for an orderly peer exit; shutting down the
@@ -1826,6 +1906,7 @@ impl RemoteSpec {
                 child: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
                 rx: Some(rx),
+                expected_ok: Default::default(),
                 reader: Some(reader),
                 label: self.label(),
                 dead: false,
@@ -1942,6 +2023,7 @@ impl RemoteSpec {
             child: Some(child),
             w: FrameWriter::new(writer, compress),
             rx: Some(rx),
+            expected_ok: Default::default(),
             reader: Some(reader),
             label: self.label(),
             dead: false,
@@ -2318,6 +2400,7 @@ impl RemoteSpec {
             child: None,
             w: FrameWriter::new(Box::new(writer), compress),
             rx: Some(rx),
+            expected_ok: Default::default(),
             reader: Some(reader),
             label: format!("{} (tcp {addr_s})", self.label()),
             dead: false,
