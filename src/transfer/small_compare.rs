@@ -6,8 +6,8 @@
 //! 2. the source reads each file once and returns only the blocks whose
 //!    hashes differ (`ReadDifferingBatch`);
 //! 3. the destination publishes each file from those blocks and the
-//!    matching blocks of the file it replaces, hashing them again as it reads
-//!    them, or keeps a file that matched whole and still does
+//!    matching blocks of the file it replaces, which must be unchanged since
+//!    they were hashed, or keeps a file that matched whole and still does
 //!    (`PatchSmallBatch`).
 //!
 //! Groups are pipelined through these stages, so a run of files costs about
