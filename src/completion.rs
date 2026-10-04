@@ -1738,25 +1738,19 @@ fn remote_path_candidates(
         );
         match connection {
             Ok(mut connection) => {
-                let result = list_remote_entries(
+                let detailed = details_requested();
+                let result = start_remote_listing(
                     &mut connection,
                     directory_for_thread.clone(),
                     root_for_thread.clone(),
                     prefix_for_thread.clone(),
                     policy,
-                    false,
+                    detailed,
                 );
                 let names_available = result.is_ok();
                 let _ = sender.send(result);
-                if names_available && details_requested() {
-                    let result = list_remote_entries(
-                        &mut connection,
-                        directory_for_thread,
-                        root_for_thread,
-                        prefix_for_thread,
-                        policy,
-                        true,
-                    );
+                if names_available && detailed {
+                    let result = receive_remote_entries(&mut connection, &prefix_for_thread);
                     let _ = sender.send(result);
                 }
                 // Return entries before connection teardown, which can cost
@@ -1768,15 +1762,7 @@ fn remote_path_candidates(
             }
         }
     });
-    let (mut entries, mut details) = receiver
-        .recv_timeout(REMOTE_COMPLETION_DEADLINE)
-        .map_err(|_| anyhow!("remote completion timed out after 40 seconds"))??;
-    if details_requested() {
-        match receiver.recv_timeout(COMPLETION_DETAILS_DEADLINE) {
-            Ok(Ok(result)) => (entries, details) = result,
-            _ => details = vec!["[metadata unavailable]".into(); entries.len()],
-        }
-    }
+    let (entries, details) = receive_remote_listing(receiver, details_requested())?;
     let mut candidates = path_candidates_from_entries(&wrapper, &typed_directory, &prefix, entries);
     for (candidate, detail) in candidates.iter_mut().zip(details) {
         candidate.detail = Some(detail);
@@ -1871,15 +1857,64 @@ fn connect_completion_endpoint(
     spec.connect_completion()
 }
 
-fn list_remote_entries(
+type RemoteEntries = (Vec<CompletionEntry>, Vec<String>);
+
+fn receive_remote_listing(
+    receiver: std::sync::mpsc::Receiver<Result<RemoteEntries>>,
+    detailed: bool,
+) -> Result<RemoteEntries> {
+    let (mut entries, mut details) = receiver
+        .recv_timeout(REMOTE_COMPLETION_DEADLINE)
+        .map_err(|_| anyhow!("remote completion timed out after 40 seconds"))??;
+    if detailed {
+        match receiver.recv_timeout(COMPLETION_DETAILS_DEADLINE) {
+            Ok(Ok(result)) => (entries, details) = result,
+            _ => details = vec!["[metadata unavailable]".into(); entries.len()],
+        }
+    }
+    Ok((entries, details))
+}
+
+fn start_remote_listing(
     connection: &mut RemoteConn,
     directory: Vec<u8>,
     confined_root: Option<Vec<u8>>,
     prefix: Vec<u8>,
     policy: PathCompletionPolicy,
+    include_details: bool,
+) -> Result<RemoteEntries> {
+    // Both requests may cross the network together. The server's ordered
+    // replies still make names available before optional metadata, so slow
+    // metadata retains its separate timeout without another request round trip.
+    connection.send(remote_listing_request(
+        directory.clone(),
+        confined_root.clone(),
+        prefix.clone(),
+        policy,
+        false,
+    ))?;
+    if include_details {
+        // Metadata is optional; a failed send must not discard a names
+        // response that the peer may already have sent.
+        let _ = connection.send(remote_listing_request(
+            directory,
+            confined_root,
+            prefix.clone(),
+            policy,
+            true,
+        ));
+    }
+    receive_remote_entries(connection, &prefix)
+}
+
+fn remote_listing_request(
+    directory: Vec<u8>,
+    confined_root: Option<Vec<u8>>,
+    prefix: Vec<u8>,
+    policy: PathCompletionPolicy,
     detailed: bool,
-) -> Result<(Vec<CompletionEntry>, Vec<String>)> {
-    let request = if !policy.follow_final_symlinks {
+) -> Request {
+    if !policy.follow_final_symlinks {
         Request::ListDirNoFollowFinal {
             directory,
             confined_root,
@@ -1904,10 +1939,13 @@ fn list_remote_entries(
             limit: MAX_DIRECTORY_CANDIDATES,
             symlink_policy: policy.parents,
         }
-    };
-    match connection.call(request)? {
+    }
+}
+
+fn receive_remote_entries(connection: &mut RemoteConn, prefix: &[u8]) -> Result<RemoteEntries> {
+    match connection.recv()? {
         Response::DirectoryEntries { entries, .. } => {
-            Ok((validate_completion_entries(entries, &prefix)?, Vec::new()))
+            Ok((validate_completion_entries(entries, prefix)?, Vec::new()))
         }
         Response::DetailedDirectoryEntries {
             entries,
@@ -1917,7 +1955,7 @@ fn list_remote_entries(
             if entries.len() != details.len() || details.iter().any(|detail| detail.len() > 16384) {
                 bail!("invalid remote completion details");
             }
-            let entries = validate_completion_entries(entries, &prefix)?;
+            let entries = validate_completion_entries(entries, prefix)?;
             if truncated {
                 if let Some(last) = details.last_mut() {
                     last.push_str(" [listing limited; narrow the prefix]");

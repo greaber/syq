@@ -383,3 +383,174 @@ fn version_prefix_keeps_command_completion_and_never_completes_a_download() {
     let words = ["syq", "--vers"].map(OsString::from);
     assert!(values(candidates(1, &words).unwrap()).contains(&b"--version-is".to_vec()));
 }
+
+// Use the same framed socket transport as a ready pooled connection. The
+// fake peer withholds every reply until it has read the complete query flight.
+fn completion_transport() -> (RemoteConn, std::os::unix::net::UnixStream) {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    let (client, server) = UnixStream::pair().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    server
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    crate::proto::FrameWriter::new(client.try_clone().unwrap(), false)
+        .write_preamble()
+        .unwrap();
+    crate::proto::FrameWriter::new(server.try_clone().unwrap(), false)
+        .write_msg(&Response::HelloOk {
+            identity: crate::identity::build().into(),
+            platform: crate::identity::platform(),
+            supports_confined_socket_nodes: false,
+            ssh_worker_ticket: None,
+        })
+        .unwrap();
+    let session = crate::session_pool::PooledSession {
+        stdin: File::from(OwnedFd::from(client.try_clone().unwrap())),
+        stdout: File::from(OwnedFd::from(client)),
+        stderr: File::open("/dev/null").unwrap(),
+    };
+    let mut connection = RemoteConn::from_pooled(session, false, "completion test".into());
+    assert!(matches!(
+        connection.recv().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    (connection, server)
+}
+
+fn one_completion_entry() -> Vec<CompletionEntry> {
+    vec![CompletionEntry {
+        name: b"alpha".to_vec(),
+        directory: false,
+    }]
+}
+
+#[test]
+fn remote_completion_pipelines_metadata_before_waiting_for_names() {
+    for follow in [false, true] {
+        for detailed in [false, true] {
+            let (mut connection, server) = completion_transport();
+            let policy = PathCompletionPolicy::new(OperatorSymlinkPolicy::TrustedOwner, follow);
+            let peer = std::thread::spawn(move || {
+                let mut reader = crate::proto::FrameReader::new(server.try_clone().unwrap());
+                for expected_details in [false, true].into_iter().take(if detailed { 2 } else { 1 })
+                {
+                    let request: Request = reader.read_msg().unwrap();
+                    let expected = remote_listing_request(
+                        b"dir".to_vec(),
+                        Some(b"root".to_vec()),
+                        b"al".to_vec(),
+                        policy,
+                        expected_details,
+                    );
+                    assert_eq!(
+                        serde_json::to_value(request).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+                let mut writer = crate::proto::FrameWriter::with_preamble_written(server, false);
+                writer
+                    .write_msg(&Response::DirectoryEntries {
+                        entries: one_completion_entry(),
+                        truncated: false,
+                    })
+                    .unwrap();
+                if detailed {
+                    writer
+                        .write_msg(&Response::DetailedDirectoryEntries {
+                            entries: one_completion_entry(),
+                            details: vec!["file metadata".into()],
+                            truncated: false,
+                        })
+                        .unwrap();
+                }
+                // A names-only query must not request optional metadata.
+                assert!(matches!(
+                    reader.read_msg::<Request>().unwrap(),
+                    Request::Shutdown
+                ));
+            });
+            let names = start_remote_listing(
+                &mut connection,
+                b"dir".to_vec(),
+                Some(b"root".to_vec()),
+                b"al".to_vec(),
+                policy,
+                detailed,
+            );
+            let details = if names.is_ok() && detailed {
+                Some(receive_remote_entries(&mut connection, b"al"))
+            } else {
+                None
+            };
+            drop(connection);
+            peer.join().unwrap();
+            assert_eq!(names.unwrap().0[0].name, b"alpha");
+            if let Some(details) = details {
+                assert_eq!(details.unwrap().1, ["file metadata"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn remote_completion_keeps_names_when_pipelined_metadata_is_slow() {
+    let (mut connection, server) = completion_transport();
+    let (release, gate) = std::sync::mpsc::sync_channel(1);
+    let peer = std::thread::spawn(move || {
+        let mut reader = crate::proto::FrameReader::new(server.try_clone().unwrap());
+        assert!(matches!(
+            reader.read_msg::<Request>().unwrap(),
+            Request::ListDir { .. }
+        ));
+        assert!(matches!(
+            reader.read_msg::<Request>().unwrap(),
+            Request::ListDirDetails { .. }
+        ));
+        let mut writer = crate::proto::FrameWriter::with_preamble_written(server, false);
+        writer
+            .write_msg(&Response::DirectoryEntries {
+                entries: one_completion_entry(),
+                truncated: false,
+            })
+            .unwrap();
+        gate.recv_timeout(Duration::from_secs(8)).unwrap();
+        writer
+            .write_msg(&Response::DetailedDirectoryEntries {
+                entries: one_completion_entry(),
+                details: vec!["late metadata".into()],
+                truncated: false,
+            })
+            .unwrap();
+    });
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = start_remote_listing(
+            &mut connection,
+            b"dir".to_vec(),
+            None,
+            b"al".to_vec(),
+            PathCompletionPolicy::new(OperatorSymlinkPolicy::TrustedOwner, true),
+            true,
+        );
+        let okay = result.is_ok();
+        let _ = sender.send(result);
+        if okay {
+            let _ = sender.send(receive_remote_entries(&mut connection, b"al"));
+        }
+    });
+    let started = std::time::Instant::now();
+    let result = receive_remote_listing(receiver, true);
+    let elapsed = started.elapsed();
+    // Release blocked work before any assertion can unwind.
+    let _ = release.send(());
+    worker.join().unwrap();
+    peer.join().unwrap();
+    let (entries, details) = result.unwrap();
+    assert_eq!(entries[0].name, b"alpha");
+    assert_eq!(details, ["[metadata unavailable]"]);
+    assert!(elapsed >= COMPLETION_DETAILS_DEADLINE);
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
