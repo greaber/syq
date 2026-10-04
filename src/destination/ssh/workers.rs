@@ -174,12 +174,24 @@ impl Login {
     /// The child must lead its own process group. Keep this guard until SSH
     /// exits, and drop it BEFORE reaping the child so its PID cannot be reused.
     pub(crate) fn watch(self, child_pid: u32) -> Result<Guard> {
-        Guard::start(child_pid, move || self.cancelled())
+        let Self {
+            session, control, ..
+        } = self;
+        Guard::start(
+            child_pid,
+            move || session.cancelled(),
+            move || !control.exists(),
+        )
     }
 }
 
+enum Event {
+    Stop,
+    Authenticated(mpsc::SyncSender<bool>),
+}
+
 pub(crate) struct Guard {
-    stop: mpsc::Sender<()>,
+    stop: mpsc::Sender<Event>,
     watcher: Option<JoinHandle<()>>,
 }
 impl fmt::Debug for Guard {
@@ -189,24 +201,45 @@ impl fmt::Debug for Guard {
     }
 }
 impl Guard {
-    fn start(child_pid: u32, cancelled: impl Fn() -> bool + Send + 'static) -> Result<Self> {
+    fn start(
+        child_pid: u32,
+        authorization_cancelled: impl Fn() -> bool + Send + 'static,
+        master_closed: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Self> {
         let pid = i32::try_from(child_pid).context("invalid SSH child PID")?;
         anyhow::ensure!(pid > 1, "invalid SSH child PID");
         let (stop, receiver) = mpsc::channel();
         let watcher = std::thread::Builder::new()
             .name("syq-ssh-worker".into())
             .spawn(move || {
-                while matches!(
-                    receiver.recv_timeout(Duration::from_millis(100)),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    if cancelled() {
+                let mut authorization = Some(authorization_cancelled);
+                loop {
+                    let event = receiver.recv_timeout(Duration::from_millis(100));
+                    if matches!(
+                        event,
+                        Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)
+                    ) {
+                        break;
+                    }
+                    let cancelled =
+                        master_closed() || authorization.as_ref().is_some_and(|closed| closed());
+                    if cancelled {
                         // This is our dedicated SSH group, including its local
                         // ProxyCommand transport. The caller still owns reaping.
                         unsafe {
                             libc::kill(-pid, libc::SIGKILL);
                         }
+                        if let Ok(Event::Authenticated(reply)) = event {
+                            let _ = reply.send(false);
+                        }
                         break;
+                    }
+                    if let Ok(Event::Authenticated(reply)) = event {
+                        // Exact helper Hello proves SSH authentication finished.
+                        // Release its one-login broker and provider admission slot;
+                        // the original approved master still owns account lifetime.
+                        drop(authorization.take());
+                        let _ = reply.send(true);
                     }
                 }
             })?;
@@ -215,10 +248,29 @@ impl Guard {
             watcher: Some(watcher),
         })
     }
+
+    /// Call only after accepting the exact helper's Hello. The acknowledgement
+    /// ensures local signing resources are released before another worker starts.
+    pub(crate) fn authenticated(&self) -> Result<()> {
+        let result = (|| {
+            let (reply, receive) = mpsc::sync_channel(1);
+            self.stop
+                .send(Event::Authenticated(reply))
+                .context("SSH worker authorization ended before helper authentication completed")?;
+            anyhow::ensure!(
+                receive.recv_timeout(Duration::from_secs(5)).context(
+                    "SSH worker did not release its signing session after authentication"
+                )?,
+                "SSH account ended before helper authentication completed"
+            );
+            Ok(())
+        })();
+        result.map_err(|error| AuthorizationError(error).into())
+    }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.stop.send(Event::Stop);
         if let Some(watcher) = self.watcher.take() {
             let _ = watcher.join();
         }
@@ -316,38 +368,47 @@ mod tests {
             .any(|arg| arg == "ProxyCommand=ssh -S /private/control -W '[target]:22' jump"));
     }
 
+    fn exited_without_reaping(child: &std::process::Child) -> bool {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        info.si_signo != 0
+    }
+
+    fn wait_exited_without_reaping(child: &std::process::Child) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !exited_without_reaping(child) {
+            assert!(
+                Instant::now() < deadline,
+                "SSH worker group survived account cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn provider_disconnect_kills_only_the_owned_worker_group() {
         let cancelled = Arc::new(AtomicBool::new(false));
         let observed = cancelled.clone();
         let mut worker =
             crate::process::group::ProcessGroup::spawn(Command::new("sleep").arg("30")).unwrap();
-        let guard =
-            Guard::start(worker.child.id(), move || observed.load(Ordering::Acquire)).unwrap();
+        let guard = Guard::start(
+            worker.child.id(),
+            move || observed.load(Ordering::Acquire),
+            || false,
+        )
+        .unwrap();
         cancelled.store(true, Ordering::Release);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            assert_eq!(
-                unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        worker.child.id() as libc::id_t,
-                        &mut info,
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                    )
-                },
-                0
-            );
-            if info.si_signo != 0 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "SSH worker group survived provider cancellation"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_exited_without_reaping(&worker.child);
         drop(guard);
         assert!(!worker.close().unwrap().success());
     }
@@ -364,14 +425,68 @@ mod tests {
         let lifetime = Released(released.clone());
         let mut worker =
             crate::process::group::ProcessGroup::spawn(Command::new("sleep").arg("30")).unwrap();
-        let guard = Guard::start(worker.child.id(), move || {
-            let _ = &lifetime;
-            false
-        })
+        let guard = Guard::start(
+            worker.child.id(),
+            move || {
+                let _ = &lifetime;
+                false
+            },
+            || false,
+        )
         .unwrap();
         drop(guard);
         assert!(released.load(Ordering::Acquire));
         assert!(worker.child.try_wait().unwrap().is_none());
         worker.close().unwrap();
+    }
+
+    #[test]
+    fn authenticated_worker_releases_signing_but_still_follows_master_lifetime() {
+        struct Released(Arc<AtomicBool>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let lifetime = Released(released.clone());
+        let source_closed = Arc::new(AtomicBool::new(false));
+        let observed_source = source_closed.clone();
+        let master_closed = Arc::new(AtomicBool::new(false));
+        let observed_master = master_closed.clone();
+        let mut worker =
+            crate::process::group::ProcessGroup::spawn(Command::new("sleep").arg("30")).unwrap();
+        let guard = Guard::start(
+            worker.child.id(),
+            move || {
+                let _ = &lifetime;
+                observed_source.load(Ordering::Acquire)
+            },
+            move || observed_master.load(Ordering::Acquire),
+        )
+        .unwrap();
+        assert!(!released.load(Ordering::Acquire));
+        guard.authenticated().unwrap();
+        assert!(released.load(Ordering::Acquire));
+        // Closing the released signing channel must not kill authenticated SSH.
+        source_closed.store(true, Ordering::Release);
+        guard.authenticated().unwrap();
+        assert!(!exited_without_reaping(&worker.child));
+        master_closed.store(true, Ordering::Release);
+        wait_exited_without_reaping(&worker.child);
+        drop(guard);
+        assert!(!worker.close().unwrap().success());
+    }
+
+    #[test]
+    fn helper_authentication_cannot_revive_a_cancelled_login() {
+        let mut worker =
+            crate::process::group::ProcessGroup::spawn(Command::new("sleep").arg("30")).unwrap();
+        let guard = Guard::start(worker.child.id(), || true, || false).unwrap();
+        let error = guard.authenticated().unwrap_err();
+        assert!(error.downcast_ref::<AuthorizationError>().is_some());
+        wait_exited_without_reaping(&worker.child);
+        drop(guard);
+        assert!(!worker.close().unwrap().success());
     }
 }

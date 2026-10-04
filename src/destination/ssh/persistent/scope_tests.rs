@@ -105,8 +105,10 @@ fn warm_account_lookup_checks_local_socket_readiness() {
     };
     assert!(active_record(&domain, record()).unwrap().is_none());
     let listen = || {
-        let listener =
-            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        let listener = crate::process::with_inheritance_guard(|| {
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        })
+        .unwrap();
         listener
             .bind(&socket2::SockAddr::unix(&control).unwrap())
             .unwrap();
@@ -122,8 +124,10 @@ fn warm_account_lookup_checks_local_socket_readiness() {
     let mut clients = Vec::new();
     let mut saturated = None;
     for _ in 0..128 {
-        let client =
-            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        let client = crate::process::with_inheritance_guard(|| {
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        })
+        .unwrap();
         client.set_nonblocking(true).unwrap();
         match client.connect(&socket2::SockAddr::unix(&control).unwrap()) {
             Ok(()) => clients.push(client),
@@ -167,7 +171,36 @@ fn warm_account_lookup_checks_local_socket_readiness() {
     );
     drop(listener);
     assert!(control.exists());
-    assert!(active_record(&domain, record()).unwrap().is_none());
+    // A parallel test may have forked with a copy of this close-on-exec
+    // listener. The saturated queue remains busy until that child execs or
+    // exits, even though this thread has closed its last descriptor.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut progress = Instant::now();
+    loop {
+        let state = match active_record(&domain, record()) {
+            Ok(None) => break,
+            Ok(Some(_)) => "inherited listener still accepts connections".to_owned(),
+            Err(error) => {
+                assert!(
+                    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(libc::EINPROGRESS)
+                    }),
+                    "unexpected stale master error: {error:#}"
+                );
+                format!("{error:#}")
+            }
+        };
+        assert!(
+            Instant::now() < deadline,
+            "closed listener did not become stale within five seconds: {state}"
+        );
+        if progress.elapsed() >= Duration::from_secs(1) {
+            eprintln!("waiting for inherited test listener to close: {state}");
+            progress = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     fs::remove_file(&control).unwrap();
     assert!(active_record(&domain, record()).unwrap().is_none());
     drop(clients);

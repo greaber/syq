@@ -2238,8 +2238,92 @@ fn approved_completion_command(t: &Tmp, words: &[&str]) -> Command {
         .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("PATH", format!("{}:/usr/bin:/bin", t.path("bin").display()))
+        // These fixtures assert each invocation's authority selection. A
+        // replacement pool spare must not write into the next invocation's
+        // trace or inherit its predecessor's fake SSH failure setting.
+        .env("SYQ_TEST_POOL_IDLE_SECS", "0")
         .env("SYQ_COMPLETION_DEBUG", "1");
     command
+}
+
+#[test]
+fn approved_completion_takes_ready_pool_without_foreground_ssh() {
+    let t = Tmp::new();
+    approved_completion_fixture(&t);
+    let (control, master) = approved_completion_master(&t, "laptop");
+    let ssh = t.path("bin/ssh");
+    let script = fs::read_to_string(&ssh).unwrap().replacen(
+        r#"printf '%s\n' "$*" >> "$FAKE_RSH_LOG""#,
+        r#"if [ "${TEST_FORBID_NEW_SSH:-0}" = 1 ]; then
+  : > "$HOME/forbidden-ssh"
+  exit 91
+fi
+printf '%s\n' "$*" >> "$FAKE_RSH_LOG""#,
+        1,
+    );
+    assert!(script.contains("TEST_FORBID_NEW_SSH"));
+    executable(&ssh, script.as_bytes());
+    let path = format!("{}/n", t.s("remote-home/data"));
+    let words = [
+        "syq",
+        "cp",
+        "--syq-path",
+        env!("CARGO_BIN_EXE_syq"),
+        "--from",
+        "backup",
+        "--auth-from",
+        "@laptop",
+        &path,
+    ];
+    let first = approved_completion_command(&t, &words)
+        .env("SYQ_TEST_POOL_IDLE_SECS", "5")
+        .run()
+        .unwrap();
+    assert_output_ok(&first);
+    assert!(!first.stdout.is_empty(), "{first:?}");
+    wait_for(
+        "the approved completion pool's first helper",
+        std::time::Duration::from_secs(10),
+        || {
+            fs::read_to_string(t.path("rsh.log"))
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line.contains("PubkeyAuthentication=no") && line.contains("--server"))
+        },
+    );
+    // The existing pool inherited no prohibition. Only this invocation must
+    // complete from its ready spare instead of opening a foreground session.
+    // Local ssh -G remains available to validate the requester configuration.
+    let second = approved_completion_command(&t, &words)
+        .env("TEST_FORBID_NEW_SSH", "1")
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    // Losing the owned master stops its pool, including any replacement
+    // helper. The five-second idle bound also covers an earlier test panic.
+    drop(master);
+    fs::remove_file(&control).unwrap();
+    wait_for(
+        "the approved completion pool to exit",
+        std::time::Duration::from_secs(10),
+        || {
+            !control.with_extension("pool").exists()
+                && !control.with_extension("pool.lock").exists()
+        },
+    );
+    assert_output_ok(&second);
+    assert_eq!(
+        completion_values(&second.stdout),
+        completion_values(&first.stdout)
+    );
+    assert!(
+        stderr_of(&second).contains("control connection from the session pool"),
+        "{second:?}"
+    );
+    assert!(
+        !t.path("home/forbidden-ssh").exists(),
+        "completion opened another SSH session"
+    );
 }
 
 #[test]

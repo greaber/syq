@@ -2051,6 +2051,12 @@ impl RemoteSpec {
             }
             error
         })?;
+        if let Some(login) = &conn.approved_login {
+            // SSH and the exact helper are authenticated. The original
+            // approved master now owns the worker's lifetime; release the
+            // per-handshake signing channel before admitting more workers.
+            login.authenticated()?;
+        }
         handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         if ssh_connection == SshConnection::Control
