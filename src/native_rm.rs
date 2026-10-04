@@ -37,6 +37,10 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 const EVENT_FLUSH: Duration = Duration::from_millis(100);
 const ATTACHED_HEARTBEAT: Duration = Duration::from_secs(1);
 const RMDIR_RETRIES: usize = 3;
+// Share short sibling batches as copying does. Large files remain separate
+// jobs: their block reclamation can run outside the directory's inode lock.
+const LEAF_BATCH_FILES: usize = 64;
+const LEAF_BATCH_BYTES: u64 = 16 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Identity {
@@ -408,6 +412,8 @@ struct DirectoryJob {
     retries: AtomicUsize,
     descendant_failed: AtomicBool,
     partials_only: bool,
+    #[cfg(target_os = "linux")]
+    leaves: Arc<crate::rooted::directory_gate::Gate>,
 }
 
 enum Task {
@@ -418,6 +424,10 @@ enum Task {
         _object: Option<File>,
         label: PathBytes,
         parent: Option<Arc<DirectoryJob>>,
+    },
+    Leaves {
+        parent: Arc<DirectoryJob>,
+        leaves: Vec<PinnedLeaf>,
     },
     Finish(Arc<DirectoryJob>),
 }
@@ -698,6 +708,8 @@ pub(crate) fn remove(
                         .flatten(),
                     label: directory.label,
                     parent: None,
+                    #[cfg(target_os = "linux")]
+                    leaves: Arc::new(crate::rooted::directory_gate::Gate::new(4)),
                     remaining: AtomicUsize::new(1),
                     retries: AtomicUsize::new(0),
                     descendant_failed: AtomicBool::new(false),
@@ -812,6 +824,11 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
     if pool.is_cancelled() {
         match task {
             Task::Scan(job) | Task::Finish(job) => abandon_directory(pool, &job),
+            Task::Leaves { parent, leaves } => {
+                for _ in leaves {
+                    directory_part_done(pool, parent.clone());
+                }
+            }
             Task::Leaf { parent, .. } => {
                 if let Some(parent) = parent {
                     directory_part_done(pool, parent);
@@ -873,6 +890,24 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
                 }
             }
         }
+        Task::Leaves { parent, leaves } => {
+            // A turn covers a short batch, avoiding a wakeup for every unlink.
+            // Single-file jobs include large files and do not take this gate.
+            #[cfg(target_os = "linux")]
+            let _permit = (leaves.len() > 1).then(|| parent.leaves.acquire());
+            for leaf in leaves {
+                process_task(
+                    pool,
+                    Task::Leaf {
+                        selector: leaf.selector,
+                        name: leaf.name,
+                        _object: leaf._object,
+                        label: leaf.label,
+                        parent: Some(parent.clone()),
+                    },
+                );
+            }
+        }
         Task::Finish(job) => finish_directory(pool, job),
     }
 }
@@ -892,12 +927,26 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
             return;
         }
     };
+    let batch_files = names
+        .len()
+        .div_ceil(pool.limit.load(Ordering::Relaxed))
+        .clamp(1, LEAF_BATCH_FILES);
+    let mut leaves = Vec::with_capacity(batch_files);
+    let mut bytes = 0u64;
+    let flush = |leaves: &mut Vec<PinnedLeaf>| {
+        if !leaves.is_empty() {
+            pool.submit(Task::Leaves {
+                parent: job.clone(),
+                leaves: std::mem::replace(leaves, Vec::with_capacity(batch_files)),
+            });
+        }
+    };
     for component in names {
         if pool.is_cancelled() {
             break;
         }
-        let identity = match metadata_at(job.directory.as_raw_fd(), &component) {
-            Ok(identity) => identity,
+        let (identity, size) = match scan_metadata_at(job.directory.as_raw_fd(), &component) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 job.descendant_failed.store(true, Ordering::SeqCst);
@@ -968,6 +1017,8 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                     removal: (!job.partials_only).then_some(pinned),
                     label,
                     parent: Some(job.clone()),
+                    #[cfg(target_os = "linux")]
+                    leaves: Arc::new(crate::rooted::directory_gate::Gate::new(4)),
                     remaining: AtomicUsize::new(1),
                     retries: AtomicUsize::new(0),
                     descendant_failed: AtomicBool::new(false),
@@ -984,15 +1035,24 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
                 }
             }
         } else {
-            pool.submit(Task::Leaf {
+            if bytes.saturating_add(size) > LEAF_BATCH_BYTES {
+                flush(&mut leaves);
+                bytes = 0;
+            }
+            leaves.push(PinnedLeaf {
                 selector: job.selector,
                 name: pinned,
                 _object: None,
                 label,
-                parent: Some(job.clone()),
             });
+            bytes = bytes.saturating_add(size);
+            if leaves.len() >= batch_files || bytes >= LEAF_BATCH_BYTES {
+                flush(&mut leaves);
+                bytes = 0;
+            }
         }
     }
+    flush(&mut leaves);
     directory_part_done(pool, job);
 }
 
@@ -1193,6 +1253,14 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     )
 }
 
+fn scan_metadata_at(parent: RawFd, component: &[u8]) -> io::Result<(Identity, u64)> {
+    let component = CString::new(component)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL"))?;
+    let stat = stat_at_cstring(parent, &component)?;
+    Ok((identity_from_stat(&stat), stat.st_size.max(0) as u64))
+}
+
+#[cfg(test)]
 fn metadata_at(parent: RawFd, component: &[u8]) -> io::Result<Identity> {
     let component = CString::new(component)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL"))?;
@@ -1200,6 +1268,10 @@ fn metadata_at(parent: RawFd, component: &[u8]) -> io::Result<Identity> {
 }
 
 fn metadata_at_cstring(parent: RawFd, component: &CString) -> io::Result<Identity> {
+    stat_at_cstring(parent, component).map(|stat| identity_from_stat(&stat))
+}
+
+fn stat_at_cstring(parent: RawFd, component: &CString) -> io::Result<libc::stat> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     retry_zero(|| unsafe {
         libc::fstatat(
@@ -1209,7 +1281,7 @@ fn metadata_at_cstring(parent: RawFd, component: &CString) -> io::Result<Identit
             libc::AT_SYMLINK_NOFOLLOW,
         )
     })?;
-    Ok(identity_from_stat(&stat))
+    Ok(stat)
 }
 
 fn identity_from_file(file: &File) -> Result<Identity> {

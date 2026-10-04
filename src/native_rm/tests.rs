@@ -554,3 +554,69 @@ fn parked_removal_workers_wake_for_growth_cancellation_and_completion() {
         thread.join().unwrap();
     }
 }
+
+#[test]
+fn cancellation_within_a_sibling_batch_leaves_remaining_files_and_drains_accounting() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let directory = File::open(temp.path()).unwrap();
+    let parent = Arc::new(DirectoryJob {
+        selector: 0,
+        directory,
+        removal: None,
+        label: Vec::new(),
+        parent: None,
+        remaining: AtomicUsize::new(17),
+        retries: AtomicUsize::new(0),
+        descendant_failed: AtomicBool::new(false),
+        partials_only: false,
+        #[cfg(target_os = "linux")]
+        leaves: Arc::new(crate::rooted::directory_gate::Gate::new(4)),
+    });
+    let leaves = (0..16)
+        .map(|i| {
+            let label = i.to_string().into_bytes();
+            fs::write(temp.path().join(OsStr::from_bytes(&label)), b"data").unwrap();
+            PinnedLeaf {
+                selector: 0,
+                name: PinnedName {
+                    parent: PinnedParent::Directory(parent.clone()),
+                    name: component_cstring(&label).unwrap(),
+                    identity: metadata_at(parent.directory.as_raw_fd(), &label).unwrap(),
+                },
+                _object: None,
+                label,
+            }
+        })
+        .collect();
+    let (sender, _receiver) = mpsc::sync_channel(1);
+    let (events, _outcomes) = mpsc::channel();
+    let pool = Arc::new(Pool {
+        sender: Mutex::new(Some(sender)),
+        pending: Mutex::new(0),
+        events,
+        dry_run: false,
+        cancelled: AtomicBool::new(false),
+        limit: AtomicUsize::new(4),
+        active: (0..4).map(|_| AtomicBool::new(false)).collect(),
+        parked: Mutex::new(()),
+        wake: Condvar::new(),
+    });
+    let cancel = Arc::downgrade(&pool);
+    let entered = AtomicUsize::new(0);
+    let _hook = hook_unlinks_in(temp.path(), move |_| {
+        if entered.fetch_add(1, Ordering::SeqCst) == 2 {
+            cancel.upgrade().unwrap().cancel();
+        }
+    });
+    process_task(
+        &pool,
+        Task::Leaves {
+            parent: parent.clone(),
+            leaves,
+        },
+    );
+    // The syscall already entered may complete. Later entries must stay put,
+    // and all batch children must be accounted for so shutdown cannot hang.
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 13);
+    assert_eq!(parent.remaining.load(Ordering::SeqCst), 1);
+}

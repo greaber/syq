@@ -93,7 +93,9 @@ pagination at the original prefix.
 entries per second. Filesystem deletion runs on the machine holding the target
 filesystem. S3 deletion adjusts concurrent requests while keeping supported
 batch requests. These measurements are separate from copying file contents and
-are not saved between runs.
+are not saved between runs. When a higher deletion count brings no clear
+throughput gain, syq returns to the lower count and checks whether fewer
+workers can do the same work.
 
 For `rm`, `--performance-tuning workers=N` fixes the filesystem worker count;
 `--performance-tuning s3-requests=N` fixes the S3 deletion request count. For

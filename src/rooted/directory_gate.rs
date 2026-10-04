@@ -48,14 +48,14 @@ struct State {
     waiting: usize,
 }
 
-struct Gate {
+pub(crate) struct Gate {
     state: Mutex<State>,
     available: Condvar,
     limit: usize,
 }
 
 impl Gate {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             state: Mutex::default(),
             available: Condvar::new(),
@@ -63,7 +63,7 @@ impl Gate {
         }
     }
 
-    fn acquire(self: &Arc<Self>) -> Permit {
+    pub(crate) fn acquire(self: &Arc<Self>) -> Permit {
         let mut state = self.state.lock().unwrap();
         while state.active == self.limit {
             state.waiting += 1;
@@ -76,7 +76,7 @@ impl Gate {
     }
 }
 
-pub(super) struct Permit(Option<Arc<Gate>>);
+pub(crate) struct Permit(Option<Arc<Gate>>);
 
 impl Drop for Permit {
     fn drop(&mut self) {

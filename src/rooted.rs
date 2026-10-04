@@ -56,7 +56,7 @@ use std::sync::{Mutex, OnceLock};
 mod macos_clone_support;
 
 #[cfg(any(target_os = "linux", test))]
-mod directory_gate;
+pub(crate) mod directory_gate;
 mod operator;
 
 pub(crate) use operator::*;
