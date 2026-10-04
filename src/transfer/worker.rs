@@ -334,6 +334,16 @@ impl Worker {
                 || (self.opts.checksum && same_size))
     }
 
+    /// Whether --hash compares a file on the per-file path: on the same
+    /// host without block reuse, that path reads both files a window at a
+    /// time, stops at the first difference and copies a differing file in
+    /// the kernel. A grouped comparison would first hash the whole
+    /// destination and read the whole source into memory, to save round
+    /// trips that cost nothing on the same host.
+    fn probes_per_file(&self, job: &FileJobData, existing: &Entry) -> bool {
+        self.opts.same_host && !self.reuses_blocks_for(job, Some(existing))
+    }
+
     /// A replaced file small enough to compare in groups is compared before
     /// any contents are sent, in pipelined groups (see `small_compare`): the
     /// destination keeps a file that already matches and is sent only the
@@ -358,9 +368,9 @@ impl Worker {
             && !self.opts.inplace
             && j.target_condition == TargetCondition::Any
             && !self.inspects_destination(j)
-            && jobs
-                .destination(idx)
-                .is_some_and(|existing| self.compares_first(j, existing))
+            && jobs.destination(idx).is_some_and(|existing| {
+                self.compares_first(j, existing) && !self.probes_per_file(j, existing)
+            })
     }
 
     pub(super) fn fail_small_batch(

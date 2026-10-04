@@ -916,21 +916,34 @@ fn copy_tree_command(t: &Tmp, remote: bool, flags: &str, extra: &[&str]) -> Comm
 }
 
 #[test]
-fn hash_compares_files_in_groups_and_rewrites_only_those_that_differ() {
-    for remote in [false, true] {
+fn hash_keeps_matching_files_and_rewrites_only_those_that_differ() {
+    // Remote copies, and same-machine ones that reuse blocks, compare files
+    // in groups. Same-machine copies without block reuse compare each file
+    // on its own, stopping at its first difference.
+    for (remote, extra) in [(false, &[][..]), (false, &["--no-W"]), (true, &[])] {
         let t = Tmp::new();
         let inodes = equal_metadata_tree(&t, 4);
-        let out = copy_tree(&t, remote, "-ac", &[]);
+        let out = copy_tree(&t, remote, "-ac", extra);
         assert_output_ok(&out);
         assert_same_tree(&t.path("src"), &t.path("dst"));
+        let case = format!("remote={remote} {extra:?}");
         for (n, inode) in inodes.iter().enumerate() {
             let now = fs::metadata(t.path(&format!("dst/same{n}"))).unwrap().ino();
-            assert_eq!(now, *inode, "remote={remote} same{n}");
+            assert_eq!(now, *inode, "{case} same{n}");
         }
+        let grouped = remote || !extra.is_empty();
         let observed = tuning_observed(&out);
-        assert_eq!(observed["compared_files"], 8, "remote={remote}");
-        assert_eq!(observed["kept_files"], 4, "remote={remote}");
-        assert_eq!(observed["range_requests"], 0, "remote={remote}");
+        assert_eq!(
+            observed["compared_files"],
+            if grouped { 8 } else { 0 },
+            "{case}"
+        );
+        assert_eq!(
+            observed["kept_files"],
+            if grouped { 4 } else { 0 },
+            "{case}"
+        );
+        assert_eq!(observed["range_requests"], 0, "{case}");
     }
 }
 
@@ -1134,7 +1147,12 @@ fn hash_keeps_hard_linked_destinations_that_already_match() {
 
 #[test]
 fn hash_keeps_an_empty_destination_that_already_matches() {
-    for (native, remote) in [(false, false), (false, true), (true, false)] {
+    for (native, remote, extra) in [
+        (false, false, &[][..]),
+        (false, false, &["--no-W"]),
+        (false, true, &[]),
+        (true, false, &[]),
+    ] {
         let t = Tmp::new();
         write(&t.path("src/a"), b"");
         write(&t.path("dst/a"), b"");
@@ -1152,20 +1170,27 @@ fn hash_keeps_an_empty_destination_that_already_matches() {
                 &t.s("dst"),
             ]);
         } else {
-            let out = copy_tree(&t, remote, "-ac", &[]);
+            let out = copy_tree(&t, remote, "-ac", extra);
             assert_output_ok(&out);
-            assert_eq!(tuning_observed(&out)["kept_files"], 1, "remote={remote}");
+            // A grouped comparison keeps it; so does the per-file path of
+            // same-machine copies without block reuse.
+            let grouped = remote || !extra.is_empty();
+            assert_eq!(
+                tuning_observed(&out)["kept_files"],
+                u64::from(grouped),
+                "remote={remote} {extra:?}"
+            );
             assert_eq!(
                 fs::metadata(t.path("dst/a")).unwrap().mtime(),
                 1_600_000_000,
-                "remote={remote}"
+                "remote={remote} {extra:?}"
             );
         }
         for name in ["a", "alias"] {
             assert_eq!(
                 fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino(),
                 inode,
-                "native={native} remote={remote} {name}"
+                "native={native} remote={remote} {extra:?} {name}"
             );
         }
     }
@@ -1174,11 +1199,13 @@ fn hash_keeps_an_empty_destination_that_already_matches() {
 #[cfg(debug_assertions)]
 #[test]
 fn hash_reports_a_matching_file_it_cannot_keep_without_rewriting_it() {
+    // Locally, block reuse keeps the comparison grouped, as remotely.
     for remote in [false, true] {
         let t = Tmp::new();
         let inodes = equal_metadata_tree(&t, 1);
         let before = read(&t.path("dst/same0"));
-        let out = copy_tree_command(&t, remote, "-ac", &[])
+        let extra: &[&str] = if remote { &[] } else { &["--no-W"] };
+        let out = copy_tree_command(&t, remote, "-ac", extra)
             .env("SYQ_TEST_FAIL_SETMETA", "/same0")
             .run()
             .unwrap();

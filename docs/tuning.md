@@ -224,8 +224,9 @@ however many files it holds.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file
-that differs is then copied whole. Larger files and `--inplace` updates are
-compared one file at a time, in comparison blocks of 4 MiB by default. For
+that differs is then copied whole. Same-machine copies without block reuse,
+larger files and `--inplace` updates are compared one file at a time, in
+comparison blocks of 4 MiB by default. For
 those, a difference near the end can add almost a full extra read of both
 files before copying. An output already being written by the current run
 resumes before that probe. Leftover partials from earlier runs do not bypass
@@ -352,7 +353,8 @@ batch files up to 64 KiB. Larger limits allow more data to be held in memory;
 interrupted whole-file copies restart from the beginning. A file that already exists at the destination joins a batch when syq
 replaces it without reading it first, as same-machine copies do by default.
 With block reuse or `--hash`, replaced files of up to 64 MiB are compared in
-batches as described above. Larger files with block reuse or `--hash`, files
+batches as described above, except `--hash` comparisons in same-machine copies
+without block reuse. Those, larger files with block reuse or `--hash`, files
 protected by an `--if-exists` policy, and preserved hard links are handled one
 at a time. On macOS, files above the batching
 limit can use APFS cloning. That limit is the smallest of the comparison block
