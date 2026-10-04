@@ -2727,6 +2727,12 @@ const LISTING_MIN_NAMES: usize = 16;
 const LISTING_BYTES_PER_NAME: u64 = 256;
 #[cfg(target_os = "linux")]
 const LISTING_SLACK_BYTES: u64 = 4 << 10;
+/// ZFS reports a directory's entry count as its size, so the space the
+/// directory occupies is checked too. That space includes overhead, 8 to
+/// 17 KiB for a ZFS directory of up to several hundred entries, so it gets a
+/// larger allowance.
+#[cfg(target_os = "linux")]
+const LISTING_ALLOCATED_SLACK_BYTES: u64 = 16 << 10;
 /// Whatever size the filesystem reports (ZFS reports its entry count), the
 /// listing stops after this many entries per name, enough to reach the end
 /// of any directory the size allows.
@@ -2772,6 +2778,15 @@ fn directories_to_list<'a>(
     candidates
 }
 
+/// Whether a directory of `size` reported bytes occupying `blocks` 512-byte
+/// blocks is small enough to list for `names` requested names.
+#[cfg(target_os = "linux")]
+fn small_enough_to_list(names: usize, size: u64, blocks: u64) -> bool {
+    let expected = LISTING_BYTES_PER_NAME.saturating_mul(names as u64);
+    size <= expected.saturating_add(LISTING_SLACK_BYTES)
+        && blocks.saturating_mul(512) <= expected.saturating_add(LISTING_ALLOCATED_SLACK_BYTES)
+}
+
 /// List each NFS directory that enough of the paths about to be stat'ed
 /// are in. The first stat of a name that another process created makes the
 /// NFS client confirm the entry with the server, one LOOKUP per name; a
@@ -2805,8 +2820,7 @@ fn list_nfs_directories_before_stats(
         let Ok(metadata) = directory.metadata() else {
             return false;
         };
-        let expected = LISTING_BYTES_PER_NAME.saturating_mul(*names as u64);
-        if metadata.len() > expected.saturating_add(LISTING_SLACK_BYTES) {
+        if !small_enough_to_list(*names, metadata.len(), metadata.blocks()) {
             return false;
         }
         let Ok(first) = RelativePath::new(first) else {
