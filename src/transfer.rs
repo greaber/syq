@@ -3402,6 +3402,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
         );
         workers_started.set(true);
+    } else if fresh_destination
+        && (src_ep.is_remote() || dst_ep.is_remote())
+        && transport_setup.is_some()
+        && !defer_destination_mutations
+        && !opts.same_host
+        && !opts.dry_run
+        && !opts.inplace
+        && (!destination_anchor_required || destination_anchor.get().is_some())
+    {
+        // Every selected regular file is work for a fresh destination. One
+        // worker connects once planning sees one, while the control
+        // connection creates directories; the usual startup decision still
+        // chooses how many more to start.
+        connect_after_file_plan.store(true, Relaxed);
+        gate.set_active(1);
+        for id in gate.begin_warming(1) {
+            spawn_worker(id);
+        }
     }
 
     let ticker = progress.spawn_ticker();
