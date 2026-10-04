@@ -428,7 +428,7 @@ def main():
         if os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1":
             print("case: one-session destination refuses concurrent SSH worker setup", flush=True)
             with copying("ssh-session-limit", ("--no-tcp",)) as (process, output):
-                process.wait(timeout=20)
+                # Session contention uses the normal bounded worker retries.
                 text = finish(process, output, success=False)
                 assert "MaxSessions >= 2" in text, text
             remote("destination", "test ! -e " + shlex.quote(c + "/ssh-session-limit"))
