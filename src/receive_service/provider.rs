@@ -589,7 +589,7 @@ impl Service {
 }
 
 fn disconnected(socket: &UnixStream) -> bool {
-    let mut byte = 0;
+    let mut byte = 0u8;
     let result = unsafe {
         libc::recv(
             socket.as_raw_fd(),
