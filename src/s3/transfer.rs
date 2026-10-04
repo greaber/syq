@@ -1200,7 +1200,7 @@ impl Engine {
                         attempt += 1;
                     }
                     Err(e) if retryable(&e) && attempt < self.options.retries => {
-                        super::backoff(attempt).await;
+                        super::retry::after_error(attempt, &e).await;
                         attempt += 1;
                     }
                     Err(e) => {
@@ -1404,7 +1404,7 @@ impl Engine {
                                         attempt += 1;
                                     }
                                     Err(e) if retryable(&e) && attempt < self.options.retries => {
-                                        super::backoff(attempt).await;
+                                        super::retry::after_error(attempt, &e).await;
                                         attempt += 1;
                                     }
                                     Err(e) => {

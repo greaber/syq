@@ -115,6 +115,7 @@ async fn tigris_version_deletion_uses_individual_requests_and_other_deletion_sta
                 let deleter = delete::Deleter {
                     client: &client,
                     bucket: "bucket",
+                    retries: 2,
                     concurrency: crate::deletion::Concurrency::s3(&args),
                     individual: args
                         .s3_remove

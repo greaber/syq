@@ -86,6 +86,7 @@ async fn deletion_adapts_to_latency_without_losing_or_duplicating_outcomes() {
             client: &client,
             bucket: "bucket",
             individual: true,
+            retries: 2,
             concurrency: crate::deletion::Concurrency {
                 initial: 10,
                 maximum: 64,
@@ -135,6 +136,7 @@ async fn cancellation_drains_started_deletions_without_admitting_more() {
         client: &client,
         bucket: "bucket",
         individual: true,
+        retries: 2,
         concurrency: crate::deletion::Concurrency {
             initial: 8,
             maximum: 8,
@@ -176,6 +178,7 @@ async fn deletion_backoff_recovers_from_request_contention() {
             client: &client,
             bucket: "bucket",
             individual: true,
+            retries: 2,
             concurrency: crate::deletion::Concurrency {
                 initial: 32,
                 maximum: 128,
@@ -296,6 +299,7 @@ async fn bulk_retries_only_transient_failed_versions_and_bounds_attempts() {
         client: &client,
         bucket: "bucket",
         individual: false,
+        retries: 2,
         concurrency: crate::deletion::Concurrency::filesystem(1),
     };
     let items: Vec<_> = [
@@ -382,6 +386,7 @@ async fn bulk_retry_backoff_observes_cancellation_and_does_not_repeat_transport_
             client: &client,
             bucket: "bucket",
             individual: false,
+            retries: 2,
             concurrency: crate::deletion::Concurrency::filesystem(1),
         };
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));

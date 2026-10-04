@@ -17,6 +17,7 @@ mod remove;
 pub(crate) use remove::RemoveFlags;
 mod prune;
 mod read_recovery;
+mod retry;
 mod state;
 pub(crate) mod stream;
 mod transfer;
@@ -28,7 +29,6 @@ use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::cli::Args;
 use crate::progress::{human, Progress};
@@ -491,10 +491,7 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
 }
 
 pub(super) async fn backoff(attempt: u32) {
-    tokio::time::sleep(Duration::from_millis(
-        100u64.saturating_mul(1 << attempt.min(7)),
-    ))
-    .await;
+    tokio::time::sleep(retry::delay(attempt, false)).await;
 }
 
 #[cfg(test)]
