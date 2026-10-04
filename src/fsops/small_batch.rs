@@ -31,28 +31,61 @@ pub(super) struct SmallStage {
 }
 
 /// Apply `each` to `items` on up to `PARALLEL_WRITES` threads, in order.
+/// This thread runs the first part, as it would otherwise only wait, and
+/// any part whose thread the system refuses to start.
 fn on_threads<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> Vec<R> {
     let per_thread = items.len().div_ceil(PARALLEL_WRITES).max(1);
     let mut parts = Vec::new();
     let mut items = items.into_iter().peekable();
     while items.peek().is_some() {
-        parts.push(items.by_ref().take(per_thread).collect::<Vec<_>>());
+        parts.push(Mutex::new(Some(
+            items.by_ref().take(per_thread).collect::<Vec<_>>(),
+        )));
     }
-    let each = &each;
+    let Some((first, rest)) = parts.split_first() else {
+        return Vec::new();
+    };
+    // Whichever thread runs a part takes it. A thread that could not start
+    // never took its part, so this thread finds it still there.
+    let run = |part: &Mutex<Option<Vec<T>>>| {
+        let part = part.lock().unwrap().take().unwrap_or_default();
+        part.into_iter().map(&each).collect::<Vec<_>>()
+    };
+    let run = &run;
     std::thread::scope(|scope| {
-        let threads: Vec<_> = parts
-            .into_iter()
-            .map(|part| scope.spawn(move || part.into_iter().map(each).collect::<Vec<_>>()))
+        let threads: Vec<_> = rest
+            .iter()
+            .map(|part| start_thread(scope, move || run(part)).ok())
             .collect();
-        threads
-            .into_iter()
-            .flat_map(|thread| {
-                thread
+        let mut results = run(first);
+        for (part, thread) in rest.iter().zip(threads) {
+            results.extend(match thread {
+                Some(thread) => thread
                     .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                None => run(part),
+            });
+        }
+        results
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Refuses the threads this thread starts, as a process limit would.
+    static REFUSE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Start `work` on a thread of `scope`, unless the system refuses one.
+fn start_thread<'scope, R: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    work: impl FnOnce() -> R + Send + 'scope,
+) -> io::Result<std::thread::ScopedJoinHandle<'scope, R>> {
+    #[cfg(test)]
+    if REFUSE_THREADS.get() {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    std::thread::Builder::new().spawn_scoped(scope, work)
 }
 
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
@@ -833,6 +866,39 @@ mod tests {
             (published.mtime(), published.mtime_nsec()),
             (1_000_000_000, 123_456_789)
         );
+    }
+
+    #[test]
+    fn parts_keep_their_order_when_threads_are_refused() {
+        // This thread runs the first part itself, and every part when no
+        // thread starts; a panic in any part reaches the caller.
+        let caller = std::thread::current().id();
+        let first_part = 20usize.div_ceil(PARALLEL_WRITES);
+        for refused in [false, true] {
+            REFUSE_THREADS.set(refused);
+            let ran = on_threads((0..20).collect(), |i: usize| {
+                (i, std::thread::current().id())
+            });
+            REFUSE_THREADS.set(false);
+            let order: Vec<_> = ran.iter().map(|(i, _)| *i).collect();
+            assert_eq!(order, (0..20).collect::<Vec<_>>(), "refused={refused}");
+            for (i, thread) in ran {
+                assert_eq!(
+                    thread == caller,
+                    refused || i < first_part,
+                    "refused={refused} item {i}"
+                );
+            }
+            for panicking in [0, 19] {
+                REFUSE_THREADS.set(refused);
+                let outcome = std::panic::catch_unwind(|| {
+                    on_threads((0..20).collect(), |i: usize| assert_ne!(i, panicking))
+                });
+                REFUSE_THREADS.set(false);
+                assert!(outcome.is_err(), "refused={refused} item {panicking}");
+            }
+        }
+        assert!(on_threads(Vec::<usize>::new(), |i| i).is_empty());
     }
 
     #[test]
