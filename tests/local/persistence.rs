@@ -1359,6 +1359,7 @@ fn auth_from_preferences_skip_native_ssh_and_explicit_flags_bypass_saved_state()
 #[test]
 fn scoped_off_closes_native_connections_despite_damaged_account_state() {
     let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
     let scope = ephemeral_scope(&t);
     let key = "cm-4adf1f61aa19aead";
     write(

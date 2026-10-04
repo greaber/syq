@@ -95,8 +95,10 @@ def provider_sshd(root, public_key, provider_environment):
         "UseDNS no", "AllowAgentForwarding no", "AllowTcpForwarding no",
         "AllowStreamLocalForwarding local", "X11Forwarding no", "PermitTTY no",
         "MaxSessions " + str(max_sessions), "LogLevel VERBOSE",
-        "SetEnv XDG_CONFIG_HOME=" + provider_environment["XDG_CONFIG_HOME"],
-        "SetEnv XDG_RUNTIME_DIR=" + provider_environment["XDG_RUNTIME_DIR"], "",
+        # OpenSSH uses only the first SetEnv directive. Both variables must
+        # be assignments in that one directive.
+        "SetEnv XDG_CONFIG_HOME=" + provider_environment["XDG_CONFIG_HOME"]
+        + " XDG_RUNTIME_DIR=" + provider_environment["XDG_RUNTIME_DIR"], "",
     ]))
     environment = provider_environment.copy()
     # The service inherits the local agent. Incoming provider logins do not.
@@ -230,7 +232,12 @@ def main():
                                     "  UserKnownHostsFile /home/syq/.ssh/known_hosts\n"
                                     "  GlobalKnownHostsFile /dev/null\n  UpdateHostKeys no\n\n".format(TARGET)).encode()
                                    + original_config)
-                source("/usr/bin/ssh", "-a", "provider", 'test -z "${SSH_AUTH_SOCK:-}"')
+                probe = shlex.join(["python3", "-c", "import json,os; print(json.dumps({name: os.environ.get(name) "
+                                    "for name in ['XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'SSH_AUTH_SOCK']}))"])
+                observed = json.loads(source("/usr/bin/ssh", "-a", "provider", probe))
+                assert observed == {"XDG_CONFIG_HOME": provider_environment["XDG_CONFIG_HOME"],
+                                    "XDG_RUNTIME_DIR": provider_environment["XDG_RUNTIME_DIR"],
+                                    "SSH_AUTH_SOCK": None}, observed
                 run("syq", "persist", "receive", "on", "--notify", "off", env=provider_environment)
 
                 print("case: a lazy provider login requests destination-account approval", flush=True)
