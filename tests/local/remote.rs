@@ -740,6 +740,51 @@ fn a_worker_rejected_after_the_last_file_does_not_fail_the_copy() {
     assert_eq!(fs::read_dir(t.path("dst")).unwrap().count(), 0);
 }
 
+/// Once a copy has failed, a worker whose connection fails stops quietly
+/// rather than retrying.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_copy_does_not_retry_a_worker_connection() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"contents");
+    std::os::unix::fs::symlink("target", t.path("src/z-full")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let started = t.path("worker-started");
+    // An empty destination starts a worker as soon as planning sees the
+    // file; creating the symlink then runs out of space, failing the copy.
+    let out = compat_command()
+        .arg("-e")
+        .arg(fake_rsh(&t))
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--syq-tcp-ports",
+            EPHEMERAL_TCP_PORTS,
+            "-a",
+            "--no-progress",
+        ])
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("127.0.0.1:{}/", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "z-full")
+        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &started)
+        .env("SYQ_TEST_FAIL_WORKER_AFTER_COPY", "fail")
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("injected capacity failure"),
+        "{out:?}"
+    );
+    assert!(started.exists(), "no worker started: {out:?}");
+    assert!(!stderr_of(&out).contains("retrying"), "{out:?}");
+    assert!(!stderr_of(&out).contains("injected worker"), "{out:?}");
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();

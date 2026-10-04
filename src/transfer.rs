@@ -2307,9 +2307,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
-                    // Once every file is finished, a connection, or a retry,
-                    // would have nothing to do.
-                    if !gate.connection_needed(id) || sched.finished() {
+                    // Once every file is finished or the copy has failed, a
+                    // connection, or a retry, would have nothing to do.
+                    if !gate.connection_needed(id) || sched.finished() || sched.is_aborted() {
                         gate.mark_absent(id);
                         return Ok(());
                     }
@@ -2339,14 +2339,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             ))
                         });
                     // Tests fail the first worker's connection once every file
-                    // is finished: "reject" as a receiver rejecting its
-                    // handshake, anything else as an ordinary failure.
+                    // is finished or the copy has failed: "reject" as a
+                    // receiver rejecting its handshake, anything else as an
+                    // ordinary failure.
                     #[cfg(debug_assertions)]
                     let conns = match std::env::var("SYQ_TEST_FAIL_WORKER_AFTER_COPY") {
                         Ok(failure) if id == 0 => {
                             let deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(60);
-                            while !sched.finished() && std::time::Instant::now() < deadline {
+                            while !sched.finished()
+                                && !sched.is_aborted()
+                                && std::time::Instant::now() < deadline
+                            {
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
                             conns.and_then(|_| {
@@ -2363,8 +2367,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         Ok(conns) => conns,
                         // The copy no longer needs this connection, so its
                         // failure cannot fail the copy, and a retry would
-                        // only delay its end.
-                        Err(_) if sched.finished() => {
+                        // only delay its end. A failed copy has reported
+                        // its own error.
+                        Err(_) if sched.finished() || sched.is_aborted() => {
                             gate.mark_absent(id);
                             return Ok(());
                         }
