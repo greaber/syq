@@ -4238,13 +4238,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if let Some(results) = progress.results_writer() {
         results.emit_result(&terminal);
     }
-    // A finished connection need not wait for its helper to exit, except
-    // where the helper listens on the only TCP port the next copy may use.
-    if tcp_ports.is_none_or(|(lo, hi)| lo != hi) {
+    if !helpers_hold_the_only_tcp_port(tcp_ports) {
         src_ctl.detach();
         dst_ctl.detach();
     }
     Ok(exit_code)
+}
+
+/// A finished connection need not wait for its helper to exit, except where
+/// the helper listens on the only TCP port the next copy may use. Port 0 asks
+/// the kernel for a free port, so it never holds one the next copy needs.
+fn helpers_hold_the_only_tcp_port(tcp_ports: Option<(u16, u16)>) -> bool {
+    matches!(tcp_ports, Some((lo, hi)) if lo == hi && lo != 0)
 }
 
 /// lstat (or stat, with `follow`) each path on `conn`.
