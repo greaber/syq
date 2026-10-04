@@ -72,6 +72,13 @@ fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a
 /// clones the file it replaces rather than writing every block.
 const CLONE_MIN_REUSED: u64 = 1 << 20;
 
+/// What the receiver does with one patch: keep the file it replaces, or
+/// stage it for publication.
+enum PatchStep<'a> {
+    Kept(Option<(u64, u64)>),
+    Staged(Box<SmallPut>, Option<PatchSource<'a>>),
+}
+
 /// The file a patch reuses blocks of, opened and fingerprinted when the
 /// patch arrived.
 pub(super) struct PatchSource<'a> {
@@ -324,6 +331,8 @@ impl FsOps {
         if current.len() != len {
             return Ok(None);
         }
+        #[cfg(debug_assertions)]
+        fail_set_meta_for_test(&target.label)?;
         set_meta_file_known(file, meta, flags, &current)
             .with_context(|| format!("set metadata {}", target.label.display()))?;
         if guarded || condition != TargetCondition::Any {
@@ -342,13 +351,13 @@ impl FsOps {
     /// its new contents and the blocks it reuses from the file it replaces.
     /// A reused block must still hash as compared; otherwise that file fails
     /// and nothing of it is written. A patch that reuses every block of an
-    /// existing file whose fingerprint is unchanged keeps that file instead.
+    /// existing file that still holds them keeps that file instead.
     /// Each file is built in memory until the batch is published, so a batch
     /// describing more than the protocol allows is refused whole.
     pub(super) fn patch_small_batch(
         &mut self,
         patches: &[SmallPatch],
-    ) -> Result<Vec<std::result::Result<SmallPatched, WireError>>> {
+    ) -> Result<Vec<std::result::Result<SmallPatched, SmallPatchError>>> {
         if !patch_batch_fits(patches.iter().map(|patch| patch.len)) {
             bail!("small-file patch batch describes more file bytes than the protocol allows");
         }
@@ -363,45 +372,78 @@ impl FsOps {
         let mut sources = Vec::new();
         let mut positions = Vec::new();
         for (position, patch) in patches.iter().enumerate() {
-            let staged = check_patch_layout(patch)
-                .and_then(|()| self.keep_patched(patch))
-                .and_then(|kept| match kept {
-                    Some(identity) => Ok(Err(identity)),
-                    None => self.stage_patch(patch).map(Ok),
-                });
-            match staged {
-                Ok(Ok((put, source))) => {
-                    puts.push(put);
+            match self.prepare_patch(patch) {
+                Ok(PatchStep::Staged(put, source)) => {
+                    puts.push(*put);
                     sources.push(source);
                     positions.push(position);
                 }
-                Ok(Err(identity)) => {
+                Ok(PatchStep::Kept(identity)) => {
                     results[position] = Ok(SmallPatched {
                         kept: true,
                         identity,
                     })
                 }
-                Err(error) => results[position] = Err(wire_error(&error)),
+                Err(error) => results[position] = Err(error),
             }
         }
         for (position, result) in positions
             .into_iter()
             .zip(self.put_small_sources(&puts, &sources))
         {
-            results[position] = result.map(|identity| SmallPatched {
-                kept: false,
-                identity,
-            });
+            results[position] = result
+                .map(|identity| SmallPatched {
+                    kept: false,
+                    identity,
+                })
+                .map_err(|error| SmallPatchError {
+                    error,
+                    matched: false,
+                });
         }
         Ok(results)
     }
 
-    /// Keep the existing file a patch would reproduce whole: every block is
+    /// Keep the existing file a patch reproduces whole, or stage the patch.
+    /// A file found to match whose keeping fails is reported as matched, so
+    /// the copy does not rewrite the same contents.
+    fn prepare_patch<'a>(
+        &mut self,
+        patch: &'a SmallPatch,
+    ) -> std::result::Result<PatchStep<'a>, SmallPatchError> {
+        let failed = |matched| {
+            move |error: anyhow::Error| SmallPatchError {
+                error: wire_error(&error),
+                matched,
+            }
+        };
+        check_patch_layout(patch).map_err(failed(false))?;
+        if let Some((target, file)) = self.whole_match(patch).map_err(failed(false))? {
+            let kept = self
+                .keep_open_small(
+                    &target,
+                    &file,
+                    patch.len,
+                    &patch.meta,
+                    patch.unchanged_flags,
+                    patch.guard.is_some(),
+                    patch.condition,
+                )
+                .map_err(failed(true))?;
+            if let Some(identity) = kept {
+                return Ok(PatchStep::Kept(identity));
+            }
+        }
+        let (put, source) = self.stage_patch(patch).map_err(failed(false))?;
+        Ok(PatchStep::Staged(Box::new(put), source))
+    }
+
+    /// The existing file a patch would reproduce whole: every block is
     /// reused, and the file still holds them. Its fingerprint shows that
     /// nothing has changed it since it was hashed; when it has changed, as
     /// keeping another name of the same file changes it, the file is hashed
     /// again.
-    fn keep_patched(&mut self, patch: &SmallPatch) -> Result<Option<Option<(u64, u64)>>> {
+    fn whole_match(&mut self, patch: &SmallPatch) -> Result<Option<(RootedTarget, File)>> {
         let Some(basis) = patch.basis else {
             return Ok(None);
         };
@@ -421,15 +463,7 @@ impl FsOps {
         {
             return Ok(None);
         }
-        self.keep_open_small(
-            &target,
-            &file,
-            patch.len,
-            &patch.meta,
-            patch.unchanged_flags,
-            patch.guard.is_some(),
-            patch.condition,
-        )
+        Ok(Some((target, file)))
     }
 
     /// The put that publishes a patch, and the file whose blocks it reuses.

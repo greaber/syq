@@ -468,6 +468,16 @@ pub struct SmallPatched {
     pub identity: Option<(u64, u64)>,
 }
 
+/// Why one file of a patch batch failed.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SmallPatchError {
+    pub error: WireError,
+    /// The existing file already held the patch's contents, and only
+    /// keeping it, by setting its metadata, failed. Nothing was published in
+    /// its place, and copying it again would rewrite the same contents.
+    pub matched: bool,
+}
+
 /// Contents and integrity hash for one successful `SmallRead`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallBlock {
@@ -1534,7 +1544,7 @@ pub enum Response {
     ScanIgnoredCount(u64),
     ExistingHashes(Vec<std::result::Result<ExistingHashes, WireError>>),
     DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
-    PatchedBatch(Vec<std::result::Result<SmallPatched, WireError>>),
+    PatchedBatch(Vec<std::result::Result<SmallPatched, SmallPatchError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

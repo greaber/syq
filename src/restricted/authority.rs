@@ -1057,7 +1057,7 @@ impl RestrictedAuthority {
                     .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
                 proto::Response::PatchedBatch(results) => match results.get(index) {
                     Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(error.as_str()),
+                    Some(Err(error)) => Some(error.error.as_str()),
                     None => Some("receiver returned no outcome for this file"),
                 },
                 _ => None,
@@ -1105,10 +1105,16 @@ impl RestrictedAuthority {
                     kept_flags,
                     hold,
                 } => {
+                    // A file that already matched was kept, or failed only
+                    // to be kept.
                     let kept = matches!(
                         response,
                         proto::Response::PatchedBatch(results)
-                            if matches!(results.get(index), Some(Ok(patched)) if patched.kept)
+                            if matches!(
+                                results.get(index),
+                                Some(Ok(proto::SmallPatched { kept: true, .. }))
+                                    | Some(Err(proto::SmallPatchError { matched: true, .. }))
+                            )
                     );
                     // A kept file occupies nothing new. A publication, or a
                     // failed attempt, keeps the size it declared, as staging

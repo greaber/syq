@@ -5275,8 +5275,9 @@ fn grouped_patch_receipts_record_kept_published_and_failed_files() {
     let kept = target.join("kept");
     let published = target.join("published");
     let failed = target.join("failed");
+    let unkept = target.join("unkept");
     fs::create_dir_all(&target).unwrap();
-    for path in [&kept, &published, &failed] {
+    for path in [&kept, &published, &failed, &unkept] {
         fs::write(path, b"old").unwrap();
     }
     let key = generate_receipt_key(EnrollmentId::random()).unwrap();
@@ -5299,6 +5300,7 @@ fn grouped_patch_receipts_record_kept_published_and_failed_files() {
         small_patch(&kept, 3, block, vec![Some([0; 32])], b""),
         small_patch(&published, 3, block, vec![None], b"new"),
         small_patch(&failed, 3, block, vec![None], b"new"),
+        small_patch(&unkept, 3, block, vec![Some([0; 32])], b""),
     ]);
     let settlement = authority.authorize(&mut batch, false).unwrap();
     fs::write(&published, b"new").unwrap();
@@ -5313,15 +5315,25 @@ fn grouped_patch_receipts_record_kept_published_and_failed_files() {
                 kept: false,
                 identity: None,
             }),
-            Err("executor rejected it".into()),
+            Err(proto::SmallPatchError {
+                error: "executor rejected it".into(),
+                matched: false,
+            }),
+            Err(proto::SmallPatchError {
+                error: "keeping it failed".into(),
+                matched: true,
+            }),
         ]),
     );
 
+    // A file that matched holds nothing new, whether or not it was kept.
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, 6);
+
     let mut verified = open_issued(&authority, &secret, &policy);
-    assert_eq!(verified.terminal.summary.operations, 3);
+    assert_eq!(verified.terminal.summary.operations, 4);
     assert_eq!(verified.terminal.summary.published_files, 1);
     assert_eq!(verified.terminal.summary.published_bytes, 3);
-    assert_eq!(verified.terminal.summary.failed, 1);
+    assert_eq!(verified.terminal.summary.failed, 2);
     let mut records = Vec::new();
     verified
         .for_each_record(|record| {
@@ -5364,6 +5376,13 @@ fn grouped_patch_receipts_record_kept_published_and_failed_files() {
                 size: 3,
                 inplace: false
             },
+            crate::receipt::OperationDisposition::Failed
+        )
+    );
+    assert_eq!(
+        operation(b"unkept"),
+        (
+            crate::receipt::OperationAction::SetMetadata { flags: 0 },
             crate::receipt::OperationDisposition::Failed
         )
     );

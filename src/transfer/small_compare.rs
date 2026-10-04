@@ -48,6 +48,9 @@ pub(super) enum Compared {
     ResumePartial,
     /// The file could not be compared or patched: replace it whole.
     Differs,
+    /// The destination already held the source's contents, but keeping it
+    /// failed: a file error, as for a content-identical per-file finish.
+    KeepFailed(WireError),
 }
 
 #[derive(Clone, Copy)]
@@ -440,6 +443,10 @@ impl Worker {
                     sent,
                     reused,
                 },
+                Err(SmallPatchError {
+                    error,
+                    matched: true,
+                }) => Compared::KeepFailed(error),
                 Err(_) => Compared::Differs,
             });
         }
@@ -467,6 +474,10 @@ impl Worker {
                 self.progress.bytes_total.fetch_sub(reused, Relaxed);
                 self.complete_file(job, false)
             }
+            Compared::KeepFailed(error) => self.file_error(
+                idx,
+                anyhow::Error::new(error).context("finish content-identical destination"),
+            ),
             Compared::SourceChanged(_) | Compared::ResumePartial | Compared::Differs => {
                 unreachable!("these files are requeued")
             }

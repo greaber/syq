@@ -884,6 +884,10 @@ fn equal_metadata_tree(t: &Tmp, count: u64) -> Vec<u64> {
 }
 
 fn copy_tree(t: &Tmp, remote: bool, flags: &str, extra: &[&str]) -> Output {
+    copy_tree_command(t, remote, flags, extra).run().unwrap()
+}
+
+fn copy_tree_command(t: &Tmp, remote: bool, flags: &str, extra: &[&str]) -> Command {
     let source = t.s("src/");
     let destination = if remote {
         format!("fake:{}", t.s("dst/"))
@@ -907,7 +911,8 @@ fn copy_tree(t: &Tmp, remote: bool, flags: &str, extra: &[&str]) -> Output {
         command.args(&args).arg("--no-progress");
         command
     };
-    command.env("SYQ_DEBUG", "1").run().unwrap()
+    command.env("SYQ_DEBUG", "1");
+    command
 }
 
 #[test]
@@ -1122,5 +1127,34 @@ fn hash_keeps_hard_linked_destinations_that_already_match() {
                 "native={native} {name}"
             );
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hash_reports_a_matching_file_it_cannot_keep_without_rewriting_it() {
+    for remote in [false, true] {
+        let t = Tmp::new();
+        let inodes = equal_metadata_tree(&t, 1);
+        let before = read(&t.path("dst/same0"));
+        let out = copy_tree_command(&t, remote, "-ac", &[])
+            .env("SYQ_TEST_FAIL_SETMETA", "/same0")
+            .run()
+            .unwrap();
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(23), "remote={remote}: {stderr}");
+        assert!(
+            stderr.contains("same0") && stderr.contains("injected"),
+            "remote={remote}: {stderr}"
+        );
+        // The file is left as it was, not rewritten, and the others copy.
+        assert_eq!(
+            fs::metadata(t.path("dst/same0")).unwrap().ino(),
+            inodes[0],
+            "remote={remote}"
+        );
+        assert_eq!(read(&t.path("dst/same0")), before);
+        assert_eq!(read(&t.path("dst/bad0")), read(&t.path("src/bad0")));
+        assert!(partial_files(&t.path("dst")).is_empty());
     }
 }
