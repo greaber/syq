@@ -111,7 +111,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Run at the remote coordinator and return after launch; requires --peer-auth own-credentials or --rsh |
 | `--peer-auth <MODE>` | How the coordinator authenticates to the peer (see the values below); --rsh takes over this policy entirely<br><br>Possible values:<br>- restricted: Constrained agent broker plus the command-restricted receiver on the peer<br>- broker: Constrained agent broker only; the peer runs no command-restricted receiver<br>- own-credentials: Forward nothing; the coordinator must hold its own credentials for the peer<br>- full-agent: Expose the complete local SSH agent to the coordinator, as `ssh -A` would<br><br>[default: restricted] |
-| `--pscope <PATH>` | Use an ephemeral SSH persistence scope created by `syq persist on --ephemeral` |
+| `--pscope <PATH>` | Use an isolated persistence domain created by `syq persist on --ephemeral` |
 
 ## S3 connection settings
 

@@ -80,7 +80,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `--syq-no-tcp` | Syq extension: send all data over ssh instead of separate TCP data connections |
 | `--syq-tcp-ports <LO-HI>` | Syq extension: port range the remote listens on for TCP data connections<br><br>[default: 47600-47699] |
 | `--syq-tcp-congestion <ALGO>` | Syq extension: use this congestion-control algorithm for TCP data sockets (Linux only) |
-| `--syq-pscope <PATH>` | Syq extension: use an isolated SSH persistence scope created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command |
+| `--syq-pscope <PATH>` | Syq extension: use an isolated persistence domain created by `syq persist on --ephemeral`; requires the default ssh or an -e ssh command |
 
 ## Performance tuning
 
