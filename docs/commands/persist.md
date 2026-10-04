@@ -15,7 +15,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist ssh-config`](#syq-persist-ssh-config) | Export native OpenSSH configuration for one already approved account connection |
 | [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
 | [`persist destinations`](#syq-persist-destinations) | Inspect or recover named return destinations |
-| [`persist connect`](#syq-persist-connect) | Connect with native SSH, or request reusable account access through an authorization |
+| [`persist connect`](#syq-persist-connect) | Connect with native SSH or request approved account access |
 | [`persist on`](#syq-persist-on) | Enable persistent connections for later syq commands |
 | [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
