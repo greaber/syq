@@ -1914,13 +1914,7 @@ fn probe_reachable_probes_each_socket_address_once() {
         .to_socket_addrs()
         .map(|mut it| it.any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST))
         .unwrap_or(false);
-    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = accepted.clone();
-    std::thread::spawn(move || {
-        while let Ok((_stream, _)) = listener.accept() {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    });
+    listener.set_nonblocking(true).unwrap();
     let candidate = |address: &str| TcpCandidate {
         address: address.to_string(),
         speed_mbps: 0,
@@ -1937,8 +1931,17 @@ fn probe_reachable_probes_each_socket_address_once() {
     assert_eq!(candidates[0].reachable, Some(true));
     assert_eq!(candidates[2].reachable, Some(true));
     assert_eq!(candidates[1].reachable, Some(via_localhost));
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Successful probes have completed connect(), so their connections are
+    // already queued. Drain them without racing a background accept thread.
+    let mut accepted = 0;
+    loop {
+        match listener.accept() {
+            Ok(_) => accepted += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("accept probe: {error}"),
+        }
+    }
+    assert_eq!(accepted, 1);
 }
 
 /// Replay socket-probe completions in a fixed order without depending on the
