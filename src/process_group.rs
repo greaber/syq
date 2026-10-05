@@ -64,20 +64,12 @@ impl ProcessGroup {
             libc::kill(-(self.child.id() as i32), libc::SIGTERM);
             libc::kill(-(self.child.id() as i32), libc::SIGCONT);
         }
-        let deadline = std::time::Instant::now() + grace;
-        loop {
-            match self.poll() {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return self.close();
-            }
-            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
-        }
+        // The shell may exit before its children finish their TERM handlers.
+        // poll() closes the entire group when that leader exits, so do not call
+        // it during the grace period. Keep the PID reserved for the final kill.
+        // Cancellation pays this bounded delay; successful exits still use poll.
+        std::thread::sleep(grace);
+        self.close()
     }
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         if let Some(status) = self.status {
@@ -208,6 +200,25 @@ mod tests {
             child.terminate(Duration::from_secs(1)).unwrap().code(),
             Some(23)
         );
+        let mut output = String::new();
+        child
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert_eq!(output, "cleaned");
+    }
+
+    #[test]
+    fn descendants_keep_the_grace_period_after_the_shell_exits() {
+        // The outer shell dies immediately on TERM. Its child must still get
+        // time to run a cleanup handler before the group is forcibly closed.
+        let mut child = child(
+            r#"sh -c 'trap "sleep 0.1; printf cleaned; exit 0" TERM; sleep 30 & printf "ready\n"; wait' & wait"#,
+        );
+        child.terminate(Duration::from_secs(1)).unwrap();
         let mut output = String::new();
         child
             .child

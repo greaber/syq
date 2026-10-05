@@ -10,12 +10,16 @@ fn index_name(path: &Path, extension: &str) -> bool {
             .is_some_and(|name| name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn private_file(path: &Path, limit: u64) -> Result<File> {
+fn private_file(path: &Path, limit: u64, create: bool) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
+        .create(create)
+        .truncate(false)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
+        .open(path)
+        .with_context(|| format!("open SSH account state {}", path.display()))?;
     let metadata = file.metadata()?;
     anyhow::ensure!(
         metadata.is_file()
@@ -42,7 +46,7 @@ impl Drop for KeeperLock {
 /// keeper may replace its index entry: take its lock and compare before removal.
 /// Keep the lock file itself so concurrent starters continue sharing one inode.
 pub(super) fn retire_record(path: &Path, control: &Path) -> Result<()> {
-    let lock = match private_file(&path.with_extension("lock"), 0) {
+    let lock = match private_file(&path.with_extension("lock"), 0, true) {
         Ok(lock) => lock,
         Err(error) if not_found(&error) && !path.exists() => return Ok(()),
         Err(error) => return Err(error),
@@ -52,7 +56,12 @@ pub(super) fn retire_record(path: &Path, control: &Path) -> Result<()> {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             return Ok(());
         }
-        return Err(error.into());
+        return Err(error).with_context(|| {
+            format!(
+                "lock SSH account state {}",
+                path.with_extension("lock").display()
+            )
+        });
     }
     let _lock = KeeperLock(lock);
     let Some(record) = read_record(path)? else {
@@ -80,7 +89,7 @@ fn keepers_running(domain: &Domain) -> Result<usize> {
         if !index_name(&path, "lock") {
             continue;
         }
-        let lock = private_file(&path, 0)?;
+        let lock = private_file(&path, 0, false)?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::WouldBlock {
@@ -133,7 +142,7 @@ fn validate_pool_files(control: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    match private_file(&crate::session_pool::lock_path(control), 0) {
+    match private_file(&crate::session_pool::lock_path(control), 0, false) {
         Ok(_) => {}
         Err(error) if not_found(&error) => {}
         Err(error) => return Err(error),
@@ -201,7 +210,7 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
             let control = scope.join(name);
             // An orphaned pool remains owned after its socket disappears, but
             // only a registered endpoint can own these sidecar names.
-            let record = private_file(&control.with_extension("json"), 128 * 1024)?;
+            let record = private_file(&control.with_extension("json"), 128 * 1024, false)?;
             let _: crate::persistence::EndpointRecord = serde_json::from_reader(record)
                 .with_context(|| format!("parse approved SSH endpoint {}", control.display()))?;
             validate_pool_files(&control)?;
@@ -233,7 +242,7 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
                 "unexpected file in approved SSH scope {}",
                 path.display()
             );
-            match private_file(&path, 128 * 1024) {
+            match private_file(&path, 128 * 1024, false) {
                 Ok(_) => {}
                 Err(error) if not_found(&error) => continue,
                 Err(error) => return Err(error),
@@ -309,7 +318,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
                 "SSH account record belongs to another persistence scope"
             );
         } else if index_name(&path, "lock") {
-            private_file(&path, 0)?;
+            private_file(&path, 0, false)?;
         } else if path.file_name().is_some_and(|name| name == GENERATION) {
             read_generation(&path)?;
         } else {
@@ -411,6 +420,27 @@ mod tests {
             path.with_extension("lock").metadata().unwrap().ino()
         );
         retire_record(&path, &control).unwrap();
+    }
+
+    #[test]
+    fn retiring_record_recreates_missing_lock_and_reports_unsafe_lock_path() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("approved-dead");
+        let control = registered_control(&scope);
+        let (path, lock) = stored_record(root.path(), control.clone());
+        let lock_path = path.with_extension("lock");
+        drop(lock);
+        fs::remove_file(&lock_path).unwrap();
+        std::os::unix::fs::symlink(root.path().join("absent"), &lock_path).unwrap();
+        let error = retire_record(&path, &control).unwrap_err();
+        assert!(format!("{error:#}").contains(lock_path.to_str().unwrap()));
+        assert!(path.exists());
+        assert!(scope.exists());
+        fs::remove_file(&lock_path).unwrap();
+        retire_record(&path, &control).unwrap();
+        assert!(!path.exists());
+        assert!(!scope.exists());
+        assert_eq!(fs::metadata(lock_path).unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]

@@ -343,8 +343,11 @@ into this copy's live worker connection, with terminal access, forwarding and
 `~/.ssh/rc` disabled (the account's shell may still read its startup files). The destination still enforces the approved
 copy scope. Closing the copy invalidates its worker connections and removes
 the key entry; an entry left by an interrupted cleanup cannot join another
-copy. Later SSH copies remove unchanged temporary entries when their worker
-service is demonstrably gone. Entries whose status is uncertain are preserved.
+copy. On Linux, later SSH copies can remove unchanged temporary entries whose
+local worker socket still exists but refuses connections. A missing socket is
+not proof that a copy ended: another host sharing the same home directory may
+still be using the key. Those entries are preserved, as are uncertain cases on
+other systems.
 Your laptop's credentials and signing agent remain on the laptop.
 
 A server can also request source-read approval to download files from another

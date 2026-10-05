@@ -93,7 +93,10 @@ mod tests {
     fn pre_cleanup_ticket_format_is_still_recognized() {
         // Frozen spelling supported by 8673c83f; do not regenerate with the writer.
         let line = r#"restrict,command="/usr/bin/syq --return-ssh-worker eyJzb2NrZXQiOiIvbm9uZXhpc3RlbnQvc3lxLWNvcHktd29ya2VyLWZpeHR1cmUvcyIsInNlY3JldCI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEifQ" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH syq-copy-worker-00112233445566778899aabbccddeeff"#;
-        assert_eq!(prune_inactive(line.as_bytes()), b"");
+        assert!(AuthorizedKeyEntry::copy_worker_ticket(line).is_some());
+        // Existing tickets remain readable, but a missing local socket does
+        // not prove that the copy ended on a host sharing authorized_keys.
+        assert_eq!(prune_inactive(line.as_bytes()), line.as_bytes());
     }
 
     #[test]
@@ -135,7 +138,6 @@ mod tests {
             original,
             "ambiguous socket was removed"
         );
-        fs::remove_file(&socket).unwrap();
         let replacement_key = generate_enrollment_key(EnrollmentId::random()).unwrap();
         let replacement = TemporaryKey::install_at(
             root.path(),
@@ -145,7 +147,11 @@ mod tests {
         )
         .unwrap();
         let after = fs::read(&path).unwrap();
-        let retained_len = contents.len() - original.len();
+        let retained_len = if cfg!(target_os = "linux") {
+            contents.len() - original.len()
+        } else {
+            contents.len()
+        };
         assert_eq!(&after[..retained_len], &contents[..retained_len]);
         assert_eq!(
             &after[retained_len..],
@@ -153,6 +159,41 @@ mod tests {
         );
         drop(replacement);
         assert_eq!(fs::read(path).unwrap(), contents[..retained_len]);
+    }
+
+    #[test]
+    fn copy_with_no_local_socket_survives_next_install_in_shared_home() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let public = |id| {
+            generate_enrollment_key(id)
+                .unwrap()
+                .public_key()
+                .to_openssh()
+                .unwrap()
+        };
+        let remote = TemporaryKey::install_at(
+            root.path(),
+            Path::new("/usr/bin/syq"),
+            &public(EnrollmentId::random()),
+            &ticket(&root.path().join("syq-copy-worker-other-host/s")),
+        )
+        .unwrap();
+        let path = root.path().join(".ssh/authorized_keys");
+        let original = fs::read(&path).unwrap();
+        let local = TemporaryKey::install_at(
+            root.path(),
+            Path::new("/usr/bin/syq"),
+            &public(EnrollmentId::random()),
+            "local_ticket",
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains(remote.entry.line()));
+        drop(local);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(remote);
+        assert!(fs::read(&path).unwrap().is_empty());
     }
 
     #[test]

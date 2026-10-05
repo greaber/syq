@@ -35,7 +35,8 @@ impl Ticket {
     }
 }
 
-/// Only definite absence is enough to prune an old forced-copy authorization.
+/// Prune only a demonstrably abandoned local socket. A missing path can
+/// belong to a live copy on another host sharing this account's home.
 /// No ticket fields or on-disk formats change; old entries use this same ticket.
 pub(crate) fn worker_ticket_inactive(encoded: &str) -> bool {
     use std::os::unix::fs::FileTypeExt;
@@ -54,7 +55,7 @@ pub(crate) fn worker_ticket_inactive(encoded: &str) -> bool {
         return false;
     }
     match ticket.socket.symlink_metadata() {
-        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        Err(_) => return false,
         Ok(metadata)
             if !metadata.file_type().is_socket()
                 || metadata.uid() != unsafe { libc::geteuid() } =>
@@ -74,12 +75,7 @@ pub(crate) fn worker_ticket_inactive(encoded: &str) -> bool {
             socket.set_nonblocking(true)?;
             socket.connect(&socket2::SockAddr::unix(&ticket.socket)?)
         })();
-        result.is_err_and(|error| {
-            matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            )
-        })
+        result.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
     }
     #[cfg(not(target_os = "linux"))]
     false

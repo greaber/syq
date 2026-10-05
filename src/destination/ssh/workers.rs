@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) struct Authorization {
     domain: Domain,
@@ -209,24 +209,72 @@ impl Login {
 struct MasterWatch(socket2::Socket);
 impl MasterWatch {
     fn connect(path: &Path) -> std::io::Result<Self> {
-        let socket = crate::process::with_inheritance_guard(|| {
-            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-        })?;
-        socket.set_nonblocking(true)?;
-        socket.connect(&socket2::SockAddr::unix(path)?)?;
-        Ok(Self(socket))
+        Self::connect_until(path, Instant::now() + Duration::from_millis(250))
+    }
+
+    fn connect_until(path: &Path, deadline: Instant) -> std::io::Result<Self> {
+        let address = socket2::SockAddr::unix(path)?;
+        loop {
+            let socket = crate::process::with_inheritance_guard(|| {
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+            })?;
+            socket.set_nonblocking(true)?;
+            match socket.connect(&address) {
+                Ok(()) => return Ok(Self(socket)),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    // Linux reports EAGAIN for a full queue; Darwin can report
+                    // ECONNREFUSED. Retry only this failed local connect, with
+                    // a fresh socket and a short deadline, never a new login.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "approved SSH master socket {} remained unavailable: {error}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn closed(&self) -> bool {
-        let mut poll = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events: 0,
-            revents: 0,
-        };
-        // HUP is reported even with OpenSSH's mux Hello still unread. Merely
-        // peeking for EOF would leave that Hello hiding a disconnected master.
-        let result = unsafe { libc::poll(&mut poll, 1, 0) };
-        result > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        // Drain the unsolicited mux Hello: on Darwin unread data can mask HUP.
+        // There are no SSH requests or replies on this local lifetime watch.
+        // Bound draining so unexpected input cannot delay cancellation checks.
+        let mut bytes = [0u8; 4096];
+        for _ in 0..4 {
+            let count = unsafe {
+                libc::recv(
+                    self.0.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if count == 0 {
+                return true;
+            }
+            if count < 0 {
+                match std::io::Error::last_os_error().kind() {
+                    std::io::ErrorKind::WouldBlock => return false,
+                    std::io::ErrorKind::Interrupted => continue,
+                    _ => return true,
+                }
+            }
+        }
+        false
     }
 }
 
@@ -368,6 +416,69 @@ mod tests {
         drop(listener);
         assert!(path.exists());
         assert!(watch.closed());
+    }
+
+    fn full_queue(path: &Path) -> (socket2::Socket, Vec<socket2::Socket>) {
+        let listener =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        let address = socket2::SockAddr::unix(path).unwrap();
+        listener.bind(&address).unwrap();
+        listener.listen(1).unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..16 {
+            let client =
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            client.set_nonblocking(true).unwrap();
+            match client.connect(&address) {
+                Ok(()) => clients.push(client),
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionRefused
+                        ),
+                        "{error}"
+                    );
+                    return (listener, clients);
+                }
+            }
+        }
+        panic!("test socket did not reach its one-entry listen backlog");
+    }
+
+    #[test]
+    fn master_watch_retries_a_full_queue_until_it_drains() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let path = root.path().join("master");
+        let (listener, _clients) = full_queue(&path);
+        let (finished, finish) = mpsc::channel();
+        let accept = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let _client = listener.accept().unwrap();
+            finish.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let watch = MasterWatch::connect_until(&path, Instant::now() + Duration::from_secs(2));
+        finished.send(()).unwrap();
+        accept.join().unwrap();
+        assert!(
+            watch.is_ok(),
+            "watch could not connect after queue drained: {:?}",
+            watch.err()
+        );
+    }
+
+    #[test]
+    fn master_watch_full_queue_has_a_deadline() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let path = root.path().join("master");
+        let (_listener, _clients) = full_queue(&path);
+        let start = Instant::now();
+        let error = MasterWatch::connect_until(&path, start + Duration::from_millis(30))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains(path.to_str().unwrap()));
     }
 
     #[test]

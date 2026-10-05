@@ -1500,7 +1500,6 @@ fn default_off_removes_dead_approved_master_and_its_record() {
             }))
             .unwrap(),
         ),
-        (record.with_extension("lock"), Vec::new()),
     ] {
         write(&path, &content);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
