@@ -352,7 +352,10 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::DescriptorCopy(_)
         | Request::ReadComparedRange { .. }
         | Request::ReadDifferingBatch { .. }
-        | Request::PatchSmallBatch(_) => true,
+        | Request::PatchSmallBatch(_)
+        | Request::PatchBegin { .. }
+        | Request::PatchData { .. }
+        | Request::PatchEnd { .. } => true,
         Request::Hello { .. }
         | Request::TcpListen { .. }
         | Request::Scan { .. }
@@ -854,6 +857,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
         source_authority: source_authority.clone(),
     };
 
+    // A restricted receiver holds each streamed patch to its grant across
+    // its pieces. Declared after `ops`, so that a connection that closes with
+    // one open settles it before its stage is removed.
+    let mut stream_gate = authority
+        .as_ref()
+        .map(|authority| crate::restricted::PatchStreamGate::new(authority.clone()));
     let (mut blocks, mut bytes) = (0u64, 0u64);
     loop {
         let waiting = server_actor.span(crate::transfer_observations::Stage::RequestWait);
@@ -865,6 +874,20 @@ fn serve<R: Read + Send + 'static, W: Write>(
         };
         drop(waiting);
         let (mut req, _request_hold) = queued.into_parts();
+        // A connection with a streamed patch open carries nothing else
+        // until the patch ends; closing the connection abandons it.
+        if (ops.patch_stream_open()
+            || stream_gate
+                .as_ref()
+                .is_some_and(crate::restricted::PatchStreamGate::is_open))
+            && !matches!(
+                req,
+                Request::PatchData { .. } | Request::PatchEnd { .. } | Request::Shutdown
+            )
+        {
+            w.write_msg(&Response::Err(crate::fsops::OPEN_PATCH_STREAM.into()))?;
+            continue;
+        }
         if metadata_control && file_payload_request(&req) {
             w.write_msg(&Response::Err(
                 "file payload requires a direct data worker".into(),
@@ -931,11 +954,22 @@ fn serve<R: Read + Send + 'static, W: Write>(
             w.write_msg(&Response::WriteStreamDone)?;
             continue;
         }
-        let settlement = match &authority {
-            Some(authority) => match authority.authorize(&mut req, over_ssh) {
+        let settlement = match &mut stream_gate {
+            Some(gate) => match gate.authorize(&mut req, over_ssh) {
                 Ok(settlement) => Some(settlement),
                 Err(error) => {
-                    w.write_msg(&Response::Err(format!("{error:#}")))?;
+                    let error = format!("{error:#}");
+                    // A refused piece fails its patch, whose end reports it;
+                    // a refused end abandons the patch.
+                    match req {
+                        Request::PatchData { .. } => ops.fail_patch_stream(&error),
+                        Request::PatchEnd { .. } => {
+                            ops.abandon_patch_stream();
+                            gate.abandon(&error);
+                        }
+                        _ => {}
+                    }
+                    w.write_msg(&Response::Err(error))?;
                     continue;
                 }
             },
@@ -968,6 +1002,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     .iter()
                     .map(|patch| patch.data.len() as u64)
                     .sum::<u64>();
+            }
+            Request::PatchData { data, .. } => {
+                blocks += 1;
+                bytes += data.len() as u64;
             }
             Request::PutSmallBatch(puts) => {
                 blocks += puts.len() as u64;
@@ -1352,8 +1390,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 } else {
                     Response::Err("mapping admission requires a restricted receiver".into())
                 };
-                if let (Some(authority), Some(settlement)) = (&authority, settlement) {
-                    authority.settle(settlement, &response);
+                if let (Some(gate), Some(settlement)) = (&mut stream_gate, settlement) {
+                    gate.settle(settlement, &response, ops.patch_stream_open());
                 }
                 w.write_msg(&response)?;
             }
@@ -1386,8 +1424,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         Ok(())
                     })
                 };
-                if let (Some(authority), Some(settlement)) = (&authority, settlement) {
-                    authority.settle(settlement, &resp);
+                if let (Some(gate), Some(settlement)) = (&mut stream_gate, settlement) {
+                    gate.settle(settlement, &resp, ops.patch_stream_open());
                 }
                 if drop_after_handling_for_test(&other) {
                     return Ok(());
@@ -1816,6 +1854,7 @@ fn drop_after_handling_for_test(request: &Request) -> bool {
         ),
         "write" => matches!(request, Request::WriteRange { .. }),
         "finalize" => matches!(request, Request::Finalize { .. }),
+        "patch-data" => matches!(request, Request::PatchData { .. }),
         _ => false,
     };
     if !matches {

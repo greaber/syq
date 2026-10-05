@@ -79,8 +79,11 @@ const DIRECT_PATCH_BYTES: usize = 1 << 20;
 
 /// Most differing data `ReadDifferingBatch` returns for one file, so that
 /// neither the source nor the patch it feeds holds more of one file. A file
-/// that differs by more is sent in ranges per file instead.
+/// that differs by more streams its patch instead (`PatchBegin`).
 pub const MAX_DIFFERING_FILE_BYTES: u64 = 16 << 20;
+
+/// Most new data one `PatchData` piece carries.
+pub const PATCH_PIECE_BYTES: u64 = 4 << 20;
 
 /// Whether a `PatchSmallBatch` of files of these lengths stays within what a
 /// receiver builds in memory before publishing any of them: `MAX_READ_BYTES`
@@ -462,6 +465,23 @@ pub struct SmallPatch {
     pub unchanged_flags: u8,
     pub condition: TargetCondition,
     pub guard: Option<ContainerGuard>,
+}
+
+impl SmallPatch {
+    /// How many bytes of the file its blocks that are not reused hold: the
+    /// new data the patch carries, the last block possibly short. Blocks
+    /// listed past the file's end hold nothing.
+    pub(crate) fn new_bytes(&self) -> u64 {
+        self.reuse
+            .iter()
+            .enumerate()
+            .filter(|(_, reuse)| reuse.is_none())
+            .map(|(index, _)| {
+                let off = (index as u64).saturating_mul(self.block);
+                self.block.min(self.len.saturating_sub(off))
+            })
+            .fold(0, u64::saturating_add)
+    }
 }
 
 /// The outcome of one file of a patch batch.
@@ -1248,9 +1268,9 @@ pub enum WireRequest<Data> {
     },
     /// Read source files, returning only the blocks that differ from the
     /// destination's hashes. A file stops being compared, with `matching`
-    /// ending there, at its first differing block when it is `compare_only`,
-    /// and otherwise once its differing blocks pass
-    /// `MAX_DIFFERING_FILE_BYTES`, when it returns no data at all.
+    /// ending there, at its first differing block when it is `compare_only`.
+    /// A file whose differing blocks pass `MAX_DIFFERING_FILE_BYTES` is
+    /// compared to its end but returns no data at all: its patch is streamed.
     ReadDifferingBatch {
         block: u64,
         reads: Vec<DifferingRead>,
@@ -1259,6 +1279,27 @@ pub enum WireRequest<Data> {
     /// files they replace, as `PutSmallBatch` publishes whole files, or keep
     /// those that already match.
     PatchSmallBatch(Vec<SmallPatch>),
+    /// Begin one patch, carrying no data, whose `data_len` new bytes follow
+    /// in `PatchData` pieces. Until `PatchEnd`, the connection accepts only
+    /// those pieces and that end. Replies `Ok`, or, once the patch has
+    /// failed, `PatchedBatch` with its failure; the patch stays open until
+    /// its end either way.
+    PatchBegin {
+        patch: Box<SmallPatch>,
+        data_len: u64,
+    },
+    /// The next new blocks of the open patch, whole and in file order, with
+    /// their payload hash. Replies as `PatchBegin` does.
+    PatchData {
+        #[serde(with = "serde_bytes")]
+        data: Data,
+        hash: ContentDigest,
+    },
+    /// Publish the open patch, or abandon it and remove what was staged.
+    /// Replies `PatchedBatch` with its one outcome.
+    PatchEnd {
+        commit: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1695,7 +1736,7 @@ impl SizeHint for Request {
 
     fn direct_payload(&self) -> bool {
         match self {
-            Request::WriteRange { .. } => true,
+            Request::WriteRange { .. } | Request::PatchData { .. } => true,
             // Patches whose data dwarfs their metadata: a second pass over
             // the metadata costs less than copying the data into a buffer.
             Request::PatchSmallBatch(patches) => {
@@ -1713,6 +1754,7 @@ impl SizeHint for Request {
             | Request::WriteRange { .. }
             | Request::PutSmallBatch(_)
             | Request::PatchSmallBatch(_)
+            | Request::PatchData { .. }
             | Request::CopySmallFiles(_)
             | Request::SeedBasis { .. } => MAX_FRAME,
             _ => MAX_METADATA_FRAME,
@@ -1721,6 +1763,10 @@ impl SizeHint for Request {
     fn size_hint(&self) -> usize {
         match self {
             Request::WriteRange { data, path, .. } => data.len() + path.len() + 64,
+            Request::PatchData { data, .. } => data.len() + 48,
+            Request::PatchBegin { patch, .. } => {
+                patch.reuse.len() * 33 + patch.path.len() + patch.meta.size_hint() + 136
+            }
             Request::SeedBasis {
                 path, final_ranges, ..
             } => path.len() + final_ranges.as_ref().map_or(0, |ranges| ranges.len() * 16) + 128,

@@ -3343,7 +3343,6 @@ impl Planner<'_> {
                 compare_final: false,
                 compared: false,
                 resume_partial: false,
-                large_patch: false,
                 recompared: 0,
                 src,
                 source,

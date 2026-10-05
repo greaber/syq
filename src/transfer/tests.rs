@@ -4194,6 +4194,11 @@ impl<F: FnMut(Request) -> Response + Send> Conn for AnsweringConn<F> {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("missing reply"))
     }
+    // Each reply arrives as its request is sent, as an in-process
+    // endpoint's does.
+    fn reply_ready(&self) -> bool {
+        !self.replies.is_empty()
+    }
     fn scan(
         &mut self,
         _: &[u8],
@@ -4287,10 +4292,18 @@ struct QueuingSource {
 impl Conn for QueuingSource {
     fn send(&mut self, mut request: Request) -> Result<()> {
         // Its files are read by path, as no source roots are registered.
-        if let Request::ReadDifferingBatch { reads, .. } = &mut request {
-            for read in reads {
-                read.source = None;
+        match &mut request {
+            Request::ReadDifferingBatch { reads, .. } => {
+                for read in reads {
+                    read.source = None;
+                }
             }
+            Request::ReadRange { source, .. }
+            | Request::ReadComparedRange { source, .. }
+            | Request::HashBlocks { source, .. }
+            | Request::FileHash { source, .. } => *source = None,
+            Request::StatMany { sources, .. } => *sources = None,
+            _ => {}
         }
         self.replies.push_back(self.ops.handle(&request));
         let data = self
@@ -4300,6 +4313,7 @@ impl Conn for QueuingSource {
                 Response::DifferingBlocks(files) => {
                     files.iter().flatten().map(|file| file.data.len()).sum()
                 }
+                Response::Block { data, .. } => data.len(),
                 _ => 0,
             })
             .sum();
@@ -4428,26 +4442,654 @@ fn grouped_comparison_holds_one_in_process_read_and_queues_remote_ones() {
     }
 }
 
+/// Jobs copying each of `files`, a name, its length and the range its
+/// source rewrites, from `root/source` into `root/target`, where an older
+/// version of each lies.
+fn differing_jobs(
+    root: &std::path::Path,
+    files: &[(&str, usize, std::ops::Range<usize>)],
+) -> Arc<Sched> {
+    use std::os::unix::fs::MetadataExt;
+    for directory in ["source", "target"] {
+        std::fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    let sched = Arc::new(Sched::new(512, 8192));
+    for (n, (name, len, changed)) in files.iter().enumerate() {
+        let old: Vec<u8> = (0..*len).map(|i| ((i * 7 + n) % 251) as u8).collect();
+        let mut new = old.clone();
+        new[changed.clone()].fill(n as u8 + 1);
+        let (source, target) = (
+            root.join("source").join(name),
+            root.join("target").join(name),
+        );
+        std::fs::write(&source, &new).unwrap();
+        std::fs::write(&target, &old).unwrap();
+        let mut job = pipeline_job(name.as_bytes(), 0);
+        job.src = source.as_os_str().as_bytes().to_vec();
+        job.dst = target.as_os_str().as_bytes().to_vec();
+        let planned = std::fs::metadata(&source).unwrap();
+        job.entry.size = planned.len();
+        job.entry.mtime = planned.mtime();
+        job.entry.mtime_nsec = planned.mtime_nsec() as u32;
+        let existing = std::fs::metadata(&target).unwrap();
+        job.dst_entry = Some(Entry {
+            mtime: 0,
+            dev: existing.dev(),
+            ino: existing.ino(),
+            nlink: existing.nlink(),
+            ..job.entry.clone()
+        });
+        sched.push_file(job);
+    }
+    sched.scan_done();
+    sched
+}
+
+#[test]
+fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
+    let block = 1 << 20;
+    // Two files of which 18 MiB differ, and one of which 1 MiB does: the
+    // first two stream their patches in pieces after the groups, the last
+    // is patched in its group.
+    let files: [(&str, usize, std::ops::Range<usize>); 3] = [
+        ("first", 24 << 20, 2 << 20..20 << 20),
+        ("second", 32 << 20, 14 << 20..32 << 20),
+        ("small", 4 << 20, 1 << 20..2 << 20),
+    ];
+    // From a remote and an in-process source, into an ordinary and a
+    // command-restricted receiver.
+    for (in_process, restricted) in [(false, false), (true, false), (false, true)] {
+        let case = format!("in_process={in_process} restricted={restricted}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sched = differing_jobs(root, &files);
+        let most = Arc::new(Mutex::new((0, 0)));
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        worker.src = Box::new(QueuingSource {
+            ops: crate::fsops::FsOps::new(),
+            replies: Default::default(),
+            in_process,
+            most: most.clone(),
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
+            root,
+            64 << 20,
+        ));
+        worker.dst = if restricted {
+            restricted_destination(authority.clone(), requests.clone(), || {})
+        } else {
+            let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+            let requests = requests.clone();
+            Box::new(AnsweringConn {
+                answer: move |request: Request| {
+                    let response = destination.handle(&request);
+                    requests.lock().unwrap().push(match request {
+                        Request::PatchData { data, hash } => Request::PatchData {
+                            data: vec![0; data.len()].into(),
+                            hash,
+                        },
+                        request => request,
+                    });
+                    response
+                },
+                replies: Default::default(),
+            })
+        };
+        worker.fast_batch_files = files.len();
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        if restricted {
+            opts.restricted_receiver = true;
+            opts.flags = flags::TIMES;
+            opts.matching_flags = flags::TIMES;
+        }
+        run_workers(&sched, vec![worker]);
+        for (name, ..) in &files {
+            assert!(
+                std::fs::read(root.join("source").join(name)).unwrap()
+                    == std::fs::read(root.join("target").join(name)).unwrap(),
+                "{case} {name}"
+            );
+        }
+        let requests = requests.lock().unwrap();
+        let count = |kind: fn(&Request) -> bool| requests.iter().filter(|r| kind(r)).count();
+        assert_eq!(
+            count(|r| matches!(r, Request::PatchBegin { .. })),
+            2,
+            "{case}"
+        );
+        assert_eq!(
+            count(|r| matches!(r, Request::PatchEnd { commit: true })),
+            2,
+            "{case}"
+        );
+        // Only the differing blocks were sent, in pieces of up to 4 MiB.
+        let pieces: Vec<usize> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::PatchData { data, .. } => Some(data.len()),
+                _ => None,
+            })
+            .collect();
+        if !restricted {
+            assert_eq!(pieces.iter().sum::<usize>(), 36 << 20, "{case}");
+            assert!(pieces.iter().all(|piece| *piece <= 4 << 20), "{case}");
+        }
+        assert_eq!(pieces.len(), 10, "{case}");
+        let (reads, data) = *most.lock().unwrap();
+        if in_process {
+            // Each piece moves on before the next is read.
+            assert_eq!(reads, 1, "{case}");
+            assert!(data <= 4 << 20, "{case}: {data} bytes");
+        } else {
+            // Pieces are read ahead, within the stream's buffer.
+            assert!(reads >= 2, "{case}: {reads} reads");
+            assert!(data <= 16 << 20, "{case}: {data} bytes");
+        }
+        if restricted {
+            assert_eq!(authority.in_flight(), 0, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_streamed_patch_that_fails_at_its_begin_sends_none_of_its_pieces() {
+    // An in-process source's pieces are ready as soon as they are read, but
+    // the sender still takes the receiver's replies first: a patch whose
+    // begin failed or was refused sends no piece. A stale begin is compared
+    // again and streamed once more; a refused one is copied whole, and the
+    // receiver's grant refuses nothing further for it.
+    use std::os::unix::fs::PermissionsExt;
+    let files = [("file", 32 << 20, 4 << 20..28 << 20)];
+    for refused in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sched = differing_jobs(root, &files);
+        let target = root.join("target/file");
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        worker.src = Box::new(QueuingSource {
+            ops: crate::fsops::FsOps::new(),
+            replies: Default::default(),
+            in_process: true,
+            most: Default::default(),
+        });
+        let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
+            root,
+            64 << 20,
+        ));
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        // The first begin goes stale: a metadata change, as keeping
+        // another name of the file makes, changes its change time.
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(!refused));
+        let stale = target.clone();
+        let mut receiver = restricted_destination(authority.clone(), executed.clone(), move || {
+            if first.swap(false, Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+        });
+        // What the receiver was sent, and its refusals of streamed requests.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let refusals = Arc::new(Mutex::new(0));
+        let mut refuse_begin = refused;
+        worker.dst = Box::new(AnsweringConn {
+            answer: {
+                let (sent, refusals) = (sent.clone(), refusals.clone());
+                move |request: Request| {
+                    let kind = match request {
+                        Request::PatchBegin { .. } => "begin",
+                        Request::PatchData { .. } => "piece",
+                        Request::PatchEnd { .. } => "end",
+                        _ => "other",
+                    };
+                    sent.lock().unwrap().push(kind);
+                    // The grant refuses the first begin, as it would one it
+                    // does not authorize.
+                    if refuse_begin && matches!(request, Request::PatchBegin { .. }) {
+                        refuse_begin = false;
+                        *refusals.lock().unwrap() += 1;
+                        return Response::Err("refused by the grant".into());
+                    }
+                    receiver.send(request).unwrap();
+                    let reply = receiver.recv().unwrap();
+                    if kind != "other" && matches!(reply, Response::Err(_)) {
+                        *refusals.lock().unwrap() += 1;
+                    }
+                    reply
+                }
+            },
+            replies: Default::default(),
+        });
+        worker.fast_batch_files = 1;
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        // The grant's hash block, which a whole copy's comparison uses.
+        opts.block = 4 << 20;
+        opts.restricted_receiver = true;
+        opts.flags = flags::TIMES;
+        opts.matching_flags = flags::TIMES;
+        // A whole copy reads ordinary ranges, which the test source serves.
+        opts.tuning.pipeline_depth = Some(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH);
+        run_workers(&sched, vec![worker]);
+        assert!(
+            std::fs::read(root.join("source/file")).unwrap() == std::fs::read(&target).unwrap(),
+            "refused={refused}"
+        );
+        let sent = sent.lock().unwrap();
+        let count = |kind: &str| sent.iter().filter(|sent| **sent == kind).count();
+        let counts = (count("begin"), count("piece"), count("end"));
+        if refused {
+            // Nothing followed the refused begin, which the file's whole
+            // copy replaced; only the begin was refused.
+            assert_eq!(counts, (1, 0, 0), "refused");
+            assert_eq!(*refusals.lock().unwrap(), 1);
+        } else {
+            // The stale patch ended without a piece; the second streamed
+            // its 24 MiB in six.
+            assert_eq!(counts, (2, 6, 2), "stale");
+            assert_eq!(*refusals.lock().unwrap(), 0);
+        }
+        assert_eq!(authority.in_flight(), 0, "refused={refused}");
+    }
+}
+
+#[test]
+fn grouped_comparison_counts_each_file_as_its_reply_settles_it() {
+    // Two files patched in groups of their own, one kept, and two of which
+    // more differs than a patch carries, whose patches stream after the
+    // groups.
+    let files: [(&str, usize, std::ops::Range<usize>); 5] = [
+        ("first", 4 << 20, 1 << 20..2 << 20),
+        ("second", 4 << 20, 2 << 20..3 << 20),
+        ("same", 4 << 20, 0..0),
+        ("streamed", 24 << 20, 2 << 20..20 << 20),
+        ("also-streamed", 24 << 20, 4 << 20..22 << 20),
+    ];
+    let total: u64 = files.iter().map(|(_, len, _)| *len as u64).sum();
+    // With the first streamed patch abandoned at its end, that file is
+    // compared again and copied on the per-file path.
+    for (in_process, abandon) in [(true, false), (false, false), (true, true)] {
+        let case = format!("in_process={in_process} abandon={abandon}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sched = differing_jobs(root, &files);
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        worker.src = Box::new(QueuingSource {
+            ops: crate::fsops::FsOps::new(),
+            replies: Default::default(),
+            in_process,
+            most: Default::default(),
+        });
+        // What progress showed as each request reached the receiver.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+        let (progress, recorded) = (worker.progress.clone(), seen.clone());
+        let mut abandoning = abandon;
+        worker.dst = Box::new(AnsweringConn {
+            answer: move |request: Request| {
+                let kind = match request {
+                    Request::PatchSmallBatch(_) => "patch",
+                    Request::PatchBegin { .. } => "begin",
+                    Request::PatchEnd { .. } => "end",
+                    _ => "other",
+                };
+                recorded.lock().unwrap().push((
+                    kind,
+                    progress.bytes_done.load(Relaxed),
+                    progress.files_done.load(Relaxed),
+                    progress.files_unchanged.load(Relaxed),
+                ));
+                match request {
+                    Request::PatchEnd { .. } if std::mem::take(&mut abandoning) => {
+                        destination.handle(&Request::PatchEnd { commit: false })
+                    }
+                    request => destination.handle(&request),
+                }
+            },
+            replies: Default::default(),
+        });
+        worker.fast_batch_files = files.len();
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = 1 << 20;
+        // A file compared again reads ordinary ranges, which the test source
+        // serves.
+        opts.tuning.pipeline_depth = Some(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH);
+        let progress = worker.progress.clone();
+        run_workers(&sched, vec![worker]);
+        for (name, ..) in &files {
+            assert!(
+                std::fs::read(root.join("source").join(name)).unwrap()
+                    == std::fs::read(root.join("target").join(name)).unwrap(),
+                "{case} {name}"
+            );
+        }
+        let seen = seen.lock().unwrap();
+        // Each group's patch reply is taken before the next group's patch
+        // is sent, and the file it keeps or publishes counts at once.
+        let patches: Vec<_> = seen.iter().filter(|seen| seen.0 == "patch").collect();
+        assert_eq!(patches.len(), 3, "{case}");
+        for (k, patch) in patches.iter().enumerate() {
+            assert_eq!(patch.2 + patch.3, k as u64, "{case}: patch {k}");
+        }
+        let begins: Vec<_> = seen.iter().filter(|seen| seen.0 == "begin").collect();
+        let ends: Vec<_> = seen.iter().filter(|seen| seen.0 == "end").collect();
+        assert_eq!((begins.len(), ends.len()), (2, 2), "{case}");
+        // Once the groups are done, before any patch streams, their files
+        // count: two patched from 1 MiB each, and one kept.
+        assert_eq!(
+            (begins[0].1, begins[0].2, begins[0].3),
+            (2 << 20, 2, 1),
+            "{case}"
+        );
+        // A streamed patch's pieces count as the receiver acknowledges them,
+        // all of them by its end.
+        for (begin, end) in begins.iter().zip(&ends).take(if abandon { 1 } else { 2 }) {
+            assert_eq!(end.1 - begin.1, 18 << 20, "{case}");
+        }
+        // Every file counts once, as sent or unchanged: an abandoned
+        // patch's pieces no longer count when it is copied again.
+        let (sent, unchanged) = (
+            progress.bytes_done.load(Relaxed),
+            progress.bytes_unchanged.load(Relaxed),
+        );
+        assert_eq!(sent + unchanged, total, "{case}");
+        if !abandon {
+            assert_eq!(sent, 38 << 20, "{case}");
+        }
+        assert_eq!(
+            (
+                progress.files_done.load(Relaxed),
+                progress.files_unchanged.load(Relaxed)
+            ),
+            (4, 1),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
+    // Eight rewritten files of 4 MiB, each a group of its own: all are sent
+    // to be hashed before any is read.
+    let names: Vec<String> = (0..8).map(|n| format!("file{n}")).collect();
+    let files: Vec<(&str, usize, std::ops::Range<usize>)> = names
+        .iter()
+        .map(|name| (name.as_str(), 4 << 20, 1 << 20..2 << 20))
+        .collect();
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let sched = differing_jobs(root, &files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    worker.src = {
+        let reads = reads.clone();
+        let mut source = crate::fsops::FsOps::new();
+        Box::new(AnsweringConn {
+            answer: move |mut request: Request| {
+                // Its files are read by path, as no source roots are
+                // registered.
+                if let Request::ReadDifferingBatch { reads: wanted, .. } = &mut request {
+                    reads.fetch_add(1, Relaxed);
+                    for read in wanted {
+                        read.source = None;
+                    }
+                }
+                source.handle(&request)
+            },
+            replies: Default::default(),
+        })
+    };
+    // The copy is aborted, as by a fatal error elsewhere, as the first patch
+    // reaches the receiver.
+    let patches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    worker.dst = {
+        let (sched, patches) = (sched.clone(), patches.clone());
+        let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+        Box::new(AnsweringConn {
+            answer: move |request: Request| {
+                if let Request::PatchSmallBatch(_) = request {
+                    patches.fetch_add(1, Relaxed);
+                    sched.abort();
+                }
+                destination.handle(&request)
+            },
+            replies: Default::default(),
+        })
+    };
+    worker.fast_batch_files = files.len();
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    worker.process_item(sched.next()).unwrap();
+    assert!(sched.is_aborted());
+    // The groups in flight read and publish nothing more; their replies were
+    // all taken.
+    assert_eq!(
+        (reads.load(Relaxed), patches.load(Relaxed)),
+        (1, 1),
+        "reads and patches sent"
+    );
+    assert!(!worker.src.reply_ready() && !worker.dst.reply_ready());
+    let published = names
+        .iter()
+        .filter(|name| {
+            std::fs::read(root.join("source").join(name)).unwrap()
+                == std::fs::read(root.join("target").join(name)).unwrap()
+        })
+        .count();
+    assert_eq!(published, 1);
+    // The patch already sent settled its file, which counts.
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+}
+
+/// A connection that fails, and stays dead, as a dropped one does: at its
+/// `fail_recv`-th reply, or as it sends its `fail_patch`-th patch batch.
+struct FailingConn {
+    inner: Box<dyn Conn>,
+    received: usize,
+    fail_recv: Option<usize>,
+    patches: usize,
+    fail_patch: Option<usize>,
+    dead: bool,
+}
+
+impl FailingConn {
+    fn new(inner: Box<dyn Conn>) -> Self {
+        Self {
+            inner,
+            received: 0,
+            fail_recv: None,
+            patches: 0,
+            fail_patch: None,
+            dead: false,
+        }
+    }
+}
+
+impl Conn for FailingConn {
+    fn send(&mut self, request: Request) -> Result<()> {
+        if let Request::PatchSmallBatch(_) = request {
+            self.patches += 1;
+            self.dead |= self.fail_patch == Some(self.patches);
+        }
+        anyhow::ensure!(!self.dead, "injected connection failure");
+        self.inner.send(request)
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.received += 1;
+        self.dead |= self.fail_recv == Some(self.received);
+        anyhow::ensure!(!self.dead, "injected connection failure");
+        self.inner.recv()
+    }
+    fn reply_ready(&self) -> bool {
+        !self.dead && self.inner.reply_ready()
+    }
+    fn is_dead(&self) -> bool {
+        self.dead
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(String),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// Compare `files` from an in-process source into an ordinary receiver
+/// until `fail` breaks one of the connections, and return the error and
+/// the worker's progress.
+fn compare_until_a_connection_fails(
+    root: &std::path::Path,
+    files: &[(&str, usize, std::ops::Range<usize>)],
+    fail: impl FnOnce(&mut FailingConn, &mut FailingConn),
+) -> (anyhow::Error, Arc<Progress>) {
+    let sched = differing_jobs(root, files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    let mut source = FailingConn::new(Box::new(QueuingSource {
+        ops: crate::fsops::FsOps::new(),
+        replies: Default::default(),
+        in_process: true,
+        most: Default::default(),
+    }));
+    let mut receiver = crate::fsops::FsOps::test_destination(&root.join("target"));
+    let mut destination = FailingConn::new(Box::new(AnsweringConn {
+        answer: move |request: Request| receiver.handle(&request),
+        replies: Default::default(),
+    }));
+    fail(&mut source, &mut destination);
+    (worker.src, worker.dst) = (Box::new(source), Box::new(destination));
+    worker.fast_batch_files = files.len();
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    let error = worker.process_item(sched.next()).unwrap_err();
+    (error, worker.progress.clone())
+}
+
+#[test]
+fn a_received_patch_reply_counts_although_the_source_then_fails() {
+    // The first file's patch reply has arrived when the source's
+    // connection fails as the second file's differing blocks are read.
+    let files = [
+        ("first", 4 << 20, 1 << 20..2 << 20),
+        ("second", 4 << 20, 1 << 20..2 << 20),
+    ];
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (error, progress) = compare_until_a_connection_fails(root, &files, |source, _| {
+        source.fail_recv = Some(2);
+    });
+    assert!(error.to_string().contains("injected connection failure"));
+    // The file the receiver published counts, and only it.
+    assert_eq!(read(root, "source/first"), read(root, "target/first"));
+    assert_ne!(read(root, "source/second"), read(root, "target/second"));
+    assert_eq!(progress.files_done.load(Relaxed), 1);
+    assert_eq!(progress.bytes_done.load(Relaxed), 1 << 20);
+}
+
+#[test]
+fn a_received_patch_reply_counts_although_a_later_patch_cannot_be_sent() {
+    // The first file's patch reply has arrived when the receiver's
+    // connection fails as the second file's patch is sent.
+    let files = [
+        ("first", 4 << 20, 1 << 20..2 << 20),
+        ("second", 4 << 20, 1 << 20..2 << 20),
+        ("third", 4 << 20, 1 << 20..2 << 20),
+    ];
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (error, progress) = compare_until_a_connection_fails(root, &files, |_, destination| {
+        destination.fail_patch = Some(2);
+    });
+    assert!(error.to_string().contains("injected connection failure"));
+    assert_eq!(read(root, "source/first"), read(root, "target/first"));
+    for name in ["second", "third"] {
+        assert_ne!(
+            read(root, &format!("source/{name}")),
+            read(root, &format!("target/{name}")),
+            "{name}"
+        );
+    }
+    assert_eq!(progress.files_done.load(Relaxed), 1);
+    assert_eq!(progress.bytes_done.load(Relaxed), 1 << 20);
+}
+
+fn read(root: &std::path::Path, path: &str) -> Vec<u8> {
+    std::fs::read(root.join(path)).unwrap()
+}
+
 /// A command-restricted receiver: each request is authorized, executed and
 /// settled as its server does, and recorded once executed. `before_patch`
-/// runs between a patch batch's authorization and its execution.
+/// runs between a patch batch's or streamed begin's authorization and its
+/// execution.
 fn restricted_destination(
     authority: Arc<crate::restricted::RestrictedAuthority>,
     requests: Arc<Mutex<Vec<Request>>>,
     mut before_patch: impl FnMut() + Send + 'static,
 ) -> Box<dyn Conn> {
     let mut ops = crate::fsops::FsOps::new();
+    let mut gate = crate::restricted::PatchStreamGate::new(authority);
     Box::new(AnsweringConn {
         answer: move |mut request: Request| {
-            let settlement = match authority.authorize(&mut request, false) {
+            if (ops.patch_stream_open() || gate.is_open())
+                && !matches!(
+                    request,
+                    Request::PatchData { .. } | Request::PatchEnd { .. }
+                )
+            {
+                return Response::Err(crate::fsops::OPEN_PATCH_STREAM.into());
+            }
+            let settlement = match gate.authorize(&mut request, false) {
                 Ok(settlement) => settlement,
-                Err(error) => return Response::Err(format!("{error:#}")),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    match request {
+                        Request::PatchData { .. } => ops.fail_patch_stream(&error),
+                        Request::PatchEnd { .. } => {
+                            ops.abandon_patch_stream();
+                            gate.abandon(&error);
+                        }
+                        _ => {}
+                    }
+                    return Response::Err(error);
+                }
             };
-            if matches!(request, Request::PatchSmallBatch(_)) {
+            if matches!(
+                request,
+                Request::PatchSmallBatch(_) | Request::PatchBegin { .. }
+            ) {
                 before_patch();
             }
             let response = ops.handle(&request);
-            authority.settle(settlement, &response);
+            gate.settle(settlement, &response, ops.patch_stream_open());
+            // Record what was executed, without the data of pieces.
+            if let Request::PatchData { hash, .. } = request {
+                request = Request::PatchData {
+                    data: Vec::new().into(),
+                    hash,
+                };
+            }
             requests.lock().unwrap().push(request);
             response
         },
@@ -4542,8 +5184,9 @@ fn copy_through_restricted_receiver(
         sched.push_file(job);
     }
     sched.scan_done();
-    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority(
+    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
         root,
+        64 << 20,
     ));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let before_patch = Arc::new(before_patch);

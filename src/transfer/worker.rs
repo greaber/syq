@@ -358,7 +358,6 @@ impl Worker {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
         !j.compared
-            && !j.large_patch
             && !self.opts.dry_run
             && j.attempt == 0
             && !self.opts.has_expected_for(j)
@@ -1224,7 +1223,6 @@ impl Worker {
             // Probe equality without creating a sidecar. A difference restarts
             // the staged pipeline; equal prefixes need not survive that restart.
             // Explicit checksums and protected/in-place checks stay separate.
-            // A grouped comparison of this attempt already found it different.
             if !inplace
                 && reuse_blocks
                 && final_is_file
@@ -1233,7 +1231,6 @@ impl Worker {
                 && size > 0
             {
                 if final_entry.is_some_and(|entry| entry.size == size)
-                    && !(job.large_patch && job.attempt == 0)
                     && self.matches_final_windows(&job)?
                 {
                     self.finish_matched_basis(idx, &job)?;

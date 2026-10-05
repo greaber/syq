@@ -1295,6 +1295,47 @@ assert any(
 PYTHON
 assert_same_tree source /tmp/syq-real-ssh/grouped-source \
     destination /tmp/syq-real-ssh/grouped-destination grouped
+# A file of which more differs than a group carries is streamed in pieces,
+# each held to the receiver's grant: only the rewritten 20 MiB crosses.
+ssh source sh -s <<'EOF'
+set -eu
+root=/tmp/syq-real-ssh/streamed-source
+install -d "$root"
+head -c 33554432 /dev/urandom >"$root/large"
+EOF
+syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/streamed-source \
+    --to destination --into /tmp/syq-real-ssh/streamed-destination
+ssh source sh -s <<'EOF'
+set -eu
+root=/tmp/syq-real-ssh/streamed-source
+head -c 20971520 /dev/urandom | dd of="$root/large" conv=notrunc status=none
+touch -m -d @1700000000 "$root/large"
+EOF
+streamed_results=/tmp/syq-real-ssh-streamed.ndjson
+streamed_debug=/tmp/syq-real-ssh-streamed.debug
+if ! SYQ_DEBUG=1 syq cp --no-progress --results "$streamed_results" \
+    --from source --srcs-in /tmp/syq-real-ssh/streamed-source \
+    --to destination --into /tmp/syq-real-ssh/streamed-destination \
+    2>"$streamed_debug"; then
+    cat "$streamed_debug" >&2
+    exit 1
+fi
+python3 - "$streamed_results" "$streamed_debug" <<'PYTHON'
+import json, sys
+from pathlib import Path
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+assert records[-1]['bytes_transferred'] == 20 << 20, records[-1]
+marker = 'syq: tuning observed: '
+observed = [
+    json.loads(line.split(marker, 1)[1])
+    for line in Path(sys.argv[2]).read_text().splitlines()
+    if marker in line
+]
+assert any(counts.get('streamed_patches') == 1 for counts in observed), observed
+PYTHON
+assert_same_tree source /tmp/syq-real-ssh/streamed-source \
+    destination /tmp/syq-real-ssh/streamed-destination streamed
 
 printf 'case: in-place copies of small files through a command-restricted receiver\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-small; for n in 1 2 3; do printf "small $n" >/tmp/syq-real-ssh/inplace-small/$n; done'

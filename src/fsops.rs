@@ -81,6 +81,9 @@ const SOURCE_SHARED_WORKER_FD_RESERVE: usize =
 /// A destination mutation names a path only relative to an authority: a
 /// registered destination root or a receiver's guard.
 const UNROOTED_MUTATION: &str = "destination mutation before a destination root was registered";
+/// The refusal of any request but the open streamed patch's data and end.
+pub(crate) const OPEN_PATCH_STREAM: &str =
+    "only the open streamed patch's data and end are valid until it ends";
 
 #[cfg(debug_assertions)]
 pub(crate) fn record_test_event(variable: &str, event: std::fmt::Arguments<'_>) -> io::Result<()> {
@@ -497,6 +500,9 @@ struct PreparedSmallCopy {
 pub struct FsOps {
     deletions: Option<crate::deletion::Batch>,
     prepared_small_copy: Option<PreparedSmallCopy>,
+    /// The patch whose new data is arriving in pieces, between `PatchBegin`
+    /// and `PatchEnd`.
+    patch_stream: Option<Box<small_batch::PatchStream>>,
     inode_preservation: crate::inode_metadata::Selection,
     sparse: bool,
     descriptor_copy: crate::descriptor_copy::Session,
@@ -722,6 +728,7 @@ impl FsOps {
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
             prepared_small_copy: None,
+            patch_stream: None,
             operator_selection: None,
             descriptor_session,
             source_roots: HashMap::new(),
@@ -1793,6 +1800,7 @@ impl FsOps {
                 files.iter().any(|file| file.guard.is_some())
             }
             Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_some()),
+            Request::PatchBegin { patch, .. } => patch.guard.is_some(),
             _ => false,
         };
         if has_guard {
@@ -1825,6 +1833,7 @@ impl FsOps {
                 files.iter().any(|file| file.guard.is_none())
             }
             Request::PatchSmallBatch(patches) => patches.iter().any(|patch| patch.guard.is_none()),
+            Request::PatchBegin { patch, .. } => patch.guard.is_none(),
             Request::CopyLocal { .. } => true,
             _ => false,
         };
@@ -2167,6 +2176,11 @@ impl FsOps {
                     }
                 }
             }
+            Request::PatchBegin { patch, .. } => {
+                if patch.guard.is_none() {
+                    map(&mut patch.path)?;
+                }
+            }
             Request::HashExistingBatch { files, .. } => {
                 for file in files {
                     if file.guard.is_none() {
@@ -2206,6 +2220,8 @@ impl FsOps {
             | Request::MappingChunk { .. }
             | Request::ConfigurePreservation { .. }
             | Request::CreateSendBudget { .. }
+            | Request::PatchData { .. }
+            | Request::PatchEnd { .. }
             | Request::StopReadStream => {}
         }
         Ok(())
