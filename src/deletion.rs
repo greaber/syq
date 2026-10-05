@@ -1,6 +1,11 @@
 //! Deletion admission is measured separately from payload transfers.
-use crate::rooted::{RelativePath, Root};
+use crate::rooted::{RelativePath, RemovalEntry, Root};
 use crate::tune::{Policy, Sampler};
+use anyhow::{bail, Context};
+use std::ffi::CString;
+use std::fs::File;
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -129,12 +134,20 @@ impl Control {
     }
 }
 
-/// A worker shares one directory turn across a short run of small unlinks.
-/// Metadata comes from the existing pre-unlink check, with no extra queries.
+/// A worker retains one parent descriptor across adjacent planned removals.
+/// The batch ends with its work share, never survives a receiver request, and
+/// grants no permission to discover or delete additional entries.
 #[derive(Default)]
 pub(crate) struct DirectoryBatch {
+    parent: Option<RemovalParent>,
     #[cfg(target_os = "linux")]
     held: Option<DeletionDirectory>,
+}
+
+struct RemovalParent {
+    root: Arc<Root>,
+    parents: Vec<Vec<u8>>,
+    directory: File,
 }
 
 #[cfg(target_os = "linux")]
@@ -147,7 +160,55 @@ struct DeletionDirectory {
 }
 
 impl DirectoryBatch {
-    pub(crate) fn before_unlink(
+    pub(crate) fn remove(
+        &mut self,
+        root: &Arc<Root>,
+        path: &RelativePath,
+        label: &Path,
+        directory: bool,
+    ) -> anyhow::Result<()> {
+        let (parents, leaf) = path.leaf()?;
+        let reuse = self
+            .parent
+            .as_ref()
+            .is_some_and(|parent| Arc::ptr_eq(&parent.root, root) && parent.parents == parents);
+        if !reuse {
+            // Release the previous directory before resolving or waiting on
+            // another one. Root object identity also separates mount views and
+            // roots revalidated by guarded requests.
+            #[cfg(target_os = "linux")]
+            {
+                self.held = None;
+            }
+            self.parent = None;
+            let directory = root.resolve_parent(path)?.into_directory()?;
+            self.parent = Some(RemovalParent {
+                root: root.clone(),
+                parents: parents.to_vec(),
+                directory,
+            });
+        }
+        let name = CString::new(leaf).expect("RelativePath excludes NUL");
+        let metadata =
+            match RemovalEntry::new(&self.parent.as_ref().unwrap().directory, &name).metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspect {}", label.display()))
+                }
+            };
+        if !directory {
+            if metadata.is_dir() {
+                bail!("{}: is now a directory; not deleting it", label.display());
+            }
+            self.before_unlink(root, path, metadata.len)?;
+        }
+        RemovalEntry::new(&self.parent.as_ref().unwrap().directory, &name)
+            .unlink(directory)
+            .with_context(|| format!("remove {}", label.display()))
+    }
+
+    fn before_unlink(
         &mut self,
         _root: &Arc<Root>,
         _path: &RelativePath,
@@ -295,6 +356,94 @@ impl Batch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn remove(
+        batch: &mut DirectoryBatch,
+        root: &Arc<Root>,
+        path: &[u8],
+        directory: bool,
+    ) -> anyhow::Result<()> {
+        batch.remove(
+            root,
+            &RelativePath::new(path)?,
+            Path::new("test entry"),
+            directory,
+        )
+    }
+
+    #[test]
+    fn planned_removals_keep_the_open_parent_without_following_a_replacement_link() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir_all(base.join("root/sub")).unwrap();
+        fs::create_dir(base.join("outside")).unwrap();
+        for name in ["first", "second", "third"] {
+            fs::write(base.join("root/sub").join(name), b"selected").unwrap();
+            fs::write(base.join("outside").join(name), b"outside").unwrap();
+        }
+        let root = Arc::new(Root::open(&base.join("root")).unwrap());
+        let mut batch = DirectoryBatch::default();
+        remove(&mut batch, &root, b"sub/first", false).unwrap();
+        fs::rename(base.join("root/sub"), base.join("root/held")).unwrap();
+        symlink(base.join("outside"), base.join("root/sub")).unwrap();
+        remove(&mut batch, &root, b"sub/second", false).unwrap();
+        assert!(!base.join("root/held/second").exists());
+        assert_eq!(fs::read(base.join("outside/second")).unwrap(), b"outside");
+        drop(batch);
+        // A later request must resolve again and reject the replacement link.
+        assert!(remove(&mut DirectoryBatch::default(), &root, b"sub/third", false).is_err());
+        assert!(base.join("root/held/third").exists());
+        assert_eq!(fs::read(base.join("outside/third")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn planned_removals_recheck_types_and_never_expand_the_plan() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("sub")).unwrap();
+        fs::write(base.join("sub/first"), b"first").unwrap();
+        fs::write(base.join("outside"), b"outside").unwrap();
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut batch = DirectoryBatch::default();
+        remove(&mut batch, &root, b"sub/first", false).unwrap();
+        fs::create_dir_all(base.join("sub/later")).unwrap();
+        fs::write(base.join("sub/later/keep"), b"keep").unwrap();
+        let error = remove(&mut batch, &root, b"sub/later", false).unwrap_err();
+        assert!(error.to_string().contains("is now a directory"));
+        assert!(remove(&mut batch, &root, b"sub/later", true).is_err());
+        assert_eq!(fs::read(base.join("sub/later/keep")).unwrap(), b"keep");
+        symlink(base.join("outside"), base.join("sub/link")).unwrap();
+        remove(&mut batch, &root, b"sub/link", false).unwrap();
+        assert!(fs::symlink_metadata(base.join("sub/link")).is_err());
+        assert_eq!(fs::read(base.join("outside")).unwrap(), b"outside");
+        remove(&mut batch, &root, b"sub/missing", false).unwrap();
+        fs::create_dir(base.join("empty")).unwrap();
+        remove(&mut batch, &root, b"empty", true).unwrap();
+        assert!(!base.join("empty").exists());
+    }
+
+    #[test]
+    fn a_new_root_object_does_not_reuse_an_old_child_directory() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("sub")).unwrap();
+        fs::write(base.join("sub/first"), b"first").unwrap();
+        fs::write(base.join("sub/second"), b"old").unwrap();
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut batch = DirectoryBatch::default();
+        remove(&mut batch, &root, b"sub/first", false).unwrap();
+        fs::rename(base.join("sub"), base.join("held")).unwrap();
+        fs::create_dir(base.join("sub")).unwrap();
+        fs::write(base.join("sub/second"), b"new").unwrap();
+        let reopened = Arc::new(Root::open(base).unwrap());
+        assert_eq!(root.identity(), reopened.identity());
+        remove(&mut batch, &reopened, b"sub/second", false).unwrap();
+        assert!(!base.join("sub/second").exists());
+        assert_eq!(fs::read(base.join("held/second")).unwrap(), b"old");
+    }
 
     #[test]
     fn deletion_control_finds_parallelism_and_rejects_contention() {

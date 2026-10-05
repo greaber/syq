@@ -477,25 +477,15 @@ fn apply_one_rooted_with_deletions(
                 *condition,
             )
         }
-        Op::Rmdir { .. } => match root.metadata_optional(path)? {
-            None => Ok(()),
-            Some(_) => root.remove_directory(path),
-        },
-        Op::Unlink { .. } => match root.metadata_optional(path)? {
-            None => Ok(()),
-            Some(metadata) if metadata.is_dir() => {
-                bail!(
-                    "{}: is now a directory; not deleting it",
-                    target.label.display()
-                )
-            }
-            Some(metadata) => {
-                if let Some(deletion) = deletion {
-                    deletion.before_unlink(root, path, metadata.len)?;
-                }
-                root.unlink(path)
-            }
-        },
+        Op::Rmdir { .. } | Op::Unlink { .. } => {
+            let mut single = crate::deletion::DirectoryBatch::default();
+            deletion.unwrap_or(&mut single).remove(
+                root,
+                path,
+                &target.label,
+                matches!(op, Op::Rmdir { .. }),
+            )
+        }
         Op::Remove { .. } => bail!("recursive remove cannot use a confined destination root"),
     }
 }

@@ -80,10 +80,10 @@ enum PinnedParent {
 }
 
 impl PinnedParent {
-    fn as_raw_fd(&self) -> RawFd {
+    fn file(&self) -> &File {
         match self {
-            Self::File(file) => file.as_raw_fd(),
-            Self::Directory(job) => job.directory.as_raw_fd(),
+            Self::File(file) => file,
+            Self::Directory(job) => &job.directory,
         }
     }
 }
@@ -1282,8 +1282,9 @@ fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<Rem
 /// outcomes already arise from an unrelated process removing the entry, so
 /// the race is not serialized.
 fn unlink_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutcome> {
-    let current = match metadata_at_cstring(name.parent.as_raw_fd(), &name.name) {
-        Ok(identity) => identity,
+    let entry = crate::rooted::RemovalEntry::new(name.parent.file(), &name.name);
+    let current = match entry.metadata() {
+        Ok(metadata) => identity_from_root(metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(RemovePinnedOutcome::AlreadyAbsent)
         }
@@ -1291,9 +1292,9 @@ fn unlink_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutco
     };
     require_same_identity(name.identity, current, "removal target")?;
     #[cfg(test)]
-    tests::before_unlink(name.parent.as_raw_fd(), &name.name);
-    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
-    retry_zero(|| unsafe { libc::unlinkat(name.parent.as_raw_fd(), name.name.as_ptr(), flags) })
+    tests::before_unlink(name.parent.file().as_raw_fd(), &name.name);
+    entry
+        .unlink(directory)
         .map(|()| RemovePinnedOutcome::Removed)
         .or_else(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -1384,11 +1385,7 @@ fn scan_metadata_at(parent: RawFd, component: &[u8]) -> io::Result<(Identity, u6
 fn metadata_at(parent: RawFd, component: &[u8]) -> io::Result<Identity> {
     let component = CString::new(component)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL"))?;
-    metadata_at_cstring(parent, &component)
-}
-
-fn metadata_at_cstring(parent: RawFd, component: &CString) -> io::Result<Identity> {
-    stat_at_cstring(parent, component).map(|stat| identity_from_stat(&stat))
+    stat_at_cstring(parent, &component).map(|stat| identity_from_stat(&stat))
 }
 
 fn stat_at_cstring(parent: RawFd, component: &CString) -> io::Result<libc::stat> {
