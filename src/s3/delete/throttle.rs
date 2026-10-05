@@ -3,7 +3,10 @@ use aws_smithy_runtime_api::{
     box_error::BoxError,
     client::{
         interceptors::{
-            context::{BeforeTransmitInterceptorContextRef, FinalizerInterceptorContextRef},
+            context::{
+                BeforeSerializationInterceptorContextRef, BeforeTransmitInterceptorContextRef,
+                FinalizerInterceptorContextRef,
+            },
             Intercept,
         },
         retries::{
@@ -106,13 +109,43 @@ impl Throttle {
         s.fresh_throttled = 0;
         s.throttled_attempts = 0;
     }
-    pub fn observer(self: &Arc<Self>, keys: usize, fresh: bool) -> Observe {
-        Observe {
-            throttle: self.clone(),
-            keys,
-            fresh,
-        }
+    pub fn client(self: &Arc<Self>, client: &aws_sdk_s3::Client) -> aws_sdk_s3::Client {
+        // Clone the configured runtime once. In particular this retains the
+        // HTTP pool, credentials, custom headers, retry policy and outage
+        // observer. Per-request config overrides add measurable CPU overhead
+        // when the provider requires individual version deletions.
+        aws_sdk_s3::Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .interceptor(Observe(self.clone()))
+                .build(),
+        )
     }
+}
+
+#[derive(Debug)]
+pub(super) struct Repeated;
+impl Storable for Repeated {
+    type Storer = StoreReplace<Self>;
+}
+impl Intercept for Repeated {
+    fn name(&self) -> &'static str {
+        "S3RepeatedBulkDeletion"
+    }
+    fn read_before_execution(
+        &self,
+        _: &BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        cfg.interceptor_state().store_put(Repeated);
+        Ok(())
+    }
+}
+#[derive(Debug)]
+struct Keys(usize);
+impl Storable for Keys {
+    type Storer = StoreReplace<Self>;
 }
 #[derive(Debug)]
 struct Started(Instant);
@@ -120,14 +153,23 @@ impl Storable for Started {
     type Storer = StoreReplace<Self>;
 }
 #[derive(Debug)]
-pub(super) struct Observe {
-    throttle: Arc<Throttle>,
-    keys: usize,
-    fresh: bool,
-}
+struct Observe(Arc<Throttle>);
 impl Intercept for Observe {
     fn name(&self) -> &'static str {
         "S3DeletionThrottleFeedback"
+    }
+    fn read_before_execution(
+        &self,
+        context: &BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let keys = context
+            .input()
+            .downcast_ref::<aws_sdk_s3::operation::delete_objects::DeleteObjectsInput>()
+            .and_then(|input| input.delete())
+            .map_or(1, |delete| delete.objects().len());
+        cfg.interceptor_state().store_put(Keys(keys));
+        Ok(())
     }
     fn read_before_transmit(
         &self,
@@ -147,6 +189,10 @@ impl Intercept for Observe {
         let Some(started) = cfg.load::<Started>() else {
             return Ok(());
         };
+        let Some(Keys(keys)) = cfg.load::<Keys>() else {
+            return Ok(());
+        };
+        let keys = *keys;
         let (success, throttled) = match context.output_or_error() {
             Some(Ok(output)) => {
                 if let Some(output) = output
@@ -157,10 +203,10 @@ impl Intercept for Observe {
                         .iter()
                         .filter(|e| crate::s3::retry::throttled(e.code(), None))
                         .count()
-                        .min(self.keys);
-                    (output.deleted().len().min(self.keys), throttled)
+                        .min(keys);
+                    (output.deleted().len().min(keys), throttled)
                 } else {
-                    (self.keys, 0)
+                    (keys, 0)
                 }
             }
             _ => {
@@ -182,15 +228,15 @@ impl Intercept for Observe {
                 if !throttled {
                     return Ok(());
                 }
-                (0, self.keys)
+                (0, keys)
             }
         };
-        let fresh = self.fresh
+        let fresh = cfg.load::<Repeated>().is_none()
             && cfg
                 .load::<RequestAttempts>()
                 .is_some_and(|n| n.attempts() == 1);
-        self.throttle
-            .observe(self.keys, fresh, success, throttled, started.0.elapsed());
+        self.0
+            .observe(keys, fresh, success, throttled, started.0.elapsed());
         Ok(())
     }
 }

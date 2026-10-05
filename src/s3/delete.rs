@@ -100,6 +100,10 @@ impl Deleter<'_> {
     ) -> Result<()> {
         let mut tuning = crate::deletion::Control::new(self.concurrency);
         let throttle = self.concurrency.automatic.then(throttle::Throttle::new);
+        let client = throttle
+            .as_ref()
+            .map(|throttle| throttle.client(self.client));
+        let client = client.as_ref().unwrap_or(self.client);
         let mut batches = items.chunks(if self.individual { 1 } else { 1000 });
         let mut pending = FuturesUnordered::new();
         let mut failure = None;
@@ -133,9 +137,8 @@ impl Deleter<'_> {
                 }
                 let targets: Vec<_> = batch.iter().map(&identify).collect();
                 let prepared = generation;
-                let throttle = throttle.as_ref();
                 pending.push(async move {
-                    (prepared, batch, self.batch(&targets, check, throttle).await)
+                    (prepared, batch, self.batch(&targets, check, client).await)
                 });
             }
             if pending.is_empty() {
@@ -179,12 +182,12 @@ impl Deleter<'_> {
         &self,
         targets: &[Target],
         check: &impl Fn() -> Result<()>,
-        throttle: Option<&std::sync::Arc<throttle::Throttle>>,
+        client: &Client,
     ) -> (
         Vec<std::result::Result<u64, Failure>>,
         Option<anyhow::Error>,
     ) {
-        let mut outcomes = self.batch_once(targets, throttle, true).await;
+        let mut outcomes = self.batch_once(targets, client, true).await;
         // The SDK retries request-level failures. Errors carried inside an HTTP
         // success need their own bounded retries; never resend successful keys.
         for attempt in 2..=u64::from(self.retries) + 1 {
@@ -218,7 +221,7 @@ impl Deleter<'_> {
             let selected: Vec<_> = retry.iter().map(|&i| targets[i].clone()).collect();
             for (index, result) in retry
                 .into_iter()
-                .zip(self.batch_once(&selected, throttle, false).await)
+                .zip(self.batch_once(&selected, client, false).await)
             {
                 outcomes[index] = result.map(|_| attempt).map_err(|mut error| {
                     error.attempts = attempt;
@@ -232,23 +235,16 @@ impl Deleter<'_> {
     async fn batch_once(
         &self,
         targets: &[Target],
-        throttle: Option<&std::sync::Arc<throttle::Throttle>>,
+        client: &Client,
         fresh: bool,
     ) -> Vec<std::result::Result<u64, Failure>> {
-        let mut config = aws_sdk_s3::config::Builder::new();
-        if let Some(throttle) = throttle {
-            config = config.interceptor(throttle.observer(targets.len(), fresh));
-        }
         if self.individual {
             let target = &targets[0];
-            let result = self
-                .client
+            let result = client
                 .delete_object()
                 .bucket(self.bucket)
                 .key(&target.key)
                 .set_version_id(target.version.clone())
-                .customize()
-                .config_override(config)
                 .send()
                 .await;
             return vec![match result {
@@ -282,21 +278,22 @@ impl Deleter<'_> {
                     .expect("key provided")
             })
             .collect();
-        let result = self
-            .client
-            .delete_objects()
-            .bucket(self.bucket)
-            .delete(
-                Delete::builder()
-                    .set_objects(Some(objects))
-                    .quiet(false)
-                    .build()
-                    .expect("objects provided"),
-            )
-            .customize()
-            .config_override(config)
-            .send()
-            .await;
+        let request = client.delete_objects().bucket(self.bucket).delete(
+            Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(false)
+                .build()
+                .expect("objects provided"),
+        );
+        let result = if fresh {
+            request.send().await
+        } else {
+            request
+                .customize()
+                .config_override(aws_sdk_s3::config::Builder::new().interceptor(throttle::Repeated))
+                .send()
+                .await
+        };
         match result {
             Err(error) => {
                 let message = format!("{}: {error}", client::failure("S3 removal", &error));

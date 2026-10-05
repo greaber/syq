@@ -69,8 +69,10 @@ impl HttpConnector for Responses {
         let status = self.status;
         HttpConnectorFuture::new(async move {
             tokio::time::sleep(Duration::from_millis(1)).await;
-            let (status, body) = if bulk {
+            let (status, body) = if bulk && call == 0 {
                 (200, "<DeleteResult><Deleted><Key>good</Key></Deleted><Error><Key>busy</Key><Code>SlowDown</Code></Error></DeleteResult>")
+            } else if bulk {
+                (200, "<DeleteResult><Error><Key>busy</Key><Code>SlowDown</Code></Error></DeleteResult>")
             } else if call < 2 {
                 (status, "<Error><Code>SlowDown</Code></Error>")
             } else {
@@ -119,14 +121,11 @@ async fn sdk_attempts_count_new_throttles_once_and_preserve_retries() {
             bulk: false,
             status,
         });
-        client
+        feedback
+            .client(&client)
             .delete_object()
             .bucket("bucket")
             .key("key")
-            .customize()
-            .config_override(
-                aws_sdk_s3::config::Builder::new().interceptor(feedback.observer(1, true)),
-            )
             .send()
             .await
             .unwrap();
@@ -148,6 +147,7 @@ async fn bulk_http_success_reports_key_outcomes_without_turning_them_into_sdk_re
         bulk: true,
         status: 200,
     });
+    let client = feedback.client(&client);
     let result = client
         .delete_objects()
         .bucket("bucket")
@@ -162,14 +162,29 @@ async fn bulk_http_success_reports_key_outcomes_without_turning_them_into_sdk_re
                 .build()
                 .unwrap(),
         )
-        .customize()
-        .config_override(aws_sdk_s3::config::Builder::new().interceptor(feedback.observer(2, true)))
         .send()
         .await
         .unwrap();
     assert_eq!(result.deleted().len(), 1);
     assert_eq!(result.errors().len(), 1);
     assert_eq!(calls.load(Relaxed), 1);
+    // Only the unsuccessful key is selected again. It must not be mistaken
+    // for a newly rejected request when deciding whether to slow other work.
+    client
+        .delete_objects()
+        .bucket("bucket")
+        .delete(
+            Delete::builder()
+                .objects(ObjectIdentifier::builder().key("busy").build().unwrap())
+                .build()
+                .unwrap(),
+        )
+        .customize()
+        .config_override(aws_sdk_s3::config::Builder::new().interceptor(Repeated))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Relaxed), 2);
     let state = feedback.state.lock().unwrap();
     assert_eq!(state.fresh_keys, 2);
     assert_eq!(state.fresh_throttled, 1);
