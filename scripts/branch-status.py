@@ -2,6 +2,7 @@
 """Report the state of the current task branch.
 
 Usage: scripts/branch-status.py [--json] [--check]
+       scripts/branch-status.py --address-master-run RUN --reason TEXT --fix URL
 
 Reports the worktree, the branch's pull request, the latest post-merge and
 nightly CI runs on master, the latest result of each check dispatched on this
@@ -11,8 +12,12 @@ the dispatched checks of any pull request.
 
 Fetches origin's master, since a local master branch is updated only by
 manual pulls and says nothing about current master. Otherwise only reads git
-and GitHub state. With --check it also runs the fixed Rust baseline (fmt,
-clippy, unit tests) in this worktree.
+and GitHub state, except --address-master-run, which records a separate commit
+status for a failed master run and its attempt. Addressed runs keep their failed
+conclusion but no longer produce a reminder. A new run or rerun is independent;
+addressing a failure never supplies passing tests or release certification.
+With --check it also runs the fixed Rust baseline (fmt, clippy, unit tests)
+in this worktree.
 
 A job that failed in a run dispatched on this branch stays a failure until a
 later dispatched run of the same job on the branch passes or that exact failed
@@ -30,14 +35,16 @@ checks (stderr diagnostic, no report, even with --json). The pull request's
 check rollup is reported as is; its required `dispatched-checks` status
 reflects the same dispatched failures this script reports.
 """
+import argparse
 import json
 import shutil
 import subprocess
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
-                               dispatched_runs, failed_checks, fetch_jobs, fetch_resolutions,
-                               in_parallel, merged_from_branch, merged_pull_requests, result_lines,
+                               dispatched_runs, failed_checks, fetch_commit_statuses, fetch_jobs,
+                               fetch_resolutions, in_parallel, merged_from_branch,
+                               merged_pull_requests, result_lines,
                                run_jobs, running, undecided, unresolved)
 from tooling import ToolError, json_output, output, report_errors
 
@@ -88,7 +95,7 @@ def master_run(workflow, event):
     """The latest run of a workflow on master for one trigger."""
     runs = json_output("gh", "run", "list", "--repo", REPOSITORY, "--workflow", workflow,
                        "--branch", "master", "--event", event, "--limit", "1", "--json",
-                       "headSha,status,conclusion,url,createdAt,databaseId", status=2)
+                       "headSha,status,conclusion,url,createdAt,databaseId,attempt", status=2)
     return runs[0] if runs else None
 
 
@@ -102,10 +109,51 @@ def run_state(workflow, run, kind, note):
             state = run.get("status") or "unknown"
     if state == "missing":
         note(f"{workflow} has no {kind} run on master")
-    elif state != "success" and state not in UNFINISHED:
+    elif state != "success" and state not in UNFINISHED and not run.get("resolution"):
         note(f"master is red: {workflow} {kind} {state} at {(run.get('headSha') or '')[:7]} "
              f"{run.get('url')}")
     return state
+
+
+def master_resolution_context(run):
+    return f"master-ci-addressed/{run['databaseId']}/{run['attempt']}"
+
+
+def failed_master_run(run):
+    return (run and run.get("status") == "completed"
+            and run.get("conclusion") not in ("success", "neutral", "skipped"))
+
+
+def annotate_master_runs(runs):
+    """Keep the original results and attach acknowledgments of exact attempts."""
+    statuses = fetch_commit_statuses(REPOSITORY, {run["headSha"] for run in runs
+                                                if failed_master_run(run)})
+    for run in runs:
+        if not failed_master_run(run):
+            continue
+        resolution = statuses.get(run["headSha"], {}).get(master_resolution_context(run), {})
+        if (resolution.get("state") == "success" and (resolution.get("description") or "").strip()
+                and resolution.get("target_url")):
+            run["resolution"] = {
+                "reason": resolution["description"], "fix": resolution["target_url"],
+                "actor": (resolution.get("creator") or {}).get("login"),
+                "created_at": resolution.get("created_at"), "url": resolution.get("url")}
+
+
+def address_master_run(run_id, reason, fix):
+    """Acknowledge only a currently reported failed master run's exact attempt."""
+    runs = in_parallel([lambda workflow=workflow, event=event: master_run(workflow, event)
+                        for workflow in WORKFLOWS for event in ("push", "schedule")])
+    run = next((run for run in runs if run and run.get("databaseId") == run_id), None)
+    if not failed_master_run(run):
+        raise ToolError(f"run {run_id} is not a current failed post-merge or nightly master run", 2)
+    output("gh", "api", "--method", "POST", f"repos/{REPOSITORY}/statuses/{run['headSha']}",
+           "-f", "state=success", "-f", f"context={master_resolution_context(run)}",
+           "-f", f"description={reason}", "-f", f"target_url={fix}", status=2)
+    print(f"Addressed master run {run_id}, attempt {run['attempt']}, at {run['headSha'][:7]}: "
+          f"{reason} {fix}")
+    print("The original result is unchanged; this is not passing test or release evidence.")
+    return 0
 
 
 def open_pull_request(branch):
@@ -191,7 +239,9 @@ def report(json_report, check):
                 if branch != "HEAD" else [] for workflow in BRANCH_WORKFLOWS]
     results = in_parallel(lookups)
     pr, merged, own_merged = results[:3]
-    latest = iter(results[3:3 + 2 * len(WORKFLOWS)])
+    latest_runs = results[3:3 + 2 * len(WORKFLOWS)]
+    annotate_master_runs(latest_runs)
+    latest = iter(latest_runs)
     runs = {run.get("databaseId"): run for workflow_runs in results[3 + 2 * len(WORKFLOWS):]
             for run in workflow_runs}
     runs = list(runs.values())
@@ -322,6 +372,10 @@ def report(json_report, check):
     def run_line(label, state, run):
         if run is None:
             return f"  {label:<16} {state:<12} (no run)"
+        if resolution := run.get("resolution"):
+            return (f"  {label:<16} {'addressed':<12} {(run.get('headSha') or '')[:7]}  "
+                    f"{run.get('url')}\n    original result: {state}; {resolution['reason']} "
+                    f"{resolution['fix']}")
         return f"  {label:<16} {state:<12} {(run.get('headSha') or '')[:7]}  {run.get('url')}"
 
     for entry in master_runs:
@@ -372,19 +426,32 @@ def report(json_report, check):
 
 
 def main():
-    json_report = check = False
-    for argument in sys.argv[1:]:
-        if argument == "--json":
-            json_report = True
-        elif argument == "--check":
-            check = True
-        else:
-            raise ToolError(f"usage: {sys.argv[0]} [--json] [--check]", 2)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="Print a JSON report")
+    parser.add_argument("--check", action="store_true", help="Run the Rust baseline")
+    parser.add_argument("--address-master-run", type=int, metavar="RUN",
+                        help="Stop reminders for this exact failed master run attempt")
+    parser.add_argument("--reason", help="One-line reason (1–140 characters)")
+    parser.add_argument("--fix", help="HTTPS link to the merged repair or replacement evidence")
+    args = parser.parse_args()
+    if args.address_master_run is not None:
+        if args.address_master_run <= 0 or args.json or args.check:
+            parser.error("--address-master-run requires a positive run ID and no report options")
+        args.reason = (args.reason or "").strip()
+        if not 1 <= len(args.reason) <= 140 or any(c in args.reason for c in "\r\n"):
+            parser.error("--reason must be one line of 1–140 characters")
+        if not args.fix or not args.fix.startswith("https://") or any(c.isspace() for c in args.fix):
+            parser.error("--fix requires an HTTPS URL")
+    elif args.reason is not None or args.fix is not None:
+        parser.error("--reason and --fix require --address-master-run")
     for tool in ("git", "gh"):
         if not shutil.which(tool):
             raise ToolError(f"branch status needs {tool}", 2)
     try:
-        return report(json_report, check)
+        if args.address_master_run is not None:
+            return address_master_run(args.address_master_run, args.reason, args.fix)
+        return report(args.json, args.check)
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise ToolError(f"unexpected GitHub response ({error!r})", 2) from None
 

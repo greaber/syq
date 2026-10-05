@@ -122,8 +122,13 @@ def resolution_context(number, job_id):
 
 def fetch_resolutions(repository, results):
     """Read each failed commit's statuses once, in parallel across PRs."""
-    heads = sorted({entry["head"] for entry in results if unresolved(entry)
-                    and entry.get("job_id")})
+    return fetch_commit_statuses(repository, {entry["head"] for entry in results
+                                             if unresolved(entry) and entry.get("job_id")})
+
+
+def fetch_commit_statuses(repository, heads):
+    """Latest status per context for each commit, including paginated history."""
+    heads = sorted(set(heads))
 
     def statuses(head):
         pages = json_output("gh", "api", f"repos/{repository}/commits/{head}/statuses?per_page=100",
