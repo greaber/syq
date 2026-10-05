@@ -4272,10 +4272,15 @@ struct QueuingSource {
 impl Conn for QueuingSource {
     fn send(&mut self, mut request: Request) -> Result<()> {
         // Its files are read by path, as no source roots are registered.
-        if let Request::ReadDifferingBatch { reads, .. } = &mut request {
-            for read in reads {
-                read.source = None;
+        match &mut request {
+            Request::ReadDifferingBatch { reads, .. } => {
+                for read in reads {
+                    read.source = None;
+                }
             }
+            Request::ReadRange { source, .. } => *source = None,
+            Request::StatMany { sources, .. } => *sources = None,
+            _ => {}
         }
         self.replies.push_back(self.ops.handle(&request));
         let data = self
@@ -4285,6 +4290,7 @@ impl Conn for QueuingSource {
                 Response::DifferingBlocks(files) => {
                     files.iter().flatten().map(|file| file.data.len()).sum()
                 }
+                Response::Block { data, .. } => data.len(),
                 _ => 0,
             })
             .sum();
@@ -4413,6 +4419,147 @@ fn grouped_comparison_holds_one_in_process_read_and_queues_remote_ones() {
     }
 }
 
+#[test]
+fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
+    use std::os::unix::fs::MetadataExt;
+    let block = 1 << 20;
+    // Two files of which 18 MiB differ, and one of which 1 MiB does: the
+    // first two stream their patches in pieces after the groups, the last
+    // is patched in its group.
+    let files: [(&str, usize, std::ops::Range<usize>); 3] = [
+        ("first", 24 << 20, 2 << 20..20 << 20),
+        ("second", 32 << 20, 14 << 20..32 << 20),
+        ("small", 4 << 20, 1 << 20..2 << 20),
+    ];
+    // From a remote and an in-process source, into an ordinary and a
+    // command-restricted receiver.
+    for (in_process, restricted) in [(false, false), (true, false), (false, true)] {
+        let case = format!("in_process={in_process} restricted={restricted}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        for directory in ["source", "target"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        let sched = Arc::new(Sched::new(512, 8192));
+        for (n, (name, len, changed)) in files.iter().enumerate() {
+            let old: Vec<u8> = (0..*len).map(|i| ((i * 7 + n) % 251) as u8).collect();
+            let mut new = old.clone();
+            new[changed.clone()].fill(n as u8 + 1);
+            let (source, target) = (
+                root.join("source").join(name),
+                root.join("target").join(name),
+            );
+            std::fs::write(&source, &new).unwrap();
+            std::fs::write(&target, &old).unwrap();
+            let mut job = pipeline_job(name.as_bytes(), 0);
+            job.src = source.as_os_str().as_bytes().to_vec();
+            job.dst = target.as_os_str().as_bytes().to_vec();
+            let planned = std::fs::metadata(&source).unwrap();
+            job.entry.size = planned.len();
+            job.entry.mtime = planned.mtime();
+            job.entry.mtime_nsec = planned.mtime_nsec() as u32;
+            let existing = std::fs::metadata(&target).unwrap();
+            job.dst_entry = Some(Entry {
+                mtime: 0,
+                dev: existing.dev(),
+                ino: existing.ino(),
+                nlink: existing.nlink(),
+                ..job.entry.clone()
+            });
+            sched.push_file(job);
+        }
+        sched.scan_done();
+        let most = Arc::new(Mutex::new((0, 0)));
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        worker.src = Box::new(QueuingSource {
+            ops: crate::fsops::FsOps::new(),
+            replies: Default::default(),
+            in_process,
+            most: most.clone(),
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
+            root,
+            64 << 20,
+        ));
+        worker.dst = if restricted {
+            restricted_destination(authority.clone(), requests.clone(), || {})
+        } else {
+            let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+            let requests = requests.clone();
+            Box::new(AnsweringConn {
+                answer: move |request: Request| {
+                    let response = destination.handle(&request);
+                    requests.lock().unwrap().push(match request {
+                        Request::PatchData { data, hash } => Request::PatchData {
+                            data: vec![0; data.len()].into(),
+                            hash,
+                        },
+                        request => request,
+                    });
+                    response
+                },
+                replies: Default::default(),
+            })
+        };
+        worker.fast_batch_files = files.len();
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.block = block;
+        if restricted {
+            opts.restricted_receiver = true;
+            opts.flags = flags::TIMES;
+            opts.matching_flags = flags::TIMES;
+        }
+        run_workers(&sched, vec![worker]);
+        for (name, ..) in &files {
+            assert!(
+                std::fs::read(root.join("source").join(name)).unwrap()
+                    == std::fs::read(root.join("target").join(name)).unwrap(),
+                "{case} {name}"
+            );
+        }
+        let requests = requests.lock().unwrap();
+        let count = |kind: fn(&Request) -> bool| requests.iter().filter(|r| kind(r)).count();
+        assert_eq!(
+            count(|r| matches!(r, Request::PatchBegin { .. })),
+            2,
+            "{case}"
+        );
+        assert_eq!(
+            count(|r| matches!(r, Request::PatchEnd { commit: true })),
+            2,
+            "{case}"
+        );
+        // Only the differing blocks were sent, in pieces of up to 4 MiB.
+        let pieces: Vec<usize> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::PatchData { data, .. } => Some(data.len()),
+                _ => None,
+            })
+            .collect();
+        if !restricted {
+            assert_eq!(pieces.iter().sum::<usize>(), 36 << 20, "{case}");
+            assert!(pieces.iter().all(|piece| *piece <= 4 << 20), "{case}");
+        }
+        assert_eq!(pieces.len(), 10, "{case}");
+        let (reads, data) = *most.lock().unwrap();
+        if in_process {
+            // Each piece moves on before the next is read.
+            assert_eq!(reads, 1, "{case}");
+            assert!(data <= 4 << 20, "{case}: {data} bytes");
+        } else {
+            // Pieces are read ahead, within the stream's buffer.
+            assert!(reads >= 2, "{case}: {reads} reads");
+            assert!(data <= 16 << 20, "{case}: {data} bytes");
+        }
+        if restricted {
+            assert_eq!(authority.in_flight(), 0, "{case}");
+        }
+    }
+}
+
 /// A command-restricted receiver: each request is authorized, executed and
 /// settled as its server does, and recorded once executed. `before_patch`
 /// runs between a patch batch's authorization and its execution.
@@ -4422,17 +4569,44 @@ fn restricted_destination(
     mut before_patch: impl FnMut() + Send + 'static,
 ) -> Box<dyn Conn> {
     let mut ops = crate::fsops::FsOps::new();
+    let mut gate = crate::restricted::PatchStreamGate::new(authority);
     Box::new(AnsweringConn {
         answer: move |mut request: Request| {
-            let settlement = match authority.authorize(&mut request, false) {
+            if (ops.patch_stream_open() || gate.is_open())
+                && !matches!(
+                    request,
+                    Request::PatchData { .. } | Request::PatchEnd { .. }
+                )
+            {
+                return Response::Err(crate::fsops::OPEN_PATCH_STREAM.into());
+            }
+            let settlement = match gate.authorize(&mut request, false) {
                 Ok(settlement) => settlement,
-                Err(error) => return Response::Err(format!("{error:#}")),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    match request {
+                        Request::PatchData { .. } => ops.fail_patch_stream(&error),
+                        Request::PatchEnd { .. } => {
+                            ops.abandon_patch_stream();
+                            gate.abandon(&error);
+                        }
+                        _ => {}
+                    }
+                    return Response::Err(error);
+                }
             };
             if matches!(request, Request::PatchSmallBatch(_)) {
                 before_patch();
             }
             let response = ops.handle(&request);
-            authority.settle(settlement, &response);
+            gate.settle(settlement, &response, ops.patch_stream_open());
+            // Record what was executed, without the data of pieces.
+            if let Request::PatchData { hash, .. } = request {
+                request = Request::PatchData {
+                    data: Vec::new().into(),
+                    hash,
+                };
+            }
             requests.lock().unwrap().push(request);
             response
         },
@@ -4527,8 +4701,9 @@ fn copy_through_restricted_receiver(
         sched.push_file(job);
     }
     sched.scan_done();
-    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority(
+    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
         root,
+        64 << 20,
     ));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let before_patch = Arc::new(before_patch);

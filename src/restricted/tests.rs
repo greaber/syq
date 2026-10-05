@@ -455,7 +455,15 @@ pub(crate) fn tcp_test_authority(root: &Path) -> RestrictedAuthority {
 /// manages modes on the receiver, and admits files of up to 1 MiB, for
 /// other modules' tests.
 pub(crate) fn time_preserving_test_authority(root: &Path) -> RestrictedAuthority {
-    let mut authority = test_authority(root, DeletionPolicy::Forbid, 1 << 20);
+    time_preserving_test_authority_of(root, 1 << 20)
+}
+
+/// The same, admitting files of up to `maximum_bytes`.
+pub(crate) fn time_preserving_test_authority_of(
+    root: &Path,
+    maximum_bytes: u64,
+) -> RestrictedAuthority {
+    let mut authority = test_authority(root, DeletionPolicy::Forbid, maximum_bytes);
     authority.copy.options.preserve_times = true;
     authority
 }
@@ -5641,4 +5649,270 @@ fn grouped_patch_receipts_record_kept_published_and_failed_files() {
                     )
         )));
     }
+}
+
+/// Authorize, execute and settle a request on the connection whose
+/// streamed patch `gate` holds, as the receiver's server does, failing the
+/// open patch when one of its pieces is refused. Returns the refusal, if any.
+fn execute_on_connection(
+    gate: &mut PatchStreamGate,
+    ops: &mut crate::fsops::FsOps,
+    mut request: Request,
+) -> std::result::Result<proto::Response, String> {
+    let settlement = match gate.authorize(&mut request, false) {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            let error = format!("{error:#}");
+            match request {
+                Request::PatchData { .. } => ops.fail_patch_stream(&error),
+                Request::PatchEnd { .. } => {
+                    ops.abandon_patch_stream();
+                    gate.abandon(&error);
+                }
+                _ => {}
+            }
+            return Err(error);
+        }
+    };
+    let response = ops.handle(&request);
+    gate.settle(settlement, &response, ops.patch_stream_open());
+    Ok(response)
+}
+
+#[test]
+fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let len = 64 * block;
+    let old: Vec<u8> = (0..len).map(|i| (i % 233) as u8).collect();
+    // More new data than one rate-limit burst.
+    let mut new = old.clone();
+    new[..20 * block as usize].fill(1);
+    new[40 * block as usize] ^= 1;
+    for name in ["refused", "published", "dropped", "outside-begin"] {
+        fs::write(target.join(name), &old).unwrap();
+    }
+    let key = generate_receipt_key(EnrollmentId::random()).unwrap();
+    let (secret, policy) = encrypted_policy(true);
+    // 8 MiB/s: a burst of 1 MiB.
+    let authority = std::sync::Arc::new(
+        test_authority_with_receipt(
+            &root,
+            DeletionPolicy::Forbid,
+            64 << 20,
+            8 << 20,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            Some((key, policy.clone())),
+        )
+        .unwrap(),
+    );
+    let burst = authority.file_data_limit.as_ref().unwrap().burst_bytes();
+    assert_eq!(burst, 1 << 20);
+    let mut ops = crate::fsops::FsOps::new();
+    let paths: Vec<_> = ["refused", "published", "dropped"]
+        .iter()
+        .map(|name| target.join(name))
+        .collect();
+    let hash = Request::HashExistingBatch {
+        block,
+        files: paths.iter().map(|path| existing_read(path, len)).collect(),
+    };
+    let proto::Response::ExistingHashes(existing) = execute_authorized(&authority, &mut ops, hash)
+    else {
+        panic!("unexpected hash response")
+    };
+    let algorithm = crate::hashing::HashPolicy::default().algorithm;
+    let payload = crate::hashing::HashPolicy::default().payload_algorithm();
+    let patch = |path: &Path, hashed: &proto::ExistingHashes| {
+        let reuse: Vec<_> = new
+            .chunks(block as usize)
+            .zip(&hashed.hashes)
+            .map(|(chunk, old)| (algorithm.hash(chunk) == *old).then_some(*old))
+            .collect();
+        let mut patch = small_patch(path, len, block, reuse, b"");
+        patch.basis = hashed.fingerprint;
+        patch
+    };
+    let begin = |patch: &proto::SmallPatch| Request::PatchBegin {
+        patch: Box::new(patch.clone()),
+        data_len: patch.new_bytes(),
+    };
+    let piece = |data: &[u8]| Request::PatchData {
+        data: data.to_vec().into(),
+        hash: payload.hash(data),
+    };
+    let new_data = |patch: &proto::SmallPatch| -> Vec<u8> {
+        new.chunks(block as usize)
+            .zip(&patch.reuse)
+            .filter(|(_, reuse)| reuse.is_none())
+            .flat_map(|(chunk, _)| chunk.to_vec())
+            .collect()
+    };
+    let in_flight = || authority.state.lock().unwrap().in_flight;
+    let sidecars = || {
+        fs::read_dir(&target)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".syq-tmp.")
+            })
+            .count()
+    };
+    let hashed: Vec<_> = existing.into_iter().map(Result::unwrap).collect();
+    let mut gate = PatchStreamGate::new(authority.clone());
+
+    // Pieces and ends need an open patch; a begin must carry no data,
+    // declare what its blocks hold, and pass every rule of a batch patch.
+    let refused_patch = patch(&paths[0], &hashed[0]);
+    let data = new_data(&refused_patch);
+    for request in [
+        piece(&data[..block as usize]),
+        Request::PatchEnd { commit: true },
+    ] {
+        let error = execute_on_connection(&mut gate, &mut ops, request).unwrap_err();
+        assert!(error.contains("no streamed patch is open"), "{error}");
+    }
+    let mut carrying = refused_patch.clone();
+    carrying.data = data.clone();
+    let mut short = begin(&refused_patch);
+    if let Request::PatchBegin { data_len, .. } = &mut short {
+        *data_len -= 1;
+    }
+    for (request, refusal) in [
+        (
+            Request::PatchBegin {
+                patch: Box::new(carrying),
+                data_len: data.len() as u64,
+            },
+            "a streamed patch carries its data in pieces",
+        ),
+        (short, "streamed patch declares"),
+        (
+            begin(&patch(&root.join("outside-begin"), &hashed[0])),
+            "outside the signed destination scopes",
+        ),
+    ] {
+        let error = execute_on_connection(&mut gate, &mut ops, request).unwrap_err();
+        assert!(error.contains(refusal), "{error}");
+    }
+    assert!(!gate.is_open() && !ops.patch_stream_open());
+    assert_eq!(in_flight(), 0);
+
+    // A begin holds its file's size and counts as in flight until its end;
+    // a second begin on its connection is refused.
+    let reserved = authority.state.lock().unwrap().reserved_bytes;
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, begin(&refused_patch)),
+        Ok(proto::Response::Ok)
+    ));
+    assert!(gate.is_open());
+    assert_eq!(in_flight(), 1);
+    assert_eq!(
+        authority.state.lock().unwrap().reserved_bytes,
+        reserved + len
+    );
+    let error = execute_on_connection(&mut gate, &mut ops, begin(&refused_patch)).unwrap_err();
+    assert!(error.contains("already open"), "{error}");
+    // A piece is charged as written data, within one rate-limit burst; a
+    // refused piece fails its patch, which then publishes nothing.
+    let transferred = authority.state.lock().unwrap().transferred_bytes;
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, piece(&data[..block as usize])),
+        Ok(proto::Response::Ok)
+    ));
+    assert_eq!(
+        authority.state.lock().unwrap().transferred_bytes,
+        transferred + block
+    );
+    let oversized = vec![0; burst as usize + 1];
+    let error = execute_on_connection(&mut gate, &mut ops, piece(&oversized)).unwrap_err();
+    assert!(error.contains("rate-limit burst"), "{error}");
+    let error = execute_on_connection(&mut gate, &mut ops, piece(&data)).unwrap_err();
+    assert!(
+        error.contains("runs past the length its begin declared"),
+        "{error}"
+    );
+    assert_eq!(sidecars(), 0);
+    let ended = execute_on_connection(&mut gate, &mut ops, Request::PatchEnd { commit: true });
+    assert!(
+        matches!(&ended, Ok(proto::Response::PatchedBatch(outcome)) if outcome[0].is_err()),
+        "{ended:?}"
+    );
+    assert!(!gate.is_open());
+    assert_eq!(in_flight(), 0);
+    assert_eq!(fs::read(&paths[0]).unwrap(), old);
+
+    // A patch whose pieces stay within its begin is published at its end.
+    let published = patch(&paths[1], &hashed[1]);
+    let data = new_data(&published);
+    assert!(matches!(
+        execute_on_connection(&mut gate, &mut ops, begin(&published)),
+        Ok(proto::Response::Ok)
+    ));
+    for chunk in data.chunks(2 * block as usize) {
+        assert!(matches!(
+            execute_on_connection(&mut gate, &mut ops, piece(chunk)),
+            Ok(proto::Response::Ok)
+        ));
+    }
+    let ended = execute_on_connection(&mut gate, &mut ops, Request::PatchEnd { commit: true });
+    assert!(
+        matches!(&ended, Ok(proto::Response::PatchedBatch(outcome)) if outcome[0].is_ok()),
+        "{ended:?}"
+    );
+    assert_eq!(fs::read(&paths[1]).unwrap(), new);
+
+    // A connection that closes with a patch open removes its stage, and
+    // its patch is settled as failed.
+    {
+        let mut gate = PatchStreamGate::new(authority.clone());
+        let mut ops = crate::fsops::FsOps::new();
+        let dropped = patch(&paths[2], &hashed[2]);
+        assert!(matches!(
+            execute_on_connection(&mut gate, &mut ops, begin(&dropped)),
+            Ok(proto::Response::Ok)
+        ));
+        assert_eq!(sidecars(), 1);
+        assert_eq!(in_flight(), 1);
+    }
+    assert_eq!(sidecars(), 0);
+    assert_eq!(in_flight(), 0);
+    assert_eq!(fs::read(&paths[2]).unwrap(), old);
+
+    // The receipt records each publication, as for batch patches.
+    let mut verified = open_issued(&authority, &secret, &policy);
+    let mut operations = Vec::new();
+    verified
+        .for_each_record(|record| {
+            if let crate::receipt::ReceiptRecord::Operation(operation) = record {
+                operations.push((operation.path, operation.action, operation.disposition));
+            }
+            Ok(())
+        })
+        .unwrap();
+    operations.sort_by(|left, right| left.0.cmp(&right.0));
+    let publish = crate::receipt::OperationAction::PublishFile {
+        size: len,
+        inplace: false,
+    };
+    use crate::receipt::OperationDisposition::{Failed, Succeeded};
+    assert_eq!(
+        operations,
+        vec![
+            (b"dropped".to_vec(), publish, Failed),
+            (b"published".to_vec(), publish, Succeeded),
+            (b"refused".to_vec(), publish, Failed),
+        ]
+    );
 }

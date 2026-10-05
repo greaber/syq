@@ -160,6 +160,239 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
     assert!(!target.exists(), "revoked writes must not publish the file");
 }
 
+#[test]
+fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
+    let root = crate::test_support::tempdir().unwrap();
+    let target = root.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let block = MIN_HASH_BLOCK_BYTES;
+    let len = 8 * block;
+    let old: Vec<u8> = (0..len).map(|i| (i % 229) as u8).collect();
+    let mut new = old.clone();
+    new[..3 * block as usize].fill(2);
+    for name in ["published", "dropped"] {
+        std::fs::write(target.join(name), &old).unwrap();
+    }
+    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority(
+        root.path(),
+    ));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_authority = authority.clone();
+    let server = std::thread::spawn(move || {
+        // One connection publishes a patch; the next closes with one open.
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            serve(
+                socket.try_clone().unwrap(),
+                socket.try_clone().unwrap(),
+                false,
+                None,
+                None,
+                Some(socket),
+                ServeSession {
+                    handshake_pending: None,
+                    ssh_worker_ticket: None,
+                    allow_tcp: true,
+                    metadata_control: false,
+                    loopback_only: false,
+                    named_socket: None,
+                    authority: Some(server_authority.clone()),
+                    source_authority: None,
+                    descriptor_session: DescriptorSessionSlot::default(),
+                },
+            )
+            .unwrap();
+        }
+    });
+    let connect = || {
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let reader = FrameReader::new(socket.try_clone().unwrap());
+        // The signed grant compresses its transport.
+        let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
+        writer
+            .write_msg(&Request::Hello {
+                identity: crate::identity::build().to_string(),
+                compress: true,
+                debug: false,
+                token: Vec::new(),
+                role: ConnectionRole::DestinationWorker {
+                    destination: None,
+                    copy_sources: Vec::new(),
+                },
+            })
+            .unwrap();
+        (socket, reader, writer)
+    };
+    let policy = crate::hashing::HashPolicy::default();
+    // Each patch reuses the blocks its file still holds.
+    let patch = |name: &str, existing: &ExistingHashes| SmallPatch {
+        path: target.join(name).as_os_str().as_bytes().to_vec(),
+        copy_id: [7; 16],
+        len,
+        block,
+        reuse: new
+            .chunks(block as usize)
+            .zip(&existing.hashes)
+            .map(|(chunk, old)| (policy.algorithm.hash(chunk) == *old).then_some(*old))
+            .collect(),
+        data: Vec::new(),
+        hash: [0; 32],
+        basis: existing.fingerprint,
+        meta: Meta {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 1_600_000_000,
+            mtime_nsec: 0,
+            inode_metadata: None,
+        },
+        flags: flags::RECEIVER_MODE | flags::TIMES,
+        unchanged_flags: flags::RECEIVER_MODE | flags::TIMES,
+        condition: TargetCondition::Any,
+        guard: None,
+    };
+    let new_data = new[..3 * block as usize].to_vec();
+    let piece = |data: &[u8]| Request::PatchData {
+        data: data.to_vec().into(),
+        hash: policy.payload_algorithm().hash(data),
+    };
+    let sidecars = || {
+        std::fs::read_dir(&target)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".syq-tmp.")
+            })
+            .count()
+    };
+    let exchange = |reader: &mut FrameReader<TcpStream>,
+                    writer: &mut FrameWriter<TcpStream>,
+                    request: &Request| {
+        writer.write_msg(request).unwrap();
+        reader.read_msg::<Response>().unwrap()
+    };
+    let hash_existing =
+        |reader: &mut FrameReader<TcpStream>, writer: &mut FrameWriter<TcpStream>, name: &str| {
+            let request = Request::HashExistingBatch {
+                block,
+                files: vec![ExistingRead {
+                    path: target.join(name).as_os_str().as_bytes().to_vec(),
+                    len,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                }],
+            };
+            match exchange(reader, writer, &request) {
+                Response::ExistingHashes(mut existing) => existing.pop().unwrap().unwrap(),
+                other => panic!("unexpected hash response {other:?}"),
+            }
+        };
+
+    let (socket, mut reader, mut writer) = connect();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    let existing = hash_existing(&mut reader, &mut writer, "published");
+    let begin = Request::PatchBegin {
+        patch: Box::new(patch("published", &existing)),
+        data_len: new_data.len() as u64,
+    };
+    assert!(matches!(
+        exchange(&mut reader, &mut writer, &begin),
+        Response::Ok
+    ));
+    assert_eq!(authority.in_flight(), 1);
+    // Until the patch ends, nothing but its pieces and end is authorized
+    // or executed, a second begin included.
+    for request in [
+        begin.clone(),
+        Request::HashExistingBatch {
+            block,
+            files: Vec::new(),
+        },
+        Request::WriteStreamFence,
+    ] {
+        let reply = exchange(&mut reader, &mut writer, &request);
+        assert!(
+            matches!(&reply, Response::Err(error) if error == crate::fsops::OPEN_PATCH_STREAM),
+            "{request:?}: {reply:?}"
+        );
+    }
+    assert_eq!(authority.in_flight(), 1);
+    for chunk in new_data.chunks(block as usize) {
+        assert!(matches!(
+            exchange(&mut reader, &mut writer, &piece(chunk)),
+            Response::Ok
+        ));
+    }
+    let reply = exchange(
+        &mut reader,
+        &mut writer,
+        &Request::PatchEnd { commit: true },
+    );
+    assert!(
+        matches!(&reply, Response::PatchedBatch(outcome) if outcome == &vec![Ok(SmallPatched { kept: false, identity: None })]),
+        "{reply:?}"
+    );
+    assert_eq!(authority.in_flight(), 0);
+    assert_eq!(std::fs::read(target.join("published")).unwrap(), new);
+    // Pieces and ends without a begin are refused.
+    for request in [
+        piece(&new_data[..block as usize]),
+        Request::PatchEnd { commit: true },
+    ] {
+        let reply = exchange(&mut reader, &mut writer, &request);
+        assert!(
+            matches!(&reply, Response::Err(error) if error.contains("no streamed patch is open")),
+            "{reply:?}"
+        );
+    }
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+
+    // A connection that closes with a patch open removes its stage and
+    // settles it.
+    let (socket, mut reader, mut writer) = connect();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    let existing = hash_existing(&mut reader, &mut writer, "dropped");
+    let begin = Request::PatchBegin {
+        patch: Box::new(patch("dropped", &existing)),
+        data_len: new_data.len() as u64,
+    };
+    assert!(matches!(
+        exchange(&mut reader, &mut writer, &begin),
+        Response::Ok
+    ));
+    assert!(matches!(
+        exchange(
+            &mut reader,
+            &mut writer,
+            &piece(&new_data[..block as usize])
+        ),
+        Response::Ok
+    ));
+    assert_eq!(sidecars(), 1);
+    socket.shutdown(std::net::Shutdown::Both).unwrap();
+    server.join().unwrap();
+    assert_eq!(sidecars(), 0);
+    assert_eq!(authority.in_flight(), 0);
+    assert_eq!(std::fs::read(target.join("dropped")).unwrap(), old);
+}
+
 // A local copy's receiver must not open its data port to the network.
 #[test]
 fn local_receiver_data_listeners_bind_loopback_only() {

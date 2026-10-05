@@ -150,12 +150,19 @@ impl<'de> serde_bytes::Deserialize<'de> for Payload {
     }
 }
 
+/// The postcard tag of a request variant, derived from the same enum the
+/// writer uses: there is no second wire schema.
+fn tag_of(request: &WireRequest<&[u8]>) -> u32 {
+    let encoded = postcard::to_stdvec(request).expect("serialize request tag");
+    postcard::take_from_bytes::<u32>(&encoded)
+        .expect("decode request tag")
+        .0
+}
+
 fn write_range_tag() -> u32 {
-    // Derive the tag from the same enum used by the writer. Other requests
-    // retain their ordinary decode path; there is no second wire schema.
     static TAG: OnceLock<u32> = OnceLock::new();
     *TAG.get_or_init(|| {
-        let request = WireRequest::WriteRange {
+        tag_of(&WireRequest::WriteRange {
             path: Vec::new(),
             inplace: false,
             copy_id: [0; 16],
@@ -164,17 +171,24 @@ fn write_range_tag() -> u32 {
             hash: [0; 32],
             data: &[] as &[u8],
             guard: None,
-        };
-        let encoded = postcard::to_stdvec(&request).expect("serialize write-range tag");
-        postcard::take_from_bytes::<u32>(&encoded)
-            .expect("decode write-range tag")
-            .0
+        })
+    })
+}
+
+fn patch_data_tag() -> u32 {
+    static TAG: OnceLock<u32> = OnceLock::new();
+    *TAG.get_or_init(|| {
+        tag_of(&WireRequest::PatchData {
+            data: &[] as &[u8],
+            hash: [0; 32],
+        })
     })
 }
 
 pub(super) fn decode_request(mut frame: FrameBuffer) -> io::Result<Budgeted<Request>> {
-    if postcard::take_from_bytes::<u32>(&frame).map(|(tag, _)| tag) != Ok(write_range_tag()) {
-        // Only raw write payloads return buffers; other requests keep their
+    let tag = postcard::take_from_bytes::<u32>(&frame).map(|(tag, _)| tag);
+    if tag != Ok(write_range_tag()) && tag != Ok(patch_data_tag()) {
+        // Only raw file payloads return buffers; other requests keep their
         // existing allocation lifetime.
         frame.returned = Weak::new();
         return wire_budget::decode(&frame);
@@ -186,47 +200,62 @@ pub(super) fn decode_request(mut frame: FrameBuffer) -> io::Result<Budgeted<Requ
     hold.grow(
         std::mem::size_of::<Request>().saturating_sub(std::mem::size_of::<WireRequest<&[u8]>>()),
     )?;
-    let WireRequest::WriteRange {
-        path,
-        inplace,
-        copy_id,
-        attempt,
-        off,
-        hash,
-        data,
-        guard,
-    } = request
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "expected write range",
-        ));
+    // Postcard borrows the payload from frame. Store a checked offset, never
+    // a pointer or a reference to storage that the reader may reuse.
+    let located = |data: &[u8]| -> io::Result<Range<usize>> {
+        let start = (data.as_ptr() as usize)
+            .checked_sub(frame.as_ptr() as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload outside frame"))?;
+        let end = start
+            .checked_add(data.len())
+            .filter(|end| *end <= frame.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload outside frame"))?;
+        Ok(start..end)
     };
-    // Postcard borrows this slice from frame. Store a checked offset, never a
-    // pointer or a reference to storage that the reader may reuse.
-    let start = (data.as_ptr() as usize)
-        .checked_sub(frame.as_ptr() as usize)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload outside frame"))?;
-    let end = start
-        .checked_add(data.len())
-        .filter(|end| *end <= frame.len())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload outside frame"))?;
-    Ok(Budgeted {
-        value: Request::WriteRange {
+    let value = match request {
+        WireRequest::WriteRange {
             path,
             inplace,
             copy_id,
             attempt,
             off,
             hash,
-            data: Payload {
-                storage: frame,
-                range: start..end,
-            },
+            data,
             guard,
-        },
-        hold,
-    })
+        } => {
+            let range = located(data)?;
+            Request::WriteRange {
+                path,
+                inplace,
+                copy_id,
+                attempt,
+                off,
+                hash,
+                data: Payload {
+                    storage: frame,
+                    range,
+                },
+                guard,
+            }
+        }
+        WireRequest::PatchData { data, hash } => {
+            let range = located(data)?;
+            Request::PatchData {
+                data: Payload {
+                    storage: frame,
+                    range,
+                },
+                hash,
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected file data",
+            ))
+        }
+    };
+    Ok(Budgeted { value, hold })
 }
 
 #[cfg(test)]
