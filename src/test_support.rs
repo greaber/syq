@@ -6,7 +6,7 @@ mod temporary;
 pub(crate) use temporary::{short_tempdir, temp_dir, tempdir};
 #[path = "../tests/support/executable.rs"]
 mod executable;
-pub(crate) use executable::write_executable;
+pub(crate) use executable::{copy_executable, write_executable};
 
 /// Run a unit test in a separate process whose stderr reader has gone away.
 /// Keep stdout available for the test harness and assertion diagnostics.
@@ -160,71 +160,73 @@ fn closed_socket_wait_preserves_buffered_bytes_and_socket_settings() {
     );
 }
 
-/// The cause of "Text file busy" test failures: a child forked while a test
-/// holds a script open for writing keeps that descriptor until it execs, and
-/// Linux refuses to run the script meanwhile. A fixture from write_executable
-/// leaves no descriptor in this process for the child to keep.
+/// Executable fixtures must never be open for writing in this process: a
+/// child that another test forks meanwhile keeps that descriptor until it
+/// execs, and running the fixture then fails with "Text file busy". Writing
+/// to a FIFO keeps the writer open mid-write, so any writer this process
+/// holds shows up among its descriptors.
 #[cfg(target_os = "linux")]
 #[test]
-fn forked_child_keeps_in_process_script_busy_but_not_fixture() {
-    use std::io::{Read, Write};
+fn executable_fixtures_are_never_open_for_writing_in_this_process() {
+    use std::io::Read;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixStream;
-    use std::os::unix::process::CommandExt as _;
-    use std::path::Path;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let root = tempdir().unwrap();
-    let script = b"#!/bin/sh\nexit 0\n";
-    let fixture = root.path().join("fixture");
-    write_executable(&fixture, script, 0o700);
-    let in_process = root.path().join("in-process");
-    let mut writer = std::fs::File::create(&in_process).unwrap();
-    writer.write_all(script).unwrap();
-    std::fs::set_permissions(&in_process, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-    // The child reports that it has forked, then waits before exec until it
-    // is released, or for at most ten seconds if this test fails first.
-    let (mut control, paused) = UnixStream::pair().unwrap();
-    paused
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    control
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let paused_fd = paused.as_raw_fd();
-    let mut command = Command::new("true");
-    command.stdin(Stdio::null()).stdout(Stdio::null());
-    unsafe {
-        command.pre_exec(move || {
-            let mut byte = [0u8];
-            libc::write(paused_fd, byte.as_ptr().cast(), 1);
-            libc::read(paused_fd, byte.as_mut_ptr().cast(), 1);
-            Ok(())
+    // More than a FIFO buffers, so the writer stays blocked until drained.
+    let contents = vec![b'#'; 1 << 20];
+    let source = root.path().join("source");
+    std::fs::write(&source, &contents).unwrap();
+    let inode = |metadata: std::fs::Metadata| (metadata.dev(), metadata.ino());
+    for copy in [false, true] {
+        let fifo = root.path().join(if copy { "copied" } else { "written" });
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let fifo_inode = inode(std::fs::metadata(&fifo).unwrap());
+        // Open the reader first so the writer's open does not wait for it.
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                if copy {
+                    copy_executable(&source, &fifo, 0o700);
+                } else {
+                    write_executable(&fifo, &contents, 0o700);
+                }
+            });
+            let mut ready = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let started = unsafe { libc::poll(&mut ready, 1, 10_000) } == 1;
+            let held: Vec<i32> = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                .filter(|&fd| {
+                    fd != reader.as_raw_fd()
+                        && std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                            .is_ok_and(|metadata| inode(metadata) == fifo_inode)
+                })
+                .collect();
+            // Drain in blocking mode until the writer closes, so it finishes
+            // even when this test fails. Without a writer, this reads EOF.
+            assert_eq!(
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, 0) },
+                0
+            );
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).unwrap();
+            writer.join().unwrap();
+            assert!(started, "the fixture writer did not start");
+            assert!(held.is_empty(), "this process held the fixture as {held:?}");
+            assert_eq!(received.len(), contents.len());
         });
     }
-    let launcher =
-        std::thread::spawn(move || command.spawn_guarded().and_then(|mut child| child.wait()));
-    control.read_exact(&mut [0u8]).unwrap();
-    drop(writer);
-
-    let run = |path: &Path| {
-        Command::new(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status_guarded()
-    };
-    let busy = run(&in_process);
-    let ready = run(&fixture);
-    control.write_all(b"x").unwrap();
-    assert!(launcher.join().unwrap().unwrap().success());
-    assert_eq!(
-        busy.map_err(|error| error.raw_os_error()),
-        Err(Some(libc::ETXTBSY))
-    );
-    assert!(ready.unwrap().success());
 }
 
 #[test]
