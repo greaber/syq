@@ -512,7 +512,13 @@ fn push_directory_children(
         });
     }
     children.reverse();
-    pending.extend(children);
+    if pending.is_empty() {
+        // Reuse the completed directory listing instead of allocating a
+        // second buffer large enough to hold every entry again.
+        *pending = children;
+    } else {
+        pending.extend(children);
+    }
     Ok(())
 }
 
