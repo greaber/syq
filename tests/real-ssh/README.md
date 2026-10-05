@@ -132,10 +132,11 @@ providers, requester-side aliases and identity selection, separate ProxyJump
 account approvals, and reuse by native `ssh`, `scp`, `sftp`, and `rsync`. They
 check command status and interruption, session and remembered approvals, scope
 isolation, and provider disconnects. Three-server cases check direct TCP/SSH
-data, restricted destination keys, receiver receipts, and cleanup after requester
-or destination-connection loss. A TCP bridge needs one free session per endpoint;
+data, restricted destination keys, receiver receipts, and process and private-key
+cleanup after requester or destination-connection loss. A TCP bridge needs one free session per endpoint;
 its SSH worker setup needs a second destination session. Idle prepared helpers
-are released before bridge setup, without interrupting other active operations.
+are released only after a refused setup, before retrying it; successful setup
+preserves warm completion helpers and other active operations.
 
 Source-shell remote copies also cover cached helper reuse, bootstrap after a
 missing or unexecutable helper, a delayed approval relay before Hello, and

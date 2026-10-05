@@ -28,6 +28,48 @@ fn private_file(path: &Path, limit: u64) -> Result<File> {
     Ok(file)
 }
 
+struct KeeperLock(File);
+impl Drop for KeeperLock {
+    fn drop(&mut self) {
+        // Forked descriptors must not keep the lock after its owner finishes.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// The caller validated and closed this recorded master. A concurrent new
+/// keeper may replace its index entry: take its lock and compare before removal.
+/// Keep the lock file itself so concurrent starters continue sharing one inode.
+pub(super) fn retire_record(path: &Path, control: &Path) -> Result<()> {
+    let lock = match private_file(&path.with_extension("lock"), 0) {
+        Ok(lock) => lock,
+        Err(error) if not_found(&error) && !path.exists() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let _lock = KeeperLock(lock);
+    let Some(record) = read_record(path)? else {
+        return Ok(());
+    };
+    if record.control != control {
+        return Ok(());
+    }
+    cleanup_master(
+        control
+            .parent()
+            .context("SSH account control has no directory")?,
+    )?;
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 fn keepers_running(domain: &Domain) -> Result<usize> {
     let Some(index) = existing_directory(domain)? else {
         return Ok(0);
@@ -45,6 +87,8 @@ fn keepers_running(domain: &Domain) -> Result<usize> {
                 return Err(error.into());
             }
             running += 1;
+        } else {
+            drop(KeeperLock(lock));
         }
     }
     Ok(running)
@@ -224,8 +268,9 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Called after the selected domain is marked closing. Default legacy index
-/// files are deliberately retained; explicit scopes remove their owned state.
+/// Called after the selected domain is marked closing. stop_all retires each
+/// recorded master in either domain; explicit scopes also remove their index.
+/// The default domain keeps lock files for concurrent future starters.
 pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
     if domain.is_default() {
         return Ok(());
@@ -325,6 +370,89 @@ mod tests {
             endpoint,
             control,
         }
+    }
+
+    fn stored_record(root: &Path, control: PathBuf) -> (PathBuf, File) {
+        let path = root.join(format!("{}.json", "a".repeat(64)));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &record(control)).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        (path, lock)
+    }
+
+    #[test]
+    fn retired_record_removes_dead_master_state_but_preserves_lock_inode() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("approved-dead");
+        let control = registered_control(&scope);
+        let (path, lock) = stored_record(root.path(), control.clone());
+        fs::write(scope.join(crate::receive_service::CLOSING), b"").unwrap();
+        fs::set_permissions(
+            scope.join(crate::receive_service::CLOSING),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        retire_record(&path, &control).unwrap();
+        assert!(!scope.exists());
+        assert!(!path.exists());
+        assert_eq!(
+            lock.metadata().unwrap().ino(),
+            path.with_extension("lock").metadata().unwrap().ino()
+        );
+        retire_record(&path, &control).unwrap();
+    }
+
+    #[test]
+    fn retiring_record_preserves_active_or_replacement_keeper() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("approved-old");
+        let control = registered_control(&scope);
+        let (path, lock) = stored_record(root.path(), control.clone());
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let lock = KeeperLock(lock);
+        retire_record(&path, &control).unwrap();
+        assert!(path.exists());
+        assert!(scope.exists());
+        drop(lock);
+        let replacement = registered_control(&root.path().join("approved-new"));
+        fs::write(
+            &path,
+            serde_json::to_vec(&record(replacement.clone())).unwrap(),
+        )
+        .unwrap();
+        retire_record(&path, &control).unwrap();
+        assert_eq!(read_record(&path).unwrap().unwrap().control, replacement);
+        assert!(scope.exists());
+        assert!(replacement.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn retiring_record_preserves_unknown_files_and_damaged_records() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("approved-dead");
+        let control = registered_control(&scope);
+        let (path, _lock) = stored_record(root.path(), control.clone());
+        fs::write(scope.join("user-file"), b"keep").unwrap();
+        assert!(retire_record(&path, &control).is_err());
+        assert_eq!(fs::read(scope.join("user-file")).unwrap(), b"keep");
+        assert!(path.exists());
+        fs::write(&path, b"damaged record").unwrap();
+        assert!(retire_record(&path, &control).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"damaged record");
     }
 
     #[test]

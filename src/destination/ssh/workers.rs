@@ -6,7 +6,8 @@ use crate::destination::ssh_auth::{self, ResolvedPolicy, Session};
 use crate::persistence::Domain;
 use anyhow::{Context, Result};
 use std::fmt;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -191,11 +192,41 @@ impl Login {
         let Self {
             session, control, ..
         } = self;
+        let master =
+            MasterWatch::connect(&control).context("watch approved SSH account connection")?;
         Guard::start(
             child_pid,
             move || session.cancelled(),
-            move || !control.exists(),
+            move || master.closed(),
         )
+    }
+}
+
+/// A local mux client occupies no SSH session and needs no network round trip.
+/// Keeping it open ties independent workers to the actual master, including
+/// when a crash leaves its socket file behind. It also keeps ControlPersist
+/// alive while those workers are active. Dropping the guard closes the watch.
+struct MasterWatch(socket2::Socket);
+impl MasterWatch {
+    fn connect(path: &Path) -> std::io::Result<Self> {
+        let socket = crate::process::with_inheritance_guard(|| {
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        })?;
+        socket.set_nonblocking(true)?;
+        socket.connect(&socket2::SockAddr::unix(path)?)?;
+        Ok(Self(socket))
+    }
+
+    fn closed(&self) -> bool {
+        let mut poll = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // HUP is reported even with OpenSSH's mux Hello still unread. Merely
+        // peeking for EOF would leave that Hello hiding a disconnected master.
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        result > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
     }
 }
 
@@ -320,6 +351,23 @@ mod tests {
             host_key_algorithms: "ssh-ed25519".into(),
             hop: None,
         }
+    }
+
+    #[test]
+    fn master_watch_detects_death_with_unread_hello_and_stale_socket() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+        let root = crate::test_support::short_tempdir().unwrap();
+        let path = root.path().join("master");
+        let listener = UnixListener::bind(&path).unwrap();
+        let watch = MasterWatch::connect(&path).unwrap();
+        let (mut master, _) = listener.accept().unwrap();
+        master.write_all(b"mux hello").unwrap();
+        assert!(!watch.closed());
+        drop(master);
+        drop(listener);
+        assert!(path.exists());
+        assert!(watch.closed());
     }
 
     #[test]

@@ -54,6 +54,31 @@ impl ProcessGroup {
         self.status = Some(status);
         Ok(status)
     }
+    /// Give a cancelled command a bounded chance to clean up. Keep the leader
+    /// unreaped until close() kills any remaining descendants, as on normal exit.
+    pub fn terminate(&mut self, grace: std::time::Duration) -> std::io::Result<ExitStatus> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGTERM);
+            libc::kill(-(self.child.id() as i32), libc::SIGCONT);
+        }
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            match self.poll() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return self.close();
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+        }
+    }
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         if let Some(status) = self.status {
             return Ok(status);
@@ -137,5 +162,74 @@ impl Drop for ForegroundTerminal {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
         let _ = set_terminal_group(self.terminal.as_raw_fd(), self.previous);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    fn child(script: &str) -> ProcessGroup {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = ProcessGroup::spawn(&mut command).unwrap();
+        let mut ready = [0; 6];
+        let output = child.child.stdout.as_mut().unwrap();
+        let mut poll = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut poll, 1, 3000) },
+            1,
+            "child did not become ready"
+        );
+        // The fixture emits these six bytes in one pipe write after its trap
+        // and child are installed, before blocking in the shell's builtin wait.
+        output.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n");
+        child
+    }
+
+    #[test]
+    fn graceful_termination_runs_child_cleanup() {
+        let mut child =
+            child("trap 'printf cleaned; exit 23' TERM; sleep 30 & printf 'ready\n'; wait");
+        assert_eq!(
+            child.terminate(Duration::from_secs(1)).unwrap().code(),
+            Some(23)
+        );
+        let mut output = String::new();
+        child
+            .child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert_eq!(output, "cleaned");
+    }
+
+    #[test]
+    fn termination_forces_exit_after_bounded_grace() {
+        let mut child = child("trap '' TERM; printf 'ready\n'; while :; do sleep 30; done");
+        let started = Instant::now();
+        assert_eq!(
+            child
+                .terminate(Duration::from_millis(100))
+                .unwrap()
+                .signal(),
+            Some(libc::SIGKILL)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

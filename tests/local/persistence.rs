@@ -1463,3 +1463,54 @@ exit 0
     assert!(log.contains("-- example"), "{log}");
     assert_eq!(read(&damaged), b"not valid JSON");
 }
+
+#[test]
+fn default_off_removes_dead_approved_master_and_its_record() {
+    let t = Tmp::new();
+    let runtime = test_support::short_tempdir().unwrap();
+    let run = |args: &[&str]| {
+        persistence_command(&t, args)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .run()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["on"]));
+    let parent = runtime
+        .path()
+        .join(format!("syq-persist-{}", unsafe { libc::geteuid() }));
+    let scope = parent.join("approved-dead");
+    let index = parent.join("authorized-ssh-v1");
+    for path in [&scope, &index] {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let control = scope.join("cm-0123456789abcdef");
+    let record = index.join(format!("{}.json", "a".repeat(64)));
+    let endpoint = serde_json::json!({"user": "test", "host": "example.invalid", "port": 22});
+    for (path, content) in [
+        (
+            scope.join(".syq-persistence"),
+            b"syq persistence scope\n".to_vec(),
+        ),
+        (
+            record.clone(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "authorizer": "laptop", "requested": endpoint,
+                "endpoint": endpoint, "control": control,
+            }))
+            .unwrap(),
+        ),
+        (record.with_extension("lock"), Vec::new()),
+    ] {
+        write(&path, &content);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_output_ok(&run(&["off"]));
+    assert!(!scope.exists(), "dead master's directory survived off");
+    assert!(!record.exists(), "dead master's index record survived off");
+    assert!(
+        record.with_extension("lock").exists(),
+        "future keepers must share the original lock"
+    );
+    assert_output_ok(&run(&["off"]));
+}
