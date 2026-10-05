@@ -34,8 +34,11 @@ Both platforms sample each process's CPU, RSS, threads, FDs and disk I/O every
 20 ms plus sampling cost. Group memory is a sampled sum of current RSS, not a
 sum of individual peaks. Single-process rm uses native time's maximum RSS.
 Samples can miss peaks and final work; check sample gaps and observer CPU, and
-use longer runs for CPU comparisons. Linux per-process I/O includes waited children: do
-not sum those historical counters. Process CPU excludes background kernel
+use longer runs for CPU comparisons. On Linux, repeat a plan with --no-sampling
+to check observer effects before judging small differences, especially with few
+available CPUs. Exit CPU accounting remains complete in that mode; per-process
+samples and group memory are unavailable. Linux per-process I/O includes waited
+children: do not sum those historical counters. Process CPU excludes background kernel
 threads (journal commits, inode cleanup, transaction sync); these are not
 system-wide filesystem cost measurements. No remote helpers are launched.
 Logs and raw host/mount metadata stay in --output.
@@ -285,11 +288,16 @@ def linux_group(pgid):
     # machines. Inspect all threads because any thread can launch a child.
     def children(pid):
         found = []
-        for path in (Path("/proc") / str(pid) / "task").glob("*/children"):
-            try:
-                found.extend(map(int, path.read_text().split()))
-            except (FileNotFoundError, ProcessLookupError):
-                pass
+        try:
+            with os.scandir(f"/proc/{pid}/task") as threads:
+                for thread in threads:
+                    try:
+                        with open(thread.path + "/children") as stream:
+                            found.extend(map(int, stream.read().split()))
+                    except (FileNotFoundError, ProcessLookupError):
+                        pass
+        except (FileNotFoundError, ProcessLookupError):
+            pass
         return found
 
     members = {}
@@ -301,7 +309,8 @@ def linux_group(pgid):
             continue
         seen.add(pid)
         try:
-            fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            with open(f"/proc/{pid}/stat") as stream:
+                fields = stream.read().rsplit(")", 1)[1].split()
             if int(fields[2]) == pgid:
                 members[pid] = fields
                 pending.extend(children(pid))
@@ -331,7 +340,7 @@ def sample_linux(launcher):
                                 peak_rss_bytes=int(status.get("VmHWM", "0 kB").split()[0]) * 1024,
                                 threads=int(status["Threads"]),
                                 allowed_cpus=status["Cpus_allowed_list"].strip(),
-                                fds=len(list((proc / "fd").iterdir())),
+                                fds=len(os.listdir(proc / "fd")),
                                 read_bytes=int(io["read_bytes"]), write_bytes=int(io["write_bytes"])))
         except (FileNotFoundError, ProcessLookupError):
             pass  # A process can exit between reads; wait accounting still captures its CPU.
@@ -506,12 +515,14 @@ def reap_group(pgid, accounting):
                 input_blocks=usage.ru_inblock, output_blocks=usage.ru_oublock)))
 
 
-def measure(command, env, cpus, stem, timeout, operation=None):
+def measure(command, env, cpus, stem, timeout, operation=None, sample_processes=True):
+    if not sample_processes and platform.system() != "Linux":
+        raise ValueError("disabling sampling requires Linux exit accounting")
     with subreaper():
-        return measure_group(command, env, cpus, stem, timeout, operation)
+        return measure_group(command, env, cpus, stem, timeout, operation, sample_processes)
 
 
-def measure_group(command, env, cpus, stem, timeout, operation):
+def measure_group(command, env, cpus, stem, timeout, operation, sample_processes):
     system = platform.system()
     darwin = DarwinSampler() if system == "Darwin" else None
     usage_path = stem.with_suffix(".usage")
@@ -527,6 +538,8 @@ def measure_group(command, env, cpus, stem, timeout, operation):
 
     def sample():
         nonlocal sample_count
+        if not sample_processes:
+            return
         snapshot = sample_linux(child.pid) if darwin is None else darwin.sample(child.pid)
         timestamp = time.monotonic() - started
         sample_times.append(timestamp)
@@ -634,7 +647,8 @@ def measure_group(command, env, cpus, stem, timeout, operation):
                 expected_processes_observed=expected_observed,
                 memory_accounting="single-process maximum RSS" if operation == "rm" else "sampled sum of process RSS",
                 processes=list(processes.values()), sampled=peaks, sample_count=sample_count,
-                max_sample_gap_seconds=max(b - a for a, b in zip([0] + sample_times, sample_times + [group_ended - started])),
+                sampling_enabled=sample_processes,
+                max_sample_gap_seconds=max(b - a for a, b in zip([0] + sample_times, sample_times + [group_ended - started])) if sample_times else None,
                 observer_cpu_seconds=(observer_after.ru_utime + observer_after.ru_stime
                                       - observer_before.ru_utime - observer_before.ru_stime),
                 command=command, observed_cpu_sets=sorted({s["allowed_cpus"] for s in processes.values() if s["allowed_cpus"] is not None}),
@@ -675,6 +689,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=180, help="seconds per measured operation")
     parser.add_argument("--fixture-timeout", type=float, default=1800, help="seconds for each setup or verification")
+    parser.add_argument("--no-sampling", action="store_true", help="Linux: keep exit CPU accounting but disable periodic process samples")
     args = parser.parse_args()
     if args.example:
         print(json.dumps(example(), indent=2))
@@ -684,6 +699,8 @@ def main():
         parser.error("need --plan, --output and positive rounds/timeouts")
     if platform.system() not in ("Linux", "Darwin") or not Path("/usr/bin/time").is_file():
         parser.error("requires Linux GNU /usr/bin/time or macOS /usr/bin/time")
+    if args.no_sampling and platform.system() != "Linux":
+        parser.error("--no-sampling requires Linux exit accounting")
     plan = json.loads(args.plan.read_text())
     validate(plan)
     args.output = args.output.resolve()
@@ -698,6 +715,7 @@ def main():
                   allowed_cpus=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                   binary_sha256={v["name"]: sha256_file(v["binary"]) for v in plan["variants"]},
                   harness_sha256=sha256_file(__file__), sample_interval_seconds=0.02,
+                  sampling_enabled=not args.no_sampling,
                   native_time_cpu_resolution_seconds=0.01,
                   drain_clock="upper bound including sampling/polling delay after coordinator exit",
                   tuning_history="disabled; automatic variants start without remembered counts",
@@ -749,7 +767,7 @@ def main():
                             command += ["--prune"]
                         if variant["workers"] is not None:
                             command += ["--performance-tuning", f"workers={variant['workers']}"]
-                        row.update(measure(command, env, variant["cpus"], stem, args.timeout, case["operation"]))
+                        row.update(measure(command, env, variant["cpus"], stem, args.timeout, case["operation"], not args.no_sampling))
                         save()
                         if row["exit_code"]:
                             raise RuntimeError(f"{stem.name}: exit {row['exit_code']}; see {stem}.stderr")

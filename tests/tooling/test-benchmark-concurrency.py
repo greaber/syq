@@ -32,10 +32,10 @@ class BenchmarkTests(unittest.TestCase):
         return dict(name="tree", operation=operation, root=str(self.root), files=6,
                     directories=2, sizes=[0, 19, 4097])
 
-    def run_measure(self, command, cpus=None, timeout=10, operation=None):
+    def run_measure(self, command, cpus=None, timeout=10, operation=None, sample_processes=True):
         with contextlib.redirect_stdout(io.StringIO()):
             return bench.measure(command, dict(os.environ, LC_ALL="C"), cpus,
-                                 self.root / "measure", timeout, operation)
+                                 self.root / "measure", timeout, operation, sample_processes)
 
     def test_verification_checks_bytes_source_and_unexpected_directories(self):
         case = self.case()
@@ -92,7 +92,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertLess(result["resources"]["peak_rss_bytes"], len(allocation) // 2)
         self.assertGreater(result["seconds"], 0)
 
-    def measure_family(self, wait):
+    def measure_family(self, wait, sample_processes=True):
         child_stats, parent_stats = self.root / "child.json", self.root / "parent.json"
         child = f"""
 import json, os, pathlib, resource, time
@@ -118,14 +118,21 @@ pathlib.Path({str(parent_stats)!r}).write_text(json.dumps(dict(pid=os.getpid(), 
 # Bypass Popen's destructor: this intentionally leaves the child un-waited.
 os._exit(0)
 """
-        result = self.run_measure([sys.executable, "-c", parent], operation="cp")
+        result = self.run_measure([sys.executable, "-c", parent], operation="cp", sample_processes=sample_processes)
         self.assertEqual(result["exit_code"], 0)
         self.assertTrue(child_stats.exists(), "the harness killed a successful operation's helper")
         records = [json.loads(p.read_text()) for p in (parent_stats, child_stats)]
         expected = sum(r["cpu"] for r in records)
         actual = result["resources"]["cpu_seconds"]
-        self.assertTrue(result["expected_processes_observed"])
         self.assertAlmostEqual(actual, expected, delta=.10 if platform.system() == "Darwin" else .04)
+        if not sample_processes:
+            self.assertTrue(result["cpu_accounting_complete"])
+            self.assertFalse(result["sampling_enabled"])
+            self.assertEqual(result["processes"], [])
+            self.assertIsNone(result["resources"]["peak_rss_bytes"])
+            self.assertIsNone(result["max_sample_gap_seconds"])
+            return result
+        self.assertTrue(result["expected_processes_observed"])
         sampled = {p["pid"]: p["sampled"] for p in result["processes"]}
         for record in records:
             self.assertAlmostEqual(sampled[record["pid"]]["user_seconds"] + sampled[record["pid"]]["system_seconds"],
@@ -146,6 +153,10 @@ os._exit(0)
 
     def test_waited_helper_cpu_is_not_counted_twice(self):
         self.measure_family(True)
+
+    @unittest.skipUnless(platform.system() == "Linux", "complete exit accounting requires Linux")
+    def test_disabled_sampling_keeps_unwaited_helper_cpu(self):
+        self.measure_family(False, sample_processes=False)
 
     @unittest.skipUnless(hasattr(os, "sched_getaffinity"), "CPU affinity is Linux-only")
     def test_affinity_applies_to_product_and_restores_runner(self):
