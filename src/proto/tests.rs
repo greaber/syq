@@ -245,6 +245,70 @@ fn direct_frame_passes_large_payload_to_transport_without_copying() {
 }
 
 #[test]
+fn large_patches_are_written_directly_with_their_buffered_encoding() {
+    // A patch batch with at least 1 MiB of data per patch passes its data to
+    // the transport as it is; a smaller one is encoded into a buffer first.
+    // The frames are the same either way.
+    struct Observe {
+        written: Vec<u8>,
+        pointer: *const u8,
+        seen: bool,
+    }
+    impl Write for Observe {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.seen |= bytes.as_ptr() == self.pointer;
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    for (len, direct) in [(4 << 20, true), (1 << 20, true), ((1 << 20) - 1, false)] {
+        let data = vec![9; len];
+        let pointer = data.as_ptr();
+        let patch = SmallPatch {
+            path: b"file".to_vec(),
+            copy_id: [1; 16],
+            len: 32 << 20,
+            block: 64 << 10,
+            reuse: (0..512).map(|i| (i % 2 == 0).then_some([3; 32])).collect(),
+            data,
+            hash: [4; 32],
+            basis: None,
+            meta: Meta {
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 5,
+                mtime_nsec: 6,
+                inode_metadata: None,
+            },
+            flags: 0,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        let request = Request::PatchSmallBatch(vec![patch]);
+        assert_eq!(request.direct_payload(), direct, "{len}");
+        let payload = postcard::to_stdvec(&request).unwrap();
+        let mut output = Observe {
+            written: Vec::new(),
+            pointer,
+            seen: false,
+        };
+        FrameWriter::new(&mut output, false)
+            .write_owned(request)
+            .unwrap();
+        assert_eq!(output.seen, direct, "{len}");
+        assert!(
+            output.written[local_preamble_len()..]
+                == raw_frame(&payload, 0)[local_preamble_len()..]
+        );
+    }
+}
+
+#[test]
 fn metadata_keeps_single_pass_serialization() {
     struct Metadata(std::cell::Cell<usize>);
     impl Serialize for Metadata {

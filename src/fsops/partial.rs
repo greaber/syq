@@ -1573,21 +1573,15 @@ impl FsOps {
                     off,
                     contents,
                 )?;
-                let first = matching.len();
-                matching.extend(contents.chunks(block as usize).enumerate().map(
-                    |(index, piece)| {
-                        read.expected.get(first + index) == Some(&algorithm.hash(piece))
-                    },
-                ));
-                for (piece, same) in contents.chunks(block as usize).zip(&matching[first..]) {
+                for piece in contents.chunks(block as usize) {
+                    let same = read.expected.get(matching.len()) == Some(&algorithm.hash(piece));
+                    matching.push(same);
                     if !same {
                         differing += piece.len() as u64;
+                        if read.compare_only {
+                            return Ok(());
+                        }
                     }
-                }
-                if read.compare_only && differing > 0 {
-                    let first_differing = matching[first..].iter().position(|same| !same);
-                    matching.truncate(first + first_differing.expect("a block differs") + 1);
-                    return Ok(());
                 }
                 off += read_len as u64;
             }

@@ -135,7 +135,7 @@ pub(crate) fn claim_block_with_digest(
     }
 }
 
-pub(crate) type Responses = mpsc::Receiver<io::Result<crate::conn::ReceivedResponse>>;
+pub(crate) type Responses = crate::conn::Replies;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Failure {
