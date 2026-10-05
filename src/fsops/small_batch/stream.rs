@@ -1,11 +1,13 @@
 //! A patch whose new data is too large to hold for a batch is streamed:
 //! `PatchBegin` opens its stage, each `PatchData` piece is written into it as
-//! it arrives, and `PatchEnd` publishes it or abandons it. The stage is made
-//! as a batch patch's is, seeded from the file it replaces under the same
-//! fingerprint check, but stays private until publication, as it holds that
-//! file's old blocks for as long as the stream lasts. A stage that will not
-//! be published, whether the patch failed, was abandoned or its connection
-//! closed, is removed at once.
+//! it arrives, and `PatchEnd` publishes it or abandons it. The stage is
+//! seeded from the file it replaces under the same fingerprint check as a
+//! batch patch's, or takes that file's reused blocks as the pieces around
+//! them arrive. Either way it holds that file's bytes for as long as the
+//! stream lasts, so it is always a new file, created exclusively, and stays
+//! private until publication. A stage that will not be published, whether
+//! the patch failed, was abandoned or its connection closed, is removed at
+//! once.
 use super::*;
 
 /// Bytes of reused blocks read, checked and written at once when a stage is
@@ -217,10 +219,8 @@ impl FsOps {
         // still has the fingerprint it had when its blocks were hashed.
         let seeded = match &source {
             Some(source) => {
-                (stage.cloned || {
-                    stage.file.set_len(0)?;
-                    self.copy_basis(source, stage)
-                }) && fingerprint(&source.old.metadata()?) == source.basis
+                (stage.cloned || self.copy_basis(source, stage))
+                    && fingerprint(&source.old.metadata()?) == source.basis
             }
             None => false,
         };
@@ -236,11 +236,12 @@ impl FsOps {
         Ok(())
     }
 
-    /// Create a streamed patch's stage, private until publication. On macOS
-    /// a seeded stage is made as a clone of the file it replaces. A creation
-    /// refused for want of descriptors reduces small-file staging, as a
-    /// batch's does, and is tried once more when other bursts have closed
-    /// their files.
+    /// Create a streamed patch's stage: a new file, created exclusively in
+    /// place of anything left at its name, private until publication. On
+    /// macOS a seeded stage is made as a clone of the file it replaces. A
+    /// creation refused for want of descriptors reduces small-file staging,
+    /// as a batch's does, and is tried once more when other bursts have
+    /// closed their files.
     fn create_stream_stage(
         &mut self,
         put: &SmallPut,
@@ -257,7 +258,7 @@ impl FsOps {
             if refused {
                 Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
             } else {
-                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, false)
+                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, true)
             }
         };
         match created {
@@ -275,7 +276,7 @@ impl FsOps {
                 drop(STAGING_ADMISSION.enter());
                 let target = self.destination_mutation_target(&put.path, put.guard.as_ref())?;
                 let _turn = root.mutation_turn(&relative).ok();
-                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, false)
+                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, true)
             }
             created => created,
         }

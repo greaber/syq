@@ -2921,6 +2921,114 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_streamed_stage_is_a_new_file_even_where_a_leftover_looks_new() {
+        // Permissions are checked only at open: whoever opened a sidecar
+        // while its mode was wider still reads it through that descriptor.
+        // A streamed patch's stage holds the old file's bytes for as long as
+        // the stream lasts, whether it is seeded from that file or takes its
+        // reused blocks as the pieces arrive. So it is created exclusively,
+        // in place of a leftover at its name, empty in the file's final mode
+        // or narrowed to 0600, and the held leftover never shows the old
+        // file's bytes. Publication still gives the file its final mode.
+        let block = MIN_HASH_BLOCK_BYTES;
+        let secret = b"only the old file holds these bytes";
+        for (leftover, seeds, cloning) in [
+            (0o644, true, true),
+            (0o644, true, false),
+            (0o600, true, true),
+            (0o600, true, false),
+            (0o644, false, false),
+            (0o600, false, false),
+        ] {
+            let case = format!("leftover {leftover:o} seeded {seeds} cloning {cloning}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let path = directory.join("file");
+            let (_, new) = private_old_file(&path, secret);
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops
+                .hash_existing_batch(
+                    block,
+                    &[ExistingRead {
+                        path: b"file".to_vec(),
+                        len: new.len() as u64,
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    }],
+                )
+                .remove(0)
+                .unwrap();
+            let mut patch = patch_from("file", &new, block, &hashed, algorithm);
+            patch.meta.mode = 0o644;
+            patch.flags = flags::MODE;
+            if !seeds {
+                // Without the old file's fingerprint the stage is not
+                // seeded: it takes the reused blocks as pieces arrive.
+                patch.basis = None;
+            }
+            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
+            let sidecar = directory.join(relative.to_path_buf());
+            fs::write(&sidecar, b"").unwrap();
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(leftover)).unwrap();
+            let held = File::open(&sidecar).unwrap();
+            let read_all = |file: &File| {
+                let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+                file.read_exact_at(&mut bytes, 0).unwrap();
+                bytes
+            };
+            let shows_secret = |file: &File| {
+                read_all(file)
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret)
+            };
+            let pieces = pieces(&patch, 1);
+            let mut begin = requested(patch.clone());
+            let data_len = std::mem::take(&mut begin.data).len() as u64;
+            let payload = ops.hash_policy.payload_algorithm();
+            CLONED_PATCHES.set(0);
+            refusing_clones(!cloning, || {
+                let begun = ops.handle(&Request::PatchBegin {
+                    patch: Box::new(begin),
+                    data_len,
+                });
+                assert!(matches!(begun, Response::Ok), "{case}: {begun:?}");
+                // A seeded stage holds the whole old file, its private
+                // block included, until the pieces arrive.
+                assert!(!shows_secret(&held), "{case}: the held leftover was seeded");
+                assert_eq!(
+                    held.metadata().unwrap().nlink(),
+                    0,
+                    "{case}: the leftover was kept as the stage"
+                );
+                for piece in &pieces {
+                    let reply = ops.handle(&Request::PatchData {
+                        data: piece.clone().into(),
+                        hash: payload.hash(piece),
+                    });
+                    assert!(matches!(reply, Response::Ok), "{case}: {reply:?}");
+                }
+                let ended = ops.handle(&Request::PatchEnd { commit: true });
+                assert!(
+                    matches!(&ended, Response::PatchedBatch(outcome) if outcome[0].is_ok()),
+                    "{case}: {ended:?}"
+                );
+            });
+            assert_eq!(CLONED_PATCHES.get(), usize::from(seeds), "{case}");
+            assert!(!shows_secret(&held), "{case}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                0o644,
+                "{case}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(entries(directory), 1, "{case}");
+        }
+    }
+
     #[test]
     fn a_streamed_patch_is_written_as_its_pieces_arrive_and_published_at_its_end() {
         let block = MIN_HASH_BLOCK_BYTES;
