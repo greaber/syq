@@ -2056,6 +2056,24 @@ impl<W: Write> FrameWriter<W> {
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::check_message_size(payload.len(), msg.frame_limit())?;
+        self.write_payload(payload)
+    }
+
+    /// As `write_msg`, but free the message once it is encoded, so that its
+    /// data is not held beside the encoded and compressed frame.
+    pub fn write_owned<T: Serialize + SizeHint>(&mut self, msg: T) -> io::Result<()> {
+        if !self.compress && msg.direct_payload() {
+            return self.write_msg(&msg);
+        }
+        self.write_preamble()?;
+        let payload = postcard::to_extend(&msg, Vec::with_capacity(msg.size_hint()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Self::check_message_size(payload.len(), msg.frame_limit())?;
+        drop(msg);
+        self.write_payload(payload)
+    }
+
+    fn write_payload(&mut self, payload: Vec<u8>) -> io::Result<()> {
         let encoded = if self.compress && payload.len() > COMPRESS_MIN {
             self.compression.encode(&payload).ok().flatten()
         } else {
@@ -2069,6 +2087,7 @@ impl<W: Write> FrameWriter<W> {
         if flag == 0 {
             self.w.write_all(&payload)?;
         } else {
+            drop(payload);
             self.w.write_all(self.compression.output(len))?;
         }
         self.w.flush()?;

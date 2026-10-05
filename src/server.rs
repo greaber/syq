@@ -1398,10 +1398,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                             Response::Stats,
                         )?;
                     } else {
-                        w.write_msg(&resp)?;
+                        w.write_owned(resp)?;
                     }
                 } else {
-                    w.write_msg(&resp)?;
+                    w.write_owned(resp)?;
                 }
             }
         }
@@ -1867,6 +1867,26 @@ struct ObservedWriter<W: Write> {
 }
 impl<W: Write> ObservedWriter<W> {
     fn write_msg(&mut self, response: &Response) -> std::io::Result<()> {
+        self.prepare_write(response)?;
+        let _send = self
+            .actor
+            .span(crate::transfer_observations::Stage::ResponseSend);
+        self.inner.write_msg(response)
+    }
+
+    /// As `write_msg`, but free the response once it is encoded, so that its
+    /// data is not held beside the compressed frame.
+    fn write_owned(&mut self, response: Response) -> std::io::Result<()> {
+        self.prepare_write(&response)?;
+        let _send = self
+            .actor
+            .span(crate::transfer_observations::Stage::ResponseSend);
+        self.inner.write_owned(response)
+    }
+
+    /// Check a response the source authority must allow, and send the
+    /// periodic transport statistics before it.
+    fn prepare_write(&mut self, response: &Response) -> std::io::Result<()> {
         if let Some(authority) = &self.source_authority {
             if let Err(error) = authority.check_response(response) {
                 self.inner.write_msg(&Response::Err(format!("{error:#}")))?;
@@ -1888,10 +1908,7 @@ impl<W: Write> ObservedWriter<W> {
                     solicited: false,
                 })))?;
         }
-        let _send = self
-            .actor
-            .span(crate::transfer_observations::Stage::ResponseSend);
-        self.inner.write_msg(response)
+        Ok(())
     }
 }
 

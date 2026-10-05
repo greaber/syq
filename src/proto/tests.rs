@@ -154,6 +154,60 @@ fn direct_frames_preserve_buffered_encoding_and_released_payloads() {
 }
 
 #[test]
+fn owned_messages_frame_as_borrowed_ones_do() {
+    // Freeing a message once it is encoded leaves the frames unchanged:
+    // compressible and incompressible ones, compressed or not.
+    let random: Vec<u8> = (0u32..1 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    for compress in [false, true] {
+        for data in [vec![7; 1 << 20], random.clone(), b"small".to_vec()] {
+            let request = || Request::WriteRange {
+                path: b"file".to_vec(),
+                inplace: false,
+                copy_id: [1; 16],
+                attempt: 0,
+                off: 0,
+                hash: [2; 32],
+                data: data.clone().into(),
+                guard: None,
+            };
+            let batch = || {
+                Request::PutSmallBatch(vec![SmallPut {
+                    path: b"file".to_vec(),
+                    copy_id: [1; 16],
+                    data: data.clone(),
+                    hash: [2; 32],
+                    meta: Meta {
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                        mtime_nsec: 0,
+                        inode_metadata: None,
+                    },
+                    flags: 0,
+                    inplace: false,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                    replaces: false,
+                }])
+            };
+            for message in [request(), batch()] {
+                let (mut borrowed, mut owned) = (Vec::new(), Vec::new());
+                FrameWriter::new(&mut borrowed, compress)
+                    .write_msg(&message)
+                    .unwrap();
+                FrameWriter::new(&mut owned, compress)
+                    .write_owned(message)
+                    .unwrap();
+                assert!(borrowed == owned, "compress={compress}");
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_frame_passes_large_payload_to_transport_without_copying() {
     struct ObservePayload {
         pointer: *const u8,

@@ -1034,11 +1034,16 @@ impl Conn for RemoteConn {
             "only writes and their fence are valid during streaming writes"
         );
         self.batch_receipts.request(&req)?;
-        self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
-        Ok(match req {
-            Request::WriteRange { data, .. } => Some(data.into_vec()),
-            _ => None,
-        })
+        if let Request::WriteRange { .. } = &req {
+            self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
+            let Request::WriteRange { data, .. } = req else {
+                unreachable!("matched above")
+            };
+            return Ok(Some(data.into_vec()));
+        }
+        // Free a request's data once it is encoded, before it is compressed.
+        self.w.write_owned(req).map_err(|e| self.io_err(e.into()))?;
+        Ok(None)
     }
     fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
         self.send(req)?;
