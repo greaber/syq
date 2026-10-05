@@ -4786,17 +4786,26 @@ fn run_workers(sched: &Sched, workers: Vec<Worker>) {
     assert!(sched.finished(), "the copy did not finish");
 }
 
+/// What a restricted receiver carried out for a copy: how many times it
+/// compared each file, in the order the files were given, and how many
+/// batches of whole files it published.
+#[derive(Debug, PartialEq)]
+struct Executed {
+    compared: Vec<usize>,
+    whole: usize,
+}
+
 /// Copy each of `files`, a name and its source's modification time, from
 /// `root/source` into `root/target` through a restricted receiver with
-/// `workers` workers, preserving times, and return how many hash and
-/// whole-file batches the receiver executed. Each worker's connection runs
-/// `before_patch` between a patch batch's authorization and its execution.
+/// `workers` workers, preserving times, and return what the receiver
+/// carried out. Each worker's connection runs `before_patch` between a
+/// patch batch's authorization and its execution.
 fn copy_through_restricted_receiver(
     root: &std::path::Path,
     files: &[(&str, i64)],
     workers: usize,
     before_patch: impl Fn() + Send + Sync + 'static,
-) -> (usize, usize) {
+) -> Executed {
     use std::os::unix::fs::MetadataExt;
     let sched = Arc::new(Sched::new(512, 8192));
     let mut entries = std::collections::HashMap::new();
@@ -4855,11 +4864,29 @@ fn copy_through_restricted_receiver(
         .collect();
     run_workers(&sched, workers);
     let requests = requests.lock().unwrap();
-    let count = |kind: fn(&Request) -> bool| requests.iter().filter(|r| kind(r)).count();
-    (
-        count(|r| matches!(r, Request::HashExistingBatch { .. })),
-        count(|r| matches!(r, Request::PutSmallBatch(_))),
-    )
+    let compared = files
+        .iter()
+        .map(|(name, _)| {
+            let destination = root.join("target").join(name);
+            let destination = destination.as_os_str().as_bytes();
+            requests
+                .iter()
+                .map(|request| match request {
+                    Request::HashExistingBatch { files, .. } => {
+                        files.iter().filter(|file| file.path == destination).count()
+                    }
+                    _ => 0,
+                })
+                .sum()
+        })
+        .collect();
+    Executed {
+        compared,
+        whole: requests
+            .iter()
+            .filter(|request| matches!(request, Request::PutSmallBatch(_)))
+            .count(),
+    }
 }
 
 #[test]
@@ -4880,7 +4907,7 @@ fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
     // Keeping one name sets the times of the file both names share, which
     // changes its change time once the clock has moved on.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let batches = copy_through_restricted_receiver(
+    let executed = copy_through_restricted_receiver(
         root,
         &[("a", 1_600_000_000), ("b", 1_600_000_000)],
         1,
@@ -4895,9 +4922,16 @@ fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
             path.display()
         );
     }
-    // The second name was compared once more, under a fresh condition, and
-    // never copied whole.
-    assert_eq!(batches, (2, 0));
+    // Each name was compared once and neither was copied whole: the second
+    // name's patch was authorized after the first name was kept, against
+    // the file as keeping it left it.
+    assert_eq!(
+        executed,
+        Executed {
+            compared: vec![1, 1],
+            whole: 0
+        }
+    );
 }
 
 #[test]
@@ -4919,7 +4953,7 @@ fn a_restricted_receiver_compares_a_changed_destination_again_only_once() {
         // block rewritten after the receiver authorized it.
         let patches = std::sync::atomic::AtomicUsize::new(0);
         let rewritten = destination.clone();
-        let batches =
+        let executed =
             copy_through_restricted_receiver(root, &[("file", 1_600_000_000)], 1, move || {
                 let changed = patches.fetch_add(1, Relaxed) + 1;
                 if changed <= changes {
@@ -4939,7 +4973,14 @@ fn a_restricted_receiver_compares_a_changed_destination_again_only_once() {
         assert_eq!(metadata.mtime(), 1_600_000_000, "{changes}");
         // It is compared again once; a second stale condition copies it
         // whole.
-        assert_eq!(batches, (2, changes - 1), "{changes}");
+        assert_eq!(
+            executed,
+            Executed {
+                compared: vec![2],
+                whole: changes - 1
+            },
+            "{changes}"
+        );
     }
 }
 
@@ -4979,7 +5020,7 @@ fn link_outside(root: &std::path::Path, name: &str, count: usize) {
 #[test]
 fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
     use std::os::unix::fs::MetadataExt;
-    for (count, workers, outside) in [(3, 1, 0), (5, 1, 0), (3, 3, 0), (5, 3, 0), (3, 3, 16)] {
+    for (count, workers, outside) in [(3, 1, 0), (8, 1, 0), (3, 3, 0), (5, 3, 0), (3, 3, 16)] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
         let (names, inode) = linked_destination(root, count, b"same");
@@ -4988,14 +5029,14 @@ fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
         link_outside(root, &names[0], outside);
         // Each name has a source time of its own, so keeping each name sets
         // new times on the file they all share. That changes its change
-        // time, once the clock has moved on, and leaves the conditions of
-        // the names not yet kept stale.
+        // time, once the clock has moved on, and would leave stale the
+        // conditions of the other names authorized before it.
         let files: Vec<_> = names
             .iter()
             .enumerate()
             .map(|(i, name)| (name.as_str(), 1_600_000_000 + i as i64))
             .collect();
-        let (hashed, whole) = copy_through_restricted_receiver(root, &files, workers, || {
+        let executed = copy_through_restricted_receiver(root, &files, workers, || {
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
         let case = format!("{count} names, {workers} workers, {outside} outside");
@@ -5008,13 +5049,115 @@ fn a_restricted_receiver_keeps_every_name_of_a_matching_destination() {
             );
             assert_eq!(std::fs::read(&path).unwrap(), b"same", "{case}: {name}");
         }
-        assert_eq!(whole, 0, "{case}: a name was copied whole");
-        // One worker compares the names not yet kept together and keeps one
-        // of them each time, so the last is compared once for each name.
+        assert_eq!(executed.whole, 0, "{case}: a name was copied whole");
+        // One worker patches the names in turn, each against the file as
+        // the last left it, so each is compared once. Other workers' names
+        // can still leave a name stale.
         if workers == 1 {
-            assert_eq!(hashed, count, "{case}");
+            assert_eq!(executed.compared, vec![1; count], "{case}");
         }
     }
+}
+
+#[test]
+fn a_restricted_receiver_keeps_or_replaces_each_name_of_a_linked_destination() {
+    use std::os::unix::fs::MetadataExt;
+    // Two blocks: a changed name's patch sends the second and reuses the
+    // first.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
+    let mut new = old.clone();
+    new[block..].fill(7);
+    let count = 8;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (names, inode) = linked_destination(root, count, &old);
+    // The odd names' sources changed. Keeping the first even name sets the
+    // times the even names share, and replacing an odd name takes a link
+    // from the file: each changes its change time once the clock has moved
+    // on.
+    let files: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if i % 2 == 0 {
+                (name.as_str(), 1_600_000_000)
+            } else {
+                std::fs::write(root.join("source").join(name), &new).unwrap();
+                (name.as_str(), 1_600_000_000 + i as i64)
+            }
+        })
+        .collect();
+    let executed = copy_through_restricted_receiver(root, &files, 1, || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
+    let mut replaced = std::collections::HashSet::new();
+    for (i, (name, mtime)) in files.iter().enumerate() {
+        let path = root.join("target").join(name);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.mtime(), *mtime, "{name}");
+        if i % 2 == 0 {
+            // A kept name still names the file the other kept names share.
+            assert_eq!(metadata.ino(), inode, "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), old, "{name}");
+        } else {
+            // A replaced name names a new file of its own.
+            assert_ne!(metadata.ino(), inode, "{name}");
+            assert!(replaced.insert(metadata.ino()), "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), new, "{name}");
+        }
+    }
+    // One worker patches the names in turn, each against the file as the
+    // last left it: each is compared once, and none is copied whole.
+    assert_eq!(
+        executed,
+        Executed {
+            compared: vec![1; count],
+            whole: 0
+        }
+    );
+}
+
+#[test]
+fn a_restricted_receiver_keeps_a_linked_destination_mode_changed_outside() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let count = 3;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (names, inode) = linked_destination(root, count, b"same");
+    let first = root.join("target").join(&names[0]);
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let files: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), 1_600_000_000 + i as i64))
+        .collect();
+    // The receiver authorizes the first patch to keep the mode the file
+    // has then. Before it is carried out, the mode changes outside the
+    // copy.
+    let patches = std::sync::atomic::AtomicUsize::new(0);
+    let changed = first.clone();
+    let executed = copy_through_restricted_receiver(root, &files, 1, move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if patches.fetch_add(1, Relaxed) == 0 {
+            std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    });
+    for name in &names {
+        let path = root.join("target").join(name);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.ino(), inode, "{name}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"same", "{name}");
+        // The mode the file had when each name was kept, not the mode
+        // chosen before the change.
+        assert_eq!(metadata.mode() & 0o7777, 0o600, "{name}");
+    }
+    // The first patch found its condition stale, and its name was compared
+    // again; the others, authorized after the change, once.
+    let mut compared = executed.compared;
+    compared.sort_unstable();
+    assert_eq!(compared, [1, 1, 2]);
+    assert_eq!(executed.whole, 0);
 }
 
 #[test]
@@ -5041,7 +5184,7 @@ fn a_restricted_receiver_replaces_a_linked_destination_that_keeps_changing() {
             .iter()
             .map(|name| (name.as_str(), 1_600_000_000))
             .collect();
-        let (hashed, whole) = copy_through_restricted_receiver(root, &files, 1, move || {
+        let executed = copy_through_restricted_receiver(root, &files, 1, move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             let write = writes.fetch_add(1, Relaxed).wrapping_add(1);
             shared.write_all_at(&[write; 16], block as u64).unwrap();
@@ -5057,8 +5200,8 @@ fn a_restricted_receiver_replaces_a_linked_destination_that_keeps_changing() {
         }
         // Compared again once for each name the file has, the names are then
         // copied whole.
-        assert_eq!(hashed, count + 1, "{count}");
-        assert_ne!(whole, 0, "{count}");
+        assert_eq!(executed.compared, vec![count + 1; count], "{count}");
+        assert_ne!(executed.whole, 0, "{count}");
     }
 }
 
@@ -5085,7 +5228,7 @@ fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_th
         .iter()
         .map(|name| (name.as_str(), 1_600_000_000))
         .collect();
-    let (hashed, whole) = copy_through_restricted_receiver(root, &files, 1, move || {
+    let executed = copy_through_restricted_receiver(root, &files, 1, move || {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let write = writes.fetch_add(1, Relaxed).wrapping_add(1);
         shared.write_all_at(&[write; 16], block as u64).unwrap();
@@ -5101,6 +5244,6 @@ fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_th
     }
     // Compared again once for each name in the copy, not for each of the
     // file's names, the names are then copied whole.
-    assert_eq!(hashed, 3);
-    assert_ne!(whole, 0);
+    assert_eq!(executed.compared, [3, 3]);
+    assert_ne!(executed.whole, 0);
 }

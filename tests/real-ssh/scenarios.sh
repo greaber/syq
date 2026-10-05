@@ -1009,6 +1009,74 @@ syq cp --if-exists=update-if-older --no-progress --performance-tuning workers=2 
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
+# Eight names of one destination file. The odd names' sources changed in
+# their second block; the even names' did not. Keeping an even name sets the
+# times they share, and replacing an odd name takes a link from the file.
+ssh source python3 - <<'PY_LINKED_SOURCE'
+import os
+root = '/tmp/syq-real-ssh/linked-source'
+os.makedirs(root)
+block = 64 * 1024
+old = bytes(i % 251 for i in range(2 * block))
+new = old[:block] + bytes([7]) * block
+for i in range(8):
+    path = f'{root}/name{i}'
+    with open(path, 'wb') as f:
+        f.write(new if i % 2 else old)
+    mtime = 1_600_000_000 + (i if i % 2 else 0)
+    os.utime(path, (mtime, mtime))
+PY_LINKED_SOURCE
+ssh destination python3 - <<'PY_LINKED_DESTINATION'
+import os
+root = '/tmp/syq-real-ssh/linked-destination'
+os.makedirs(root)
+block = 64 * 1024
+first = f'{root}/name0'
+with open(first, 'wb') as f:
+    f.write(bytes(i % 251 for i in range(2 * block)))
+os.utime(first, (1_500_000_000, 1_500_000_000))
+for i in range(1, 8):
+    os.link(first, f'{root}/name{i}')
+with open('/tmp/syq-real-ssh/linked-inode', 'w') as f:
+    f.write(str(os.stat(first).st_ino))
+PY_LINKED_DESTINATION
+# One worker: the receiver carries out its requests in turn.
+syq cp --copy-metadata=mtime --no-progress --performance-tuning workers=1 \
+    --results /tmp/syq-linked-results.ndjson \
+    --from source --srcs-in /tmp/syq-real-ssh/linked-source \
+    --to destination --into /tmp/syq-real-ssh/linked-destination
+python3 - /tmp/syq-linked-results.ndjson <<'PY_LINKED_RESULTS'
+import json, sys
+result = [json.loads(line) for line in open(sys.argv[1])][-1]
+assert result['type'] == 'result' and result['status'] == 'success', result
+assert result['errors'] == 0, result
+PY_LINKED_RESULTS
+ssh destination python3 - <<'PY_LINKED_CHECK'
+import os
+root = '/tmp/syq-real-ssh/linked-destination'
+inode = int(open('/tmp/syq-real-ssh/linked-inode').read())
+block = 64 * 1024
+old = bytes(i % 251 for i in range(2 * block))
+new = old[:block] + bytes([7]) * block
+replaced = set()
+for i in range(8):
+    path = f'{root}/name{i}'
+    status = os.stat(path)
+    with open(path, 'rb') as f:
+        contents = f.read()
+    if i % 2:
+        # A replaced name names a new file of its own.
+        assert contents == new and status.st_ino != inode, (i, status)
+        assert status.st_ino not in replaced, (i, status)
+        replaced.add(status.st_ino)
+        assert int(status.st_mtime) == 1_600_000_000 + i, (i, status)
+    else:
+        # A kept name still names the file the other kept names share.
+        assert contents == old and status.st_ino == inode, (i, status)
+        assert int(status.st_mtime) == 1_600_000_000, (i, status)
+PY_LINKED_CHECK
+
 printf 'case: expression selection on source, destination, and local coordinators\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
 for coordinator in src dst local; do

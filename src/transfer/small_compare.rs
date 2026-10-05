@@ -238,13 +238,15 @@ impl Worker {
                 Some(Compared::StaleCondition) => {
                     // Keeping or replacing each other name of the
                     // destination in this copy changes the change time its
-                    // condition holds, once, and so can leave this name's
-                    // condition stale once. Comparing it again as many times
-                    // as this copy has names of the file lets every name be
-                    // kept, and leaves one comparison for a change from
-                    // outside. A file that goes stale more often, as one
-                    // that keeps changing does, is replaced whole. Names of
-                    // it outside this copy do not count.
+                    // condition holds, once. This batch's names of the file
+                    // are authorized in turn (see `compare_small_files`),
+                    // but another worker's can still leave this name's
+                    // condition stale, once each. Comparing it again as many
+                    // times as this copy has names of the file lets every
+                    // name be kept, and leaves one comparison for a change
+                    // from outside. A file that goes stale more often, as
+                    // one that keeps changing does, is replaced whole. Names
+                    // of it outside this copy do not count.
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let names = jobs.destination_names(i);
                     let job = &mut jobs[i];
@@ -284,15 +286,35 @@ impl Worker {
         let mut unissued = std::collections::VecDeque::new();
         let (_, group_bytes) = self.compare_group_limits();
         let (mut start, mut bytes) = (0, 0u64);
+        // A restricted receiver binds each patch to the change time of the
+        // file it replaces when it authorizes the patch's request, and
+        // authorizes all of a request's patches before it carries out any.
+        // Keeping one name of a hard-linked file with new metadata, or
+        // replacing it, changes the change time the file's other names
+        // share, so another of them in the same request would find its
+        // condition stale: it would be compared again, or copied whole if
+        // it was to be replaced. Each name of such a file goes in a group of
+        // its own instead. This connection's requests are carried out in
+        // turn, so a later group's patch is authorized against the file as
+        // the earlier one left it.
+        let mut linked = std::collections::HashSet::new();
         for (i, job) in jobs.iter().enumerate() {
+            let identity = job
+                .dst_entry
+                .as_deref()
+                .filter(|_| self.opts.restricted_receiver)
+                .and_then(crate::sched::linked_identity);
             if i > start
                 && (i - start >= COMPARE_GROUP_FILES
-                    || bytes.saturating_add(job.entry.size) > group_bytes)
+                    || bytes.saturating_add(job.entry.size) > group_bytes
+                    || identity.is_some_and(|identity| linked.contains(&identity)))
             {
                 unissued.push_back((start..i).collect::<Vec<_>>());
                 (start, bytes) = (i, 0);
+                linked.clear();
             }
             bytes += job.entry.size;
+            linked.extend(identity);
         }
         if start < jobs.len() {
             unissued.push_back((start..jobs.len()).collect());
