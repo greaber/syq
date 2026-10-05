@@ -33,8 +33,12 @@ pub fn join(root: &[u8], rel: &[u8]) -> PathBytes {
     if root.is_empty() {
         return rel.to_vec();
     }
-    let mut v = root.to_vec();
-    if !v.ends_with(b"/") {
+    let separator = !root.ends_with(b"/");
+    // Queued file paths can live for the whole copy. Allocate their final
+    // length instead of growing the prefix and retaining spare capacity.
+    let mut v = Vec::with_capacity(root.len() + usize::from(separator) + rel.len());
+    v.extend_from_slice(root);
+    if separator {
         v.push(b'/');
     }
     v.extend_from_slice(rel);
