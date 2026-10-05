@@ -435,10 +435,14 @@ impl ForwardChild {
         let mut installed = false;
         let mut reclaimed = false;
         loop {
-            anyhow::ensure!(
-                !cancelled() && Instant::now() < deadline,
-                "copy setup stopped"
-            );
+            anyhow::ensure!(!cancelled(), "copy setup cancelled");
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "copy setup deadline expired",
+                )
+                .into());
+            }
             let mut child = Self::spawn_command(spec.helper_command(&[operation.into()]))?;
             let reply = (|| {
                 write_message(
@@ -559,9 +563,17 @@ impl ForwardChild {
             if info.si_signo != 0 {
                 return Ok(self.close()?);
             }
-            if cancelled() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if cancelled() {
                 let _ = self.close();
-                bail!("return helper stopped while waiting for its exit status");
+                bail!("return helper cancelled while waiting for its exit status");
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                let _ = self.close();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "return helper deadline expired while waiting for its exit status",
+                )
+                .into());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1205,7 +1217,7 @@ mod tests {
         let mut result = Vec::new();
         client.read_to_end(&mut result).unwrap();
         assert_eq!(result, b"done");
-        client.shutdown(std::net::Shutdown::Both).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
         let released = thread.join().unwrap().unwrap();
         assert!(released);
         // The independently owned coordinator may still flush its final stdout.

@@ -134,7 +134,9 @@ pub(crate) fn probe_forwarded(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let stream = forwarded_handshake(stream, deadline, Some(cancelled))?;
-    stream.shutdown(std::net::Shutdown::Both)?;
+    // Hello already succeeded. A peer closing first must not turn that into
+    // failure (macOS reports ENOTCONN when shutting down a closed socket).
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     Ok(())
 }
 
@@ -413,11 +415,19 @@ impl Service {
     }
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let socket = stream.try_clone()?;
-        socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        let hello: Hello = crate::destination::read_message(&mut stream)?;
+        // Before Hello, local clients and SSH-forwarded clients share this
+        // socket. Allow network latency for Hello and the following Access;
+        // keep the shorter budget for requests identified as local control.
+        socket.set_read_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+        socket.set_write_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+        let mut handshake = crate::destination::DeadlineIo {
+            inner: &mut stream,
+            deadline: Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT,
+            cancelled: None,
+        };
+        let hello: Hello = crate::destination::read_message(&mut handshake)?;
         crate::destination::write_message(
-            &mut stream,
+            &mut handshake,
             &HelloReply {
                 version: PROTOCOL,
                 build: crate::identity::build().into(),
@@ -428,6 +438,8 @@ impl Service {
             "unsupported local provider protocol"
         );
         if hello.control {
+            socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+            socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
             let request: Control = crate::destination::read_message(&mut stream)?;
             let decision_error = match request {
                 Control::Status => None,
@@ -481,7 +493,12 @@ impl Service {
             hello.build == crate::identity::build(),
             "local provider build changed"
         );
-        let request: Access = crate::destination::read_message(&mut stream)?;
+        let request: Access =
+            crate::destination::read_message(&mut crate::destination::DeadlineIo {
+                inner: &mut stream,
+                deadline: Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT,
+                cancelled: None,
+            })?;
         socket.set_read_timeout(Some(IO_TIMEOUT))?;
         socket.set_write_timeout(Some(IO_TIMEOUT))?;
         match request {
@@ -1090,6 +1107,45 @@ mod tests {
         assert!(error.chain().any(|cause| cause
             .downcast_ref::<std::io::Error>()
             .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionAborted)));
+    }
+
+    #[test]
+    fn service_allows_forwarding_latency_before_hello_and_access() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain).unwrap());
+        let (mut client, server) = pair(&service);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || service.handle(server));
+        let mut hello = Vec::new();
+        crate::destination::write_message(
+            &mut hello,
+            &Hello {
+                version: PROTOCOL,
+                build: crate::identity::build().into(),
+                control: false,
+            },
+        )
+        .unwrap();
+        // A partial Hello and a request following the Hello response can
+        // each arrive more than the local two-second budget apart over SSH.
+        client.write_all(&hello[..2]).unwrap();
+        std::thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100));
+        client.write_all(&hello[2..]).unwrap();
+        let _: HelloReply = crate::destination::read_message(&mut client).unwrap();
+        std::thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100));
+        crate::destination::write_message(
+            &mut client,
+            &Access::Attach {
+                profile: Some("missing".into()),
+            },
+        )
+        .unwrap();
+        let reply: std::result::Result<Ticket, String> =
+            crate::destination::read_message(&mut client).unwrap();
+        assert!(reply.unwrap_err().contains("missing"));
+        worker.join().unwrap().unwrap();
     }
 
     #[test]

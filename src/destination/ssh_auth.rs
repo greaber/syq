@@ -29,6 +29,8 @@ pub(crate) fn retryable_setup_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<RetryableSetupError>()
             || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                // Synthetic ConnectionAborted marks deliberate cancellation;
+                // the actual OS connection-aborted error is a transport failure.
                 matches!(
                     error.kind(),
                     std::io::ErrorKind::TimedOut
@@ -38,7 +40,7 @@ pub(crate) fn retryable_setup_error(error: &anyhow::Error) -> bool {
                         | std::io::ErrorKind::ConnectionReset
                         | std::io::ErrorKind::BrokenPipe
                         | std::io::ErrorKind::UnexpectedEof
-                )
+                ) || error.raw_os_error() == Some(libc::ECONNABORTED)
             })
     })
 }

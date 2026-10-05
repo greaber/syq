@@ -146,6 +146,14 @@ enum AdmissionReply {
     Error(String),
 }
 impl AdmissionReply {
+    fn failure(ssh_admission: bool, error: anyhow::Error) -> Self {
+        if ssh_admission && !super::ssh_auth::retryable_setup_error(&error) {
+            Self::SshRefused(format!("{error:#}"))
+        } else {
+            Self::Error(format!("{error:#}"))
+        }
+    }
+
     fn ssh_result(self) -> Result<forward::ssh::Peer> {
         match self {
             Self::Ssh(peer) => Ok(peer),
@@ -318,12 +326,14 @@ impl Selection {
                 io_timeout: ADMISSION,
             },
             move |mut stream, _| {
+                let mut ssh_admission = false;
                 let result = (|| {
                     let request: AdmissionRequest = read_message(&mut forward::DeadlineIo {
                         inner: &mut stream,
                         deadline: Instant::now() + ADMISSION,
                         cancelled: None,
                     })?;
+                    ssh_admission = matches!(request.action, Action::Ssh { .. });
                     anyhow::ensure!(
                         request.version == VERSION
                             && request.identity == crate::identity::build()
@@ -390,11 +400,7 @@ impl Selection {
                     }
                 })();
                 if let Err(error) = result {
-                    let reply = if super::ssh_auth::retryable_setup_error(&error) {
-                        AdmissionReply::Error(format!("{error:#}"))
-                    } else {
-                        AdmissionReply::SshRefused(format!("{error:#}"))
-                    };
+                    let reply = AdmissionReply::failure(ssh_admission, error);
                     let _ = write_message(&mut stream, &reply);
                 }
             },
@@ -781,6 +787,66 @@ mod tests {
         .unwrap_err();
         assert!(!is_setup_refusal(&next));
         assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn expired_setup_can_retry_but_cancelled_setup_is_remembered() {
+        for cancelled in [false, true] {
+            let setup = Mutex::new(forward::ssh::SetupMemo::default());
+            let attempts = std::cell::Cell::new(0);
+            let spec = crate::conn::RemoteSpec::local_receiver(false);
+            for _ in 0..2 {
+                let error = cached_ssh_setup(&setup, "key", || {
+                    attempts.set(attempts.get() + 1);
+                    forward::ForwardChild::over_spec(
+                        &spec,
+                        "--return-ssh-setup",
+                        &"request",
+                        Instant::now(),
+                        &|| cancelled,
+                    )?;
+                    panic!("expired or cancelled setup must not start a helper")
+                })
+                .unwrap_err();
+                assert_eq!(is_setup_refusal(&error), cancelled, "{error:#}");
+            }
+            assert_eq!(attempts.get(), if cancelled { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn control_and_lifetime_admission_keep_the_original_error() {
+        let broker = PrivateBroker::start_managed(
+            PrivateBrokerConfig {
+                directory_prefix: "syq-peer-error-",
+                socket_name: "s",
+                listener_thread: "peer-error",
+                client_thread: "peer-error-client",
+                max_connections: 2,
+                io_timeout: ADMISSION,
+            },
+            |mut stream, _| {
+                let request: AdmissionRequest = read_message(&mut stream).unwrap();
+                let reply = AdmissionReply::failure(
+                    matches!(request.action, Action::Ssh { .. }),
+                    anyhow::anyhow!("peer copy is closed"),
+                );
+                write_message(&mut stream, &reply).unwrap();
+            },
+        )
+        .unwrap();
+        let ticket = Ticket {
+            version: VERSION,
+            identity: crate::identity::build().into(),
+            socket: broker.socket_path().into(),
+            secret: "x".repeat(43),
+        };
+        for error in [
+            ticket.control().unwrap_err(),
+            ticket.lifetime().unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "peer bridge: peer copy is closed");
+        }
     }
 
     #[test]

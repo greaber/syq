@@ -68,18 +68,20 @@ struct Admission {
 }
 impl Server {
     pub(super) fn start(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<Self> {
-        Self::start_with(authority, crate::restricted::TemporaryKey::install)
+        Self::start_with(authority, 1, crate::restricted::TemporaryKey::install)
     }
     fn start_with(
         authority: Arc<crate::restricted::RestrictedAuthority>,
+        max_connections: usize,
         install: impl Fn(&str, &str) -> Result<crate::restricted::TemporaryKey> + Send + Sync + 'static,
     ) -> Result<Self> {
         let secret = random_token()?;
         let expected = secret.clone();
         let state: Arc<Mutex<Option<Admission>>> = Arc::new(Mutex::new(None));
         let shared = state.clone();
-        let broker =
-            PrivateBroker::start_managed(config("syq-copy-setup-", 1), move |mut stream, _| {
+        let broker = PrivateBroker::start_managed(
+            config("syq-copy-setup-", max_connections),
+            move |mut stream, _| {
                 let result = (|| {
                     authenticate(&mut stream, &expected)?;
                     let public_key: String =
@@ -103,7 +105,8 @@ impl Server {
                 if let Err(error) = result {
                     let _ = write_message(&mut stream, &Reply::Error(format!("{error:#}")));
                 }
-            })?;
+            },
+        )?;
         let ticket = Ticket {
             socket: broker.socket_path().to_path_buf(),
             secret,
@@ -257,10 +260,14 @@ pub(in crate::destination) fn setup_over_spec(
         matches!(reply, Reply::Ready),
         "invalid peer SSH setup response"
     );
-    anyhow::ensure!(
-        !cancelled() && Instant::now() < deadline,
-        "peer copy closed during SSH setup"
-    );
+    anyhow::ensure!(!cancelled(), "peer copy closed during SSH setup");
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "peer SSH setup deadline expired",
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -743,7 +750,9 @@ mod tests {
         let request = constrain(request, &root.path().join("output"), 1024, 100, 0).unwrap();
         let (authority, _) = crate::restricted::named_authority(root.path(), request).unwrap();
         let install_home = home.clone();
-        let server = Server::start_with(authority.clone(), move |key, ticket| {
+        // Replies can arrive before their handler threads finish. This test
+        // exercises key scope, not the broker's admission limit.
+        let server = Server::start_with(authority.clone(), 8, move |key, ticket| {
             crate::restricted::TemporaryKey::install_at(
                 &install_home,
                 Path::new("/usr/bin/syq"),
@@ -895,7 +904,7 @@ mod tests {
         let secret = random_token().unwrap();
         let expected = secret.clone();
         let broker =
-            PrivateBroker::start_managed(config("syq-setup-test-", 1), move |mut socket, _| {
+            PrivateBroker::start_managed(config("syq-setup-test-", 4), move |mut socket, _| {
                 authenticate(&mut socket, &expected).unwrap();
                 let public: String =
                     read_socket_message(&mut socket.try_clone().unwrap(), TIMEOUT).unwrap();

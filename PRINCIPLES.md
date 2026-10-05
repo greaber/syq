@@ -45,10 +45,12 @@ here. The accepted ones are:
   the receiver's receipt in the temporary directory. Replay protection cannot
   be optional, so this state must be writable; `--peer-auth broker` or
   `own-credentials` copy without the receiver.
-- SSH data transport for a copy authorized through a receiving machine or
-  approved account may temporarily add a forced-command key to the destination
-  account's `~/.ssh/authorized_keys`. The key serves only that live copy. TCP
-  data transport does not require this write.
+- SSH data transport for a one-copy laptop-authorized upload or a copy between
+  two other servers using approved accounts may create the destination account's
+  `~/.ssh` directory and add a forced-command key to `~/.ssh/authorized_keys`.
+  The key serves only that live copy; normal cleanup removes the entry, but a
+  crash can leave an inert entry behind. TCP data transport and ordinary
+  two-machine approved-account copies do not require this write.
 - `--detach` writes the detached copy's log under `~/.syq` on the coordinating
   server, because that log is the only record of how the copy ended.
 

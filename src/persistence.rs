@@ -1280,7 +1280,7 @@ mod tests {
 
     #[test]
     fn closing_scope_removes_linked_preferences_without_removing_the_target() {
-        let root = crate::test_support::tempdir().unwrap();
+        let root = crate::test_support::short_tempdir().unwrap();
         let scope = root.path().join("scope");
         initialize_scope(&scope).unwrap();
         let target = root.path().join("saved.json");

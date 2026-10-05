@@ -409,6 +409,9 @@ mod tests {
         assert!(retryable(
             ssh_auth::RetryableSetupError("capacity exhausted".into()).into()
         ));
+        assert!(retryable(
+            std::io::Error::from_raw_os_error(libc::ECONNABORTED).into()
+        ));
         for message in [
             "the account grant ended",
             "provider configuration changed",
