@@ -5824,6 +5824,14 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     );
     let error = execute_on_connection(&mut gate, &mut ops, begin(&refused_patch)).unwrap_err();
     assert!(error.contains("already open"), "{error}");
+    let second = begin(&patch(&paths[1], &hashed[1]));
+    let error = gate.authorize(&mut second.clone(), true).unwrap_err();
+    assert!(format!("{error:#}").contains("already open"), "{error:#}");
+    // A refused begin holds none of its file's size.
+    assert_eq!(
+        authority.state.lock().unwrap().reserved_bytes,
+        reserved + len
+    );
     // A piece is charged as written data, within one rate-limit burst; a
     // refused piece fails its patch, which then publishes nothing.
     let transferred = authority.state.lock().unwrap().transferred_bytes;

@@ -2376,6 +2376,7 @@ impl RestrictedAuthority {
                 // Nothing of a refused request executes, including the
                 // entries authorized before the refusing one.
                 self.forget_provisional(&pending);
+                self.release_patch_holds(outcomes.into_iter());
                 let mut state = self.state.lock().unwrap();
                 if tracked {
                     state.in_flight = state.in_flight.saturating_sub(1);
