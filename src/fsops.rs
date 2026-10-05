@@ -64,7 +64,7 @@ pub(crate) fn destination_fraction_matches(source: u32, destination: u32) -> boo
 }
 
 pub const PARTIAL_MARKER: &str = ".syq-tmp.";
-const FD_CACHE_MAX: usize = 16;
+pub(crate) const FD_CACHE_MAX: usize = 16;
 const PARTIAL_DIRECTORY_CACHE_MAX: usize = 64;
 const PARTIAL_CANDIDATES_MAX: usize = 256;
 const SOURCE_FD_RESERVE: usize = 32;

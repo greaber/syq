@@ -3463,14 +3463,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 });
         if autotune {
             let mut capacity = local_descriptors
-                .map(|budget| budget.workers(if src_ep.is_remote() { 0 } else { srcs.len() }))
+                .map(|budget| {
+                    budget.source_workers(if src_ep.is_remote() { 0 } else { srcs.len() })
+                })
                 .unwrap_or(usize::MAX);
             let receiver_roots = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
                 srcs.len()
             } else {
                 0
             };
-            for (endpoint, roots) in [(&src_ep, srcs.len()), (&dst_ep, receiver_roots)] {
+            for (endpoint, roots, receiver) in [
+                (&src_ep, srcs.len(), false),
+                (&dst_ep, receiver_roots, true),
+            ] {
                 if let Endpoint::Remote(spec) = endpoint {
                     // TCP workers share the control helper's process. SSH
                     // workers each have their own process and descriptor limit.
@@ -3484,7 +3489,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         if let Some(budget) =
                             spec.diagnostics().peer.and_then(|peer| peer.descriptors)
                         {
-                            capacity = capacity.min(budget.workers(roots));
+                            capacity = capacity.min(if receiver {
+                                budget.receiver_workers(roots)
+                            } else {
+                                budget.source_workers(roots)
+                            });
                         }
                     }
                 }
