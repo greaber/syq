@@ -407,11 +407,15 @@ mod tests {
         use std::os::unix::net::UnixListener;
         let root = crate::test_support::short_tempdir().unwrap();
         let path = root.path().join("master");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener =
+            crate::process::with_inheritance_guard(|| UnixListener::bind(&path)).unwrap();
         let watch = MasterWatch::connect(&path).unwrap();
-        let (mut master, _) = listener.accept().unwrap();
+        let (mut master, _) = crate::process::with_inheritance_guard(|| listener.accept()).unwrap();
         master.write_all(b"mux hello").unwrap();
         assert!(!watch.closed());
+        // closed() drains available bytes. Leave fresh bytes unread when the
+        // master exits so this continues covering Darwin's buffered-EOF case.
+        master.write_all(b"remaining mux hello").unwrap();
         drop(master);
         drop(listener);
         assert!(path.exists());
@@ -419,15 +423,19 @@ mod tests {
     }
 
     fn full_queue(path: &Path) -> (socket2::Socket, Vec<socket2::Socket>) {
-        let listener =
-            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        let listener = crate::process::with_inheritance_guard(|| {
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        })
+        .unwrap();
         let address = socket2::SockAddr::unix(path).unwrap();
         listener.bind(&address).unwrap();
         listener.listen(1).unwrap();
         let mut clients = Vec::new();
         for _ in 0..16 {
-            let client =
-                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+            let client = crate::process::with_inheritance_guard(|| {
+                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+            })
+            .unwrap();
             client.set_nonblocking(true).unwrap();
             match client.connect(&address) {
                 Ok(()) => clients.push(client),
@@ -454,7 +462,7 @@ mod tests {
         let (finished, finish) = mpsc::channel();
         let accept = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
-            let _client = listener.accept().unwrap();
+            let _client = crate::process::with_inheritance_guard(|| listener.accept()).unwrap();
             finish.recv_timeout(Duration::from_secs(3)).unwrap();
         });
         let watch = MasterWatch::connect_until(&path, Instant::now() + Duration::from_secs(2));
