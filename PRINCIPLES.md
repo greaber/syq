@@ -14,44 +14,28 @@ of the pull request so it is reviewed as a decision rather than as routine
 editing. If a task seems to require breaking a principle, raise that before
 implementing it.
 
-## Copying and removing write little outside the files they change
+## File operations have no incidental write requirements
 
-Copying and removing files, whether through `syq cp`, `syq rsync`, or `syq rm`,
-write where they change files: for a copy, the destination files and
-directories it creates, including their partial files; for a removal, the files
-it removes. They work with read-only source data and with an unwritable home
-directory or cache on every machine involved. Removal also works on a
-completely full filesystem, which is often why someone is removing files.
+Copying works with read-only source data. Removal works on a completely full
+filesystem, which is often why someone is removing files.
 
-Beyond that, syq may need a few small files, such as local sockets, in the
-temporary directory: `TMPDIR` when it is set, otherwise `/tmp`. Syq keeps this
-to a minimum.
+An unwritable home directory or cache must not block copying or removal merely
+because syq cannot save optional state. Caches, tuning information, completion
+caches, and optional resume or recovery records can improve these operations,
+but failures to read or write that state must not prevent them from succeeding.
 
-Syq may also read and write optional state, such as the tuning cache, resume
-and recovery records, and completion caches, to help performance. When syq
-cannot read or write it, copying and removal still succeed.
+Syq may use a few small temporary files or sockets under `TMPDIR`, or `/tmp`
+when it is unset. Keep these requirements small.
 
-Any other write requirement is discussed with the maintainer first and recorded
-here. The accepted ones are:
+Features that inherently need installation, authorization state, or durable
+logs can require writes outside the files being copied or removed. Their
+documentation must explain what they write, where, and which locations must
+be writable. Required security state must not be silently skipped when writing
+it fails.
 
-- Installing a missing SSH helper needs a durable writable location on the
-  server; the temporary directory is not a lasting place for it. When the
-  server's home is unwritable, install syq there separately and use
-  `--syq-path` or `--no-bootstrap`.
-- Copies between two servers through the command-restricted receiver, the
-  default, keep security state: enrollment keys on the invoking machine, and in
-  the destination account a restricted key added to `~/.ssh/authorized_keys`,
-  the installed receiver, and its replay-protection records. They also collect
-  the receiver's receipt in the temporary directory. Replay protection cannot
-  be optional, so this state must be writable; `--peer-auth broker` or
-  `own-credentials` copy without the receiver.
-- `--detach` writes the detached copy's log under `~/.syq` on the coordinating
-  server, because that log is the only record of how the copy ended.
-
-Why: the temporary directory is the conventional place for a program's
-short-lived files, so a little space there is unsurprising. Caches and records
-exist to make syq faster and should never be the reason a copy or removal
-fails.
+Why: optional bookkeeping and performance improvements should never prevent
+useful file operations. Features with necessary write requirements should make
+those requirements clear.
 
 ## Startup latency and throughput are core
 

@@ -91,9 +91,13 @@ Approved-account uploads and downloads also run in this profile, with larger
 files and overlapping independent SSH data connections. The requester-config
 fixture disables idle helper prewarming only for its completion calls in this
 profile: a ready helper would occupy the sole session needed by its later shell
-commands. The default profile keeps prewarming enabled. Workflows that require
-concurrent sessions on one connection, including approved three-server SSH
-setup, run in the default profile and are listed in `max-sessions-1.skip`.
+commands. The peer-copy case prewarms both approved connections in both profiles:
+a TCP copy can reclaim idle helpers after a session refusal, while the default
+profile checks that TCP and SSH copies preserve the same helpers for completion.
+The peer-copy case also checks that the one-session destination refuses SSH
+worker setup with a session-limit diagnostic. Other workflows requiring
+concurrent sessions run only in the default profile; those cases are listed in
+`max-sessions-1.skip`.
 
 The first build downloads the pinned Rust toolchain image, Debian packages, and
 Cargo dependencies. Test execution itself uses only the Compose project's
@@ -107,7 +111,10 @@ before the remaining scenarios reuse those helpers.
 
 The source sshd permits remote Unix socket forwarding for named return transfers
 (OpenSSH 9.2 also requires remote TCP forwarding permission). The destination
-keeps forwarding disabled. The runner has no SSH server. Return scenarios cover
+keeps forwarding disabled. The core runner also hosts a loopback sshd for an
+isolated requester account without the laptop's keys. The ordinary-provider case
+uses a separate disposable SSH listener that permits local Unix forwarding;
+it does not change the other scenarios' forwarding restrictions. Return scenarios cover
 copies from independent source shells without a forwarded agent, encrypted TCP
 workers dialed by the laptop, explicit SSH data, TCP interruption and resume, destination
 background startup through persistence, `--root` traversal refusal, unconfined
@@ -119,6 +126,16 @@ automatic approval. An isolated D-Bus notification service exercises the real
 Linux `notify-send` client with Allow, Deny, dismissal, unexpected actions, and
 service failure; only Allow starts a copy. This does not exercise a particular desktop's visual
 layout or the macOS dialog.
+
+SSH authorization cases cover laptop return connections and ordinary SSH
+providers, requester-side aliases and identity selection, separate ProxyJump
+account approvals, and reuse by native `ssh`, `scp`, `sftp`, and `rsync`. They
+check command status and interruption, session and remembered approvals, scope
+isolation, and provider disconnects. Three-server cases check direct TCP/SSH
+data, restricted destination keys, receiver receipts, and cleanup after requester
+or destination-connection loss. A TCP bridge needs one free session per endpoint;
+its SSH worker setup needs a second destination session. Idle prepared helpers
+are released before bridge setup, without interrupting other active operations.
 
 Source-shell remote copies also cover cached helper reuse, bootstrap after a
 missing or unexecutable helper, a delayed approval relay before Hello, and

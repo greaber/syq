@@ -455,6 +455,7 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || crate::destination::peer_bridge::is_setup_refusal(error)
+        || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
             .chain()
@@ -1810,6 +1811,33 @@ impl RemoteSpec {
         }
         let conn = self.take_pooled_control(compress);
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
+    }
+
+    /// Only a failed SSH startup may reclaim idle slots from an approved
+    /// master. Successful helper launches never inspect or change the pool.
+    /// Callers retry at most once, before starting the copy or its command.
+    pub(crate) fn release_idle_helpers_after_startup_failure(
+        &self,
+        status: &std::process::ExitStatus,
+    ) -> bool {
+        if status.code() != Some(255) {
+            return false;
+        }
+        let Some(multiplexer) = &self.ssh_multiplexer else {
+            return false;
+        };
+        if !multiplexer.existing_only || !crate::session_pool::is_running(&multiplexer.path) {
+            return false;
+        }
+        if let Err(error) = crate::session_pool::stop(&multiplexer.path) {
+            // Recovery is best effort. The caller still reports the original
+            // startup failure, which explains why recovery was attempted.
+            crate::output::diagnostic!(
+                "syq: could not release idle helpers after SSH startup failed: {error:#}"
+            );
+            return false;
+        }
+        true
     }
 
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
@@ -3245,6 +3273,9 @@ impl Endpoint {
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
+                            }
+                            if spec.forwarded.as_ref().is_some_and(|copy| !copy.has_ssh()) {
+                                return Err(e).context(crate::destination::SshWorkersUnavailable);
                             }
                             let mut g = spec.tcp.lock().unwrap();
                             let mut warning = None;

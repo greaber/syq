@@ -25,9 +25,11 @@ impl Signals {
         let (wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
         wake.set_nonblocking(true)?;
         let received = Arc::new(AtomicUsize::new(0));
-        let mut termination = vec![libc::SIGINT, libc::SIGTERM];
-        if !crate::process::signals::inherited_hangup_is_ignored()? {
-            termination.push(libc::SIGHUP);
+        let mut termination = Vec::new();
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            if !crate::process::signals::inherited_is_ignored(signal)? {
+                termination.push(signal);
+            }
         }
         let registrations = crate::process::signals::owned(&termination, || {
             let mut registrations = crate::process::signals::Registrations::default();
@@ -339,6 +341,32 @@ mod tests {
                 assert_eq!(run(&mut command, || false).unwrap(), 17);
                 assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
             }
+            "ignored-termination" => {
+                // Both nested foreground owners and their exec children must
+                // retain dispositions inherited from a backgrounding shell.
+                let owner = Signals::new().unwrap();
+                assert_eq!(run(&mut subprocess("ignored-child"), || false).unwrap(), 0);
+                for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    assert_eq!(unsafe { libc::raise(signal) }, 0);
+                }
+                assert_eq!(owner.received.load(Ordering::Acquire), 0);
+                drop(owner);
+                for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    assert_eq!(unsafe { libc::raise(signal) }, 0);
+                }
+            }
+            "ignored-child" => {
+                for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    let mut disposition: libc::sigaction = unsafe { std::mem::zeroed() };
+                    assert_eq!(
+                        unsafe { libc::sigaction(signal, std::ptr::null(), &mut disposition) },
+                        0
+                    );
+                    assert_eq!(disposition.sa_sigaction, libc::SIG_IGN);
+                    assert_eq!(unsafe { libc::kill(libc::getppid(), signal) }, 0);
+                    assert_eq!(unsafe { libc::raise(signal) }, 0);
+                }
+            }
             "terminal-child" => {
                 assert_eq!(unsafe { libc::isatty(libc::STDIN_FILENO) }, 1);
                 assert_eq!(unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) }, unsafe {
@@ -426,6 +454,36 @@ mod tests {
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", SUBPROCESS_TEST, "--nocapture"])
             .env(SUBPROCESS, "nohup");
+        let output = crate::process::capture_output_bounded(
+            &mut command,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            64 * 1024,
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "status={}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn inherited_ignored_termination_survives_foreground_owners_and_exec() {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = subprocess("ignored-termination");
+        unsafe {
+            command.pre_exec(|| {
+                for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
         let output = crate::process::capture_output_bounded(
             &mut command,
             Instant::now() + Duration::from_secs(5),

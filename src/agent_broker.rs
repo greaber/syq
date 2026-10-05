@@ -382,9 +382,12 @@ fn inspect_ssh_configuration_at(
         let detail = String::from_utf8_lossy(&output.stderr)
             .lines()
             .filter(|line| {
-                !["debug1:", "debug2:", "debug3:"]
+                let version_banner = line.starts_with("OpenSSH_")
+                    && crate::conn::parse_openssh_version(line.as_bytes()).is_some();
+                let debug_trace = ["debug1:", "debug2:", "debug3:"]
                     .iter()
-                    .any(|prefix| line.starts_with(prefix))
+                    .any(|prefix| line.starts_with(prefix));
+                !(version_banner || debug_trace)
             })
             .collect::<Vec<_>>()
             .join("\n");

@@ -189,8 +189,7 @@ mod tests {
 
     #[test]
     fn provider_permissions_are_separate_from_return_grants_and_other_domains() {
-        let root = std::fs::canonicalize("/tmp").unwrap();
-        let temporary = tempfile::tempdir_in(root).unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let first = domain(&temporary.path().join("first"));
         let second = domain(&temporary.path().join("second"));
         let permission = permission();
@@ -235,8 +234,7 @@ mod tests {
 
     #[test]
     fn malformed_or_incompatible_provider_state_is_never_replaced() {
-        let root = std::fs::canonicalize("/tmp").unwrap();
-        let temporary = tempfile::tempdir_in(root).unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let domain = domain(&temporary.path().join("provider"));
         let path = domain.config_file(STATE_FILE).unwrap();
         let permission = permission();

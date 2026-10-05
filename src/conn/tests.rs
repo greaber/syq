@@ -42,6 +42,62 @@ fn bootstrap_stderr_preserves_invalid_utf8_in_both_channels() {
 }
 
 #[test]
+fn tcp_only_source_worker_failure_is_terminal_without_ssh_fallback() {
+    // Reserve an address without listening, so connection refusal cannot race
+    // another test reusing a released ephemeral port.
+    let refused = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    refused
+        .bind(
+            &"127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    let port = refused.local_addr().unwrap().as_socket().unwrap().port();
+    let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let approved =
+        crate::destination::ReturnConnection::source(control, "127.0.0.1".into()).unwrap();
+    let mut spec = super::RemoteSpec::local_receiver(false);
+    spec.forwarded = Some(approved);
+    *spec.tcp.lock().unwrap() = Some(super::TcpInfo {
+        pacing: None,
+        reverse: None,
+        addrs: vec!["127.0.0.1".into()],
+        port,
+        key: None,
+        token: Vec::new(),
+        congestion_control: None,
+        failed: false,
+        failure: None,
+        next: Default::default(),
+    });
+    let endpoint = super::Endpoint::Remote(spec.clone());
+    let error = endpoint
+        .connect_with_sources(false, Vec::new(), false)
+        .err()
+        .unwrap();
+    assert!(super::is_non_retryable_connect_error(&error), "{error:#}");
+    assert!(
+        error.is::<crate::destination::SshWorkersUnavailable>(),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("requires direct TCP"));
+    assert!(
+        !spec.tcp.lock().unwrap().as_ref().unwrap().failed,
+        "TCP-only failure must not activate the SSH fallback state"
+    );
+    let error = spec
+        .forwarded
+        .as_ref()
+        .unwrap()
+        .ssh_command()
+        .err()
+        .unwrap();
+    assert!(super::is_non_retryable_connect_error(&error));
+}
+
+#[test]
 fn advertised_tcp_port_must_match_requested_range() {
     for port in [47_600, 47_650, 47_699] {
         super::validate_advertised_tcp_port(port, (47_600, 47_699)).unwrap();
@@ -1763,7 +1819,7 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
 #[test]
 fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     use std::os::unix::net::UnixListener;
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = crate::test_support::short_tempdir().unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
     let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
@@ -1788,7 +1844,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
 #[test]
 fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the

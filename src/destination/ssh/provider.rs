@@ -348,8 +348,63 @@ fn master_command(record: &Record) -> Result<Command> {
     record.endpoint()?;
     Ok(command)
 }
+fn control_metadata(record: &Record) -> Result<Option<fs::Metadata>> {
+    if !owned_directory(&record.directory)? {
+        return Ok(None);
+    }
+    let metadata = match fs::symlink_metadata(record.control()) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_socket()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "SSH provider control must be an owned private Unix socket"
+    );
+    Ok(Some(metadata))
+}
+
+// Only the caller holding the provider index lock can retire this path. On
+// Linux a full queue returns EAGAIN, distinct from an abandoned listener's
+// ECONNREFUSED. Darwin reports ECONNREFUSED for both; leave that case visible.
+fn remove_abandoned_control(record: &Record) -> Result<bool> {
+    let Some(before) = control_metadata(record)? else {
+        return Ok(true);
+    };
+    let socket = crate::process::with_inheritance_guard(|| {
+        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+    })?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&socket2::SockAddr::unix(record.control())?) {
+        Ok(()) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(control_metadata(record)?.is_none());
+        }
+        Err(error) if cfg!(target_os = "linux")
+            && error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+        Err(error) => return Err(error).with_context(|| format!(
+            "cannot verify whether SSH provider control {} is abandoned; retry shutdown, or remove this socket only after confirming its provider SSH master has stopped",
+            record.control().display()
+        )),
+    }
+    let Some(after) = control_metadata(record)? else {
+        return Ok(true);
+    };
+    anyhow::ensure!(
+        (before.dev(), before.ino()) == (after.dev(), after.ino()),
+        "SSH provider control changed while checking abandonment"
+    );
+    match fs::remove_file(record.control()) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn stop_master(record: &Record) -> Result<()> {
-    if !record.control().exists() {
+    if control_metadata(record)?.is_none() {
         return Ok(());
     }
     let mut command = master_command(record)?;
@@ -359,7 +414,7 @@ fn stop_master(record: &Record) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let output =
         crate::process::capture_output_bounded(&mut command, deadline, &|| false, 16 * 1024)?;
-    if !output.status.success() && record.control().exists() {
+    if !output.status.success() && !remove_abandoned_control(record)? {
         bail!(
             "SSH provider refused shutdown: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -683,7 +738,26 @@ fn forward_service(record: &Record, remote: &Path) -> Result<()> {
     privatize_forwarded_socket(&record.directory)?;
     Ok(())
 }
+fn probe_forwarded(record: &Record, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    (|| -> Result<()> {
+        let socket = crate::process::with_inheritance_guard(|| {
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        })?;
+        socket.set_nonblocking(true)?;
+        socket.connect(&socket2::SockAddr::unix(record.forwarded())?)?;
+        socket.set_nonblocking(false)?;
+        service::probe_forwarded(socket.into(), deadline, cancelled)
+    })()
+    .with_context(|| {
+        format!(
+            "verify SSH authorization provider {} through its forwarded socket",
+            record.provider
+        )
+    })
+}
+
 fn keeper(startup: Startup) -> Result<()> {
+    let deadline = Instant::now() + SETUP;
     let domain = Domain::select(startup.scope.as_deref())?;
     validate_record(&domain, &startup.record.provider, &startup.record)?;
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
@@ -740,6 +814,10 @@ fn keeper(startup: Startup) -> Result<()> {
     );
     validate_ticket(&hello.ticket)?;
     forward_service(&owner.record, &hello.socket)?;
+    // -O forward only creates the local listener. sshd can still deny the
+    // remote Unix channel, so prove the existing service protocol end to end
+    // before publishing a reusable binding or reporting successful setup.
+    probe_forwarded(&owner.record, deadline, &cancelled)?;
     anyhow::ensure!(
         !cancelled(),
         "SSH provider setup cancelled before readiness"
@@ -1005,6 +1083,95 @@ mod tests {
                 port: Some(22),
             },
         }
+    }
+
+    fn cleanup_fixture() -> (tempfile::TempDir, Domain, Record) {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let scope = root.path().join("s");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        directory(&domain).unwrap();
+        let physical = domain.runtime_path().join("provider-test");
+        fs::DirBuilder::new().mode(0o700).create(&physical).unwrap();
+        let record = Record {
+            version: 1,
+            build: crate::identity::build().into(),
+            provider: provider(),
+            generation: persistent::ensure_generation(&domain).unwrap(),
+            scope_identity: domain.identity().unwrap(),
+            directory: physical,
+            ticket: None,
+        };
+        let mut owner = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(record.directory.join("owner"))
+            .unwrap();
+        owner
+            .write_all(key(&record.provider).unwrap().as_bytes())
+            .unwrap();
+        write_record(&domain, &record).unwrap();
+        (root, domain, record)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_provider_socket_does_not_block_shutdown_or_reconnect_cleanup() {
+        let (_root, domain, record) = cleanup_fixture();
+        let lock = lock_file(
+            &record_path(&domain, &record.provider)
+                .unwrap()
+                .with_extension("lock"),
+            true,
+        )
+        .unwrap();
+        assert!(try_lock(&lock).unwrap());
+        for path in [record.control(), record.forwarded()] {
+            drop(UnixListener::bind(&path).unwrap());
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        validate_record(&domain, &record.provider, &record).unwrap();
+        // Exercise the real mux-only `ssh -O exit` refusal, not a mocked status.
+        remove_record(&domain, &record).unwrap();
+        assert!(!record.directory.exists());
+        assert!(!record_path(&domain, &record.provider).unwrap().exists());
+        assert!(persistent::generation_open(&domain, &record.generation).unwrap());
+    }
+
+    #[test]
+    fn provider_cleanup_preserves_live_or_unverified_control_paths() {
+        let (_root, _domain, record) = cleanup_fixture();
+        let listener = UnixListener::bind(record.control()).unwrap();
+        fs::set_permissions(record.control(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!remove_abandoned_control(&record).unwrap());
+        assert!(record.control().exists());
+        drop(listener);
+        fs::remove_file(record.control()).unwrap();
+        fs::write(record.control(), b"not a socket").unwrap();
+        assert!(stop_master(&record).is_err());
+        assert_eq!(fs::read(record.control()).unwrap(), b"not a socket");
+        fs::remove_file(record.control()).unwrap();
+        let target = record.directory.join("target");
+        let _listener = UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, record.control()).unwrap();
+        assert!(stop_master(&record).is_err());
+        assert!(target.exists());
+        assert!(fs::symlink_metadata(record.control())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provider_cleanup_does_not_guess_when_refused_is_ambiguous() {
+        let (_root, _domain, record) = cleanup_fixture();
+        drop(UnixListener::bind(record.control()).unwrap());
+        fs::set_permissions(record.control(), fs::Permissions::from_mode(0o600)).unwrap();
+        let error = remove_abandoned_control(&record).unwrap_err();
+        assert!(error.to_string().contains("only after confirming"));
+        assert!(record.control().exists());
     }
 
     #[test]

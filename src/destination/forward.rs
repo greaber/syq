@@ -432,13 +432,16 @@ impl ForwardChild {
         deadline: Instant,
         cancelled: &impl Fn() -> bool,
     ) -> Result<(Self, Reply)> {
-        for install in [false, true] {
-            anyhow::ensure!(
-                !cancelled() && Instant::now() < deadline,
-                "copy setup stopped"
-            );
-            if install {
-                spec.install_helper()?;
+        let mut installed = false;
+        let mut reclaimed = false;
+        loop {
+            anyhow::ensure!(!cancelled(), "copy setup cancelled");
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "copy setup deadline expired",
+                )
+                .into());
             }
             let mut child = Self::spawn_command(spec.helper_command(&[operation.into()]))?;
             let reply = (|| {
@@ -469,21 +472,46 @@ impl ForwardChild {
                 Ok(reply) => return Ok((child, reply)),
                 Err(error) => {
                     let status = child.wait_for_exit(deadline, cancelled);
-                    if !install
+                    if !reclaimed
+                        && status
+                            .as_ref()
+                            .is_ok_and(|status| status.code() == Some(255))
+                        && spec.release_idle_helpers_after_startup_failure(status.as_ref().unwrap())
+                    {
+                        // The failed child has been closed. No copy data has
+                        // been admitted before this setup reply and Hello.
+                        reclaimed = true;
+                        continue;
+                    }
+                    if !installed
                         && spec.bootstrap_helper
                         && status
                             .as_ref()
                             .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
                     {
+                        spec.install_helper()?;
+                        installed = true;
                         continue;
                     }
-                    return Err(error).with_context(|| {
-                        format!("approved account helper failed: {}", child.errors())
-                    });
+                    let errors = child.errors();
+                    let error = if status.as_ref().is_ok_and(|s| s.code() == Some(255))
+                        && errors.contains("mux_client_request_session: session request failed:")
+                    {
+                        let error =
+                            super::ssh_auth::RetryableSetupError(format!("{error:#}")).into();
+                        if operation == "--return-ssh-setup" {
+                            anyhow::Error::context(error, "SSH session refused; destination sshd MaxSessions >= 2 is required beside the copy control session")
+                        } else {
+                            error
+                        }
+                    } else {
+                        error
+                    };
+                    return Err(error)
+                        .with_context(|| format!("approved account helper failed: {errors}"));
                 }
             }
         }
-        unreachable!()
     }
 
     pub(super) fn spawn_streaming_command(mut command: Command) -> Result<Self> {
@@ -535,9 +563,17 @@ impl ForwardChild {
             if info.si_signo != 0 {
                 return Ok(self.close()?);
             }
-            if cancelled() || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if cancelled() {
                 let _ = self.close();
-                bail!("return helper stopped while waiting for its exit status");
+                bail!("return helper cancelled while waiting for its exit status");
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                let _ = self.close();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "return helper deadline expired while waiting for its exit status",
+                )
+                .into());
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -692,10 +728,10 @@ fn relay_inner(
     result
 }
 
-pub(super) struct DeadlineIo<'a, T> {
-    pub(super) inner: &'a mut T,
-    pub(super) deadline: Instant,
-    pub(super) cancelled: Option<&'a dyn Fn() -> bool>,
+pub(crate) struct DeadlineIo<'a, T> {
+    pub(crate) inner: &'a mut T,
+    pub(crate) deadline: Instant,
+    pub(crate) cancelled: Option<&'a dyn Fn() -> bool>,
 }
 impl<T: Read + AsRawFd> Read for DeadlineIo<'_, T> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -781,7 +817,7 @@ fn resolve_ssh_destination(home: &Path, path: &[u8]) -> Result<(PathBuf, PathBuf
     resolve_destination(home, None, path)
 }
 
-fn receive(metadata_control: bool) -> Result<i32> {
+fn receive() -> Result<i32> {
     crate::fsops::reserve_startup_descriptors();
     let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
     if fd < 0 {
@@ -815,9 +851,7 @@ fn receive(metadata_control: bool) -> Result<i32> {
             return Err(error);
         }
     };
-    let _lifetime = metadata_control
-        .then(|| crate::server::ControlLifetime::watch(&input, authority.clone()))
-        .transpose()?;
+    let _lifetime = crate::server::ControlLifetime::watch(&input, authority.clone())?;
     let workers = ssh::Server::start(authority.clone())?;
     let mut approved = approved;
     approved.token = workers.ticket()?;
@@ -831,8 +865,8 @@ fn receive(metadata_control: bool) -> Result<i32> {
             START_TIMEOUT,
             Duration::from_secs(10),
         ),
+        std::io::stdout().lock(),
         pending,
-        metadata_control,
     );
     authority.close_control();
     drop(workers);
@@ -933,8 +967,7 @@ fn read_source_hostname(
 
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
     match argv.get(1).and_then(|v| v.to_str())? {
-        "--return-receiver" if argv.len() == 2 => Some(receive(false)),
-        "--peer-receiver" if argv.len() == 2 => Some(receive(true)),
+        "--return-receiver" | "--peer-receiver" if argv.len() == 2 => Some(receive()),
         "--return-ssh-setup" if argv.len() == 2 => Some(ssh::setup()),
         "--return-ssh-worker" if argv.len() == 3 => Some(
             argv[2]
@@ -1076,6 +1109,47 @@ mod tests {
     }
 
     #[test]
+    fn approved_setup_session_hint_only_follows_an_actual_session_refusal() {
+        for (message, operation, hint) in [
+            (
+                "mux_client_request_session: session request failed: Session open refused by peer",
+                "--return-ssh-setup",
+                true,
+            ),
+            (
+                "Permission denied (publickey).",
+                "--return-ssh-setup",
+                false,
+            ),
+            (
+                "mux_client_request_session: session request failed: Session open refused by peer",
+                "--peer-receiver",
+                false,
+            ),
+        ] {
+            let mut spec = crate::conn::RemoteSpec::local_receiver(false);
+            spec.local_process = false;
+            spec.rsh = vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf '%s' '{}' >&2; exit 255", message),
+            ];
+            let error = ForwardChild::over_spec(
+                &spec,
+                operation,
+                &"setup",
+                Instant::now() + Duration::from_secs(3),
+                &|| false,
+            )
+            .err()
+            .unwrap();
+            let detail = format!("{error:#}");
+            assert!(detail.contains(message), "{detail}");
+            assert_eq!(detail.contains("MaxSessions >= 2"), hint, "{detail}");
+        }
+    }
+
+    #[test]
     fn helper_exit_status_and_stderr_survive_group_cleanup() {
         let mut command = Command::new("sh");
         // A descendant keeps stderr open after the launcher has exited.
@@ -1143,7 +1217,7 @@ mod tests {
         let mut result = Vec::new();
         client.read_to_end(&mut result).unwrap();
         assert_eq!(result, b"done");
-        client.shutdown(std::net::Shutdown::Both).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
         let released = thread.join().unwrap().unwrap();
         assert!(released);
         // The independently owned coordinator may still flush its final stdout.
@@ -1175,7 +1249,11 @@ mod tests {
         let started = Instant::now();
         let thread =
             std::thread::spawn(move || relay_peer(server, input, output, || false, &mut peer));
-        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        // read_exact retries EINTR from signal tests sharing this process.
+        assert_eq!(
+            client.read_exact(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
         // Keep B's read/upload side alive even though C disappeared.
         assert!(!thread.join().unwrap().unwrap());
         assert!(started.elapsed() < Duration::from_secs(4));

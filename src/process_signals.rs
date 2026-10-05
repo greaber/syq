@@ -59,10 +59,22 @@ static INTERRUPT: State = State::new(libc::SIGINT);
 static TERMINATE: State = State::new(libc::SIGTERM);
 static HANGUP: State = State::new(libc::SIGHUP);
 
-/// An inherited ignored hangup applies to the operation and its exec children.
-/// Callers must omit HUP listeners in this case, including wakeup-only handlers.
-pub(crate) fn inherited_hangup_is_ignored() -> io::Result<bool> {
-    HANGUP.install()
+/// An inherited ignored signal applies to the operation and its exec children.
+/// Callers must omit all listeners for it, including wakeup-only handlers.
+pub(crate) fn inherited_is_ignored(signal: i32) -> io::Result<bool> {
+    state(signal)?.install()
+}
+
+fn state(signal: i32) -> io::Result<&'static State> {
+    match signal {
+        libc::SIGINT => Ok(&INTERRUPT),
+        libc::SIGTERM => Ok(&TERMINATE),
+        libc::SIGHUP => Ok(&HANGUP),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported termination signal",
+        )),
+    }
 }
 
 pub(crate) struct Owned<T> {
@@ -100,17 +112,7 @@ pub(crate) fn owned<T>(
 ) -> io::Result<Owned<T>> {
     let mut states = Vec::new();
     for signal in signals {
-        let state = match *signal {
-            libc::SIGINT => &INTERRUPT,
-            libc::SIGTERM => &TERMINATE,
-            libc::SIGHUP => &HANGUP,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unsupported termination signal",
-                ))
-            }
-        };
+        let state = state(*signal)?;
         if !states.iter().any(|old: &&State| old.signal == state.signal) {
             state.install()?;
             states.push(state);
@@ -213,7 +215,7 @@ mod tests {
                 let flag = Arc::new(AtomicBool::new(false));
                 let owner = owned(&[libc::SIGHUP], || {
                     let mut registrations = Registrations::default();
-                    if !inherited_hangup_is_ignored()? {
+                    if !inherited_is_ignored(libc::SIGHUP)? {
                         registrations
                             .push(signal_hook::flag::register(libc::SIGHUP, flag.clone())?);
                     }

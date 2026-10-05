@@ -418,7 +418,7 @@ pub(super) fn broker(
         move |stream, _| {
             let mut writer = stream.try_clone().unwrap();
             if let Err(error) = handler.handle(stream) {
-                let _ = write_message(&mut writer, &Reply::Error(format!("{error:#}")));
+                let _ = ssh_auth::reply_error(&mut writer, &error);
             }
         },
     )

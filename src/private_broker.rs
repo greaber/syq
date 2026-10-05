@@ -277,9 +277,11 @@ fn accept_connections<F>(
 {
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     while !shutdown.load(Ordering::Acquire) {
-        reap_workers(&mut workers);
         match listener.accept() {
             Ok((stream, _)) => {
+                // A handler may finish while accept waits. Reap at admission,
+                // so its stale handle cannot consume a connection slot.
+                reap_workers(&mut workers);
                 // BSD-derived kernels (macOS) hand accepted sockets the
                 // listener's non-blocking flag; Linux does not. Workers read
                 // with timeouts and need a blocking socket either way.
@@ -323,6 +325,7 @@ fn accept_connections<F>(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                reap_workers(&mut workers);
                 // Wake as soon as a client or the shutdown connection arrives;
                 // a sleep here delayed every descriptor claim and every close.
                 crate::sys::wait_readable(listener.as_raw_fd(), Duration::from_millis(5));

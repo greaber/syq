@@ -246,17 +246,17 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
     result
 }
 
-/// A laptop-authenticated, one-copy helper with direct encrypted TCP workers.
-pub(crate) fn run_forwarded<R: Read + Send + 'static>(
+/// A relayed one-copy control. File payload uses direct TCP or SSH workers.
+pub(crate) fn run_forwarded<R: Read + Send + 'static, W: Write>(
     authority: Arc<crate::restricted::RestrictedAuthority>,
     input: R,
+    output: W,
     pending: Arc<std::sync::atomic::AtomicBool>,
-    metadata_control: bool,
 ) -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
         input,
-        io::stdout().lock(),
+        output,
         true,
         None,
         None,
@@ -265,7 +265,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static>(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
-            metadata_control,
+            metadata_control: true,
             loopback_only: false,
             named_socket: None,
             authority: Some(authority.clone()),
