@@ -6748,3 +6748,30 @@ fn native_copy_reports_original_writer_close_error() {
     assert_eq!(fs::read(&target).unwrap(), b"previous good copy");
     assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
 }
+
+#[test]
+fn creations_wait_for_their_parents_created_in_the_same_request() {
+    let mkdir = |path: &[u8]| Op::Mkdir {
+        path: path.to_vec(),
+        mode: 0o700,
+        condition: TargetCondition::Any,
+    };
+    let ops = [
+        mkdir(b"a/b/c"),
+        mkdir(b"a"),
+        Op::Symlink {
+            path: b"a/b/link".to_vec(),
+            target: b"target".to_vec(),
+            condition: TargetCondition::Any,
+        },
+        mkdir(b"x/y"),
+        mkdir(b"a/b"),
+    ];
+    let all: Vec<usize> = (0..ops.len()).collect();
+    assert_eq!(
+        creation_waves(&ops, &all),
+        vec![vec![1, 3], vec![4], vec![0, 2]]
+    );
+    // Without a parent in the request, everything stays in one wave.
+    assert_eq!(creation_waves(&ops, &[0, 2, 3]), vec![vec![0, 2, 3]]);
+}

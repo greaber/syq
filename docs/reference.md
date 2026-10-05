@@ -318,11 +318,13 @@ untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts
 follows the selected transfer strategy.
 
-A copy may temporarily make a newly created directory writable while filling it.
-After interruption, syq cannot distinguish that directory from a pre-existing
-writable directory. A retry treats it as an existing container, so its permissions
-and modification time may differ from an uninterrupted copy. Explicit
-`--copy-metadata=permissions,mtime` makes those attributes match the source.
+A copy may temporarily make a newly created directory writable while filling it,
+or keep it open only to its owner until its copied permissions, group, or ACLs
+are applied. After interruption, syq cannot distinguish that directory from a
+pre-existing directory. A retry treats it as an existing container, so its
+permissions and modification time may differ from an uninterrupted copy.
+Explicit `--copy-metadata=permissions,mtime` makes those attributes match the
+source.
 
 Partial files may remain after a successful retry. To remove them:
 
@@ -405,6 +407,14 @@ To preserve source permissions and ownership as well:
 ```sh
 syq cp --copy-metadata=permissions,ownership project --into backup
 ```
+
+A directory receives its copied permissions, group, and ACLs after its
+contents. Until then, syq lets nobody into it whom the finished directory would
+keep out. A new directory starts with the source's permissions, or open only to
+its owner while a group or ACL is still to be copied. With
+`--copy-metadata=permissions`, an existing directory that allows more than its
+source is restricted to the source's permissions before syq fills it; its owner
+keeps access until the copy finishes.
 
 | Syq option | Corresponding rsync option |
 |---|---|
