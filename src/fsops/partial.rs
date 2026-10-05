@@ -1508,7 +1508,7 @@ impl FsOps {
     }
 
     /// Return only the blocks of each source whose comparison hashes differ
-    /// from what the destination holds. Each source is read once, a chunk of
+    /// from what the destination holds. Each source is compared a chunk of
     /// whole blocks at a time, so no more of it is held than one chunk and
     /// its differing blocks.
     fn read_differing_batch(&mut self, block: u64, reads: &[DifferingRead]) -> Result<Response> {
@@ -1535,7 +1535,10 @@ impl FsOps {
     /// at a time. A comparison that only decides whether the file is
     /// unchanged stops at its first differing block; any other stops once
     /// its differing blocks pass `MAX_DIFFERING_FILE_BYTES`, and returns no
-    /// data, as the file is then sent in ranges per file.
+    /// data, as the file is then sent in ranges per file. A file read in
+    /// one chunk sends its differing blocks as read; a longer one reads them
+    /// again once compared, into a buffer of exactly their size, rather than
+    /// keeping blocks that might all be discarded.
     fn read_differing(
         &mut self,
         read: &DifferingRead,
@@ -1545,16 +1548,18 @@ impl FsOps {
         let len = u64::from(read.len);
         let algorithm = self.hash_policy.algorithm;
         let mut matching = Vec::with_capacity(len.div_ceil(block) as usize);
-        let mut data = Vec::new();
         if len == 0 {
             // Metadata is enough for an empty file, even with mode 000.
             self.source_content_target(read.source.as_ref())?;
         }
         let mut buffer = vec![0; chunk.min(len) as usize];
         // Prepare the next chunks while this one is compared.
-        if len > chunk {
+        let chunks = len > chunk;
+        if chunks {
             self.begin_source_range(0..len);
         }
+        // The bytes of the blocks that differ.
+        let mut differing = 0;
         let compared = (|| -> Result<()> {
             let mut off = 0;
             while off < len {
@@ -1573,49 +1578,63 @@ impl FsOps {
                         read.expected.get(first + index) == Some(&algorithm.hash(piece))
                     },
                 ));
-                let same = &matching[first..];
-                let Some(differs) = same.iter().position(|same| !same) else {
-                    off += read_len as u64;
-                    continue;
-                };
-                if read.compare_only {
-                    matching.truncate(first + differs + 1);
+                for (piece, same) in contents.chunks(block as usize).zip(&matching[first..]) {
+                    if !same {
+                        differing += piece.len() as u64;
+                    }
+                }
+                if read.compare_only && differing > 0 {
+                    let first_differing = matching[first..].iter().position(|same| !same);
+                    matching.truncate(first + first_differing.expect("a block differs") + 1);
                     return Ok(());
                 }
-                if read_len as u64 == len
-                    && len <= MAX_DIFFERING_FILE_BYTES
-                    && !same.contains(&true)
-                {
-                    // Every block of a file read in one chunk differs: send
-                    // it as read.
-                    data = std::mem::take(&mut buffer);
+                if differing > MAX_DIFFERING_FILE_BYTES {
                     return Ok(());
-                }
-                if data.capacity() == 0 {
-                    // Reserve the most the file can still carry, so that the
-                    // data never moves as it grows.
-                    let rest = len - off - (differs as u64) * block;
-                    data.reserve_exact(rest.min(MAX_DIFFERING_FILE_BYTES) as usize);
-                }
-                for (piece, same) in contents.chunks(block as usize).zip(same) {
-                    if *same {
-                        continue;
-                    }
-                    if (data.len() + piece.len()) as u64 > MAX_DIFFERING_FILE_BYTES {
-                        data = Vec::new();
-                        return Ok(());
-                    }
-                    data.extend_from_slice(piece);
                 }
                 off += read_len as u64;
             }
             Ok(())
         })();
-        if len > chunk {
+        if chunks {
             self.end_source_range();
         }
         compared?;
-        data.shrink_to_fit();
+        let data = if read.compare_only || differing == 0 || differing > MAX_DIFFERING_FILE_BYTES {
+            Vec::new()
+        } else if !chunks && differing == len {
+            // Every block of a file read in one chunk differs: send it as
+            // read.
+            buffer
+        } else {
+            let mut data = Vec::with_capacity(differing as usize);
+            let block = block as usize;
+            let mut index = 0;
+            while index < matching.len() {
+                if matching[index] {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < matching.len() && !matching[index] {
+                    index += 1;
+                }
+                let range = start * block..(index * block).min(len as usize);
+                if chunks {
+                    let at = data.len();
+                    data.resize(at + range.len(), 0);
+                    self.read_source_into(
+                        &read.path,
+                        read.source.as_ref(),
+                        read.attempt,
+                        range.start as u64,
+                        &mut data[at..],
+                    )?;
+                } else {
+                    data.extend_from_slice(&buffer[range]);
+                }
+            }
+            data
+        };
         // Only the differing blocks are sent, so only they take a payload
         // hash, and only when transfers are checked.
         let hash = if self.hash_policy.transfer_integrity {
