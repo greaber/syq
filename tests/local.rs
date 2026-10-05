@@ -891,6 +891,17 @@ fn persistence_command(t: &Tmp, args: &[&str]) -> Command {
     command
 }
 
+/// Turns persistence off for a fixture when dropped, even if the test fails.
+/// `Tmp` only removes files: a receiving authorization provider started by
+/// `persist receive on` keeps running after its runtime directory is gone.
+struct PersistenceOff<'a>(&'a Tmp);
+
+impl Drop for PersistenceOff<'_> {
+    fn drop(&mut self) {
+        let _ = persistence_command(self.0, &["off"]).run();
+    }
+}
+
 fn completion_command(t: &Tmp, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
     command
