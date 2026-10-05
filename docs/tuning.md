@@ -223,13 +223,13 @@ With block reuse enabled, a replaced file of up to 64 MiB is compared before
 any of its contents are sent, together with other files. (The default
 strategy compares only files whose destination has the same size.) The receiving side
 hashes the file it would replace in 64 KiB blocks, the sending side reads the
-source once and sends only the blocks that differ, and the receiving side
+source and sends only the blocks that differ, and the receiving side
 builds the new file from those and its own matching blocks, which must be
 unchanged since they were hashed. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
-however many files it holds. The sending side holds about 16 MiB of changed
-data per worker at most: a file of which more than 16 MiB differs is compared
-again on its own, as larger files are, and only its differing blocks are sent.
+however many files it holds. A file of which more than 16 MiB differs is
+compared again on its own, as larger files are, and only its differing blocks
+are sent.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file
