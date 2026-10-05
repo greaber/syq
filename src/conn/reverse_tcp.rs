@@ -77,6 +77,7 @@ impl RemoteSpec {
                 Some(Cipher::new(&key, 0, 2)),
             )),
             replies,
+            reply_bytes(&role),
             observation.clone(),
         )?;
         let conn = RemoteConn {

@@ -247,7 +247,7 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
         detached: false,
     };
     let (keep_open, empty) = std::sync::mpsc::channel();
-    let queued = conn.rx.replace(empty);
+    let queued = conn.rx.replace(empty.into());
     assert!(
         conn.try_recv_with_arrival().is_none(),
         "empty reader must not block"
@@ -293,9 +293,13 @@ fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
         drop(writer);
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, thread, _) =
-            spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone())
-                .unwrap();
+        let (rx, thread, _) = spawn_observed_reader(
+            Box::new(std::io::Cursor::new(wire)),
+            1,
+            None,
+            observation.clone(),
+        )
+        .unwrap();
         assert!(matches!(
             rx.recv().unwrap().unwrap().value,
             Response::HelloOk { .. }
@@ -776,7 +780,7 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
         child: None,
         approved_login: None,
         w: FrameWriter::new(Box::new(CountWrites(writes.clone())), false),
-        rx: Some(rx),
+        rx: Some(rx.into()),
         replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
         reader: None,
         label: "inactive stream test".into(),
@@ -1309,11 +1313,150 @@ fn tuning_pipeline_drains_responses_while_sending_large_requests() {
 }
 
 #[test]
+fn a_full_reply_byte_limit_still_drains_replies_while_requests_are_sent() {
+    use socket2::SockRef;
+    // A sequential source answers each 512 KiB request with 2 MiB of file
+    // data, over TCP with buffers far smaller than either. The coordinator
+    // sends 16 requests before taking any reply. Its reader stops at 4 MiB
+    // of queued replies, which leaves the source blocked writing the third,
+    // no longer reading requests; the sends finish only because the reader
+    // reads on while a request is being sent.
+    const REQUESTS: usize = 16;
+    let timeout = std::time::Duration::from_secs(10);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let small = |socket: &TcpStream| {
+        socket.set_nodelay(true).unwrap();
+        let socket = SockRef::from(socket);
+        socket.set_send_buffer_size(64 << 10).unwrap();
+        socket.set_recv_buffer_size(64 << 10).unwrap();
+    };
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        small(&socket);
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        socket.set_write_timeout(Some(timeout)).unwrap();
+        let mut requests = FrameReader::new(socket.try_clone().unwrap());
+        let mut responses = FrameWriter::new(socket, false);
+        responses.write_msg(&hello_ok()).unwrap();
+        for _ in 0..REQUESTS {
+            let Request::ReadRange { off, len, .. } = requests.read_msg().unwrap() else {
+                panic!("expected a range request");
+            };
+            responses
+                .write_msg(&Response::Block {
+                    off,
+                    hash: [0; 32],
+                    data: vec![7; len as usize],
+                })
+                .unwrap();
+        }
+    });
+    let socket = TcpStream::connect(address).unwrap();
+    small(&socket);
+    socket.set_read_timeout(Some(timeout)).unwrap();
+    socket.set_write_timeout(Some(timeout)).unwrap();
+    let (rx, reader, _) = spawn_observed_reader(
+        Box::new(socket.try_clone().unwrap()),
+        REQUESTS,
+        Some(4 << 20),
+        Default::default(),
+    )
+    .unwrap();
+    let mut conn = RemoteConn {
+        batch_receipts: Default::default(),
+        deferred: Default::default(),
+        transport_stop: None,
+        observation: Default::default(),
+        child: None,
+        approved_login: None,
+        w: FrameWriter::new(Box::new(socket), false),
+        rx: Some(rx),
+        replies: REQUESTS,
+        reader: Some(reader),
+        label: "reply byte limit test".into(),
+        dead: false,
+        rpc_observation: None,
+        write_stream: None,
+        peer: None,
+        tcp_socket: None,
+        named_socket: None,
+        multiplexed_ssh: false,
+        detached: false,
+    };
+    assert!(matches!(conn.recv().unwrap(), Response::HelloOk { .. }));
+    for i in 0..REQUESTS {
+        conn.send(Request::ReadRange {
+            path: vec![b'x'; 512 << 10],
+            source: None,
+            attempt: 0,
+            off: i as u64,
+            len: 2 << 20,
+        })
+        .unwrap();
+    }
+    for i in 0..REQUESTS {
+        assert!(
+            matches!(conn.recv().unwrap(), Response::Block { off, data, .. }
+            if off == i as u64 && data.len() == 2 << 20)
+        );
+    }
+    server.join().unwrap();
+    conn.dead = true;
+}
+
+#[test]
+fn a_reply_byte_limit_stops_the_reader_until_replies_are_taken() {
+    // Without requests being sent, the reader stops once the queued replies
+    // carry the limit, and reads on as they are taken.
+    let mut wire = Vec::new();
+    {
+        let mut writer = FrameWriter::new(&mut wire, false);
+        writer.write_msg(&hello_ok()).unwrap();
+        for off in 0..8 {
+            writer
+                .write_msg(&Response::Block {
+                    off,
+                    hash: [0; 32],
+                    data: vec![1; 1 << 20],
+                })
+                .unwrap();
+        }
+    }
+    let (rx, reader, _) = spawn_observed_reader(
+        Box::new(std::io::Cursor::new(wire)),
+        16,
+        Some(2 << 20),
+        Default::default(),
+    )
+    .unwrap();
+    let timeout = std::time::Duration::from_secs(10);
+    let take = |rx: &Replies| rx.recv_timeout(timeout).unwrap().unwrap().value;
+    assert!(matches!(take(&rx), Response::HelloOk { .. }));
+    // Two replies reach the limit; the reader waits before a third.
+    let deadline = std::time::Instant::now() + timeout;
+    while rx.queued_bytes() < 2 << 20 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reader stalled early"
+        );
+        std::thread::yield_now();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(rx.queued_bytes(), 2 << 20);
+    for off in 0..8 {
+        assert!(matches!(take(&rx), Response::Block { off: got, .. } if got == off));
+    }
+    drop(rx);
+    reader.join().unwrap();
+}
+
+#[test]
 fn transport_stats_response_wait_has_a_deadline() {
     let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
     let timeout = std::time::Duration::from_millis(20);
     let start = std::time::Instant::now();
-    assert!(receive_transport_stats(&receiver, timeout).is_none());
+    assert!(receive_transport_stats(&receiver.into(), timeout).is_none());
     assert!(start.elapsed() >= timeout);
     assert!(start.elapsed() < std::time::Duration::from_secs(1));
 }
@@ -2480,7 +2623,7 @@ fn transport_paced_receive_stops_when_scheduler_aborts() {
     // Leave the channel open without completing a frame: a throttled source
     // may take minutes to finish one. Abort must not wait for that frame.
     let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
-    connection.rx = Some(receiver);
+    connection.rx = Some(receiver.into());
     let scheduler = std::sync::Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
     connection.transport_stop = Some(std::sync::Arc::downgrade(&scheduler));
     let receiving = std::thread::spawn(move || connection.recv());
@@ -2621,9 +2764,13 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
     peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
-    let (rx, reader, batch_receipts) =
-        spawn_observed_reader(Box::new(client.try_clone().unwrap()), 4, Default::default())
-            .unwrap();
+    let (rx, reader, batch_receipts) = spawn_observed_reader(
+        Box::new(client.try_clone().unwrap()),
+        4,
+        None,
+        Default::default(),
+    )
+    .unwrap();
     let mut replies = FrameWriter::new(peer.try_clone().unwrap(), false);
     replies.write_msg(&hello_ok()).unwrap();
     let mut requests = FrameReader::new(peer);
