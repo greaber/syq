@@ -2736,26 +2736,18 @@ impl FsOps {
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
         {
+            let selected =
+                apply::selected_removals(ops, guard, destination_root, destination_prefix);
             return self
                 .deletions
                 .get_or_insert_with(Default::default)
-                .run_init(
-                    ops,
-                    crate::deletion::DirectoryBatch::default,
-                    |deletion, op| {
-                        apply::apply_one_with_deletions(
-                            op,
-                            guard,
-                            destination_root.clone(),
-                            destination_prefix,
-                            Some(deletion),
-                        )
-                        .err()
-                        .as_ref()
-                        .map(wire_error)
-                    },
-                    Option::is_none,
-                )
+                .run(selected)
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .map(|result| result.err().as_ref().map(wire_error))
+                        .collect()
+                })
                 .unwrap_or_else(|error| {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });

@@ -234,7 +234,9 @@ syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
 This makes the contents of `deploy` match `build`: it copies changes, then
 removes extras. Preview with `--dry-run -v` first. If more than 100 removals
 are planned, syq refuses all deletions. Scan or copy errors also prevent deletion.
-Ignored paths are kept.
+Ignored paths are kept. Use `--prune-before` instead of `--prune` to free space
+before copying. Source selection must finish first; a later copy failure does
+not restore removed extras. The same `--max-delete` limit applies.
 
 Placement determines where pruning happens. Compare:
 

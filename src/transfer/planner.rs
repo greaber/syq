@@ -1448,7 +1448,11 @@ impl Planner<'_> {
     /// applied. Contested claims (two sources naming one regular file) are
     /// fine only when one of them *is* the destination file; settle those
     /// with one stat pass, then apply everything if there was no conflict.
-    pub(super) fn replay_buffered(&mut self, before_apply: impl FnOnce()) -> Result<()> {
+    pub(super) fn replay_buffered(
+        &mut self,
+        before_mutations: impl FnOnce(&mut Self) -> Result<()>,
+        before_apply: impl FnOnce(),
+    ) -> Result<()> {
         let Some(mut buffered) = self.buffer.take() else {
             return Ok(());
         };
@@ -1505,6 +1509,7 @@ impl Planner<'_> {
             self.retire_planning_state();
             return Ok(());
         }
+        before_mutations(self)?;
         if let Some((root, condition, is_destination_root)) = self.create_root.take() {
             if self.use_operator_anchor {
                 let selection =
@@ -3454,6 +3459,51 @@ impl Planner<'_> {
         }
     }
 
+    /// Timing belongs to the copy planner. Both modes require a complete,
+    /// valid selection; only the default can also wait for successful copies.
+    pub(super) fn prune(
+        &mut self,
+        overlap_unsearchable: bool,
+        before: bool,
+    ) -> Result<(u64, DeletePlan)> {
+        let reason = if self.scan_warned {
+            Some("source scan errors")
+        } else if overlap_unsearchable {
+            Some("source ancestry could not be checked")
+        } else if self.progress.errors.load(Relaxed) != 0 {
+            Some("copy or scan errors")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.progress
+                .eprintln(&format!("syq: {reason}; skipping deletions"));
+            return Ok((0, DeletePlan::Skipped(reason)));
+        }
+        if before && self.destination_root_known_missing {
+            return Ok((0, DeletePlan::Planned(0)));
+        }
+        match self
+            .assert_mutation_root()
+            .and_then(|_| self.plan_deletes())
+        {
+            Ok(()) if self.delete_walk_failed => {
+                self.progress
+                    .eprintln("syq: destination walk reported errors; skipping deletions");
+                Ok((0, DeletePlan::Skipped("destination walk errors")))
+            }
+            Ok(()) => {
+                let planned = DeletePlan::Planned(self.deletes.len());
+                self.assert_mutation_root()?;
+                Ok((self.run_deletes()?, planned))
+            }
+            Err(error) => {
+                self.progress.error(&format!("syq: delete: {error:#}"));
+                Ok((0, DeletePlan::Skipped("destination planning failed")))
+            }
+        }
+    }
+
     pub(super) fn run_deletes(&mut self) -> Result<u64> {
         let opts = self.opts;
         let leaves = std::mem::take(&mut self.deletes.leaves);
@@ -3565,9 +3615,13 @@ impl Planner<'_> {
             }
             Ok(())
         };
-        run(self, &leaves, false)?;
-        for (_, items) in dirs.iter().rev() {
-            run(self, items, true)?;
+        run(
+            self,
+            &crate::deletion::spread(leaves, |item| &item.0),
+            false,
+        )?;
+        for (_, items) in dirs.into_iter().rev() {
+            run(self, &crate::deletion::spread(items, |item| &item.0), true)?;
         }
         Ok(n)
     }

@@ -20,16 +20,6 @@ pub(super) fn apply_one(
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Result<()> {
-    apply_one_with_deletions(op, guard, destination_root, destination_prefix, None)
-}
-
-pub(super) fn apply_one_with_deletions(
-    op: &Op,
-    guard: Option<&ContainerGuard>,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    deletion: Option<&mut crate::deletion::DirectoryBatch>,
-) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
         let relative = RelativePath::new(path)?;
@@ -81,14 +71,61 @@ pub(super) fn apply_one_with_deletions(
                 dev: *dev,
                 ino: *ino,
             };
-            return apply_one_rooted_with_deletions(&operation, &target.as_rooted(), deletion);
+            return apply_one_rooted(&operation, &target.as_rooted());
         }
-        return apply_one_rooted_with_deletions(op, &target.as_rooted(), deletion);
+        return apply_one_rooted(op, &target.as_rooted());
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted_with_deletions(op, &target, deletion)
+    apply_one_rooted(op, &target)
+}
+
+/// Resolve one authorized request's root, then keep the caller's explicit
+/// names. No Selected operation permits traversal or recursive discovery.
+pub(super) fn selected_removals(
+    ops: &[Op],
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Vec<Result<crate::deletion::Selected>> {
+    let root = if let Some(guard) = guard {
+        ops.first()
+            .map(|op| guarded_target(op_path(op), guard).map(|target| target.root))
+            .unwrap_or_else(|| Err(anyhow::anyhow!("empty deletion request")))
+    } else {
+        destination_root.context(UNROOTED_MUTATION)
+    };
+    ops.iter()
+        .map(|op| {
+            let root = root
+                .as_ref()
+                .map_err(|error| anyhow::Error::new(wire_error(error)))?
+                .clone();
+            let path = op_path(op);
+            let label = if guard.is_some() {
+                resolve(path)
+            } else {
+                PathBuf::from(OsStr::from_bytes(
+                    &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+                ))
+            };
+            #[cfg(debug_assertions)]
+            fail_apply_capacity_for_test(&label)?;
+            let relative = if let Some(guard) = guard {
+                relative_under(&resolve(&guard.root), &resolve(path))?
+            } else {
+                RelativePath::new(path)?
+            };
+            Ok(crate::deletion::Selected {
+                root,
+                path: relative,
+                label,
+                directory: matches!(op, Op::Rmdir { .. }),
+                size: None,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn error_is_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool {
@@ -310,11 +347,7 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted_with_deletions(
-    op: &Op,
-    target: &RootedTarget,
-    deletion: Option<&mut crate::deletion::DirectoryBatch>,
-) -> Result<()> {
+fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
@@ -477,25 +510,13 @@ fn apply_one_rooted_with_deletions(
                 *condition,
             )
         }
-        Op::Rmdir { .. } => match root.metadata_optional(path)? {
-            None => Ok(()),
-            Some(_) => root.remove_directory(path),
-        },
-        Op::Unlink { .. } => match root.metadata_optional(path)? {
-            None => Ok(()),
-            Some(metadata) if metadata.is_dir() => {
-                bail!(
-                    "{}: is now a directory; not deleting it",
-                    target.label.display()
-                )
-            }
-            Some(metadata) => {
-                if let Some(deletion) = deletion {
-                    deletion.before_unlink(root, path, metadata.len)?;
-                }
-                root.unlink(path)
-            }
-        },
+        Op::Rmdir { .. } | Op::Unlink { .. } => crate::deletion::DirectoryBatch::default().remove(
+            root,
+            path,
+            &target.label,
+            matches!(op, Op::Rmdir { .. }),
+            None,
+        ),
         Op::Remove { .. } => bail!("recursive remove cannot use a confined destination root"),
     }
 }

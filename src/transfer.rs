@@ -3130,7 +3130,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             hardlink_inodes: Default::default(),
         })
     });
-    let defer_destination_mutations = args.hardlinks || multiple_distinct_sources;
+    let defer_destination_mutations =
+        args.hardlinks || multiple_distinct_sources || args.prune_before;
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -3866,6 +3867,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             Err(error) => scan_err = Some(error),
         }
     }
+    let mut deleted = 0u64;
+    let mut delete_plan = if opts.delete {
+        DeletePlan::Skipped("the copy plan did not complete")
+    } else {
+        DeletePlan::Disabled
+    };
     if scan_err.is_none() && !st.collision {
         // Multiple sources still settle final-path conflicts before writing.
         // Once settled, overlap replay with copying just as for a single scan.
@@ -3894,17 +3901,25 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             None
         };
-        if let Err(error) = st.replay_buffered(|| {
-            // Replay has created a deferred root by now. Without one (for
-            // example --existing against a missing destination) there is
-            // nothing for workers to anchor to and nothing for them to do.
-            let anchored = !destination_anchor_required || destination_anchor.get().is_some();
-            if let (Some(initial), true) = (local_start, anchored) {
-                spawn_workers(initial, refine_start);
-                workers_started.set(true);
-                sched.release_preflighted_work();
-            }
-        }) {
+        if let Err(error) = st.replay_buffered(
+            |planner| {
+                if args.prune_before {
+                    (deleted, delete_plan) = planner.prune(prune_overlap_unsearchable, true)?;
+                }
+                Ok(())
+            },
+            || {
+                // Replay has created a deferred root by now. Without one (for
+                // example --existing against a missing destination) there is
+                // nothing for workers to anchor to and nothing for them to do.
+                let anchored = !destination_anchor_required || destination_anchor.get().is_some();
+                if let (Some(initial), true) = (local_start, anchored) {
+                    spawn_workers(initial, refine_start);
+                    workers_started.set(true);
+                    sched.release_preflighted_work();
+                }
+            },
+        ) {
             scan_err = Some(error);
         }
     }
@@ -4136,44 +4151,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     sched.clear_finished_work();
-    let mut deleted = 0u64;
-    let mut delete_plan = if opts.delete {
-        DeletePlan::Skipped("the copy plan did not complete")
-    } else {
-        DeletePlan::Disabled
-    };
-    // --delete runs once the workers are done, so the destination walk sees a
-    // quiescent tree (no partials being renamed, no entries being replaced),
-    // and before apply_deferred, since unlinking bumps directory mtimes. Any
-    // source-side scan problem disables deletion: a directory we couldn't
-    // read would otherwise look like one whose contents vanished.
-    if !aborted && opts.delete && scan_err.is_none() && !collision {
-        if st.scan_warned {
-            delete_plan = DeletePlan::Skipped("source scan errors");
-            progress.eprintln("syq: source scan reported errors; skipping deletions");
-        } else if prune_overlap_unsearchable {
-            delete_plan = DeletePlan::Skipped("source ancestry could not be checked");
-            progress.eprintln("syq: source ancestry could not be checked; skipping deletions");
-        } else if progress.errors.load(Relaxed) != 0 {
-            delete_plan = DeletePlan::Skipped("copy errors");
-            progress.eprintln("syq: copy reported errors; skipping deletions");
-        } else {
-            match st.assert_mutation_root().and_then(|_| st.plan_deletes()) {
-                Ok(()) if st.delete_walk_failed => {
-                    delete_plan = DeletePlan::Skipped("destination walk errors");
-                    progress.eprintln("syq: destination walk reported errors; skipping deletions")
-                }
-                Ok(()) => {
-                    delete_plan = DeletePlan::Planned(st.deletes.len());
-                    st.assert_mutation_root()?;
-                    deleted = st.run_deletes()?;
-                }
-                Err(e) => {
-                    delete_plan = DeletePlan::Skipped("destination planning failed");
-                    progress.error(&format!("syq: delete: {e:#}"));
-                }
-            }
-        }
+    if !args.prune_before && !aborted && opts.delete && scan_err.is_none() && !collision {
+        (deleted, delete_plan) = st.prune(prune_overlap_unsearchable, false)?;
     }
     if !aborted && !opts.dry_run {
         st.apply_deferred()?;

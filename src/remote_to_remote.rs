@@ -1026,7 +1026,9 @@ fn run_remote(
             remote.push("--follow-dst".into());
         }
     }
-    if args.delete {
+    if args.prune_before {
+        remote.push("--prune-before".into());
+    } else if args.delete {
         remote.push("--prune".into());
     }
     if args.inplace {

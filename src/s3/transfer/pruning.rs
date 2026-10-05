@@ -1,6 +1,8 @@
 use super::*;
 use crate::s3::prune::{self, Plan};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 
 struct Candidate {
     depth: usize,
@@ -64,38 +66,34 @@ impl Engine {
             tokio::task::spawn_blocking(move || {
                 let mut found = found;
                 found.sort_by_key(|c| std::cmp::Reverse(c.depth));
-                let mut deletion = crate::deletion::Batch::default();
+                let mut deletion =
+                    crate::deletion::Batch::with_cancellation(engine.cancelled.clone());
                 // Equal-depth entries are independent; finish children before
                 // admitting their parents and never remove a tree recursively.
                 for level in found.chunk_by(|a, b| a.depth == b.depth) {
-                    let mut remaining = level;
-                    while !remaining.is_empty() {
+                    let selected = crate::deletion::spread(level.iter().collect(), |candidate| {
+                        &candidate.path
+                    });
+                    for chunk in selected.chunks(1000) {
                         engine.check_cancelled()?;
-                        let (chunk, rest) =
-                            remaining.split_at(remaining.len().min(deletion.chunk_size()));
-                        remaining = rest;
-                        let results = deletion.run_init(
-                            chunk,
-                            crate::deletion::DirectoryBatch::default,
-                            |admission, candidate| {
-                                if engine.check_cancelled().is_err() {
-                                    return None;
-                                }
-                                Some(RelativePath::new(&candidate.path).and_then(|path| {
-                                    if candidate.kind == "dir" {
-                                        root.remove_directory(&path)
-                                    } else {
-                                        admission.before_unlink(&root, &path, candidate.size)?;
-                                        root.unlink(&path)
-                                    }
-                                }))
-                            },
-                            |result| matches!(result, Some(Ok(()))),
+                        let results = deletion.run(
+                            chunk
+                                .iter()
+                                .map(|candidate| {
+                                    Ok(crate::deletion::Selected {
+                                        root: root.clone(),
+                                        path: RelativePath::new(&candidate.path)?,
+                                        label: std::path::PathBuf::from(OsStr::from_bytes(
+                                            &candidate.path,
+                                        )),
+                                        directory: candidate.kind == "dir",
+                                        size: Some(candidate.size),
+                                    })
+                                })
+                                .collect(),
                         )?;
                         for (candidate, result) in chunk.iter().zip(results) {
-                            if let Some(result) = result {
-                                engine.deletion_finished(candidate, result, "io");
-                            }
+                            engine.deletion_finished(candidate, result, "io");
                         }
                         engine.check_cancelled()?;
                     }

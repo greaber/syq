@@ -1718,6 +1718,16 @@ impl Root {
         }
     }
 
+    /// A resolved removal parent is owned for a descendant directory, or
+    /// borrows this root for one of its direct children.
+    pub(crate) fn removal_entry<'a>(
+        &'a self,
+        parent: Option<&'a File>,
+        name: &'a CStr,
+    ) -> RemovalEntry<'a> {
+        RemovalEntry::new(parent.unwrap_or(&self.directory), name)
+    }
+
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
     /// followed. Directories are refused by the kernel.
     pub(crate) fn unlink(&self, path: &RelativePath) -> Result<()> {
@@ -1785,10 +1795,45 @@ pub(crate) struct ResolvedParent<'a> {
     leaf: CString,
 }
 
+/// One already-validated name beneath an opened directory. Removal callers
+/// choose their own identity and type checks; neither operation follows the
+/// final symlink, and unlink never expands into a recursive removal.
+pub(crate) struct RemovalEntry<'a> {
+    directory: &'a File,
+    name: &'a CStr,
+}
+
+impl<'a> RemovalEntry<'a> {
+    pub(crate) fn new(directory: &'a File, name: &'a CStr) -> Self {
+        Self { directory, name }
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
+        metadata_at(self.directory.as_raw_fd(), self.name)
+    }
+
+    pub(crate) fn unlink(&self, directory: bool) -> io::Result<()> {
+        unlink_at(
+            self.directory.as_raw_fd(),
+            self.name,
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    }
+}
+
 // An operation-local parent handle. Callers that check the final pathname must
 // still resolve it from Root; retaining this handle must not hide replacement
 // of an ancestor during a metadata update.
 impl ResolvedParent<'_> {
+    /// Transfer a descendant's parent into a deletion batch. None means a
+    /// direct child of the caller's retained Root, with no additional fd.
+    pub(crate) fn into_owned_directory(self) -> Option<File> {
+        match self.directory {
+            DirectoryHandle::Borrowed(_) => None,
+            DirectoryHandle::Owned(directory) => Some(directory),
+        }
+    }
+
     pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
         metadata_at(self.directory.as_raw_fd(), &self.leaf)
     }
@@ -2250,7 +2295,7 @@ pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
     Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
 }
 
-fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
+fn metadata_at(parent: RawFd, name: &CStr) -> io::Result<RootMetadata> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     retry_zero(|| unsafe {
         libc::fstatat(parent, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)

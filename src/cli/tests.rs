@@ -1287,3 +1287,23 @@ fn removal_tuning_accepts_only_the_matching_endpoint_control() {
         assert!(parse(&words).is_err(), "{words:?}");
     }
 }
+
+#[test]
+fn prune_before_enables_pruning_and_requires_placement() {
+    let argv = [
+        "--prune-before",
+        "--max-delete=3",
+        "source",
+        "--into",
+        "destination",
+    ]
+    .map(std::ffi::OsString::from);
+    let args = parse_native_copy(&argv).unwrap();
+    assert!(args.delete && args.prune_before);
+    assert_eq!(args.max_delete, Some(3));
+    let argv = ["--prune-before", "source", "--to", "host"].map(std::ffi::OsString::from);
+    assert!(parse_native_copy(&argv)
+        .unwrap_err()
+        .to_string()
+        .contains("explicit placement"));
+}

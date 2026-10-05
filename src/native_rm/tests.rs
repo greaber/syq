@@ -257,8 +257,10 @@ fn failed_attached_emit_cancels_pending_mutation() {
     });
 
     let mut heartbeat = Vec::new();
-    let error =
-        emit_attached(&pool, &mut heartbeat, &mut |_| bail!("client disconnected")).unwrap_err();
+    let error = crate::deletion::workers::emit(&pool, &mut heartbeat, &mut |_| {
+        bail!("client disconnected")
+    })
+    .unwrap_err();
     assert!(error.to_string().contains("client disconnected"));
     assert!(pool.is_cancelled());
 

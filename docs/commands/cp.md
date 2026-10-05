@@ -65,8 +65,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--if-exists <POLICY>` | How to handle existing destination files; directories remain containers<br><br>Possible values:<br>- error-if-different: Reject detected content differences; trusts matching size and mtime unless --hash is set<br>- error: Report an error for every existing destination leaf<br>- keep: Leave existing entries and their metadata alone<br>- update: Update contents when they differ and apply requested metadata<br>- update-if-older: Keep newer destinations; otherwise update differing contents<br><br>[default: update] |
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
+| `--prune-before` | Remove extras before copying to free space; implies pruning |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
-| `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
+| `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |
 
 ## Metadata and symlinks
 
@@ -192,6 +193,11 @@ restrictions are listed under [file descriptors](#file-descriptors).
 ## Pruning
 
 `--prune` deletes only within the copied directories, after copying succeeds.
+Use `--prune-before` instead when you need to free disk space first. It waits
+for source selection to finish, then removes extras before copying. A later
+copy failure does not restore those removals. Both modes honor `--max-delete`
+and skip deletions if scanning reports errors.
+
 Ignored paths, syq partial files, and recovery entries are
 kept. This also keeps their parent directories; extra hard links to copied
 files may be kept too. An interruption during deletion can leave some extras

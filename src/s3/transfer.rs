@@ -51,7 +51,7 @@ pub(super) struct Engine {
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
-    cancelled: std::sync::atomic::AtomicBool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_wake: tokio::sync::Notify,
     uploads: Arc<super::upload_http::Cancellation>,
     authorization: Option<Arc<super::authorization::Authorization>>,
@@ -212,7 +212,7 @@ impl Engine {
         let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Arc::new(Self {
             tuning: super::tuning::Tuning::new(&options, &args, control),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
             authorization,
@@ -274,7 +274,7 @@ impl Engine {
             let args = self.args.clone();
             let local::UploadPlan {
                 sources: plan,
-                prune,
+                mut prune,
                 ignored,
                 excluded,
             } = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
@@ -326,7 +326,11 @@ impl Engine {
                 .await?;
                 let authorized = async {
                     self.prepare_pruning(&prune).await?;
-                    self.finish_authorization().await
+                    self.finish_authorization().await?;
+                    if self.args.prune_before {
+                        self.prune(std::mem::take(&mut prune), None).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
                 }
                 .await;
                 let prepared = std::mem::take(&mut *prepared.lock().await);
@@ -362,6 +366,9 @@ impl Engine {
                 })
                 .await?;
             } else {
+                if self.args.prune_before {
+                    self.prune(std::mem::take(&mut prune), None).await?;
+                }
                 parallel(plan, workers, |source| {
                     let engine = self.clone();
                     async move {
@@ -378,12 +385,14 @@ impl Engine {
                 .await?;
             }
             self.progress.finish_transfer();
-            self.prune(prune, None).await?;
+            if !self.args.prune_before {
+                self.prune(prune, None).await?;
+            }
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let DownloadPlan {
                 jobs: mut plan,
-                prune,
+                mut prune,
                 service_times,
             } = self.download_plan(&destination.prefix).await?;
             self.authorize_downloads(&mut plan).await?;
@@ -394,6 +403,10 @@ impl Engine {
                 .bytes_total
                 .store(plan.iter().map(|s| s.size).sum(), Relaxed);
             self.progress.scan_done.store(true, Relaxed);
+            if self.args.prune_before {
+                self.prune(std::mem::take(&mut prune), Some(&destination))
+                    .await?;
+            }
             // Directory metadata is applied after descendants, so creating
             // children cannot change the restored times or require final modes.
             let directories = Arc::new(Mutex::new(Vec::new()));
@@ -422,7 +435,11 @@ impl Engine {
             self.progress.finish_transfer();
             // Prune while directories are writable, then restore their modes and times.
             // Apply metadata even when the deletion budget refuses pruning.
-            let pruned = self.prune(prune, Some(&destination)).await;
+            let pruned = if self.args.prune_before {
+                Ok(())
+            } else {
+                self.prune(prune, Some(&destination)).await
+            };
             self.finish_directories(&destination, &directories).await?;
             pruned?;
         }

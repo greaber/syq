@@ -662,6 +662,7 @@ def _copy_arguments(
     sparse: bool,
     inplace: bool,
     max_delete: int | None,
+    prune_before: bool = False,
     transfer_strategy: str | None = None,
     hash_or_copy: bool = False,
     integrity_checking: str | None = None,
@@ -734,8 +735,8 @@ def _copy_arguments(
                 "--as, --as-new, and --as-existing require exactly one "
                 "ordinary source object"
             )
-    if prune:
-        argv.append("--prune")
+    if prune or prune_before:
+        argv.append("--prune-before" if prune_before else "--prune")
     if dry_run:
         argv.append("--dry-run")
     if hash:
@@ -808,8 +809,8 @@ def _copy_arguments(
         argv.append("--inplace")
     max_delete = _nonnegative_integer(max_delete, option="--max-delete")
     if max_delete is not None:
-        if not prune:
-            raise SyqInvocationError("--max-delete requires --prune")
+        if not (prune or prune_before):
+            raise SyqInvocationError("--max-delete requires --prune or --prune-before")
         argv.extend(("--max-delete", str(max_delete)))
     return argv, source_count, source_end
 
@@ -1261,6 +1262,7 @@ class Client:
         stream_concurrency: int = 4,
         results: BinaryIO | None = None,
         prune: bool = False,
+        prune_before: bool = False,
         dry_run: bool = False,
         hash: bool = False,
         hash_or_copy: bool = False,
@@ -1344,6 +1346,7 @@ class Client:
             as_new=as_new,
             as_existing=as_existing,
             prune=prune,
+            prune_before=prune_before,
             dry_run=dry_run,
             hash=hash,
             hash_or_copy=hash_or_copy,
@@ -1387,15 +1390,15 @@ class Client:
             tcp_congestion=tcp_congestion,
             peer_auth=peer_auth,
         )
-        if mapping is not None and prune:
-            raise SyqInvocationError("--mapping conflicts with --prune")
+        if mapping is not None and (prune or prune_before):
+            raise SyqInvocationError("--mapping conflicts with --prune and --prune-before")
         if mapping is None:
             if source_count == 0:
                 raise SyqInvocationError("syq cp needs a source selector or mapping")
             return self._typed(
                 argv,
                 mode="cp",
-                prune=prune,
+                prune=prune or prune_before,
                 mapping=False,
                 dry_run=dry_run,
                 selectors_total=None,

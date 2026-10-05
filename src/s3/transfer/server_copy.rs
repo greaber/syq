@@ -198,7 +198,9 @@ impl Engine {
     async fn server_copy_inner(self: Arc<Self>) -> Result<()> {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
         let DownloadPlan {
-            jobs: plan, prune, ..
+            jobs: plan,
+            mut prune,
+            ..
         } = self.download_plan(&target).await?;
         self.check_upload_placement(
             plan.first()
@@ -237,7 +239,11 @@ impl Engine {
             let prepared = std::mem::take(&mut *prepared.lock().await);
             let finish = async {
                 self.prepare_pruning(&prune).await?;
-                self.finish_authorization().await
+                self.finish_authorization().await?;
+                if self.args.prune_before {
+                    self.prune(std::mem::take(&mut prune), None).await?;
+                }
+                Ok::<_, anyhow::Error>(())
             }
             .await;
             if let Err(error) = finish {
@@ -266,6 +272,9 @@ impl Engine {
             })
             .await?;
         } else {
+            if self.args.prune_before {
+                self.prune(std::mem::take(&mut prune), None).await?;
+            }
             parallel(plan, workers, |mut job| {
                 let engine = self.clone();
                 async move {
@@ -281,7 +290,9 @@ impl Engine {
             .await?;
         }
         self.progress.finish_transfer();
-        self.prune(prune, None).await?;
+        if !self.args.prune_before {
+            self.prune(prune, None).await?;
+        }
         Ok(())
     }
 

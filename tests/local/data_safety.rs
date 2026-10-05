@@ -540,3 +540,82 @@ fn prune_ancestry_permission_error_names_source_and_explains_skipping() {
     assert_eq!(read(&t.path("dst/file")), b"source contents");
     assert_eq!(read(&t.path("dst/extra")), b"keep");
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn prune_before_removes_extras_before_a_copy_failure() {
+    for before in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), &vec![b'n'; 128 << 10]);
+        write(&t.path("dst/file"), b"previous complete file");
+        write(&t.path("dst/extra"), b"extra");
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                if before { "--prune-before" } else { "--prune" },
+                "--performance-tuning=copy-path=ranges",
+                "--srcs-in",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+            ])
+            .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+            .run()
+            .unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(t.path("dst/extra").exists(), !before, "{out:?}");
+        assert_eq!(read(&t.path("dst/file")), b"previous complete file");
+    }
+}
+
+#[test]
+fn prune_before_honors_preview_limits_and_protected_paths() {
+    for extra in [vec![], vec!["--dry-run"], vec!["--max-delete", "0"]] {
+        let t = Tmp::new();
+        write(&t.path("src/new"), b"new");
+        write(&t.path("dst/extra/old"), b"old");
+        write(&t.path("dst/ignored/keep"), b"keep");
+        let mut args = vec!["cp", "--prune-before", "--ignore=ignored", "--srcs-in"];
+        let src = t.s("src");
+        let dst = t.s("dst");
+        args.extend([src.as_str(), "--into", dst.as_str()]);
+        args.extend(extra.clone());
+        let out = native_syq(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(if extra.contains(&"--max-delete") {
+                25
+            } else {
+                0
+            }),
+            "{out:?}"
+        );
+        assert_eq!(
+            t.path("dst/extra/old").exists(),
+            !extra.is_empty(),
+            "{out:?}"
+        );
+        assert_eq!(read(&t.path("dst/ignored/keep")), b"keep");
+        assert_eq!(t.path("dst/new").exists(), !extra.contains(&"--dry-run"));
+    }
+}
+
+#[test]
+fn prune_before_preserves_extras_when_source_selection_fails() {
+    let t = Tmp::new();
+    write(&t.path("a/same"), b"one");
+    write(&t.path("b/same"), b"two");
+    write(&t.path("dst/extra"), b"keep");
+    for source in [t.s("missing"), t.s("b/same")] {
+        let out = native_syq(&[
+            "cp",
+            "--prune-before",
+            &t.s("a/same"),
+            &source,
+            "--into",
+            &t.s("dst"),
+        ]);
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(read(&t.path("dst/extra")), b"keep");
+    }
+}

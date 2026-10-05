@@ -817,6 +817,7 @@ class AsyncClient:
         stream_concurrency: int = 4,
         results: BinaryIO | None = None,
         prune: bool = False,
+        prune_before: bool = False,
         dry_run: bool = False,
         hash: bool = False,
         hash_or_copy: bool = False,
@@ -902,6 +903,7 @@ class AsyncClient:
             as_new=as_new,
             as_existing=as_existing,
             prune=prune,
+            prune_before=prune_before,
             dry_run=dry_run,
             hash=hash,
             hash_or_copy=hash_or_copy,
@@ -945,15 +947,15 @@ class AsyncClient:
             tcp_congestion=tcp_congestion,
             peer_auth=peer_auth,
         )
-        if mapping is not None and prune:
-            raise SyqInvocationError("--mapping conflicts with --prune")
+        if mapping is not None and (prune or prune_before):
+            raise SyqInvocationError("--mapping conflicts with --prune and --prune-before")
         if mapping is None:
             if source_count == 0:
                 raise SyqInvocationError("syq cp needs a source selector or mapping")
             result = await self._typed(
                 argv,
                 mode="cp",
-                prune=prune,
+                prune=prune or prune_before,
                 mapping=False,
                 dry_run=dry_run,
                 selectors_total=None,

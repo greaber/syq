@@ -84,9 +84,10 @@ In addition to the shared arguments above, it accepts:
 | `from_`, `to` | SSH endpoint strings or `s3://BUCKET`; omitted endpoints are local |
 | `into`, `into_new`, `into_existing` | Destination directory paths |
 | `as_`, `as_new`, `as_existing` | Exact destination paths |
-| `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*` and `prune`. Async clients also accept `AsyncMapping` and async iterables |
+| `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`; replaces selectors; conflicts with `as_*`, `prune`, and `prune_before`. Async clients also accept `AsyncMapping` and async iterables |
 | `stream_concurrency` | Maximum callback entries active at once; default `4`, range `1..256`; transport worker and request limits are shared across entries |
 | `follow_dst` | Boolean: follow destination symlinks |
+| `prune_before` | Boolean: remove extras before copying to free space; implies pruning. Later copy failures do not restore removals |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |
@@ -97,7 +98,7 @@ In addition to the shared arguments above, it accepts:
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
 | `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
-| `max_delete` | Nonnegative integer deletion limit; requires `prune=True` |
+| `max_delete` | Nonnegative integer deletion limit; requires `prune=True` or `prune_before=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
 | `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/reference.html#choose-a-transfer-strategy) |
 | `performance_tuning` | Comma-separated overrides, e.g. `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8,s3-requests=16"`; omitted means automatic |
@@ -565,7 +566,7 @@ unsuccessful copy. Read attributes directly, for example
 With `dry_run=True`, mutation totals describe planned changes.
 A failed call reports work completed before it stopped.
 
-Ordinary copies have all three deletion fields only with `prune=True`;
+Ordinary copies have all three deletion fields with `prune=True` or `prune_before=True`;
 otherwise they are `None`. Receiver-attested results have only
 `deletions_completed`, and their unchanged/excluded totals are always zero
 because the receiver cannot observe source-side skips. `receipt` is

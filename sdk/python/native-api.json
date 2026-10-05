@@ -24,6 +24,7 @@
         "mapping",
         "results",
         "prune",
+        "prune-before",
         "max-delete",
         "dry-run",
         "auth-from",
