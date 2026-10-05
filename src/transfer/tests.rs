@@ -4332,7 +4332,7 @@ impl Conn for QueuingSource {
 }
 
 #[test]
-fn grouped_comparison_holds_at_most_a_worker_bound_of_file_data() {
+fn grouped_comparison_holds_one_in_process_read_and_queues_remote_ones() {
     use std::os::unix::fs::MetadataExt;
     // Rewritten files: twenty of 1 MiB, four to a group, and four of 12 MiB,
     // each a group of its own, whose reads return all their data.
@@ -4400,8 +4400,9 @@ fn grouped_comparison_holds_at_most_a_worker_bound_of_file_data() {
         }
         let (reads, data) = *most.lock().unwrap();
         if in_process {
-            // Each read's data moves on before the next read.
-            assert_eq!(reads, 1);
+            // Each read's data moves on before the next read: no more than
+            // one group's is held.
+            assert_eq!((reads, data), (1, 12 << 20));
         } else {
             // Reads overlap, within the source's reply queue.
             assert!(
@@ -4409,11 +4410,6 @@ fn grouped_comparison_holds_at_most_a_worker_bound_of_file_data() {
                 "{reads} reads"
             );
         }
-        // A large file's data was held, but never more than the bound.
-        assert!(
-            (12 << 20..=super::small_compare::WORKER_DATA_BYTES as usize).contains(&data),
-            "{data} bytes held, in_process={in_process}"
-        );
     }
 }
 

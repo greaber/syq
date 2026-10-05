@@ -620,13 +620,14 @@ fn spawn_reader(
 /// Replies a connection's reader queues before it stops reading. Control
 /// requests also pipeline up to the default depth. Keeping that capacity
 /// prevents a sequential helper blocking on replies while its coordinator is
-/// still sending requests (including large path batches). A destination
-/// worker's queue also holds the replies a grouped comparison awaits while it
-/// sends a patch; they carry no file data.
+/// still sending requests (including large path batches). A worker's queue
+/// also holds the replies of every group a grouped comparison keeps in
+/// flight: a source's carry differing blocks, and a read stream's blocks
+/// queue as deep.
 fn reply_queue(read_ahead: usize, role: &ConnectionRole) -> usize {
     let replies = read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH);
     match role {
-        ConnectionRole::DestinationWorker { .. } => {
+        ConnectionRole::SourceWorker { .. } | ConnectionRole::DestinationWorker { .. } => {
             replies.max(crate::transfer_tuning::COMPARE_WINDOW)
         }
         _ => replies,

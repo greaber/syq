@@ -12,22 +12,18 @@
 //!
 //! Groups are pipelined through these stages, so a run of files costs about
 //! one round trip of lead time rather than round trips per file. Groups are
-//! small and many are in flight (`COMPARE_WINDOW`), so that a worker holds
-//! little file data at once (`WORKER_DATA_BYTES`), and a file of which more
+//! small and many are in flight (`COMPARE_WINDOW`), and a file of which more
 //! differs than one patch carries (`MAX_DIFFERING_FILE_BYTES`) is compared
-//! and sent in ranges per file instead.
+//! and sent in ranges per file instead. An in-process source's reply moves
+//! on before the next read, so a worker holds one group's data at a time; a
+//! remote source's replies are bounded by its connection's reply queue.
 
 use super::*;
-use crate::proto::MAX_DIFFERING_FILE_BYTES;
 use crate::transfer_tuning::COMPARE_WINDOW;
 
 /// Files and source bytes per group.
 const COMPARE_GROUP_FILES: usize = 256;
 const COMPARE_GROUP_BYTES: u64 = 4 << 20;
-/// File data a worker holds for its groups: what the reads in flight may
-/// return, and then what their patches carry until they are sent. A read
-/// that would pass it waits, unless the worker holds nothing.
-pub(super) const WORKER_DATA_BYTES: u64 = 16 << 20;
 /// Files up to this size are compared and patched in groups. A larger file
 /// takes the per-file path, whose ranges several workers can share.
 const PATCH_MAX_FILE: u64 = crate::proto::MAX_PATCH_FILE_BYTES;
@@ -98,9 +94,6 @@ struct Group {
     reads: Vec<PendingRead>,
     /// Files sent to be published, and the bytes sent and reused.
     published: Vec<(usize, u64, u64)>,
-    /// The most file data its read may return, held from the worker's
-    /// `WORKER_DATA_BYTES` from sending the read until sending its patch.
-    reserved: u64,
 }
 
 impl Worker {
@@ -240,22 +233,16 @@ impl Worker {
         let source_queue = self.src.reply_queue().unwrap_or(usize::MAX);
         let mut groups: Vec<Group> = Vec::new();
         let mut in_flight = 0;
-        // File data held for the groups, and reads waiting to be sent.
-        let mut held = 0;
+        // Reads waiting for the source to owe fewer replies.
         let mut waiting: std::collections::VecDeque<(usize, Request)> = Default::default();
         let mut source = std::collections::VecDeque::new();
         let mut destination = std::collections::VecDeque::new();
         let result = (|| -> Result<()> {
             loop {
-                while let Some((group, _)) = waiting.front() {
-                    let reserved = groups[*group].reserved;
-                    if source.len() >= source_queue
-                        || (held > 0 && held + reserved > WORKER_DATA_BYTES)
-                    {
+                while source.len() < source_queue {
+                    let Some((group, request)) = waiting.pop_front() else {
                         break;
-                    }
-                    let (group, request) = waiting.pop_front().expect("waiting read");
-                    held += reserved;
+                    };
                     self.src.send(request)?;
                     source.push_back((group, Stage::Read, std::time::Instant::now()));
                 }
@@ -315,19 +302,12 @@ impl Worker {
                 let next =
                     self.compare_stage(&jobs, &mut groups[group], stage, response, &mut outcomes)?;
                 match next {
-                    Some((Stage::Read, request)) => {
-                        groups[group].reserved = Self::read_reservation(&request);
-                        waiting.push_back((group, request));
-                    }
+                    Some((Stage::Read, request)) => waiting.push_back((group, request)),
                     Some((stage, request)) => {
                         self.dst.send(request)?;
                         destination.push_back((group, stage, std::time::Instant::now()));
                     }
                     None => in_flight -= 1,
-                }
-                if let Stage::Read = stage {
-                    // Its patch, if any, has been sent.
-                    held -= std::mem::take(&mut groups[group].reserved);
                 }
             }
         })();
@@ -354,18 +334,6 @@ impl Worker {
         let source_end = drain(&mut self.src, source, &mut groups, &mut outcomes);
         let destination_end = drain(&mut self.dst, destination, &mut groups, &mut outcomes);
         (outcomes, result.and(source_end).and(destination_end))
-    }
-
-    /// The most file data a read of differing blocks may return.
-    fn read_reservation(request: &Request) -> u64 {
-        let Request::ReadDifferingBatch { reads, .. } = request else {
-            return 0;
-        };
-        reads
-            .iter()
-            .filter(|read| !read.compare_only)
-            .map(|read| u64::from(read.len).min(MAX_DIFFERING_FILE_BYTES))
-            .sum()
     }
 
     /// Act on one group's reply: record the outcomes it decides, and return
