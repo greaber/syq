@@ -5,6 +5,8 @@
 mod process;
 use crate::process::CommandExt as _;
 use process::group as process_group;
+#[path = "support/executable.rs"]
+mod executable_support;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -33,8 +35,6 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use std::sync::OnceLock;
-
-use std::sync::RwLock;
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
 #[path = "support/macos_clone.rs"]
@@ -361,31 +361,15 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     partials.pop().unwrap()
 }
 
-/// Keeps executable fixtures from being written while a child is forked.
-///
-/// Tests run in parallel threads of one process. A child forked by one test
-/// inherits every open descriptor until it execs, including a wrapper script
-/// another test is still writing. If that child is slow to exec under load,
-/// the wrapper's own exec fails with ETXTBSY ("Text file busy"). Writers take
-/// the exclusive side; every spawn takes the shared side, and both `spawn`
-/// and `output` only return once the child has exec'd, so no un-exec'd child
-/// can hold a fixture open when its writer proceeds.
-static PROCESS_IMAGE_LOCK: RwLock<()> = RwLock::new(());
-
+/// Write an executable fixture with mode 0755. See `executable_support` for
+/// why fixtures are never written by the test process itself.
 fn executable(p: &Path, body: &[u8]) {
-    let _writing = PROCESS_IMAGE_LOCK
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    write(p, body);
-    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    executable_support::write_executable(p, body, 0o755);
 }
 
-/// `Command::output` and `Command::spawn` with the fork under
-/// [`PROCESS_IMAGE_LOCK`]. Use these instead of the inherent methods
-/// everywhere in this file. The lock covers only the spawn: several tests
-/// race a child against filesystem changes, so waiting for it must not hold
-/// other tests back. `run` captures stdout and stderr and closes stdin like
-/// `Command::output`; a test that feeds stdin uses `start`.
+/// Launch shorthands used throughout this file. `run` captures stdout and
+/// stderr and closes stdin like `Command::output`; a test that feeds stdin
+/// uses `start`.
 trait Launch {
     fn run(&mut self) -> std::io::Result<Output>;
     fn start(&mut self) -> std::io::Result<std::process::Child>;
@@ -393,17 +377,10 @@ trait Launch {
 
 impl Launch for Command {
     fn run(&mut self) -> std::io::Result<Output> {
-        self.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .start()?
-            .wait_with_output()
+        self.capture_output()
     }
 
     fn start(&mut self) -> std::io::Result<std::process::Child> {
-        let _spawning = PROCESS_IMAGE_LOCK
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.spawn_guarded()
     }
 }

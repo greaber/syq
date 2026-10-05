@@ -2601,7 +2601,7 @@ fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
             &format!("#!/bin/sh\nulimit -n {limit}\n"),
             1,
         );
-        fs::write(&rsh, script).unwrap();
+        executable(&rsh, script.as_bytes());
         let count = if selectors { 200 } else { 4000 };
         for index in 0..count {
             write(
@@ -2684,7 +2684,7 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
         fs::read_to_string(&rsh)
             .unwrap()
             .replacen("#!/bin/sh\n", "#!/bin/sh\nulimit -n 128\n", 1);
-    fs::write(&rsh, script).unwrap();
+    executable(&rsh, script.as_bytes());
     let large = prng((256 << 10) + 13, 731);
     for index in 0..576 {
         write(

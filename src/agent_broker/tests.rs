@@ -237,24 +237,11 @@ fn configured_value_identical_to_flattened_defaults_fails_closed() {
 fn configuration_failure_keeps_ssh_error_without_debug_trace() {
     let root = crate::test_support::tempdir().unwrap();
     let ssh = root.path().join("ssh");
-    // Write in a child so parallel test forks cannot inherit an executable's
-    // writable descriptor and cause ETXTBSY when this fixture is launched.
-    let written = Command::new("sh")
-        .args([
-            "-c",
-            "printf '%s' \"$1\" > \"$2\"",
-            "write-ssh",
-            "#!/bin/sh\nprintf '%s\n' 'OpenSSH_9.6p1, OpenSSL 3.0.13' 'debug1: Reading configuration data /private/config' 'debug2: checking match' '/private/config line 7: Bad configuration option: misspelled' 'debug3: final pass' >&2\nexit 255\n",
-        ])
-        .arg(&ssh)
-        .capture_output()
-        .unwrap();
-    assert!(
-        written.status.success(),
-        "{}",
-        String::from_utf8_lossy(&written.stderr)
+    crate::test_support::write_executable(
+        &ssh,
+        "#!/bin/sh\nprintf '%s\n' 'OpenSSH_9.6p1, OpenSSL 3.0.13' 'debug1: Reading configuration data /private/config' 'debug2: checking match' '/private/config line 7: Bad configuration option: misspelled' 'debug3: final pass' >&2\nexit 255\n",
+        0o700,
     );
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
     let error = inspect_ssh_configuration(ssh.to_str().unwrap(), None, "host.invalid", false)
         .err()
         .expect("configuration failure");
@@ -569,15 +556,14 @@ fn policy_deadline_interrupts_real_openssh_match_exec() {
         ),
     )
     .unwrap();
-    std::fs::write(
+    crate::test_support::write_executable(
         &ssh,
         format!(
             "#!/bin/sh\nexec ssh -F {} \"$@\"\n",
             shell_words::quote(config.to_str().unwrap()),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        0o700,
+    );
     let started = Instant::now();
     let error = resolve_host_policy_at_bounded(
         ssh.to_str().unwrap(),
@@ -602,8 +588,7 @@ fn known_host_search_obeys_deadline_and_cancellation() {
     let known_hosts = temp.path().join("known_hosts");
     let keygen = temp.path().join("ssh-keygen");
     std::fs::write(&known_hosts, "").unwrap();
-    std::fs::write(&keygen, "#!/bin/sh\nexec sleep 30\n").unwrap();
-    std::fs::set_permissions(&keygen, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_executable(&keygen, "#!/bin/sh\nexec sleep 30\n", 0o700);
     let started = Instant::now();
     let error = read_known_host_keys_bounded(
         &keygen.clone().into_os_string(),
@@ -655,17 +640,18 @@ fn resolved_host_policy_uses_real_openssh_and_ssh_keygen() {
         )
         .unwrap();
     let quoted_config = shell_words::quote(config.to_str().unwrap());
-    std::fs::write(
-            &ssh,
-            format!(
-                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi\ndone\nexec ssh -F {quoted_config} \"$@\"\n"
-            ),
-        )
-        .unwrap();
-    std::fs::write(&ssh_keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
-    for program in [&ssh, &ssh_keygen] {
-        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    crate::test_support::write_executable(
+        &ssh,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi\ndone\nexec ssh -F {quoted_config} \"$@\"\n"
+        ),
+        0o700,
+    );
+    crate::test_support::write_executable(
+        &ssh_keygen,
+        "#!/bin/sh\nexec ssh-keygen \"$@\"\n",
+        0o700,
+    );
 
     let resolved = resolve_host_policy(ssh.to_str().unwrap(), None, "vault").unwrap();
     assert_eq!(resolved.login_user, "backup");
@@ -735,16 +721,13 @@ fn resolved_policy_exports_only_keys_above_laptop_rsa_minimum() {
     .unwrap();
     // Supply the laptop's effective policy without making this regression
     // depend on the test machine supporting the newer OpenSSH directive.
-    std::fs::write(&ssh, format!(
+    crate::test_support::write_executable(&ssh, format!(
         "#!/bin/sh\nconfiguration={}\nfor arg in \"$@\"; do if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi; done\necho \"debug1: Reading configuration data $configuration\" >&2\nprintf '%s\\n' 'user backup' 'hostname vault' 'port 22' {} 'globalknownhostsfile none' 'hostkeyalgorithms rsa-sha2-512' 'requiredrsasize 3072'\n",
         shell_words::quote(config.to_str().unwrap()),
         shell_words::quote(&format!("userknownhostsfile {}", known_hosts.display())),
-    )).unwrap();
+    ), 0o700);
     let keygen = temp.path().join("ssh-keygen");
-    std::fs::write(&keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
-    for program in [&ssh, &keygen] {
-        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    crate::test_support::write_executable(&keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n", 0o700);
     let policy = resolve_host_policy(ssh.to_str().unwrap(), None, "vault").unwrap();
     assert_eq!(policy.host_keys.as_slice(), std::slice::from_ref(&large));
     assert_eq!(

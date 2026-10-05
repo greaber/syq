@@ -763,8 +763,7 @@ fn receiving_automatic_cwd_and_server_scope_are_independent() {
     fs::create_dir(t.runtime()).unwrap();
     fs::create_dir_all(t.path("root/inbox")).unwrap();
     fs::create_dir_all(t.path("root/explicit")).unwrap();
-    write(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"$SSH_LOG\"\necho fixture connection unavailable >&2\nexit 42\n");
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    executable_support::write_executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"$SSH_LOG\"\necho fixture connection unavailable >&2\nexit 42\n", 0o700);
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(["persist", "receive"])
@@ -912,8 +911,7 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
     use std::os::unix::net::UnixListener;
     let t = Tmp::new();
     write(&t.path("source"), b"source");
-    write(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\n: > \"$SSH_MARKER\"\nexit 55\n");
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    executable_support::write_executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_9.2p1 >&2; exit 0; fi\n: > \"$SSH_MARKER\"\nexit 55\n", 0o700);
     let mut path = vec![t.path("bin")];
     path.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -1108,11 +1106,10 @@ fn receiving_v2_preferences_migrate_without_retaining_implicit_approval() {
 fn return_via_requires_approval_and_rejects_unsupported_routes() {
     let t = Tmp::new();
     write(&t.path("source"), b"payload");
-    write(
+    executable(
         &t.path("bin/ssh"),
         b"#!/bin/sh\ntouch \"$HOME/ssh-used\"\nexit 99\n",
     );
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     for option in ["--auth-from"] {
         for extra in [
             vec![],
@@ -1410,11 +1407,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     let t = Tmp::new();
     fs::create_dir(t.path("runtime")).unwrap();
     write(&t.path("source"), b"payload");
-    write(
-        &t.path("bin/ssh"),
-        b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nif [ \"$1\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nhostkeyalgorithms ssh-ed25519\\n'; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n",
-    );
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+    executable_support::write_executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nif [ \"$1\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nhostkeyalgorithms ssh-ed25519\\n'; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n", 0o700);
     let mut paths = vec![t.path("bin")];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let paths = std::env::join_paths(paths).unwrap();

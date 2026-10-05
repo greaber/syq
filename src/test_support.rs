@@ -4,6 +4,9 @@ use crate::process::CommandExt as _;
 #[path = "../tests/support/temp.rs"]
 mod temporary;
 pub(crate) use temporary::{short_tempdir, temp_dir, tempdir};
+#[path = "../tests/support/executable.rs"]
+mod executable;
+pub(crate) use executable::write_executable;
 
 /// Run a unit test in a separate process whose stderr reader has gone away.
 /// Keep stdout available for the test harness and assertion diagnostics.
@@ -155,6 +158,73 @@ fn closed_socket_wait_preserves_buffered_bytes_and_socket_settings() {
         unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) },
         flags
     );
+}
+
+/// The cause of "Text file busy" test failures: a child forked while a test
+/// holds a script open for writing keeps that descriptor until it execs, and
+/// Linux refuses to run the script meanwhile. A fixture from write_executable
+/// leaves no descriptor in this process for the child to keep.
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_child_keeps_in_process_script_busy_but_not_fixture() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt as _;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let root = tempdir().unwrap();
+    let script = b"#!/bin/sh\nexit 0\n";
+    let fixture = root.path().join("fixture");
+    write_executable(&fixture, script, 0o700);
+    let in_process = root.path().join("in-process");
+    let mut writer = std::fs::File::create(&in_process).unwrap();
+    writer.write_all(script).unwrap();
+    std::fs::set_permissions(&in_process, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The child reports that it has forked, then waits before exec until it
+    // is released, or for at most ten seconds if this test fails first.
+    let (mut control, paused) = UnixStream::pair().unwrap();
+    paused
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let paused_fd = paused.as_raw_fd();
+    let mut command = Command::new("true");
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    unsafe {
+        command.pre_exec(move || {
+            let mut byte = [0u8];
+            libc::write(paused_fd, byte.as_ptr().cast(), 1);
+            libc::read(paused_fd, byte.as_mut_ptr().cast(), 1);
+            Ok(())
+        });
+    }
+    let launcher =
+        std::thread::spawn(move || command.spawn_guarded().and_then(|mut child| child.wait()));
+    control.read_exact(&mut [0u8]).unwrap();
+    drop(writer);
+
+    let run = |path: &Path| {
+        Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status_guarded()
+    };
+    let busy = run(&in_process);
+    let ready = run(&fixture);
+    control.write_all(b"x").unwrap();
+    assert!(launcher.join().unwrap().unwrap().success());
+    assert_eq!(
+        busy.map_err(|error| error.raw_os_error()),
+        Err(Some(libc::ETXTBSY))
+    );
+    assert!(ready.unwrap().success());
 }
 
 #[test]

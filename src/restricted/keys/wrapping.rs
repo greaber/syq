@@ -262,8 +262,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let askpass = root.join("askpass");
-        fs::write(&askpass, b"#!/bin/sh\nprintf '%s\\n' fixture-unlock\n").unwrap();
-        fs::set_permissions(&askpass, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_executable(
+            &askpass,
+            b"#!/bin/sh\nprintf '%s\\n' fixture-unlock\n",
+            0o700,
+        );
         let status = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "restricted::keys::wrapping::tests::agent_unlocks_wrapped_receiver_without_another_passphrase", "--nocapture"])
             .env(CHILD, root).env("SSH_AUTH_SOCK", socket)

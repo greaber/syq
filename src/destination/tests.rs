@@ -6,7 +6,6 @@ use crate::proto::{Request, Response};
 #[test]
 fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
     use ssh_agent_lib::ssh_key::{private::Ed25519Keypair, PrivateKey};
-    use std::os::unix::fs::PermissionsExt;
 
     let client = PrivateKey::new(Ed25519Keypair::from_seed(&[41; 32]).into(), "").unwrap();
     let ca = PrivateKey::new(Ed25519Keypair::from_seed(&[42; 32]).into(), "").unwrap();
@@ -47,18 +46,19 @@ fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
             contents.push_str(&format!(" HostKeyAlias {alias}\n"));
         }
         fs::write(&config, contents).unwrap();
-        fs::write(
+        crate::test_support::write_executable(
             &ssh,
             format!(
                 "#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi\ndone\nexec ssh -F {} \"$@\"\n",
                 shell_words::quote(config.to_str().unwrap())
             ),
-        )
-        .unwrap();
-        fs::write(&ssh_keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
-        for program in [&ssh, &ssh_keygen] {
-            fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+            0o700,
+        );
+        crate::test_support::write_executable(
+            &ssh_keygen,
+            "#!/bin/sh\nexec ssh-keygen \"$@\"\n",
+            0o700,
+        );
         let policy = crate::agent_broker::resolve_host_policy_at_bounded(
             ssh.to_str().unwrap(),
             None,
