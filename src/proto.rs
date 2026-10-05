@@ -73,6 +73,11 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 /// batch (`patch_batch_fits`).
 pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;
 
+/// Most differing data `ReadDifferingBatch` returns for one file, so that
+/// neither the source nor the patch it feeds holds more of one file. A file
+/// that differs by more is sent in ranges per file instead.
+pub const MAX_DIFFERING_FILE_BYTES: u64 = 16 << 20;
+
 /// Whether a `PatchSmallBatch` of files of these lengths stays within what a
 /// receiver builds in memory before publishing any of them: `MAX_READ_BYTES`
 /// in all. The lengths count reused blocks, which cost the request almost
@@ -1238,8 +1243,10 @@ pub enum WireRequest<Data> {
         files: Vec<ExistingRead>,
     },
     /// Read source files, returning only the blocks that differ from the
-    /// destination's hashes. A `compare_only` file stops being compared at
-    /// its first differing block, where its `matching` ends.
+    /// destination's hashes. A file stops being compared, with `matching`
+    /// ending there, at its first differing block when it is `compare_only`,
+    /// and otherwise once its differing blocks pass
+    /// `MAX_DIFFERING_FILE_BYTES`, when it returns no data at all.
     ReadDifferingBatch {
         block: u64,
         reads: Vec<DifferingRead>,

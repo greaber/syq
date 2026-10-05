@@ -11,7 +11,9 @@
 //!    (`PatchSmallBatch`).
 //!
 //! Groups are pipelined through these stages, so a run of files costs about
-//! one round trip of lead time rather than round trips per file.
+//! one round trip of lead time rather than round trips per file. A file of
+//! which more differs than one patch carries (`MAX_DIFFERING_FILE_BYTES`) is
+//! compared and sent in ranges per file instead.
 
 use super::*;
 
@@ -49,6 +51,9 @@ pub(super) enum Compared {
     ResumePartial,
     /// The file could not be compared or patched: replace it whole.
     Differs,
+    /// More of the file differs than one patch carries: compare and send it
+    /// in ranges per file.
+    LargePatch,
     /// The destination no longer met the patch's target condition, as when
     /// keeping another name of the same file changed it: compare it again,
     /// under a fresh condition.
@@ -169,6 +174,10 @@ impl Worker {
                 }
                 Some(Compared::ResumePartial) => {
                     self.sched.jobs.lock().unwrap()[i].resume_partial = true;
+                    self.sched.requeue(i);
+                }
+                Some(Compared::LargePatch) => {
+                    self.sched.jobs.lock().unwrap()[i].large_patch = true;
                     self.sched.requeue(i);
                 }
                 Some(Compared::SourceChanged(now)) => {
@@ -399,6 +408,12 @@ impl Worker {
                         outcomes[i] = Some(Compared::SourceChanged(source));
                         continue;
                     }
+                    // The source stops at a file of which more differs than
+                    // one patch carries, and sends none of it.
+                    if !compare_only && data.is_empty() && matching.contains(&false) {
+                        outcomes[i] = Some(Compared::LargePatch);
+                        continue;
+                    }
                     if matching.len() as u64 != job.entry.size.div_ceil(block)
                         || (compare_only && matching.iter().any(|same| !same))
                     {
@@ -531,6 +546,7 @@ impl Worker {
             Compared::SourceChanged(_)
             | Compared::ResumePartial
             | Compared::Differs
+            | Compared::LargePatch
             | Compared::StaleCondition => unreachable!("these files are requeued"),
         }
     }

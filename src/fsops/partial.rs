@@ -1533,7 +1533,9 @@ impl FsOps {
 
     /// Compare one source with the destination's block hashes, `chunk` bytes
     /// at a time. A comparison that only decides whether the file is
-    /// unchanged stops at its first differing block.
+    /// unchanged stops at its first differing block; any other stops once
+    /// its differing blocks pass `MAX_DIFFERING_FILE_BYTES`, and returns no
+    /// data, as the file is then sent in ranges per file.
     fn read_differing(
         &mut self,
         read: &DifferingRead,
@@ -1580,7 +1582,10 @@ impl FsOps {
                     matching.truncate(first + differs + 1);
                     return Ok(());
                 }
-                if read_len as u64 == len && !same.contains(&true) {
+                if read_len as u64 == len
+                    && len <= MAX_DIFFERING_FILE_BYTES
+                    && !same.contains(&true)
+                {
                     // Every block of a file read in one chunk differs: send
                     // it as read.
                     data = std::mem::take(&mut buffer);
@@ -1590,12 +1595,17 @@ impl FsOps {
                     // Reserve the most the file can still carry, so that the
                     // data never moves as it grows.
                     let rest = len - off - (differs as u64) * block;
-                    data.reserve_exact(rest as usize);
+                    data.reserve_exact(rest.min(MAX_DIFFERING_FILE_BYTES) as usize);
                 }
                 for (piece, same) in contents.chunks(block as usize).zip(same) {
-                    if !same {
-                        data.extend_from_slice(piece);
+                    if *same {
+                        continue;
                     }
+                    if (data.len() + piece.len()) as u64 > MAX_DIFFERING_FILE_BYTES {
+                        data = Vec::new();
+                        return Ok(());
+                    }
+                    data.extend_from_slice(piece);
                 }
                 off += read_len as u64;
             }

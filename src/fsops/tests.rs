@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 fn differing_reads_keep_only_differing_blocks() {
     let directory = crate::test_support::tempdir().unwrap();
     let block = MIN_HASH_BLOCK_BYTES as usize;
+    let limit = MAX_DIFFERING_FILE_BYTES as usize;
     let mut ops = FsOps::new();
     ops.set_hash_policy(crate::hashing::HashPolicy {
         transfer_integrity: true,
@@ -68,9 +69,11 @@ fn differing_reads_keep_only_differing_blocks() {
     // Name, length, the blocks that differ, and whether the read only
     // decides whether the file is unchanged.
     let three = (3 << 20) + 100;
-    let cases: [(&str, usize, Vec<usize>, bool); 4] = [
+    let cases: [(&str, usize, Vec<usize>, bool); 6] = [
         // Blocks on either side of a chunk boundary, and the short last one.
         ("edited", three, vec![1, 15, 16, 48], false),
+        ("limit", 20 << 20, (0..limit / block).collect(), false),
+        ("over", 20 << 20, (0..=limit / block).collect(), false),
         // A file read in one chunk that differs whole.
         ("whole", 300 << 10, (0..5).collect(), false),
         ("compared", three, vec![20, 30], true),
@@ -119,6 +122,13 @@ fn differing_reads_keep_only_differing_blocks() {
             .copied()
             .collect();
         match *name {
+            "over" => {
+                // Past what one patch carries: no data, and no further
+                // comparison than the chunk that passed it.
+                assert!(result.data.is_empty());
+                assert_eq!(result.matching.len(), limit / block + 16);
+                assert!(!result.matching[limit / block]);
+            }
             "compared" => {
                 // Only whether it is unchanged: no further than the first
                 // differing block.
@@ -138,6 +148,7 @@ fn differing_reads_keep_only_differing_blocks() {
             }
         }
     }
+    assert_eq!(results[1].data.len(), limit);
 }
 
 #[test]

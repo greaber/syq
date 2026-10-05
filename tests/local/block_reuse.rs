@@ -458,6 +458,64 @@ fn bandwidth_limited_copies_send_only_the_small_files_that_differ() {
 }
 
 #[test]
+fn a_file_of_which_more_differs_than_a_patch_carries_is_compared_per_file() {
+    // A grouped patch carries at most 16 MiB of a file's new data, so that
+    // no more is held at once. A file that differs by more is compared again
+    // on its own, in 4 MiB blocks, and only those that differ are sent; one
+    // within the limit is patched in its group.
+    for remote in [false, true] {
+        let t = Tmp::new();
+        let source = prng(32 << 20, 881);
+        for (name, changed) in [("within", 16 << 20), ("over", (16 << 20) + (64 << 10))] {
+            let mut old = source.clone();
+            old[..changed].fill(b'x');
+            write(&t.path(&format!("src/{name}")), &source);
+            write(&t.path(&format!("dst/{name}")), &old);
+            set_mtime(&t.path(&format!("dst/{name}")), 1);
+        }
+        let mut args = vec!["-a", "--no-whole-file"];
+        let (source_dir, destination_dir) = (t.s("src/"), t.s("dst/"));
+        let remote_destination = format!("fake:{destination_dir}");
+        let mut command = if remote {
+            let rsh = fake_rsh(&t);
+            args.extend([
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--syq-no-bootstrap",
+                source_dir.as_str(),
+                remote_destination.as_str(),
+            ]);
+            remote_syq_command(&t, &rsh, &args)
+        } else {
+            args.extend([
+                "--no-progress",
+                "--performance-tuning=workers=1",
+                source_dir.as_str(),
+                destination_dir.as_str(),
+            ]);
+            let mut command = compat_command();
+            command.args(&args);
+            command
+        };
+        let out = command.env("SYQ_DEBUG", "1").run().unwrap();
+        assert_output_ok(&out);
+        for name in ["within", "over"] {
+            assert_eq!(
+                read(&t.path(&format!("dst/{name}"))),
+                source,
+                "{name} remote={remote}"
+            );
+        }
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], 2, "remote={remote}");
+        assert_eq!(observed["patched_files"], 1, "remote={remote}");
+        // The five 4 MiB blocks that differ.
+        assert_eq!(observed["range_requests"], 5, "remote={remote}");
+        assert!(partial_files(&t.path("dst")).is_empty());
+    }
+}
+
+#[test]
 fn by_default_only_replaced_files_of_unchanged_size_are_compared() {
     for explicit in [false, true] {
         let t = Tmp::new();

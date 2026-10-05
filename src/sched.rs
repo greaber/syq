@@ -56,6 +56,10 @@ pub struct FileJobData {
     /// Earlier runs left partial copies of this file: it takes the per-file
     /// path, which resumes from them.
     pub resume_partial: bool,
+    /// A small destination was compared with this source, and more of it
+    /// differs than one grouped patch carries: the per-file path compares and
+    /// sends it in ranges, without first probing whether it matches.
+    pub large_patch: bool,
     /// How many times a grouped patch of this file found its destination no
     /// longer met the patch's target condition, and the file was compared
     /// again.
