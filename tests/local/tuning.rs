@@ -2733,7 +2733,7 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
             ]);
         }
         command
-            .env("SYQ_TUNING_CACHE", "")
+            .env("SYQ_TUNING_CACHE", t.path(&format!("{label}-tuning.json")))
             .env("SYQ_TUNING_HISTORY", &history_path)
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"))
