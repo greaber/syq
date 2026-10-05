@@ -712,6 +712,7 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
         }
     }
     let mut controls = Vec::new();
+    let mut records = Vec::new();
     for entry in fs::read_dir(index)? {
         let result: Result<()> = (|| {
             let path = entry?.path();
@@ -723,7 +724,9 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
             };
             // Generation cancellation may already have made the keeper remove
             // this socket and scope while off was inspecting its index record.
-            if !mark_closing(domain, &record)? {
+            let present = mark_closing(domain, &record)?;
+            records.push((path, record.control.clone()));
+            if !present {
                 return Ok(());
             }
             controls.push(record.control.clone());
@@ -758,8 +761,11 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
     if let Err(error) = resolution::wait(domain) {
         errors.push(format!("{error:#}"));
     }
-    if !domain.is_default() {
-        if let Err(error) = cleanup::wait_for_keepers(domain) {
+    if let Err(error) = cleanup::wait_for_keepers(domain) {
+        errors.push(format!("{error:#}"));
+    }
+    for (path, control) in records {
+        if let Err(error) = cleanup::retire_record(&path, &control) {
             errors.push(format!("{error:#}"));
         }
     }

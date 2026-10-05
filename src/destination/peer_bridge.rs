@@ -5,6 +5,7 @@ use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoi
 use crate::conn::{Endpoint, RemoteSpec};
 use crate::destination::ssh::persistent::Cached;
 use std::os::fd::AsFd;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{ChildStdout, ExitStatus};
 use subtle::ConstantTimeEq;
 
@@ -180,6 +181,27 @@ impl Ticket {
         anyhow::ensure!(self.secret.len() == 43, "invalid peer bridge admission");
         Ok(())
     }
+    pub(in crate::destination) fn key_directory(&self) -> Result<tempfile::TempDir> {
+        self.validate()?;
+        let parent = self
+            .socket
+            .parent()
+            .context("peer coordinator directory missing")?;
+        // The coordinator owns this directory. Its Drop removes the private
+        // key even if the copy is killed before its own TempDir can be dropped.
+        let metadata = parent.symlink_metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0,
+            "peer coordinator directory is not private"
+        );
+        Ok(tempfile::Builder::new()
+            .prefix("syq-copy-key-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)?)
+    }
+
     fn connect(&self, action: Action) -> Result<(UnixStream, AdmissionReply)> {
         self.validate()?;
         let mut stream = connect_socket(&self.socket, Instant::now() + ADMISSION, Some(ADMISSION))?;
@@ -739,12 +761,14 @@ fn run_owned_coordinator(
             return Ok(status.code().unwrap_or(1));
         }
         if interrupted() != 0 {
+            child.terminate(Duration::from_secs(1))?;
             return Ok(128 + interrupted());
         }
         // Mapping stdin retains its normal EOF semantics. This separate
         // per-copy channel closes with A even if a shared SSH master keeps
         // the coordinator's standard streams open after its client exits.
         if requester_closed(lifetime) {
+            child.terminate(Duration::from_secs(1))?;
             bail!(
                 "requesting copy or approved peer control ended while the coordinator was running"
             );
@@ -756,6 +780,26 @@ fn run_owned_coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_removes_key_directory_left_by_killed_copy() {
+        let owner = crate::test_support::short_tempdir().unwrap();
+        fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let ticket = Ticket {
+            version: VERSION,
+            identity: crate::identity::build().into(),
+            socket: owner.path().join("control"),
+            secret: "a".repeat(43),
+        };
+        // A killed child cannot run its TempDir destructor.
+        let directory = ticket.key_directory().unwrap().keep();
+        let key = directory.join("key");
+        fs::write(&key, b"disposable test key").unwrap();
+        assert_eq!(directory.parent(), Some(owner.path()));
+        assert_eq!(directory.metadata().unwrap().mode() & 0o777, 0o700);
+        drop(owner);
+        assert!(!key.exists());
+    }
 
     #[test]
     fn peer_ssh_setup_retries_lost_reply_but_memoizes_explicit_refusal() {

@@ -619,7 +619,10 @@ impl Client {
     fn command_with(&self, setup: impl FnOnce(&str) -> Result<Peer>) -> Result<Command> {
         let mut state = self.state.lock().unwrap();
         if state.is_none() {
-            let directory = crate::private_broker::private_temp_dir("syq-copy-key-")?;
+            let directory = match &self.setup {
+                Setup::Return { .. } => crate::private_broker::private_temp_dir("syq-copy-key-")?,
+                Setup::PeerBridge(ticket) => ticket.key_directory()?,
+            };
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed)?;
             let pair = ssh_key::private::Ed25519Keypair::from_seed(&seed);

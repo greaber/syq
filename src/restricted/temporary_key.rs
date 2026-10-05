@@ -64,6 +64,61 @@ impl Drop for TemporaryKey {
 mod tests {
     use super::*;
 
+    fn ticket(socket: &Path) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({"socket": socket, "secret": "a".repeat(43)}))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn install_and_cleanup_preserve_other_copies_without_local_listeners() {
+        use std::os::unix::net::UnixListener;
+        // Both home and TMPDIR may be shared across hosts. Neither a missing
+        // socket nor a visible socket without a local listener proves that
+        // another copy has ended on its host.
+        for socket_exists in [false, true] {
+            let root = crate::test_support::short_tempdir().unwrap();
+            let service = root.path().join("syq-copy-worker-other-host");
+            fs::create_dir(&service).unwrap();
+            let socket = service.join("s");
+            if socket_exists {
+                drop(UnixListener::bind(&socket).unwrap());
+            }
+            let public = || {
+                generate_enrollment_key(EnrollmentId::random())
+                    .unwrap()
+                    .public_key()
+                    .to_openssh()
+                    .unwrap()
+            };
+            let other = TemporaryKey::install_at(
+                root.path(),
+                Path::new("/usr/bin/syq"),
+                &public(),
+                &ticket(&socket),
+            )
+            .unwrap();
+            let path = root.path().join(".ssh/authorized_keys");
+            let original = fs::read(&path).unwrap();
+            let local = TemporaryKey::install_at(
+                root.path(),
+                Path::new("/usr/bin/syq"),
+                &public(),
+                "local_ticket",
+            )
+            .unwrap();
+            let mut expected = original.clone();
+            expected.extend_from_slice(format!("{}\n", local.entry.line()).as_bytes());
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            drop(local);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            drop(other);
+            assert!(fs::read(&path).unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn cleanup_preserves_unrelated_authorized_keys_edits() {
         let root = crate::test_support::tempdir().unwrap();

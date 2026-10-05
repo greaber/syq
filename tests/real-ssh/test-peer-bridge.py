@@ -43,6 +43,20 @@ for row in open("/proc/net/tcp").read().splitlines()[1:]:
     connected |= fields[3] == "01" and peer == address and int(port, 16) == v["port"]
 print(json.dumps(connected))
 ''',
+    "key_directories": r'''
+from pathlib import Path
+import os, tempfile
+root = Path(tempfile.gettempdir())
+paths = list(root.glob("syq-copy-key-*")) + list(root.glob("syq-peer-*/syq-copy-key-*"))
+owned = []
+for p in paths:
+    try:
+        if p.stat().st_uid == os.getuid():
+            owned.append(str(p))
+    except FileNotFoundError:
+        pass
+print(json.dumps(sorted(owned)))
+''',
     "partial": r'''
 import hashlib
 from pathlib import Path
@@ -359,6 +373,11 @@ def main():
         # an empty file, so establish the same baseline as the full suite.
         remote("destination", "mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys")
         b_keys, c_keys = fingerprint("source"), fingerprint("destination")
+        initial_key_directories = probe("source", "key_directories")
+
+        def no_copy_keys():
+            return probe("source", "key_directories") == initial_key_directories
+
         remote("source", "dd if=/dev/urandom of=" + shlex.quote(b + "/data")
                + " bs=1M count=8 status=none && chmod 444 " + shlex.quote(b + "/data"))
         expected = digest("source", b + "/data")
@@ -400,6 +419,7 @@ def main():
             wait_for("destination temporary key cleanup", lambda: fingerprint("destination") == c_keys)
             assert json.loads(remote("source", "syq persist status --json"))["authorized_ssh"] == []
             no_pending()
+            wait_for("source temporary key directory cleanup", no_copy_keys)
 
         print("case: peer TCP preserves warm helpers unless SSH refuses a session", flush=True)
         controls = {row["control"] for row in rows}
@@ -477,6 +497,7 @@ def main():
             remote("destination", "test ! -e " + shlex.quote(outside))
             remote("requester", "kill -TERM $(cat " + shlex.quote(a + "/pid") + ")")
             finish(process, output, success=False)
+        wait_for("cancelled source key directory cleanup", no_copy_keys)
         wait_for("cancelled destination key cleanup", lambda: fingerprint("destination") == c_keys)
         assert probe("destination", "late_worker", ticket=ticket)
         remote("destination", "test ! -e " + shlex.quote(c + "/cancelled"))
@@ -505,6 +526,7 @@ def main():
             owned = probe("source", "copy_processes", destination=c + "/crashed")
             assert probe("requester", "kill_requester", pidfile=a + "/pid", destination=c + "/crashed")
             wait_for("copy and workers after requester crash", lambda: probe("source", "workers_exited", workers=workers + owned), timeout=5)
+            wait_for("source key directory cleanup after requester crash", no_copy_keys)
             wait_for("destination key cleanup after requester crash", lambda: fingerprint("destination") == c_keys)
             assert probe("destination", "late_worker", ticket=ticket)
             finish(process, output, success=False)
@@ -535,6 +557,7 @@ def main():
                    "-l", endpoint["user"], "-p", str(endpoint["port"]), "-O", "exit", "--", endpoint["host"]]))
             wait_for("copy and workers after destination connection loss", lambda: probe("source", "workers_exited", workers=workers + owned), timeout=5)
             finish(process, output, success=False)
+        wait_for("source key directory cleanup after connection loss", no_copy_keys)
         wait_for("destination key cleanup after connection loss", lambda: fingerprint("destination") == c_keys)
         remote("destination", "test ! -e " + shlex.quote(c + "/peer-loss"))
         rows = json.loads(requester("persist", "status", "--json"))["authorized_ssh"]
@@ -551,6 +574,7 @@ def main():
             wait_for("copy before revocation", lambda: partial("revoked"))
             run("syq", "persist", "receive", "off", "--name", "laptop")
             finish(process, output, success=False)
+        wait_for("revoked source key directory cleanup", no_copy_keys)
         wait_for("revoked destination key cleanup", lambda: fingerprint("destination") == c_keys)
         remote("destination", "test ! -e " + shlex.quote(c + "/revoked"))
         run("syq", "persist", "receive", "on", "--name", "laptop", "--notify", "off")
