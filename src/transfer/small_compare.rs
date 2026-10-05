@@ -139,7 +139,8 @@ fn differing_ranges(patch: &SmallPatch, piece: u64) -> Vec<(u64, u32)> {
 enum StreamStep {
     /// A piece read from the source, at its offset and length.
     Piece(usize, u64, u32),
-    /// The patch's begin or a piece sent to the destination.
+    /// The patch's begin, or a piece, sent to the destination.
+    Begin(usize),
     Ack(usize),
     /// The source's metadata read after the patch's last piece.
     Recheck(usize),
@@ -156,6 +157,8 @@ struct StreamState {
     /// It cannot be published: a piece failed, or the receiver reported
     /// that the patch did.
     failed: bool,
+    /// The receiver refused its begin, so no patch is open there to end.
+    refused: bool,
     /// The source changed while it was read, to this or nothing.
     changed: Option<Option<Entry>>,
 }
@@ -473,6 +476,12 @@ impl Worker {
         // The patch whose reads are being sent, and the piece bytes read
         // and not yet sent on.
         let (mut reading, mut buffered) = (0, 0u64);
+        #[cfg(debug_assertions)]
+        crate::fsops::test_race_barrier(
+            "SYQ_TEST_PATCH_STREAM_READY_FILE",
+            "SYQ_TEST_PATCH_STREAM_CONTINUE_FILE",
+            "streamed patches before their pieces are read",
+        )?;
         self.begin_stream(&mut streams, &mut states, 0, &mut destination)?;
         loop {
             while source.len() < reads && reading < streams.len() {
@@ -540,8 +549,11 @@ impl Worker {
             }
             let (step, _) = source.pop_front().expect("pending reply");
             let response = self.src.recv()?;
-            // Before anything more goes to the destination, it must owe no
-            // more acknowledgments than its connection queues.
+            // Before anything more goes to the destination, take the replies
+            // that have arrived, so that a patch the receiver has failed
+            // sends no more pieces, and owe no more acknowledgments than the
+            // destination's connection queues.
+            self.arrived_replies(&streams, &mut states, &mut destination, outcomes)?;
             while destination.len() >= acknowledgments {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let reply = self.dst.recv()?;
@@ -578,26 +590,40 @@ impl Worker {
                 StreamStep::Recheck(index) => {
                     let now = match ok(response, "check streamed patch source") {
                         Ok(Response::Stats(mut entries)) if entries.len() == 1 => {
-                            entries.pop().flatten()
+                            Some(entries.pop().flatten())
                         }
                         Ok(other) => bail!("unexpected response {other:?}"),
-                        Err(_) => {
-                            states[index].failed = true;
-                            None
-                        }
+                        Err(_) => None,
                     };
                     let state = &mut states[index];
                     if !state.begun {
                         continue;
                     }
-                    if !state.failed
-                        && source_changed(&jobs[streams[index].file].entry, now.as_ref())
-                    {
-                        state.changed = Some(now);
+                    // A piece that could not be read, as when the source
+                    // shrank, fails the patch; the source's metadata then
+                    // tells whether it changed, unless reading that failed
+                    // too.
+                    match now {
+                        Some(now)
+                            if source_changed(&jobs[streams[index].file].entry, now.as_ref()) =>
+                        {
+                            state.changed = Some(now);
+                        }
+                        Some(_) => {}
+                        None => state.failed = true,
                     }
-                    let commit = !state.failed && state.changed.is_none();
-                    self.dst.send(Request::PatchEnd { commit })?;
-                    destination.push_back((StreamStep::End(index), std::time::Instant::now()));
+                    if state.refused {
+                        // Nothing is open at the receiver: the patch ends
+                        // here.
+                        outcomes[streams[index].file] = Some(match state.changed.take() {
+                            Some(now) => Compared::SourceChanged(now),
+                            None => Compared::Differs,
+                        });
+                    } else {
+                        let commit = !state.failed && state.changed.is_none();
+                        self.dst.send(Request::PatchEnd { commit })?;
+                        destination.push_back((StreamStep::End(index), std::time::Instant::now()));
+                    }
                     if index + 1 < streams.len() {
                         while destination.len() >= acknowledgments {
                             let (step, _) = destination.pop_front().expect("pending reply");
@@ -607,9 +633,35 @@ impl Worker {
                         self.begin_stream(&mut streams, &mut states, index + 1, &mut destination)?;
                     }
                 }
-                StreamStep::Ack(_) | StreamStep::End(_) => unreachable!("destination steps"),
+                StreamStep::Begin(_) | StreamStep::Ack(_) | StreamStep::End(_) => {
+                    unreachable!("destination steps")
+                }
             }
         }
+    }
+
+    /// Act on the destination's replies that have already arrived, without
+    /// waiting for more.
+    fn arrived_replies(
+        &mut self,
+        streams: &[Streamed],
+        states: &mut [StreamState],
+        destination: &mut std::collections::VecDeque<(StreamStep, std::time::Instant)>,
+        outcomes: &mut [Option<Compared>],
+    ) -> Result<()> {
+        while !destination.is_empty() {
+            let response = if self.dst.reply_ready() {
+                self.dst.recv()?
+            } else {
+                match self.dst.try_recv_with_arrival() {
+                    Some(reply) => reply?.0,
+                    None => return Ok(()),
+                }
+            };
+            let (step, _) = destination.pop_front().expect("pending reply");
+            self.streamed_reply(streams, states, step, response, outcomes);
+        }
+        Ok(())
     }
 
     /// Send the begin of stream `index`, unless the copy was aborted. A patch
@@ -631,7 +683,7 @@ impl Worker {
             patch: Box::new(patch),
             data_len: stream.sent,
         })?;
-        destination.push_back((StreamStep::Ack(index), std::time::Instant::now()));
+        destination.push_back((StreamStep::Begin(index), std::time::Instant::now()));
         states[index].begun = true;
         Ok(())
     }
@@ -648,10 +700,15 @@ impl Worker {
     ) {
         match step {
             // A begin or piece replies Ok until the patch fails; its end
-            // reports why.
-            StreamStep::Ack(index) => {
+            // reports why. A refused begin opened nothing.
+            StreamStep::Begin(index) | StreamStep::Ack(index) => {
                 if !matches!(response, Response::Ok) {
                     states[index].failed = true;
+                }
+                if let (StreamStep::Begin(_), Response::Err(_) | Response::EndpointError(_)) =
+                    (&step, &response)
+                {
+                    states[index].refused = true;
                 }
             }
             StreamStep::End(index) => {

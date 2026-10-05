@@ -624,6 +624,51 @@ fn a_streamed_patch_whose_source_changes_while_it_is_read_is_not_published() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn a_streamed_patch_whose_source_shrinks_is_retried_at_its_new_size() {
+    // The source shrinks once compared, so the pieces past its new end
+    // cannot be read. The file is retried as one whose source changed, at
+    // its new size, rather than replaced whole at the size it was planned.
+    let t = Tmp::new();
+    let source = prng(32 << 20, 887);
+    let mut old = source.clone();
+    old[..20 << 20].fill(b'v');
+    write(&t.path("src/file"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let ready = t.path("compared");
+    let continuation = t.path("continue");
+    let mut child = reusing_copy(&t, "local", &[])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_PATCH_STREAM_READY_FILE", &ready)
+        .env("SYQ_TEST_PATCH_STREAM_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "streamed patch pieces");
+    OpenOptions::new()
+        .write(true)
+        .open(t.path("src/file"))
+        .unwrap()
+        .set_len(10 << 20)
+        .unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert!(
+        stderr_of(&out).contains("changed during transfer, retrying"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(read(&t.path("dst/file")), &source[..10 << 20]);
+    // The retry copies what the source now holds, once.
+    assert_eq!(stats_bytes(&out, "bytes transferred"), 10 << 20);
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 0);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn a_streamed_patch_publishes_over_a_destination_changed_before_its_end() {
     let t = Tmp::new();
     let source = large_differences(&t);
