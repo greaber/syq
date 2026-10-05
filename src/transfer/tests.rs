@@ -4869,6 +4869,161 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
 }
 
+/// A connection that fails, and stays dead, as a dropped one does: at its
+/// `fail_recv`-th reply, or as it sends its `fail_patch`-th patch batch.
+struct FailingConn {
+    inner: Box<dyn Conn>,
+    received: usize,
+    fail_recv: Option<usize>,
+    patches: usize,
+    fail_patch: Option<usize>,
+    dead: bool,
+}
+
+impl FailingConn {
+    fn new(inner: Box<dyn Conn>) -> Self {
+        Self {
+            inner,
+            received: 0,
+            fail_recv: None,
+            patches: 0,
+            fail_patch: None,
+            dead: false,
+        }
+    }
+}
+
+impl Conn for FailingConn {
+    fn send(&mut self, request: Request) -> Result<()> {
+        if let Request::PatchSmallBatch(_) = request {
+            self.patches += 1;
+            self.dead |= self.fail_patch == Some(self.patches);
+        }
+        anyhow::ensure!(!self.dead, "injected connection failure");
+        self.inner.send(request)
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.received += 1;
+        self.dead |= self.fail_recv == Some(self.received);
+        anyhow::ensure!(!self.dead, "injected connection failure");
+        self.inner.recv()
+    }
+    fn reply_ready(&self) -> bool {
+        !self.dead && self.inner.reply_ready()
+    }
+    fn is_dead(&self) -> bool {
+        self.dead
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(String),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// Compare `files` from an in-process source into an ordinary receiver
+/// until `fail` breaks one of the connections, and return the error and
+/// the worker's progress.
+fn compare_until_a_connection_fails(
+    root: &std::path::Path,
+    files: &[(&str, usize, std::ops::Range<usize>)],
+    fail: impl FnOnce(&mut FailingConn, &mut FailingConn),
+) -> (anyhow::Error, Arc<Progress>) {
+    let sched = differing_jobs(root, files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    let mut source = FailingConn::new(Box::new(QueuingSource {
+        ops: crate::fsops::FsOps::new(),
+        replies: Default::default(),
+        in_process: true,
+        most: Default::default(),
+    }));
+    let mut receiver = crate::fsops::FsOps::test_destination(&root.join("target"));
+    let mut destination = FailingConn::new(Box::new(AnsweringConn {
+        answer: move |request: Request| receiver.handle(&request),
+        replies: Default::default(),
+    }));
+    fail(&mut source, &mut destination);
+    (worker.src, worker.dst) = (Box::new(source), Box::new(destination));
+    worker.fast_batch_files = files.len();
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    let error = worker.process_item(sched.next()).unwrap_err();
+    (error, worker.progress.clone())
+}
+
+#[test]
+fn a_received_patch_reply_counts_although_the_source_then_fails() {
+    // The first file's patch reply has arrived when the source's
+    // connection fails as the second file's differing blocks are read.
+    let files = [
+        ("first", 4 << 20, 1 << 20..2 << 20),
+        ("second", 4 << 20, 1 << 20..2 << 20),
+    ];
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (error, progress) = compare_until_a_connection_fails(root, &files, |source, _| {
+        source.fail_recv = Some(2);
+    });
+    assert!(error.to_string().contains("injected connection failure"));
+    // The file the receiver published counts, and only it.
+    assert_eq!(read(root, "source/first"), read(root, "target/first"));
+    assert_ne!(read(root, "source/second"), read(root, "target/second"));
+    assert_eq!(progress.files_done.load(Relaxed), 1);
+    assert_eq!(progress.bytes_done.load(Relaxed), 1 << 20);
+}
+
+#[test]
+fn a_received_patch_reply_counts_although_a_later_patch_cannot_be_sent() {
+    // The first file's patch reply has arrived when the receiver's
+    // connection fails as the second file's patch is sent.
+    let files = [
+        ("first", 4 << 20, 1 << 20..2 << 20),
+        ("second", 4 << 20, 1 << 20..2 << 20),
+        ("third", 4 << 20, 1 << 20..2 << 20),
+    ];
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (error, progress) = compare_until_a_connection_fails(root, &files, |_, destination| {
+        destination.fail_patch = Some(2);
+    });
+    assert!(error.to_string().contains("injected connection failure"));
+    assert_eq!(read(root, "source/first"), read(root, "target/first"));
+    for name in ["second", "third"] {
+        assert_ne!(
+            read(root, &format!("source/{name}")),
+            read(root, &format!("target/{name}")),
+            "{name}"
+        );
+    }
+    assert_eq!(progress.files_done.load(Relaxed), 1);
+    assert_eq!(progress.bytes_done.load(Relaxed), 1 << 20);
+}
+
+fn read(root: &std::path::Path, path: &str) -> Vec<u8> {
+    std::fs::read(root.join(path)).unwrap()
+}
+
 /// A command-restricted receiver: each request is authorized, executed and
 /// settled as its server does, and recorded once executed. `before_patch`
 /// runs between a patch batch's or streamed begin's authorization and its

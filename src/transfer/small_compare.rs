@@ -329,8 +329,6 @@ impl Worker {
         let mut source = std::collections::VecDeque::new();
         let mut destination = std::collections::VecDeque::new();
         let result = (|| -> Result<()> {
-            // Replies taken and not yet acted on, in the order they are taken.
-            let mut taken = std::collections::VecDeque::new();
             loop {
                 // Once the copy is aborted, the groups in flight send nothing
                 // further: what they have outstanding is drained below.
@@ -371,69 +369,64 @@ impl Worker {
                     });
                     in_flight += 1;
                 }
-                // Replies arrive in order on each connection. Take one that
-                // has arrived, as an in-process endpoint's has, so that the
-                // data it holds moves on at once; otherwise wait for the one
-                // whose request went out first.
-                let from_source = match (source.front(), destination.front()) {
-                    (Some(_), Some(_)) if self.src.reply_ready() => true,
-                    (Some(_), Some(_)) if self.dst.reply_ready() => false,
-                    (Some((_, _, a)), Some((_, _, b))) => a <= b,
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => {
-                        debug_assert!(waiting.is_empty());
-                        return Ok(());
-                    }
-                };
-                if from_source {
-                    // A patch reply waits behind the hash replies of the
-                    // groups issued before it. Before a source reply, whose
-                    // patch may first wait for the bandwidth limit, take the
-                    // destination's replies that have already arrived, so
-                    // that the files their patches keep or publish count at
-                    // once.
-                    while !destination.is_empty() {
-                        let Some(response) = self.arrived_reply()? else {
-                            break;
-                        };
-                        let (group, stage, _) = destination.pop_front().expect("pending reply");
-                        taken.push_back((group, stage, response));
-                    }
-                }
-                let (group, stage, _) = if from_source {
-                    source.pop_front()
+                // Replies arrive in order on each connection, and each is
+                // acted on as soon as it is taken, so that what a patch reply
+                // published is recorded before anything else can fail. A
+                // destination reply that has already arrived goes first:
+                // acting on it sends nothing, and a patch reply, which waits
+                // behind the hash replies of the groups issued before it,
+                // then counts its files at once rather than after a source
+                // reply whose patch may first wait for the bandwidth limit.
+                // Next comes a source reply that has arrived, as an
+                // in-process source's has, so that the data it holds moves
+                // on at once; otherwise wait for the reply whose request went
+                // out first.
+                let arrived = if destination.is_empty() {
+                    None
                 } else {
-                    destination.pop_front()
-                }
-                .expect("pending reply");
-                let response = if from_source {
-                    self.src.recv()?
-                } else {
-                    self.dst.recv()?
+                    self.arrived_reply()?
                 };
-                taken.push_back((group, stage, response));
-                while let Some((group, stage, response)) = taken.pop_front() {
-                    let next = self.compare_stage(
-                        &jobs,
-                        &mut groups[group],
-                        stage,
-                        response,
-                        &mut outcomes,
-                        &mut streams,
-                    )?;
-                    if let Stage::Patch = stage {
-                        let files = groups[group].files.iter().copied();
-                        self.complete_settled(batch, files, &mut outcomes)?;
-                    }
-                    match next {
-                        Some((Stage::Read, request)) => waiting.push_back((group, request)),
-                        Some((stage, request)) => {
-                            self.dst.send(request)?;
-                            destination.push_back((group, stage, std::time::Instant::now()));
+                let (group, stage, response) = if let Some(response) = arrived {
+                    let (group, stage, _) = destination.pop_front().expect("pending reply");
+                    (group, stage, response)
+                } else {
+                    let from_source = match (source.front(), destination.front()) {
+                        (Some(_), Some(_)) if self.src.reply_ready() => true,
+                        (Some((_, _, a)), Some((_, _, b))) => a <= b,
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => {
+                            debug_assert!(waiting.is_empty());
+                            return Ok(());
                         }
-                        None => in_flight -= 1,
+                    };
+                    if from_source {
+                        let (group, stage, _) = source.pop_front().expect("pending reply");
+                        (group, stage, self.src.recv()?)
+                    } else {
+                        let (group, stage, _) = destination.pop_front().expect("pending reply");
+                        (group, stage, self.dst.recv()?)
                     }
+                };
+                let next = self.compare_stage(
+                    &jobs,
+                    &mut groups[group],
+                    stage,
+                    response,
+                    &mut outcomes,
+                    &mut streams,
+                )?;
+                if let Stage::Patch = stage {
+                    let files = groups[group].files.iter().copied();
+                    self.complete_settled(batch, files, &mut outcomes)?;
+                }
+                match next {
+                    Some((Stage::Read, request)) => waiting.push_back((group, request)),
+                    Some((stage, request)) => {
+                        self.dst.send(request)?;
+                        destination.push_back((group, stage, std::time::Instant::now()));
+                    }
+                    None => in_flight -= 1,
                 }
             }
         })();
