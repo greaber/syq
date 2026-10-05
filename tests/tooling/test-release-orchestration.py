@@ -186,6 +186,8 @@ class PathScopeTests(Scratch):
         for path, checks in [("tests/tooling/test-release-tools.py", "release workflows"),
                              ("tests/tooling/test-installer.py", "installer workflows"),
                              ("tests/tooling/test-try-benchmark.py", "benchmark workflows"),
+                             ("scripts/benchmark-concurrency.py", "benchmark workflows"),
+                             ("tests/tooling/test-benchmark-concurrency.py", "benchmark workflows"),
                              ("tests/tooling/test-run-focused-check.py", "focused workflows"),
                              ("tests/tooling/test-branch-status.py", "branch workflows"),
                              ("scripts/setup.sh", "setup workflows"),
