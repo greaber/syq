@@ -420,6 +420,12 @@ impl Engine {
             })
             .await?;
             self.progress.finish_transfer();
+            #[cfg(debug_assertions)]
+            crate::fsops::test_race_barrier(
+                "SYQ_TEST_FINALIZATION_READY_FILE",
+                "SYQ_TEST_FINALIZATION_CONTINUE_FILE",
+                "copy finalization",
+            )?;
             // Prune while directories are writable, then restore their modes and times.
             // Apply metadata even when the deletion budget refuses pruning.
             let pruned = self.prune(prune, Some(&destination)).await;
