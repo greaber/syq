@@ -257,7 +257,7 @@ impl FsOps {
             if refused {
                 Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
             } else {
-                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE)
+                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, false)
             }
         };
         match created {
@@ -275,7 +275,7 @@ impl FsOps {
                 drop(STAGING_ADMISSION.enter());
                 let target = self.destination_mutation_target(&put.path, put.guard.as_ref())?;
                 let _turn = root.mutation_turn(&relative).ok();
-                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE)
+                self.create_stage(put, source, target, PRIVATE_PARTIAL_MODE, false)
             }
             created => created,
         }
