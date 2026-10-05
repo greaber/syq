@@ -3454,6 +3454,119 @@ fn seed_basis_hashes_retry_bytes_without_rewriting_them() {
     assert_eq!(fs::read(partial).unwrap(), b"retry bytes");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
+    // A whole-file attempt that failed for want of space leaves an empty
+    // sidecar in the file's final mode, and anyone that mode admits may have
+    // opened it. A later attempt seeds from the old file, or from an earlier
+    // copy's partial (here one that appeared after the attempt failed, as
+    // another copy's would). It must not write those bytes through that
+    // inode, but into a new private sidecar, and the published file must
+    // have only the new contents and the wanted mode.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let secret = b"only the old file holds these bytes";
+    for donor in ["final", "partial"] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let path = temporary.path().join("file");
+        let id = [21; 16];
+        let target = || PartialTarget {
+            path: b"file",
+            id: &id,
+            guard: None,
+        };
+        let mut old: Vec<u8> = (0..8 * block).map(|i| (i % 251) as u8 | 1).collect();
+        for chunk in old[3 * block..4 * block].chunks_mut(secret.len()) {
+            chunk.copy_from_slice(&secret[..chunk.len()]);
+        }
+        let mut new = old.clone();
+        new[3 * block..4 * block].fill(0x5a);
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut ops = destination_ops(temporary.path());
+        super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+        let prepared = ops.prepare(
+            target(),
+            PrepareOptions {
+                size: new.len() as u64,
+                inplace: false,
+                mode: 0o644,
+                attempt: 0,
+                create_if_missing: true,
+            },
+        );
+        super::partial::FALLOCATE_ERRNO.set(None);
+        assert!(prepared.is_err(), "{donor}: {prepared:?}");
+        let sidecar = partial_path(&path, &id).unwrap();
+        let reader = File::open(&sidecar).unwrap();
+        assert_eq!(reader.metadata().unwrap().len(), 0, "{donor}");
+        if donor == "partial" {
+            let earlier = partial_path(&path, &[22; 16]).unwrap();
+            fs::write(&earlier, &old).unwrap();
+            fs::set_permissions(&earlier, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let read_all = |file: &File| {
+            let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+            file.read_exact_at(&mut bytes, 0).unwrap();
+            bytes
+        };
+        let holds_secret =
+            |bytes: Vec<u8>| bytes.windows(secret.len()).any(|bytes| bytes == secret);
+        // Another worker of the same copy retries the file.
+        let mut ops = destination_ops(temporary.path());
+        let seeded = ops
+            .seed_basis(target(), new.len() as u64, block as u64, None, 1)
+            .unwrap();
+        assert!(
+            !holds_secret(read_all(&reader)),
+            "{donor}: seeded through the held descriptor"
+        );
+        let algorithm = ops.hash_policy.algorithm;
+        assert_eq!(seeded.hashes.len(), 8, "{donor}");
+        for (index, chunk) in new.chunks(block).enumerate() {
+            if seeded.hashes[index] != algorithm.hash(chunk) {
+                ops.write_range(
+                    target(),
+                    false,
+                    1,
+                    (index * block) as u64,
+                    content_digest(chunk),
+                    chunk,
+                )
+                .unwrap();
+            }
+        }
+        let meta = Meta {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            inode_metadata: None,
+        };
+        ops.finalize(
+            b"file",
+            false,
+            &id,
+            &meta,
+            flags::MODE,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None,
+            },
+        )
+        .unwrap();
+        assert!(!holds_secret(read_all(&reader)), "{donor}");
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode() & 0o7777,
+            0o644,
+            "{donor}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), new, "{donor}");
+        assert!(!sidecar.exists(), "{donor}");
+    }
+}
+
 #[test]
 fn partial_discovery_is_exact_and_directory_cache_is_bounded() {
     let temporary = crate::test_support::tempdir().unwrap();

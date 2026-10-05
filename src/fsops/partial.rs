@@ -760,7 +760,7 @@ impl FsOps {
                 final_ranges.is_none_or(|ranges| !ranges.is_empty()),
             )?;
         }
-        let (relative, _label, opened) =
+        let (relative, label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
                 self.open_private_partial_rooted(
                     &target.root,
@@ -773,7 +773,7 @@ impl FsOps {
         let (output, basis_size) = opened.context("sidecar creation was requested")?;
         let location = FileLocation::Rooted {
             root: target.root.identity(),
-            relative,
+            relative: relative.clone(),
         };
         // Retry bytes already belong to this invocation. Hash them in place;
         // copying them onto themselves adds writes without improving safety.
@@ -820,6 +820,19 @@ impl FsOps {
             selected_final = input.as_ref().and(final_ranges);
             final_donor = input.is_some();
         }
+        // A donor's bytes go only into a sidecar created for them: an empty
+        // one found at the name may have been opened while its mode was
+        // wider, as when an earlier attempt created it in the final mode.
+        let (output, basis_size) = if input.is_some() && basis_size.is_some() {
+            drop(output);
+            self.uncache_rooted(&target.root, &relative);
+            let (output, _) = create_fresh_rooted_partial(&target.root, &relative, &label, || {
+                self.create_partial_rooted(&target.root, &relative, PRIVATE_PARTIAL_MODE)
+            })?;
+            (output, None)
+        } else {
+            (output, basis_size)
+        };
         if stage_only {
             let mut compare_final = false;
             if let Some(input) = input.as_ref() {
@@ -3363,6 +3376,45 @@ pub(super) fn discard_safe_rooted_partial_if_same(
         Some(_) | None => {}
     }
     Ok(())
+}
+
+/// Create a sidecar with `create`, which must create exclusively, removing
+/// whatever the name holds first. A sidecar that will hold anything but the
+/// new contents, such as bytes of the file it replaces or of an earlier
+/// partial, must be a file no one else can have opened: permissions are
+/// checked only at open, so whoever opened a leftover while its mode was
+/// wider can read what is later written to it. Only an exclusive create shows
+/// that a file is new, whatever mode the filesystem gives it; an empty file
+/// of ours with a narrow mode may have been neither. Like the checked reuse,
+/// this removes anything but a directory at the sidecar's name, which is
+/// this copy's own.
+pub(super) fn create_fresh_rooted_partial(
+    root: &Root,
+    relative: &RelativePath,
+    label: &Path,
+    create: impl Fn() -> Result<File>,
+) -> Result<(File, fs::Metadata)> {
+    for _ in 0..8 {
+        match create() {
+            Ok(file) => {
+                let metadata = file.metadata()?;
+                note_created_owner(&metadata);
+                return Ok((file, metadata));
+            }
+            Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
+                match root.unlink(relative) {
+                    Ok(()) => {}
+                    Err(error) if error_is_kind(&error, io::ErrorKind::NotFound) => {}
+                    Err(error) => return Err(error.context(format!("replace {}", label.display()))),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    bail!(
+        "partial {} changed repeatedly while creating it",
+        label.display()
+    )
 }
 
 #[cfg(debug_assertions)]
