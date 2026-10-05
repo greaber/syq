@@ -613,7 +613,9 @@ class NativeClientTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
 
     def test_prune_before_implies_pruning(self) -> None:
-        run = self.client.cp("source", into="target", prune_before=True, max_delete=5)
+        events = []
+        self.client.cp("source", into="target", prune_before=True, max_delete=5, on_event=events.append)
+        run = next(event for event in events if isinstance(event, syq.RunEvent))
         self.assertTrue(run.prune)
         self.assertIn("--prune-before", self.argv())
         self.assertNotIn("--prune", self.argv())

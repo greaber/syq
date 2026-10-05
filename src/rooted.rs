@@ -1736,6 +1736,7 @@ impl Root {
 
     /// Remove one empty directory. Recursive deletion is intentionally not part
     /// of this foundation.
+    #[cfg(test)]
     pub(crate) fn remove_directory(&self, path: &RelativePath) -> Result<()> {
         self.unlink_with_flags(path, libc::AT_REMOVEDIR, "remove directory")
     }
