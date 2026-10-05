@@ -676,7 +676,9 @@ impl FsOps {
     /// A stage made as the clone, as on macOS, holds it already. When the
     /// file cannot be copied so, or changed after it was hashed, the stage
     /// holds the assembled file instead, its reused blocks read and checked
-    /// again. The write is observed unless `unobserved` collects its bytes
+    /// again. So does a sidecar left by an earlier attempt: it had that
+    /// attempt's mode, and a reader that opened it then can still read it.
+    /// The write is observed unless `unobserved` collects its bytes
     /// for a caller that records them, as `write_small_stage` does.
     fn write_patch_stage(
         &self,
@@ -691,6 +693,8 @@ impl FsOps {
         // nothing changed it before or while it was copied.
         let copied = if stage.cloned {
             true
+        } else if stage.reused {
+            false
         } else {
             file.set_len(0)?;
             self.copy_basis(source, stage)
@@ -1056,7 +1060,12 @@ impl FsOps {
 
     /// Create the stage of a put, or of a patch with the file it reuses
     /// blocks of. On macOS, where a clone is a new file, a cloning patch's
-    /// stage is made as a clone of that file when it can be.
+    /// stage is made as a clone of that file when it can be. On Linux a
+    /// patch's stage is created and then takes a clone or copy of that file,
+    /// whose bytes may be kept from others: the wanted mode, the group a new
+    /// file gets, or an ACL inherited from the directory could let them read
+    /// those bytes beside the target. So the stage is created with only its
+    /// owner's permissions, and publication sets the wanted mode.
     fn create_stage(
         &mut self,
         put: &SmallPut,
@@ -1078,8 +1087,11 @@ impl FsOps {
                 });
             }
         }
-        let _ = source;
-        self.create_small_stage(put, target)
+        let mut mode = staged_file_mode(&put.meta, put.flags);
+        if cfg!(target_os = "linux") && source.is_some() {
+            mode &= 0o700;
+        }
+        self.create_small_stage_with_mode(put, target, mode)
     }
 
     /// Clone the file a patch reuses blocks of to the patch's sidecar name,
@@ -1122,8 +1134,16 @@ impl FsOps {
         put: &SmallPut,
         target: RootedTarget,
     ) -> Result<SmallStage> {
+        self.create_small_stage_with_mode(put, target, staged_file_mode(&put.meta, put.flags))
+    }
+
+    fn create_small_stage_with_mode(
+        &mut self,
+        put: &SmallPut,
+        target: RootedTarget,
+        mode: u32,
+    ) -> Result<SmallStage> {
         self.uncache_rooted(&target.root, &target.relative);
-        let mode = staged_file_mode(&put.meta, put.flags);
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 // Nothing reads a small file's sidecar, so it is opened for
@@ -1720,6 +1740,86 @@ mod tests {
         expected[5 * block as usize..6 * block as usize].fill(2);
         assert_eq!(fs::read(&path).unwrap(), expected);
         assert_eq!(entries(directory), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seeded_stage_lets_no_one_else_read_the_file_it_replaces() {
+        // A patch's stage takes a clone or kernel copy of the file it
+        // replaces before the differing blocks are written over it. Until
+        // publication gives it the wanted mode, only its owner may open it:
+        // the old file here is private and the new one is not, so a stage
+        // created in the wanted mode would let others read the old file's
+        // bytes beside the target. A sidecar left by an earlier attempt may
+        // have been opened while it had that attempt's mode, so it is
+        // written whole instead.
+        let block = MIN_HASH_BLOCK_BYTES;
+        for (wanted, cloning, leftover) in [
+            (0o644, true, false),
+            (0o644, false, false),
+            (0o4755, false, false),
+            (0o644, true, true),
+        ] {
+            let case = format!("mode {wanted:o} cloning {cloning} leftover {leftover}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..32 * block).map(|i| (i % 249) as u8 | 1).collect();
+            let mut new = old.clone();
+            new[20 * block as usize] ^= 0xff;
+            let path = directory.join("file");
+            fs::write(&path, &old).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops
+                .hash_existing_batch(
+                    block,
+                    &[ExistingRead {
+                        path: b"file".to_vec(),
+                        len: new.len() as u64,
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    }],
+                )
+                .remove(0)
+                .unwrap();
+            let mut patch = patch_from("file", &new, block, &hashed, algorithm);
+            patch.meta.mode = wanted;
+            patch.flags = flags::MODE;
+            let Ok(PatchStep::Staged(put, Some(source))) = ops.prepare_patch(&patch) else {
+                panic!("{case}: the patch is not staged from the file it replaces");
+            };
+            let target = ops.destination_mutation_target(&put.path, None).unwrap();
+            let (relative, _) = rooted_partial_target(&target, &put.copy_id).unwrap();
+            let sidecar = directory.join(relative.to_path_buf());
+            if leftover {
+                fs::write(&sidecar, b"an earlier attempt").unwrap();
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            let mode = || fs::metadata(&sidecar).unwrap().mode() & 0o7777;
+            let stage = ops.create_stage(&put, Some(&source), target).unwrap();
+            assert_eq!(stage.reused, leftover, "{case}");
+            assert_eq!(stage.created.mode() & 0o077, 0, "{case}: created");
+            assert_eq!(mode() & 0o077, 0, "{case}: created");
+            CLONED_PATCHES.set(0);
+            refusing_clones(!cloning, || ops.write_patch_stage(&source, &stage, None)).unwrap();
+            assert_eq!(CLONED_PATCHES.get(), usize::from(!leftover), "{case}");
+            assert_eq!(mode() & 0o077, 0, "{case}: written");
+            // Publication gives the wanted mode and the new contents.
+            refusing_clones(!cloning, || {
+                ops.write_small_stage(&put, Some(&source), &stage, None)
+            })
+            .unwrap();
+            ops.publish_small_stage(&put, &stage).unwrap();
+            ops.finish_small_stage(&put, stage).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                wanted,
+                "{case}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(entries(directory), 1, "{case}");
+        }
     }
 
     #[cfg(target_os = "linux")]
