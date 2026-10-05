@@ -32,9 +32,9 @@ impl RequestReader {
         named_socket: Option<std::os::unix::net::UnixStream>,
         disconnected: Arc<std::sync::atomic::AtomicBool>,
         source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
-        let thread = std::thread::spawn(move || loop {
+        let thread = std::thread::Builder::new().spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
             let failed = msg.is_err();
             if failed {
@@ -49,13 +49,13 @@ impl RequestReader {
             if tx.send(msg).is_err() || failed {
                 break;
             }
-        });
-        Self {
+        })?;
+        Ok(Self {
             rx: Some(rx),
             thread: Some(thread),
             tcp_socket,
             named_socket,
-        }
+        })
     }
 
     fn recv(
@@ -812,6 +812,9 @@ fn serve<R: Read + Send + 'static, W: Write>(
     // All foreign descriptor claims and their close-on-exec setup are complete
     // before readiness is acknowledged or this connection starts its reader.
     w.write_msg(&Response::HelloOk {
+        descriptors: is_control
+            .then(crate::resources::Descriptors::current)
+            .flatten(),
         identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
@@ -837,7 +840,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
         .as_ref()
         .filter(|_| matches!(role, ConnectionRole::Control))
         .cloned();
-    let reader = RequestReader::spawn(r, tcp_socket, named_socket, disconnected, source_control);
+    let reader = RequestReader::spawn(r, tcp_socket, named_socket, disconnected, source_control)
+        .context("start request reader")?;
     let server_actor = ops.observations.actor("server");
     let mut w = ObservedWriter {
         compress: w.compress,
@@ -1569,23 +1573,25 @@ fn tcp_listen(
             descriptor_session.clone(),
         );
         let pacing = pacing.clone();
-        std::thread::spawn(move || {
-            accept_data_connections(
-                listener,
-                key,
-                token,
-                debug,
-                compress,
-                next_id,
-                live,
-                max_live,
-                seen,
-                authority,
-                source_authority,
-                descriptor_session,
-                pacing,
-            )
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                accept_data_connections(
+                    listener,
+                    key,
+                    token,
+                    debug,
+                    compress,
+                    next_id,
+                    live,
+                    max_live,
+                    seen,
+                    authority,
+                    source_authority,
+                    descriptor_session,
+                    pacing,
+                )
+            })
+            .context("start TCP accept thread")?;
     }
     Ok((port, families, effective_congestion_control))
 }
@@ -1660,27 +1666,33 @@ fn accept_data_connections(
             descriptor_session.clone(),
         );
         let pacing = pacing.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = serve_tcp(
-                stream,
-                id,
-                key,
-                token,
-                debug,
-                compress,
-                &seen,
-                authority.clone(),
-                source_authority.clone(),
-                descriptor_session,
-                pacing,
-                handshake_deadline,
-            ) {
-                if debug {
-                    crate::output::diagnostic!("syq server (tcp {id}): {e:#}");
+        let failed_live = live.clone();
+        if std::thread::Builder::new()
+            .spawn(move || {
+                if let Err(e) = serve_tcp(
+                    stream,
+                    id,
+                    key,
+                    token,
+                    debug,
+                    compress,
+                    &seen,
+                    authority.clone(),
+                    source_authority.clone(),
+                    descriptor_session,
+                    pacing,
+                    handshake_deadline,
+                ) {
+                    if debug {
+                        crate::output::diagnostic!("syq server (tcp {id}): {e:#}");
+                    }
                 }
-            }
-            live.fetch_sub(1, Relaxed);
-        });
+                live.fetch_sub(1, Relaxed);
+            })
+            .is_err()
+        {
+            failed_live.fetch_sub(1, Relaxed);
+        }
     }
 }
 

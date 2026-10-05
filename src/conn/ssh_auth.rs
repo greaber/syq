@@ -22,9 +22,9 @@ impl Failure {
     }
 }
 
-pub(super) fn capture(mut stderr: ChildStderr) -> Receiver<Option<Failure>> {
+pub(super) fn capture(mut stderr: ChildStderr) -> std::io::Result<Receiver<Option<Failure>>> {
     let (send, receive) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         // Keep diagnostics live, including partial lines, with bounded storage.
         // Successful persistent SSH connections may keep this pipe open; nobody
         // waits for the reader after a successful helper handshake.
@@ -48,8 +48,8 @@ pub(super) fn capture(mut stderr: ChildStderr) -> Receiver<Option<Failure>> {
             }
         }
         let _ = send.send(classify(&tail));
-    });
-    receive
+    })?;
+    Ok(receive)
 }
 
 fn classify(stderr: &[u8]) -> Option<Failure> {

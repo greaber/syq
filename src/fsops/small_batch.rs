@@ -12,6 +12,87 @@ pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
 
+// Filesystem servers may have a much lower limit than this process, and FUSE
+// may translate their exhaustion to EPERM. Learn only for this process. A
+// failed create gets one retry after the staged files have been closed; all
+// checks and atomic publication still run on that retry.
+const REDUCED: usize = 1 << (usize::BITS - 1);
+struct StagingAdmission {
+    // The high bit stops new bursts; the other bits count admitted bursts.
+    state: AtomicUsize,
+    wait: Mutex<()>,
+    drained: std::sync::Condvar,
+}
+impl StagingAdmission {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            wait: Mutex::new(()),
+            drained: std::sync::Condvar::new(),
+        }
+    }
+    fn width(&self) -> usize {
+        if self.state.load(Ordering::Relaxed) & REDUCED == 0 {
+            BURST
+        } else {
+            1
+        }
+    }
+    fn enter(&self) -> Option<StagingBurst<'_>> {
+        // The healthy path does not take a process-wide mutex. Admission and
+        // reduction use one atomic so no new burst can slip past a reduction.
+        let mut state = self.state.load(Ordering::Relaxed);
+        while state & REDUCED == 0 {
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(StagingBurst(self)),
+                Err(current) => state = current,
+            }
+        }
+        let mut wait = self.wait.lock().unwrap();
+        while self.state.load(Ordering::Acquire) != REDUCED {
+            wait = self.drained.wait(wait).unwrap();
+        }
+        None
+    }
+    fn reduce(&self) {
+        let before = self.state.fetch_or(REDUCED, Ordering::AcqRel);
+        if before & REDUCED == 0 && crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq: reducing small-file staging after descriptor pressure"
+            );
+        }
+    }
+}
+static STAGING_ADMISSION: StagingAdmission = StagingAdmission::new();
+struct StagingBurst<'a>(&'a StagingAdmission);
+impl Drop for StagingBurst<'_> {
+    fn drop(&mut self) {
+        if self.0.state.fetch_sub(1, Ordering::AcqRel) == REDUCED + 1 {
+            // Pair with the waiter's condition check to avoid a missed wake.
+            let _wait = self.0.wait.lock().unwrap();
+            self.0.drained.notify_all();
+        }
+    }
+}
+
+fn retry_stage_open(error: &anyhow::Error, network: impl FnOnce() -> bool) -> bool {
+    let errno = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error);
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE) => true,
+        // SSHFS can translate the server's EMFILE to EPERM. Inspect only on
+        // failure: local permission errors should not shrink future batches.
+        Some(libc::EPERM) => network(),
+        _ => false,
+    }
+}
 /// Threads a run writes and closes its files on, on a network filesystem.
 /// Creating and renaming stay one at a time per directory, so a few threads
 /// keep the rest shorter than the creates.
@@ -699,7 +780,7 @@ impl FsOps {
                 next += 1;
                 continue;
             }
-            let reserved = ReservedDescriptors::up_to(BURST - 1);
+            let reserved = ReservedDescriptors::up_to(STAGING_ADMISSION.width() - 1);
             let mut run: Vec<(usize, RootedTarget)> = Vec::with_capacity(1 + reserved.0);
             // A run stays in one directory and names each target once: a
             // repeated target would share its sidecar with the earlier one.
@@ -757,16 +838,59 @@ impl FsOps {
         let Some((_, first)) = run.first() else {
             return;
         };
+        let Some(burst) = STAGING_ADMISSION.enter() else {
+            for (index, _) in run {
+                results[index] = self
+                    .put_small_with_source(
+                        &puts[index],
+                        sources.get(index).and_then(Option::as_ref),
+                    )
+                    .map_err(|error| wire_error(&error));
+            }
+            return;
+        };
         let (root, directory) = (first.root.clone(), first.relative.clone());
         let source = |index: usize| sources.get(index).and_then(Option::as_ref);
         let mut stages = Vec::with_capacity(run.len());
+        let mut retry = Vec::new();
         {
             // A turn only schedules. If it cannot be taken, the operations
             // themselves report what is wrong with the path.
             let _turn = root.mutation_turn(&directory).ok();
-            for (index, target) in run {
-                match self.create_stage(&puts[index], source(index), target) {
+            let mut remaining = run.into_iter();
+            while let Some((index, target)) = remaining.next() {
+                #[cfg(debug_assertions)]
+                let refuse = std::env::var("SYQ_TEST_STAGING_LIMIT")
+                    .ok()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|limit| stages.len() >= limit);
+                #[cfg(not(debug_assertions))]
+                let refuse = false;
+                let created = if refuse {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
+                } else {
+                    self.create_stage(&puts[index], source(index), target)
+                };
+                match created {
                     Ok(stage) => stages.push((index, stage)),
+                    Err(error)
+                        if retry_stage_open(&error, || {
+                            if let Some((_, stage)) = stages.first() {
+                                on_network_file_system(&stage.file, stage.created.dev())
+                            } else {
+                                root.resolve_parent(&directory).ok().is_some_and(|parent| {
+                                    parent.directory().metadata().ok().is_some_and(|meta| {
+                                        on_network_file_system(parent.directory(), meta.dev())
+                                    })
+                                })
+                            }
+                        }) =>
+                    {
+                        STAGING_ADMISSION.reduce();
+                        retry.push(index);
+                        retry.extend(remaining.map(|(index, _)| index));
+                        break;
+                    }
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
@@ -842,6 +966,34 @@ impl FsOps {
         for (index, result) in finished {
             results[index] = result;
         }
+        drop(burst);
+        if !retry.is_empty() {
+            // Other workers must publish and close their existing bursts too.
+            // They never wait while holding a burst or directory turn.
+            drop(STAGING_ADMISSION.enter());
+        }
+        for index in retry {
+            results[index] = self
+                .put_small_with_source(&puts[index], sources.get(index).and_then(Option::as_ref))
+                .map_err(|error| wire_error(&error));
+        }
+    }
+
+    // A patch can carry its contents in an open basis rather than put.data.
+    // The one-file fallback must keep that basis and its validation intact.
+    fn put_small_with_source(
+        &mut self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+    ) -> Result<Option<(u64, u64)>> {
+        if source.is_none() {
+            return self.put_small(put);
+        }
+        let target = self.small_target(put)?;
+        let stage = self.create_stage(put, source, target)?;
+        self.write_small_stage(put, source, &stage, None)?;
+        self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage)
     }
 
     /// Create the stage of a put, or of a patch with the file it reuses
@@ -1035,6 +1187,49 @@ impl FsOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_reduction_drains_admitted_bursts_before_retry() {
+        let admission = StagingAdmission::new();
+        let first = admission.enter().unwrap();
+        let second = admission.enter().unwrap();
+        assert_eq!(admission.width(), BURST);
+        admission.reduce();
+        assert_eq!(admission.width(), 1);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let admission = &admission;
+            let waiter = scope.spawn(move || {
+                assert!(admission.enter().is_none());
+                tx.send(()).unwrap();
+            });
+            drop(first);
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            drop(second);
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            waiter.join().unwrap();
+        });
+        assert!(admission.enter().is_none());
+    }
+
+    #[test]
+    fn staging_permission_recovery_requires_network_filesystem() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let error = io::Error::from_raw_os_error(errno).into();
+            assert!(retry_stage_open(&error, || panic!(
+                "no filesystem query needed"
+            )));
+        }
+        let permission = io::Error::from_raw_os_error(libc::EPERM).into();
+        assert!(!retry_stage_open(&permission, || false));
+        assert!(retry_stage_open(&permission, || true));
+        let denied = io::Error::from_raw_os_error(libc::EACCES).into();
+        assert!(!retry_stage_open(&denied, || panic!(
+            "no filesystem query needed"
+        )));
+    }
 
     fn put(path: &str, data: &[u8]) -> SmallPut {
         SmallPut {

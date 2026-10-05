@@ -339,6 +339,7 @@ impl DescriptorSession {
             socket_name: "broker.sock",
             listener_thread: "syq-fd-listener",
             client_thread: "syq-fd-client",
+            inline_on_thread_failure: true,
             max_connections,
             io_timeout: BROKER_IO_TIMEOUT,
         };
@@ -1331,6 +1332,72 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rejected"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn descriptor_handoffs_survive_client_thread_refusal() {
+        const CHILD: &str = "SYQ_TEST_DESCRIPTOR_BROKER_INLINE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "descriptor_broker::tests::descriptor_handoffs_survive_client_thread_refusal",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("SYQ_TEST_REFUSE_BROKER_THREAD", "syq-fd-client")
+                .status_guarded()
+                .unwrap();
+            assert!(status.success(), "thread-refusal subprocess failed");
+            return;
+        }
+
+        // Exercise the real protocol, including repeatable identity, access
+        // mode, close-on-exec, and rejection, with every client spawn refused.
+        source_parent_and_object_are_distinct_repeatable_capabilities();
+        independent_process_receives_exact_registered_descriptor();
+        broker_rejects_bad_secrets_and_unknown_roots();
+        stream_tickets_preserve_direction_across_the_broker();
+
+        // A stalled inline client must not make broker teardown wait for the
+        // I/O timeout. Also prove the hook reached the listener fallback.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let broker = PrivateBroker::start_managed(
+            PrivateBrokerConfig {
+                directory_prefix: "syq-inline-test-",
+                socket_name: "broker.sock",
+                listener_thread: "syq-inline-test-listener",
+                client_thread: "syq-fd-client",
+                inline_on_thread_failure: true,
+                max_connections: 1,
+                io_timeout: Duration::from_secs(30),
+            },
+            move |mut stream, _| {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some("syq-inline-test-listener")
+                );
+                entered_tx.send(()).unwrap();
+                assert!(stream.read_exact(&mut [0]).is_err());
+            },
+        )
+        .unwrap();
+        let directory = broker.socket_path().parent().unwrap().to_path_buf();
+        let mut stalled = UnixStream::connect(broker.socket_path()).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            drop(broker);
+            closed_tx.send(()).unwrap();
+        });
+        closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(stalled.read(&mut [0]).unwrap(), 0);
+        assert!(!directory.exists());
     }
 
     #[test]

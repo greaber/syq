@@ -1117,6 +1117,7 @@ impl ConstrainedAgentBroker {
                 socket_name: "agent.sock",
                 listener_thread: "syq-agent-listener",
                 client_thread: "syq-agent-client",
+                inline_on_thread_failure: false,
                 max_connections,
                 io_timeout: BROKER_IO_TIMEOUT,
             },

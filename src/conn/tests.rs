@@ -77,6 +77,7 @@ use std::os::unix::ffi::OsStrExt;
 
 fn hello_ok() -> Response {
     Response::HelloOk {
+        descriptors: None,
         identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
@@ -236,7 +237,8 @@ fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, thread, _) =
-            spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone());
+            spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone())
+                .unwrap();
         assert!(matches!(
             rx.recv().unwrap().unwrap().value,
             Response::HelloOk { .. }
@@ -972,6 +974,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         let mut writer = FrameWriter::new(socket, false);
         writer
             .write_msg(&Response::HelloOk {
+                descriptors: None,
                 identity: crate::identity::build().to_string(),
                 platform: crate::identity::platform(),
                 supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
@@ -1125,6 +1128,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
     assert!(!helper_needs_install(&error));
     assert!(is_ssh_connect_error(&error));
     conn.peer = Some(PeerInfo {
+        descriptors: None,
         identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: false,
@@ -2379,6 +2383,7 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
     let before = spec.pool_endpoint().program;
     assert_eq!(spec.session_command_for(&server, true), before);
     spec.diagnostics.lock().unwrap().peer = Some(PeerInfo {
+        descriptors: None,
         identity: crate::identity::build().into(),
         platform: "linux-aarch64".into(),
         supports_confined_socket_nodes: true,
@@ -2552,7 +2557,8 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
     let (rx, reader, batch_receipts) =
-        spawn_observed_reader(Box::new(client.try_clone().unwrap()), 4, Default::default());
+        spawn_observed_reader(Box::new(client.try_clone().unwrap()), 4, Default::default())
+            .unwrap();
     let mut replies = FrameWriter::new(peer.try_clone().unwrap(), false);
     replies.write_msg(&hello_ok()).unwrap();
     let mut requests = FrameReader::new(peer);
@@ -2620,4 +2626,16 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     drop(replies);
     drop(requests);
     drop(conn);
+}
+
+#[test]
+fn local_worker_initialization_preserves_descriptor_exhaustion() {
+    let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE)).context(
+        WorkerInitializationError("initialize local source worker".into()),
+    );
+    assert!(is_worker_initialization_error(&error));
+    assert!(crate::resources::exhausted(&error));
+    let rejection: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
+    assert!(is_worker_initialization_error(&rejection));
+    assert!(!crate::resources::exhausted(&rejection));
 }
