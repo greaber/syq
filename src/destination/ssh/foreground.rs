@@ -660,7 +660,12 @@ mod tests {
             .args(["-c", "echo $$ > pid; exec sleep 30"])
             .current_dir(root.path());
         let started = Instant::now();
-        let error = run(&mut command, || marker.exists()).unwrap_err();
+        // The redirection creates the file before echo writes the PID, so
+        // revoke only once the whole line is there.
+        let error = run(&mut command, || {
+            fs::read_to_string(&marker).is_ok_and(|pid| pid.ends_with('\n'))
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("revoked"));
         assert!(started.elapsed() < Duration::from_secs(5));
         let pid: i32 = fs::read_to_string(marker).unwrap().trim().parse().unwrap();
