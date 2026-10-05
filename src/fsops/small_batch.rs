@@ -669,13 +669,17 @@ impl FsOps {
     /// copy_file_range, keeping the file's holes. A stage taking a copy of
     /// a dense file is allocated first, as a partial seeded from one is.
     /// Only what the new file can reuse is copied: the old file up to the new
-    /// length, rounded up to a whole block so that a clone stays aligned.
+    /// length, rounded up to 64 KiB, which keeps a clone aligned whatever the
+    /// comparison block is.
     /// False when the file could not be copied so.
     fn copy_basis(&self, source: &PatchSource<'_>, stage: &SmallStage) -> bool {
         #[cfg(target_os = "linux")]
         {
-            let patch = source.patch;
-            let reusable = patch.len.div_ceil(patch.block).saturating_mul(patch.block);
+            let reusable = source
+                .patch
+                .len
+                .div_ceil(MIN_HASH_BLOCK_BYTES)
+                .saturating_mul(MIN_HASH_BLOCK_BYTES);
             super::basis_copy::seed(
                 &source.old,
                 &stage.file,

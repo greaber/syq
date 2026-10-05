@@ -34,7 +34,7 @@ pub(super) fn seed(
     prepare_copy: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let len = len.min(input.metadata()?.len());
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     SEEDED.set(len);
     if len == 0 {
         return Ok(());
