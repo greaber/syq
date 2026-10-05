@@ -228,8 +228,9 @@ builds the new file from those and its own matching blocks, which must be
 unchanged since they were hashed. A file whose contents already match is kept, and only
 its metadata is updated. Comparing a batch of files costs about one round trip,
 however many files it holds. The sending side holds about 16 MiB of changed
-data per worker at most: a file of which more than 16 MiB differs is compared
-again on its own, as larger files are, and only its differing blocks are sent.
+data per worker at most: a file of which more than 16 MiB differs sends its
+differing blocks after its batch, in pieces of up to 4 MiB as they are read,
+and the receiving side writes each piece as it arrives.
 
 Explicit `--hash` comparisons of files up to 64 MiB use the same batches;
 without block reuse, they only decide whether a file is unchanged, and a file

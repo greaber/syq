@@ -306,6 +306,32 @@ mod tests {
     }
 
     #[test]
+    fn patch_pieces_keep_their_frames_as_writes_do() {
+        let bytes = [3, 0, 255, 7];
+        let piece = Request::PatchData {
+            data: bytes.to_vec().into(),
+            hash: [9; 32],
+        };
+        let encoded = postcard::to_stdvec(&piece).unwrap();
+        let frame = encoded.clone();
+        let ptr = frame.as_ptr();
+        let decoded = decode_request(frame.into()).unwrap();
+        assert_eq!(postcard::to_stdvec(&decoded.value).unwrap(), encoded);
+        let Request::PatchData { data, hash } = decoded.value else {
+            panic!("not a patch piece")
+        };
+        assert_eq!(data.storage.as_ptr(), ptr);
+        assert_eq!(&*data, bytes);
+        assert_eq!(hash, [9; 32]);
+        // The patch's other requests decode as any other request does.
+        let end = postcard::to_stdvec(&Request::PatchEnd { commit: true }).unwrap();
+        assert!(matches!(
+            decode_request(end.into()).unwrap().value,
+            Request::PatchEnd { commit: true }
+        ));
+    }
+
+    #[test]
     fn outgoing_buffer_recycling_preserves_the_allocation() {
         let mut bytes = Vec::with_capacity(4096);
         bytes.extend_from_slice(b"outgoing");
