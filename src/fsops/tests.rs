@@ -1854,6 +1854,174 @@ fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() 
     assert_eq!(staged_mode(0o660, flags::MODE, false), 0o660);
 }
 
+/// A Linux POSIX ACL as the kernel stores it: (tag, permissions, id) entries.
+#[cfg(target_os = "linux")]
+fn posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in entries {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    acl
+}
+
+#[cfg(target_os = "linux")]
+fn access_acl(file: &File) -> Option<Vec<u8>> {
+    let path = CString::new(crate::sys::proc_fd_path(file)).unwrap();
+    let mut value = vec![0u8; 4096];
+    let count = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if count < 0 {
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA)
+        );
+        return None;
+    }
+    value.truncate(count as usize);
+    Some(value)
+}
+
+/// What an ACL grants a named user once its mask applies.
+#[cfg(target_os = "linux")]
+fn granted_to_user(acl: &[u8], uid: u32) -> u16 {
+    let entries = acl[4..].chunks_exact(8).map(|entry| {
+        (
+            u16::from_le_bytes([entry[0], entry[1]]),
+            u16::from_le_bytes([entry[2], entry[3]]),
+            u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+        )
+    });
+    let mask = entries
+        .clone()
+        .find(|(tag, _, _)| *tag == 0x10)
+        .map_or(7, |(_, permissions, _)| permissions);
+    entries
+        .filter(|(tag, _, id)| *tag == 0x02 && *id == uid)
+        .map(|(_, permissions, _)| permissions & mask)
+        .sum()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn acls_are_set_before_the_mode_so_inherited_entries_stay_masked() {
+    use std::os::unix::fs::DirBuilderExt;
+    // A stage is created private, so the entries it inherits from the
+    // destination directory's default ACL are masked. Setting its final mode
+    // before the source's ACL widens that mask, and the inherited entries
+    // grant access until the ACL replaces them. Files and directories go
+    // through different metadata steps; both must set the ACL first, and
+    // leave exactly the mode and ACL they did before.
+    const INHERITED: u32 = 54_321;
+    const SOURCE_USER: u32 = 54_322;
+    const ANY: u32 = u32::MAX;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let default = posix_acl(&[
+        (0x01, 7, ANY),
+        (0x02, 6, INHERITED),
+        (0x04, 0, ANY),
+        (0x10, 6, ANY),
+        (0x20, 0, ANY),
+    ]);
+    let parent_path = CString::new(parent.as_os_str().as_bytes()).unwrap();
+    if unsafe {
+        libc::setxattr(
+            parent_path.as_ptr(),
+            c"system.posix_acl_default".as_ptr(),
+            default.as_ptr().cast(),
+            default.len(),
+            0,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+        eprintln!("skipping: the test filesystem has no POSIX ACLs ({error})");
+        return;
+    }
+    let source = |mode: u32| {
+        posix_acl(&[
+            (0x01, (mode >> 6) as u16 & 7, ANY),
+            (0x02, 4, SOURCE_USER),
+            (0x04, 4, ANY),
+            (0x10, (mode >> 3) as u16 & 7, ANY),
+            (0x20, mode as u16 & 7, ANY),
+        ])
+    };
+    let mut exposed = Vec::new();
+    for (name, directory, mode, has_acl) in [
+        ("file", false, 0o640, true),
+        ("setuid", false, 0o4750, true),
+        ("plain", false, 0o640, false),
+        ("directory", true, 0o750, true),
+        ("plain-directory", true, 0o750, false),
+    ] {
+        let path = parent.join(name);
+        let stage = if directory {
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            File::open(&path).unwrap()
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap()
+        };
+        let inherited = access_acl(&stage).expect("the stage inherits an ACL");
+        assert_eq!(granted_to_user(&inherited, INHERITED), 0, "{name}");
+        let meta = Meta {
+            inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+                acls: Some(crate::inode_metadata::PosixAcls {
+                    access: has_acl.then(|| source(0o777)),
+                    default: None,
+                }),
+                ..Default::default()
+            })),
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        let granted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = granted.clone();
+        ACCESS_CHANGED.set(Some(Box::new(move |file: &File| {
+            observed
+                .borrow_mut()
+                .push(access_acl(file).map_or(0, |acl| granted_to_user(&acl, INHERITED)));
+        })));
+        let current = stage.metadata().unwrap();
+        let applied = if directory {
+            set_meta_handle_known(&stage, &meta, flags::MODE, &current)
+        } else {
+            set_meta_written_file_for_publication(&stage, &meta, flags::MODE, &current)
+        };
+        ACCESS_CHANGED.set(None);
+        applied.unwrap();
+        assert_eq!(stage.metadata().unwrap().mode() & 0o7777, mode, "{name}");
+        assert_eq!(access_acl(&stage), has_acl.then(|| source(mode)), "{name}");
+        let granted = granted.borrow();
+        assert!(!granted.is_empty(), "{name}");
+        if granted.iter().any(|&permissions| permissions != 0) {
+            exposed.push(format!("{name}: {granted:?}"));
+        }
+    }
+    assert!(
+        exposed.is_empty(),
+        "the inherited entry was granted permissions on the way: {exposed:?}"
+    );
+}
+
 #[test]
 fn small_copy_leaf_accepts_root_and_relative_prefixes_without_nested_paths() {
     for (prefix, path) in [

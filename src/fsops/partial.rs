@@ -3771,6 +3771,9 @@ fn set_meta_file_inner(
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
             std::os::unix::fs::fchown(f, uid, gid)
         })?;
+    if owner_changed {
+        super::access_changed(f);
+    }
     #[cfg(debug_assertions)]
     if before_publication && atomic_acl_mode && owner_changed {
         test_race_barrier(
@@ -3778,17 +3781,6 @@ fn set_meta_file_inner(
             "SYQ_TEST_ACL_OWNER_CONTINUE_FILE",
             "ACL stage after ownership change",
         )?;
-    }
-    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
-        // On network filesystems every setattr is a round trip; skip it when
-        // the mode is already right. Always run it for set-id bits after a
-        // chown, which clears them, and when the metadata predates a write,
-        // which clears them for an unprivileged writer.
-        let cur = current.mode() & 0o7777;
-        let want = meta.mode & 0o7777;
-        if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
-            f.set_permissions(fs::Permissions::from_mode(want))?;
-        }
     }
     if flags & flags::TIMES != 0
         && (!times_current
@@ -3804,14 +3796,37 @@ fn set_meta_file_inner(
             return Err(io::Error::last_os_error().into());
         }
     }
+    // A Linux ACL before the mode, which it carries (see `apply_acls`).
+    let acl_set_mode = crate::inode_metadata::apply_acls(
+        f,
+        meta.inode_metadata.as_deref(),
+        meta.mode,
+        flags & flags::MODE_MASK != 0,
+    )?;
+    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
+        // On network filesystems every setattr is a round trip; skip it when
+        // the mode is already right. Always run it for set-id bits after a
+        // chown, which clears them, and when the metadata predates a write,
+        // which clears them for an unprivileged writer.
+        let cur = if acl_set_mode {
+            current.mode() & 0o7000 | meta.mode & 0o777
+        } else {
+            current.mode() & 0o7777
+        };
+        let want = meta.mode & 0o7777;
+        if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
+            f.set_permissions(fs::Permissions::from_mode(want))?;
+            super::access_changed(f);
+        }
+    }
     if before_publication {
-        crate::inode_metadata::apply_before_publication(
+        crate::inode_metadata::apply_after_acls_before_publication(
             f,
             meta.inode_metadata.as_deref(),
             meta.mode,
         )
     } else {
-        crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+        crate::inode_metadata::apply_after_acls(f, meta.inode_metadata.as_deref(), meta.mode)
     }
 }
 

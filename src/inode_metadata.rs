@@ -226,6 +226,7 @@ mod platform {
             }
             return Err(error).with_context(|| format!("reconcile attribute {:?}", name));
         }
+        crate::fsops::access_changed(file);
         Ok(())
     }
     pub(super) fn capture(file: &File, selection: Selection) -> Result<InodeMetadata> {
@@ -337,33 +338,65 @@ mod platform {
         }
         Ok(acl)
     }
-    pub(super) fn apply(file: &File, metadata: &InodeMetadata, mode: u32) -> Result<()> {
-        anyhow::ensure!(
-            metadata.size_hint() <= MAX_INODE_METADATA,
-            "inode metadata exceeds the 4 MiB transfer limit"
-        );
-        anyhow::ensure!(
-            metadata.macos_acl.is_none(),
-            "macOS ACLs cannot be converted to Linux POSIX ACLs"
-        );
-        let current = file.metadata()?;
-        if let Some(acls) = &metadata.acls {
-            anyhow::ensure!(
-                !current.file_type().is_symlink(),
-                "POSIX ACLs cannot be applied to a symlink"
-            );
-            let access = acls
-                .access
-                .as_deref()
-                .map(|a| access_for_mode(a, mode))
-                .transpose()?;
-            set(file, ACCESS, access.as_deref())?;
-            if current.is_dir() {
-                set(file, DEFAULT, acls.default.as_deref())?;
-            } else {
-                anyhow::ensure!(acls.default.is_none(), "default ACL requires a directory");
-            }
+    /// The access ACL with only the owner, group and other entries of
+    /// `mode`, which the kernel stores as those mode bits alone.
+    fn base_access(mode: u32) -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions) in [(0x01u16, mode >> 6), (0x04, mode >> 3), (0x20, mode)] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(((permissions & 7) as u16).to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
         }
+        acl
+    }
+
+    /// Set the POSIX ACLs. An access ACL's owner, mask (or group) and other
+    /// entries are the file's permission bits, so this sets those of `mode`
+    /// too, and returns whether it did. With `mode_selected`, an access ACL
+    /// the file should lose is replaced by the one holding just `mode`, which
+    /// the kernel stores as the mode alone: one step that drops the ACL and
+    /// sets the bits. Removing the ACL would leave its mask as the group bits
+    /// until a chmod.
+    pub(super) fn apply_acls(
+        file: &File,
+        acls: &PosixAcls,
+        mode: u32,
+        mode_selected: bool,
+    ) -> Result<bool> {
+        let current = file.metadata()?;
+        anyhow::ensure!(
+            !current.file_type().is_symlink(),
+            "POSIX ACLs cannot be applied to a symlink"
+        );
+        if !current.is_dir() {
+            anyhow::ensure!(acls.default.is_none(), "default ACL requires a directory");
+        }
+        let access = acls
+            .access
+            .as_deref()
+            .map(|a| access_for_mode(a, mode))
+            .transpose()?;
+        let carried = match access {
+            Some(access) => {
+                set(file, ACCESS, Some(&access))?;
+                true
+            }
+            None if mode_selected && get(file, ACCESS)?.is_some() => {
+                set(file, ACCESS, Some(&base_access(mode)))?;
+                true
+            }
+            None => {
+                set(file, ACCESS, None)?;
+                false
+            }
+        };
+        if current.is_dir() {
+            set(file, DEFAULT, acls.default.as_deref())?;
+        }
+        Ok(carried)
+    }
+
+    pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
         if let Some(attributes) = &metadata.xattrs {
             let mut previous: Option<&[u8]> = None;
             for (name, value) in &attributes.values {
@@ -483,10 +516,45 @@ pub(crate) fn default_permissions(directory: &File) -> Result<u32> {
 }
 
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
+    apply_acls(file, metadata, mode, false)?;
     apply_inner(file, metadata, mode, false)
 }
 
-pub(crate) fn apply_before_publication(
+/// Set the Linux POSIX ACLs. Call this before any chmod: a stage is created
+/// private, which masks the entries it inherits from its directory's default
+/// ACL, and a chmod to the final mode first would widen that mask, letting
+/// those entries in until the ACL is replaced. Returns whether the permission
+/// bits now are those of `mode`, so that a chmod is needed only for set-id
+/// and sticky bits. `mode_selected` says the caller sets `mode` in any case.
+/// Apply the rest with `apply_after_acls`.
+pub(crate) fn apply_acls(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+    mode_selected: bool,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Some(metadata) = metadata {
+        if let Some(acls) = &metadata.acls {
+            validate_apply(metadata)?;
+            return platform::apply_acls(file, acls, mode, mode_selected);
+        }
+    }
+    let _ = (file, metadata, mode, mode_selected);
+    Ok(false)
+}
+
+/// Apply the metadata other than the ACLs `apply_acls` has set.
+pub(crate) fn apply_after_acls(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<()> {
+    apply_inner(file, metadata, mode, false)
+}
+
+/// The same for a staged file about to be published.
+pub(crate) fn apply_after_acls_before_publication(
     file: &File,
     metadata: Option<&InodeMetadata>,
     mode: u32,
@@ -518,6 +586,24 @@ pub(crate) fn finish_publication(
     Ok(())
 }
 
+fn validate_apply(metadata: &InodeMetadata) -> Result<()> {
+    anyhow::ensure!(
+        metadata.size_hint() <= MAX_INODE_METADATA,
+        "inode metadata exceeds the 4 MiB transfer limit"
+    );
+    anyhow::ensure!(
+        metadata.crtime.is_none() || cfg!(target_os = "macos"),
+        "birth-time preservation requires a macOS destination"
+    );
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        metadata.macos_acl.is_none(),
+        "macOS ACLs cannot be converted to Linux POSIX ACLs"
+    );
+    Ok(())
+}
+
+/// Everything but the Linux POSIX ACLs, which `apply_acls` sets first.
 fn apply_inner(
     file: &File,
     metadata: Option<&InodeMetadata>,
@@ -528,19 +614,11 @@ fn apply_inner(
     let Some(metadata) = metadata else {
         return Ok(());
     };
-    anyhow::ensure!(
-        metadata.size_hint() <= MAX_INODE_METADATA,
-        "inode metadata exceeds the 4 MiB transfer limit"
-    );
-    anyhow::ensure!(
-        metadata.crtime.is_none() || cfg!(target_os = "macos"),
-        "birth-time preservation requires a macOS destination"
-    );
+    validate_apply(metadata)?;
     #[cfg(target_os = "linux")]
     {
-        if metadata.acls.is_some() || metadata.macos_acl.is_some() || metadata.xattrs.is_some() {
-            platform::apply(file, metadata, mode)?;
-        }
+        let _ = mode;
+        platform::apply_xattrs(file, metadata)?;
     }
     #[cfg(target_os = "macos")]
     {

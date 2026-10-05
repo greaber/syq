@@ -165,6 +165,29 @@ pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str
 }
 
 #[cfg(test)]
+pub(crate) type AccessObserver = Box<dyn FnMut(&File)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after each change this thread makes to who may open a file:
+    /// its owner, its mode or an ACL.
+    pub(crate) static ACCESS_CHANGED: std::cell::RefCell<Option<AccessObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Let a test see `file` after a change to its owner, its mode or an ACL.
+#[inline]
+pub(crate) fn access_changed(file: &File) {
+    #[cfg(test)]
+    ACCESS_CHANGED.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(file);
+        }
+    });
+    let _ = file;
+}
+
+#[cfg(test)]
 pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
     *blake3::hash(data).as_bytes()
 }
