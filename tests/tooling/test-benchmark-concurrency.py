@@ -7,7 +7,6 @@ import io
 import json
 import os
 from pathlib import Path
-import platform
 import shutil
 import subprocess
 import sys
@@ -52,6 +51,12 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "tree differs"):
                 bench.verify(self.root, case, hashes, bench.Deadline(10, "verify"))
             (self.root / "destination/extra").rmdir()
+            shutil.rmtree(self.root / "destination")
+            (self.root / "destination").symlink_to(self.root / "source", target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "expected directory"):
+                bench.verify(self.root, case, hashes, bench.Deadline(10, "verify"))
+            (self.root / "destination").unlink()
+            shutil.copytree(self.root / "source", self.root / "destination")
             (self.root / "source" / bench.filename(case, 1)).unlink()
             with self.assertRaisesRegex(RuntimeError, "tree differs"):
                 bench.verify(self.root, case, hashes, bench.Deadline(10, "verify"))
@@ -157,6 +162,14 @@ class BenchmarkTests(unittest.TestCase):
             bad["variants"][0]["cpus"] = [max(os.sched_getaffinity(0)) + 1]
             with self.assertRaisesRegex(ValueError, "outside"):
                 bench.validate(bad)
+
+    def test_nonfinite_timeout_is_rejected_before_creating_output(self):
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/benchmark-concurrency.py"),
+                                 "--plan", "unused.json", "--output", str(self.root / "results"),
+                                 "--timeout", "nan"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("positive rounds/timeouts", result.stderr)
+        self.assertFalse((self.root / "results").exists())
 
 
 if __name__ == "__main__":

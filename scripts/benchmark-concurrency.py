@@ -22,7 +22,8 @@ Requires Linux (GNU /usr/bin/time) or macOS (/usr/bin/time). CPU affinity is
 Linux-only and applies to the WHOLE process, independently of worker count;
 it does not reproduce worker-only pinning. CPU/RSS are the local product's
 wait4 accounting from native time, avoiding the Python fixture builder's RSS.
-Wall time includes that small native launcher. Linux thread/FD/I/O samples are
+Wall time includes that small native launcher; CPU time has 10 ms precision.
+Linux thread/FD/I/O samples are
 lower bounds at 20 ms intervals; macOS reports these as unavailable. No remote
 helpers are launched. Logs and raw host/mount metadata stay in --output.
 """
@@ -187,11 +188,15 @@ def verify(root, case, hashes, deadline):
         tree = source if case["operation"] == "rm" else destination
         if not tree.is_dir() or next(tree.iterdir(), None) is not None:
             raise RuntimeError("removal left paths behind or removed the selection root")
+        if case["operation"] == "prune" and (not source.is_dir() or next(source.iterdir(), None) is not None):
+            raise RuntimeError("pruning changed the empty source")
         return
     expected_dirs = {f"d{i:04d}" for i in range(case["directories"])}
     # Both source preservation and destination contents are checked, including
     # unexpected directories/files and symlinks, without following any links.
     for tree in (source, destination):
+        if tree.is_symlink() or not tree.is_dir():
+            raise RuntimeError(f"expected directory: {tree}")
         seen = set()
         dirs = set()
         for current, directories, files in os.walk(tree):
@@ -265,11 +270,29 @@ def group_alive(pgid):
             except (FileNotFoundError, ProcessLookupError):
                 pass
         return False
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except ProcessLookupError:
-        return False
+    # On macOS killpg(pgid, 0) can return EPERM for an exiting group after
+    # orphan adoption. Inspect states, as on Linux, rather than treating a
+    # zombie as a live worker or interpreting EPERM as proof of termination.
+    states = subprocess.run(["/bin/ps", "-axo", "pgid=,stat="], capture_output=True,
+                            text=True, check=True, timeout=5).stdout
+    return any(int(group) == pgid and not state.startswith("Z")
+               for group, state in (line.split() for line in states.splitlines()))
+
+
+def cpu_constraints():
+    """Keep available cgroup v2 limits/counters and topology as raw evidence."""
+    paths = [Path("/proc/self/cgroup"), Path("/proc/cpuinfo")]
+    root = Path("/sys/fs/cgroup")
+    paths.extend(root / name for name in ("cpu.max", "cpu.stat", "cpuset.cpus.effective"))
+    membership = paths[0]
+    if membership.exists():
+        for line in membership.read_text().splitlines():
+            if line.startswith("0::"):
+                current = (root / line[3:].lstrip("/")).resolve()
+                while current != root and current.is_relative_to(root):
+                    paths.extend(current / name for name in ("cpu.max", "cpu.stat", "cpuset.cpus.effective"))
+                    current = current.parent
+    return {str(path): path.read_text() for path in paths if path.is_file()}
 
 
 def measure(command, env, cpus, stem, timeout):
@@ -383,6 +406,7 @@ def main():
     mounts = Path("/proc/self/mountinfo")
     (args.output / "mounts.txt").write_text(mounts.read_text() if mounts.exists() else
         subprocess.run(["/sbin/mount"], capture_output=True, text=True, check=True, timeout=10).stdout)
+    (args.output / "cpu-constraints.json").write_text(json.dumps(cpu_constraints(), indent=2))
 
     def save():
         report["comparisons"] = comparisons(report["trials"], plan["reference"])
