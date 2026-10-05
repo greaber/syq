@@ -141,6 +141,59 @@ fn sparse_updates_and_inplace_clear_old_nonzero_data() {
     }
 }
 
+/// Same-host in-place copies and small in-place puts write over the old
+/// file before cutting it to length: zeros over its old bytes must clear
+/// them rather than be skipped.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn sparse_inplace_local_copies_and_small_puts_clear_old_data() {
+    let large = sparse_data();
+    let mut small = vec![0; 48 << 10];
+    small[100..4000].copy_from_slice(&prng(3900, 31));
+    small[40 << 10..(40 << 10) + 900].copy_from_slice(&prng(900, 32));
+    // The kernel clone where the filesystem has one, and the userspace copy.
+    for refuse_kernel_copy in [false, true] {
+        for old_extra in [777, 0] {
+            let t = Tmp::new();
+            write_sparse_source(&t.path("src/large"), &large);
+            write(&t.path("src/small"), &small);
+            for name in ["large", "small"] {
+                set_mtime(&t.path(&format!("src/{name}")), 1_700_000_000);
+            }
+            write(&t.path("dst/large"), &prng(large.len() + old_extra, 33));
+            write(&t.path("dst/small"), &prng(small.len() + old_extra, 34));
+            for name in ["large", "small"] {
+                fs::File::open(t.path(&format!("dst/{name}")))
+                    .unwrap()
+                    .sync_all()
+                    .unwrap();
+            }
+            let inodes = ["large", "small"]
+                .map(|name| fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino());
+            let out = compat_command()
+                .args([
+                    "-aS",
+                    "--inplace",
+                    "--no-progress",
+                    &t.s("src/"),
+                    &t.s("dst/"),
+                ])
+                .envs(refuse_kernel_copy.then_some(("SYQ_TEST_COPY_LOCAL_EXDEV", "1")))
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            assert!(read(&t.path("dst/large")) == large);
+            assert!(read(&t.path("dst/small")) == small);
+            for (name, inode) in ["large", "small"].into_iter().zip(inodes) {
+                assert_eq!(
+                    fs::metadata(t.path(&format!("dst/{name}"))).unwrap().ino(),
+                    inode
+                );
+            }
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn sparse_capacity_estimates_are_advisory_and_report_unknown_allocation() {
