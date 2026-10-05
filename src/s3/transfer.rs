@@ -496,43 +496,52 @@ impl Engine {
         directories: &DirectoryMetadata,
     ) -> Result<()> {
         if !self.args.dry_run {
-            let mut metadata = directories.metadata.lock().await;
-            metadata.sort_by_key(|(path, _, _, _)| std::cmp::Reverse(path.len()));
-            let mut finished = HashSet::new();
-            for (path, meta, mode, explicit) in metadata.iter() {
-                let path = RelativePath::new(path.as_bytes())?;
-                local::apply_metadata(
-                    &destination.root,
-                    &path,
-                    meta,
-                    &self.args,
-                    *mode,
-                    *explicit,
-                    mode.is_none(),
-                )?;
-                finished.insert(directory_key(&path));
-            }
-            // A marker directory created by a descendant whose own marker
-            // was skipped or failed gets the mode its creation would
-            // otherwise have given it.
-            let mut unfinished: Vec<Vec<u8>> = directories
-                .created
-                .lock()
-                .unwrap()
+            let metadata = directories.metadata.lock().await;
+            // Marker metadata, and a default mode for a marker directory
+            // created by a descendant whose own marker was skipped or failed:
+            // what creating it would otherwise have given it. Children go
+            // before parents, whose final mode may no longer let us in.
+            let mut work: Vec<(Vec<u8>, Option<&MarkerMetadata>)> = metadata
                 .iter()
-                .filter(|path| !finished.contains(*path))
-                .cloned()
-                .collect();
-            unfinished.sort_by_key(|path| std::cmp::Reverse(path.len()));
-            for path in unfinished {
-                let directory = destination
-                    .root
-                    .open_directory(&RelativePath::new(&path)?)?;
-                let current = directory.metadata()?.mode();
-                crate::fsops::set_mode_handle(
-                    &directory,
-                    crate::fsops::created_directory_mode(&directory, 0o777, current)?,
-                )?;
+                .map(|entry| {
+                    Ok((
+                        directory_key(&RelativePath::new(entry.0.as_bytes())?),
+                        Some(entry),
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let finished: HashSet<Vec<u8>> = work.iter().map(|(path, _)| path.clone()).collect();
+            work.extend(
+                directories
+                    .created
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|path| !finished.contains(*path))
+                    .map(|path| (path.clone(), None)),
+            );
+            work.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+            for (path, marker) in work {
+                let path = RelativePath::new(&path)?;
+                match marker {
+                    Some((_, meta, mode, explicit)) => local::apply_metadata(
+                        &destination.root,
+                        &path,
+                        meta,
+                        &self.args,
+                        *mode,
+                        *explicit,
+                        mode.is_none(),
+                    )?,
+                    None => {
+                        let directory = destination.root.open_directory(&path)?;
+                        let current = directory.metadata()?.mode();
+                        crate::fsops::set_mode_handle(
+                            &directory,
+                            crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())

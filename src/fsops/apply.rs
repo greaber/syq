@@ -513,8 +513,6 @@ pub(super) fn set_meta_rooted(
         require_rooted_metadata(&handle, metadata, &target.label)?;
         let opened = handle.metadata()?;
         require_open_target_known(&opened, &target.label, condition)?;
-        let directory_meta = receiver_directory_meta(&handle, metadata, meta, flags)?;
-        let meta = directory_meta.as_ref().unwrap_or(meta);
         if flags & flags::TIMES != 0
             && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec)
         {
@@ -540,20 +538,6 @@ pub(super) fn set_meta_rooted(
         .metadata()
         .with_context(|| format!("stat confined path {}", target.label.display()))?;
     require_rooted_condition(metadata, condition, &target.label)?;
-    // A receiver-managed directory mode depends on the directory itself.
-    // Its handle is checked against this lookup below like any other.
-    let mut directory_handle = None;
-    let directory_meta = if receives_directory_mode(metadata, flags) {
-        let handle = parent
-            .open_metadata()
-            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
-        let directory_meta = receiver_directory_meta(&handle, metadata, meta, flags)?;
-        directory_handle = Some(handle);
-        directory_meta
-    } else {
-        None
-    };
-    let meta = directory_meta.as_ref().unwrap_or(meta);
     let is_link = metadata.is_symlink();
     let owner_differs = (flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
@@ -596,12 +580,9 @@ pub(super) fn set_meta_rooted(
             crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
         }
     } else {
-        let handle = match directory_handle {
-            Some(handle) => handle,
-            None => parent.open_metadata().with_context(|| {
-                format!("open confined metadata handle {}", target.label.display())
-            })?,
-        };
+        let handle = parent
+            .open_metadata()
+            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
         let opened = handle.metadata()?;
         if opened.dev() != metadata.dev || opened.ino() != metadata.ino {
             bail!(
@@ -639,31 +620,6 @@ pub(super) fn set_meta_rooted(
     drop(parent);
     let after = target.root.metadata(&target.relative)?;
     require_rooted_identity(after, condition, &target.label)
-}
-
-fn receives_directory_mode(metadata: RootMetadata, flags: u8) -> bool {
-    flags & flags::RECEIVER_MODE != 0 && flags & flags::MODE == 0 && metadata.is_dir()
-}
-
-/// A coordinator sends a receiver-managed mode for a directory it created
-/// private: the mode its creation would otherwise have proposed. Apply what
-/// that creation would have given: permissions limited by the umask, or by
-/// the default ACL the directory inherited (its own default ACL is the one
-/// its parent passed on), and the setgid bit it inherited from its parent.
-/// A restricted receiver turns this flag into MODE before it gets here.
-fn receiver_directory_meta(
-    directory: &File,
-    metadata: RootMetadata,
-    meta: &Meta,
-    flags: u8,
-) -> Result<Option<Meta>> {
-    if !receives_directory_mode(metadata, flags) {
-        return Ok(None);
-    }
-    Ok(Some(Meta {
-        mode: created_directory_mode(directory, meta.mode, metadata.mode)?,
-        ..meta.clone()
-    }))
 }
 
 /// The mode creating `directory` with `proposed` would have given it, for a

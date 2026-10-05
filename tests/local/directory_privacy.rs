@@ -1,8 +1,9 @@
-//! A directory whose permissions, group or ACL are applied after it is filled
-//! must not let anyone but its owner reach the entries published into it
-//! before then. Each test holds the copy at finalization, after every entry is
-//! published and before any directory metadata is applied, and checks that
-//! the finished copy still has the same metadata as before.
+//! A directory receives its copied permissions, group and ACL after it is
+//! filled. Until then it must not let anyone reach the entries published
+//! into it whom the finished directory would keep out. Most tests hold the
+//! copy at finalization, after every entry is published and before any final
+//! directory metadata is applied, and also check that the finished copy keeps
+//! the metadata it had before.
 use super::*;
 
 /// The umask every copy here runs with.
@@ -23,23 +24,20 @@ fn syq_command(args: &[&str]) -> Command {
     command
 }
 
-/// Run `command` with a fixed umask, call `observe` while syq waits at copy
-/// finalization, and return its observation and the finished command's output.
-fn observe_before_finalization<R>(
-    t: &Tmp,
-    mut command: Command,
-    observe: impl FnOnce() -> R,
-) -> (R, Output) {
-    let ready = t.path("finalizing");
+/// Start `command` with a fixed umask, held at the named test barrier
+/// (`SYQ_TEST_<barrier>_READY_FILE`), and wait until it gets there.
+fn start_held(t: &Tmp, mut command: Command, barrier: &str) -> (std::process::Child, PathBuf) {
+    let ready = t.path("held");
     let continuation = t.path("continue");
     let _ = fs::remove_file(&ready);
     let _ = fs::remove_file(&continuation);
     command
-        .env("SYQ_TEST_FINALIZATION_READY_FILE", &ready)
-        .env("SYQ_TEST_FINALIZATION_CONTINUE_FILE", &continuation)
+        .env(format!("SYQ_TEST_{barrier}_READY_FILE"), &ready)
+        .env(format!("SYQ_TEST_{barrier}_CONTINUE_FILE"), &continuation)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     unsafe {
         command.pre_exec(|| {
             libc::umask(0o022);
@@ -47,11 +45,37 @@ fn observe_before_finalization<R>(
         });
     }
     let mut child = command.start().unwrap();
-    wait_for_confinement_marker(&mut child, &ready, "copy finalization");
+    wait_for_confinement_marker(&mut child, &ready, barrier);
+    (child, continuation)
+}
+
+/// Run `command`, call `observe` while syq holds at the named barrier, and
+/// return its observation and the finished command's output.
+fn observe_at<R>(
+    t: &Tmp,
+    command: Command,
+    barrier: &str,
+    observe: impl FnOnce() -> R,
+) -> (R, Output) {
+    let (child, continuation) = start_held(t, command, barrier);
     let observed = observe();
     release_confinement_barrier(&continuation);
-    let output = child.wait_with_output().unwrap();
-    (observed, output)
+    (observed, child.wait_with_output().unwrap())
+}
+
+/// The same at copy finalization: everything is published, and no final
+/// directory metadata is applied yet.
+fn observe_before_finalization<R>(
+    t: &Tmp,
+    command: Command,
+    observe: impl FnOnce() -> R,
+) -> (R, Output) {
+    observe_at(t, command, "FINALIZATION", observe)
+}
+
+/// Whether `during` grants no group or other access that `after` lacks.
+fn within(during: u32, after: u32) -> bool {
+    during & 0o077 & !after == 0
 }
 
 fn modes(t: &Tmp, paths: &[&str]) -> Vec<u32> {
@@ -71,12 +95,12 @@ fn source_tree(t: &Tmp, root_mode: u32, sub_mode: u32) {
 }
 
 #[test]
-fn a_new_destination_root_is_private_until_it_takes_the_source_permissions() {
+fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
     let default_rsync = 0o777 & !UMASK;
-    // (arguments, destination root's mode after the copy, private while filled)
-    let cases: [(&[&str], u32, bool); 6] = [
-        (&["rsync", "-a", "src/", "dst/"], 0o750, true),
-        (&["rsync", "-rp", "src/", "dst/"], 0o750, true),
+    // (arguments, destination root's mode after the copy)
+    let cases: [(&[&str], u32); 6] = [
+        (&["rsync", "-a", "src/", "dst/"], 0o750),
+        (&["rsync", "-rp", "src/", "dst/"], 0o750),
         (
             &[
                 "cp",
@@ -87,10 +111,8 @@ fn a_new_destination_root_is_private_until_it_takes_the_source_permissions() {
                 "dst",
             ],
             0o750,
-            true,
         ),
-        // Group without permissions: the root's default mode is restored.
-        (&["rsync", "-rg", "src/", "dst/"], default_rsync, true),
+        (&["rsync", "-rg", "src/", "dst/"], default_rsync),
         (
             &[
                 "cp",
@@ -101,12 +123,10 @@ fn a_new_destination_root_is_private_until_it_takes_the_source_permissions() {
                 "dst",
             ],
             0o755,
-            true,
         ),
-        // Nothing is applied later: the creation mode is already final.
-        (&["rsync", "-r", "src/", "dst/"], default_rsync, false),
+        (&["rsync", "-r", "src/", "dst/"], default_rsync),
     ];
-    for (args, final_mode, private_while_filled) in cases {
+    for (args, final_mode) in cases {
         let t = Tmp::new();
         source_tree(&t, 0o750, 0o750);
         let mut command = syq_command(args);
@@ -119,78 +139,10 @@ fn a_new_destination_root_is_private_until_it_takes_the_source_permissions() {
             after, final_mode,
             "{args:?}: root is {after:o} after the copy"
         );
-        if private_while_filled {
-            assert!(
-                private(during),
-                "{args:?}: root was {during:o} while filled"
-            );
-        } else {
-            assert_eq!(during, final_mode, "{args:?}");
-        }
-    }
-}
-
-#[test]
-fn new_directories_stay_private_while_group_metadata_is_pending() {
-    // Group without permissions restores the source mode limited by the
-    // umask, with owner access, as creating the directory directly did.
-    let restored = (0o775 | 0o700) & !UMASK;
-    // (arguments, private while filled, nested directory mode after the copy)
-    let cases: [(&[&str], bool, u32); 4] = [
-        (&["rsync", "-a", "src/", "dst/"], true, 0o775),
-        (&["rsync", "-rg", "src/", "dst/"], true, restored),
-        (
-            &[
-                "cp",
-                "--copy-metadata=ownership",
-                "--srcs-in",
-                "src",
-                "--into",
-                "dst",
-            ],
-            true,
-            restored,
-        ),
-        // Permissions alone: created with its final bits through the umask,
-        // as before, which grants no one more than the finished copy.
-        (
-            &[
-                "cp",
-                "--copy-metadata=permissions",
-                "--srcs-in",
-                "src",
-                "--into",
-                "dst",
-            ],
-            false,
-            0o775,
-        ),
-    ];
-    for (args, private_while_filled, final_mode) in cases {
-        let t = Tmp::new();
-        source_tree(&t, 0o755, 0o775);
-        let mut command = syq_command(args);
-        command.current_dir(&t.0);
-        let (during, output) =
-            observe_before_finalization(&t, command, || mode(&t.path("dst/sub")));
-        assert_output_ok(&output);
-        let after = mode(&t.path("dst/sub"));
-        assert_eq!(
-            after, final_mode,
-            "{args:?}: dst/sub is {after:o} after the copy"
+        assert!(
+            within(during, after),
+            "{args:?}: root was {during:o} while filled"
         );
-        assert_eq!(
-            fs::metadata(t.path("dst/sub")).unwrap().gid(),
-            fs::metadata(t.path("src/sub")).unwrap().gid()
-        );
-        if private_while_filled {
-            assert!(
-                private(during),
-                "{args:?}: dst/sub was {during:o} while filled"
-            );
-        } else {
-            assert_eq!(during, final_mode & !UMASK, "{args:?}");
-        }
     }
 }
 
@@ -207,19 +159,18 @@ fn other_group() -> Option<libc::gid_t> {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn a_setgid_parent_group_cannot_reach_entries_before_the_source_group_is_applied() {
+fn a_new_directory_has_its_final_group_before_anything_is_published() {
     let Some(group) = other_group() else {
         eprintln!("skipped: this process has no supplementary group to own the parent");
         return;
     };
-    // (arguments, final modes of the root and the nested directory)
+    // (arguments, permission bits of the root and the nested directory after
+    // the copy). Whether a group change clears an inherited setgid bit depends
+    // on the filesystem, so only the root's restored setgid bit is checked.
     for (args, final_modes) in [
-        // Without -p the default modes are restored, keeping the setgid bit
-        // the directories inherited from their parent even though their
-        // group changed.
         (
             &["rsync", "-rg", "src/", "shared/dst/"][..],
-            [0o2755, 0o2000 | ((0o751 | 0o700) & !UMASK)],
+            [0o2755, (0o751 | 0o700) & !UMASK],
         ),
         (&["rsync", "-a", "src/", "shared/dst/"][..], [0o755, 0o751]),
     ] {
@@ -228,33 +179,73 @@ fn a_setgid_parent_group_cannot_reach_entries_before_the_source_group_is_applied
         fs::create_dir(t.path("shared")).unwrap();
         std::os::unix::fs::chown(t.path("shared"), None, Some(group)).unwrap();
         fs::set_permissions(t.path("shared"), fs::Permissions::from_mode(0o2775)).unwrap();
+        let source_gid = fs::metadata(t.path("src")).unwrap().gid();
         let mut command = syq_command(args);
         command.current_dir(&t.0);
-        let (during, output) = observe_before_finalization(&t, command, || {
+        // Held before the first file's data is written: the directories
+        // exist, inherited the parent's group, and hold nothing published.
+        let (during, output) = observe_at(&t, command, "SMALL_STAGE", || {
             ["shared/dst", "shared/dst/sub"].map(|path| {
                 let metadata = fs::metadata(t.path(path)).unwrap();
-                (metadata.gid(), metadata.mode() & 0o7777)
+                (
+                    metadata.gid(),
+                    metadata.mode() & 0o7777,
+                    t.path(path).join("file").exists(),
+                )
             })
         });
         assert_output_ok(&output);
         assert_eq!(read(&t.path("shared/dst/sub/file")), b"nested file");
-        let source_gid = fs::metadata(t.path("src")).unwrap().gid();
         for path in ["shared/dst", "shared/dst/sub"] {
             assert_eq!(fs::metadata(t.path(path)).unwrap().gid(), source_gid);
         }
         let after = modes(&t, &["shared/dst", "shared/dst/sub"]);
         assert_eq!(
-            after,
+            [after[0], after[1] & !0o2000],
             final_modes,
             "{args:?}: {} after the copy",
             octal(&after)
         );
-        for (gid, during) in during {
-            // The directory inherited the parent's group, which the copy has
-            // not replaced yet: that group must not be able to enter it.
-            assert_eq!(gid, group, "{args:?}");
-            assert!(private(during), "{args:?}: {during:o} while filled");
+        for ((gid, during, published), after) in during.into_iter().zip(after) {
+            assert!(!published, "{args:?}: a file was published already");
+            assert_eq!(gid, source_gid, "{args:?}: still the parent's group");
+            assert!(within(during, after), "{args:?}: {during:o} while filled");
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_existing_directory_has_its_final_group_before_anything_is_published() {
+    let Some(group) = other_group() else {
+        eprintln!("skipped: this process has no supplementary group to own the destination");
+        return;
+    };
+    for args in [
+        &["rsync", "-rg", "src/", "dst/"][..],
+        &["rsync", "-a", "src/", "dst/"][..],
+    ] {
+        let t = Tmp::new();
+        source_tree(&t, 0o750, 0o750);
+        for path in ["dst", "dst/sub"] {
+            fs::create_dir_all(t.path(path)).unwrap();
+            std::os::unix::fs::chown(t.path(path), None, Some(group)).unwrap();
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let source_gid = fs::metadata(t.path("src")).unwrap().gid();
+        let mut command = syq_command(args);
+        command.current_dir(&t.0);
+        let (during, output) = observe_at(&t, command, "SMALL_STAGE", || {
+            ["dst", "dst/sub"].map(|path| fs::metadata(t.path(path)).unwrap().gid())
+        });
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/sub/file")), b"nested file");
+        for path in ["dst", "dst/sub"] {
+            assert_eq!(fs::metadata(t.path(path)).unwrap().gid(), source_gid);
+            assert_eq!(mode(&t.path(path)), 0o750, "{args:?}: {path}");
+        }
+        // The old group, which the copy replaces, must not reach new files.
+        assert_eq!(during, [source_gid; 2], "{args:?}: group while filled");
     }
 }
 
@@ -434,7 +425,7 @@ fn a_mapping_mode_narrower_than_the_source_applies_while_filling() {
 }
 
 #[test]
-fn a_remote_receiver_keeps_new_directories_private_until_finalization() {
+fn a_remote_receiver_grants_no_more_than_the_source_while_filling() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     t.expose_remote_syq();
@@ -457,10 +448,66 @@ fn a_remote_receiver_keeps_new_directories_private_until_finalization() {
         let after = modes(&t, &["dst", "dst/sub"]);
         assert_eq!(after, [root, sub], "{args:?}: {} after", octal(&after));
         assert!(
-            during.iter().all(|mode| private(*mode)),
+            during.iter().zip(&after).all(|(d, a)| within(*d, *a)),
             "{args:?}: {} while filled",
             octal(&during)
         );
+    }
+}
+
+#[test]
+fn an_interrupted_copy_ends_with_the_same_directory_metadata_after_a_retry() {
+    // (arguments, modes of the root and the nested directory)
+    let cases: [(&[&str], [u32; 2]); 3] = [
+        (
+            &["rsync", "-rg", "src/", "dst/"],
+            [0o777 & !UMASK, 0o775 & !UMASK],
+        ),
+        (
+            &[
+                "cp",
+                "--copy-metadata=ownership",
+                "--srcs-in",
+                "src",
+                "--into",
+                "dst",
+            ],
+            [0o755, 0o775 & !UMASK],
+        ),
+        (&["rsync", "-a", "src/", "dst/"], [0o750, 0o775]),
+    ];
+    for (args, final_modes) in cases {
+        let t = Tmp::new();
+        source_tree(&t, 0o750, 0o775);
+        let mut command = syq_command(args);
+        command.current_dir(&t.0);
+        // Killed before any final directory metadata is applied.
+        let (mut child, _) = start_held(&t, command, "FINALIZATION");
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        child.wait().unwrap();
+        let mut retry = syq_command(args);
+        retry.current_dir(&t.0);
+        unsafe {
+            retry.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+        assert_output_ok(&retry.run().unwrap());
+        let after = modes(&t, &["dst", "dst/sub"]);
+        assert_eq!(
+            after,
+            final_modes,
+            "{args:?}: {} after the retry",
+            octal(&after)
+        );
+        for (destination, source) in [("dst", "src"), ("dst/sub", "src/sub")] {
+            assert_eq!(
+                fs::metadata(t.path(destination)).unwrap().gid(),
+                fs::metadata(t.path(source)).unwrap().gid()
+            );
+        }
+        assert_eq!(read(&t.path("dst/sub/file")), b"nested file");
     }
 }
 

@@ -3319,22 +3319,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
     let root_create_condition = TargetCondition::Any;
-    // A directory target receives a contents source's permissions, group or
-    // ACL only after it is filled. Create it private until then. Without
-    // such metadata its creation mode is already final. A restricted
-    // receiver chooses default modes itself, so only source modes qualify.
+    // A directory target receives a contents source's permissions only
+    // after it is filled. An ordinary receiver gets the planner's metadata
+    // for it before anything is published into it. A restricted receiver
+    // gets none early, so create the root private there until its source
+    // mode is applied; without -p it chooses default modes itself.
     let private_root = (create_root
         && dst_is_dir
+        && opts.restricted_receiver
+        && opts.perms
         && args.files_from.is_none()
         && args.native_mapping.is_none()
-        && srcs.iter().any(Location::copies_contents)
-        && opts.flags & (flags::MODE | flags::GROUP) != 0
-        && (!opts.restricted_receiver || opts.perms))
-        .then_some(if use_operator_anchor {
-            operator_directory_mode(&opts)
-        } else {
-            0o755
-        });
+        && srcs.iter().any(Location::copies_contents))
+    .then_some(0o755);
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories
@@ -3349,12 +3346,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 TargetCondition::Any
             };
-            let mode = if dst_is_dir && private_root.is_some() {
-                0o700
-            } else {
-                operator_directory_mode(&opts)
-            };
-            directory_selection = Some(create_operator_directory(&mut *dst_ctl, condition, mode)?);
+            directory_selection = Some(create_operator_directory(
+                &mut *dst_ctl,
+                condition,
+                opts.rsync_creation,
+            )?);
         }
         if let Some(selection) = directory_selection.take() {
             let anchor = match prepared_anchor.take() {
@@ -3744,7 +3740,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             std::collections::HashSet::new()
         },
         private_root,
-        private_dirs: Default::default(),
         mapping_mode: false,
         create_root: if defer_operator_directory_creation {
             Some((
@@ -4808,24 +4803,14 @@ fn register_source_roots(
     }
 }
 
-/// The mode a missing destination directory is created with when nothing
-/// applies its metadata later.
-fn operator_directory_mode(opts: &Opts) -> u32 {
-    if opts.rsync_creation {
-        0o777
-    } else {
-        0o755
-    }
-}
-
 fn create_operator_directory(
     conn: &mut dyn Conn,
     condition: TargetCondition,
-    mode: u32,
+    rsync_creation: bool,
 ) -> Result<DirectoryAnchor> {
     match ok(
         conn.call(Request::CreateOperatorDirectory {
-            mode,
+            mode: if rsync_creation { 0o777 } else { 0o755 },
             require_absent: condition == TargetCondition::Absent,
         })?,
         "create destination directory",

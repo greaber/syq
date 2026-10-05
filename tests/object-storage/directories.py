@@ -61,6 +61,8 @@ def private(observed):
 
 
 def check():
+    # Every download here, held or not, runs with this umask.
+    os.umask(UMASK)
     remote = 's3://' + c.BUCKET
     with tempfile.TemporaryDirectory(prefix='syq-s3-directories-') as temp:
         root = Path(temp).resolve()
@@ -108,6 +110,26 @@ def check():
         # A parent without a marker keeps its creation mode, as before.
         assert mode(destination / 'mapped') == 0o777 & ~UMASK
         assert private(during), during
+
+        # A marker the copy skips leaves its directory, created by a child,
+        # with its default mode, even beneath a parent that ends unreadable.
+        mapping.write_text(''.join(json.dumps(entry) + '\n' for entry in [
+            {'src': {'encoding': 'utf-8', 'value': prefix + '/source'},
+             'dst': {'encoding': 'utf-8', 'value': 'parent'}, 'kind': 'dir',
+             'metadata': {'mode': 0o400}},
+            {'src': {'encoding': 'utf-8', 'value': prefix + '/source/private'},
+             'dst': {'encoding': 'utf-8', 'value': 'parent/skipped'}, 'kind': 'dir'},
+            {'src': {'encoding': 'utf-8', 'value': prefix + '/source/private/deep/file'},
+             'dst': {'encoding': 'utf-8', 'value': 'parent/skipped/file'}},
+        ]))
+        destination = root / 'skipped'
+        c.run(['--from', remote, '--mapping', mapping, '--into', destination,
+               '--copy-if', "src.name != 'private' or dst.exists",
+               '--resource-limits=s3-objects=1'])
+        assert mode(destination / 'parent') == 0o400
+        (destination / 'parent').chmod(0o700)
+        assert mode(destination / 'parent/skipped') == 0o777 & ~UMASK
+        assert (destination / 'parent/skipped/file').read_bytes() == b'secret'
         print('S3 download directory privacy checks passed', flush=True)
 
 
