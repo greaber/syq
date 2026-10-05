@@ -22,10 +22,12 @@ pub(crate) use batch_progress::BatchProgress;
 pub(crate) use batch_progress::BatchReceipts;
 mod bootstrap;
 mod local;
+mod replies;
 mod reverse_tcp;
 mod ssh_auth;
 mod ssh_multiplexer;
 mod tcp_socket;
+pub(crate) use replies::Replies;
 pub(crate) use reverse_tcp::ReverseTcp;
 
 #[cfg(test)]
@@ -161,6 +163,17 @@ pub trait Conn: Send {
     /// queueing several block responses there only retains their buffers.
     fn supports_request_pipelining(&self) -> bool {
         true
+    }
+    /// A reply has already arrived, so `recv` returns without waiting.
+    fn reply_ready(&self) -> bool {
+        false
+    }
+    /// Most requests that may await replies at once without their replies
+    /// backing up into the peer, which could then stop reading requests
+    /// while this side waits to send one. None when each request is answered
+    /// as it is sent.
+    fn reply_queue(&self) -> Option<usize> {
+        None
     }
     /// Current kernel RTT estimate for a TCP data connection. This is a
     /// local socket query and never sends a protocol request.
@@ -530,6 +543,8 @@ pub(crate) struct ReceivedResponse {
     pub(crate) value: Response,
     hold: crate::wire_budget::Hold,
     started_at: std::time::Instant,
+    /// The file data it carries (`Replies`).
+    bytes: usize,
 }
 
 impl ReceivedResponse {
@@ -538,6 +553,7 @@ impl ReceivedResponse {
     ) -> Self {
         let (value, hold) = message.into_parts();
         Self {
+            bytes: replies::file_bytes(&value),
             value,
             hold,
             started_at,
@@ -563,7 +579,9 @@ pub struct RemoteConn {
     w: FrameWriter<Box<dyn Write + Send>>,
     /// Responses are parsed on a reader thread so the network keeps flowing
     /// while the caller processes the previous one.
-    rx: Option<std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>>,
+    rx: Option<Replies>,
+    /// Replies the reader queues before it stops reading (`reply_queue`).
+    replies: usize,
     deferred: DeferredReplies,
     reader: Option<std::thread::JoinHandle<()>>,
     label: String,
@@ -595,34 +613,69 @@ const TRANSPORT_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 fn spawn_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
-) -> (
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
-    std::thread::JoinHandle<()>,
-) {
-    let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default()).unwrap();
+) -> (Replies, std::thread::JoinHandle<()>) {
+    let replies = reply_queue(read_ahead, &ConnectionRole::Control);
+    let (rx, reader, _) = spawn_observed_reader(input, replies, None, Default::default()).unwrap();
     (rx, reader)
 }
+
+/// Replies a connection's reader queues before it stops reading. Control
+/// requests also pipeline up to the default depth. Keeping that capacity
+/// prevents a sequential helper blocking on replies while its coordinator is
+/// still sending requests (including large path batches). A worker's queue
+/// also holds the replies of every group a grouped comparison keeps in
+/// flight: a source's carry differing blocks, and a read stream's blocks
+/// queue as deep.
+fn reply_queue(read_ahead: usize, role: &ConnectionRole) -> usize {
+    let replies = read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH);
+    match role {
+        ConnectionRole::SourceWorker { .. } | ConnectionRole::DestinationWorker { .. } => {
+            replies.max(crate::transfer_tuning::COMPARE_WINDOW)
+        }
+        _ => replies,
+    }
+}
+
+/// File data a source worker's queued replies may carry before its reader
+/// stops reading the connection (`Replies`): about what one patch carries.
+/// A larger queue held more while a pull's destination fell behind, and no
+/// pull measured was faster for it.
+const SOURCE_REPLY_BYTES: usize = 16 << 20;
+
+/// The file data a connection's queued replies may carry, if limited: a
+/// source worker's, whose replies carry the data a grouped comparison or a
+/// read stream returns.
+fn reply_bytes(role: &ConnectionRole) -> Option<usize> {
+    matches!(role, ConnectionRole::SourceWorker { .. }).then_some(SOURCE_REPLY_BYTES)
+}
+
 type ObservedReader = (
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
+    Replies,
     std::thread::JoinHandle<()>,
     std::sync::Arc<batch_progress::BatchReceipts>,
 );
 
 fn spawn_observed_reader(
     input: Box<dyn Read + Send>,
-    read_ahead: usize,
+    replies: usize,
+    bytes: Option<usize>,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
 ) -> Result<ObservedReader> {
-    // Control requests also pipeline up to the default depth. Keeping that
-    // capacity prevents a sequential helper blocking on replies while its
-    // coordinator is still sending requests (including large path batches).
-    let (tx, rx) = std::sync::mpsc::sync_channel(
-        read_ahead.max(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH),
-    );
+    let (tx, rx) = std::sync::mpsc::sync_channel(replies);
+    let queued = bytes.map(replies::QueuedBytes::new);
+    let reader_queued = queued.clone();
     let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
     let receipts = batch_receipts.clone();
     let reader = std::thread::Builder::new()
         .spawn(move || {
+            // Every reply counts against the byte limit from when it is
+            // queued until it is taken, the handshake's included.
+            let send = |msg: std::io::Result<ReceivedResponse>| {
+                if let (Some(queued), Ok(message)) = (&reader_queued, &msg) {
+                    queued.queued(message.bytes);
+                }
+                tx.send(msg).is_ok()
+            };
             let mut r = FrameReader::new(input);
             r.set_limit(MAX_HANDSHAKE_FRAME);
             let hello = r
@@ -634,7 +687,7 @@ fn spawn_observed_reader(
             let accepted = matches!(&hello, Ok(message)
             if matches!(&message.value, Response::HelloOk { identity, .. }
                 if identity == crate::identity::build()));
-            if tx.send(hello).is_err() || !accepted {
+            if !send(hello) || !accepted {
                 return;
             }
             r.set_limit(MAX_FRAME);
@@ -656,19 +709,21 @@ fn spawn_observed_reader(
                     receipts.response(&message.value);
                 }
                 let failed = msg.is_err();
-                if tx.send(msg).is_err() || failed {
+                if !send(msg) || failed {
                     break;
+                }
+                if let Some(queued) = &reader_queued {
+                    if !queued.wait_for_room() {
+                        break;
+                    }
                 }
             }
         })
         .map_err(crate::resources::allocation_error)?;
-    Ok((rx, reader, batch_receipts))
+    Ok((Replies::new(rx, queued), reader, batch_receipts))
 }
 
-fn receive_transport_stats(
-    rx: &std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
-    timeout: std::time::Duration,
-) -> Option<TcpSocketStats> {
+fn receive_transport_stats(rx: &Replies, timeout: std::time::Duration) -> Option<TcpSocketStats> {
     match rx
         .recv_timeout(timeout)
         .map(|result| result.map(ReceivedResponse::into_inner))
@@ -740,11 +795,12 @@ impl RemoteConn {
     ) -> Result<Self> {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, reader, batch_receipts) = spawn_observed_reader(
-            Box::new(session.stdout),
+        let replies = reply_queue(
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
-            observation.clone(),
-        )?;
+            &ConnectionRole::Control,
+        );
+        let (rx, reader, batch_receipts) =
+            spawn_observed_reader(Box::new(session.stdout), replies, None, observation.clone())?;
         let mut stderr = session.stderr;
         std::thread::Builder::new()
             .spawn(move || {
@@ -760,6 +816,7 @@ impl RemoteConn {
             approved_login: None,
             w: FrameWriter::with_preamble_written(Box::new(session.stdin), compress),
             rx: Some(rx),
+            replies,
             deferred: Default::default(),
             reader: Some(reader),
             label,
@@ -1041,11 +1098,18 @@ impl Conn for RemoteConn {
             "only writes and their fence are valid during streaming writes"
         );
         self.batch_receipts.request(&req)?;
-        self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
-        Ok(match req {
-            Request::WriteRange { data, .. } => Some(data.into_vec()),
-            _ => None,
-        })
+        // The peer may have to send replies before it reads this request.
+        let _sending = self.rx.as_ref().and_then(Replies::sending);
+        if let Request::WriteRange { .. } = &req {
+            self.w.write_msg(&req).map_err(|e| self.io_err(e.into()))?;
+            let Request::WriteRange { data, .. } = req else {
+                unreachable!("matched above")
+            };
+            return Ok(Some(data.into_vec()));
+        }
+        // Free a request's data once it is encoded, before it is compressed.
+        self.w.write_owned(req).map_err(|e| self.io_err(e.into()))?;
+        Ok(None)
     }
     fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
         self.send(req)?;
@@ -1125,6 +1189,9 @@ impl Conn for RemoteConn {
     }
     fn is_dead(&self) -> bool {
         self.dead
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(self.replies)
     }
     fn detach(&mut self) {
         self.detached = true;
@@ -2085,9 +2152,11 @@ impl RemoteSpec {
         if let Some(stream) = return_stream {
             let observation =
                 std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+            let replies = reply_queue(self.read_ahead, &role);
             let (rx, reader, batch_receipts) = spawn_observed_reader(
                 Box::new(stream.try_clone()?),
-                self.read_ahead,
+                replies,
+                reply_bytes(&role),
                 observation.clone(),
             )?;
             let conn = RemoteConn {
@@ -2098,6 +2167,7 @@ impl RemoteSpec {
                 approved_login: None,
                 w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
                 rx: Some(rx),
+                replies,
                 deferred: Default::default(),
                 reader: Some(reader),
                 label: self.label(),
@@ -2247,16 +2317,21 @@ impl RemoteSpec {
                 .and_then(|p| p.activity.clone()),
             handshake_pending: handshake.clone(),
         };
-        let (rx, reader, batch_receipts) =
-            match spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone()) {
-                Ok(reader) => reader,
-                Err(error) => {
-                    drop(writer);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
-            };
+        let replies = reply_queue(self.read_ahead, &role);
+        let (rx, reader, batch_receipts) = match spawn_observed_reader(
+            Box::new(stdout),
+            replies,
+            reply_bytes(&role),
+            observation.clone(),
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                drop(writer);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
@@ -2265,6 +2340,7 @@ impl RemoteSpec {
             approved_login,
             w: FrameWriter::new(writer, compress),
             rx: Some(rx),
+            replies,
             deferred: Default::default(),
             reader: Some(reader),
             label: self.label(),
@@ -2733,8 +2809,13 @@ impl RemoteSpec {
         );
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let (rx, reader, batch_receipts) =
-            spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone())?;
+        let replies = reply_queue(self.read_ahead, &role);
+        let (rx, reader, batch_receipts) = spawn_observed_reader(
+            Box::new(reader),
+            replies,
+            reply_bytes(&role),
+            observation.clone(),
+        )?;
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
@@ -2743,6 +2824,7 @@ impl RemoteSpec {
             approved_login: None,
             w: FrameWriter::new(Box::new(writer), compress),
             rx: Some(rx),
+            replies,
             deferred: Default::default(),
             reader: Some(reader),
             label: format!("{} (tcp {addr_s})", self.label()),

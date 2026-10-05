@@ -1857,6 +1857,19 @@ impl FsOps {
         bail!("source content request omitted its registered source reference")
     }
 
+    /// A destination worker rooted at `directory`, whose requests name files
+    /// by their paths there, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn test_destination(directory: &Path) -> Self {
+        let mut ops = Self::new();
+        ops.install_destination(
+            File::open(directory).unwrap(),
+            directory.as_os_str().as_bytes(),
+        )
+        .unwrap();
+        ops
+    }
+
     fn install_destination(&mut self, directory: File, request_prefix: &[u8]) -> Result<()> {
         let root = Arc::new(Root::from_directory(directory)?);
         self.fds.clear();

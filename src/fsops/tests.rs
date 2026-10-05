@@ -55,6 +55,103 @@ use std::os::unix::fs::{symlink, FileTypeExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
+fn differing_reads_keep_only_differing_blocks() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let limit = MAX_DIFFERING_FILE_BYTES as usize;
+    let mut ops = FsOps::new();
+    ops.set_hash_policy(crate::hashing::HashPolicy {
+        transfer_integrity: true,
+        ..Default::default()
+    });
+    let algorithm = ops.hash_policy.algorithm;
+    let old = |len: usize| -> Vec<u8> { (0..len).map(|i| (i % 251) as u8).collect() };
+    // Name, length, the blocks that differ, and whether the read only
+    // decides whether the file is unchanged.
+    let three = (3 << 20) + 100;
+    let cases: [(&str, usize, Vec<usize>, bool); 6] = [
+        // Blocks on either side of a chunk boundary, and the short last one.
+        ("edited", three, vec![1, 15, 16, 48], false),
+        ("limit", 20 << 20, (0..limit / block).collect(), false),
+        ("over", 20 << 20, (0..=limit / block).collect(), false),
+        // A file read in one chunk that differs whole.
+        ("whole", 300 << 10, (0..5).collect(), false),
+        ("compared", three, vec![20, 30], true),
+        ("empty", 0, vec![], false),
+    ];
+    let mut reads = Vec::new();
+    let mut sources = Vec::new();
+    for (name, len, changed, compare_only) in &cases {
+        let mut source = old(*len);
+        for &index in changed {
+            let end = ((index + 1) * block).min(*len);
+            for byte in &mut source[index * block..end] {
+                *byte ^= 0x5a;
+            }
+        }
+        let path = directory.path().join(name);
+        fs::write(&path, &source).unwrap();
+        reads.push(DifferingRead {
+            path: path.as_os_str().as_bytes().to_vec(),
+            source: None,
+            attempt: 0,
+            len: *len as u32,
+            expected: old(*len)
+                .chunks(block)
+                .map(|chunk| algorithm.hash(chunk))
+                .collect(),
+            compare_only: *compare_only,
+        });
+        sources.push(source);
+    }
+    let Response::DifferingBlocks(results) = ops.handle(&Request::ReadDifferingBatch {
+        block: block as u64,
+        reads,
+    }) else {
+        panic!("unexpected response");
+    };
+    let results: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+    for (((name, len, changed, _), source), result) in cases.iter().zip(&sources).zip(&results) {
+        assert_eq!(result.source.as_ref().unwrap().size, *len as u64, "{name}");
+        let differing: Vec<_> = (0..len.div_ceil(block))
+            .filter(|index| changed.contains(index))
+            .collect();
+        let data: Vec<u8> = differing
+            .iter()
+            .flat_map(|&index| &source[index * block..((index + 1) * block).min(*len)])
+            .copied()
+            .collect();
+        match *name {
+            "over" => {
+                // Past what one patch carries: no data, and no further
+                // comparison than the chunk that passed it.
+                assert!(result.data.is_empty());
+                assert_eq!(result.matching.len(), limit / block + 16);
+                assert!(!result.matching[limit / block]);
+            }
+            "compared" => {
+                // Only whether it is unchanged: no further than the first
+                // differing block.
+                assert!(result.data.is_empty());
+                assert_eq!(result.matching.len(), 21);
+                assert!(result.matching[..20].iter().all(|same| *same));
+                assert!(!result.matching[20]);
+            }
+            _ => {
+                let matching: Vec<_> = (0..len.div_ceil(block))
+                    .map(|index| !changed.contains(&index))
+                    .collect();
+                assert_eq!(result.matching, matching, "{name}");
+                assert!(result.data == data, "{name}");
+                assert_eq!(result.data.capacity(), result.data.len(), "{name}");
+                assert_eq!(result.hash, algorithm.hash(&data), "{name}");
+            }
+        }
+    }
+    assert_eq!(results[1].data.len(), limit);
+}
+
+#[test]
 fn selected_hash_is_independent_of_payload_integrity() {
     use crate::hashing::{HashAlgorithm, HashPolicy};
     let directory = crate::test_support::tempdir().unwrap();

@@ -219,6 +219,9 @@ impl Conn for LocalConn {
     fn supports_request_pipelining(&self) -> bool {
         false
     }
+    fn reply_ready(&self) -> bool {
+        !self.pending.is_empty()
+    }
     fn begin_streaming_writes(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.pending.is_empty() && self.write_stream.is_none(),

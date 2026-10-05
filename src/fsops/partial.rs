@@ -1,5 +1,9 @@
 use super::*;
 
+/// Bytes of a source a grouped comparison reads at once, rounded down to
+/// whole comparison blocks, or one block when blocks are larger.
+const DIFFERING_READ_CHUNK: u64 = 1 << 20;
+
 impl FsOps {
     pub fn probe_partial(
         &mut self,
@@ -1508,7 +1512,7 @@ impl FsOps {
     }
 
     fn read_small_batch(&mut self, reads: &[SmallRead]) -> Result<Response> {
-        let blocks = self.read_small_sources(reads, true, |_, _, data, hash| SmallBlock {
+        let blocks = self.read_small_sources(reads, |_, _, data, hash| SmallBlock {
             source: None,
             data,
             hash,
@@ -1516,59 +1520,149 @@ impl FsOps {
         Ok(Response::SmallBlocks(blocks))
     }
 
-    /// Read each source whole and return only the blocks whose comparison
-    /// hashes differ from what the destination holds, so each source byte is
-    /// read once.
+    /// Return only the blocks of each source whose comparison hashes differ
+    /// from what the destination holds. Each source is compared a chunk of
+    /// whole blocks at a time, so no more of it is held than one chunk and
+    /// its differing blocks.
     fn read_differing_batch(&mut self, block: u64, reads: &[DifferingRead]) -> Result<Response> {
         if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
             bail!("invalid comparison block size {block}");
         }
-        // Only the differing blocks are sent, so only they take a payload
-        // hash, and only when transfers are checked.
-        let differing = self.read_small_sources(reads, false, |ops, read, contents, _| {
-            let algorithm = ops.hash_policy.algorithm;
-            let matching: Vec<bool> = contents
-                .chunks(block as usize)
-                .enumerate()
-                .map(|(index, chunk)| read.expected.get(index) == Some(&algorithm.hash(chunk)))
-                .collect();
-            let data = if read.compare_only {
-                Vec::new()
-            } else if !matching.contains(&true) {
-                // Every block differs: send the contents as read.
-                contents
-            } else {
-                let mut data = Vec::new();
-                for (chunk, same) in contents.chunks(block as usize).zip(&matching) {
+        let total: u64 = reads.iter().map(|read| u64::from(read.len)).sum();
+        if total > MAX_READ_BYTES {
+            bail!("small-file batch requests {total} bytes, exceeding the {MAX_READ_BYTES}-byte protocol limit");
+        }
+        let chunk = DIFFERING_READ_CHUNK.max(block) / block * block;
+        let mut differing: Vec<_> = reads
+            .iter()
+            .map(|read| {
+                self.read_differing(read, block, chunk)
+                    .map_err(|error| errstr(&error))
+            })
+            .collect();
+        self.recheck_small_sources(reads, &mut differing)?;
+        Ok(Response::DifferingBlocks(differing))
+    }
+
+    /// Compare one source with the destination's block hashes, `chunk` bytes
+    /// at a time. A comparison that only decides whether the file is
+    /// unchanged stops at its first differing block; any other stops once
+    /// its differing blocks pass `MAX_DIFFERING_FILE_BYTES`, and returns no
+    /// data, as the file is then sent in ranges per file. A file read in
+    /// one chunk sends its differing blocks as read; a longer one reads them
+    /// again once compared, into a buffer of exactly their size, rather than
+    /// keeping blocks that might all be discarded.
+    fn read_differing(
+        &mut self,
+        read: &DifferingRead,
+        block: u64,
+        chunk: u64,
+    ) -> Result<DifferingBlocks> {
+        let len = u64::from(read.len);
+        let algorithm = self.hash_policy.algorithm;
+        let mut matching = Vec::with_capacity(len.div_ceil(block) as usize);
+        if len == 0 {
+            // Metadata is enough for an empty file, even with mode 000.
+            self.source_content_target(read.source.as_ref())?;
+        }
+        let mut buffer = vec![0; chunk.min(len) as usize];
+        // Prepare the next chunks while this one is compared.
+        let chunks = len > chunk;
+        if chunks {
+            self.begin_source_range(0..len);
+        }
+        // The bytes of the blocks that differ.
+        let mut differing = 0;
+        let compared = (|| -> Result<()> {
+            let mut off = 0;
+            while off < len {
+                let read_len = chunk.min(len - off) as usize;
+                let contents = &mut buffer[..read_len];
+                self.read_source_into(
+                    &read.path,
+                    read.source.as_ref(),
+                    read.attempt,
+                    off,
+                    contents,
+                )?;
+                for piece in contents.chunks(block as usize) {
+                    let same = read.expected.get(matching.len()) == Some(&algorithm.hash(piece));
+                    matching.push(same);
                     if !same {
-                        data.extend_from_slice(chunk);
+                        differing += piece.len() as u64;
+                        if read.compare_only {
+                            return Ok(());
+                        }
                     }
                 }
-                data
-            };
-            let hash = if ops.hash_policy.transfer_integrity {
-                ops.observed_payload_hash(&data)
-            } else {
-                [0; 32]
-            };
-            DifferingBlocks {
-                source: None,
-                matching,
-                data,
-                hash,
+                if differing > MAX_DIFFERING_FILE_BYTES {
+                    return Ok(());
+                }
+                off += read_len as u64;
             }
-        })?;
-        Ok(Response::DifferingBlocks(differing))
+            Ok(())
+        })();
+        if chunks {
+            self.end_source_range();
+        }
+        compared?;
+        let data = if read.compare_only || differing == 0 || differing > MAX_DIFFERING_FILE_BYTES {
+            Vec::new()
+        } else if !chunks && differing == len {
+            // Every block of a file read in one chunk differs: send it as
+            // read.
+            buffer
+        } else {
+            let mut data = Vec::with_capacity(differing as usize);
+            let block = block as usize;
+            let mut index = 0;
+            while index < matching.len() {
+                if matching[index] {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < matching.len() && !matching[index] {
+                    index += 1;
+                }
+                let range = start * block..(index * block).min(len as usize);
+                if chunks {
+                    let at = data.len();
+                    data.resize(at + range.len(), 0);
+                    self.read_source_into(
+                        &read.path,
+                        read.source.as_ref(),
+                        read.attempt,
+                        range.start as u64,
+                        &mut data[at..],
+                    )?;
+                } else {
+                    data.extend_from_slice(&buffer[range]);
+                }
+            }
+            data
+        };
+        // Only the differing blocks are sent, so only they take a payload
+        // hash, and only when transfers are checked.
+        let hash = if self.hash_policy.transfer_integrity {
+            self.observed_payload_hash(&data)
+        } else {
+            [0; 32]
+        };
+        Ok(DifferingBlocks {
+            source: None,
+            matching,
+            data,
+            hash,
+        })
     }
 
     /// Read each small source whole, convert its contents and payload hash
     /// with `convert` as soon as it is read, and attach the source's metadata
-    /// rechecked after every read. Without `payload`, `convert` does not use
-    /// the payload hash of the contents, and none is computed.
+    /// rechecked after every read.
     fn read_small_sources<R: SmallSourceRead, T: SmallSourceResult>(
         &mut self,
         reads: &[R],
-        payload: bool,
         mut convert: impl FnMut(&Self, &R, Vec<u8>, ContentDigest) -> T,
     ) -> Result<Vec<std::result::Result<T, String>>> {
         let total: u64 = reads.iter().map(|read| u64::from(read.len())).sum();
@@ -1580,33 +1674,31 @@ impl FsOps {
             .map(|read| {
                 // Metadata is enough for an empty file, even with mode 000.
                 let result = if read.len() == 0 {
-                    self.source_content_target(read.source()).map(|_| {
-                        let hash = if payload {
-                            self.observed_payload_hash(&[])
-                        } else {
-                            [0; 32]
-                        };
-                        (Vec::new(), hash)
-                    })
+                    self.source_content_target(read.source())
+                        .map(|_| (Vec::new(), self.observed_payload_hash(&[])))
                 } else {
-                    self.read_range_hashed(
-                        read.path(),
-                        read.source(),
-                        read.attempt(),
-                        0,
-                        read.len(),
-                        payload,
-                    )
-                    .and_then(|response| match response {
-                        Response::Block { data, hash, .. } => Ok((data, hash)),
-                        other => bail!("unexpected response {other:?}"),
-                    })
+                    self.read_range(read.path(), read.source(), read.attempt(), 0, read.len())
+                        .and_then(|response| match response {
+                            Response::Block { data, hash, .. } => Ok((data, hash)),
+                            other => bail!("unexpected response {other:?}"),
+                        })
                 };
                 result
                     .map(|(data, hash)| convert(self, read, data, hash))
                     .map_err(|error| errstr(&error))
             })
             .collect();
+        self.recheck_small_sources(reads, &mut blocks)?;
+        Ok(blocks)
+    }
+
+    /// Attach to each source read without error its metadata, rechecked
+    /// after every file of the batch was read.
+    fn recheck_small_sources<R: SmallSourceRead, T: SmallSourceResult>(
+        &mut self,
+        reads: &[R],
+        blocks: &mut [std::result::Result<T, String>],
+    ) -> Result<()> {
         #[cfg(debug_assertions)]
         test_race_barrier(
             "SYQ_TEST_SOURCE_RECHECK_READY_FILE",
@@ -1639,7 +1731,7 @@ impl FsOps {
                 blocks[i].as_mut().unwrap().set_source(entry);
             }
         }
-        Ok(blocks)
+        Ok(())
     }
 
     /// Write a whole small file through its private partial and atomically
@@ -2081,21 +2173,31 @@ impl FsOps {
         off: u64,
         len: u32,
     ) -> Result<Response> {
-        self.read_range_hashed(path, source, attempt, off, len, true)
+        if u64::from(len) > MAX_READ_BYTES {
+            bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
+        }
+        let mut data = vec![0u8; len as usize];
+        self.read_source_into(path, source, attempt, off, &mut data)?;
+        let hash = if self.hash_policy.transfer_integrity {
+            let _hash = self
+                .operation
+                .span(crate::transfer_observations::Stage::Hashing);
+            self.hash_policy.payload_algorithm().hash(&data)
+        } else {
+            [0; 32]
+        };
+        Ok(Response::Block { off, hash, data })
     }
 
-    /// Read a range, with its payload hash when transfers are checked and
-    /// `hashed` asks for it.
-    fn read_range_hashed(
+    /// Fill `data` from a source at `off`.
+    fn read_source_into(
         &mut self,
         path: &[u8],
         source: Option<&RegisteredPath>,
         attempt: u32,
         off: u64,
-        len: u32,
-        hashed: bool,
-    ) -> Result<Response> {
-        let operation = self.operation.clone();
+        data: &mut [u8],
+    ) -> Result<()> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some()
             || std::env::var_os("SYQ_TEST_FAIL_READ_RANGE_NAME")
@@ -2103,9 +2205,9 @@ impl FsOps {
         {
             bail!("test read-range failure");
         }
-        if u64::from(len) > MAX_READ_BYTES {
-            bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
-        }
+        let len = data.len();
+        #[cfg(not(target_os = "linux"))]
+        let operation = self.operation.clone();
         #[cfg(target_os = "linux")]
         let mut preparation = std::mem::take(&mut self.read_ahead);
         let result = (|| {
@@ -2121,15 +2223,14 @@ impl FsOps {
                 // explicit rsync --insecure-links compatibility path.
                 self.cached(&p, attempt)?.file()
             };
-            let mut data = vec![0u8; len as usize];
             #[cfg(target_os = "linux")]
-            let read = preparation.read_exact_at(f, &mut data, off);
+            let read = preparation.read_exact_at(f, data, off);
             #[cfg(not(target_os = "linux"))]
             let read = {
                 let reading = operation.span(crate::transfer_observations::Stage::SourceRead);
-                let result = f.read_exact_at(&mut data, off);
+                let result = f.read_exact_at(data, off);
                 if result.is_ok() {
-                    reading.bytes(u64::from(len));
+                    reading.bytes(len as u64);
                 }
                 result
             };
@@ -2139,15 +2240,7 @@ impl FsOps {
                 "SYQ_TEST_SOURCE_READ_EVENTS",
                 format_args!("read {off} {len}"),
             )?;
-            let hash = {
-                if hashed && self.hash_policy.transfer_integrity {
-                    let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
-                    self.hash_policy.payload_algorithm().hash(&data)
-                } else {
-                    [0; 32]
-                }
-            };
-            Ok(Response::Block { off, hash, data })
+            Ok(())
         })();
         #[cfg(target_os = "linux")]
         {

@@ -4258,6 +4258,161 @@ fn reading_source(entries: std::collections::HashMap<PathBytes, Entry>) -> Box<d
     })
 }
 
+/// A source that reads with its own `FsOps`, answering each request as it is
+/// sent: at once, as an in-process source does, when `in_process`, and
+/// otherwise queueing its replies as a remote one does. It records the most
+/// reads awaiting replies at once, and the most file data they held.
+struct QueuingSource {
+    ops: crate::fsops::FsOps,
+    replies: std::collections::VecDeque<Response>,
+    in_process: bool,
+    most: Arc<Mutex<(usize, usize)>>,
+}
+
+impl Conn for QueuingSource {
+    fn send(&mut self, mut request: Request) -> Result<()> {
+        // Its files are read by path, as no source roots are registered.
+        if let Request::ReadDifferingBatch { reads, .. } = &mut request {
+            for read in reads {
+                read.source = None;
+            }
+        }
+        self.replies.push_back(self.ops.handle(&request));
+        let data = self
+            .replies
+            .iter()
+            .map(|reply| match reply {
+                Response::DifferingBlocks(files) => {
+                    files.iter().flatten().map(|file| file.data.len()).sum()
+                }
+                _ => 0,
+            })
+            .sum();
+        let mut most = self.most.lock().unwrap();
+        *most = (most.0.max(self.replies.len()), most.1.max(data));
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.replies
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("missing reply"))
+    }
+    fn reply_ready(&self) -> bool {
+        self.in_process && !self.replies.is_empty()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        (!self.in_process).then_some(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(String),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn grouped_comparison_holds_one_in_process_read_and_queues_remote_ones() {
+    use std::os::unix::fs::MetadataExt;
+    // Rewritten files: twenty of 1 MiB, four to a group, and four of 12 MiB,
+    // each a group of its own, whose reads return all their data.
+    let files: Vec<(String, usize)> = (0..20)
+        .map(|n| (format!("small{n}"), 1 << 20))
+        .chain((0..4).map(|n| (format!("large{n}"), 12 << 20)))
+        .collect();
+    for in_process in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        for directory in ["source", "target"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        let sched = Arc::new(Sched::new(512, 8192));
+        for (n, (name, len)) in files.iter().enumerate() {
+            let contents = |seed: usize| -> Vec<u8> {
+                (0..*len).map(|i| ((i * 7 + seed) % 251) as u8).collect()
+            };
+            let (source, target) = (
+                root.join("source").join(name),
+                root.join("target").join(name),
+            );
+            std::fs::write(&source, contents(n)).unwrap();
+            std::fs::write(&target, contents(n + 1)).unwrap();
+            let mut job = pipeline_job(name.as_bytes(), 0);
+            job.src = source.as_os_str().as_bytes().to_vec();
+            job.dst = target.as_os_str().as_bytes().to_vec();
+            let planned = std::fs::metadata(&source).unwrap();
+            job.entry.size = planned.len();
+            job.entry.mtime = planned.mtime();
+            job.entry.mtime_nsec = planned.mtime_nsec() as u32;
+            let existing = std::fs::metadata(&target).unwrap();
+            job.dst_entry = Some(Entry {
+                mtime: 0,
+                dev: existing.dev(),
+                ino: existing.ino(),
+                ..job.entry.clone()
+            });
+            sched.push_file(job);
+        }
+        sched.scan_done();
+        let most = Arc::new(Mutex::new((0, 0)));
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        worker.src = Box::new(QueuingSource {
+            ops: crate::fsops::FsOps::new(),
+            replies: Default::default(),
+            in_process,
+            most: most.clone(),
+        });
+        let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+        worker.dst = Box::new(AnsweringConn {
+            answer: move |request: Request| destination.handle(&request),
+            replies: Default::default(),
+        });
+        worker.fast_batch_files = files.len();
+        Arc::get_mut(&mut worker.opts).unwrap().block = 4 << 20;
+        run_workers(&sched, vec![worker]);
+        for (name, _) in &files {
+            assert!(
+                std::fs::read(root.join("source").join(name)).unwrap()
+                    == std::fs::read(root.join("target").join(name)).unwrap(),
+                "{name}"
+            );
+        }
+        let (reads, data) = *most.lock().unwrap();
+        if in_process {
+            // Each read's data moves on before the next read: no more than
+            // one group's is held.
+            assert_eq!((reads, data), (1, 12 << 20));
+        } else {
+            // Reads overlap, within the source's reply queue.
+            assert!(
+                (2..=crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH).contains(&reads),
+                "{reads} reads"
+            );
+        }
+    }
+}
+
 /// A command-restricted receiver: each request is authorized, executed and
 /// settled as its server does, and recorded once executed. `before_patch`
 /// runs between a patch batch's authorization and its execution.

@@ -73,6 +73,15 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 /// batch (`patch_batch_fits`).
 pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;
 
+/// Data per patch from which an uncompressed `PatchSmallBatch` is written
+/// without first encoding it into a buffer.
+const DIRECT_PATCH_BYTES: usize = 1 << 20;
+
+/// Most differing data `ReadDifferingBatch` returns for one file, so that
+/// neither the source nor the patch it feeds holds more of one file. A file
+/// that differs by more is sent in ranges per file instead.
+pub const MAX_DIFFERING_FILE_BYTES: u64 = 16 << 20;
+
 /// Whether a `PatchSmallBatch` of files of these lengths stays within what a
 /// receiver builds in memory before publishing any of them: `MAX_READ_BYTES`
 /// in all. The lengths count reused blocks, which cost the request almost
@@ -1238,7 +1247,10 @@ pub enum WireRequest<Data> {
         files: Vec<ExistingRead>,
     },
     /// Read source files, returning only the blocks that differ from the
-    /// destination's hashes.
+    /// destination's hashes. A file stops being compared, with `matching`
+    /// ending there, at its first differing block when it is `compare_only`,
+    /// and otherwise once its differing blocks pass
+    /// `MAX_DIFFERING_FILE_BYTES`, when it returns no data at all.
     ReadDifferingBatch {
         block: u64,
         reads: Vec<DifferingRead>,
@@ -1682,7 +1694,17 @@ impl SizeHint for Request {
     }
 
     fn direct_payload(&self) -> bool {
-        matches!(self, Request::WriteRange { .. })
+        match self {
+            Request::WriteRange { .. } => true,
+            // Patches whose data dwarfs their metadata: a second pass over
+            // the metadata costs less than copying the data into a buffer.
+            Request::PatchSmallBatch(patches) => {
+                !patches.is_empty()
+                    && patches.iter().map(|patch| patch.data.len()).sum::<usize>()
+                        >= patches.len() * DIRECT_PATCH_BYTES
+            }
+            _ => false,
+        }
     }
     fn frame_limit(&self) -> usize {
         match self {
@@ -2049,6 +2071,24 @@ impl<W: Write> FrameWriter<W> {
         let payload = postcard::to_extend(msg, Vec::with_capacity(msg.size_hint()))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::check_message_size(payload.len(), msg.frame_limit())?;
+        self.write_payload(payload)
+    }
+
+    /// As `write_msg`, but free the message once it is encoded, so that its
+    /// data is not held beside the encoded and compressed frame.
+    pub fn write_owned<T: Serialize + SizeHint>(&mut self, msg: T) -> io::Result<()> {
+        if !self.compress && msg.direct_payload() {
+            return self.write_msg(&msg);
+        }
+        self.write_preamble()?;
+        let payload = postcard::to_extend(&msg, Vec::with_capacity(msg.size_hint()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Self::check_message_size(payload.len(), msg.frame_limit())?;
+        drop(msg);
+        self.write_payload(payload)
+    }
+
+    fn write_payload(&mut self, payload: Vec<u8>) -> io::Result<()> {
         let encoded = if self.compress && payload.len() > COMPRESS_MIN {
             self.compression.encode(&payload).ok().flatten()
         } else {
@@ -2062,6 +2102,7 @@ impl<W: Write> FrameWriter<W> {
         if flag == 0 {
             self.w.write_all(&payload)?;
         } else {
+            drop(payload);
             self.w.write_all(self.compression.output(len))?;
         }
         self.w.flush()?;

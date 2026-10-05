@@ -11,14 +11,19 @@
 //!    (`PatchSmallBatch`).
 //!
 //! Groups are pipelined through these stages, so a run of files costs about
-//! one round trip of lead time rather than round trips per file.
+//! one round trip of lead time rather than round trips per file. Groups are
+//! small and many are in flight (`COMPARE_WINDOW`), and a file of which more
+//! differs than one patch carries (`MAX_DIFFERING_FILE_BYTES`) is compared
+//! and sent in ranges per file instead. An in-process source's reply moves
+//! on before the next read, so a worker holds one group's data at a time; a
+//! remote source's replies are bounded by its connection's reply queue.
 
 use super::*;
+use crate::transfer_tuning::COMPARE_WINDOW;
 
-/// Files and source bytes per group. The source reads each file of a group
-/// into memory to compare it.
+/// Files and source bytes per group.
 const COMPARE_GROUP_FILES: usize = 256;
-const COMPARE_GROUP_BYTES: u64 = 16 << 20;
+const COMPARE_GROUP_BYTES: u64 = 4 << 20;
 /// Files up to this size are compared and patched in groups. A larger file
 /// takes the per-file path, whose ranges several workers can share.
 const PATCH_MAX_FILE: u64 = crate::proto::MAX_PATCH_FILE_BYTES;
@@ -49,6 +54,9 @@ pub(super) enum Compared {
     ResumePartial,
     /// The file could not be compared or patched: replace it whole.
     Differs,
+    /// More of the file differs than one patch carries: compare and send it
+    /// in ranges per file.
+    LargePatch,
     /// The destination no longer met the patch's target condition, as when
     /// keeping another name of the same file changed it: compare it again,
     /// under a fresh condition.
@@ -123,7 +131,7 @@ impl Worker {
         let (max_file, group_bytes) = self.compare_group_limits();
         // Only differing blocks cross the network, so a batch holds enough
         // groups to keep the pipeline full: two windows of them.
-        let batch_bytes = group_bytes * 2 * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u64;
+        let batch_bytes = group_bytes * 2 * COMPARE_WINDOW as u64;
         let mut batch = vec![idx];
         batch.extend(self.sched.take_small_near(
             idx,
@@ -171,6 +179,10 @@ impl Worker {
                     self.sched.jobs.lock().unwrap()[i].resume_partial = true;
                     self.sched.requeue(i);
                 }
+                Some(Compared::LargePatch) => {
+                    self.sched.jobs.lock().unwrap()[i].large_patch = true;
+                    self.sched.requeue(i);
+                }
                 Some(Compared::SourceChanged(now)) => {
                     let job = self.job(i);
                     self.retry_changed_small(i, &job, now);
@@ -211,15 +223,29 @@ impl Worker {
         if start < jobs.len() {
             unissued.push_back((start..jobs.len()).collect());
         }
-        let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
+        // Each group has at most one request outstanding, so the groups in
+        // flight bound the replies the destination owes, and waiting reads
+        // those the source owes, to what each connection queues.
+        let window = self
+            .dst
+            .reply_queue()
+            .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
+        let source_queue = self.src.reply_queue().unwrap_or(usize::MAX);
         let mut groups: Vec<Group> = Vec::new();
         let mut in_flight = 0;
-        // Each group has at most one request outstanding, so neither
-        // connection has more than `window` replies pending.
+        // Reads waiting for the source to owe fewer replies.
+        let mut waiting: std::collections::VecDeque<(usize, Request)> = Default::default();
         let mut source = std::collections::VecDeque::new();
         let mut destination = std::collections::VecDeque::new();
         let result = (|| -> Result<()> {
             loop {
+                while source.len() < source_queue {
+                    let Some((group, request)) = waiting.pop_front() else {
+                        break;
+                    };
+                    self.src.send(request)?;
+                    source.push_back((group, Stage::Read, std::time::Instant::now()));
+                }
                 while in_flight < window && self.gate.allowed(self.id) && !self.sched.is_aborted() {
                     let Some(files) = unissued.pop_front() else {
                         break;
@@ -247,13 +273,20 @@ impl Worker {
                     });
                     in_flight += 1;
                 }
-                // Replies arrive in order on each connection. Take the one
+                // Replies arrive in order on each connection. Take one that
+                // has arrived, as an in-process endpoint's has, so that the
+                // data it holds moves on at once; otherwise wait for the one
                 // whose request went out first.
                 let from_source = match (source.front(), destination.front()) {
+                    (Some(_), Some(_)) if self.src.reply_ready() => true,
+                    (Some(_), Some(_)) if self.dst.reply_ready() => false,
                     (Some((_, _, a)), Some((_, _, b))) => a <= b,
                     (Some(_), None) => true,
                     (None, Some(_)) => false,
-                    (None, None) => return Ok(()),
+                    (None, None) => {
+                        debug_assert!(waiting.is_empty());
+                        return Ok(());
+                    }
                 };
                 let (group, stage, _) = if from_source {
                     source.pop_front()
@@ -269,10 +302,7 @@ impl Worker {
                 let next =
                     self.compare_stage(&jobs, &mut groups[group], stage, response, &mut outcomes)?;
                 match next {
-                    Some((Stage::Read, request)) => {
-                        self.src.send(request)?;
-                        source.push_back((group, Stage::Read, std::time::Instant::now()));
-                    }
+                    Some((Stage::Read, request)) => waiting.push_back((group, request)),
                     Some((stage, request)) => {
                         self.dst.send(request)?;
                         destination.push_back((group, stage, std::time::Instant::now()));
@@ -281,6 +311,12 @@ impl Worker {
                 }
             }
         })();
+        // Files whose reads were never sent were not compared.
+        for (group, _) in waiting {
+            for read in &groups[group].reads {
+                outcomes[read.file] = None;
+            }
+        }
         // An endpoint error consumes its own reply. Drain the requests still
         // outstanding in wire order, keeping what they decided; a transport
         // error ends the drain.
@@ -397,6 +433,12 @@ impl Worker {
                     };
                     if source_changed(&job.entry, source.as_ref()) {
                         outcomes[i] = Some(Compared::SourceChanged(source));
+                        continue;
+                    }
+                    // The source stops at a file of which more differs than
+                    // one patch carries, and sends none of it.
+                    if !compare_only && data.is_empty() && matching.contains(&false) {
+                        outcomes[i] = Some(Compared::LargePatch);
                         continue;
                     }
                     if matching.len() as u64 != job.entry.size.div_ceil(block)
@@ -531,6 +573,7 @@ impl Worker {
             Compared::SourceChanged(_)
             | Compared::ResumePartial
             | Compared::Differs
+            | Compared::LargePatch
             | Compared::StaleCondition => unreachable!("these files are requeued"),
         }
     }
