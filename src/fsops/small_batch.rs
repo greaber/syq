@@ -7,6 +7,9 @@ use super::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+mod stream;
+pub(super) use stream::PatchStream;
+
 pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError>;
 
 /// Files one burst stages before it publishes any of them.
@@ -654,15 +657,7 @@ impl FsOps {
             // A clone keeps the reused blocks unread, so each must lie
             // within the file it comes from. Otherwise assembling reads them
             // and fails.
-            let within = patch
-                .reuse
-                .iter()
-                .enumerate()
-                .filter(|(_, reuse)| reuse.is_some())
-                .all(|(index, _)| {
-                    (index as u64 * patch.block + patch.block).min(patch.len) <= basis.len
-                });
-            if within && fingerprint(&old.metadata()?) == basis {
+            if stream::reuses_within(patch, basis.len) && fingerprint(&old.metadata()?) == basis {
                 let source = PatchSource {
                     old: old.try_clone()?,
                     basis,
@@ -925,7 +920,8 @@ impl FsOps {
                 let created = if refuse {
                     Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
                 } else {
-                    self.create_stage(&puts[index], source(index), target)
+                    let mode = staged_file_mode(&puts[index].meta, puts[index].flags);
+                    self.create_stage(&puts[index], source(index), target, mode, false)
                 };
                 match created {
                     Ok(stage) => stages.push((index, stage)),
@@ -1057,21 +1053,27 @@ impl FsOps {
         } else {
             self.small_target(put)?
         };
-        let stage = self.create_stage(put, source, target)?;
+        let mode = staged_file_mode(&put.meta, put.flags);
+        let stage = self.create_stage(put, source, target, mode, false)?;
         self.write_small_stage(put, source, &stage, None)?;
         self.publish_small_stage(put, &stage)?;
         self.finish_small_stage(put, stage)
     }
 
     /// Create the stage of a put, or of a patch with the file it reuses
-    /// blocks of. On macOS, where a clone is a new file, a cloning patch's
-    /// stage is made as a clone of that file when it can be. On Linux a
-    /// patch's stage takes a clone or copy of that file once created.
+    /// blocks of, with `mode`. On macOS, where a clone is a new file, a
+    /// cloning patch's stage is made as a clone of that file when it can be,
+    /// private until publication. On Linux a patch's stage takes a clone or
+    /// copy of that file once created, so it is created as a new file
+    /// (`create_seeded_stage`); so is any stage that is to be `fresh`, as a
+    /// streamed patch's, which may place that file's blocks itself.
     fn create_stage(
         &mut self,
         put: &SmallPut,
         source: Option<&PatchSource<'_>>,
         target: RootedTarget,
+        mode: u32,
+        fresh: bool,
     ) -> Result<SmallStage> {
         #[cfg(target_os = "macos")]
         if let Some(source) = source {
@@ -1088,10 +1090,10 @@ impl FsOps {
                 });
             }
         }
-        if cfg!(target_os = "linux") && source.is_some() {
-            return self.create_seeded_stage(put, target);
+        if fresh || (cfg!(target_os = "linux") && source.is_some()) {
+            return self.create_seeded_stage(put, target, mode);
         }
-        self.create_small_stage(put, target)
+        self.create_small_stage_with_mode(put, target, mode)
     }
 
     /// The stage of a patch that will take a clone or copy of the file it
@@ -1100,11 +1102,16 @@ impl FsOps {
     /// let them read them beside the target, and whoever opened a sidecar
     /// left at the name while its mode was wider can read what is written to
     /// it. So the stage is created exclusively, replacing anything at the
-    /// name, with only its owner's permissions, and publication sets the
-    /// wanted mode. It is new whatever mode the filesystem gave it.
-    fn create_seeded_stage(&mut self, put: &SmallPut, target: RootedTarget) -> Result<SmallStage> {
+    /// name, with only the owner's permissions of `mode`, and publication
+    /// sets the wanted mode. It is new whatever mode the filesystem gave it.
+    fn create_seeded_stage(
+        &mut self,
+        put: &SmallPut,
+        target: RootedTarget,
+        mode: u32,
+    ) -> Result<SmallStage> {
         self.uncache_rooted(&target.root, &target.relative);
-        let mode = staged_file_mode(&put.meta, put.flags) & 0o700;
+        let mode = mode & 0o700;
         let (partial, label, (file, created)) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 self.uncache_rooted(&target.root, relative);
@@ -1163,8 +1170,17 @@ impl FsOps {
         put: &SmallPut,
         target: RootedTarget,
     ) -> Result<SmallStage> {
-        self.uncache_rooted(&target.root, &target.relative);
         let mode = staged_file_mode(&put.meta, put.flags);
+        self.create_small_stage_with_mode(put, target, mode)
+    }
+
+    fn create_small_stage_with_mode(
+        &mut self,
+        put: &SmallPut,
+        target: RootedTarget,
+        mode: u32,
+    ) -> Result<SmallStage> {
+        self.uncache_rooted(&target.root, &target.relative);
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 // Nothing reads a small file's sidecar, so it is opened for
@@ -2833,5 +2849,545 @@ mod tests {
         drop(exhausted);
         let again = ReservedDescriptors::up_to(held);
         assert!(again.0 > 0 || held == 0);
+    }
+
+    /// The new data of `patch` in pieces of `blocks` of its new blocks each,
+    /// the last piece taking what remains.
+    fn pieces(patch: &SmallPatch, blocks: usize) -> Vec<Vec<u8>> {
+        let lens: Vec<usize> = patch
+            .reuse
+            .iter()
+            .enumerate()
+            .filter(|(_, reuse)| reuse.is_none())
+            .map(|(index, _)| patch.block.min(patch.len - index as u64 * patch.block) as usize)
+            .collect();
+        let mut pieces = Vec::new();
+        let mut taken = 0;
+        for group in lens.chunks(blocks) {
+            let len: usize = group.iter().sum();
+            pieces.push(patch.data[taken..taken + len].to_vec());
+            taken += len;
+        }
+        pieces
+    }
+
+    /// `patch` as a request to `receiver` names it.
+    fn requested(mut patch: SmallPatch) -> SmallPatch {
+        patch.path = [b"logical/".as_slice(), &patch.path].concat();
+        patch
+    }
+
+    /// Begin `patch` as a streamed patch, send `pieces`, and end it,
+    /// returning the replies to the begin and each piece, and the end's
+    /// outcome. `between` runs before the end.
+    fn stream_patch(
+        ops: &mut FsOps,
+        patch: &SmallPatch,
+        pieces: &[Vec<u8>],
+        commit: bool,
+        between: impl FnOnce(&mut FsOps),
+    ) -> (
+        Vec<Response>,
+        std::result::Result<SmallPatched, SmallPatchError>,
+    ) {
+        let algorithm = ops.hash_policy.payload_algorithm();
+        let mut begin = requested(patch.clone());
+        let data_len = std::mem::take(&mut begin.data).len() as u64;
+        let mut replies = vec![ops.handle(&Request::PatchBegin {
+            patch: Box::new(begin),
+            data_len,
+        })];
+        for piece in pieces {
+            replies.push(ops.handle(&Request::PatchData {
+                data: piece.clone().into(),
+                hash: algorithm.hash(piece),
+            }));
+        }
+        between(ops);
+        match ops.handle(&Request::PatchEnd { commit }) {
+            Response::PatchedBatch(mut outcome) if outcome.len() == 1 => {
+                (replies, outcome.pop().unwrap())
+            }
+            other => panic!("unexpected end reply {other:?}"),
+        }
+    }
+
+    /// The sidecars in `directory`.
+    fn sidecars(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".syq-tmp."))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_streamed_stage_is_a_new_file_even_where_a_leftover_looks_new() {
+        // Permissions are checked only at open: whoever opened a sidecar
+        // while its mode was wider still reads it through that descriptor.
+        // A streamed patch's stage holds the old file's bytes for as long as
+        // the stream lasts, whether it is seeded from that file or takes its
+        // reused blocks as the pieces arrive. So it is created exclusively,
+        // in place of a leftover at its name, empty in the file's final mode
+        // or narrowed to 0600, and the held leftover never shows the old
+        // file's bytes. Publication still gives the file its final mode.
+        let block = MIN_HASH_BLOCK_BYTES;
+        let secret = b"only the old file holds these bytes";
+        for (leftover, seeds, cloning) in [
+            (0o644, true, true),
+            (0o644, true, false),
+            (0o600, true, true),
+            (0o600, true, false),
+            (0o644, false, false),
+            (0o600, false, false),
+        ] {
+            let case = format!("leftover {leftover:o} seeded {seeds} cloning {cloning}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let path = directory.join("file");
+            let (_, new) = private_old_file(&path, secret);
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops
+                .hash_existing_batch(
+                    block,
+                    &[ExistingRead {
+                        path: b"file".to_vec(),
+                        len: new.len() as u64,
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    }],
+                )
+                .remove(0)
+                .unwrap();
+            let mut patch = patch_from("file", &new, block, &hashed, algorithm);
+            patch.meta.mode = 0o644;
+            patch.flags = flags::MODE;
+            if !seeds {
+                // Without the old file's fingerprint the stage is not
+                // seeded: it takes the reused blocks as pieces arrive.
+                patch.basis = None;
+            }
+            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
+            let sidecar = directory.join(relative.to_path_buf());
+            fs::write(&sidecar, b"").unwrap();
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(leftover)).unwrap();
+            let held = File::open(&sidecar).unwrap();
+            let read_all = |file: &File| {
+                let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+                file.read_exact_at(&mut bytes, 0).unwrap();
+                bytes
+            };
+            let shows_secret = |file: &File| {
+                read_all(file)
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret)
+            };
+            let pieces = pieces(&patch, 1);
+            let mut begin = requested(patch.clone());
+            let data_len = std::mem::take(&mut begin.data).len() as u64;
+            let payload = ops.hash_policy.payload_algorithm();
+            CLONED_PATCHES.set(0);
+            refusing_clones(!cloning, || {
+                let begun = ops.handle(&Request::PatchBegin {
+                    patch: Box::new(begin),
+                    data_len,
+                });
+                assert!(matches!(begun, Response::Ok), "{case}: {begun:?}");
+                // A seeded stage holds the whole old file, its private
+                // block included, until the pieces arrive.
+                assert!(!shows_secret(&held), "{case}: the held leftover was seeded");
+                assert_eq!(
+                    held.metadata().unwrap().nlink(),
+                    0,
+                    "{case}: the leftover was kept as the stage"
+                );
+                for piece in &pieces {
+                    let reply = ops.handle(&Request::PatchData {
+                        data: piece.clone().into(),
+                        hash: payload.hash(piece),
+                    });
+                    assert!(matches!(reply, Response::Ok), "{case}: {reply:?}");
+                }
+                let ended = ops.handle(&Request::PatchEnd { commit: true });
+                assert!(
+                    matches!(&ended, Response::PatchedBatch(outcome) if outcome[0].is_ok()),
+                    "{case}: {ended:?}"
+                );
+            });
+            assert_eq!(CLONED_PATCHES.get(), usize::from(seeds), "{case}");
+            assert!(!shows_secret(&held), "{case}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                0o644,
+                "{case}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(entries(directory), 1, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_streamed_patch_is_written_as_its_pieces_arrive_and_published_at_its_end() {
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old: Vec<u8> = (0..32 * block).map(|i| (i % 247) as u8 | 1).collect();
+        // One file reuses enough of the file it replaces to seed its stage
+        // from it; the other reuses too little and places its reused blocks
+        // as its pieces arrive, reading and checking each.
+        let mut seeded = old.clone();
+        seeded[5 * block as usize..6 * block as usize].fill(0);
+        seeded[20 * block as usize..23 * block as usize].fill(9);
+        seeded.extend_from_slice(b"tail");
+        let mut placed = old.clone();
+        placed[block as usize..20 * block as usize].fill(0);
+        placed[25 * block as usize] ^= 0xff;
+        placed.truncate(placed.len() - 100);
+        for (sparse, cloning, pieces_of) in [
+            (false, true, 1),
+            (true, true, 2),
+            (false, false, 3),
+            (true, false, 64),
+        ] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let mut ops = receiver(directory);
+            ops.sparse = sparse;
+            ops.hash_policy.transfer_integrity = true;
+            let algorithm = ops.hash_policy.algorithm;
+            for (name, new, seeds) in [("seeded", &seeded, true), ("placed", &placed, false)] {
+                fs::write(directory.join(name), &old).unwrap();
+                let read = ExistingRead {
+                    path: name.as_bytes().to_vec(),
+                    len: new.len() as u64,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                };
+                let hashed = ops.hash_existing_batch(block, &[read]);
+                let mut patch =
+                    patch_from(name, new, block, hashed[0].as_ref().unwrap(), algorithm);
+                // Published readable by others, but private until then.
+                patch.meta.mode = 0o644;
+                patch.flags = flags::MODE;
+                let pieces = pieces(&patch, pieces_of);
+                let case = format!("{name} sparse {sparse} cloning {cloning} pieces {pieces_of}");
+                CLONED_PATCHES.set(0);
+                let (replies, outcome) = refusing_clones(!cloning, || {
+                    stream_patch(&mut ops, &patch, &pieces, true, |ops| {
+                        assert!(ops.patch_stream_open());
+                        let staged = sidecars(directory);
+                        assert_eq!(staged.len(), 1, "{case}");
+                        let mode = fs::metadata(&staged[0]).unwrap().mode();
+                        assert_eq!(mode & 0o077, 0, "{case}: stage mode {mode:o}");
+                    })
+                });
+                assert!(
+                    replies.iter().all(|reply| matches!(reply, Response::Ok)),
+                    "{case}: {replies:?}"
+                );
+                assert_eq!(
+                    outcome,
+                    Ok(SmallPatched {
+                        kept: false,
+                        identity: None
+                    }),
+                    "{case}"
+                );
+                assert!(!ops.patch_stream_open());
+                assert_eq!(&fs::read(directory.join(name)).unwrap(), new, "{case}");
+                let mode = fs::metadata(directory.join(name)).unwrap().mode();
+                assert_eq!(mode & 0o777, 0o644, "{case}");
+                let copies = seeds && (cfg!(target_os = "linux") || clones_files(directory));
+                assert_eq!(CLONED_PATCHES.get(), usize::from(copies), "{case}");
+                assert!(sidecars(directory).is_empty(), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_streamed_patch_that_fails_or_is_abandoned_leaves_nothing_behind() {
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old: Vec<u8> = (0..32 * block).map(|i| (i % 241) as u8 | 1).collect();
+        let mut new = old.clone();
+        new[..4 * block as usize].fill(3);
+        new[12 * block as usize..14 * block as usize].fill(4);
+        let corrupt = |pieces: &mut Vec<Vec<u8>>| pieces[1][7] ^= 1;
+        let truncated = |pieces: &mut Vec<Vec<u8>>| {
+            pieces.pop();
+        };
+        let extended =
+            |pieces: &mut Vec<Vec<u8>>| pieces.push(vec![1; MIN_HASH_BLOCK_BYTES as usize]);
+        let split = |pieces: &mut Vec<Vec<u8>>| {
+            let last = pieces.pop().unwrap();
+            let (first, second) = last.split_at(100);
+            pieces.extend([first.to_vec(), second.to_vec()]);
+        };
+        type Change = fn(&mut Vec<Vec<u8>>);
+        let cases: [(&str, Option<Change>, bool, bool, bool); 8] = [
+            // Name, how its pieces change, whether it commits, whether its
+            // stage is seeded, and whether the file changes once begun.
+            ("abandoned", None, false, true, false),
+            ("corrupted", Some(corrupt), true, true, false),
+            ("short", Some(truncated), true, true, false),
+            ("long", Some(extended), true, true, false),
+            ("split", Some(split), true, false, false),
+            ("changed", None, true, false, true),
+            ("dropped", None, true, true, false),
+            ("seeded-changed", None, true, true, true),
+        ];
+        for (name, change, commit, seeds, changes) in cases {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let mut ops = receiver(directory);
+            ops.hash_policy.transfer_integrity = true;
+            let algorithm = ops.hash_policy.algorithm;
+            fs::write(directory.join("file"), &old).unwrap();
+            let read = ExistingRead {
+                path: b"file".to_vec(),
+                len: new.len() as u64,
+                condition: TargetCondition::Any,
+                guard: None,
+            };
+            let hashed = ops.hash_existing_batch(block, &[read]);
+            let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
+            if !seeds {
+                // Without the old file's fingerprint the stage is not seeded.
+                patch.basis = None;
+            }
+            let mut pieces = pieces(&patch, 2);
+            if let Some(change) = change {
+                change(&mut pieces);
+            }
+            let mut begin = requested(patch.clone());
+            let data_len = std::mem::take(&mut begin.data).len() as u64;
+            assert!(matches!(
+                ops.handle(&Request::PatchBegin {
+                    patch: Box::new(begin),
+                    data_len
+                }),
+                Response::Ok
+            ));
+            assert_eq!(sidecars(directory).len(), 1, "{name}");
+            if changes {
+                // A block the stage reuses changes after it was compared.
+                let mut changed = old.clone();
+                changed[30 * block as usize] ^= 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                fs::write(directory.join("file"), &changed).unwrap();
+            }
+            let payload = ops.hash_policy.payload_algorithm();
+            let mut failed = false;
+            for piece in &pieces {
+                let reply = ops.handle(&Request::PatchData {
+                    data: piece.clone().into(),
+                    hash: payload.hash(if name == "corrupted" {
+                        &pieces[0]
+                    } else {
+                        piece
+                    }),
+                });
+                // A piece reports a failure at once, and the stage is gone.
+                if !matches!(reply, Response::Ok) {
+                    assert!(
+                        matches!(&reply, Response::PatchedBatch(outcome) if outcome[0].is_err()),
+                        "{name}: {reply:?}"
+                    );
+                    assert!(sidecars(directory).is_empty(), "{name}");
+                    failed = true;
+                }
+            }
+            if name == "dropped" {
+                // A connection that closes with the patch open drops it.
+                drop(ops);
+                assert!(sidecars(directory).is_empty(), "{name}");
+                assert_eq!(fs::read(directory.join("file")).unwrap(), old, "{name}");
+                continue;
+            }
+            let reply = ops.handle(&Request::PatchEnd { commit });
+            let Response::PatchedBatch(outcome) = reply else {
+                panic!("{name}: unexpected end reply {reply:?}");
+            };
+            // A seeded stage keeps the blocks it copied, which matched when
+            // copied; only an unseeded one reads the changed block.
+            let succeeds = name == "seeded-changed";
+            assert_eq!(outcome[0].is_ok(), succeeds, "{name}: {outcome:?}");
+            assert!(failed || commit || !succeeds, "{name}");
+            if let Err(error) = &outcome[0] {
+                assert!(
+                    !error.stale_condition && !error.matched,
+                    "{name}: {error:?}"
+                );
+            }
+            assert!(!ops.patch_stream_open(), "{name}");
+            assert!(sidecars(directory).is_empty(), "{name}");
+            let expected = if succeeds {
+                new.clone()
+            } else if changes {
+                let mut changed = old.clone();
+                changed[30 * block as usize] ^= 1;
+                changed
+            } else {
+                old.clone()
+            };
+            assert_eq!(
+                fs::read(directory.join("file")).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connection_with_a_streamed_patch_open_carries_nothing_else() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        let mut ops = receiver(directory);
+        let block = MIN_HASH_BLOCK_BYTES;
+        let new = vec![5; 2 * block as usize];
+        let patch = SmallPatch {
+            reuse: vec![None, None],
+            data: Vec::new(),
+            ..patch_from(
+                "file",
+                &new,
+                block,
+                &ExistingHashes {
+                    fingerprint: None,
+                    hashes: Vec::new(),
+                    partials: false,
+                },
+                ops.hash_policy.algorithm,
+            )
+        };
+        // Pieces and ends without a begin are refused.
+        for request in [
+            Request::PatchData {
+                data: new.clone().into(),
+                hash: [0; 32],
+            },
+            Request::PatchEnd { commit: true },
+        ] {
+            assert!(
+                matches!(ops.handle(&request), Response::EndpointError(_)),
+                "{request:?}"
+            );
+        }
+        let begin = || Request::PatchBegin {
+            patch: Box::new(requested(patch.clone())),
+            data_len: new.len() as u64,
+        };
+        assert!(matches!(ops.handle(&begin()), Response::Ok));
+        // Until it ends, the connection refuses everything else, a second
+        // begin included, and the patch stays open.
+        for request in [
+            begin(),
+            Request::HashExistingBatch {
+                block,
+                files: Vec::new(),
+            },
+            Request::PutSmallBatch(vec![put("other", b"data")]),
+        ] {
+            assert!(
+                matches!(ops.handle(&request), Response::Err(error) if error == OPEN_PATCH_STREAM),
+                "{request:?}"
+            );
+        }
+        assert!(!directory.join("other").exists());
+        let piece = ops.handle(&Request::PatchData {
+            data: new.clone().into(),
+            hash: ops.hash_policy.payload_algorithm().hash(&new),
+        });
+        assert!(matches!(piece, Response::Ok));
+        assert!(matches!(
+            ops.handle(&Request::PatchEnd { commit: true }),
+            Response::PatchedBatch(outcome) if outcome == vec![Ok(SmallPatched {
+                kept: false,
+                identity: None
+            })]
+        ));
+        assert_eq!(fs::read(directory.join("file")).unwrap(), new);
+        // A begin that declares other data than its blocks hold fails its
+        // patch, which still ends only when told.
+        let mut wrong = begin();
+        if let Request::PatchBegin { data_len, .. } = &mut wrong {
+            *data_len += 1;
+        }
+        assert!(
+            matches!(ops.handle(&wrong), Response::PatchedBatch(outcome) if outcome[0].is_err())
+        );
+        assert!(ops.patch_stream_open());
+        assert!(matches!(
+            ops.handle(&Request::PatchEnd { commit: true }),
+            Response::PatchedBatch(outcome) if outcome[0].is_err()
+        ));
+        assert!(sidecars(directory).is_empty());
+    }
+
+    #[test]
+    fn a_streamed_patch_whose_destination_went_stale_is_compared_again() {
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old: Vec<u8> = (0..32 * block).map(|i| (i % 239) as u8 | 1).collect();
+        let mut new = old.clone();
+        new[..3 * block as usize].fill(8);
+        // The condition fails when the patch begins, or only before it is
+        // published.
+        for at_begin in [true, false] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            fs::write(directory.join("file"), &old).unwrap();
+            let metadata = fs::metadata(directory.join("file")).unwrap();
+            let condition = TargetCondition::MatchesFingerprint {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                ctime: metadata.ctime(),
+                ctime_nsec: metadata.ctime_nsec() as u32,
+            };
+            let read = ExistingRead {
+                path: b"file".to_vec(),
+                len: new.len() as u64,
+                condition,
+                guard: None,
+            };
+            let hashed = ops.hash_existing_batch(block, &[read]);
+            let mut patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
+            patch.condition = condition;
+            // A change of metadata alone, as keeping another name of the
+            // file makes, leaves its blocks but not its change time.
+            let touch = || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                fs::set_permissions(directory.join("file"), fs::Permissions::from_mode(0o640))
+                    .unwrap();
+            };
+            if at_begin {
+                touch();
+            }
+            let pieces = pieces(&patch, 4);
+            let (replies, outcome) = stream_patch(&mut ops, &patch, &pieces, true, |_| {
+                if !at_begin {
+                    touch();
+                }
+            });
+            assert_eq!(
+                matches!(replies[0], Response::Ok),
+                !at_begin,
+                "at_begin={at_begin}: {replies:?}"
+            );
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(SmallPatchError {
+                        stale_condition: true,
+                        matched: false,
+                        ..
+                    })
+                ),
+                "at_begin={at_begin}: {outcome:?}"
+            );
+            assert_eq!(fs::read(directory.join("file")).unwrap(), old);
+            assert!(sidecars(directory).is_empty());
+        }
     }
 }

@@ -457,62 +457,392 @@ fn bandwidth_limited_copies_send_only_the_small_files_that_differ() {
     assert!(partial_files(&t.path("dst")).is_empty());
 }
 
+/// The byte counts `--stats` printed for `label`.
+fn stats_bytes(out: &Output, label: &str) -> u64 {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&format!("{label}: ")))
+        .unwrap_or_else(|| panic!("missing {label} in {stdout}"));
+    line.replace(',', "").parse().unwrap()
+}
+
+/// Files of 32 MiB, one of which differs by 16 MiB, as much as one patch
+/// carries, and one by more, written to `src` and `dst`. Returns the source
+/// contents.
+fn large_differences(t: &Tmp) -> Vec<u8> {
+    let source = prng(32 << 20, 881);
+    for (name, changed) in [("within", 16 << 20), ("over", (16 << 20) + (64 << 10))] {
+        let mut old = source.clone();
+        old[..changed].fill(b'x');
+        write(&t.path(&format!("src/{name}")), &source);
+        write(&t.path(&format!("dst/{name}")), &old);
+        set_mtime(&t.path(&format!("dst/{name}")), 1);
+    }
+    source
+}
+
+/// A copy of `src/` into `dst/` that reuses blocks: in-process, pushed to a
+/// remote destination, or pulled from a remote source.
+fn reusing_copy(t: &Tmp, route: &str, extra: &[&str]) -> Command {
+    let (source_dir, destination_dir) = (t.s("src/"), t.s("dst/"));
+    let mut args = vec!["-a", "--no-whole-file", "--stats"];
+    args.extend(extra);
+    if route == "local" {
+        let mut command = compat_command();
+        command.args(&args).args([
+            "--no-progress",
+            "--performance-tuning=workers=1",
+            source_dir.as_str(),
+            destination_dir.as_str(),
+        ]);
+        return command;
+    }
+    let rsh = fake_rsh(t);
+    let remote = |path: &str| format!("fake:{path}");
+    let (source, destination) = if route == "push" {
+        (source_dir.clone(), remote(&destination_dir))
+    } else {
+        (remote(&source_dir), destination_dir.clone())
+    };
+    args.extend([
+        "--rsync-path",
+        env!("CARGO_BIN_EXE_syq"),
+        "--syq-no-bootstrap",
+        source.as_str(),
+        destination.as_str(),
+    ]);
+    remote_syq_command(t, &rsh, &args)
+}
+
 #[test]
-fn a_file_of_which_more_differs_than_a_patch_carries_is_compared_per_file() {
+fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
     // A grouped patch carries at most 16 MiB of a file's new data, so that
-    // no more is held at once. A file that differs by more is compared again
-    // on its own, in 4 MiB blocks, and only those that differ are sent; one
-    // within the limit is patched in its group.
-    for remote in [false, true] {
+    // no more is held at once. A file that differs by more streams its
+    // patch: its differing blocks follow in pieces as they are read, and
+    // only they are sent.
+    for route in ["local", "push", "pull"] {
         let t = Tmp::new();
-        let source = prng(32 << 20, 881);
-        for (name, changed) in [("within", 16 << 20), ("over", (16 << 20) + (64 << 10))] {
-            let mut old = source.clone();
-            old[..changed].fill(b'x');
-            write(&t.path(&format!("src/{name}")), &source);
-            write(&t.path(&format!("dst/{name}")), &old);
-            set_mtime(&t.path(&format!("dst/{name}")), 1);
-        }
-        let mut args = vec!["-a", "--no-whole-file"];
-        let (source_dir, destination_dir) = (t.s("src/"), t.s("dst/"));
-        let remote_destination = format!("fake:{destination_dir}");
-        let mut command = if remote {
-            let rsh = fake_rsh(&t);
-            args.extend([
-                "--rsync-path",
-                env!("CARGO_BIN_EXE_syq"),
-                "--syq-no-bootstrap",
-                source_dir.as_str(),
-                remote_destination.as_str(),
-            ]);
-            remote_syq_command(&t, &rsh, &args)
-        } else {
-            args.extend([
-                "--no-progress",
-                "--performance-tuning=workers=1",
-                source_dir.as_str(),
-                destination_dir.as_str(),
-            ]);
-            let mut command = compat_command();
-            command.args(&args);
-            command
-        };
-        let out = command.env("SYQ_DEBUG", "1").run().unwrap();
+        let source = large_differences(&t);
+        let out = reusing_copy(&t, route, &[])
+            .env("SYQ_DEBUG", "1")
+            .run()
+            .unwrap();
         assert_output_ok(&out);
         for name in ["within", "over"] {
             assert_eq!(
                 read(&t.path(&format!("dst/{name}"))),
                 source,
-                "{name} remote={remote}"
+                "{name} {route}"
             );
         }
         let observed = tuning_observed(&out);
-        assert_eq!(observed["compared_files"], 2, "remote={remote}");
-        assert_eq!(observed["patched_files"], 1, "remote={remote}");
-        // The five 4 MiB blocks that differ.
-        assert_eq!(observed["range_requests"], 5, "remote={remote}");
-        assert!(partial_files(&t.path("dst")).is_empty());
+        assert_eq!(observed["compared_files"], 2, "{route}");
+        assert_eq!(observed["patched_files"], 2, "{route}");
+        assert_eq!(observed["streamed_patches"], 1, "{route}");
+        assert_eq!(observed["range_requests"], 0, "{route}");
+        let sent = (32 << 20) + (64 << 10);
+        assert_eq!(stats_bytes(&out, "bytes transferred"), sent, "{route}");
+        assert_eq!(
+            stats_bytes(&out, "bytes unchanged"),
+            (64 << 20) - sent,
+            "{route}"
+        );
+        assert!(partial_files(&t.path("dst")).is_empty(), "{route}");
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_checks_each_piece_and_one_that_fails_is_copied_whole() {
+    for (route, corrupted) in [("local", false), ("local", true), ("push", true)] {
+        let case = format!("{route} corrupted={corrupted}");
+        let t = Tmp::new();
+        let source = prng(32 << 20, 882);
+        let mut old = source.clone();
+        old[(8 << 20)..(28 << 20)].fill(b'y');
+        write(&t.path("src/file"), &source);
+        write(&t.path("dst/file"), &old);
+        set_mtime(&t.path("dst/file"), 1);
+        let marker = t.path("corrupted-once");
+        let mut command = reusing_copy(&t, route, &["--integrity-checking=transfer=blake3"]);
+        command.env("SYQ_DEBUG", "1");
+        if corrupted {
+            command.env("SYQ_TEST_CORRUPT_PAYLOAD_ONCE", &marker);
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/file")), source, "{case}");
+        assert_eq!(marker.exists(), corrupted, "{case}");
+        let observed = tuning_observed(&out);
+        assert_eq!(observed["compared_files"], 1, "{case}");
+        let streamed = u64::from(!corrupted);
+        assert_eq!(observed["patched_files"], streamed, "{case}");
+        assert_eq!(observed["streamed_patches"], streamed, "{case}");
+        assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_whose_source_changes_while_it_is_read_is_not_published() {
+    let t = Tmp::new();
+    let source = prng(32 << 20, 883);
+    let mut old = source.clone();
+    old[..20 << 20].fill(b'z');
+    write(&t.path("src/file"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let ready = t.path("read");
+    let continuation = t.path("continue");
+    let mut child = reusing_copy(&t, "local", &[])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_PATCH_STREAM_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_PATCH_STREAM_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "streamed patch source check");
+    // Every piece has been read; the source then changes.
+    let changed = prng(32 << 20, 884);
+    write(&t.path("src/file"), &changed);
+    set_mtime(&t.path("src/file"), 1_700_000_000);
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert!(
+        stderr_of(&out).contains("changed during transfer, retrying"),
+        "{}",
+        stderr_of(&out)
+    );
+    // The patch was abandoned and the file copied again from its new source.
+    assert_eq!(read(&t.path("dst/file")), changed);
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 0);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_whose_source_shrinks_is_retried_at_its_new_size() {
+    // The source shrinks once compared, so the pieces past its new end
+    // cannot be read. The file is retried as one whose source changed, at
+    // its new size, rather than replaced whole at the size it was planned.
+    let t = Tmp::new();
+    let source = prng(32 << 20, 887);
+    let mut old = source.clone();
+    old[..20 << 20].fill(b'v');
+    write(&t.path("src/file"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let ready = t.path("compared");
+    let continuation = t.path("continue");
+    let mut child = reusing_copy(&t, "local", &[])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_PATCH_STREAM_READY_FILE", &ready)
+        .env("SYQ_TEST_PATCH_STREAM_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "streamed patch pieces");
+    OpenOptions::new()
+        .write(true)
+        .open(t.path("src/file"))
+        .unwrap()
+        .set_len(10 << 20)
+        .unwrap();
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    assert!(
+        stderr_of(&out).contains("changed during transfer, retrying"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(read(&t.path("dst/file")), &source[..10 << 20]);
+    // The retry copies what the source now holds, once.
+    assert_eq!(stats_bytes(&out, "bytes transferred"), 10 << 20);
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 0);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_that_fails_at_its_begin_is_copied_whole() {
+    // The receiver fails the patch as it begins, over a real pipe: the
+    // file is then copied whole and ends correct, with nothing left
+    // behind. How many pieces can go out before the failure's reply
+    // arrives depends on timing here; the early stop itself is checked
+    // exactly by `transfer::tests::a_streamed_patch_that_fails_at_its_begin_sends_none_of_its_pieces`.
+    let t = Tmp::new();
+    let source = prng(32 << 20, 888);
+    let mut old = source.clone();
+    old[..20 << 20].fill(b'u');
+    write(&t.path("src/file"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let out = reusing_copy(&t, "push", &[])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_FAIL_PATCH_STREAM_BEGIN", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), source);
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["compared_files"], 1);
+    assert_eq!(observed["patched_files"], 0);
+    assert_eq!(observed["streamed_patches"], 0);
+    // Only the whole copy counts as transferred.
+    assert_eq!(stats_bytes(&out, "bytes transferred"), 32 << 20);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_publishes_over_a_destination_changed_before_its_end() {
+    let t = Tmp::new();
+    let source = large_differences(&t);
+    let ready = t.path("written");
+    let continuation = t.path("continue");
+    let mut child = reusing_copy(&t, "local", &[])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_PATCH_STREAM_END_READY_FILE", &ready)
+        .env("SYQ_TEST_PATCH_STREAM_END_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "streamed patch publication");
+    // The stage holds its reused blocks already; the file it replaces is
+    // rewritten, as by another writer, before it is published.
+    write(&t.path("dst/over"), b"rewritten meanwhile");
+    release_confinement_barrier(&continuation);
+    let out = child.wait_with_output().unwrap();
+    assert_output_ok(&out);
+    for name in ["within", "over"] {
+        assert_eq!(read(&t.path(&format!("dst/{name}"))), source, "{name}");
+    }
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 1);
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_that_fails_leaves_no_partial_file() {
+    // The patch fails as it would be published, or its connection drops
+    // after one of its pieces; the file is copied again.
+    for (route, failure) in [("local", "publish"), ("push", "publish"), ("push", "drop")] {
+        let case = format!("{route} {failure}");
+        let t = Tmp::new();
+        let source = large_differences(&t);
+        let mut command = reusing_copy(&t, route, &[]);
+        command.env("SYQ_DEBUG", "1");
+        if failure == "publish" {
+            command.env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "over");
+        } else {
+            command
+                .env("SYQ_TEST_DROP_AFTER_REQUEST", "patch-data")
+                .env("SYQ_TEST_DROP_MARKER", t.path("dropped"));
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        for name in ["within", "over"] {
+            assert_eq!(
+                read(&t.path(&format!("dst/{name}"))),
+                source,
+                "{case} {name}"
+            );
+        }
+        // A patch that failed as it was published is copied whole; one
+        // whose connection dropped is compared and streamed again.
+        let streamed = if failure == "drop" {
+            assert!(t.path("dropped").exists(), "{case}");
+            assert!(
+                stderr_of(&out).contains("connection dropped; reopening"),
+                "{case}: {}",
+                stderr_of(&out)
+            );
+            1
+        } else {
+            0
+        };
+        assert_eq!(
+            tuning_observed(&out)["streamed_patches"],
+            streamed,
+            "{case}"
+        );
+        assert!(partial_files(&t.path("dst")).is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn a_relayed_copy_streams_its_patch_through_the_coordinator() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let source = prng(32 << 20, 885);
+    let mut old = source.clone();
+    old[4 << 20..24 << 20].fill(0);
+    write(&t.path("src"), &source);
+    write(&t.path("dst"), &old);
+    set_mtime(&t.path("dst"), 1);
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args([
+            "--syq-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--no-tcp",
+            "--no-progress",
+            "--stats",
+            "--integrity-checking=transfer=blake3",
+            "--performance-tuning=workers=1",
+            "--from",
+            "hostA",
+            &t.s("src"),
+            "--to",
+            "hostB",
+            "--coordinate-at",
+            "local",
+            "--as",
+            &t.s("dst"),
+        ])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), source);
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 1);
+    assert_eq!(stats_bytes(&out, "bytes transferred"), 20 << 20);
+    assert!(partial_files(&t.0).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_streamed_patch_whose_stage_is_refused_for_want_of_descriptors_is_staged_again() {
+    let t = Tmp::new();
+    let source = prng(32 << 20, 886);
+    let mut old = source.clone();
+    old[..20 << 20].fill(b'w');
+    write(&t.path("src/file"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let out = reusing_copy(&t, "local", &[])
+        .env("SYQ_TEST_STAGING_LIMIT", "0")
+        .env("SYQ_DEBUG", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(
+        stderr_of(&out).contains("reducing small-file staging"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(read(&t.path("dst/file")), source);
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 1);
+    assert!(partial_files(&t.path("dst")).is_empty());
 }
 
 #[test]

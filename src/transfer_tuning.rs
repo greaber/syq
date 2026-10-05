@@ -377,6 +377,8 @@ pub(crate) struct BenchmarkStats {
     pub compared_files: u64,
     pub kept_files: u64,
     pub patched_files: u64,
+    /// Of the patched files, those whose new data was streamed in pieces.
+    pub streamed_patches: u64,
 }
 
 impl BenchmarkStats {
@@ -392,6 +394,7 @@ impl BenchmarkStats {
         self.compared_files += other.compared_files;
         self.kept_files += other.kept_files;
         self.patched_files += other.patched_files;
+        self.streamed_patches += other.streamed_patches;
         self.max_request_bytes = self.max_request_bytes.max(other.max_request_bytes);
         self.max_batch_files = self.max_batch_files.max(other.max_batch_files);
         self.max_batch_bytes = self.max_batch_bytes.max(other.max_batch_bytes);

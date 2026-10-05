@@ -1546,12 +1546,13 @@ impl FsOps {
 
     /// Compare one source with the destination's block hashes, `chunk` bytes
     /// at a time. A comparison that only decides whether the file is
-    /// unchanged stops at its first differing block; any other stops once
-    /// its differing blocks pass `MAX_DIFFERING_FILE_BYTES`, and returns no
-    /// data, as the file is then sent in ranges per file. A file read in
-    /// one chunk sends its differing blocks as read; a longer one reads them
-    /// again once compared, into a buffer of exactly their size, rather than
-    /// keeping blocks that might all be discarded.
+    /// unchanged stops at its first differing block. A file whose differing
+    /// blocks pass `MAX_DIFFERING_FILE_BYTES` is compared to its end but
+    /// returns no data: the sender reads its differing blocks itself and
+    /// streams its patch. A file read in one chunk sends its differing
+    /// blocks as read; a longer one reads them again once compared, into a
+    /// buffer of exactly their size, rather than keeping blocks that might
+    /// all be discarded.
     fn read_differing(
         &mut self,
         read: &DifferingRead,
@@ -1595,9 +1596,6 @@ impl FsOps {
                         }
                     }
                 }
-                if differing > MAX_DIFFERING_FILE_BYTES {
-                    return Ok(());
-                }
                 off += read_len as u64;
             }
             Ok(())
@@ -1606,7 +1604,8 @@ impl FsOps {
             self.end_source_range();
         }
         compared?;
-        let data = if read.compare_only || differing == 0 || differing > MAX_DIFFERING_FILE_BYTES {
+        let streamed = !read.compare_only && differing > MAX_DIFFERING_FILE_BYTES;
+        let data = if read.compare_only || differing == 0 || streamed {
             Vec::new()
         } else if !chunks && differing == len {
             // Every block of a file read in one chunk differs: send it as
@@ -1643,8 +1642,9 @@ impl FsOps {
             data
         };
         // Only the differing blocks are sent, so only they take a payload
-        // hash, and only when transfers are checked.
-        let hash = if self.hash_policy.transfer_integrity {
+        // hash, and only when transfers are checked. A streamed patch's
+        // pieces carry their own.
+        let hash = if self.hash_policy.transfer_integrity && !streamed {
             self.observed_payload_hash(&data)
         } else {
             [0; 32]
@@ -2636,6 +2636,13 @@ impl FsOps {
             };
             return result.unwrap_or_else(|e| Response::Err(format!("{e:#}")));
         }
+        // A connection with a streamed patch open carries nothing else
+        // until that patch ends.
+        if self.patch_stream.is_some()
+            && !matches!(req, Request::PatchData { .. } | Request::PatchEnd { .. })
+        {
+            return Response::Err(OPEN_PATCH_STREAM.into());
+        }
         if let Err(error) = self
             .validate_source_session_request(req)
             .and_then(|()| self.validate_destination_session_request(req))
@@ -3102,6 +3109,11 @@ impl FsOps {
             Request::PatchSmallBatch(patches) => {
                 self.patch_small_batch(patches).map(Response::PatchedBatch)
             }
+            Request::PatchBegin { patch, data_len } => {
+                Ok(self.begin_patch_stream(patch, *data_len))
+            }
+            Request::PatchData { data, hash } => self.patch_stream_data(data, *hash),
+            Request::PatchEnd { commit } => self.end_patch_stream(*commit),
             Request::PutSmallBatch(puts) => {
                 let results = self.put_small_batch(puts);
                 if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {

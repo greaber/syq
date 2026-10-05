@@ -651,6 +651,12 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// Requests authorized and not yet settled, for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> u64 {
+        self.state.lock().unwrap().in_flight
+    }
+
     pub(crate) fn release_connection(&self) {
         let mut state = self.state.lock().unwrap();
         state.live_connections = state.live_connections.saturating_sub(1);
@@ -1044,6 +1050,7 @@ impl RestrictedAuthority {
             outcomes,
             touched,
             tracked,
+            stream: _,
         } = settlement;
         if creations.is_empty() && outcomes.is_empty() && touched.is_empty() && !tracked {
             return;
@@ -1913,6 +1920,66 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// Release the sizes held by the patches of a refused request.
+    fn release_patch_holds(&self, outcomes: impl Iterator<Item = PendingOutcome>) {
+        let mut state = self.state.lock().unwrap();
+        for outcome in outcomes {
+            if let PendingOutcome::Patch {
+                path,
+                copy_id,
+                hold: Some(hold),
+                ..
+            } = outcome
+            {
+                Self::settle_observation_reservation(&mut state, &(path, copy_id), hold, false);
+            }
+        }
+    }
+
+    /// Hold an authorized request to the streamed patch open on its
+    /// connection. A begin needs none to be open. Each piece must belong to
+    /// the open patch and stay within the new data its begin declared, and is
+    /// charged as a written range is, within one rate-limit burst. An end
+    /// needs the patch open.
+    fn authorize_stream(
+        &self,
+        request: &Request,
+        stream: &mut Option<OpenPatchStream>,
+        step: &mut StreamStep,
+    ) -> Result<()> {
+        match request {
+            Request::PatchBegin { patch, data_len } => {
+                if stream.is_some() {
+                    bail!("a streamed patch is already open on this connection");
+                }
+                *step = StreamStep::Begin {
+                    path: patch.path.clone(),
+                    declared: *data_len,
+                };
+            }
+            Request::PatchData { data, .. } => {
+                let open = stream
+                    .as_mut()
+                    .context("no streamed patch is open on this connection")?;
+                let received = open
+                    .received
+                    .checked_add(data.len() as u64)
+                    .filter(|received| *received <= open.declared)
+                    .context("streamed patch data runs past the length its begin declared")?;
+                self.charge_bytes(&open.path, open.received, data.len())?;
+                open.received = received;
+            }
+            Request::PatchEnd { .. } => {
+                if stream.is_none() {
+                    bail!("no streamed patch is open on this connection");
+                }
+                *step = StreamStep::End;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// A patch either keeps the existing file, as FinishBasis does, or
     /// publishes a new file from its data and the existing file's blocks, as
     /// a staged copy that reuses compared blocks does. Only the executor's
@@ -2239,7 +2306,19 @@ impl RestrictedAuthority {
     /// Check and rewrite one request against the signed grant. The returned
     /// settlement must be handed back to `settle` with the executor's
     /// response so provisional creations are forgotten when execution fails.
+    /// A streamed patch needs its connection's `PatchStreamGate`.
     pub(crate) fn authorize(&self, request: &mut Request, over_ssh: bool) -> Result<Settlement> {
+        self.authorize_streaming(request, over_ssh, &mut None)
+    }
+
+    /// `authorize`, with the streamed patch open on the request's
+    /// connection, if any.
+    fn authorize_streaming(
+        &self,
+        request: &mut Request,
+        over_ssh: bool,
+        stream: &mut Option<OpenPatchStream>,
+    ) -> Result<Settlement> {
         let mut pending = Vec::new();
         let mut outcomes = Vec::new();
         let mut touched = Vec::new();
@@ -2280,17 +2359,24 @@ impl RestrictedAuthority {
                 state.in_flight += 1;
             }
         }
-        match self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes, &mut touched) {
+        let mut step = StreamStep::None;
+        let authorized =
+            self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes, &mut touched);
+        let authorized =
+            authorized.and_then(|()| self.authorize_stream(request, stream, &mut step));
+        match authorized {
             Ok(()) => Ok(Settlement {
                 creations: pending,
                 outcomes,
                 touched,
                 tracked,
+                stream: step,
             }),
             Err(error) => {
                 // Nothing of a refused request executes, including the
                 // entries authorized before the refusing one.
                 self.forget_provisional(&pending);
+                self.release_patch_holds(outcomes.into_iter());
                 let mut state = self.state.lock().unwrap();
                 if tracked {
                     state.in_flight = state.in_flight.saturating_sub(1);
@@ -2801,26 +2887,36 @@ impl RestrictedAuthority {
                 if let Err(error) = self.authorize_patches(patches, pending, outcomes, touched) {
                     // A refused batch executes nothing: release the sizes
                     // its patches already hold.
-                    let mut state = self.state.lock().unwrap();
-                    for outcome in outcomes.drain(first..) {
-                        if let PendingOutcome::Patch {
-                            path,
-                            copy_id,
-                            hold: Some(hold),
-                            ..
-                        } = outcome
-                        {
-                            Self::settle_observation_reservation(
-                                &mut state,
-                                &(path, copy_id),
-                                hold,
-                                false,
-                            );
-                        }
-                    }
+                    self.release_patch_holds(outcomes.drain(first..));
                     return Err(error);
                 }
             }
+            // A streamed patch passes every rule a patch of a batch does. Its
+            // pieces and end are checked against it in `authorize_stream`.
+            Request::PatchBegin { patch, data_len } => {
+                if !patch.data.is_empty() {
+                    bail!("a streamed patch carries its data in pieces");
+                }
+                self.check_comparison_request(patch.block, patch.len)?;
+                let blocks = patch.len.div_ceil(patch.block);
+                if patch.reuse.len() as u64 != blocks {
+                    bail!(
+                        "streamed patch lists {} blocks, not {blocks}",
+                        patch.reuse.len()
+                    );
+                }
+                let new = patch.new_bytes();
+                if *data_len == 0 || *data_len != new {
+                    bail!("streamed patch declares {data_len} new bytes for blocks of {new} bytes");
+                }
+                let first = outcomes.len();
+                let patches = std::slice::from_mut(&mut **patch);
+                if let Err(error) = self.authorize_patches(patches, pending, outcomes, touched) {
+                    self.release_patch_holds(outcomes.drain(first..));
+                    return Err(error);
+                }
+            }
+            Request::PatchData { .. } | Request::PatchEnd { .. } => {}
             Request::CopyLocal { .. }
             | Request::ReadRange { .. }
             | Request::ReadComparedRange { .. }
@@ -2883,6 +2979,111 @@ pub(crate) struct Settlement {
     pub(super) touched: Vec<Vec<u8>>,
     /// The request counts as in flight until settled.
     pub(super) tracked: bool,
+    /// Where the request leaves its connection's streamed patch.
+    pub(super) stream: StreamStep,
+}
+
+/// What a request does to its connection's streamed patch.
+#[derive(Debug, Default)]
+pub(super) enum StreamStep {
+    #[default]
+    None,
+    /// Begin a patch whose pieces carry `declared` new bytes.
+    Begin {
+        path: Vec<u8>,
+        declared: u64,
+    },
+    End,
+}
+
+/// A streamed patch open on one connection: the new data its pieces may
+/// still carry, and its begin's settlement, which its end settles with the
+/// patch's outcome. Until then the patch counts as in flight, as a batch
+/// patch does until its reply.
+#[derive(Debug)]
+pub(crate) struct OpenPatchStream {
+    path: Vec<u8>,
+    declared: u64,
+    received: u64,
+    settlement: Settlement,
+}
+
+/// The streamed patch open on one receiver connection, if any. A connection
+/// that closes with one open settles it as a failed publication.
+pub(crate) struct PatchStreamGate {
+    authority: std::sync::Arc<RestrictedAuthority>,
+    open: Option<OpenPatchStream>,
+}
+
+impl PatchStreamGate {
+    pub(crate) fn new(authority: std::sync::Arc<RestrictedAuthority>) -> Self {
+        Self {
+            authority,
+            open: None,
+        }
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// `RestrictedAuthority::authorize`, for a request on this connection.
+    pub(crate) fn authorize(
+        &mut self,
+        request: &mut Request,
+        over_ssh: bool,
+    ) -> Result<Settlement> {
+        self.authority
+            .authorize_streaming(request, over_ssh, &mut self.open)
+    }
+
+    /// Settle an executed request. A begin whose patch the executor left
+    /// `opened` is held until its end, and the end settles both.
+    pub(crate) fn settle(
+        &mut self,
+        mut settlement: Settlement,
+        response: &proto::Response,
+        opened: bool,
+    ) {
+        match std::mem::take(&mut settlement.stream) {
+            StreamStep::Begin { path, declared } if opened => {
+                self.open = Some(OpenPatchStream {
+                    path,
+                    declared,
+                    received: 0,
+                    settlement,
+                });
+            }
+            StreamStep::End => {
+                self.authority.settle(settlement, response);
+                if let Some(open) = self.open.take() {
+                    self.authority.settle(open.settlement, response);
+                }
+            }
+            _ => self.authority.settle(settlement, response),
+        }
+    }
+
+    /// Settle the open streamed patch as failed with `error`, as when its
+    /// end was refused or its connection closed first.
+    pub(crate) fn abandon(&mut self, error: &str) {
+        if let Some(open) = self.open.take() {
+            self.authority.settle(
+                open.settlement,
+                &proto::Response::PatchedBatch(vec![Err(proto::SmallPatchError {
+                    error: error.to_string().into(),
+                    matched: false,
+                    stale_condition: false,
+                })]),
+            );
+        }
+    }
+}
+
+impl Drop for PatchStreamGate {
+    fn drop(&mut self) {
+        self.abandon("the connection closed before its streamed patch ended");
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

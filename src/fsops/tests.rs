@@ -123,11 +123,14 @@ fn differing_reads_keep_only_differing_blocks() {
             .collect();
         match *name {
             "over" => {
-                // Past what one patch carries: no data, and no further
-                // comparison than the chunk that passed it.
+                // Past what one patch carries: compared to its end, but no
+                // data, as its patch is streamed.
+                let matching: Vec<_> = (0..len.div_ceil(block))
+                    .map(|index| !changed.contains(&index))
+                    .collect();
+                assert_eq!(result.matching, matching, "{name}");
                 assert!(result.data.is_empty());
-                assert_eq!(result.matching.len(), limit / block + 16);
-                assert!(!result.matching[limit / block]);
+                assert_eq!(result.hash, [0; 32]);
             }
             "compared" => {
                 // Only whether it is unchanged: no further than the first
