@@ -21,19 +21,32 @@ impl Descriptors {
         })
     }
 
-    pub fn workers(self, roots: usize) -> usize {
+    pub fn source_workers(self, roots: usize) -> usize {
+        self.workers(roots, false)
+    }
+
+    pub fn receiver_workers(self, roots: usize) -> usize {
+        self.workers(roots, true)
+    }
+
+    fn workers(self, roots: usize, receiver: bool) -> usize {
         // Source registrations retain parent/object pairs in both registry and
-        // control. Leave a quarter for small-file staging (its existing shared
-        // allowance), plus control/scanning headroom. A worker may retain file
-        // caches, transport clones, source claims and transient opens. This is
-        // admission for the main consumers, not a promise against all EMFILE.
+        // control. Only receivers stage files: source/coordinator processes
+        // should not reserve the receiver's separate quarter-limit allowance.
+        // Keep control/scanning headroom in either process.
         let available = self
             .limit
             .saturating_sub(self.open)
-            .saturating_sub(self.limit / 4)
+            .saturating_sub(if receiver { self.limit / 4 } else { 0 })
             .saturating_sub(32)
             .saturating_sub((roots as u64).saturating_mul(4));
-        let per_worker = 32u64.saturating_add((roots as u64).saturating_mul(2));
+        // Keep the entire file cache, up to eight transport descriptors (two
+        // coordinator connections, or a helper's socket clones), and four for
+        // the destination root, held comparison basis and transient opens.
+        // Source parent/object claims are charged separately. These are still
+        // estimates, not reservations or a promise against every EMFILE.
+        let per_worker = (crate::fsops::FD_CACHE_MAX as u64 + 8 + 4)
+            .saturating_add((roots as u64).saturating_mul(2));
         usize::try_from(available / per_worker)
             .unwrap_or(usize::MAX)
             .max(1)
@@ -121,13 +134,40 @@ mod tests {
     }
 
     #[test]
+    fn receivers_with_low_limits_admit_more_than_one_worker() {
+        let budget = Descriptors {
+            limit: 128,
+            open: 6,
+        };
+        assert_eq!(budget.receiver_workers(0), 2);
+        assert!(Descriptors { open: 70, ..budget }.receiver_workers(0) < 2);
+    }
+
+    #[test]
+    fn sources_do_not_reserve_receiver_staging_handles() {
+        let budget = Descriptors {
+            limit: 512,
+            open: 12,
+        };
+        assert!(budget.source_workers(1) > budget.receiver_workers(1));
+        assert_eq!(
+            Descriptors {
+                limit: 128,
+                ..budget
+            }
+            .source_workers(1),
+            2
+        );
+    }
+
+    #[test]
     fn descriptor_admission_leaves_room_for_staging_and_control() {
         assert_eq!(
             Descriptors {
                 limit: 128,
                 open: 12
             }
-            .workers(1),
+            .receiver_workers(1),
             1
         );
         assert_eq!(
@@ -135,15 +175,15 @@ mod tests {
                 limit: 512,
                 open: 12
             }
-            .workers(1),
-            9
+            .receiver_workers(1),
+            11
         );
         assert!(
             Descriptors {
                 limit: 1 << 20,
                 open: 12
             }
-            .workers(1)
+            .receiver_workers(1)
                 > 10_000
         );
         assert!(
@@ -151,19 +191,19 @@ mod tests {
                 limit: 1024,
                 open: 400
             }
-            .workers(20)
+            .receiver_workers(20)
                 < Descriptors {
                     limit: 1024,
                     open: 12
                 }
-                .workers(1)
+                .receiver_workers(1)
         );
         assert_eq!(
             Descriptors {
                 limit: 32,
                 open: 32
             }
-            .workers(256),
+            .receiver_workers(256),
             1
         );
     }

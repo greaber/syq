@@ -2585,10 +2585,10 @@ fn resource_pressure_reports_essential_and_fixed_worker_failures() {
 #[test]
 fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
     for (label, limit, tcp, selectors, expected) in [
-        ("tcp-low", 128, true, false, 1..=1),
+        ("tcp-low", 128, true, false, 2..=2),
         // A ceiling above the SSH start of eight must still report the
         // reduction from the TCP start of sixteen.
-        ("tcp-notice", 512, true, false, 9..=11),
+        ("tcp-notice", 512, true, false, 11..=13),
         ("ssh-processes", 128, false, false, 8..=8),
         // Only the local source holds these roots. Charging them to this
         // receiver's shared process used to reduce its ceiling to five.
@@ -2671,6 +2671,96 @@ fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
                 read(&t.path(&format!("destination/f{index}"))),
                 format!("file {index}").as_bytes()
             );
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let script =
+        fs::read_to_string(&rsh)
+            .unwrap()
+            .replacen("#!/bin/sh\n", "#!/bin/sh\nulimit -n 128\n", 1);
+    fs::write(&rsh, script).unwrap();
+    let large = prng((256 << 10) + 13, 731);
+    for index in 0..576 {
+        write(
+            &t.path(&format!("source/d{}/f{index:04}", index % 8)),
+            if index < 64 { &large } else { b"small" },
+        );
+    }
+    // Ordinary range requests fill the source's descriptor caches. Automatic
+    // copying also exercises the receiver's shared small-file staging pool.
+    for (label, remote, ranges) in [
+        ("push-auto", Some("--to"), false),
+        ("push-ranges", Some("--to"), true),
+        ("pull-ranges", Some("--from"), true),
+        ("local-ranges", None, true),
+    ] {
+        let history_path = t.path(&format!("{label}.sqlite"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--srcs-in",
+            &t.s("source"),
+            "--into",
+            &t.s(label),
+            "--no-progress",
+            "--no-compress",
+        ]);
+        if let Some(endpoint) = remote {
+            command.args([
+                endpoint,
+                "host",
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+            ]);
+            command.env("SYQ_TEST_REQUIRE_TCP", "1");
+        } else {
+            set_child_nofile_limit(&mut command, 128);
+        }
+        if ranges {
+            command.args([
+                "--performance-tuning",
+                "copy-path=ranges,request-size=64K,pipeline-depth=4",
+            ]);
+        }
+        command
+            .env("SYQ_TUNING_CACHE", "")
+            .env("SYQ_TUNING_HISTORY", &history_path)
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output =
+            wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+        assert_output_ok(&output);
+        let history = rusqlite::Connection::open(history_path).unwrap();
+        let initial: i64 = history.query_row(
+            "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='starting_count'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(initial >= 2, "{label}: only {initial} workers");
+        for index in 0..576 {
+            assert_eq!(
+                read(&t.path(&format!("{label}/d{}/f{index:04}", index % 8))),
+                if index < 64 { &large[..] } else { b"small" },
+                "{label}: f{index:04}",
+            );
+        }
+        for directory in 0..8 {
+            assert!(partial_files(&t.path(&format!("{label}/d{directory}"))).is_empty());
         }
     }
 }
