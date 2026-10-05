@@ -208,7 +208,7 @@ impl DirectoryBatch {
             .with_context(|| format!("remove {}", label.display()))
     }
 
-    fn before_unlink(
+    pub(crate) fn before_unlink(
         &mut self,
         _root: &Arc<Root>,
         _path: &RelativePath,
