@@ -3836,6 +3836,158 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
 }
 
 #[test]
+fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
+    // The first attempt stages the file in its mode, 0644, so anyone may open
+    // the sidecar. Then the source changes, and so does its mode. Permissions
+    // are checked only at open, so a narrower retry must not write the new
+    // contents through that inode, which a reader may hold open; a retry in
+    // the same mode resumes from it. A retry on the same connection finds the
+    // sidecar when it prepares, one on another connection among the
+    // candidates it seeds from.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let secret = b"contents for the owner alone";
+    let old: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8 | 1).collect();
+    let mut new = old.clone();
+    for chunk in new[block..].chunks_mut(secret.len()) {
+        chunk.copy_from_slice(&secret[..chunk.len()]);
+    }
+    let read_all = |file: &File| {
+        let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        bytes
+    };
+    let mut exposed = Vec::new();
+    for connection in ["same", "another"] {
+        for retry_mode in [0o600, 0o644] {
+            let case = format!("{connection} connection, retry mode {retry_mode:o}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let path = temporary.path().join("file");
+            let id = [41; 16];
+            let target = || PartialTarget {
+                path: b"file",
+                id: &id,
+                guard: None,
+            };
+            let mut ops = destination_ops(temporary.path());
+            let prepared = ops
+                .prepare(
+                    target(),
+                    PrepareOptions {
+                        size: old.len() as u64,
+                        inplace: false,
+                        mode: 0o644,
+                        attempt: 0,
+                        create_if_missing: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(prepared.partial_size, None, "{case}");
+            for (index, chunk) in old.chunks(block).enumerate() {
+                ops.write_range(
+                    target(),
+                    false,
+                    0,
+                    (index * block) as u64,
+                    content_digest(chunk),
+                    chunk,
+                )
+                .unwrap();
+            }
+            let sidecar = partial_path(&path, &id).unwrap();
+            // As created under the usual umask.
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            let reader = File::open(&sidecar).unwrap();
+            let staged = reader.metadata().unwrap().ino();
+            let mut ops = if connection == "same" {
+                ops
+            } else {
+                destination_ops(temporary.path())
+            };
+            // The retry as the worker makes it: resume from what Prepare
+            // reports, otherwise write every range.
+            let prepared = ops
+                .prepare(
+                    target(),
+                    PrepareOptions {
+                        size: new.len() as u64,
+                        inplace: false,
+                        mode: retry_mode,
+                        attempt: 1,
+                        create_if_missing: true,
+                    },
+                )
+                .unwrap();
+            let reusable = if prepared.partial_size.is_some() || prepared.has_candidates {
+                ops.seed_basis(target(), new.len() as u64, block as u64, None, 1)
+                    .unwrap()
+                    .hashes
+            } else {
+                Vec::new()
+            };
+            let algorithm = ops.hash_policy.algorithm;
+            let mut written = 0;
+            for (index, chunk) in new.chunks(block).enumerate() {
+                if reusable.get(index) != Some(&algorithm.hash(chunk)) {
+                    ops.write_range(
+                        target(),
+                        false,
+                        1,
+                        (index * block) as u64,
+                        content_digest(chunk),
+                        chunk,
+                    )
+                    .unwrap();
+                    written += 1;
+                }
+            }
+            let resumed = fs::metadata(&sidecar).unwrap().ino() == staged;
+            let meta = Meta {
+                mode: retry_mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+                inode_metadata: None,
+            };
+            ops.finalize(
+                b"file",
+                false,
+                &id,
+                &meta,
+                flags::MODE,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                retry_mode,
+                "{case}"
+            );
+            if retry_mode == 0o644 {
+                // Anyone may open the published file anyway: resume.
+                assert!(resumed, "{case}");
+                assert_eq!(written, 1, "{case}");
+            } else {
+                if read_all(&reader)
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret)
+                {
+                    exposed.push(case);
+                }
+            }
+        }
+    }
+    assert!(
+        exposed.is_empty(),
+        "the retry wrote through a descriptor opened at 0644: {exposed:?}"
+    );
+}
+
+#[test]
 fn partial_discovery_is_exact_and_directory_cache_is_bounded() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut ops = destination_ops(temporary.path());
@@ -6028,7 +6180,7 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
         let mut ops = FsOps::new();
         ops.inode_preservation.acls = true;
         let (mut file, basis) = ops
-            .open_private_partial_rooted(&root, &relative, &path, true, 0o644)
+            .open_private_partial_rooted(&root, &relative, &path, true, 0o644, None)
             .unwrap()
             .unwrap();
         assert!(basis.is_none());

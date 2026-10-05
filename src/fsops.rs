@@ -1353,13 +1353,15 @@ impl FsOps {
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
+        let staged = staged_file_mode(meta, flags);
         let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
             self.open_private_partial_rooted(
                 &rooted.root,
                 partial,
                 label,
                 true,
-                staged_file_mode(meta, flags),
+                staged,
+                Some(staged),
             )
         })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;

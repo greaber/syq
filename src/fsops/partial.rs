@@ -88,6 +88,13 @@ impl FsOps {
         Ok(true)
     }
 
+    /// Open the sidecar at `relative` to resume from or overwrite, creating
+    /// it exclusively in `create_mode` when absent and `create_if_missing`.
+    /// A sidecar found there keeps its group and other bits: whoever they
+    /// let open it may still hold it open, and a chmod does not stop them
+    /// reading. One whose group or other bits exceed `widest`, the mode this
+    /// attempt would create it in, is replaced instead. `None` leaves that
+    /// check to the Prepare that came first in the attempt.
     pub(super) fn open_private_partial_rooted(
         &mut self,
         root: &Root,
@@ -95,6 +102,7 @@ impl FsOps {
         label: &Path,
         create_if_missing: bool,
         create_mode: u32,
+        widest: Option<u32>,
     ) -> Result<Option<(File, Option<u64>)>> {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
@@ -122,7 +130,9 @@ impl FsOps {
                             {
                                 continue;
                             }
-                            if !self.reusable_partial_permissions(&file)? {
+                            if !self.reusable_partial_permissions(&file)?
+                                || wider_than(opened.mode(), widest)
+                            {
                                 drop(file);
                                 discard_safe_rooted_partial_if_same(
                                     root,
@@ -133,10 +143,11 @@ impl FsOps {
                                 )?;
                                 continue;
                             }
-                            if opened.mode() & 0o7777 != 0o600 {
+                            let repaired = opened.mode() & 0o777 | 0o600;
+                            if opened.mode() & 0o7777 != repaired {
                                 let repair = (|| -> Result<()> {
                                     fail_partial_chmod_for_test()?;
-                                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                                    file.set_permissions(fs::Permissions::from_mode(repaired))?;
                                     Ok(())
                                 })();
                                 if let Err(error) = repair {
@@ -204,7 +215,9 @@ impl FsOps {
                                 continue;
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
-                            if !self.reusable_partial_permissions(&handle)? {
+                            if !self.reusable_partial_permissions(&handle)?
+                                || wider_than(metadata.mode, widest)
+                            {
                                 drop(handle);
                                 discard_safe_rooted_partial_if_same(
                                     root,
@@ -217,7 +230,7 @@ impl FsOps {
                             }
                             let repair = (|| -> Result<()> {
                                 fail_partial_chmod_for_test()?;
-                                set_mode_handle(&handle, 0o600)?;
+                                set_mode_handle(&handle, metadata.mode & 0o777 | 0o600)?;
                                 Ok(())
                             })();
                             if let Err(error) = repair {
@@ -266,6 +279,35 @@ impl FsOps {
             "partial {} changed repeatedly while opening it",
             label.display()
         )
+    }
+
+    /// Remove this copy's sidecar when its group or other bits exceed
+    /// `widest`, as `open_private_partial_rooted` replaces such a sidecar.
+    fn discard_wider_partial(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        widest: u32,
+    ) -> Result<()> {
+        with_rooted_partial(target, copy_id, |relative, label| {
+            self.uncache_rooted(&target.root, relative);
+            match target.root.metadata_optional(relative)? {
+                Some(metadata)
+                    if is_owned_rooted_partial(metadata)
+                        && wider_than(metadata.mode, Some(widest)) =>
+                {
+                    discard_safe_rooted_partial_if_same(
+                        &target.root,
+                        relative,
+                        metadata.dev,
+                        metadata.ino,
+                        label,
+                    )
+                }
+                _ => Ok(()),
+            }
+        })?;
+        Ok(())
     }
 
     /// Bounded, best-effort discovery using equality on the readable prefix.
@@ -363,6 +405,11 @@ impl FsOps {
         // mistaken for bytes already written by this invocation on a retry.
         if !inplace && create_if_missing && size > 0 && !self.candidate_partials(&target).is_empty()
         {
+            if attempt > 0 {
+                // Seeding resumes from a sidecar an earlier attempt left,
+                // without this attempt's mode to check it against.
+                self.discard_wider_partial(&target, copy_id, mode | 0o600)?;
+            }
             return Ok(Preparation {
                 partial_size: None,
                 has_candidates: true,
@@ -513,6 +560,7 @@ impl FsOps {
                     label,
                     create_if_missing,
                     PRIVATE_PARTIAL_MODE,
+                    Some(mode | 0o600),
                 )
                 .map(|opened| opened.map(|(file, basis_size)| (file, basis_size, None)))
             })?;
@@ -766,12 +814,16 @@ impl FsOps {
         }
         let (relative, label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
+                // Prepare has replaced an earlier attempt's sidecar that is
+                // wider than this attempt's staged mode, which is not sent
+                // here. One that is not is resumed as it is.
                 self.open_private_partial_rooted(
                     &target.root,
                     relative,
                     label,
                     true,
                     PRIVATE_PARTIAL_MODE,
+                    None,
                 )
             })?;
         let (output, basis_size) = opened.context("sidecar creation was requested")?;
@@ -1234,6 +1286,7 @@ impl FsOps {
                         label,
                         true,
                         PRIVATE_PARTIAL_MODE,
+                        Some(PRIVATE_PARTIAL_MODE),
                     )
                 })?;
             target_relative = relative;
@@ -3405,6 +3458,13 @@ pub(super) fn is_fresh_partial(metadata: &fs::Metadata, mode: u32) -> bool {
         && metadata.len() == 0
         && metadata.mode() & 0o7000 == 0
         && metadata.mode() & 0o777 & !(mode & 0o777) == 0
+}
+
+/// Whether a sidecar's mode lets its group or others in beyond `widest`.
+/// On Linux an ACL's mask is the group bits, so the mode also bounds what
+/// the ACL's named entries grant.
+fn wider_than(mode: u32, widest: Option<u32>) -> bool {
+    widest.is_some_and(|widest| mode & 0o077 & !widest != 0)
 }
 
 /// Whether the open or create of the sidecar was refused because of what
