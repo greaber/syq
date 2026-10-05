@@ -132,6 +132,10 @@ class BenchmarkTests(unittest.TestCase):
         result = bench.comparisons([dict(base, variant="old"), dict(base, variant="new")], "old")
         self.assertIsNone(result[0]["cpu_seconds"]["median_ratio"])
         self.assertEqual(result[0]["cpu_seconds"]["paired_ratios"], [])
+        nonzero = copy.deepcopy(base)
+        nonzero["resources"]["cpu_seconds"] = .01
+        result = bench.comparisons([dict(nonzero, variant="old"), dict(base, variant="new")], "old")
+        self.assertIsNone(result[0]["cpu_seconds"]["median_ratio"])
 
     def test_macos_time_units_and_missing_fields(self):
         log = """syq: incidental diagnostic

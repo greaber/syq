@@ -360,7 +360,9 @@ def comparisons(rows, reference):
             result = dict(case=case, variant=variant, paired_rounds=len(pairs))
             for key in ("seconds", "cpu_seconds", "peak_rss_bytes"):
                 values = [(a[key], b[key]) if key == "seconds" else (a["resources"][key], b["resources"][key]) for a, b in pairs]
-                ratios = [b / a for a, b in values if a > 0]
+                # Native time rounds short CPU measurements to zero. Neither
+                # a zero denominator nor a zero numerator establishes a ratio.
+                ratios = [b / a for a, b in values if a > 0 and b > 0]
                 result[key] = dict(reference_median=statistics.median(a for a, _ in values),
                                    variant_median=statistics.median(b for _, b in values),
                                    paired_ratios=ratios,
