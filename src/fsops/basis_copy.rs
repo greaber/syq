@@ -5,10 +5,23 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Refuses the clones this thread asks for, as a filesystem that
+    /// cannot clone would.
+    pub(super) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The bytes this thread's last seed copied or cloned.
+    pub(super) static SEEDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn try_clone(input: &File, output: &File, len: u64) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+        return false;
+    }
+    #[cfg(test)]
+    if REFUSE_CLONES.get() {
         return false;
     }
     crate::local_copy::try_clone(input, output, len)
@@ -21,6 +34,8 @@ pub(super) fn seed(
     prepare_copy: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let len = len.min(input.metadata()?.len());
+    #[cfg(all(test, target_os = "linux"))]
+    SEEDED.set(len);
     if len == 0 {
         return Ok(());
     }

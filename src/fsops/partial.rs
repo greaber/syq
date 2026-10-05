@@ -328,15 +328,7 @@ impl FsOps {
         }
         #[cfg(target_os = "linux")]
         {
-            let dev = file.metadata()?.dev();
-            let key = file_system_key(file, dev);
-            let traits = file_system_traits(file, key);
-            #[cfg(debug_assertions)]
-            let traits = FileSystemTraits {
-                is_nfs: traits.is_nfs || std::env::var_os("SYQ_TEST_DESTINATION_NFS").is_some(),
-                ..traits
-            };
-            preallocate_new_file(file, size, traits)
+            preallocate_new_file_on(file, file.metadata()?.dev(), size)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1503,7 +1495,7 @@ impl FsOps {
     }
 
     fn read_small_batch(&mut self, reads: &[SmallRead]) -> Result<Response> {
-        let blocks = self.read_small_sources(reads, |_, _, data, hash| SmallBlock {
+        let blocks = self.read_small_sources(reads, true, |_, _, data, hash| SmallBlock {
             source: None,
             data,
             hash,
@@ -1518,17 +1510,34 @@ impl FsOps {
         if !(MIN_HASH_BLOCK_BYTES..=MAX_HASH_BLOCK_BYTES).contains(&block) {
             bail!("invalid comparison block size {block}");
         }
-        let differing = self.read_small_sources(reads, |ops, read, contents, _| {
-            let mut matching = Vec::new();
-            let mut data = Vec::new();
-            for (index, chunk) in contents.chunks(block as usize).enumerate() {
-                let same = read.expected.get(index) == Some(&ops.hash_policy.algorithm.hash(chunk));
-                if !same && !read.compare_only {
-                    data.extend_from_slice(chunk);
+        // Only the differing blocks are sent, so only they take a payload
+        // hash, and only when transfers are checked.
+        let differing = self.read_small_sources(reads, false, |ops, read, contents, _| {
+            let algorithm = ops.hash_policy.algorithm;
+            let matching: Vec<bool> = contents
+                .chunks(block as usize)
+                .enumerate()
+                .map(|(index, chunk)| read.expected.get(index) == Some(&algorithm.hash(chunk)))
+                .collect();
+            let data = if read.compare_only {
+                Vec::new()
+            } else if !matching.contains(&true) {
+                // Every block differs: send the contents as read.
+                contents
+            } else {
+                let mut data = Vec::new();
+                for (chunk, same) in contents.chunks(block as usize).zip(&matching) {
+                    if !same {
+                        data.extend_from_slice(chunk);
+                    }
                 }
-                matching.push(same);
-            }
-            let hash = ops.observed_payload_hash(&data);
+                data
+            };
+            let hash = if ops.hash_policy.transfer_integrity {
+                ops.observed_payload_hash(&data)
+            } else {
+                [0; 32]
+            };
             DifferingBlocks {
                 source: None,
                 matching,
@@ -1541,10 +1550,12 @@ impl FsOps {
 
     /// Read each small source whole, convert its contents and payload hash
     /// with `convert` as soon as it is read, and attach the source's metadata
-    /// rechecked after every read.
+    /// rechecked after every read. Without `payload`, `convert` does not use
+    /// the payload hash of the contents, and none is computed.
     fn read_small_sources<R: SmallSourceRead, T: SmallSourceResult>(
         &mut self,
         reads: &[R],
+        payload: bool,
         mut convert: impl FnMut(&Self, &R, Vec<u8>, ContentDigest) -> T,
     ) -> Result<Vec<std::result::Result<T, String>>> {
         let total: u64 = reads.iter().map(|read| u64::from(read.len())).sum();
@@ -1556,14 +1567,27 @@ impl FsOps {
             .map(|read| {
                 // Metadata is enough for an empty file, even with mode 000.
                 let result = if read.len() == 0 {
-                    self.source_content_target(read.source())
-                        .map(|_| (Vec::new(), self.observed_payload_hash(&[])))
+                    self.source_content_target(read.source()).map(|_| {
+                        let hash = if payload {
+                            self.observed_payload_hash(&[])
+                        } else {
+                            [0; 32]
+                        };
+                        (Vec::new(), hash)
+                    })
                 } else {
-                    self.read_range(read.path(), read.source(), read.attempt(), 0, read.len())
-                        .and_then(|response| match response {
-                            Response::Block { data, hash, .. } => Ok((data, hash)),
-                            other => bail!("unexpected response {other:?}"),
-                        })
+                    self.read_range_hashed(
+                        read.path(),
+                        read.source(),
+                        read.attempt(),
+                        0,
+                        read.len(),
+                        payload,
+                    )
+                    .and_then(|response| match response {
+                        Response::Block { data, hash, .. } => Ok((data, hash)),
+                        other => bail!("unexpected response {other:?}"),
+                    })
                 };
                 result
                     .map(|(data, hash)| convert(self, read, data, hash))
@@ -2044,6 +2068,20 @@ impl FsOps {
         off: u64,
         len: u32,
     ) -> Result<Response> {
+        self.read_range_hashed(path, source, attempt, off, len, true)
+    }
+
+    /// Read a range, with its payload hash when transfers are checked and
+    /// `hashed` asks for it.
+    fn read_range_hashed(
+        &mut self,
+        path: &[u8],
+        source: Option<&RegisteredPath>,
+        attempt: u32,
+        off: u64,
+        len: u32,
+        hashed: bool,
+    ) -> Result<Response> {
         let operation = self.operation.clone();
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_READ_RANGE").is_some()
@@ -2089,7 +2127,7 @@ impl FsOps {
                 format_args!("read {off} {len}"),
             )?;
             let hash = {
-                if self.hash_policy.transfer_integrity {
+                if hashed && self.hash_policy.transfer_integrity {
                     let _hash = operation.span(crate::transfer_observations::Stage::Hashing);
                     self.hash_policy.payload_algorithm().hash(&data)
                 } else {
@@ -3340,6 +3378,19 @@ pub(super) fn fail_partial_chmod_for_test() -> Result<()> {
     Ok(())
 }
 
+/// Preallocate a new file on device `dev`, as `preallocate_new_file` does
+/// on that device's filesystem.
+#[cfg(target_os = "linux")]
+pub(super) fn preallocate_new_file_on(file: &File, dev: u64, size: u64) -> Result<()> {
+    let traits = file_system_traits(file, file_system_key(file, dev));
+    #[cfg(debug_assertions)]
+    let traits = FileSystemTraits {
+        is_nfs: traits.is_nfs || std::env::var_os("SYQ_TEST_DESTINATION_NFS").is_some(),
+        ..traits
+    };
+    preallocate_new_file(file, size, traits)
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits) -> Result<()> {
     if size == 0 {
@@ -3371,8 +3422,20 @@ pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Fails the preallocations this thread makes with this error, as
+    /// `SYQ_TEST_FALLOCATE_ERRNO` does for a whole process.
+    pub(super) static FALLOCATE_ERRNO: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 pub(super) fn test_fallocate_errno() -> Option<i32> {
+    #[cfg(test)]
+    if let Some(errno) = FALLOCATE_ERRNO.get() {
+        return Some(errno);
+    }
     let value = std::env::var_os("SYQ_TEST_FALLOCATE_ERRNO")?;
     match value.to_string_lossy().as_ref() {
         "unsupported" => Some(libc::EOPNOTSUPP),
