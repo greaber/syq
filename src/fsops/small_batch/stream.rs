@@ -177,6 +177,10 @@ impl FsOps {
     /// seeded. The reused blocks of a stage that is not seeded are read,
     /// checked and written as the pieces around them arrive.
     fn open_patch_stream(&mut self, stream: &mut PatchStream) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_FAIL_PATCH_STREAM_BEGIN").is_some() {
+            bail!("injected streamed patch begin failure");
+        }
         let patch = &stream.patch;
         check_stream_layout(patch, stream.data_len)?;
         let target = self.destination_mutation_target(&patch.path, patch.guard.as_ref())?;

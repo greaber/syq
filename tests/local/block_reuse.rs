@@ -669,6 +669,45 @@ fn a_streamed_patch_whose_source_shrinks_is_retried_at_its_new_size() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn a_streamed_patch_that_fails_at_its_begin_sends_little_of_its_data() {
+    // The receiver fails the patch as it begins. The sender stops at the
+    // failure's reply instead of sending the patch's 20 MiB of new data,
+    // and the file is then copied whole.
+    let t = Tmp::new();
+    let source = prng(32 << 20, 888);
+    let mut old = source.clone();
+    old[..20 << 20].fill(b'u');
+    write(&t.path("src/file"), &source);
+    write(&t.path("dst/file"), &old);
+    set_mtime(&t.path("dst/file"), 1);
+    let out = reusing_copy(&t, "push", &[])
+        .env("SYQ_DEBUG", "1")
+        .env("SYQ_TEST_FAIL_PATCH_STREAM_BEGIN", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), source);
+    assert_eq!(tuning_observed(&out)["streamed_patches"], 0);
+    // What the receiver was sent: the whole copy, and at most the two
+    // pieces that could go out before the failure's reply came back.
+    let received: u64 = stderr_of(&out)
+        .lines()
+        .filter_map(|line| line.strip_prefix("syq server: "))
+        .map(|line| {
+            line.split(" blocks, ")
+                .nth(1)
+                .and_then(|mib| mib.strip_suffix(" MiB"))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .sum();
+    assert!((32..=40).contains(&received), "{received} MiB received");
+    assert!(partial_files(&t.path("dst")).is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn a_streamed_patch_publishes_over_a_destination_changed_before_its_end() {
     let t = Tmp::new();
     let source = large_differences(&t);
