@@ -212,19 +212,6 @@ impl AuthorizedKeyEntry {
         })
     }
 
-    /// Recognize only our unchanged forced-copy spelling, never a durable
-    /// enrollment, a user key, or an entry whose options were edited.
-    pub(crate) fn copy_worker_ticket(line: &str) -> Option<&str> {
-        let rest = line.strip_prefix("restrict,command=\"")?;
-        let (command, key) = rest.split_once("\" ")?;
-        let (executable, ticket) = command.split_once(" --return-ssh-worker ")?;
-        let (public, marker) = key.rsplit_once(' ')?;
-        let id = EnrollmentId::parse(marker.strip_prefix("syq-copy-worker-")?).ok()?;
-        let key = EnrollmentPublicKey::parse(public).ok()?;
-        let entry = Self::copy_worker(id, Path::new(executable), ticket, &key).ok()?;
-        (entry.line() == line).then_some(ticket)
-    }
-
     pub fn marker(&self) -> String {
         self.marker.clone()
     }

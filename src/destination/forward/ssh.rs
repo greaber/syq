@@ -35,52 +35,6 @@ impl Ticket {
     }
 }
 
-/// Prune only a demonstrably abandoned local socket. A missing path can
-/// belong to a live copy on another host sharing this account's home.
-/// No ticket fields or on-disk formats change; old entries use this same ticket.
-pub(crate) fn worker_ticket_inactive(encoded: &str) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    let Ok(ticket) = Ticket::decode(encoded) else {
-        return false;
-    };
-    let Some(parent) = ticket.socket.parent() else {
-        return false;
-    };
-    if ticket.socket.file_name().is_none_or(|name| name != "s")
-        || parent
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_none_or(|name| !name.starts_with("syq-copy-worker-"))
-    {
-        return false;
-    }
-    match ticket.socket.symlink_metadata() {
-        Err(_) => return false,
-        Ok(metadata)
-            if !metadata.file_type().is_socket()
-                || metadata.uid() != unsafe { libc::geteuid() } =>
-        {
-            return false
-        }
-        Ok(_) => {}
-    }
-    // A full listen queue can also mean ECONNREFUSED on Darwin. Preserve that
-    // uncertain entry. On Linux only a definitively refused socket is stale.
-    #[cfg(target_os = "linux")]
-    {
-        let result = (|| -> std::io::Result<()> {
-            let socket = crate::process::with_inheritance_guard(|| {
-                socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-            })?;
-            socket.set_nonblocking(true)?;
-            socket.connect(&socket2::SockAddr::unix(&ticket.socket)?)
-        })();
-        result.is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
-    }
-    #[cfg(not(target_os = "linux"))]
-    false
-}
-
 fn authenticate(stream: &mut (impl Read + AsRawFd), expected: &str) -> Result<()> {
     use subtle::ConstantTimeEq;
     let mut secret = [0u8; 43];

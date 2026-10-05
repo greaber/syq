@@ -31,7 +31,6 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
-pub(crate) use forward::ssh::worker_ticket_inactive;
 pub(crate) use forward::DeadlineIo;
 pub(crate) mod handoff;
 mod identity;
