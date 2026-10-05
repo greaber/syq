@@ -2703,10 +2703,15 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
         let history_path = t.path(&format!("{label}.sqlite"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command.arg("cp");
-        if let Some(endpoint) = remote {
+        if remote == Some("--from") {
+            command.args(["--from", "host"]);
+        }
+        command.args(["--srcs-in", &t.s("source")]);
+        if remote == Some("--to") {
+            command.args(["--to", "host"]);
+        }
+        if remote.is_some() {
             command.args([
-                endpoint,
-                "host",
                 "--rsh",
                 rsh.to_str().unwrap(),
                 "--syq-path",
@@ -2718,14 +2723,7 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
         } else {
             set_child_nofile_limit(&mut command, 128);
         }
-        command.args([
-            "--srcs-in",
-            &t.s("source"),
-            "--into",
-            &t.s(label),
-            "--no-progress",
-            "--no-compress",
-        ]);
+        command.args(["--into", &t.s(label), "--no-progress", "--no-compress"]);
         if ranges {
             command.args([
                 "--performance-tuning",
