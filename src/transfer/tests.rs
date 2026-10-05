@@ -4752,6 +4752,13 @@ fn grouped_comparison_counts_each_file_as_its_reply_settles_it() {
             );
         }
         let seen = seen.lock().unwrap();
+        // Each group's patch reply is taken before the next group's patch
+        // is sent, and the file it keeps or publishes counts at once.
+        let patches: Vec<_> = seen.iter().filter(|seen| seen.0 == "patch").collect();
+        assert_eq!(patches.len(), 3, "{case}");
+        for (k, patch) in patches.iter().enumerate() {
+            assert_eq!(patch.2 + patch.3, k as u64, "{case}: patch {k}");
+        }
         let begins: Vec<_> = seen.iter().filter(|seen| seen.0 == "begin").collect();
         let ends: Vec<_> = seen.iter().filter(|seen| seen.0 == "end").collect();
         assert_eq!((begins.len(), ends.len()), (2, 2), "{case}");

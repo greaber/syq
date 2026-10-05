@@ -312,12 +312,14 @@ impl Worker {
         }
         // Each group has at most one request outstanding, so the groups in
         // flight bound the replies the destination owes, and waiting reads
-        // those the source owes, to what each connection queues.
+        // those the source owes, to what each connection queues. An
+        // in-process source answers each read as it is sent: it is sent one
+        // at a time, so that its data moves on before the next is read.
         let window = self
             .dst
             .reply_queue()
             .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
-        let source_queue = self.src.reply_queue().unwrap_or(usize::MAX);
+        let source_queue = self.src.reply_queue().unwrap_or(1);
         let mut groups: Vec<Group> = Vec::new();
         // Patches to stream once the groups are done.
         let mut streams = Vec::new();
@@ -327,6 +329,8 @@ impl Worker {
         let mut source = std::collections::VecDeque::new();
         let mut destination = std::collections::VecDeque::new();
         let result = (|| -> Result<()> {
+            // Replies taken and not yet acted on, in the order they are taken.
+            let mut taken = std::collections::VecDeque::new();
             loop {
                 // Once the copy is aborted, the groups in flight send nothing
                 // further: what they have outstanding is drained below.
@@ -382,6 +386,21 @@ impl Worker {
                         return Ok(());
                     }
                 };
+                if from_source {
+                    // A patch reply waits behind the hash replies of the
+                    // groups issued before it. Before a source reply, whose
+                    // patch may first wait for the bandwidth limit, take the
+                    // destination's replies that have already arrived, so
+                    // that the files their patches keep or publish count at
+                    // once.
+                    while !destination.is_empty() {
+                        let Some(response) = self.arrived_reply()? else {
+                            break;
+                        };
+                        let (group, stage, _) = destination.pop_front().expect("pending reply");
+                        taken.push_back((group, stage, response));
+                    }
+                }
                 let (group, stage, _) = if from_source {
                     source.pop_front()
                 } else {
@@ -393,25 +412,28 @@ impl Worker {
                 } else {
                     self.dst.recv()?
                 };
-                let next = self.compare_stage(
-                    &jobs,
-                    &mut groups[group],
-                    stage,
-                    response,
-                    &mut outcomes,
-                    &mut streams,
-                )?;
-                if let Stage::Patch = stage {
-                    let files = groups[group].files.iter().copied();
-                    self.complete_settled(batch, files, &mut outcomes)?;
-                }
-                match next {
-                    Some((Stage::Read, request)) => waiting.push_back((group, request)),
-                    Some((stage, request)) => {
-                        self.dst.send(request)?;
-                        destination.push_back((group, stage, std::time::Instant::now()));
+                taken.push_back((group, stage, response));
+                while let Some((group, stage, response)) = taken.pop_front() {
+                    let next = self.compare_stage(
+                        &jobs,
+                        &mut groups[group],
+                        stage,
+                        response,
+                        &mut outcomes,
+                        &mut streams,
+                    )?;
+                    if let Stage::Patch = stage {
+                        let files = groups[group].files.iter().copied();
+                        self.complete_settled(batch, files, &mut outcomes)?;
                     }
-                    None => in_flight -= 1,
+                    match next {
+                        Some((Stage::Read, request)) => waiting.push_back((group, request)),
+                        Some((stage, request)) => {
+                            self.dst.send(request)?;
+                            destination.push_back((group, stage, std::time::Instant::now()));
+                        }
+                        None => in_flight -= 1,
+                    }
                 }
             }
         })();
@@ -712,6 +734,17 @@ impl Worker {
         }
     }
 
+    /// The destination's next reply, if it has already arrived.
+    fn arrived_reply(&mut self) -> Result<Option<Response>> {
+        if self.dst.reply_ready() {
+            return self.dst.recv().map(Some);
+        }
+        self.dst
+            .try_recv_with_arrival()
+            .transpose()
+            .map(|reply| reply.map(|(response, _)| response))
+    }
+
     /// Act on the destination's replies that have already arrived, without
     /// waiting for more.
     fn arrived_replies(
@@ -723,13 +756,8 @@ impl Worker {
         outcomes: &mut [Option<Compared>],
     ) -> Result<()> {
         while !destination.is_empty() {
-            let response = if self.dst.reply_ready() {
-                self.dst.recv()?
-            } else {
-                match self.dst.try_recv_with_arrival() {
-                    Some(reply) => reply?.0,
-                    None => return Ok(()),
-                }
+            let Some(response) = self.arrived_reply()? else {
+                return Ok(());
             };
             let (step, _) = destination.pop_front().expect("pending reply");
             self.streamed_reply(batch, streams, states, step, response, outcomes)?;
