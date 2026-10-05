@@ -1041,16 +1041,35 @@ for i in range(1, 8):
 with open('/tmp/syq-real-ssh/linked-inode', 'w') as f:
     f.write(str(os.stat(first).st_ino))
 PY_LINKED_DESTINATION
-# One worker: the receiver carries out its requests in turn.
-syq cp --copy-metadata=mtime --no-progress --performance-tuning workers=1 \
-    --results /tmp/syq-linked-results.ndjson \
+# One worker, whose requests the receiver carries out in turn: each name is
+# compared once, and each changed name is sent only its second block.
+linked_results=/tmp/syq-real-ssh-linked.ndjson
+linked_debug=/tmp/syq-real-ssh-linked.debug
+if ! SYQ_DEBUG=1 syq cp --copy-metadata=mtime --no-progress \
+    --performance-tuning workers=1 --results "$linked_results" \
     --from source --srcs-in /tmp/syq-real-ssh/linked-source \
-    --to destination --into /tmp/syq-real-ssh/linked-destination
-python3 - /tmp/syq-linked-results.ndjson <<'PY_LINKED_RESULTS'
+    --to destination --into /tmp/syq-real-ssh/linked-destination \
+    2>"$linked_debug"; then
+    cat "$linked_debug" >&2
+    exit 1
+fi
+python3 - "$linked_results" "$linked_debug" <<'PY_LINKED_RESULTS'
 import json, sys
-result = [json.loads(line) for line in open(sys.argv[1])][-1]
-assert result['type'] == 'result' and result['status'] == 'success', result
-assert result['errors'] == 0, result
+from pathlib import Path
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+assert records[-1]['errors'] == 0, records[-1]
+assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
+marker = 'syq: tuning observed: '
+observed = [
+    json.loads(line.split(marker, 1)[1])
+    for line in Path(sys.argv[2]).read_text().splitlines()
+    if marker in line
+]
+assert any(
+    (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
+    for counts in observed
+), observed
 PY_LINKED_RESULTS
 ssh destination python3 - <<'PY_LINKED_CHECK'
 import os
