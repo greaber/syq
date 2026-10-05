@@ -1,5 +1,6 @@
 //! Shared bounded S3 deletion with one outcome per requested key/version.
 use super::client;
+mod throttle;
 use anyhow::Result;
 use aws_sdk_s3::{
     error::ProvideErrorMetadata,
@@ -98,6 +99,7 @@ impl Deleter<'_> {
         mut finished: impl FnMut(&T, std::result::Result<u64, Failure>),
     ) -> Result<()> {
         let mut tuning = crate::deletion::Control::new(self.concurrency);
+        let throttle = self.concurrency.automatic.then(throttle::Throttle::new);
         let mut batches = items.chunks(if self.individual { 1 } else { 1000 });
         let mut pending = FuturesUnordered::new();
         let mut failure = None;
@@ -109,6 +111,20 @@ impl Deleter<'_> {
         let mut generation = 0;
         let mut old_pending = 0usize;
         loop {
+            // Retry sleeps retain their batch slots. Restart the existing tuner
+            // below broad throttling, and drain its old generation before
+            // measuring whether additional concurrency helps again.
+            if let Some(limit) = throttle.as_ref().and_then(|t| t.take_limit(tuning.limit())) {
+                tuning = crate::deletion::Control::new(crate::deletion::Concurrency {
+                    initial: limit,
+                    startup_doubling: false,
+                    ..self.concurrency
+                });
+                generation += 1;
+                old_pending = pending.len();
+                completed = 0;
+                sampled = tokio::time::Instant::now();
+            }
             while failure.is_none() && pending.len() < tuning.limit() {
                 let Some(batch) = batches.next() else { break };
                 if let Err(error) = check() {
@@ -117,7 +133,10 @@ impl Deleter<'_> {
                 }
                 let targets: Vec<_> = batch.iter().map(&identify).collect();
                 let prepared = generation;
-                pending.push(async move { (prepared, batch, self.batch(&targets, check).await) });
+                let throttle = throttle.as_ref();
+                pending.push(async move {
+                    (prepared, batch, self.batch(&targets, check, throttle).await)
+                });
             }
             if pending.is_empty() {
                 break;
@@ -160,11 +179,12 @@ impl Deleter<'_> {
         &self,
         targets: &[Target],
         check: &impl Fn() -> Result<()>,
+        throttle: Option<&std::sync::Arc<throttle::Throttle>>,
     ) -> (
         Vec<std::result::Result<u64, Failure>>,
         Option<anyhow::Error>,
     ) {
-        let mut outcomes = self.batch_once(targets).await;
+        let mut outcomes = self.batch_once(targets, throttle, true).await;
         // The SDK retries request-level failures. Errors carried inside an HTTP
         // success need their own bounded retries; never resend successful keys.
         for attempt in 2..=u64::from(self.retries) + 1 {
@@ -196,7 +216,10 @@ impl Deleter<'_> {
                 return (outcomes, Some(error));
             }
             let selected: Vec<_> = retry.iter().map(|&i| targets[i].clone()).collect();
-            for (index, result) in retry.into_iter().zip(self.batch_once(&selected).await) {
+            for (index, result) in retry
+                .into_iter()
+                .zip(self.batch_once(&selected, throttle, false).await)
+            {
                 outcomes[index] = result.map(|_| attempt).map_err(|mut error| {
                     error.attempts = attempt;
                     error
@@ -206,7 +229,16 @@ impl Deleter<'_> {
         (outcomes, None)
     }
 
-    async fn batch_once(&self, targets: &[Target]) -> Vec<std::result::Result<u64, Failure>> {
+    async fn batch_once(
+        &self,
+        targets: &[Target],
+        throttle: Option<&std::sync::Arc<throttle::Throttle>>,
+        fresh: bool,
+    ) -> Vec<std::result::Result<u64, Failure>> {
+        let mut config = aws_sdk_s3::config::Builder::new();
+        if let Some(throttle) = throttle {
+            config = config.interceptor(throttle.observer(targets.len(), fresh));
+        }
         if self.individual {
             let target = &targets[0];
             let result = self
@@ -215,6 +247,8 @@ impl Deleter<'_> {
                 .bucket(self.bucket)
                 .key(&target.key)
                 .set_version_id(target.version.clone())
+                .customize()
+                .config_override(config)
                 .send()
                 .await;
             return vec![match result {
@@ -259,6 +293,8 @@ impl Deleter<'_> {
                     .build()
                     .expect("objects provided"),
             )
+            .customize()
+            .config_override(config)
             .send()
             .await;
         match result {
