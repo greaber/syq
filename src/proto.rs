@@ -1238,7 +1238,8 @@ pub enum WireRequest<Data> {
         files: Vec<ExistingRead>,
     },
     /// Read source files, returning only the blocks that differ from the
-    /// destination's hashes.
+    /// destination's hashes. A `compare_only` file stops being compared at
+    /// its first differing block, where its `matching` ends.
     ReadDifferingBatch {
         block: u64,
         reads: Vec<DifferingRead>,
