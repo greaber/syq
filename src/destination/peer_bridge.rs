@@ -823,6 +823,7 @@ mod tests {
                 socket_name: "s",
                 listener_thread: "peer-error",
                 client_thread: "peer-error-client",
+                inline_on_thread_failure: false,
                 max_connections: 2,
                 io_timeout: ADMISSION,
             },
