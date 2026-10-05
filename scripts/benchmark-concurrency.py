@@ -34,7 +34,7 @@ Both platforms sample each process's CPU, RSS, threads, FDs and disk I/O every
 20 ms plus sampling cost. Group memory is a sampled sum of current RSS, not a
 sum of individual peaks. Single-process rm uses native time's maximum RSS.
 Samples can miss peaks and final work; check sample gaps and observer CPU, and
-use longer runs for CPU comparisons. On Linux, repeat a plan with --no-sampling
+use longer runs for CPU comparisons. On Linux, repeat a plan with --no-process-sampling
 to check observer effects before judging small differences, especially with few
 available CPUs. Exit CPU accounting remains complete in that mode; per-process
 samples and group memory are unavailable. Linux per-process I/O includes waited
@@ -689,7 +689,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=180, help="seconds per measured operation")
     parser.add_argument("--fixture-timeout", type=float, default=1800, help="seconds for each setup or verification")
-    parser.add_argument("--no-sampling", action="store_true", help="Linux: keep exit CPU accounting but disable periodic process samples")
+    parser.add_argument("--no-process-sampling", action="store_true",
+                        help="Linux benchmark control: skip periodic CPU/RSS/thread/FD/I/O reads; keep elapsed time and full exit CPU accounting")
     args = parser.parse_args()
     if args.example:
         print(json.dumps(example(), indent=2))
@@ -699,8 +700,8 @@ def main():
         parser.error("need --plan, --output and positive rounds/timeouts")
     if platform.system() not in ("Linux", "Darwin") or not Path("/usr/bin/time").is_file():
         parser.error("requires Linux GNU /usr/bin/time or macOS /usr/bin/time")
-    if args.no_sampling and platform.system() != "Linux":
-        parser.error("--no-sampling requires Linux exit accounting")
+    if args.no_process_sampling and platform.system() != "Linux":
+        parser.error("--no-process-sampling requires Linux exit accounting")
     plan = json.loads(args.plan.read_text())
     validate(plan)
     args.output = args.output.resolve()
@@ -715,7 +716,7 @@ def main():
                   allowed_cpus=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                   binary_sha256={v["name"]: sha256_file(v["binary"]) for v in plan["variants"]},
                   harness_sha256=sha256_file(__file__), sample_interval_seconds=0.02,
-                  sampling_enabled=not args.no_sampling,
+                  sampling_enabled=not args.no_process_sampling,
                   native_time_cpu_resolution_seconds=0.01,
                   drain_clock="upper bound including sampling/polling delay after coordinator exit",
                   tuning_history="disabled; automatic variants start without remembered counts",
@@ -767,7 +768,7 @@ def main():
                             command += ["--prune"]
                         if variant["workers"] is not None:
                             command += ["--performance-tuning", f"workers={variant['workers']}"]
-                        row.update(measure(command, env, variant["cpus"], stem, args.timeout, case["operation"], not args.no_sampling))
+                        row.update(measure(command, env, variant["cpus"], stem, args.timeout, case["operation"], not args.no_process_sampling))
                         save()
                         if row["exit_code"]:
                             raise RuntimeError(f"{stem.name}: exit {row['exit_code']}; see {stem}.stderr")
