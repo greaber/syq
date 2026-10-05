@@ -637,8 +637,10 @@ fn reply_queue(read_ahead: usize, role: &ConnectionRole) -> usize {
 }
 
 /// File data a source worker's queued replies may carry before its reader
-/// stops reading the connection (`Replies`).
-const SOURCE_REPLY_BYTES: usize = 32 << 20;
+/// stops reading the connection (`Replies`): about what one patch carries.
+/// A larger queue held more while a pull's destination fell behind, and no
+/// pull measured was faster for it.
+const SOURCE_REPLY_BYTES: usize = 16 << 20;
 
 /// The file data a connection's queued replies may carry, if limited: a
 /// source worker's, whose replies carry the data a grouped comparison or a
