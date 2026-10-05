@@ -256,11 +256,13 @@ jobs:
           needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
         run: tests/tooling/test-installer.py
-      - name: Test interactive benchmark
+      - name: Test benchmark tooling
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
-        run: python3 tests/tooling/test-try-benchmark.py
+        run: |
+          python3 tests/tooling/test-try-benchmark.py
+          python3 tests/tooling/test-benchmark-concurrency.py
       - name: Test release tooling
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&

@@ -7,11 +7,13 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -30,10 +32,10 @@ class BenchmarkTests(unittest.TestCase):
         return dict(name="tree", operation=operation, root=str(self.root), files=6,
                     directories=2, sizes=[0, 19, 4097])
 
-    def run_measure(self, command, cpus=None, timeout=10):
+    def run_measure(self, command, cpus=None, timeout=10, operation=None):
         with contextlib.redirect_stdout(io.StringIO()):
             return bench.measure(command, dict(os.environ, LC_ALL="C"), cpus,
-                                 self.root / "measure", timeout)
+                                 self.root / "measure", timeout, operation)
 
     def test_verification_checks_bytes_source_and_unexpected_directories(self):
         case = self.case()
@@ -85,10 +87,65 @@ class BenchmarkTests(unittest.TestCase):
         # wait4 on a Python-spawned child itself can inherit this memory peak.
         allocation = bytearray(96 * 1024 * 1024)
         allocation[0] = 1
-        result = self.run_measure(["/usr/bin/true"])
+        result = self.run_measure(["/usr/bin/true"], operation="rm")
         self.assertEqual(result["exit_code"], 0)
         self.assertLess(result["resources"]["peak_rss_bytes"], len(allocation) // 2)
         self.assertGreater(result["seconds"], 0)
+
+    def measure_family(self, wait):
+        child_stats, parent_stats = self.root / "child.json", self.root / "parent.json"
+        child = f"""
+import json, os, pathlib, resource, time
+memory = bytearray(20 * 1024 * 1024)
+fds = [open(os.devnull) for _ in range(12)]
+pathlib.Path({str(self.root / 'written')!r}).write_bytes(b'x' * (4 * 1024 * 1024))
+end = time.process_time() + .6
+while time.process_time() < end:
+    sum(range(1000))
+u = resource.getrusage(resource.RUSAGE_SELF)
+pathlib.Path({str(child_stats)!r}).write_text(json.dumps(dict(pid=os.getpid(), cpu=u.ru_utime+u.ru_stime)))
+"""
+        parent = f"""
+import json, os, pathlib, resource, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', {child!r}])
+end = time.process_time() + .2
+while time.process_time() < end:
+    sum(range(1000))
+if {wait!r}:
+    child.wait()
+u = resource.getrusage(resource.RUSAGE_SELF)
+pathlib.Path({str(parent_stats)!r}).write_text(json.dumps(dict(pid=os.getpid(), cpu=u.ru_utime+u.ru_stime)))
+# Bypass Popen's destructor: this intentionally leaves the child un-waited.
+os._exit(0)
+"""
+        result = self.run_measure([sys.executable, "-c", parent], operation="cp")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(child_stats.exists(), "the harness killed a successful operation's helper")
+        records = [json.loads(p.read_text()) for p in (parent_stats, child_stats)]
+        expected = sum(r["cpu"] for r in records)
+        actual = result["resources"]["cpu_seconds"]
+        self.assertTrue(result["expected_processes_observed"])
+        self.assertAlmostEqual(actual, expected, delta=.10 if platform.system() == "Darwin" else .04)
+        sampled = {p["pid"]: p["sampled"] for p in result["processes"]}
+        for record in records:
+            self.assertAlmostEqual(sampled[record["pid"]]["user_seconds"] + sampled[record["pid"]]["system_seconds"],
+                                   record["cpu"], delta=.10)
+        self.assertGreaterEqual(sampled[records[1]["pid"]]["fds"], 12)
+        self.assertGreaterEqual(result["sampled"]["threads"], 2)
+        self.assertGreater(sampled[records[1]["pid"]]["peak_rss_bytes"], 20 * 1024 * 1024)
+        if platform.system() == "Linux":
+            self.assertEqual(len(result["accounting"]), 1 if wait else 2)
+            self.assertTrue(result["cpu_accounting_complete"])
+        else:
+            self.assertFalse(result["cpu_accounting_complete"])
+        return result
+
+    def test_unwaited_helper_finishes_and_its_cpu_is_counted(self):
+        result = self.measure_family(False)
+        self.assertGreater(result["drain_seconds"], .1)
+
+    def test_waited_helper_cpu_is_not_counted_twice(self):
+        self.measure_family(True)
 
     @unittest.skipUnless(hasattr(os, "sched_getaffinity"), "CPU affinity is Linux-only")
     def test_affinity_applies_to_product_and_restores_runner(self):
@@ -136,6 +193,72 @@ class BenchmarkTests(unittest.TestCase):
         nonzero["resources"]["cpu_seconds"] = .01
         result = bench.comparisons([dict(nonzero, variant="old"), dict(base, variant="new")], "old")
         self.assertIsNone(result[0]["cpu_seconds"]["median_ratio"])
+
+    def test_missing_samples_do_not_claim_a_cpu_or_memory_ratio(self):
+        base = dict(case="case", round=1, verified=True, seconds=.001,
+                    resources=dict(cpu_seconds=None, peak_rss_bytes=None))
+        result = bench.comparisons([dict(base, variant="old"), dict(base, variant="new")], "old")[0]
+        self.assertEqual(result["seconds"]["median_ratio"], 1)
+        for key in ("cpu_seconds", "peak_rss_bytes"):
+            self.assertIsNone(result[key]["median_ratio"])
+            self.assertEqual(result[key]["available_pairs"], 0)
+
+    def test_prune_fixed_reference_is_rejected(self):
+        plan = dict(reference="fixed", cases=[self.case("prune")], variants=[
+            dict(name="fixed", binary="/usr/bin/true", workers=8, cpus=None)])
+        with self.assertRaisesRegex(ValueError, "automatic-worker reference"):
+            bench.validate(plan)
+
+    def test_unique_logs_and_prune_skips_fixed_workers(self):
+        binary = self.root / "fake-syq"
+        binary.write_text(f"#!{sys.executable}\n" + """
+import pathlib, shutil, sys
+args = sys.argv
+source = pathlib.Path(args[args.index('--srcs-in') + 1])
+tree = pathlib.Path(args[args.index('--into') + 1]) if '--prune' in args else source
+if '--prune' in args:
+    assert '--performance-tuning' not in args
+for path in tree.iterdir():
+    shutil.rmtree(path)
+print(' '.join(args))
+""")
+        binary.chmod(0o755)
+        plan = dict(reference="auto-1-fixed", cases=[dict(self.case("rm"), name=n) for n in ("tree", "tree-1-auto")]
+                    + [self.case("prune") | dict(name="prune")], variants=[
+            dict(name=n, binary=str(binary), workers=w, cpus=None) for n, w in (("auto-1-fixed", None), ("fixed", 8))])
+        path = self.root / "plan.json"
+        path.write_text(json.dumps(plan))
+        subprocess.run([sys.executable, str(ROOT / "scripts/benchmark-concurrency.py"),
+                        "--plan", str(path), "--output", str(self.root / "results"), "--rounds", "1"],
+                       check=True, capture_output=True, text=True, timeout=20)
+        report = json.loads((self.root / "results/results.json").read_text())
+        self.assertTrue(report["complete"])
+        self.assertTrue(report["cleaned"])
+        self.assertEqual(len(report["trials"]), 5)
+        prefixes = [t["log_prefix"] for t in report["trials"]]
+        self.assertEqual(len(set(prefixes)), 5)
+        for prefix in prefixes:
+            self.assertTrue(Path(prefix + ".stdout").read_text())
+        self.assertEqual(len(report["skipped_variants"]), 1)
+        self.assertEqual(report["skipped_variants"][0]["variant"], "fixed")
+        self.assertIn("disabled", report["tuning_history"])
+
+    def test_failed_snapshot_replace_preserves_previous_results(self):
+        path = self.root / "results.json"
+        bench.save_json(path, {"trials": [1]})
+        with mock.patch.object(Path, "replace", side_effect=OSError("interrupted replacement")):
+            with self.assertRaises(OSError):
+                bench.save_json(path, {"trials": [1, 2]})
+        self.assertEqual(json.loads(path.read_text()), {"trials": [1]})
+
+    def test_changed_binary_invalidates_run(self):
+        path = self.root / "binary"
+        path.write_bytes(b"old")
+        report = dict(plan=dict(variants=[dict(name="base", binary=str(path))]),
+                      binary_sha256={"base": bench.sha256_file(path)})
+        path.write_bytes(b"new")
+        with self.assertRaisesRegex(RuntimeError, "binary changed"):
+            bench.check_binaries(report)
 
     def test_macos_time_units_and_missing_fields(self):
         log = """syq: incidental diagnostic

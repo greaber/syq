@@ -14,21 +14,37 @@ matter but cannot establish steady-state behavior. Run without other benchmarks.
 
 The reference is another measured variant, normally the old automatic tuner.
 Fixed counts are controls, not substitutes for testing the automatic candidate.
+Pruning has its own automatic deletion pool: fixed-worker variants are skipped
+for prune cases. Tuning cache/history are disabled, so automatic copies always
+start without remembered worker counts. This does not measure learned starts.
 Results retain paired rounds, individual cases and worst slowdowns; there is no
 aggregate pass threshold. Reversing variant order balances linear order effects,
 but does not remove workload drift or prove safety on unmeasured systems.
 
 Requires Linux (GNU /usr/bin/time) or macOS (/usr/bin/time). CPU affinity is
 Linux-only and applies to the WHOLE process, independently of worker count;
-it does not reproduce worker-only pinning. CPU/RSS are the local product's
-wait4 accounting from native time, avoiding the Python fixture builder's RSS.
-Wall time includes that small native launcher; CPU time has 10 ms precision.
-Linux thread/FD/I/O samples are
-lower bounds at 20 ms intervals; macOS reports these as unavailable. No remote
-helpers are launched. Logs and raw host/mount metadata stay in --output.
+it does not reproduce worker-only pinning. Wall time ends when the coordinator
+exits, including the small native time launcher. The harness then lets helpers
+exit within the same timeout. Linux CPU includes exit accounting for all local
+processes, using a subreaper for helpers the coordinator did not wait for.
+macOS copy/prune CPU is an estimate from cumulative per-process libproc samples;
+it can miss final work or entire short-lived processes. Missing either expected
+process makes that estimate unavailable. Native time CPU has 10 ms precision.
+Both platforms sample each process's CPU, RSS, threads, FDs and disk I/O every
+20 ms plus sampling cost. Group memory is a sampled sum of current RSS, not a
+sum of individual peaks. Single-process rm uses native time's maximum RSS.
+Samples are lower bounds; check sample gaps and observer CPU, and use longer
+runs for CPU comparisons. Linux per-process I/O includes waited children: do
+not sum those historical counters. Process CPU excludes background kernel
+threads (journal commits, inode cleanup, transaction sync); these are not
+system-wide filesystem cost measurements. No remote helpers are launched.
+Logs and raw host/mount metadata stay in --output.
 """
 
 import argparse
+import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -37,6 +53,7 @@ from pathlib import Path
 import platform
 import random
 import re
+import resource
 import signal
 import statistics
 import subprocess
@@ -113,6 +130,25 @@ def validate(plan):
         variant["binary"] = str(Path(variant["binary"]).resolve(strict=True))
         if not os.access(variant["binary"], os.X_OK):
             raise ValueError("binary must be executable")
+    reference = next(v for v in plan["variants"] if v["name"] == plan["reference"])
+    if any(c["operation"] == "prune" for c in plan["cases"]) and reference["workers"] is not None:
+        raise ValueError("prune cases require an automatic-worker reference")
+
+
+def case_variants(case, variants):
+    return [v for v in variants if case["operation"] != "prune" or v["workers"] is None]
+
+
+def save_json(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def check_binaries(report):
+    report["binary_sha256_after"] = {v["name"]: sha256_file(v["binary"]) for v in report["plan"]["variants"]}
+    if report["binary_sha256_after"] != report["binary_sha256"]:
+        raise RuntimeError("a benchmark binary changed during the run; comparisons are invalid")
 
 
 class Deadline:
@@ -152,13 +188,14 @@ def fixture(root, case, deadline):
             deadline.check(f"creating file {index}/{case['files']}")
         path = tree / filename(case, index)
         size = case["sizes"][index % len(case["sizes"])]
-        digest = hashlib.sha256()
+        digest = hashlib.sha256() if case["operation"] == "cp" else None
         with path.open("wb") as stream:
             remaining = size
             while remaining:
                 data = rng.randbytes(min(remaining, 1 << 20))
                 stream.write(data)
-                digest.update(data)
+                if digest is not None:
+                    digest.update(data)
                 remaining -= len(data)
                 deadline.check(f"creating file {index}/{case['files']}")
             if size:
@@ -166,7 +203,7 @@ def fixture(root, case, deadline):
                 os.fsync(stream.fileno())
         # Store hashes only when copying bytes; large empty rm trees should
         # not leave a million-entry Python manifest hot during measurement.
-        if case["operation"] == "cp":
+        if digest is not None:
             hashes[str(filename(case, index))] = digest.hexdigest()
         allocated += path.stat().st_blocks * 512
         logical += size
@@ -242,34 +279,152 @@ def time_usage(log, system):
     return row
 
 
+def linux_group(pgid):
+    members = {}
+    for proc in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = proc.read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) == pgid:
+                members[int(proc.parent.name)] = fields
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return members
+
+
 def sample_linux(launcher):
-    """Find time's direct child, the local syq process, not the Python parent."""
+    """Sample every process in the group, including the local receiver."""
     samples = []
-    try:
-        children = Path(f"/proc/{launcher}/task/{launcher}/children").read_text().split()
-        for pid in children:
-            proc = Path("/proc") / pid
+    ticks = os.sysconf("SC_CLK_TCK")
+    for pid, fields in linux_group(launcher).items():
+        if pid == launcher:
+            continue
+        proc = Path("/proc") / str(pid)
+        try:
             status = dict(line.split(":", 1) for line in (proc / "status").read_text().splitlines())
             io = dict(line.split(":", 1) for line in (proc / "io").read_text().splitlines())
-            samples.append(dict(pid=int(pid), threads=int(status["Threads"]),
+            command = (proc / "cmdline").read_bytes().decode(errors="replace").split("\0")[:-1]
+            samples.append(dict(pid=pid, parent_pid=int(fields[1]), command=command,
+                                user_seconds=int(fields[11]) / ticks,
+                                system_seconds=int(fields[12]) / ticks,
+                                rss_bytes=int(status.get("VmRSS", "0 kB").split()[0]) * 1024,
+                                peak_rss_bytes=int(status.get("VmHWM", "0 kB").split()[0]) * 1024,
+                                threads=int(status["Threads"]),
                                 allowed_cpus=status["Cpus_allowed_list"].strip(),
                                 fds=len(list((proc / "fd").iterdir())),
                                 read_bytes=int(io["read_bytes"]), write_bytes=int(io["write_bytes"])))
-    except (FileNotFoundError, ProcessLookupError):
-        pass  # A short process can finish between reads; never report a zero peak.
+        except (FileNotFoundError, ProcessLookupError):
+            pass  # A process can exit between reads; wait accounting still captures its CPU.
     return samples
+
+
+class DarwinSampler:
+    """Read-only libproc counters; no task suspension, tracing or product hooks.
+
+    ABI: apple-oss-distributions/xnu, bsd/sys/{proc_info,resource}.h.
+    rusage CPU counters use Mach time units (fill_task_rusage in bsd_kern.c).
+    """
+    class BsdInfo(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint32) for n in (
+            "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid", "rgid",
+            "svuid", "svgid", "reserved")] + [
+            ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)] + [
+            (n, ctypes.c_uint32) for n in ("nfiles", "pgid", "pjobc", "tdev", "tpgid", "nice")] + [
+            ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+    class TaskInfo(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in (
+            "virtual", "resident", "user", "system", "threads_user", "threads_system")] + [
+            (n, ctypes.c_int32) for n in ("policy", "faults", "pageins", "cow_faults", "messages_sent",
+                "messages_received", "syscalls_mach", "syscalls_unix", "csw", "threadnum", "numrunning", "priority")]
+
+    class Usage(ctypes.Structure):
+        _fields_ = [("uuid", ctypes.c_ubyte * 16)] + [(n, ctypes.c_uint64) for n in (
+            "user", "system", "idle_wakeups", "interrupt_wakeups", "pageins", "wired", "resident",
+            "footprint", "start", "exit", "child_user", "child_system", "child_idle", "child_interrupt",
+            "child_pageins", "child_elapsed", "read_bytes", "write_bytes")]
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        self.lib.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+        self.lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        self.lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        timebase = (ctypes.c_uint32 * 2)()
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        if libsystem.mach_timebase_info(ctypes.byref(timebase)) != 0:
+            raise RuntimeError("mach_timebase_info failed")
+        self.seconds_per_tick = timebase[0] / timebase[1] / 1e9
+
+    def pids(self, pgid):
+        pids = (ctypes.c_int * 4096)()
+        ctypes.set_errno(0)
+        size = self.lib.proc_listpids(2, pgid, pids, ctypes.sizeof(pids))
+        if size == ctypes.sizeof(pids):
+            raise RuntimeError("process group exceeds sampler capacity")
+        if size < 0 or (size == 0 and ctypes.get_errno() not in (0, errno.ESRCH, errno.ENOENT)):
+            raise OSError(ctypes.get_errno(), "cannot list benchmark process group")
+        return [pid for pid in pids[:size // ctypes.sizeof(ctypes.c_int)] if pid]
+
+    def info(self, pid, flavor, value):
+        ctypes.set_errno(0)
+        size = self.lib.proc_pidinfo(pid, flavor, 0, ctypes.byref(value), ctypes.sizeof(value))
+        if size == ctypes.sizeof(value):
+            return value
+        if size == 0 and ctypes.get_errno() in (0, errno.ESRCH, errno.ENOENT):
+            return None
+        raise OSError(ctypes.get_errno(), f"cannot read process {pid}, flavor {flavor} (size {size})")
+
+    def alive(self, pgid):
+        for pid in self.pids(pgid):
+            info = self.info(pid, 3, self.BsdInfo())
+            if info is not None and info.status != 5:  # SZOMB
+                return True
+        return False
+
+    def sample(self, launcher):
+        samples = []
+        for pid in self.pids(launcher):
+            if pid == launcher:
+                continue
+            bsd = self.info(pid, 3, self.BsdInfo())
+            if bsd is None or bsd.status == 5:
+                continue
+            task = self.info(pid, 4, self.TaskInfo())
+            usage = self.Usage()
+            if bsd is None or task is None:
+                continue
+            if self.lib.proc_pid_rusage(pid, 2, ctypes.byref(usage)):
+                if ctypes.get_errno() in (errno.ESRCH, errno.ENOENT):
+                    continue
+                raise OSError(ctypes.get_errno(), f"cannot read process {pid} usage")
+            # PROC_PIDLISTFDS returns packed (fd, type) pairs, eight bytes each.
+            ctypes.set_errno(0)
+            size = self.lib.proc_pidinfo(pid, 1, 0, None, 0)
+            if size <= 0 and ctypes.get_errno():
+                if ctypes.get_errno() in (errno.ESRCH, errno.ENOENT):
+                    continue
+                raise OSError(ctypes.get_errno(), f"cannot count process {pid} descriptors")
+            fds = ctypes.create_string_buffer(max(size + 4096, 4096))
+            ctypes.set_errno(0)
+            size = self.lib.proc_pidinfo(pid, 1, 0, fds, len(fds))
+            if size <= 0 and ctypes.get_errno():
+                if ctypes.get_errno() in (errno.ESRCH, errno.ENOENT):
+                    continue
+                raise OSError(ctypes.get_errno(), f"cannot read process {pid} descriptors")
+            if size == len(fds):
+                raise RuntimeError("file descriptor list grew beyond sampler buffer")
+            samples.append(dict(pid=pid, parent_pid=bsd.ppid,
+                command=[(bsd.name or bsd.comm).decode(errors="replace")], allowed_cpus=None,
+                user_seconds=usage.user * self.seconds_per_tick,
+                system_seconds=usage.system * self.seconds_per_tick,
+                rss_bytes=usage.resident, peak_rss_bytes=usage.resident,
+                threads=task.threadnum, fds=size // 8,
+                read_bytes=usage.read_bytes, write_bytes=usage.write_bytes))
+        return samples
 
 
 def group_alive(pgid):
     if platform.system() == "Linux":
-        for proc in Path("/proc").glob("[0-9]*/stat"):
-            try:
-                fields = proc.read_text().rsplit(")", 1)[1].split()
-                if int(fields[2]) == pgid and fields[0] != "Z":
-                    return True
-            except (FileNotFoundError, ProcessLookupError):
-                pass
-        return False
+        return any(fields[0] != "Z" for fields in linux_group(pgid).values())
     # On macOS killpg(pgid, 0) can return EPERM for an exiting group after
     # orphan adoption. Inspect states, as on Linux, rather than treating a
     # zombie as a live worker or interpreting EPERM as proof of termination.
@@ -295,13 +450,91 @@ def cpu_constraints():
     return {str(path): path.read_text() for path in paths if path.is_file()}
 
 
-def measure(command, env, cpus, stem, timeout):
+@contextlib.contextmanager
+def subreaper():
+    """Adopt un-waited local helpers; restore the caller's original setting."""
+    if platform.system() != "Linux":
+        yield
+        return
+    # https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) or libc.prctl(36, 1, 0, 0, 0):
+        raise OSError(ctypes.get_errno(), "cannot enable child subreaper accounting")
+    try:
+        yield
+    finally:
+        if libc.prctl(36, previous.value, 0, 0, 0):
+            raise OSError(ctypes.get_errno(), "cannot restore child subreaper setting")
+
+
+def reap_group(pgid, accounting):
+    """Only call after the launcher waiter has finished, to avoid a wait race."""
+    while True:
+        try:
+            pid, status, usage = os.wait4(-pgid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid == 0:
+            return False
+        accounting.append(dict(pid=pid, exit_code=os.waitstatus_to_exitcode(status),
+            scope="adopted process and descendants it waited for", resources=dict(
+                user_seconds=usage.ru_utime, system_seconds=usage.ru_stime,
+                peak_rss_bytes=usage.ru_maxrss * 1024,
+                voluntary_switches=usage.ru_nvcsw, involuntary_switches=usage.ru_nivcsw,
+                input_blocks=usage.ru_inblock, output_blocks=usage.ru_oublock)))
+
+
+def measure(command, env, cpus, stem, timeout, operation=None):
+    with subreaper():
+        return measure_group(command, env, cpus, stem, timeout, operation)
+
+
+def measure_group(command, env, cpus, stem, timeout, operation):
     system = platform.system()
+    darwin = DarwinSampler() if system == "Darwin" else None
     usage_path = stem.with_suffix(".usage")
     timed = (["/usr/bin/time", "-f", GNU_FORMAT, "-o", str(usage_path)] if system == "Linux"
              else ["/usr/bin/time", "-l"]) + command
     ended = []
-    samples = []
+    processes = {}
+    accounting = []
+    peaks = dict(threads=None, fds=None, rss_bytes=None)
+    sample_count = 0
+    sample_times = []
+    observer_before = resource.getrusage(resource.RUSAGE_SELF)
+
+    def sample():
+        nonlocal sample_count
+        snapshot = sample_linux(child.pid) if darwin is None else darwin.sample(child.pid)
+        timestamp = time.monotonic() - started
+        sample_times.append(timestamp)
+        present = {entry["pid"] for entry in snapshot}
+        for pid, record in processes.items():
+            if pid not in present:
+                record.setdefault("first_missing_seconds", timestamp)
+        if not snapshot:
+            return
+        sample_count += 1
+        for key in peaks:
+            peaks[key] = max(peaks[key] or 0, sum(s[key] for s in snapshot))
+        for entry in snapshot:
+            pid = entry["pid"]
+            record = processes.setdefault(pid, dict(pid=pid, command=[], sampled={}))
+            record.setdefault("first_seen_seconds", timestamp)
+            record["last_seen_seconds"] = timestamp
+            record.pop("first_missing_seconds", None)
+            if entry["command"]:
+                record["command"] = entry["command"]
+            if entry["parent_pid"] == child.pid:
+                record["role"] = "coordinator"
+            elif "--local-receiver" in record["command"]:
+                record["role"] = "local_receiver"
+            else:
+                record.setdefault("role", "descendant")
+            record["allowed_cpus"] = entry["allowed_cpus"]
+            for key in ("threads", "fds", "peak_rss_bytes", "user_seconds", "system_seconds", "read_bytes", "write_bytes"):
+                record["sampled"][key] = max(record["sampled"].get(key, 0), entry[key])
     with stem.with_suffix(".stdout").open("wb") as stdout, stem.with_suffix(".stderr").open("wb") as stderr:
         affinity = os.sched_getaffinity(0) if cpus is not None else None
         try:
@@ -320,33 +553,71 @@ def measure(command, env, cpus, stem, timeout):
         waiter = threading.Thread(target=wait)
         waiter.start()
         deadline = Deadline(timeout, stem.name)
+        finished = False
         try:
             while waiter.is_alive():
                 deadline.check(f"running {time.monotonic() - started:.1f}s")
-                if system == "Linux":
-                    samples.extend(sample_linux(child.pid))
+                sample()
                 waiter.join(0.02)
-        finally:
-            # Also catch descendants if a faulty executable leaves them behind
-            # after time exits. Reap the launcher and verify the entire group.
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            waiter.join(10)
-            cleanup = Deadline(10, stem.name + " cleanup", interruptible=False)
-            while group_alive(child.pid):
-                cleanup.check("waiting for process group to exit")
+            # The coordinator can exit before its receiver. Allow orderly
+            # shutdown, account for adopted descendants, and keep the original
+            # deadline. Successful trials must never kill unfinished helpers.
+            while True:
+                sample()
+                reaped = reap_group(child.pid, accounting) if system == "Linux" else True
+                if reaped and not (darwin.alive(child.pid) if darwin else group_alive(child.pid)):
+                    break
+                deadline.check("waiting for receiver/process group to finish")
                 time.sleep(0.02)
+            group_ended = time.monotonic()
+            finished = True
+        finally:
+            # On timeout/interruption, terminate and reap the entire group.
+            if not finished:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                waiter.join(10)
+                cleanup = Deadline(10, stem.name + " cleanup", interruptible=False)
+                while True:
+                    reaped = reap_group(child.pid, accounting) if system == "Linux" and not waiter.is_alive() else True
+                    if not waiter.is_alive() and reaped and not (darwin.alive(child.pid) if darwin else group_alive(child.pid)):
+                        break
+                    cleanup.check("waiting for process group to exit")
+                    time.sleep(0.02)
         log = (usage_path if system == "Linux" else stem.with_suffix(".stderr")).read_text()
-    resources = time_usage(log, system)
-    resources["cpu_seconds"] = resources["user_seconds"] + resources["system_seconds"]
-    peaks = {key: max((s[key] for s in samples), default=None)
-             for key in ("threads", "fds", "read_bytes", "write_bytes")}
-    return dict(seconds=ended[0] - started, exit_code=child.returncode, resources=resources,
-                sampled=peaks, sample_count=len(samples), command=command,
-                observed_cpu_sets=sorted({s["allowed_cpus"] for s in samples}),
-                process_ids=sorted({s["pid"] for s in samples}), log_prefix=str(stem))
+    coordinator = time_usage(log, system)
+    coordinator_pid = next((p for p, r in processes.items() if r.get("role") == "coordinator"), None)
+    accounting.insert(0, dict(pid=coordinator_pid, scope="coordinator and descendants it waited for",
+                              resources=coordinator))
+    complete = system == "Linux" or operation == "rm"
+    resources = {key: sum(a["resources"][key] for a in accounting) if complete else None
+                 for key in coordinator if key != "peak_rss_bytes"}
+    resources["cpu_seconds"] = resources["user_seconds"] + resources["system_seconds"] if complete else None
+    expected_observed = coordinator_pid is not None and (operation not in ("cp", "prune") or len(processes) >= 2)
+    if not complete and expected_observed:
+        for key in ("user_seconds", "system_seconds"):
+            resources[key] = sum(p["sampled"][key] for p in processes.values())
+        resources["cpu_seconds"] = resources["user_seconds"] + resources["system_seconds"]
+    # Wait accounting's maxrss is the largest process, not a group memory
+    # peak. Keep it per accounting record. Never sum per-process peak values.
+    resources["peak_rss_bytes"] = peaks["rss_bytes"]
+    if operation == "rm":
+        resources["peak_rss_bytes"] = coordinator["peak_rss_bytes"]
+    observer_after = resource.getrusage(resource.RUSAGE_SELF)
+    return dict(seconds=ended[0] - started, process_group_seconds=group_ended - started,
+                drain_seconds=group_ended - ended[0], exit_code=child.returncode,
+                resources=resources, accounting=accounting, cpu_accounting_complete=complete,
+                cpu_accounting="exit accounting" if complete else "sampled cumulative process CPU",
+                expected_processes_observed=expected_observed,
+                memory_accounting="single-process maximum RSS" if operation == "rm" else "sampled sum of process RSS",
+                processes=list(processes.values()), sampled=peaks, sample_count=sample_count,
+                max_sample_gap_seconds=max(b - a for a, b in zip([0] + sample_times, sample_times + [group_ended - started])),
+                observer_cpu_seconds=(observer_after.ru_utime + observer_after.ru_stime
+                                      - observer_before.ru_utime - observer_before.ru_stime),
+                command=command, observed_cpu_sets=sorted({s["allowed_cpus"] for s in processes.values() if s["allowed_cpus"] is not None}),
+                log_prefix=str(stem))
 
 
 def comparisons(rows, reference):
@@ -360,11 +631,13 @@ def comparisons(rows, reference):
             result = dict(case=case, variant=variant, paired_rounds=len(pairs))
             for key in ("seconds", "cpu_seconds", "peak_rss_bytes"):
                 values = [(a[key], b[key]) if key == "seconds" else (a["resources"][key], b["resources"][key]) for a, b in pairs]
+                values = [(a, b) for a, b in values if a is not None and b is not None]
                 # Native time rounds short CPU measurements to zero. Neither
                 # a zero denominator nor a zero numerator establishes a ratio.
                 ratios = [b / a for a, b in values if a > 0 and b > 0]
-                result[key] = dict(reference_median=statistics.median(a for a, _ in values),
-                                   variant_median=statistics.median(b for _, b in values),
+                result[key] = dict(available_pairs=len(values),
+                                   reference_median=statistics.median(a for a, _ in values) if values else None,
+                                   variant_median=statistics.median(b for _, b in values) if values else None,
                                    paired_ratios=ratios,
                                    median_ratio=statistics.median(ratios) if ratios else None,
                                    worst_ratio=max(ratios) if ratios else None)
@@ -404,6 +677,10 @@ def main():
                   binary_sha256={v["name"]: sha256_file(v["binary"]) for v in plan["variants"]},
                   harness_sha256=sha256_file(__file__), sample_interval_seconds=0.02,
                   cpu_time_resolution_seconds=0.01,
+                  tuning_history="disabled; automatic variants start without remembered counts",
+                  kernel_background_cpu="not counted",
+                  skipped_variants=[dict(case=c["name"], variant=v["name"], reason="pruning tunes its own deletion workers")
+                      for c in plan["cases"] for v in plan["variants"] if v not in case_variants(c, plan["variants"])],
                   wall_clock="includes native time launcher", cache="fresh fsynced fixtures, warm caches")
     mounts = Path("/proc/self/mountinfo")
     (args.output / "mounts.txt").write_text(mounts.read_text() if mounts.exists() else
@@ -412,7 +689,7 @@ def main():
 
     def save():
         report["comparisons"] = comparisons(report["trials"], plan["reference"])
-        (args.output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+        save_json(args.output / "results.json", report)
 
     def interrupted(signum, _frame):
         # Defer interruption to a checkpoint so Popen cannot launch a process
@@ -426,10 +703,13 @@ def main():
     try:
         for case in plan["cases"]:
             for iteration in range(args.rounds):
-                variants = plan["variants"] if iteration % 2 == 0 else list(reversed(plan["variants"]))
+                eligible = case_variants(case, plan["variants"])
+                variants = eligible if iteration % 2 == 0 else list(reversed(eligible))
                 for variant in variants:
-                    stem = args.output / f"{case['name']}-{iteration + 1}-{variant['name']}"
-                    row = dict(case=case["name"], variant=variant["name"], round=iteration + 1, verified=False)
+                    trial = len(report["trials"]) + 1
+                    stem = args.output / f"trial-{trial:06d}"
+                    row = dict(trial=trial, case=case["name"], variant=variant["name"], round=iteration + 1, verified=False,
+                               worker_control="automatic pruning" if case["operation"] == "prune" else variant["workers"] or "automatic")
                     report["trials"].append(row)
                     save()
                     with tempfile.TemporaryDirectory(prefix="syq-concurrency-", dir=case["root"]) as temporary:
@@ -446,7 +726,7 @@ def main():
                             command += ["--prune"]
                         if variant["workers"] is not None:
                             command += ["--performance-tuning", f"workers={variant['workers']}"]
-                        row.update(measure(command, env, variant["cpus"], stem, args.timeout))
+                        row.update(measure(command, env, variant["cpus"], stem, args.timeout, case["operation"]))
                         save()
                         if row["exit_code"]:
                             raise RuntimeError(f"{stem.name}: exit {row['exit_code']}; see {stem}.stderr")
@@ -455,6 +735,7 @@ def main():
                     row["cleaned"] = not root.exists()
                     save()
                     print(json.dumps(row), flush=True)
+        check_binaries(report)
         report["complete"] = True
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
