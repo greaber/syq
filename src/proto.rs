@@ -73,6 +73,10 @@ pub fn hash_response_fits(block: u64, len: u64) -> bool {
 /// batch (`patch_batch_fits`).
 pub const MAX_PATCH_FILE_BYTES: u64 = MAX_READ_BYTES;
 
+/// Data per patch from which an uncompressed `PatchSmallBatch` is written
+/// without first encoding it into a buffer.
+const DIRECT_PATCH_BYTES: usize = 1 << 20;
+
 /// Most differing data `ReadDifferingBatch` returns for one file, so that
 /// neither the source nor the patch it feeds holds more of one file. A file
 /// that differs by more is sent in ranges per file instead.
@@ -1690,7 +1694,17 @@ impl SizeHint for Request {
     }
 
     fn direct_payload(&self) -> bool {
-        matches!(self, Request::WriteRange { .. })
+        match self {
+            Request::WriteRange { .. } => true,
+            // Patches whose data dwarfs their metadata: a second pass over
+            // the metadata costs less than copying the data into a buffer.
+            Request::PatchSmallBatch(patches) => {
+                !patches.is_empty()
+                    && patches.iter().map(|patch| patch.data.len()).sum::<usize>()
+                        >= patches.len() * DIRECT_PATCH_BYTES
+            }
+            _ => false,
+        }
     }
     fn frame_limit(&self) -> usize {
         match self {
