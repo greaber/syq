@@ -1586,6 +1586,9 @@ impl FsOps {
                     off,
                     contents,
                 )?;
+                let _hash = self
+                    .operation
+                    .span(crate::transfer_observations::Stage::Hashing);
                 for piece in contents.chunks(block as usize) {
                     let same = read.expected.get(matching.len()) == Some(&algorithm.hash(piece));
                     matching.push(same);

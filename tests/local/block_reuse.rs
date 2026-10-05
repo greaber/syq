@@ -467,6 +467,76 @@ fn stats_bytes(out: &Output, label: &str) -> u64 {
     line.replace(',', "").parse().unwrap()
 }
 
+#[test]
+fn stats_show_grouped_comparison_reads_and_hashing() {
+    // Edited files compared in groups: the destination reads and hashes
+    // each file it would replace, and the source hashes its own.
+    let t = Tmp::new();
+    let (files, size) = (4, 4 << 20);
+    for i in 0..files {
+        let source = prng(size, 900 + i as u64);
+        let mut old = source.clone();
+        old[1 << 20..(1 << 20) + 100].fill(b'x');
+        write(&t.path(&format!("src/f{i}")), &source);
+        write(&t.path(&format!("dst/f{i}")), &old);
+        set_mtime(&t.path(&format!("dst/f{i}")), 1);
+    }
+    let out = native_syq(&[
+        "cp",
+        "--transfer-strategy",
+        "aligned-block",
+        "--stats",
+        "--no-progress",
+        "--results",
+        &t.s("results"),
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_output_ok(&out);
+    for i in 0..files {
+        assert_eq!(
+            read(&t.path(&format!("src/f{i}"))),
+            read(&t.path(&format!("dst/f{i}")))
+        );
+    }
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let activity = records
+        .iter()
+        .rev()
+        .find_map(|record| record.get("activity"))
+        .expect("activity with --stats");
+    // Each endpoint's filesystem operations over the whole copy: whether
+    // they hashed, and the bytes they read.
+    let observed = |endpoint: &str| -> (bool, u64) {
+        activity["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["label"].as_str().unwrap().starts_with(endpoint))
+            .flat_map(|row| row["cumulative_actors"].as_array().unwrap())
+            .filter(|actor| actor["role"] == "filesystem")
+            .fold((false, 0), |(hashed, read), actor| {
+                (
+                    hashed || actor["fractions"].get("hashing").is_some(),
+                    read + actor["bytes"]["source_read"].as_u64().unwrap_or(0),
+                )
+            })
+    };
+    let (hashed, read_bytes) = observed("destination worker");
+    assert!(hashed, "destination hashing: {activity}");
+    assert!(
+        read_bytes >= (files * size) as u64,
+        "destination reads {read_bytes}: {activity}"
+    );
+    assert!(observed("source worker").0, "source hashing: {activity}");
+}
+
 /// Files of 32 MiB, one of which differs by 16 MiB, as much as one patch
 /// carries, and one by more, written to `src` and `dst`. Returns the source
 /// contents.
