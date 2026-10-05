@@ -668,17 +668,26 @@ impl FsOps {
     /// cloned where the filesystem can, or else copied with
     /// copy_file_range, keeping the file's holes. A stage taking a copy of
     /// a dense file is allocated first, as a partial seeded from one is.
+    /// Only what the new file can reuse is copied: the old file up to the new
+    /// length, rounded up to a whole block so that a clone stays aligned.
     /// False when the file could not be copied so.
     fn copy_basis(&self, source: &PatchSource<'_>, stage: &SmallStage) -> bool {
         #[cfg(target_os = "linux")]
         {
-            super::basis_copy::seed(&source.old, &stage.file, source.basis.len, || {
-                let old = source.old.metadata()?;
-                if old.blocks().saturating_mul(512) >= old.len() {
-                    self.preallocate_stage(stage, source.patch.len)?;
-                }
-                Ok(())
-            })
+            let patch = source.patch;
+            let reusable = patch.len.div_ceil(patch.block).saturating_mul(patch.block);
+            super::basis_copy::seed(
+                &source.old,
+                &stage.file,
+                source.basis.len.min(reusable),
+                || {
+                    let old = source.old.metadata()?;
+                    if old.blocks().saturating_mul(512) >= old.len() {
+                        self.preallocate_stage(stage, source.patch.len)?;
+                    }
+                    Ok(())
+                },
+            )
             .is_ok()
         }
         #[cfg(not(target_os = "linux"))]
@@ -1337,8 +1346,8 @@ mod tests {
             ];
             assert_eq!(patches[0].data.len() as u64, 2 * block + 4);
             // A reused block of "raced" changes after it was hashed. A clone
-            // keeps reused blocks unread, so only the change time shows the
-            // change: wait until the write gives a new one.
+            // or kernel copy keeps reused blocks unread, so only the change
+            // time shows the change: wait until the write gives a new one.
             std::thread::sleep(std::time::Duration::from_millis(50));
             let mut raced = old.clone();
             raced[0] ^= 1;
@@ -1357,6 +1366,50 @@ mod tests {
             assert!(results[1].is_err(), "{case}: {:?}", results[1]);
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced, "{case}");
             assert_eq!(entries(directory), 2, "{case}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shorter_file_copies_only_the_blocks_it_can_reuse() {
+        // A patch for a file shorter than the one it replaces, as with an
+        // explicit block-reuse strategy, copies or clones the old file only
+        // up to the new length, rounded up to a whole block.
+        let block = MIN_HASH_BLOCK_BYTES;
+        for cloning in [true, false] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..64 * block).map(|i| (i % 251) as u8 | 1).collect();
+            fs::write(directory.join("file"), &old).unwrap();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops.hash_existing_batch(
+                block,
+                &[ExistingRead {
+                    path: b"file".to_vec(),
+                    len: 64 * block,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                }],
+            );
+            // Enough reused blocks to copy rather than assemble the file.
+            let mut new = old[..20 * block as usize].to_vec();
+            new.extend_from_slice(b"tail");
+            let patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
+            assert_eq!(patch.data, b"tail");
+            super::super::basis_copy::SEEDED.set(0);
+            let results = refusing_clones(!cloning, || ops.patch_small_batch(&[patch])).unwrap();
+            assert!(results[0].is_ok(), "cloning {cloning}: {:?}", results[0]);
+            assert_eq!(
+                fs::read(directory.join("file")).unwrap(),
+                new,
+                "cloning {cloning}"
+            );
+            assert_eq!(
+                super::super::basis_copy::SEEDED.get(),
+                21 * block,
+                "cloning {cloning}"
+            );
         }
     }
 
