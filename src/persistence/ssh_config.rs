@@ -22,11 +22,16 @@ pub(crate) fn run(domain: &super::Domain, command: ExportCommand) -> Result<i32>
     let requested = crate::cli::parse_native_endpoint(Some(&command.host))?
         .context("SSH destination is missing")?;
     crate::destination::ssh::validate_endpoint(&requested)?;
+    let explicit = command.auth_from.is_some();
     let mode = crate::auth_from::resolve(domain, &requested.host, command.auth_from)?;
     ensure!(mode != AuthFrom::Ssh,
         "ssh-config exports approved account connections; select an authorization provider instead of native SSH authorization");
-    let cached = crate::destination::ssh::persistent::select_export(domain, &requested, &mode)?
-        .context("no approved account connection matches; first run syq ssh HOST --auth-from PROVIDER (ssh-config never opens a connection)")?;
+    let cached = crate::auth_from::selected_context(
+        crate::destination::ssh::persistent::select_export(domain, &requested, &mode)
+            .and_then(|cached| cached.context("no approved account connection matches; first run syq ssh HOST --auth-from PROVIDER (ssh-config never opens a connection)")),
+        &mode,
+        explicit,
+    )?;
     let config = export(&requested, cached.endpoint(), cached.control())?;
     std::io::stdout().lock().write_all(config.as_bytes())?;
     Ok(0)

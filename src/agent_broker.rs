@@ -382,9 +382,12 @@ fn inspect_ssh_configuration_at(
         let detail = String::from_utf8_lossy(&output.stderr)
             .lines()
             .filter(|line| {
-                !["debug1:", "debug2:", "debug3:"]
+                let version_banner = line.starts_with("OpenSSH_")
+                    && crate::conn::parse_openssh_version(line.as_bytes()).is_some();
+                let debug_trace = ["debug1:", "debug2:", "debug3:"]
                     .iter()
-                    .any(|prefix| line.starts_with(prefix))
+                    .any(|prefix| line.starts_with(prefix));
+                !(version_banner || debug_trace)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1117,6 +1120,7 @@ impl ConstrainedAgentBroker {
                 socket_name: "agent.sock",
                 listener_thread: "syq-agent-listener",
                 client_thread: "syq-agent-client",
+                inline_on_thread_failure: false,
                 max_connections,
                 io_timeout: BROKER_IO_TIMEOUT,
             },
@@ -1794,7 +1798,7 @@ fn encode_identities_response(identities: &[Identity]) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     let mut length = [0u8; 4];
     let first = stream.read(&mut length[..1])?;
     if first == 0 {
@@ -1813,7 +1817,7 @@ fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(frame))
 }
 
-fn write_frame(stream: &mut impl Write, frame: &[u8]) -> io::Result<()> {
+pub(crate) fn write_frame(stream: &mut impl Write, frame: &[u8]) -> io::Result<()> {
     let length = u32::try_from(frame.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SSH agent frame too large"))?;
     stream.write_all(&length.to_be_bytes())?;

@@ -51,11 +51,18 @@ filesystem copies; use `s3-requests` for the shared S3 data-request count.
 | `s3-part-size` | Automatic | 5 MiB–5 GiB per upload part or download range |
 | `s3-retries` | `10` | 0–100 retries for transient failures and throttling; 0 disables retries |
 
-Retries wait longer each time, so with the default budget a single request can
-keep retrying for a minute or more. If 8 requests in a row fail after all their
-retries, each with no connection, a timeout, or a server error or throttling
-response, `syq cp` and `syq rm` stop instead of trying the remaining objects;
-rerun the command once the service is available.
+Each request has its own retry allowance. Retries wait longer each time, with
+randomized delays to spread out concurrent retries. Requests keep their
+concurrency slots while waiting, so throttling slows new work too. With the
+default budget a single request can keep retrying for a minute or more. If 8
+requests in a row fail after all their retries, each with no connection, a
+timeout, or a server error or throttling response, `syq cp` and `syq rm` stop
+instead of trying the remaining objects; rerun the command once the service is
+available.
+
+For bulk deletion, syq retries only keys with temporary errors, up to
+`s3-retries` times during pruning or 10 times with `syq rm`. This count is
+separate from retries of the batch request itself.
 
 The concurrency limits are nested. For example:
 
@@ -92,10 +99,10 @@ pagination at the original prefix.
 concurrency using completed entries per second. Filesystem deletion runs on
 the machine holding the target filesystem. S3 deletion adjusts concurrent
 requests while keeping supported batch requests. These measurements are
-separate from copying file contents and are not saved between runs. When a higher deletion count brings no clear
-throughput gain, syq returns to the previous count. It keeps a lower count
-when that improves throughput, such as when excess workers contend for the
-same filesystem locks.
+separate from copying file contents and are not saved between runs. When a
+higher deletion count brings no clear throughput gain, syq returns to the
+previous count. It keeps a lower count when that improves throughput, such as
+when excess workers contend for the same filesystem locks.
 
 For `rm` and `clean-partials`, `--performance-tuning workers=N` fixes the
 filesystem worker count. For S3 removal, `--performance-tuning s3-requests=N`

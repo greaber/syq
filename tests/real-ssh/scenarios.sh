@@ -1242,6 +1242,8 @@ root=/tmp/syq-real-ssh/grouped-source
 install -d "$root"
 for n in 1 2 3 4 5 6 7 8; do
     head -c 262144 /dev/urandom >"$root/file-$n"
+    # Byte 100 is changed below; make sure that changes the file.
+    printf 0 | dd of="$root/file-$n" bs=1 seek=100 conv=notrunc status=none
 done
 EOF
 syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/grouped-source \

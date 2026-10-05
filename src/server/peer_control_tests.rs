@@ -24,6 +24,16 @@ impl Session {
                 .unwrap();
         }
         let worker = std::thread::spawn(move || {
+            if metadata_control {
+                // Both laptop uploads and three-server bridges enter through
+                // this function; exercise its enforced metadata-only policy.
+                return run_forwarded(
+                    authority,
+                    server.try_clone().unwrap(),
+                    server,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+            }
             serve(
                 server.try_clone().unwrap(),
                 server.try_clone().unwrap(),

@@ -1,18 +1,18 @@
 # syq ssh
 
-Open a shell on another server using SSH authorization from your laptop:
+Open a shell or run a command using your saved authorization choice, or native
+SSH when none is configured:
 
 ```sh
-syq ssh --auth-from @laptop user@hostB
-syq ssh --auth-from @laptop hostB -- hostname
+syq ssh user@hostB
+syq ssh hostB -- hostname
 ```
 
-Run these commands on the server you are working on. First
-[connect your laptop to that server](../receive.md#set-up-receiving).
-The requesting server's SSH configuration chooses the destination, login user,
-port, and route. Your laptop asks you to approve access to that account and
-checks its trusted host keys. Session traffic follows the requesting server's
-route; it is not relayed through the laptop for authorization.
+To authorize through your laptop while working on another server, first
+[connect the laptop to that server](../receive.md#set-up-receiving), then use
+`syq ssh --auth-from @laptop hostB`. Your laptop approves the destination account
+and checks its trusted host keys. The requesting server's SSH configuration
+chooses the account, address, and route; session traffic follows that route.
 
 <!-- CLI: ssh -->
 ```text
@@ -51,12 +51,9 @@ The first laptop-authorized login asks permission for the source account to use
 shown command describes the requester's intent; it is not a restriction on that
 permission. Copy roots and byte limits do not apply.
 
-Choose **Allow** to permit logins between those accounts while the laptop's
-current receiving connection to the source remains open. Commands and copies
-reuse the approved SSH connection without another prompt. **Remember** permits
-future logins between the same accounts through that profile while the laptop
-is available. Different accounts or changed trusted host keys require new
-approval. See [account permission controls](../persistence-reference.md#account-permissions).
+Commands and copies reuse the approved SSH connection. See
+[account permission controls](../persistence-reference.md#account-permissions)
+for approval lifetimes, remembered permissions, and revocation limits.
 
 The laptop's ordinary SSH agent is not forwarded. Syq limits its authentication
 requests to the approved destination host keys and login account. The requesting

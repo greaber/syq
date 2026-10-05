@@ -401,6 +401,7 @@ fn completion_transport() -> (RemoteConn, std::os::unix::net::UnixStream) {
         .unwrap();
     crate::proto::FrameWriter::new(server.try_clone().unwrap(), false)
         .write_msg(&Response::HelloOk {
+            descriptors: None,
             identity: crate::identity::build().into(),
             platform: crate::identity::platform(),
             supports_confined_socket_nodes: false,
@@ -412,7 +413,7 @@ fn completion_transport() -> (RemoteConn, std::os::unix::net::UnixStream) {
         stdout: File::from(OwnedFd::from(client)),
         stderr: File::open("/dev/null").unwrap(),
     };
-    let mut connection = RemoteConn::from_pooled(session, false, "completion test".into());
+    let mut connection = RemoteConn::from_pooled(session, false, "completion test".into()).unwrap();
     assert!(matches!(
         connection.recv().unwrap(),
         Response::HelloOk { .. }

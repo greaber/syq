@@ -89,10 +89,16 @@ pub(crate) fn select(args: &Args) -> Result<Option<Selection>> {
         anyhow::ensure!(!authorized, "approved direct peer copies require distinct SSH endpoints, source coordination, and restricted peer authentication; --rsh and --detach are not supported");
         return Ok(None);
     }
-    let coordinator =
-        ssh::persistent::select_or_connect(&domain, &requested(source), &source_mode)?;
-    let peer =
-        ssh::persistent::select_or_connect(&domain, &requested(destination), &destination_mode)?;
+    let coordinator = crate::auth_from::selected_context(
+        ssh::persistent::select_or_connect(&domain, &requested(source), &source_mode),
+        &source_mode,
+        args.auth_from_explicit,
+    )?;
+    let peer = crate::auth_from::selected_context(
+        ssh::persistent::select_or_connect(&domain, &requested(destination), &destination_mode),
+        &destination_mode,
+        args.auth_from_explicit,
+    )?;
     match (coordinator, peer) {
         (Some(coordinator), Some(peer)) => Ok(Some(Selection {
             coordinator: Arc::new(coordinator),
@@ -140,6 +146,14 @@ enum AdmissionReply {
     Error(String),
 }
 impl AdmissionReply {
+    fn failure(ssh_admission: bool, error: anyhow::Error) -> Self {
+        if ssh_admission && !super::ssh_auth::retryable_setup_error(&error) {
+            Self::SshRefused(format!("{error:#}"))
+        } else {
+            Self::Error(format!("{error:#}"))
+        }
+    }
+
     fn ssh_result(self) -> Result<forward::ssh::Peer> {
         match self {
             Self::Ssh(peer) => Ok(peer),
@@ -306,18 +320,21 @@ impl Selection {
                 socket_name: "s",
                 listener_thread: "peer-bridge",
                 client_thread: "peer-control",
+                inline_on_thread_failure: false,
                 // Keep the existing control/setup headroom in addition to
                 // the coordinator's one long-lived lifetime connection.
                 max_connections: 4,
                 io_timeout: ADMISSION,
             },
             move |mut stream, _| {
+                let mut ssh_admission = false;
                 let result = (|| {
                     let request: AdmissionRequest = read_message(&mut forward::DeadlineIo {
                         inner: &mut stream,
                         deadline: Instant::now() + ADMISSION,
                         cancelled: None,
                     })?;
+                    ssh_admission = matches!(request.action, Action::Ssh { .. });
                     anyhow::ensure!(
                         request.version == VERSION
                             && request.identity == crate::identity::build()
@@ -384,11 +401,7 @@ impl Selection {
                     }
                 })();
                 if let Err(error) = result {
-                    let reply = if is_setup_refusal(&error) {
-                        AdmissionReply::SshRefused(format!("{error:#}"))
-                    } else {
-                        AdmissionReply::Error(format!("{error:#}"))
-                    };
+                    let reply = AdmissionReply::failure(ssh_admission, error);
                     let _ = write_message(&mut stream, &reply);
                 }
             },
@@ -416,13 +429,13 @@ fn cached_ssh_setup(
     public_key: &str,
     resolve: impl FnOnce() -> Result<forward::ssh::Peer>,
 ) -> Result<forward::ssh::Peer> {
-    let mut memo = setup
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("peer SSH setup is already active"))?;
+    let mut memo = setup.try_lock().map_err(|_| {
+        super::ssh_auth::RetryableSetupError("peer SSH setup is already active".into())
+    })?;
     memo.resolve(public_key, || match resolve() {
         Ok(peer) => Ok(Ok(peer)),
-        Err(error) if is_setup_refusal(&error) => Ok(Err(format!("{error:#}"))),
-        Err(error) => Err(error),
+        Err(error) if super::ssh_auth::retryable_setup_error(&error) => Err(error),
+        Err(error) => Ok(Err(format!("{error:#}"))),
     })
 }
 
@@ -448,11 +461,9 @@ impl Prepared {
         receive: impl FnOnce(ChildStdout) -> Result<T> + Send + 'static,
     ) -> Result<(ExitStatus, T)> {
         let deadline = Instant::now() + SETUP;
-        let mut ready_child = None;
-        for install in [false, true] {
-            if install {
-                self.coordinator.install_helper()?;
-            }
+        let mut installed = false;
+        let mut reclaimed = false;
+        let (mut child, ready) = loop {
             let mut child = forward::ForwardChild::spawn_streaming_command(
                 self.coordinator
                     .helper_command(&["--peer-coordinator".into()]),
@@ -463,26 +474,37 @@ impl Prepared {
                 cancelled: Some(&|| self.closed.load(Ordering::Acquire)),
             });
             match ready {
-                Ok(ready) => {
-                    ready_child = Some((child, ready));
-                    break;
-                }
+                Ok(ready) => break (child, ready),
                 Err(error) => {
                     let status =
                         child.wait_for_exit(deadline, &|| self.closed.load(Ordering::Acquire));
-                    if !install
+                    if !reclaimed
+                        && status
+                            .as_ref()
+                            .is_ok_and(|status| status.code() == Some(255))
+                        && self
+                            .coordinator
+                            .release_idle_helpers_after_startup_failure(status.as_ref().unwrap())
+                    {
+                        // No CoordinatorStart (and therefore no copy command)
+                        // has been sent. Retry only this failed SSH startup.
+                        reclaimed = true;
+                        continue;
+                    }
+                    if !installed
                         && self.coordinator.bootstrap_helper
                         && status
                             .as_ref()
                             .is_ok_and(|s| crate::remote_helper::needs_install(s.code()))
                     {
+                        self.coordinator.install_helper()?;
+                        installed = true;
                         continue;
                     }
                     return Err(error).context("start approved peer coordinator");
                 }
             }
-        }
-        let (mut child, ready) = ready_child.context("peer coordinator did not become ready")?;
+        };
         anyhow::ensure!(
             ready.version == VERSION && ready.identity == crate::identity::build(),
             "peer coordinator build mismatch"
@@ -741,7 +763,7 @@ mod tests {
         let attempts = std::cell::Cell::new(0);
         let lost = cached_ssh_setup(&setup, "same-copy-key", || {
             attempts.set(attempts.get() + 1);
-            bail!("setup reply lost")
+            Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
         })
         .unwrap_err();
         assert!(!is_setup_refusal(&lost));
@@ -761,11 +783,83 @@ mod tests {
         let another_copy = Mutex::new(forward::ssh::SetupMemo::default());
         let next = cached_ssh_setup(&another_copy, "new-copy-key", || {
             attempts.set(attempts.get() + 1);
-            bail!("new copy tried its own setup")
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
         })
         .unwrap_err();
         assert!(!is_setup_refusal(&next));
         assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn expired_setup_can_retry_but_cancelled_setup_is_remembered() {
+        for cancelled in [false, true] {
+            let setup = Mutex::new(forward::ssh::SetupMemo::default());
+            let attempts = std::cell::Cell::new(0);
+            let spec = crate::conn::RemoteSpec::local_receiver(false);
+            for _ in 0..2 {
+                let error = cached_ssh_setup(&setup, "key", || {
+                    attempts.set(attempts.get() + 1);
+                    forward::ForwardChild::over_spec(
+                        &spec,
+                        "--return-ssh-setup",
+                        &"request",
+                        Instant::now(),
+                        &|| cancelled,
+                    )?;
+                    panic!("expired or cancelled setup must not start a helper")
+                })
+                .unwrap_err();
+                assert_eq!(is_setup_refusal(&error), cancelled, "{error:#}");
+            }
+            assert_eq!(attempts.get(), if cancelled { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn control_and_lifetime_admission_keep_the_original_error() {
+        let broker = PrivateBroker::start_managed(
+            PrivateBrokerConfig {
+                directory_prefix: "syq-peer-error-",
+                socket_name: "s",
+                listener_thread: "peer-error",
+                client_thread: "peer-error-client",
+                inline_on_thread_failure: false,
+                max_connections: 2,
+                io_timeout: ADMISSION,
+            },
+            |mut stream, _| {
+                let request: AdmissionRequest = read_message(&mut stream).unwrap();
+                let reply = AdmissionReply::failure(
+                    matches!(request.action, Action::Ssh { .. }),
+                    anyhow::anyhow!("peer copy is closed"),
+                );
+                write_message(&mut stream, &reply).unwrap();
+            },
+        )
+        .unwrap();
+        let ticket = Ticket {
+            version: VERSION,
+            identity: crate::identity::build().into(),
+            socket: broker.socket_path().into(),
+            secret: "x".repeat(43),
+        };
+        for error in [
+            ticket.control().unwrap_err(),
+            ticket.lifetime().unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "peer bridge: peer copy is closed");
+        }
+    }
+
+    #[test]
+    fn peer_ssh_setup_does_not_repeat_configuration_errors() {
+        let setup = Mutex::new(forward::ssh::SetupMemo::default());
+        let error =
+            cached_ssh_setup(&setup, "key", || bail!("invalid SSH configuration")).unwrap_err();
+        assert!(is_setup_refusal(&error));
+        let again = cached_ssh_setup(&setup, "key", || panic!("permanent failure was retried"))
+            .unwrap_err();
+        assert_eq!(again.to_string(), error.to_string());
     }
 
     #[test]
@@ -899,6 +993,7 @@ mod tests {
                     socket_name: "s",
                     listener_thread: "peer-life-test",
                     client_thread: "peer-life-client",
+                    inline_on_thread_failure: false,
                     max_connections: 1,
                     io_timeout: ADMISSION,
                 },

@@ -10,6 +10,8 @@ thread_local! {
     /// Refuses the clones this thread asks for, as a filesystem that
     /// cannot clone would.
     pub(super) static REFUSE_CLONES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The bytes this thread's last seed copied or cloned.
+    pub(super) static SEEDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(target_os = "linux")]
@@ -32,6 +34,8 @@ pub(super) fn seed(
     prepare_copy: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let len = len.min(input.metadata()?.len());
+    #[cfg(all(test, target_os = "linux"))]
+    SEEDED.set(len);
     if len == 0 {
         return Ok(());
     }

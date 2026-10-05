@@ -2114,6 +2114,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         args.connections
     };
+    let local_descriptors = autotune
+        .then(crate::resources::Descriptors::current)
+        .flatten();
     // Descriptor preflight is an estimate, not a reservation. For automatic
     // copies check the source roots and control session, not every worker the
     // tuner might someday try. Fixed counts retain their up-front estimate.
@@ -2141,25 +2144,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let candidates = small_copy_candidate.then(|| srcs.to_vec());
         let source_progress = progress.clone();
         // Local metadata is usually ready before the SSH handshake completes.
-        let t = std::thread::spawn(move || -> Result<_> {
-            if let Some(source) = prepared_source {
-                return source
-                    .control
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .context("prepared source already consumed")?;
-            }
-            connect_source(
-                &a,
-                &b,
-                Some(&source_progress),
-                candidates.as_deref(),
-                source_shared_workers,
-                copy_local_claim_workers,
-                remote_source_handoff_workers,
-            )
-        });
+        let t = std::thread::Builder::new()
+            .spawn(move || -> Result<_> {
+                if let Some(source) = prepared_source {
+                    return source
+                        .control
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .context("prepared source already consumed")?;
+                }
+                connect_source(
+                    &a,
+                    &b,
+                    Some(&source_progress),
+                    candidates.as_deref(),
+                    source_shared_workers,
+                    copy_local_claim_workers,
+                    remote_source_handoff_workers,
+                )
+            })
+            .map_err(crate::resources::allocation_error)
+            .context("start source connection setup thread")?;
         // The small-copy offer configures hashing and selects entries in the
         // same turn. General copies keep the usual control initialization.
         let destination_setup = progress.clock.setup.begin();
@@ -2247,7 +2253,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         Endpoint::Local { .. } => crate::identity::supports_confined_socket_nodes(),
     };
-    // Admission is complete before worker closures receive shared options.
     let opts = Arc::new(opts);
     let sched = Arc::new(Sched::new(block, opts.tuning.split_min_size(block)));
 
@@ -2322,7 +2327,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 transport_stats.clone(),
                 connect_after_file_plan.clone(),
             );
-            let h = std::thread::spawn(move || -> Result<()> {
+            if !gate.connection_needed(id) {
+                gate.mark_absent(id);
+                return;
+            }
+            let admission = gate.clone();
+            let failed_schedule = sched.clone();
+            let failed_progress = progress.clone();
+            let quiet = opts.quiet;
+            #[cfg(debug_assertions)]
+            let refused = std::env::var("SYQ_TEST_WORKER_THREAD_LIMIT")
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| id >= n);
+            #[cfg(not(debug_assertions))]
+            let refused = false;
+            let work = move || -> Result<()> {
                 if connect_after_file_plan.load(Relaxed) && !sched.wait_for_anticipated_file_work()
                 {
                     gate.mark_absent(id);
@@ -2425,7 +2445,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                         Err(error)
                             if crate::conn::is_tcp_congestion_error(&error)
-                                || crate::conn::is_worker_initialization_error(&error) =>
+                                || (crate::conn::is_worker_initialization_error(&error)
+                                    && (!autotune || !crate::resources::exhausted(&error))) =>
                         {
                             gate.mark_failed(id);
                             if !gate.allowed(id) && debug() {
@@ -2437,6 +2458,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                         Err(error) => {
                             failures += 1;
+                            if autotune && crate::resources::exhausted(&error) {
+                                let limit = (gate.active() / 2).max(1);
+                                if gate.limit_resources(limit) && !opts.quiet {
+                                    progress.eprintln(&format!("syq: worker setup exhausted resources; continuing with at most {limit} workers ({error:#})"));
+                                }
+                                if !gate.connection_needed(id) {
+                                    gate.mark_absent(id);
+                                    return Ok(());
+                                }
+                            }
                             if failures >= CONNECTION_RECOVERY_ATTEMPTS {
                                 gate.mark_failed(id);
                                 if !gate.allowed(id) && debug() {
@@ -2541,19 +2572,39 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         }
                     }
                 }
-            });
-            workers.lock().unwrap().push(h);
+            };
+            let spawned = if refused {
+                Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+            } else {
+                std::thread::Builder::new().spawn(work)
+            };
+            match spawned {
+                Ok(thread) => workers.lock().unwrap().push(thread),
+                Err(error) if autotune && id > 0 => {
+                    admission.mark_absent(id);
+                    let limit = (id / 2).max(1);
+                    if admission.limit_resources(limit) && !quiet {
+                        failed_progress.eprintln(&format!("syq: cannot start another worker; continuing with at most {limit} workers ({error})"));
+                    }
+                }
+                Err(error) => {
+                    admission.mark_failed(id);
+                    failed_schedule.abort();
+                    failed_progress.error(&format!("syq: cannot start copy worker: {error}"));
+                }
+            }
         })
     };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
     let spawn_workers = |initial: usize, refine_start: Option<usize>| {
+        gate.set_active(initial);
+        let initial = gate.active();
         if let Some(history) = progress.tuning_history.get() {
             history.event(
                 "workers_start",
                 serde_json::json!({"workers":initial,"active":initial,"automatic":autotune}),
             );
         }
-        gate.set_active(initial);
         for id in gate.begin_warming(initial) {
             spawn_worker(id);
         }
@@ -2564,15 +2615,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.clone(),
                 spawn_worker.clone(),
             );
-            let n0 = initial;
+            let n0 = gate.active();
+            let maximum_workers = maximum_workers.min(gate.resource_limit());
             let policy = if refine_start == Some(n0) {
                 tune::Policy::refine(n0, tune::MIN, maximum_workers)
             } else {
                 tune::Policy::new(n0, tune::MIN, maximum_workers)
             };
-            *tuner.lock().unwrap() = Some(std::thread::spawn(move || {
-                tune::run(policy, gate, sched, progress, |id| spawn_worker(id))
-            }));
+            *tuner.lock().unwrap() = std::thread::Builder::new()
+                .spawn(move || tune::run(policy, gate, sched, progress, |id| spawn_worker(id)))
+                .inspect_err(|error| {
+                    if debug() {
+                        crate::output::diagnostic!(
+                            "syq: cannot start tuner; continuing at the starting worker count ({error})"
+                        );
+                    }
+                })
+                .ok();
         }
     };
     let (registered_sources, small_entries) = match early_sources {
@@ -3402,9 +3461,48 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .as_ref()
                         .is_some_and(|info| !info.failed),
                 });
-        if autotune && all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
-            args.connections = tune::START_TCP.min(args.automatic_worker_limit());
-            gate.set_active(args.connections);
+        if autotune {
+            let mut capacity = local_descriptors
+                .map(|budget| budget.workers(if src_ep.is_remote() { 0 } else { srcs.len() }))
+                .unwrap_or(usize::MAX);
+            let receiver_roots = if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
+                srcs.len()
+            } else {
+                0
+            };
+            for (endpoint, roots) in [(&src_ep, srcs.len()), (&dst_ep, receiver_roots)] {
+                if let Endpoint::Remote(spec) = endpoint {
+                    // TCP workers share the control helper's process. SSH
+                    // workers each have their own process and descriptor limit.
+                    let shared = spec
+                        .tcp
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|info| !info.failed);
+                    if shared {
+                        if let Some(budget) =
+                            spec.diagnostics().peer.and_then(|peer| peer.descriptors)
+                        {
+                            capacity = capacity.min(budget.workers(roots));
+                        }
+                    }
+                }
+            }
+            if capacity < maximum_workers {
+                let progress = progress.clone();
+                let quiet = opts.quiet;
+                gate.limit_descriptors(capacity, move || {
+                    if !quiet {
+                        progress.eprintln(&format!(
+                            "syq: open-file limits restrict this copy to {capacity} workers; increasing the endpoint limits may improve performance"
+                        ));
+                    }
+                });
+            }
+            if all_remote_endpoints_use_tcp && (src_ep.is_remote() || dst_ep.is_remote()) {
+                args.connections = tune::START_TCP.min(maximum_workers);
+            }
         }
         let transport_activity = transport_budget.is_some();
         progress.tuning_transport.store(transport_activity, Relaxed);
@@ -3439,9 +3537,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .then(|| history.starting_count(&key, src_ep.is_remote() || dst_ep.is_remote()))
                 .flatten();
             if let Some(hint) = &hint {
-                args.connections = hint.workers.min(args.automatic_worker_limit());
-                gate.set_active(args.connections);
+                args.connections = hint.workers.min(maximum_workers);
             }
+            gate.set_active(args.connections);
+            args.connections = gate.active();
             history.event("starting_count", serde_json::json!({"workers":args.connections,
                 "reason":if hint.is_some() {"history"} else if autotune {"default"} else {"explicit"},
                 "hint":hint}));
@@ -3457,6 +3556,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 }
             }
         }
+        gate.set_active(args.connections);
+        args.connections = gate.active();
         print_transport_diagnostics(args, &src_ep, &dst_ep);
         if args.verbose >= 2 {
             if let Some(hint) = &selected_history {

@@ -12,6 +12,87 @@ pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
 
+// Filesystem servers may have a much lower limit than this process, and FUSE
+// may translate their exhaustion to EPERM. Learn only for this process. A
+// failed create gets one retry after the staged files have been closed; all
+// checks and atomic publication still run on that retry.
+const REDUCED: usize = 1 << (usize::BITS - 1);
+struct StagingAdmission {
+    // The high bit stops new bursts; the other bits count admitted bursts.
+    state: AtomicUsize,
+    wait: Mutex<()>,
+    drained: std::sync::Condvar,
+}
+impl StagingAdmission {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            wait: Mutex::new(()),
+            drained: std::sync::Condvar::new(),
+        }
+    }
+    fn width(&self) -> usize {
+        if self.state.load(Ordering::Relaxed) & REDUCED == 0 {
+            BURST
+        } else {
+            1
+        }
+    }
+    fn enter(&self) -> Option<StagingBurst<'_>> {
+        // The healthy path does not take a process-wide mutex. Admission and
+        // reduction use one atomic so no new burst can slip past a reduction.
+        let mut state = self.state.load(Ordering::Relaxed);
+        while state & REDUCED == 0 {
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(StagingBurst(self)),
+                Err(current) => state = current,
+            }
+        }
+        let mut wait = self.wait.lock().unwrap();
+        while self.state.load(Ordering::Acquire) != REDUCED {
+            wait = self.drained.wait(wait).unwrap();
+        }
+        None
+    }
+    fn reduce(&self) {
+        let before = self.state.fetch_or(REDUCED, Ordering::AcqRel);
+        if before & REDUCED == 0 && crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq: reducing small-file staging after descriptor pressure"
+            );
+        }
+    }
+}
+static STAGING_ADMISSION: StagingAdmission = StagingAdmission::new();
+struct StagingBurst<'a>(&'a StagingAdmission);
+impl Drop for StagingBurst<'_> {
+    fn drop(&mut self) {
+        if self.0.state.fetch_sub(1, Ordering::AcqRel) == REDUCED + 1 {
+            // Pair with the waiter's condition check to avoid a missed wake.
+            let _wait = self.0.wait.lock().unwrap();
+            self.0.drained.notify_all();
+        }
+    }
+}
+
+fn retry_stage_open(error: &anyhow::Error, network: impl FnOnce() -> bool) -> bool {
+    let errno = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error);
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE) => true,
+        // SSHFS can translate the server's EMFILE to EPERM. Inspect only on
+        // failure: local permission errors should not shrink future batches.
+        Some(libc::EPERM) => network(),
+        _ => false,
+    }
+}
 /// Threads a run writes and closes its files on, on a network filesystem.
 /// Creating and renaming stay one at a time per directory, so a few threads
 /// keep the rest shorter than the creates.
@@ -668,17 +749,30 @@ impl FsOps {
     /// cloned where the filesystem can, or else copied with
     /// copy_file_range, keeping the file's holes. A stage taking a copy of
     /// a dense file is allocated first, as a partial seeded from one is.
+    /// Only what the new file can reuse is copied: the old file up to the new
+    /// length, rounded up to 64 KiB, which keeps a clone aligned whatever the
+    /// comparison block is.
     /// False when the file could not be copied so.
     fn copy_basis(&self, source: &PatchSource<'_>, stage: &SmallStage) -> bool {
         #[cfg(target_os = "linux")]
         {
-            super::basis_copy::seed(&source.old, &stage.file, source.basis.len, || {
-                let old = source.old.metadata()?;
-                if old.blocks().saturating_mul(512) >= old.len() {
-                    self.preallocate_stage(stage, source.patch.len)?;
-                }
-                Ok(())
-            })
+            let reusable = source
+                .patch
+                .len
+                .div_ceil(MIN_HASH_BLOCK_BYTES)
+                .saturating_mul(MIN_HASH_BLOCK_BYTES);
+            super::basis_copy::seed(
+                &source.old,
+                &stage.file,
+                source.basis.len.min(reusable),
+                || {
+                    let old = source.old.metadata()?;
+                    if old.blocks().saturating_mul(512) >= old.len() {
+                        self.preallocate_stage(stage, source.patch.len)?;
+                    }
+                    Ok(())
+                },
+            )
             .is_ok()
         }
         #[cfg(not(target_os = "linux"))]
@@ -726,7 +820,7 @@ impl FsOps {
                 next += 1;
                 continue;
             }
-            let reserved = ReservedDescriptors::up_to(BURST - 1);
+            let reserved = ReservedDescriptors::up_to(STAGING_ADMISSION.width() - 1);
             let mut run: Vec<(usize, RootedTarget)> = Vec::with_capacity(1 + reserved.0);
             // A run stays in one directory and names each target once: a
             // repeated target would share its sidecar with the earlier one.
@@ -766,7 +860,7 @@ impl FsOps {
                 }
                 run.push((index, target));
             }
-            self.put_small_run(puts, sources, run, &mut results);
+            self.put_small_run(puts, sources, built, run, &mut results);
         }
         results
     }
@@ -783,22 +877,67 @@ impl FsOps {
         &mut self,
         puts: &[SmallPut],
         sources: &[Option<PatchSource<'_>>],
+        built: bool,
         run: Vec<(usize, RootedTarget)>,
         results: &mut [SmallOutcome],
     ) {
         let Some((_, first)) = run.first() else {
             return;
         };
+        let Some(burst) = STAGING_ADMISSION.enter() else {
+            for (index, _) in run {
+                results[index] = self
+                    .put_small_with_source(
+                        &puts[index],
+                        sources.get(index).and_then(Option::as_ref),
+                        built,
+                    )
+                    .map_err(|error| wire_error(&error));
+            }
+            return;
+        };
         let (root, directory) = (first.root.clone(), first.relative.clone());
         let source = |index: usize| sources.get(index).and_then(Option::as_ref);
         let mut stages = Vec::with_capacity(run.len());
+        let mut retry = Vec::new();
         {
             // A turn only schedules. If it cannot be taken, the operations
             // themselves report what is wrong with the path.
             let _turn = root.mutation_turn(&directory).ok();
-            for (index, target) in run {
-                match self.create_stage(&puts[index], source(index), target) {
+            let mut remaining = run.into_iter();
+            while let Some((index, target)) = remaining.next() {
+                #[cfg(debug_assertions)]
+                let refuse = std::env::var("SYQ_TEST_STAGING_LIMIT")
+                    .ok()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|limit| stages.len() >= limit);
+                #[cfg(not(debug_assertions))]
+                let refuse = false;
+                let created = if refuse {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
+                } else {
+                    self.create_stage(&puts[index], source(index), target)
+                };
+                match created {
                     Ok(stage) => stages.push((index, stage)),
+                    Err(error)
+                        if retry_stage_open(&error, || {
+                            if let Some((_, stage)) = stages.first() {
+                                on_network_file_system(&stage.file, stage.created.dev())
+                            } else {
+                                root.resolve_parent(&directory).ok().is_some_and(|parent| {
+                                    parent.directory().metadata().ok().is_some_and(|meta| {
+                                        on_network_file_system(parent.directory(), meta.dev())
+                                    })
+                                })
+                            }
+                        }) =>
+                    {
+                        STAGING_ADMISSION.reduce();
+                        retry.push(index);
+                        retry.extend(remaining.map(|(index, _)| index));
+                        break;
+                    }
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
@@ -874,6 +1013,45 @@ impl FsOps {
         for (index, result) in finished {
             results[index] = result;
         }
+        drop(burst);
+        if !retry.is_empty() {
+            // Other workers must publish and close their existing bursts too.
+            // They never wait while holding a burst or directory turn.
+            drop(STAGING_ADMISSION.enter());
+        }
+        for index in retry {
+            results[index] = self
+                .put_small_with_source(
+                    &puts[index],
+                    sources.get(index).and_then(Option::as_ref),
+                    built,
+                )
+                .map_err(|error| wire_error(&error));
+        }
+    }
+
+    // A patch can carry its contents in an open basis rather than put.data.
+    // The one-file fallback must keep that basis and its validation intact.
+    // A put `built` from a patch, whose data was checked as it arrived, has
+    // no payload hash to check, whether or not it keeps a basis.
+    fn put_small_with_source(
+        &mut self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+        built: bool,
+    ) -> Result<Option<(u64, u64)>> {
+        if source.is_none() && !built {
+            return self.put_small(put);
+        }
+        let target = if built {
+            self.destination_mutation_target(&put.path, put.guard.as_ref())?
+        } else {
+            self.small_target(put)?
+        };
+        let stage = self.create_stage(put, source, target)?;
+        self.write_small_stage(put, source, &stage, None)?;
+        self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage)
     }
 
     /// Create the stage of a put, or of a patch with the file it reuses
@@ -1068,6 +1246,49 @@ impl FsOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_reduction_drains_admitted_bursts_before_retry() {
+        let admission = StagingAdmission::new();
+        let first = admission.enter().unwrap();
+        let second = admission.enter().unwrap();
+        assert_eq!(admission.width(), BURST);
+        admission.reduce();
+        assert_eq!(admission.width(), 1);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let admission = &admission;
+            let waiter = scope.spawn(move || {
+                assert!(admission.enter().is_none());
+                tx.send(()).unwrap();
+            });
+            drop(first);
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            drop(second);
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            waiter.join().unwrap();
+        });
+        assert!(admission.enter().is_none());
+    }
+
+    #[test]
+    fn staging_permission_recovery_requires_network_filesystem() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let error = io::Error::from_raw_os_error(errno).into();
+            assert!(retry_stage_open(&error, || panic!(
+                "no filesystem query needed"
+            )));
+        }
+        let permission = io::Error::from_raw_os_error(libc::EPERM).into();
+        assert!(!retry_stage_open(&permission, || false));
+        assert!(retry_stage_open(&permission, || true));
+        let denied = io::Error::from_raw_os_error(libc::EACCES).into();
+        assert!(!retry_stage_open(&denied, || panic!(
+            "no filesystem query needed"
+        )));
+    }
 
     fn put(path: &str, data: &[u8]) -> SmallPut {
         SmallPut {
@@ -1337,8 +1558,8 @@ mod tests {
             ];
             assert_eq!(patches[0].data.len() as u64, 2 * block + 4);
             // A reused block of "raced" changes after it was hashed. A clone
-            // keeps reused blocks unread, so only the change time shows the
-            // change: wait until the write gives a new one.
+            // or kernel copy keeps reused blocks unread, so only the change
+            // time shows the change: wait until the write gives a new one.
             std::thread::sleep(std::time::Duration::from_millis(50));
             let mut raced = old.clone();
             raced[0] ^= 1;
@@ -1358,6 +1579,147 @@ mod tests {
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced, "{case}");
             assert_eq!(entries(directory), 2, "{case}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shorter_file_copies_only_the_blocks_it_can_reuse() {
+        // A patch for a file shorter than the one it replaces, as with an
+        // explicit block-reuse strategy, copies or clones the old file only
+        // up to the new length, rounded up to a whole block.
+        let block = MIN_HASH_BLOCK_BYTES;
+        for cloning in [true, false] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let old: Vec<u8> = (0..64 * block).map(|i| (i % 251) as u8 | 1).collect();
+            fs::write(directory.join("file"), &old).unwrap();
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops.hash_existing_batch(
+                block,
+                &[ExistingRead {
+                    path: b"file".to_vec(),
+                    len: 64 * block,
+                    condition: TargetCondition::Any,
+                    guard: None,
+                }],
+            );
+            // Enough reused blocks to copy rather than assemble the file.
+            let mut new = old[..20 * block as usize].to_vec();
+            new.extend_from_slice(b"tail");
+            let patch = patch_from("file", &new, block, hashed[0].as_ref().unwrap(), algorithm);
+            assert_eq!(patch.data, b"tail");
+            super::super::basis_copy::SEEDED.set(0);
+            let results = refusing_clones(!cloning, || ops.patch_small_batch(&[patch])).unwrap();
+            assert!(results[0].is_ok(), "cloning {cloning}: {:?}", results[0]);
+            assert_eq!(
+                fs::read(directory.join("file")).unwrap(),
+                new,
+                "cloning {cloning}"
+            );
+            assert_eq!(
+                super::super::basis_copy::SEEDED.get(),
+                21 * block,
+                "cloning {cloning}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_patch_publishes_requested_metadata_without_old_xattrs() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        if !clones_files(directory) {
+            return;
+        }
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old = vec![1; 32 * block as usize];
+        let path = directory.join("file");
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let original = File::open(&path).unwrap();
+        let attribute = c"syq.test.old-metadata";
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    original.as_raw_fd(),
+                    attribute.as_ptr(),
+                    b"old".as_ptr().cast(),
+                    3,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        let mut ops = receiver(directory);
+        let hashed = ops.hash_existing_batch(
+            block,
+            &[ExistingRead {
+                path: b"file".to_vec(),
+                len: old.len() as u64,
+                condition: TargetCondition::Any,
+                guard: None,
+            }],
+        );
+        let hashed = hashed[0].as_ref().unwrap();
+        let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
+        reuse[5] = None;
+        let data = vec![2; block as usize];
+        let patch = SmallPatch {
+            path: b"file".to_vec(),
+            copy_id: [5; 16],
+            len: old.len() as u64,
+            block,
+            reuse,
+            hash: content_digest(&data),
+            data,
+            basis: hashed.fingerprint,
+            meta: Meta {
+                // Match the old mode: using its metadata instead of the
+                // private clone's would incorrectly skip restoring this.
+                mode: 0o644,
+                mtime: 1_234_567_890,
+                mtime_nsec: 123_456_789,
+                ..put("file", b"").meta
+            },
+            flags: flags::MODE | flags::TIMES,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        CLONED_PATCHES.set(0);
+        let results = ops.patch_small_batch(&[patch]).unwrap();
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(CLONED_PATCHES.get(), 1);
+        let published = File::open(&path).unwrap();
+        let metadata = published.metadata().unwrap();
+        assert_ne!(metadata.ino(), original.metadata().unwrap().ino());
+        assert_eq!(metadata.mode() & 0o7777, 0o644);
+        assert_eq!(metadata.mtime(), 1_234_567_890);
+        assert_eq!(metadata.mtime_nsec(), 123_456_789);
+        assert_eq!(
+            unsafe {
+                libc::fgetxattr(
+                    published.as_raw_fd(),
+                    attribute.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOATTR)
+        );
+        let mut expected = old;
+        expected[5 * block as usize..6 * block as usize].fill(2);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(entries(directory), 1);
     }
 
     #[cfg(target_os = "linux")]

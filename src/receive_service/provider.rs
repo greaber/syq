@@ -13,6 +13,7 @@ pub(crate) const LOCK_FILE: &str = "provider-v1.lock";
 const INTERNAL: &str = "--receive-provider-service";
 const PROTOCOL: u16 = 1;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const FORWARDED_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CLIENTS: usize = 256;
 
@@ -125,15 +126,46 @@ fn attach_in(domain: &Domain, profile: Option<&str>) -> Result<Attachment> {
     })
 }
 
+/// Verify forwarding reaches this exact provider service without opening an
+/// attachment, resolving policy, or requesting account approval.
+pub(crate) fn probe_forwarded(
+    stream: UnixStream,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let stream = forwarded_handshake(stream, deadline, Some(cancelled))?;
+    // Hello already succeeded. A peer closing first must not turn that into
+    // failure (macOS reports ENOTCONN when shutting down a closed socket).
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn forwarded_handshake(
+    mut stream: UnixStream,
+    deadline: Instant,
+    cancelled: Option<&dyn Fn() -> bool>,
+) -> Result<UnixStream> {
+    // This channel crosses SSH, unlike the local service socket. Use an
+    // absolute network deadline and retain timeouts for the next Access write.
+    stream.set_read_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+    stream.set_write_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+    exchange_hello(&mut crate::destination::DeadlineIo {
+        inner: &mut stream,
+        deadline: deadline.min(Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT),
+        cancelled,
+    }, false).context(
+        "could not open the SSH authorization provider service; check that receiving is running there and sshd permits local forwarding with AllowTcpForwarding and AllowStreamLocalForwarding set to local or yes",
+    )?;
+    Ok(stream)
+}
+
 /// Use the same exact-build protocol over an already connected SSH Unix forward.
 pub(crate) fn open_forwarded(
     stream: UnixStream,
     session: &str,
     operation: SessionRequest,
 ) -> Result<UnixStream> {
-    let stream = handshake(stream, false).context(
-        "could not open the SSH authorization provider service; check that receiving is running there and sshd permits local forwarding with AllowTcpForwarding and AllowStreamLocalForwarding set to local or yes",
-    )?;
+    let stream = forwarded_handshake(stream, Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT, None)?;
     send_operation(stream, session, operation)
 }
 fn send_operation(
@@ -176,15 +208,19 @@ fn connect(domain: &Domain, control: bool) -> Result<UnixStream> {
 fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    exchange_hello(&mut stream, control)?;
+    Ok(stream)
+}
+fn exchange_hello(stream: &mut (impl Read + Write), control: bool) -> Result<()> {
     crate::destination::write_message(
-        &mut stream,
+        stream,
         &Hello {
             version: PROTOCOL,
             build: crate::identity::build().into(),
             control,
         },
     )?;
-    let reply: HelloReply = crate::destination::read_message(&mut stream)?;
+    let reply: HelloReply = crate::destination::read_message(stream)?;
     anyhow::ensure!(
         reply.version == PROTOCOL,
         "unsupported local provider protocol; restart receiving with its original syq build"
@@ -195,7 +231,7 @@ fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
         reply.build,
         crate::identity::build()
     );
-    Ok(stream)
+    Ok(())
 }
 fn query(domain: &Domain, operation: Control) -> Result<Snapshot> {
     let mut stream = connect(domain, true)?;
@@ -379,11 +415,19 @@ impl Service {
     }
     fn handle(&self, mut stream: TrackedStream) -> Result<()> {
         let socket = stream.try_clone()?;
-        socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        let hello: Hello = crate::destination::read_message(&mut stream)?;
+        // Before Hello, local clients and SSH-forwarded clients share this
+        // socket. Allow network latency for Hello and the following Access;
+        // keep the shorter budget for requests identified as local control.
+        socket.set_read_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+        socket.set_write_timeout(Some(FORWARDED_HANDSHAKE_TIMEOUT))?;
+        let mut handshake = crate::destination::DeadlineIo {
+            inner: &mut stream,
+            deadline: Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT,
+            cancelled: None,
+        };
+        let hello: Hello = crate::destination::read_message(&mut handshake)?;
         crate::destination::write_message(
-            &mut stream,
+            &mut handshake,
             &HelloReply {
                 version: PROTOCOL,
                 build: crate::identity::build().into(),
@@ -394,6 +438,8 @@ impl Service {
             "unsupported local provider protocol"
         );
         if hello.control {
+            socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+            socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
             let request: Control = crate::destination::read_message(&mut stream)?;
             let decision_error = match request {
                 Control::Status => None,
@@ -447,7 +493,12 @@ impl Service {
             hello.build == crate::identity::build(),
             "local provider build changed"
         );
-        let request: Access = crate::destination::read_message(&mut stream)?;
+        let request: Access =
+            crate::destination::read_message(&mut crate::destination::DeadlineIo {
+                inner: &mut stream,
+                deadline: Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT,
+                cancelled: None,
+            })?;
         socket.set_read_timeout(Some(IO_TIMEOUT))?;
         socket.set_write_timeout(Some(IO_TIMEOUT))?;
         match request {
@@ -936,8 +987,7 @@ mod tests {
     use super::*;
 
     fn fixture() -> (tempfile::TempDir, Domain, Preferences) {
-        let root = fs::canonicalize("/tmp").unwrap();
-        let directory = tempfile::tempdir_in(root).unwrap();
+        let directory = crate::test_support::short_tempdir().unwrap();
         let path = directory.path().join("domain");
         crate::persistence::initialize_scope(&path).unwrap();
         let domain = Domain::select(Some(&path)).unwrap();
@@ -989,6 +1039,116 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_readiness_only_exchanges_hello_without_creating_authority() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain).unwrap());
+        let (client, server) = pair(&service);
+        let serving = service.clone();
+        let worker = std::thread::spawn(move || serving.handle(server));
+        probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false).unwrap();
+        // The deliberate EOF occurs where an Access operation would start.
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)));
+        let state = service.snapshot(None);
+        assert!(state
+            .profiles
+            .iter()
+            .all(|profile| profile.sessions == 0 && profile.pending.is_empty()));
+        service.close();
+    }
+
+    #[test]
+    fn forwarded_readiness_rejects_a_denied_or_unresponsive_channel() {
+        let (client, server) = UnixStream::pair().unwrap();
+        server.shutdown(std::net::Shutdown::Both).unwrap();
+        let error = probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("sshd permits local forwarding"));
+
+        let (client, _silent_server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error = probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap_err();
+        assert!(error.to_string().contains("provider service"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn forwarded_readiness_allows_ssh_latency_and_obeys_cancellation() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let responder = std::thread::spawn(move || {
+            let _: Hello = crate::destination::read_message(&mut server).unwrap();
+            // Longer than the local-only service timeout.
+            std::thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100));
+            crate::destination::write_message(
+                &mut server,
+                &HelloReply {
+                    version: PROTOCOL,
+                    build: crate::identity::build().into(),
+                },
+            )
+            .unwrap();
+        });
+        probe_forwarded(
+            client,
+            Instant::now() + FORWARDED_HANDSHAKE_TIMEOUT,
+            &|| false,
+        )
+        .unwrap();
+        responder.join().unwrap();
+
+        let (client, _server) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error =
+            probe_forwarded(client, started + FORWARDED_HANDSHAKE_TIMEOUT, &|| true).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionAborted)));
+    }
+
+    #[test]
+    fn service_allows_forwarding_latency_before_hello_and_access() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain).unwrap());
+        let (mut client, server) = pair(&service);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || service.handle(server));
+        let mut hello = Vec::new();
+        crate::destination::write_message(
+            &mut hello,
+            &Hello {
+                version: PROTOCOL,
+                build: crate::identity::build().into(),
+                control: false,
+            },
+        )
+        .unwrap();
+        // A partial Hello and a request following the Hello response can
+        // each arrive more than the local two-second budget apart over SSH.
+        client.write_all(&hello[..2]).unwrap();
+        std::thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100));
+        client.write_all(&hello[2..]).unwrap();
+        let _: HelloReply = crate::destination::read_message(&mut client).unwrap();
+        std::thread::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100));
+        crate::destination::write_message(
+            &mut client,
+            &Access::Attach {
+                profile: Some("missing".into()),
+            },
+        )
+        .unwrap();
+        let reply: std::result::Result<Ticket, String> =
+            crate::destination::read_message(&mut client).unwrap();
+        assert!(reply.unwrap_err().contains("missing"));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn provider_build_mismatch_names_both_builds_and_matching_restart() {
         let (client, mut server) = UnixStream::pair().unwrap();
         let reply = std::thread::spawn(move || {
@@ -1005,9 +1165,10 @@ mod tests {
             )
             .unwrap();
         });
-        let error = handshake(client, false).unwrap_err();
+        let error = probe_forwarded(client, Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap_err();
         reply.join().unwrap();
-        let error = error.to_string();
+        let error = format!("{error:#}");
         assert!(error.contains("provider-other-build"));
         assert!(error.contains(crate::identity::build()));
         assert!(error.contains("install the same syq build on the requester and provider"));

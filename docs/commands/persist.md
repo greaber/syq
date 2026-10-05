@@ -14,7 +14,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist auth-from`](#syq-persist-auth-from) | Choose default authorization for server copies and SSH sessions |
 | [`persist ssh-config`](#syq-persist-ssh-config) | Export native OpenSSH configuration for one already approved account connection |
 | [`persist receive`](#syq-persist-receive) | Configure receiving and decide incoming copy or command requests |
-| [`persist destinations`](#syq-persist-destinations) | Inspect or recover named return destinations |
+| [`persist destinations`](#syq-persist-destinations) | Inspect shared receiving names; --pscope does not filter them |
 | [`persist connect`](#syq-persist-connect) | Connect with native SSH or request approved account access |
 | [`persist on`](#syq-persist-on) | Enable persistent connections for later syq commands |
 | [`persist off`](#syq-persist-off) | Disable persistence and close its live SSH control connections |
@@ -138,7 +138,10 @@ syq persist receive pending [OPTIONS]
 
 ## syq persist receive approve
 
-`ID` is a pending request ID from `persist receive pending` on this machine. Approval applies to that request only.
+`ID` is a pending request ID from `persist receive pending` on this machine.
+Copy and command approvals apply once. SSH account requests grant
+[session access](../persistence-reference.md#account-permissions); add `--remember`
+to permit future account authentications too.
 
 <!-- CLI: persist receive approve -->
 ```text
@@ -208,8 +211,9 @@ syq persist receive permissions [OPTIONS] <COMMAND>
 
 ## syq persist receive permissions list
 
-Show remembered source-account and destination-account pairs. Use `--json` for
-structured output, including each permission's ID.
+Show remembered return-channel and ordinary-provider account permissions,
+including each destination's trusted name and connection route. Use `--json`
+for [structured permission records](../automation.md#remembered-account-permissions).
 
 <!-- CLI: persist receive permissions list -->
 ```text
@@ -371,6 +375,10 @@ syq persist receive wait [OPTIONS] <HOST>
 <!-- /CLI -->
 
 ## syq persist destinations
+
+Receiving names are shared by this OS account across persistence domains.
+`--pscope` does not filter this registry; forgetting an offline name releases it
+for every domain. See [shared names](../persistence-reference.md#isolated-script-scopes).
 
 <!-- CLI: persist destinations -->
 ```text

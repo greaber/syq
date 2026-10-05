@@ -222,14 +222,13 @@ fn inspect_descriptor_children(
     }
     let chunk = names.len().div_ceil(DESCRIPTOR_STAT_THREADS).max(1);
     use rayon::prelude::*;
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(DESCRIPTOR_STAT_THREADS)
-            .thread_name(|index| format!("syq-scan-stat-{index}"))
-            .build()
-            .expect("directory stat worker pool")
-    });
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let Some(pool) = POOL
+        .get_or_init(|| crate::resources::optional_pool("syq-scan-stat", DESCRIPTOR_STAT_THREADS))
+        .as_ref()
+    else {
+        return names.iter().map(inspect).collect();
+    };
     pool.install(|| {
         names
             .par_chunks(chunk)
@@ -400,14 +399,10 @@ fn produce_descriptor_scan(
     tx: SyncSender<ScanChunk>,
 ) -> u64 {
     const DIRECTORY_WORKERS: usize = 8;
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-    let pool = POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(DIRECTORY_WORKERS)
-            .thread_name(|index| format!("syq-scan-directory-{index}"))
-            .build()
-            .expect("directory scan worker pool")
-    });
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let pool = POOL
+        .get_or_init(|| crate::resources::optional_pool("syq-scan-directory", DIRECTORY_WORKERS))
+        .as_ref();
     let scan = DescriptorScan {
         root: &root,
         scan_root: &scan_root,
@@ -427,7 +422,7 @@ fn produce_descriptor_scan(
         // Return every productive round before sending to the consumer: a
         // backpressured scan must never occupy one of the shared pool threads.
         use rayon::prelude::*;
-        let steps = pool.install(|| {
+        let mut step_rounds = || {
             let started = Instant::now();
             for round in 0..8 {
                 let count = DIRECTORY_WORKERS.min(directories.len());
@@ -435,17 +430,18 @@ fn produce_descriptor_scan(
                 retained_directories -= work.iter().filter(|d| d.opened.is_some()).count();
                 let available =
                     DESCRIPTOR_DIRECTORY_FDS.saturating_sub(retained_directories + count);
-                let steps: Vec<_> = work
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(index, directory)| {
-                        let label = directory.relative.clone();
-                        let retain = available / count + usize::from(index < available % count);
-                        scan.step(directory, retain, count == 1).map_err(|error| {
-                            format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
-                        })
+                let inspect = |(index, directory): (usize, DescriptorDirectory)| {
+                    let label = directory.relative.clone();
+                    let retain = available / count + usize::from(index < available % count);
+                    scan.step(directory, retain, count == 1).map_err(|error| {
+                        format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
                     })
-                    .collect();
+                };
+                let steps: Vec<_> = if pool.is_some() {
+                    work.into_par_iter().enumerate().map(inspect).collect()
+                } else {
+                    work.into_iter().enumerate().map(inspect).collect()
+                };
                 ignored_count += steps
                     .iter()
                     .filter_map(|step| step.as_ref().ok())
@@ -468,7 +464,11 @@ fn produce_descriptor_scan(
                 }
             }
             unreachable!("bounded empty-directory rounds always return")
-        });
+        };
+        let steps = match pool {
+            Some(pool) => pool.install(step_rounds),
+            None => step_rounds(),
+        };
         let mut children = Vec::new();
         let mut remainders = Vec::new();
         for step in steps {

@@ -176,7 +176,12 @@ fn index_path(domain: &Domain, authorizer: &str, destination: &NativeEndpoint) -
         .join(format!("{}.json", blake3::hash(&identity).to_hex())))
 }
 fn read_record(path: &Path) -> Result<Option<Record>> {
-    read_record_inner(path).with_context(|| format!("read SSH account record {}", path.display()))
+    read_record_inner(path).with_context(|| {
+        format!(
+            "read SSH account record {}; repair this file, or move it out of this directory and reconnect; removing a record does not close its SSH connection",
+            path.display(),
+        )
+    })
 }
 fn read_record_inner(path: &Path) -> Result<Option<Record>> {
     let file = match OpenOptions::new()

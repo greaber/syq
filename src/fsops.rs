@@ -2934,9 +2934,11 @@ fn list_nfs_directories_before_stats(
     };
     let settled: Vec<bool> = if candidates.len() < 2 {
         candidates.iter().map(list).collect()
-    } else {
+    } else if let Some(pool) = metadata_pool() {
         use rayon::prelude::*;
-        metadata_pool().install(|| candidates.par_iter().map(list).collect())
+        pool.install(|| candidates.par_iter().map(list).collect())
+    } else {
+        candidates.iter().map(list).collect()
     };
     for ((parent, _, _), settled) in candidates.iter().zip(settled) {
         if settled {
@@ -2985,15 +2987,10 @@ fn stat_with_parent(
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
 
-fn metadata_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(PAR_THREADS)
-            .thread_name(|index| format!("syq-metadata-{index}"))
-            .build()
-            .expect("metadata worker pool")
-    })
+fn metadata_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| crate::resources::optional_pool("syq-metadata", PAR_THREADS))
+        .as_ref()
 }
 
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -3014,6 +3011,9 @@ fn parallel_by_directory<R: Send>(
     if selected.len() < PAR_MIN {
         return selected.iter().map(|&index| f(&ops[index])).collect();
     }
+    let Some(pool) = metadata_pool() else {
+        return selected.iter().map(|&index| f(&ops[index])).collect();
+    };
     let mut directories = HashMap::<&[u8], Vec<usize>>::new();
     let mut removals = Vec::new();
     for (position, &index) in selected.iter().enumerate() {
@@ -3050,7 +3050,7 @@ fn parallel_by_directory<R: Send>(
         }))
         .collect();
     use rayon::prelude::*;
-    let done: Vec<Vec<(usize, R)>> = metadata_pool().install(|| {
+    let done: Vec<Vec<(usize, R)>> = pool.install(|| {
         shares
             .par_iter()
             .map(|share| {
@@ -3083,9 +3083,13 @@ fn parallel_map_init<T: Sync, R: Send, S>(
         let mut state = init();
         return items.iter().map(|item| f(&mut state, item)).collect();
     }
+    let Some(pool) = metadata_pool() else {
+        let mut state = init();
+        return items.iter().map(|item| f(&mut state, item)).collect();
+    };
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
-    metadata_pool().install(|| {
+    pool.install(|| {
         items
             .par_chunks(chunk)
             .flat_map_iter(|chunk| {

@@ -411,13 +411,14 @@ pub(super) fn broker(
             socket_name: "s",
             listener_thread: "named-test-listener",
             client_thread: "named-test-client",
+            inline_on_thread_failure: false,
             max_connections: 16,
             io_timeout: Duration::from_secs(2),
         },
         move |stream, _| {
             let mut writer = stream.try_clone().unwrap();
             if let Err(error) = handler.handle(stream) {
-                let _ = write_message(&mut writer, &Reply::Error(format!("{error:#}")));
+                let _ = ssh_auth::reply_error(&mut writer, &error);
             }
         },
     )

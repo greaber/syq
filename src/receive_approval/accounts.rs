@@ -47,7 +47,7 @@ impl AccountIdentity {
 
     pub(super) fn validate(&self) -> Result<()> {
         if let Some(host) = &self.trusted_host {
-            crate::destination::ssh::validate_host_key_alias(host)?;
+            validate_trusted_host(host)?;
         }
         crate::destination::ssh::validate_endpoint(&self.endpoint)?;
         anyhow::ensure!(
@@ -95,6 +95,38 @@ impl AccountIdentity {
             self.endpoint.port.unwrap_or(22)
         )
     }
+}
+
+/// Provider-generated known_hosts names can contain an IPv6 interface zone.
+/// This is a display/permission identity, never an SSH argument or endpoint.
+fn validate_trusted_host(host: &str) -> Result<()> {
+    if !host.contains('%') {
+        return crate::destination::ssh::validate_host_key_alias(host);
+    }
+    let invalid = || anyhow::anyhow!("invalid provider trusted IPv6 host name");
+    anyhow::ensure!(host.len() <= 512, "provider trusted host name is too long");
+    let address = if let Some(bracketed) = host.strip_prefix('[') {
+        let (address, port) = bracketed.split_once("]:").ok_or_else(invalid)?;
+        anyhow::ensure!(
+            !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != 0),
+            "invalid provider trusted IPv6 port"
+        );
+        address
+    } else {
+        host
+    };
+    let (address, zone) = address.split_once('%').ok_or_else(invalid)?;
+    anyhow::ensure!(
+        address.parse::<std::net::Ipv6Addr>().is_ok()
+            && !zone.is_empty()
+            && zone
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+        "invalid provider trusted IPv6 host name"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +430,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_ipv6_zone_trust_names_roundtrip_without_relaxing_endpoints() {
+        for host in ["fe80::1%en0", "fe80::1%3", "[fe80::1%eth0.2]:2200"] {
+            let mut permission = permission();
+            let endpoint = permission.destination.endpoint.clone();
+            permission.destination = permission.destination.with_trusted_host(host).unwrap();
+            assert_eq!(permission.destination.label(), format!("alice@{host}"));
+            assert_eq!(permission.destination.endpoint, endpoint);
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("permissions");
+            update(&path, Some(&permission), None).unwrap();
+            assert_eq!(read(&path).unwrap().permissions[0].permission, permission);
+            // No requester route or SSH token validation is relaxed.
+            let mut endpoint = endpoint;
+            endpoint.host = host.into();
+            assert!(crate::destination::ssh::validate_endpoint(&endpoint).is_err());
+            assert!(crate::destination::ssh::validate_host_key_alias(host).is_err());
+        }
+        for host in [
+            "host%zone",
+            "fe80::1%",
+            "fe80::1%en0%other",
+            "fe80::1%bad/name",
+            "fe80::1%en0\nother",
+            "[fe80::1%en0]:0",
+            "[fe80::1%en0]:65536",
+            "[fe80::1%en0]",
+        ] {
+            assert!(
+                permission().destination.with_trusted_host(host).is_err(),
+                "{host:?}"
+            );
+        }
+    }
+
+    #[test]
     fn remembered_permission_matches_the_complete_trusted_pair_and_profile() {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("account-permissions-v1.json");
@@ -439,9 +506,7 @@ mod tests {
 
     #[test]
     fn remembered_permissions_belong_only_to_the_authorizing_domain() {
-        // Socket paths must fit even when the platform's ambient TMPDIR is long.
-        let root = std::fs::canonicalize("/tmp").unwrap();
-        let temporary = tempfile::tempdir_in(root).unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let first_path = temporary.path().join("first");
         let second_path = temporary.path().join("second");
         for path in [&first_path, &second_path] {
