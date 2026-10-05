@@ -33,8 +33,8 @@ process makes that estimate unavailable. Native time CPU has 10 ms precision.
 Both platforms sample each process's CPU, RSS, threads, FDs and disk I/O every
 20 ms plus sampling cost. Group memory is a sampled sum of current RSS, not a
 sum of individual peaks. Single-process rm uses native time's maximum RSS.
-Samples are lower bounds; check sample gaps and observer CPU, and use longer
-runs for CPU comparisons. Linux per-process I/O includes waited children: do
+Samples can miss peaks and final work; check sample gaps and observer CPU, and
+use longer runs for CPU comparisons. Linux per-process I/O includes waited children: do
 not sum those historical counters. Process CPU excludes background kernel
 threads (journal commits, inode cleanup, transaction sync); these are not
 system-wide filesystem cost measurements. No remote helpers are launched.
@@ -649,7 +649,8 @@ def comparisons(rows, reference):
             pairs = [(refs[r["round"]], r) for r in rows if r["case"] == case and r["variant"] == variant and r["verified"] and r["round"] in refs]
             if not pairs:
                 continue
-            result = dict(case=case, variant=variant, paired_rounds=len(pairs))
+            result = dict(case=case, variant=variant, paired_rounds=len(pairs),
+                          cpu_accounting_complete=all(r.get("cpu_accounting_complete", False) for pair in pairs for r in pair))
             for key in ("seconds", "cpu_seconds", "peak_rss_bytes"):
                 values = [(a[key], b[key]) if key == "seconds" else (a["resources"][key], b["resources"][key]) for a, b in pairs]
                 values = [(a, b) for a, b in values if a is not None and b is not None]
@@ -697,7 +698,8 @@ def main():
                   allowed_cpus=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                   binary_sha256={v["name"]: sha256_file(v["binary"]) for v in plan["variants"]},
                   harness_sha256=sha256_file(__file__), sample_interval_seconds=0.02,
-                  cpu_time_resolution_seconds=0.01,
+                  native_time_cpu_resolution_seconds=0.01,
+                  drain_clock="upper bound including sampling/polling delay after coordinator exit",
                   tuning_history="disabled; automatic variants start without remembered counts",
                   kernel_background_cpu="not counted",
                   skipped_variants=[dict(case=c["name"], variant=v["name"], reason="pruning tunes its own deletion workers")
