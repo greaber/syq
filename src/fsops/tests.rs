@@ -4181,6 +4181,168 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
 }
 
 #[test]
+fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
+    // Some filesystems report one fixed mode for every file, such as Linux
+    // CIFS without POSIX extensions (0755 by default). Mode bits restrict
+    // nobody there, so a retry reuses and resumes from the sidecar an
+    // earlier attempt left however wide it looks, as before the rule that
+    // replaces a wider one. Elsewhere that rule still holds: a sidecar wider
+    // than a narrower retry's mode is replaced, and a same-mode retry
+    // resumes. The first attempt creates the device's first sidecar, which
+    // shows that the device cannot narrow a new file.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8 | 1).collect();
+    let mut new = old.clone();
+    new[block..].fill(0x5a);
+    let mut wrong = Vec::new();
+    for forced in [None, Some(0o755)] {
+        for connection in ["same", "another"] {
+            for retry_mode in [0o600, 0o644] {
+                let shown = forced.map_or("none".into(), |mode: u32| format!("{mode:o}"));
+                let case =
+                    format!("forced {shown}, {connection} connection, retry mode {retry_mode:o}");
+                FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().clear());
+                FORCED_MODE.set(forced);
+                let temporary = crate::test_support::tempdir().unwrap();
+                let path = temporary.path().join("file");
+                let id = [43; 16];
+                let target = || PartialTarget {
+                    path: b"file",
+                    id: &id,
+                    guard: None,
+                };
+                let prepare = |ops: &mut FsOps, mode, attempt, len: usize| {
+                    ops.prepare(
+                        target(),
+                        PrepareOptions {
+                            size: len as u64,
+                            inplace: false,
+                            mode,
+                            attempt,
+                            create_if_missing: true,
+                        },
+                    )
+                    .unwrap()
+                };
+                let mut ops = destination_ops(temporary.path());
+                prepare(&mut ops, 0o644, 0, old.len());
+                for (index, chunk) in old.chunks(block).enumerate() {
+                    ops.write_range(
+                        target(),
+                        false,
+                        0,
+                        (index * block) as u64,
+                        content_digest(chunk),
+                        chunk,
+                    )
+                    .unwrap();
+                }
+                let sidecar = partial_path(&path, &id).unwrap();
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+                let staged = fs::metadata(&sidecar).unwrap().ino();
+                let mut ops = if connection == "same" {
+                    ops
+                } else {
+                    destination_ops(temporary.path())
+                };
+                let prepared = prepare(&mut ops, retry_mode, 1, new.len());
+                let reusable = if prepared.partial_size.is_some() || prepared.has_candidates {
+                    ops.seed_basis(target(), new.len() as u64, block as u64, None, 1)
+                        .unwrap()
+                        .hashes
+                } else {
+                    Vec::new()
+                };
+                let algorithm = ops.hash_policy.algorithm;
+                let mut written = 0;
+                for (index, chunk) in new.chunks(block).enumerate() {
+                    if reusable.get(index) != Some(&algorithm.hash(chunk)) {
+                        ops.write_range(
+                            target(),
+                            false,
+                            1,
+                            (index * block) as u64,
+                            content_digest(chunk),
+                            chunk,
+                        )
+                        .unwrap();
+                        written += 1;
+                    }
+                }
+                let reused = fs::metadata(&sidecar).unwrap().ino() == staged;
+                let meta = Meta {
+                    mode: retry_mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    inode_metadata: None,
+                };
+                ops.finalize(
+                    b"file",
+                    false,
+                    &id,
+                    &meta,
+                    flags::MODE,
+                    TargetMutation {
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    },
+                )
+                .unwrap();
+                FORCED_MODE.set(None);
+                assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+                assert_eq!(
+                    fs::metadata(&path).unwrap().mode() & 0o7777,
+                    retry_mode,
+                    "{case}"
+                );
+                let expected = forced.is_some() || retry_mode == 0o644;
+                if reused != expected || (reused && written != 1) {
+                    wrong.push(format!("{case}: reused {reused}, wrote {written} blocks"));
+                }
+            }
+        }
+    }
+    FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().clear());
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn only_a_device_that_cannot_narrow_a_new_file_skips_the_width_check() {
+    // The probe marks a device only when a new file there stays wider than
+    // the mode it was created with. A file a directory's inherited ACL
+    // widened can be narrowed, so its device keeps the check, and a mark is
+    // for its own device number alone.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("new");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    // Widened after creation, as an inherited ACL can widen a new file.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let dev = file.metadata().unwrap().dev();
+    FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().clear());
+    note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    assert_eq!(fixed_wide_modes(dev), Some(false));
+    assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+    assert!(wider_than(0o644, dev, Some(0o600)));
+    // The same where every file reports 0755 and a chmod does not show.
+    FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().clear());
+    FORCED_MODE.set(Some(0o755));
+    note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    FORCED_MODE.set(None);
+    assert_eq!(fixed_wide_modes(dev), Some(true));
+    assert!(!wider_than(0o644, dev, Some(0o600)));
+    assert!(wider_than(0o644, dev.wrapping_add(1), Some(0o600)));
+    assert!(!wider_than(0o600, dev.wrapping_add(1), Some(0o600)));
+    FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().clear());
+}
+
+#[test]
 fn partial_discovery_is_exact_and_directory_cache_is_bounded() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut ops = destination_ops(temporary.path());

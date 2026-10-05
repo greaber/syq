@@ -109,7 +109,9 @@ impl FsOps {
         if create_if_missing {
             match self.create_partial_rooted(root, relative, create_mode) {
                 Ok(file) => {
-                    note_created_owner(&file.metadata()?);
+                    let created = file.metadata()?;
+                    note_created_owner(&created);
+                    note_created_mode(&file, &created, create_mode);
                     return Ok(Some((file, None)));
                 }
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
@@ -131,7 +133,7 @@ impl FsOps {
                                 continue;
                             }
                             if !self.reusable_partial_permissions(&file)?
-                                || wider_than(opened.mode(), widest)
+                                || wider_than(opened.mode(), opened.dev(), widest)
                             {
                                 drop(file);
                                 discard_safe_rooted_partial_if_same(
@@ -143,8 +145,9 @@ impl FsOps {
                                 )?;
                                 continue;
                             }
-                            let repaired = opened.mode() & 0o777 | 0o600;
-                            if opened.mode() & 0o7777 != repaired {
+                            let reported = reported_mode(opened.mode());
+                            let repaired = reported & 0o777 | 0o600;
+                            if reported & 0o7777 != repaired {
                                 let repair = (|| -> Result<()> {
                                     fail_partial_chmod_for_test()?;
                                     file.set_permissions(fs::Permissions::from_mode(repaired))?;
@@ -216,7 +219,7 @@ impl FsOps {
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
                             if !self.reusable_partial_permissions(&handle)?
-                                || wider_than(metadata.mode, widest)
+                                || wider_than(metadata.mode, metadata.dev, widest)
                             {
                                 drop(handle);
                                 discard_safe_rooted_partial_if_same(
@@ -261,7 +264,9 @@ impl FsOps {
                 None if !create_if_missing => return Ok(None),
                 None => match self.create_partial_rooted(root, relative, create_mode) {
                     Ok(file) => {
-                        note_created_owner(&file.metadata()?);
+                        let created = file.metadata()?;
+                        note_created_owner(&created);
+                        note_created_mode(&file, &created, create_mode);
                         return Ok(Some((file, None)));
                     }
                     Err(error)
@@ -294,7 +299,7 @@ impl FsOps {
             match target.root.metadata_optional(relative)? {
                 Some(metadata)
                     if is_owned_rooted_partial(metadata)
-                        && wider_than(metadata.mode, Some(widest)) =>
+                        && wider_than(metadata.mode, metadata.dev, Some(widest)) =>
                 {
                     discard_safe_rooted_partial_if_same(
                         &target.root,
@@ -3454,17 +3459,108 @@ pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {
 /// including an older sidecar with data or a wider mode, takes the checked
 /// path, which repairs or replaces it before anything is written.
 pub(super) fn is_fresh_partial(metadata: &fs::Metadata, mode: u32) -> bool {
+    let reported = reported_mode(metadata.mode());
     is_owned_partial(metadata)
         && metadata.len() == 0
-        && metadata.mode() & 0o7000 == 0
-        && metadata.mode() & 0o777 & !(mode & 0o777) == 0
+        && reported & 0o7000 == 0
+        && reported & 0o777 & !(mode & 0o777) == 0
 }
 
-/// Whether a sidecar's mode lets its group or others in beyond `widest`.
-/// On Linux an ACL's mask is the group bits, so the mode also bounds what
-/// the ACL's named entries grant.
-fn wider_than(mode: u32, widest: Option<u32>) -> bool {
-    widest.is_some_and(|widest| mode & 0o077 & !widest != 0)
+/// Whether a sidecar's mode lets its group or others in beyond `widest`,
+/// so that someone may hold it open who could not open a new one. On Linux
+/// an ACL's mask is the group bits, so the mode also bounds what the ACL's
+/// named entries grant. Never on a device whose files cannot be narrowed
+/// (`fixed_wide_modes`): a new file there would be no less readable.
+pub(super) fn wider_than(mode: u32, dev: u64, widest: Option<u32>) -> bool {
+    widest.is_some_and(|widest| reported_mode(mode) & 0o077 & !widest != 0)
+        && fixed_wide_modes(dev) != Some(true)
+}
+
+/// Devices probed for whether a file can be narrowed below the mode it came
+/// out with: `true` for one that cannot, such as a Linux CIFS mount without
+/// POSIX extensions, vfat or exfat, which report one fixed mode for every
+/// file. Mode bits restrict nobody there. Every file, new or reused, admits
+/// whoever that mode admits, so replacing a reused sidecar that looks wider
+/// than its attempt's mode could not make it any less readable; it would
+/// only cost the sidecar's resumable bytes and several requests.
+///
+/// Only a file syq has just created exclusively marks a device, and the
+/// entry is for that device number alone and lasts for this process. A
+/// sidecar on any other filesystem has another device number and keeps the
+/// check; so does one beside a directory whose inherited NFSv4 ACL widened
+/// a new file, since that file can be narrowed. `false` records such a
+/// device, so each device is probed once.
+#[cfg(not(test))]
+fn fixed_wide_mode_devices() -> &'static Mutex<HashMap<u64, bool>> {
+    static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+    DEVICES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The probed devices of this thread, which other tests do not share.
+    pub(super) static FIXED_WIDE_MODE_DEVICES: std::cell::RefCell<HashMap<u64, bool>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// A mode this thread's sidecars report, as a device that reports one
+    /// fixed mode does, like `SYQ_TEST_FORCED_MODE` for a whole process.
+    pub(super) static FORCED_MODE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn fixed_wide_modes(dev: u64) -> Option<bool> {
+    #[cfg(test)]
+    return FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow().get(&dev).copied());
+    #[cfg(not(test))]
+    fixed_wide_mode_devices().lock().unwrap().get(&dev).copied()
+}
+
+pub(super) fn record_fixed_wide_modes(dev: u64, fixed: bool) {
+    #[cfg(test)]
+    FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().insert(dev, fixed));
+    #[cfg(not(test))]
+    fixed_wide_mode_devices().lock().unwrap().insert(dev, fixed);
+}
+
+/// Probe the device of a sidecar just created exclusively with `requested`
+/// when it came out wider: try to narrow it to `requested`, which only takes
+/// an empty file of ours to the mode it was created with. The device is
+/// marked when the mode stays wider or the change is refused, as vfat and
+/// exfat refuse modes they cannot store. Another error leaves it unprobed.
+pub(super) fn note_created_mode(file: &File, created: &fs::Metadata, requested: u32) {
+    let requested = requested & 0o777;
+    let wider = |mode: u32| reported_mode(mode) & 0o777 & !requested != 0;
+    if !wider(created.mode()) || fixed_wide_modes(created.dev()).is_some() {
+        return;
+    }
+    let fixed = match file.set_permissions(fs::Permissions::from_mode(requested)) {
+        Ok(()) => file.metadata().is_ok_and(|now| wider(now.mode())),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => true,
+        Err(_) => return,
+    };
+    record_fixed_wide_modes(created.dev(), fixed);
+}
+
+/// A sidecar's mode as reported. Debug builds simulate a device that
+/// reports one fixed mode for every file with `SYQ_TEST_FORCED_MODE`, the
+/// permission bits in octal.
+fn reported_mode(mode: u32) -> u32 {
+    #[cfg(debug_assertions)]
+    if let Some(forced) = test_forced_mode() {
+        return mode & !0o7777 | forced;
+    }
+    mode
+}
+
+#[cfg(debug_assertions)]
+fn test_forced_mode() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(mode) = FORCED_MODE.get() {
+        return Some(mode & 0o777);
+    }
+    let value = std::env::var_os("SYQ_TEST_FORCED_MODE")?;
+    u32::from_str_radix(value.to_str()?, 8)
+        .ok()
+        .map(|mode| mode & 0o777)
 }
 
 /// Whether the open or create of the sidecar was refused because of what
