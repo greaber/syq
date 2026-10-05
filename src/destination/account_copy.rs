@@ -38,17 +38,21 @@ pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
                 args.auth_from_explicit.then(|| args.auth_from.clone()),
             )?;
             super::handoff::validate_account_selection(&mode)?;
-            if let AuthFrom::Provider(authorizer) = mode {
-                super::ssh_auth::prepare(&super::ssh::SessionRequest {
-                    provider: authorizer,
-                    destination: NativeEndpoint {
-                        user: location.user,
-                        host,
-                        port: location.port,
-                    },
-                    tty: super::ssh::Tty::Disabled,
-                    command: Vec::new(),
-                })?;
+            if let AuthFrom::Provider(authorizer) = &mode {
+                crate::auth_from::selected_context(
+                    super::ssh_auth::prepare(&super::ssh::SessionRequest {
+                        provider: authorizer.clone(),
+                        destination: NativeEndpoint {
+                            user: location.user,
+                            host,
+                            port: location.port,
+                        },
+                        tty: super::ssh::Tty::Disabled,
+                        command: Vec::new(),
+                    }),
+                    &mode,
+                    args.auth_from_explicit,
+                )?;
             }
         }
     }
@@ -98,8 +102,11 @@ pub(super) fn select(args: &mut Args) -> Result<bool> {
         port: location.port,
     };
     let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
-    let Some(cached) =
-        super::ssh::persistent::select_or_connect(&domain, &requested, &args.auth_from)?
+    let Some(cached) = crate::auth_from::selected_context(
+        super::ssh::persistent::select_or_connect(&domain, &requested, &args.auth_from),
+        &args.auth_from,
+        args.auth_from_explicit,
+    )?
     else {
         return Ok(false);
     };
@@ -160,7 +167,11 @@ pub(crate) fn approved_operation(
         host: host.clone(),
         port: location.port,
     };
-    if let Some(cached) = super::ssh::persistent::select_or_connect(&domain, &requested, &mode)? {
+    if let Some(cached) = crate::auth_from::selected_context(
+        super::ssh::persistent::select_or_connect(&domain, &requested, &mode),
+        &mode,
+        args.auth_from_explicit,
+    )? {
         return approved_connection(args, location, &domain, &cached).map(Some);
     }
     Ok(None)

@@ -139,9 +139,14 @@ pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<Se
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let (request, explicit, scope) = parse_command(argv)?;
     let domain = crate::persistence::Domain::select(scope.as_deref())?;
+    let explicit_mode = explicit.is_some();
     let mode = crate::auth_from::resolve(&domain, &request.destination.host, explicit)?;
     crate::fsops::reserve_startup_descriptors();
-    if let Some(mut command) = persistent::command(&domain, &request, &mode)? {
+    if let Some(mut command) = crate::auth_from::selected_context(
+        persistent::command(&domain, &request, &mode),
+        &mode,
+        explicit_mode,
+    )? {
         return foreground::run_cached(&mut command, || false);
     }
     anyhow::ensure!(

@@ -2227,8 +2227,7 @@ mod tests {
 
     #[test]
     fn provider_approval_has_distinct_origin_and_session_or_remember_decisions() {
-        let root = std::fs::canonicalize("/tmp").unwrap();
-        let temporary = tempfile::tempdir_in(root).unwrap();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         for remember in [false, true] {
             let scope = temporary
                 .path()

@@ -1436,3 +1436,52 @@ fn deletion_policy_requires_a_gain_in_either_direction() {
     }
     assert!(policy.settled() >= 32, "{:?}", policy.history);
 }
+
+#[test]
+fn resource_ceiling_survives_tuning_and_retires_surplus_connections() {
+    let gate = Gate::new(8);
+    gate.begin_warming(8);
+    for id in 0..8 {
+        gate.mark_ready(id);
+    }
+    assert!(gate.limit_resources(2));
+    gate.set_active(16);
+    gate.set_connect_target(32);
+    gate.prepare(ConnectionPlan {
+        connect: 64,
+        keep: 64,
+    });
+    assert_eq!(gate.active(), 2);
+    assert!(!gate.connection_needed(2));
+    assert!(gate.begin_warming(64).is_empty());
+    assert!(!gate.limit_resources(4));
+    assert_eq!(gate.resource_limit(), 2);
+}
+
+#[test]
+fn descriptor_notice_follows_selected_start_and_later_growth() {
+    for requested in [10, 16, 64] {
+        let notices = Arc::new(AtomicUsize::new(0));
+        let report = notices.clone();
+        let gate = Gate::new(8);
+        gate.limit_descriptors(10, move || {
+            report.fetch_add(1, Relaxed);
+        });
+        gate.set_active(8);
+        gate.begin_warming(8);
+        assert_eq!(notices.load(Relaxed), 0);
+        gate.set_active(requested);
+        gate.begin_warming(requested);
+        assert_eq!(gate.active(), 10);
+        assert_eq!(notices.load(Relaxed), 1);
+    }
+    // Anticipatory connections can reach the ceiling before active workers.
+    let notices = Arc::new(AtomicUsize::new(0));
+    let report = notices.clone();
+    let gate = Gate::new(8);
+    gate.limit_descriptors(10, move || {
+        report.fetch_add(1, Relaxed);
+    });
+    gate.begin_warming(10);
+    assert_eq!(notices.load(Relaxed), 1);
+}

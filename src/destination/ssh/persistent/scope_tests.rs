@@ -307,6 +307,8 @@ fn status_keeps_valid_accounts_and_reports_bad_record_paths() {
     assert_eq!(snapshot.errors.len(), 1);
     assert!(snapshot.errors[0].contains(invalid.to_str().unwrap()));
     assert!(snapshot.errors[0].contains("read SSH account record"));
+    assert!(snapshot.errors[0].contains("move it out of this directory"));
+    assert!(snapshot.errors[0].contains("does not close its SSH connection"));
     // Off still signals incomplete cleanup, while invalidating approvals and
     // closing the valid entry rather than stopping at the malformed record.
     ensure_generation(&domain).unwrap();
@@ -314,6 +316,12 @@ fn status_keeps_valid_accounts_and_reports_bad_record_paths() {
     assert!(format!("{error:#}").contains(invalid.to_str().unwrap()));
     assert!(!generation_path(&domain).exists());
     assert!(!record.control.exists());
+    // An unreadable record cannot establish ownership of a master. Preserve it
+    // until the user follows the recovery hint; healthy entries still work.
+    assert_eq!(fs::read(&invalid).unwrap(), b"{broken");
+    fs::rename(&invalid, root.path().join("damaged-record")).unwrap();
+    assert!(status(&domain).unwrap().errors.is_empty());
+    stop_all(&domain).unwrap();
 }
 
 #[test]

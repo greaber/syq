@@ -15,7 +15,7 @@ use aws_smithy_runtime_api::{
             },
             Intercept,
         },
-        retries::classifiers::{ClassifyRetry, RetryAction},
+        retries::classifiers::{ClassifyRetry, RetryAction, RetryClassifierPriority},
         runtime_components::RuntimeComponents,
     },
 };
@@ -28,20 +28,33 @@ use std::{collections::HashMap, time::Duration};
 // so classify the status itself for every operation. A 429 response means the
 // request was not processed, so a retry within the bounded budget is safe.
 #[derive(Debug)]
-struct Throttling;
+pub(super) struct Throttling;
 impl ClassifyRetry for Throttling {
     fn classify_retry(&self, context: &InterceptorContext) -> RetryAction {
-        if context
-            .response()
-            .is_some_and(|r| r.status().as_u16() == 429)
-        {
-            RetryAction::throttling_error()
+        if let Some(response) = context.response().filter(|r| r.status().as_u16() == 429) {
+            // R2 sends Retry-After seconds; the SDK only reads x-amz-retry-after.
+            super::retry::server_delay(response)
+                // A zero hint must not disable the SDK's normal backoff.
+                .filter(|delay| !delay.is_zero())
+                .map_or_else(RetryAction::throttling_error, |delay| {
+                    RetryAction::retryable_error_with_explicit_delay(
+                        aws_smithy_types::retry::ErrorKind::ThrottlingError,
+                        delay,
+                    )
+                })
         } else {
             RetryAction::NoActionIndicated
         }
     }
     fn name(&self) -> &'static str {
         "S3 HTTP 429 throttling"
+    }
+    fn priority(&self) -> RetryClassifierPriority {
+        // Run after AWS error-code and modeled-error classification so known
+        // codes such as SlowDown cannot discard our Retry-After delay.
+        RetryClassifierPriority::run_after(
+            RetryClassifierPriority::modeled_as_retryable_classifier(),
+        )
     }
 }
 
@@ -380,6 +393,7 @@ pub(super) async fn connect_authorized(
                 .unwrap_or_else(|| Region::new("us-east-1")),
         )
         .retry_config(RetryConfig::standard().with_max_attempts(options.retries + 1))
+        .retry_partition(super::retry::partition())
         .retry_classifier(Throttling)
         .timeout_config(request_timeouts())
         .stalled_stream_protection(aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())

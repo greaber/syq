@@ -13,7 +13,9 @@ fn advanced_description(path: &str) -> Option<&'static str> {
         "syq map" => Some("Print source-to-destination mappings as NDJSON"),
         "syq receiver" => Some("Manage manual receiver enrollment and recovery"),
         "syq receiver enroll" => Some("Manually enroll or refresh a receiver"),
-        "syq persist destinations" => Some("Inspect or recover named return destinations"),
+        "syq persist destinations" => {
+            Some("Inspect shared receiving names; --pscope does not filter them")
+        }
         "syq persist receive wait" | "syq persist destinations wait" => {
             Some("Wait for a connection with a deadline")
         }
@@ -50,6 +52,7 @@ fn configure_at(mut command: Command, path: &str) -> Command {
                     "syq _ls" => true,
                     "syq exec" => matches!(arg.get_id().as_str(), "on" | "cwd"),
                     "syq persist connect" => arg.get_id() == "timeout",
+                    "syq persist auth-from" => matches!(arg.get_id().as_str(), "host" | "reset"),
                     "syq persist receive on" => matches!(
                         arg.get_id().as_str(),
                         "auto_approve_root"
@@ -342,7 +345,7 @@ pub(crate) fn root() -> Command {
             .help("Install the newest signed release (standalone installs); Homebrew: brew upgrade syq"))
         .disable_help_subcommand(true)
         .subcommand(Command::new("cp").about("Copy files and directories, optionally removing destination-only files"))
-        .subcommand(Command::new("ssh").about("Open an SSH shell or command using laptop authorization"))
+        .subcommand(Command::new("ssh").about("Open an SSH shell or command with native or approved account access"))
         .subcommand(Command::new("exec").about("Run a command on a named receiving machine after local approval"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("clean-partials").about("Delete syq partial files in directory trees"))

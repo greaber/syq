@@ -241,6 +241,7 @@ pub(crate) fn drain_range_replies_with<T>(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
+    pub(crate) descriptors: Option<crate::resources::Descriptors>,
     pub identity: String,
     pub platform: String,
     pub supports_confined_socket_nodes: bool,
@@ -407,9 +408,7 @@ impl std::fmt::Display for WorkerInitializationError {
 impl std::error::Error for WorkerInitializationError {}
 
 pub(crate) fn is_worker_initialization_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<WorkerInitializationError>())
+    error.is::<WorkerInitializationError>()
 }
 
 /// A worker handshake rejection that tests inject.
@@ -456,6 +455,7 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || crate::destination::peer_bridge::is_setup_refusal(error)
+        || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
             .chain()
@@ -599,18 +599,20 @@ fn spawn_reader(
     std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
     std::thread::JoinHandle<()>,
 ) {
-    let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default());
+    let (rx, reader, _) = spawn_observed_reader(input, read_ahead, Default::default()).unwrap();
     (rx, reader)
 }
+type ObservedReader = (
+    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
+    std::thread::JoinHandle<()>,
+    std::sync::Arc<batch_progress::BatchReceipts>,
+);
+
 fn spawn_observed_reader(
     input: Box<dyn Read + Send>,
     read_ahead: usize,
     observation: std::sync::Arc<crate::transfer_observations::RemoteSample>,
-) -> (
-    std::sync::mpsc::Receiver<std::io::Result<ReceivedResponse>>,
-    std::thread::JoinHandle<()>,
-    std::sync::Arc<batch_progress::BatchReceipts>,
-) {
+) -> Result<ObservedReader> {
     // Control requests also pipeline up to the default depth. Keeping that
     // capacity prevents a sequential helper blocking on replies while its
     // coordinator is still sending requests (including large path batches).
@@ -619,46 +621,48 @@ fn spawn_observed_reader(
     );
     let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
     let receipts = batch_receipts.clone();
-    let reader = std::thread::spawn(move || {
-        let mut r = FrameReader::new(input);
-        r.set_limit(MAX_HANDSHAKE_FRAME);
-        let hello = r
-            .read_budgeted_with_start::<Response>()
-            .map(ReceivedResponse::from_frame);
-        // Make the same acceptance check as receive_hello before allowing the
-        // background reader to allocate any ordinary data frame. This also
-        // covers pooled sessions, whose Hello was sent by another process.
-        let accepted = matches!(&hello, Ok(message)
-            if matches!(&message.value, Response::HelloOk { identity, .. }
-                if identity == crate::identity::build()));
-        if tx.send(hello).is_err() || !accepted {
-            return;
-        }
-        r.set_limit(MAX_FRAME);
-        loop {
-            let msg = r
+    let reader = std::thread::Builder::new()
+        .spawn(move || {
+            let mut r = FrameReader::new(input);
+            r.set_limit(MAX_HANDSHAKE_FRAME);
+            let hello = r
                 .read_budgeted_with_start::<Response>()
                 .map(ReceivedResponse::from_frame);
-            if let Ok(message) = &msg {
-                if let Response::TransportStats(stats) = &message.value {
-                    if let Some(value) = &stats.observation {
-                        let mut value = value.clone();
-                        value.tcp = stats.tcp.clone();
-                        observation.update(value);
+            // Make the same acceptance check as receive_hello before allowing the
+            // background reader to allocate any ordinary data frame. This also
+            // covers pooled sessions, whose Hello was sent by another process.
+            let accepted = matches!(&hello, Ok(message)
+            if matches!(&message.value, Response::HelloOk { identity, .. }
+                if identity == crate::identity::build()));
+            if tx.send(hello).is_err() || !accepted {
+                return;
+            }
+            r.set_limit(MAX_FRAME);
+            loop {
+                let msg = r
+                    .read_budgeted_with_start::<Response>()
+                    .map(ReceivedResponse::from_frame);
+                if let Ok(message) = &msg {
+                    if let Response::TransportStats(stats) = &message.value {
+                        if let Some(value) = &stats.observation {
+                            let mut value = value.clone();
+                            value.tcp = stats.tcp.clone();
+                            observation.update(value);
+                        }
+                        if !stats.solicited {
+                            continue;
+                        }
                     }
-                    if !stats.solicited {
-                        continue;
-                    }
+                    receipts.response(&message.value);
                 }
-                receipts.response(&message.value);
+                let failed = msg.is_err();
+                if tx.send(msg).is_err() || failed {
+                    break;
+                }
             }
-            let failed = msg.is_err();
-            if tx.send(msg).is_err() || failed {
-                break;
-            }
-        }
-    });
-    (rx, reader, batch_receipts)
+        })
+        .map_err(crate::resources::allocation_error)?;
+    Ok((rx, reader, batch_receipts))
 }
 
 fn receive_transport_stats(
@@ -733,19 +737,22 @@ impl RemoteConn {
         session: crate::session_pool::PooledSession,
         compress: bool,
         label: String,
-    ) -> Self {
+    ) -> Result<Self> {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, reader, batch_receipts) = spawn_observed_reader(
             Box::new(session.stdout),
             crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
             observation.clone(),
-        );
+        )?;
         let mut stderr = session.stderr;
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
-        });
-        RemoteConn {
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+            })
+            .map_err(crate::resources::allocation_error)
+            .context("start pooled stderr reader")?;
+        Ok(RemoteConn {
             batch_receipts,
             transport_stop: None,
             observation,
@@ -764,7 +771,7 @@ impl RemoteConn {
             named_socket: None,
             multiplexed_ssh: false,
             detached: true,
-        }
+        })
     }
 
     fn transport_stats_with_timeout(
@@ -1128,9 +1135,15 @@ impl Conn for RemoteConn {
             "streaming writes already active"
         );
         self.receive_deferred(None)?;
-        self.write_stream = Some(crate::streaming::WriteReplies::spawn(
+        match crate::streaming::WriteReplies::spawn(
             self.rx.take().context("response reader missing")?,
-        ));
+        ) {
+            Ok(stream) => self.write_stream = Some(stream),
+            Err(error) => {
+                self.dead = true;
+                return Err(error).context("start streaming reply reader");
+            }
+        }
         Ok(())
     }
     fn check_streaming_writes(&mut self) -> Result<()> {
@@ -1282,10 +1295,21 @@ impl Drop for RemoteConn {
             // Shutdown or EOF, and waiting for its exit status would cost a
             // round trip. Reap our ssh client, if any, once it exits.
             self.rx.take();
-            if let Some(mut child) = self.child.take() {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+            if let Some(child) = self.child.take() {
+                let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+                let reaper = child.clone();
+                if std::thread::Builder::new()
+                    .spawn(move || {
+                        if let Some(mut child) = reaper.lock().unwrap().take() {
+                            let _ = child.wait();
+                        }
+                    })
+                    .is_err()
+                {
+                    if let Some(mut child) = child.lock().unwrap().take() {
+                        let _ = child.wait();
+                    }
+                }
             }
             return;
         }
@@ -1746,7 +1770,7 @@ impl RemoteSpec {
         }
         let program = self.program_command(&["--server".into()]);
         let session = crate::session_pool::take(&multiplexer.path, &program)?;
-        let conn = RemoteConn::from_pooled(session, compress, self.label());
+        let conn = RemoteConn::from_pooled(session, compress, self.label()).ok()?;
         match receive_hello(conn, false) {
             Ok(conn) => {
                 if crate::output::debug() {
@@ -1787,6 +1811,33 @@ impl RemoteSpec {
         }
         let conn = self.take_pooled_control(compress);
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
+    }
+
+    /// Only a failed SSH startup may reclaim idle slots from an approved
+    /// master. Successful helper launches never inspect or change the pool.
+    /// Callers retry at most once, before starting the copy or its command.
+    pub(crate) fn release_idle_helpers_after_startup_failure(
+        &self,
+        status: &std::process::ExitStatus,
+    ) -> bool {
+        if status.code() != Some(255) {
+            return false;
+        }
+        let Some(multiplexer) = &self.ssh_multiplexer else {
+            return false;
+        };
+        if !multiplexer.existing_only || !crate::session_pool::is_running(&multiplexer.path) {
+            return false;
+        }
+        if let Err(error) = crate::session_pool::stop(&multiplexer.path) {
+            // Recovery is best effort. The caller still reports the original
+            // startup failure, which explains why recovery was attempted.
+            crate::output::diagnostic!(
+                "syq: could not release idle helpers after SSH startup failed: {error:#}"
+            );
+            return false;
+        }
+        true
     }
 
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
@@ -2038,7 +2089,7 @@ impl RemoteSpec {
                 Box::new(stream.try_clone()?),
                 self.read_ahead,
                 observation.clone(),
-            );
+            )?;
             let conn = RemoteConn {
                 batch_receipts,
                 transport_stop: None,
@@ -2136,13 +2187,16 @@ impl RemoteSpec {
                 Stdio::inherit()
             },
         );
-        let mut child = cmd.spawn_guarded().with_context(|| {
-            if self.local_process {
-                "spawn local receiver".to_string()
-            } else {
-                format!("spawn {:?}", self.rsh[0])
-            }
-        })?;
+        let mut child = cmd
+            .spawn_guarded()
+            .map_err(crate::resources::allocation_error)
+            .with_context(|| {
+                if self.local_process {
+                    "spawn local receiver".to_string()
+                } else {
+                    format!("spawn {:?}", self.rsh[0])
+                }
+            })?;
         let approved_login = match login.map(|login| login.watch(child.id())).transpose() {
             Ok(guard) => guard,
             Err(error) => {
@@ -2152,7 +2206,15 @@ impl RemoteSpec {
                 return Err(error);
             }
         };
-        let ssh_failure = child.stderr.take().map(ssh_auth::capture);
+        let ssh_failure = match child.stderr.take().map(ssh_auth::capture).transpose() {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(crate::resources::allocation_error(error))
+                    .context("start SSH stderr reader");
+            }
+        };
         let stdin = child.stdin.take().unwrap();
         let pacing = (!matches!(role, ConnectionRole::Control))
             .then(|| self.pacing.lock().unwrap().clone())
@@ -2186,7 +2248,15 @@ impl RemoteSpec {
             handshake_pending: handshake.clone(),
         };
         let (rx, reader, batch_receipts) =
-            spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone());
+            match spawn_observed_reader(Box::new(stdout), self.read_ahead, observation.clone()) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    drop(writer);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
@@ -2411,13 +2481,16 @@ impl RemoteSpec {
         };
         validate_advertised_tcp_port(port, ports)?;
         let spec = self.clone();
-        let probe = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            let result = spec.probe_tcp_addresses(advertised, port);
-            spec.diagnostics.lock().unwrap().tcp_probe_time =
-                Some((start, std::time::Instant::now()));
-            result
-        });
+        let probe = std::thread::Builder::new()
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let result = spec.probe_tcp_addresses(advertised, port);
+                spec.diagnostics.lock().unwrap().tcp_probe_time =
+                    Some((start, std::time::Instant::now()));
+                result
+            })
+            .map_err(crate::resources::allocation_error)
+            .context("start TCP address probe")?;
         Ok(PendingTcpSetup {
             pacing,
             reverse: None,
@@ -2661,7 +2734,7 @@ impl RemoteSpec {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, reader, batch_receipts) =
-            spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone());
+            spawn_observed_reader(Box::new(reader), self.read_ahead, observation.clone())?;
         let conn = RemoteConn {
             batch_receipts,
             transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
@@ -2752,6 +2825,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
                     .unwrap_or_default();
                 let _ = tx.send((i, addrs));
             })
+            .map_err(crate::resources::allocation_error)
             .context("start TCP address resolver")?;
     }
     drop(resolved_tx);
@@ -2798,6 +2872,7 @@ fn probe_reachable(candidates: &mut [TcpCandidate], port: u16) -> Result<()> {
             .spawn(move || {
                 let _ = tx.send((t, TcpStream::connect_timeout(&addr, timeout).is_ok()));
             })
+            .map_err(crate::resources::allocation_error)
             .context("start TCP address probe")?;
     }
     drop(tx);
@@ -2999,12 +3074,14 @@ fn hello(
 fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
     match conn.recv() {
         Ok(Response::HelloOk {
+            descriptors,
             identity,
             platform,
             supports_confined_socket_nodes,
             ssh_worker_ticket,
         }) if identity == crate::identity::build() => {
             conn.peer = Some(PeerInfo {
+                descriptors,
                 identity,
                 platform,
                 supports_confined_socket_nodes,
@@ -3154,11 +3231,24 @@ impl Endpoint {
                         unreachable!("destination workers require an isolated receiver")
                     }
                     ConnectionRole::SourceWorker { roots, .. } => {
-                        conn.ops.initialize_sources(&roots).map_err(|error| {
-                            WorkerInitializationError(format!(
-                                "initialize local source worker: {error:#}"
-                            ))
-                        })?
+                        let mut initialize = || -> Result<()> {
+                            #[cfg(debug_assertions)]
+                            {
+                                static REFUSED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if std::env::var_os("SYQ_TEST_LOCAL_SOURCE_EMFILE_ONCE").is_some()
+                                    && !REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    return Err(
+                                        std::io::Error::from_raw_os_error(libc::EMFILE).into()
+                                    );
+                                }
+                            }
+                            conn.ops.initialize_sources(&roots)
+                        };
+                        initialize().context(WorkerInitializationError(
+                            "initialize local source worker".into(),
+                        ))?
                     }
                     ConnectionRole::StreamWorker { ticket, settings } => {
                         conn.ops.initialize_stream(&ticket, settings)?
@@ -3174,7 +3264,8 @@ impl Endpoint {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e)
                             if is_tcp_congestion_error(&e)
-                                || is_worker_initialization_error(&e) =>
+                                || is_worker_initialization_error(&e)
+                                || crate::resources::exhausted(&e) =>
                         {
                             return Err(e);
                         }
@@ -3182,6 +3273,9 @@ impl Endpoint {
                             #[cfg(debug_assertions)]
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
+                            }
+                            if spec.forwarded.as_ref().is_some_and(|copy| !copy.has_ssh()) {
+                                return Err(e).context(crate::destination::SshWorkersUnavailable);
                             }
                             let mut g = spec.tcp.lock().unwrap();
                             let mut warning = None;

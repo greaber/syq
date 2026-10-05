@@ -42,6 +42,62 @@ fn bootstrap_stderr_preserves_invalid_utf8_in_both_channels() {
 }
 
 #[test]
+fn tcp_only_source_worker_failure_is_terminal_without_ssh_fallback() {
+    // Reserve an address without listening, so connection refusal cannot race
+    // another test reusing a released ephemeral port.
+    let refused = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    refused
+        .bind(
+            &"127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    let port = refused.local_addr().unwrap().as_socket().unwrap().port();
+    let (control, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let approved =
+        crate::destination::ReturnConnection::source(control, "127.0.0.1".into()).unwrap();
+    let mut spec = super::RemoteSpec::local_receiver(false);
+    spec.forwarded = Some(approved);
+    *spec.tcp.lock().unwrap() = Some(super::TcpInfo {
+        pacing: None,
+        reverse: None,
+        addrs: vec!["127.0.0.1".into()],
+        port,
+        key: None,
+        token: Vec::new(),
+        congestion_control: None,
+        failed: false,
+        failure: None,
+        next: Default::default(),
+    });
+    let endpoint = super::Endpoint::Remote(spec.clone());
+    let error = endpoint
+        .connect_with_sources(false, Vec::new(), false)
+        .err()
+        .unwrap();
+    assert!(super::is_non_retryable_connect_error(&error), "{error:#}");
+    assert!(
+        error.is::<crate::destination::SshWorkersUnavailable>(),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("requires direct TCP"));
+    assert!(
+        !spec.tcp.lock().unwrap().as_ref().unwrap().failed,
+        "TCP-only failure must not activate the SSH fallback state"
+    );
+    let error = spec
+        .forwarded
+        .as_ref()
+        .unwrap()
+        .ssh_command()
+        .err()
+        .unwrap();
+    assert!(super::is_non_retryable_connect_error(&error));
+}
+
+#[test]
 fn advertised_tcp_port_must_match_requested_range() {
     for port in [47_600, 47_650, 47_699] {
         super::validate_advertised_tcp_port(port, (47_600, 47_699)).unwrap();
@@ -77,6 +133,7 @@ use std::os::unix::ffi::OsStrExt;
 
 fn hello_ok() -> Response {
     Response::HelloOk {
+        descriptors: None,
         identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
@@ -236,7 +293,8 @@ fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let (rx, thread, _) =
-            spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone());
+            spawn_observed_reader(Box::new(std::io::Cursor::new(wire)), 1, observation.clone())
+                .unwrap();
         assert!(matches!(
             rx.recv().unwrap().unwrap().value,
             Response::HelloOk { .. }
@@ -972,6 +1030,7 @@ fn hello_carries_destination_initialization_before_readiness() {
         let mut writer = FrameWriter::new(socket, false);
         writer
             .write_msg(&Response::HelloOk {
+                descriptors: None,
                 identity: crate::identity::build().to_string(),
                 platform: crate::identity::platform(),
                 supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
@@ -1125,6 +1184,7 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
     assert!(!helper_needs_install(&error));
     assert!(is_ssh_connect_error(&error));
     conn.peer = Some(PeerInfo {
+        descriptors: None,
         identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: false,
@@ -1759,7 +1819,7 @@ fn first_ssh_worker_retries_independently_after_mux_rejection() {
 #[test]
 fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     use std::os::unix::net::UnixListener;
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = crate::test_support::short_tempdir().unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
     let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
@@ -1784,7 +1844,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
 #[test]
 fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     use std::os::unix::fs::PermissionsExt;
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
@@ -2379,6 +2439,7 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
     let before = spec.pool_endpoint().program;
     assert_eq!(spec.session_command_for(&server, true), before);
     spec.diagnostics.lock().unwrap().peer = Some(PeerInfo {
+        descriptors: None,
         identity: crate::identity::build().into(),
         platform: "linux-aarch64".into(),
         supports_confined_socket_nodes: true,
@@ -2552,7 +2613,8 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .unwrap();
     let (rx, reader, batch_receipts) =
-        spawn_observed_reader(Box::new(client.try_clone().unwrap()), 4, Default::default());
+        spawn_observed_reader(Box::new(client.try_clone().unwrap()), 4, Default::default())
+            .unwrap();
     let mut replies = FrameWriter::new(peer.try_clone().unwrap(), false);
     replies.write_msg(&hello_ok()).unwrap();
     let mut requests = FrameReader::new(peer);
@@ -2620,4 +2682,16 @@ fn batch_acknowledgments_reach_progress_before_the_worker_consumes_them() {
     drop(replies);
     drop(requests);
     drop(conn);
+}
+
+#[test]
+fn local_worker_initialization_preserves_descriptor_exhaustion() {
+    let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE)).context(
+        WorkerInitializationError("initialize local source worker".into()),
+    );
+    assert!(is_worker_initialization_error(&error));
+    assert!(crate::resources::exhausted(&error));
+    let rejection: anyhow::Error = WorkerInitializationError("destination changed".into()).into();
+    assert!(is_worker_initialization_error(&rejection));
+    assert!(!crate::resources::exhausted(&rejection));
 }

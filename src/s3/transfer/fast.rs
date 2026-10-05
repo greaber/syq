@@ -194,6 +194,7 @@ impl Engine {
             // Whether this attempt's GET succeeded. A body or local write that
             // fails afterwards is not a sign that the service is down.
             let mut answered = initial.is_some();
+            let mut retry_delay = None;
             let result = async {
                 let body = if let Some(body) = initial.take() {
                     body
@@ -213,6 +214,7 @@ impl Engine {
                         .await
                         .map_err(|e| {
                             if retryable(&e) {
+                                retry_delay = Some(crate::s3::retry::error_delay(attempt, &e));
                                 anyhow::Error::new(e.into_service_error())
                             } else {
                                 Permanent(format!("S3 GET failed: {}", e.into_service_error()))
@@ -389,7 +391,10 @@ impl Engine {
                         batch.clear();
                         fragments.clear();
                         batch_size = 0;
-                        crate::s3::backoff(attempt).await;
+                        tokio::time::sleep(
+                            retry_delay.unwrap_or_else(|| crate::s3::retry::delay(attempt, false)),
+                        )
+                        .await;
                     }
                     attempt += 1;
                 }

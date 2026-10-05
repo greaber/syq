@@ -100,6 +100,12 @@ impl HttpConnector for Responses {
                 *response.status_mut() = 412.try_into().unwrap();
                 return Ok(response);
             }
+            if fault == "throttled" && number == 1 {
+                *response.status_mut() = 503.try_into().unwrap();
+                *response.body_mut() = SdkBody::from("<Error><Code>SlowDown</Code></Error>");
+                response.headers_mut().insert("x-amz-retry-after", "5000");
+                return Ok(response);
+            }
             response.headers_mut().insert("etag", "\"fixture-v1\"");
             response
                 .headers_mut()
@@ -217,7 +223,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
     assert_eq!(result.is_err(), failed, "{fault}: {result:?}");
     let expected_requests = if retries == 0 || !peers || paced || fault == "uniform" {
         0
-    } else if fault == "truncated" {
+    } else if matches!(fault, "truncated" | "throttled") {
         2
     } else {
         1
@@ -238,6 +244,9 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
         );
     }
     if requests.len() == 2 {
+        if fault == "throttled" {
+            assert!(requests[1].1 - requests[0].1 >= Duration::from_secs(5));
+        }
         assert_eq!(
             requests[1].0, 0,
             "transport error must restart the whole range"
@@ -275,6 +284,11 @@ async fn slow_read_recovery_preserves_contents_and_identity() {
     ] {
         copy(fault, if fault == "truncated" { 2 } else { 1 }, true, false).await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn download_throttling_honors_server_delay_before_restarting() {
+    copy("throttled", 2, true, false).await;
 }
 
 #[tokio::test(start_paused = true)]

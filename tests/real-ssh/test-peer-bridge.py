@@ -13,6 +13,25 @@ import time
 # Each probe runs as the ordinary account whose authority it inspects. Inputs,
 # including the late-worker capability, travel over stdin and are never logged.
 PROBES = {
+    "pool_spares": r'''
+from pathlib import Path
+found = {}
+for p in Path("/proc").iterdir():
+    if not p.name.isdigit():
+        continue
+    try:
+        args = p.joinpath("cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+        if not args or Path(args[0]).name != "ssh" or "-S" not in args or "--server" not in args[-1]:
+            continue
+        control = args[args.index("-S") + 1]
+        stat = p.joinpath("stat").read_text().rsplit(") ", 1)[1].split()
+        parent = Path("/proc", stat[1], "cmdline").read_bytes().split(b"\0")
+        if b"--session-pool" in parent and stat[0] != "Z":
+            found[control] = [int(p.name), stat[19]]
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+print(json.dumps({control: found[control] for control in v["controls"] if control in found}))
+''',
     "tcp": r'''
 import socket, struct
 address = socket.gethostbyname("destination")
@@ -382,7 +401,21 @@ def main():
             assert json.loads(remote("source", "syq persist status --json"))["authorized_ssh"] == []
             no_pending()
 
-        print("case: encrypted TCP data travels directly from B to C", flush=True)
+        print("case: peer TCP preserves warm helpers unless SSH refuses a session", flush=True)
+        controls = {row["control"] for row in rows}
+        for host, path in (("source", b + "/da"), ("destination", c + "/")):
+            words = ["syq", "cp", "--auth-from", "@laptop", "--from", host, path]
+            remote("requester", shlex.join([
+                "env", "PATH=/usr/bin:/bin:/usr/local/bin", "syq", "completion",
+                "__complete", "fish", str(len(words) - 1), "--", *words]))
+        def spares():
+            return probe("requester", "pool_spares", controls=list(controls))
+
+        wait_for("prepared helpers on both approved masters",
+                 lambda: set(spares()) == controls)
+        warm_spares = spares()
+        assert set(warm_spares) == controls, "prepared helpers disappeared before copy"
+        no_pending()
         port = 47811
         with copying("tcp", ("--tcp-ports", f"{port}-{port}",
                              "--resource-limits", "bandwidth=1M")) as (process, output):
@@ -391,9 +424,25 @@ def main():
             assert fingerprint("destination") == c_keys
             finish(process, output)
         assert_results("tcp")
+        after = json.loads(requester("persist", "status", "--json"))["authorized_ssh"]
+        assert {row["control"] for row in after} == controls, "peer copy replaced approved masters"
+        assert all(row["connected"] for row in after), after
 
-        # SSH setup opens another session beside C's live control session.
-        # This scenario runs in the default profile, which allows both.
+        # TCP uses one session on each master; SSH key setup needs another
+        # beside C's live control. This limit must fail without a different route.
+        if os.environ.get("SYQ_REAL_SSH_PROFILE") == "max-sessions-1":
+            print("case: one-session destination refuses concurrent SSH worker setup", flush=True)
+            with copying("ssh-session-limit", ("--no-tcp",)) as (process, output):
+                # Session contention uses the normal bounded worker retries.
+                text = finish(process, output, success=False)
+                assert "MaxSessions >= 2" in text, text
+            remote("destination", "test ! -e " + shlex.quote(c + "/ssh-session-limit"))
+            wait_for("session-limit destination key cleanup", lambda: fingerprint("destination") == c_keys)
+            assert fingerprint("source") == b_keys
+            no_pending()
+            return
+
+        assert spares() == warm_spares, "successful TCP copy discarded warm completion helpers"
         print("case: blocked TCP falls back to direct restricted SSH with saved providers", flush=True)
         for host in ("source", "destination"):
             requester("persist", "auth-from", "@laptop", "--for", host)
@@ -406,6 +455,16 @@ def main():
             remote("destination", "test ! -e " + shlex.quote(outside))
             finish(process, output)
         assert_results("fallback")
+        assert spares() == warm_spares, "successful SSH fallback discarded warm completion helpers"
+
+        print("case: completion consumes the helper preserved across peer copies", flush=True)
+        words = ["syq", "cp", "--auth-from", "@laptop", "--from", "source", b + "/da"]
+        candidates = remote("requester", shlex.join([
+            "env", "PATH=/usr/bin:/bin:/usr/local/bin", "syq", "completion",
+            "__complete", "fish", str(len(words) - 1), "--", *words]))
+        assert b + "/data" in candidates, candidates
+        source_control = next(row["control"] for row in after if row["requested"]["host"] == "source")
+        assert spares().get(source_control) != warm_spares[source_control], "completion did not consume its spare"
 
         print("case: SSH-only source coordination restricts the key and cancels its authority", flush=True)
         with copying("cancelled", ("--no-tcp", "--coordinate-at", "src",

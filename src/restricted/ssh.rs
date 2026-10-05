@@ -39,6 +39,7 @@ pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroke
             socket_name: "s",
             listener_thread: "receiver-ssh",
             client_thread: "receiver-ssh-worker",
+            inline_on_thread_failure: false,
             max_connections: 128,
             io_timeout: TIMEOUT,
         },

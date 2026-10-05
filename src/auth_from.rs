@@ -178,19 +178,35 @@ fn path(domain: &Domain) -> Result<PathBuf> {
 fn read(path: &Path) -> Result<Config> {
     read_inner(path).with_context(|| {
         format!(
-            "read saved authorization choice from {}; repair this file or pass --auth-from explicitly",
+            "read saved authorization choice from {}; repair this file or pass --auth-from explicitly (--syq-auth-from for rsync)",
             path.display(),
         )
     })
 }
 
+fn linked_target(path: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(path).with_context(|| {
+        format!(
+            "resolve symlinked authorization preferences {}; the target must exist",
+            path.display()
+        )
+    })
+}
+
 fn read_inner(path: &Path) -> Result<Config> {
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let open = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+    };
+    let mut file = match open(path) {
         Ok(file) => file,
+        // Keep the ordinary read to one open. A final symlink resolves once;
+        // a dangling target is an error, never a missing/default preference.
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            open(&linked_target(path)?).context("open linked authorization preferences")?
+        }
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 || error.raw_os_error() == Some(libc::ENOTDIR) =>
@@ -233,6 +249,15 @@ pub(crate) fn resolve(domain: &Domain, host: &str, explicit: Option<AuthFrom>) -
         return Ok(choice);
     }
     load(domain)?.selected(host)
+}
+
+pub(crate) fn selected_context<T>(result: Result<T>, mode: &AuthFrom, explicit: bool) -> Result<T> {
+    match mode {
+        AuthFrom::Provider(provider) if !explicit => result.with_context(|| {
+            format!("authorization provider {provider} comes from the saved auth-from choice")
+        }),
+        _ => result,
+    }
 }
 
 pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
@@ -278,10 +303,51 @@ fn update_inner(
     if create_parent {
         std::fs::create_dir_all(parent).context("create authorization configuration directory")?;
     }
+    let linked_file = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_symlink(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("inspect authorization preferences"),
+    };
+    let target = if linked_file {
+        linked_target(path)?
+    } else {
+        path.to_owned()
+    };
+    let parent = target
+        .parent()
+        .context("authorization target parent missing")?;
+    let linked = linked_file || std::fs::symlink_metadata(parent)?.file_type().is_symlink();
+    // Resolve once, then lock, read and atomically replace in the target's
+    // directory. Different links to the same file share this lock, and the
+    // user's symlink is never replaced when preferences are saved.
+    let parent = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "resolve authorization configuration directory {}",
+            parent.display()
+        )
+    })?;
+    let path = parent.join(
+        target
+            .file_name()
+            .context("authorization configuration filename missing")?,
+    );
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent).with_context(|| format!("open authorization configuration directory {}; use a real directory, not a symlink", parent.display()))?;
+        .open(&parent)
+        .with_context(|| {
+            format!(
+                "open authorization configuration directory {}",
+                parent.display()
+            )
+        })?;
+    if linked {
+        anyhow::ensure!(
+            directory.metadata()?.uid() == unsafe { libc::geteuid() },
+            "symlinked authorization configuration directory must be owned by this user: {}",
+            parent.display()
+        );
+    }
     // A read-modify-write changes one override while preserving concurrent
     // changes made by another `persist auth-from` command.
     loop {
@@ -293,7 +359,7 @@ fn update_inner(
             return Err(error).context("lock authorization configuration");
         }
     }
-    let mut config = read(path)?;
+    let mut config = read(&path)?;
     match (host, value) {
         (None, value) => config.default = value.map(spelling),
         (Some(host), Some(value)) => {
@@ -303,12 +369,12 @@ fn update_inner(
             config.hosts.remove(host);
         }
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
     serde_json::to_writer_pretty(&mut temporary, &config)?;
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary
-        .persist(path)
+        .persist(&path)
         .map_err(|error| error.error)
         .context("write authorization preferences")?;
     Ok(config)
@@ -520,6 +586,137 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved, original);
         }
+    }
+
+    #[test]
+    fn linked_config_directory_and_file_update_target_without_replacing_links() {
+        let root = crate::test_support::tempdir().unwrap();
+        let target = root.path().join("owned-config");
+        std::fs::create_dir(&target).unwrap();
+        let linked = root.path().join("config");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        let path = linked.join("auth-from.json");
+        update(&path, Some("backup"), Some(&AuthFrom::Ssh), true).unwrap();
+        update(
+            &path,
+            None,
+            Some(&AuthFrom::Provider(Provider::Return("laptop".into()))),
+            true,
+        )
+        .unwrap();
+        assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            read(&target.join("auth-from.json"))
+                .unwrap()
+                .selected("backup")
+                .unwrap(),
+            AuthFrom::Ssh
+        );
+        assert_eq!(
+            read(&path).unwrap().selected("other").unwrap(),
+            AuthFrom::Provider(Provider::Return("laptop".into()))
+        );
+
+        let actual = target.join("saved.json");
+        std::fs::rename(&path, &actual).unwrap();
+        let original = std::fs::read(&actual).unwrap();
+        let mut old_reader = std::fs::File::open(&actual).unwrap();
+        std::os::unix::fs::symlink("saved.json", &path).unwrap();
+        assert_eq!(
+            read(&path).unwrap().selected("backup").unwrap(),
+            AuthFrom::Ssh
+        );
+        update(&path, None, Some(&AuthFrom::Auto), true).unwrap();
+        update(&path, Some("backup"), None, true).unwrap();
+        assert_eq!(std::fs::read_link(&path).unwrap(), Path::new("saved.json"));
+        assert_eq!(
+            read(&actual).unwrap().selected("backup").unwrap(),
+            AuthFrom::Auto
+        );
+        // Replacement is atomic: a reader of the old inode still sees the
+        // complete old configuration, while the link now reads the new one.
+        let mut old_contents = Vec::new();
+        old_reader.read_to_end(&mut old_contents).unwrap();
+        assert_eq!(old_contents, original);
+    }
+
+    #[test]
+    fn linked_preferences_reject_missing_and_unsafe_targets_without_changing_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::tempdir().unwrap();
+        let path = root.path().join("auth-from.json");
+        let target = root.path().join("saved.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        for error in [
+            read(&path).err().unwrap(),
+            update(&path, None, None, true).err().unwrap(),
+        ] {
+            assert!(format!("{error:#}").contains("the target must exist"));
+        }
+        assert!(!target.exists());
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read(&path).is_err());
+        assert!(update(&path, None, Some(&AuthFrom::Ssh), true).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+    }
+
+    #[test]
+    fn concurrent_updates_through_different_links_preserve_all_overrides() {
+        let root = crate::test_support::tempdir().unwrap();
+        let target = root.path().join("saved.json");
+        std::fs::write(&target, br#"{"version":1,"future":true}"#).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let directory = root.path().join(format!("config-{index}"));
+                std::fs::create_dir(&directory).unwrap();
+                let link = directory.join("auth-from.json");
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    update(
+                        &link,
+                        Some(&format!("host-{index}")),
+                        Some(&AuthFrom::Ssh),
+                        true,
+                    )
+                    .unwrap();
+                    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let config = read(&target).unwrap();
+        assert_eq!(config.hosts.len(), 8);
+        assert!(config.hosts.values().all(|value| value == "ssh"));
+        assert_eq!(config.extensions["future"], true);
+        assert_eq!(config.version, Some(1));
+    }
+
+    #[test]
+    fn saved_provider_error_context_preserves_typed_failure() {
+        let mode = AuthFrom::Provider(Provider::Return("laptop".into()));
+        let error = selected_context::<()>(
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into()),
+            &mode,
+            false,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider @laptop comes from the saved"));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        let explicit =
+            selected_context::<()>(Err(anyhow::anyhow!("original")), &mode, true).unwrap_err();
+        assert_eq!(explicit.to_string(), "original");
     }
 
     #[test]

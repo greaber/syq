@@ -1046,3 +1046,53 @@ fn bandwidth_limited_relays_transfer_only_differing_blocks() {
         assert!(partial_files(&t.0).is_empty());
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn staging_recovery_preserves_patch_sources() {
+    // Patches carry no payload hash of their own: with transfer integrity
+    // on, the recovery path must still publish them rather than refuse them.
+    for (network, integrity) in [(false, false), (true, false), (false, true), (true, true)] {
+        let t = Tmp::new();
+        // A comparison group must fit more than two files so the failure
+        // leaves two staged patches to write on the network worker threads.
+        let source = prng(2 << 20, 8317);
+        let mut old = source.clone();
+        old[..1 << 20].fill(b'x');
+        for index in 0..8 {
+            write(&t.path(&format!("src/f{index}")), &source);
+            write(&t.path(&format!("dst/f{index}")), &old);
+            set_mtime(&t.path(&format!("dst/f{index}")), 1);
+        }
+        let mut command = compat_command();
+        command
+            .args([
+                "-a",
+                "--no-progress",
+                "--no-whole-file",
+                "--performance-tuning=workers=2,batch-files=8",
+                &t.s("src/"),
+                &t.s("dst/"),
+            ])
+            .env("SYQ_TEST_STAGING_LIMIT", "2")
+            .env("SYQ_DEBUG", "1");
+        if network {
+            command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+        }
+        if integrity {
+            command.arg("--integrity-checking=transfer=blake3");
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        assert!(
+            stderr_of(&out).contains("reducing small-file staging"),
+            "{}",
+            stderr_of(&out)
+        );
+        assert_eq!(tuning_observed(&out)["patched_files"], 8);
+        for index in 0..8 {
+            assert_eq!(read(&t.path(&format!("dst/f{index}"))), source);
+        }
+        assert!(partial_files(&t.path("dst")).is_empty());
+    }
+}

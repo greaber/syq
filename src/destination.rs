@@ -31,6 +31,7 @@ use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
 pub(crate) mod account_copy;
 pub(crate) mod exec;
 mod forward;
+pub(crate) use forward::DeadlineIo;
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod peer_bridge;
@@ -165,10 +166,7 @@ impl ReturnConnection {
     }
 
     pub(crate) fn ssh_command(&self) -> Result<Command> {
-        self.ssh
-            .as_ref()
-            .context("copy has no SSH worker authorization")?
-            .command()
+        self.ssh.as_ref().ok_or(SshWorkersUnavailable)?.command()
     }
 
     pub(crate) fn take_control(&self) -> Result<UnixStream> {
@@ -179,6 +177,17 @@ impl ReturnConnection {
             .context("approved return control connection was already consumed")
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct SshWorkersUnavailable;
+impl std::fmt::Display for SshWorkersUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "approved source requires direct TCP; SSH source authorization is unavailable",
+        )
+    }
+}
+impl std::error::Error for SshWorkersUnavailable {}
 
 /// This value is a TCP address candidate only, never SSH or shell syntax.
 fn validate_data_hostname(host: &str) -> Result<()> {
@@ -645,6 +654,7 @@ fn exchange(
             "named destination requires its matching helper; reconnect from the receiving machine"
         );
     }
+    let ssh_setup = matches!(message, Message::ForwardSsh { .. });
     let deadline = Instant::now() + timeout;
     let mut stream = connect_socket(&registration.socket, deadline, stream_timeout).map_err(|error| {
         let message = if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -676,8 +686,17 @@ fn exchange(
         },
     )?;
     let reply = read_message(&mut io)?;
-    if let Reply::Error(error) = &reply {
-        bail!("receiving machine: {error}");
+    match &reply {
+        Reply::Error(error) if ssh_setup => {
+            return Err(forward::ssh::SetupRefusal(format!("receiving machine: {error}")).into());
+        }
+        Reply::RetryableError(error) if ssh_setup => {
+            return Err(
+                ssh_auth::RetryableSetupError(format!("receiving machine: {error}")).into(),
+            );
+        }
+        Reply::Error(error) => bail!("receiving machine: {error}"),
+        _ => {}
     }
     Ok((stream, reply))
 }
@@ -1247,6 +1266,15 @@ impl Receiver {
             } => self.pull(target, command, cwd, *request, stream),
             Message::ForwardSsh { token, public_key } => {
                 self.forward_ssh(token, public_key, stream)
+                    .map_err(|error| {
+                        if ssh_auth::retryable_setup_error(&error) {
+                            // A lost setup reply may follow a successful key install.
+                            // Keep that uncertainty retryable across the return RPC.
+                            ssh_auth::RetryableSetupError(format!("{error:#}")).into()
+                        } else {
+                            error
+                        }
+                    })
             }
             Message::Forward {
                 target,
@@ -1567,6 +1595,7 @@ pub(crate) fn serve_background(
             socket_name: "r",
             listener_thread: "syq-return-listener",
             client_thread: "syq-return-client",
+            inline_on_thread_failure: false,
             max_connections: 272,
             io_timeout: Duration::from_secs(10),
         },
