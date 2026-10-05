@@ -159,6 +159,10 @@ thread_local! {
     static REFUSE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Patched files this thread wrote over a clone of the file they replace.
     static CLONED_PATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs when a patch's stage holds the clone or copy of the file it
+    /// replaces, before the differing blocks are written over it.
+    static AFTER_SEEDING: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Start `work` on a thread of `scope`, unless the system refuses one.
@@ -673,11 +677,13 @@ impl FsOps {
 
     /// Write a patch's stage from the file it replaces: that file, cloned
     /// or copied in the kernel, with the differing blocks written over it.
-    /// A stage made as the clone, as on macOS, holds it already. When the
-    /// file cannot be copied so, or changed after it was hashed, the stage
-    /// holds the assembled file instead, its reused blocks read and checked
-    /// again. The write is observed unless `unobserved` collects its bytes
-    /// for a caller that records them, as `write_small_stage` does.
+    /// A stage made as the clone, as on macOS, holds it already; any other
+    /// stage that can take the copy was created empty for it
+    /// (`create_seeded_stage`). When the file cannot be copied so, or
+    /// changed after it was hashed, the stage holds the assembled file
+    /// instead, its reused blocks read and checked again. The write is
+    /// observed unless `unobserved` collects its bytes for a caller that
+    /// records them, as `write_small_stage` does.
     fn write_patch_stage(
         &self,
         source: &PatchSource<'_>,
@@ -689,12 +695,8 @@ impl FsOps {
         // Like a clone, a copy is trusted only if the file it came from
         // still has the fingerprint it had when its blocks were hashed:
         // nothing changed it before or while it was copied.
-        let copied = if stage.cloned {
-            true
-        } else {
-            file.set_len(0)?;
-            self.copy_basis(source, stage)
-        } && fingerprint(&source.old.metadata()?) == source.basis;
+        let copied = (stage.cloned || self.copy_basis(source, stage))
+            && fingerprint(&source.old.metadata()?) == source.basis;
         if !copied {
             file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;
@@ -708,7 +710,14 @@ impl FsOps {
             .with_context(|| format!("write {}", stage.label.display()));
         }
         #[cfg(test)]
-        CLONED_PATCHES.set(CLONED_PATCHES.get() + 1);
+        {
+            CLONED_PATCHES.set(CLONED_PATCHES.get() + 1);
+            AFTER_SEEDING.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook()
+                }
+            });
+        }
         let writing = unobserved.is_none().then(|| {
             self.operation
                 .span(crate::transfer_observations::Stage::DestinationWrite)
@@ -1056,7 +1065,8 @@ impl FsOps {
 
     /// Create the stage of a put, or of a patch with the file it reuses
     /// blocks of. On macOS, where a clone is a new file, a cloning patch's
-    /// stage is made as a clone of that file when it can be.
+    /// stage is made as a clone of that file when it can be. On Linux a
+    /// patch's stage takes a clone or copy of that file once created.
     fn create_stage(
         &mut self,
         put: &SmallPut,
@@ -1078,8 +1088,39 @@ impl FsOps {
                 });
             }
         }
-        let _ = source;
+        if cfg!(target_os = "linux") && source.is_some() {
+            return self.create_seeded_stage(put, target);
+        }
         self.create_small_stage(put, target)
+    }
+
+    /// The stage of a patch that will take a clone or copy of the file it
+    /// replaces. Those bytes may be kept from others: the wanted mode, the
+    /// group a new file gets, or an ACL inherited from the directory could
+    /// let them read them beside the target, and whoever opened a sidecar
+    /// left at the name while its mode was wider can read what is written to
+    /// it. So the stage is created exclusively, replacing anything at the
+    /// name, with only its owner's permissions, and publication sets the
+    /// wanted mode. It is new whatever mode the filesystem gave it.
+    fn create_seeded_stage(&mut self, put: &SmallPut, target: RootedTarget) -> Result<SmallStage> {
+        self.uncache_rooted(&target.root, &target.relative);
+        let mode = staged_file_mode(&put.meta, put.flags) & 0o700;
+        let (partial, label, (file, created)) =
+            with_rooted_partial(&target, &put.copy_id, |relative, label| {
+                self.uncache_rooted(&target.root, relative);
+                create_fresh_rooted_partial(&target.root, relative, label, || {
+                    target.root.create_write_only_file(relative, mode)
+                })
+            })?;
+        Ok(SmallStage {
+            target,
+            partial,
+            label,
+            file,
+            reused: false,
+            cloned: false,
+            created,
+        })
     }
 
     /// Clone the file a patch reuses blocks of to the patch's sidecar name,
@@ -1720,6 +1761,178 @@ mod tests {
         expected[5 * block as usize..6 * block as usize].fill(2);
         assert_eq!(fs::read(&path).unwrap(), expected);
         assert_eq!(entries(directory), 1);
+    }
+
+    /// Run `f` with `hook` called whenever a patch's stage holds the clone or
+    /// copy of the file it replaces, before the differing blocks are written.
+    #[cfg(target_os = "linux")]
+    fn after_seeding<R>(hook: impl FnMut() + 'static, f: impl FnOnce() -> R) -> R {
+        AFTER_SEEDING.set(Some(Box::new(hook)));
+        let result = f();
+        AFTER_SEEDING.set(None);
+        result
+    }
+
+    /// A file of 32 comparison blocks whose block 20 holds `secret` and
+    /// nothing else does, written at `path` with mode 0600, and the same
+    /// file with that block replaced.
+    #[cfg(target_os = "linux")]
+    fn private_old_file(path: &Path, secret: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let block = MIN_HASH_BLOCK_BYTES as usize;
+        let mut old: Vec<u8> = (0..32 * block).map(|i| (i % 249) as u8 | 1).collect();
+        for chunk in old[20 * block..21 * block].chunks_mut(secret.len()) {
+            chunk.copy_from_slice(&secret[..chunk.len()]);
+        }
+        let mut new = old.clone();
+        new[20 * block..21 * block].fill(0x5a);
+        fs::write(path, &old).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        (old, new)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seeded_stage_lets_no_one_else_read_the_file_it_replaces() {
+        // A patch's stage takes a clone or kernel copy of the file it
+        // replaces before the differing blocks are written over it. Until
+        // publication gives it the wanted mode, only its owner may open it:
+        // the old file here is private and the new one is not, so a stage
+        // created in the wanted mode would let others read the old file's
+        // bytes beside the target.
+        let block = MIN_HASH_BLOCK_BYTES;
+        for (wanted, cloning) in [(0o644, true), (0o644, false), (0o4755, false)] {
+            let case = format!("mode {wanted:o} cloning {cloning}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let path = directory.join("file");
+            let (_, new) = private_old_file(&path, b"old");
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops
+                .hash_existing_batch(
+                    block,
+                    &[ExistingRead {
+                        path: b"file".to_vec(),
+                        len: new.len() as u64,
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    }],
+                )
+                .remove(0)
+                .unwrap();
+            let mut patch = patch_from("file", &new, block, &hashed, algorithm);
+            patch.meta.mode = wanted;
+            patch.flags = flags::MODE;
+            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
+            let sidecar = directory.join(relative.to_path_buf());
+            let seeded = std::rc::Rc::new(std::cell::Cell::new(None));
+            let observed = seeded.clone();
+            let results = after_seeding(
+                move || observed.set(Some(fs::metadata(&sidecar).unwrap().mode() & 0o7777)),
+                || refusing_clones(!cloning, || ops.patch_small_batch(&[patch])),
+            )
+            .unwrap();
+            assert!(results[0].is_ok(), "{case}: {:?}", results[0]);
+            let seeded = seeded
+                .get()
+                .expect("the stage takes a copy of the old file");
+            assert_eq!(seeded & 0o077, 0, "{case}: seeded in mode {seeded:o}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                wanted,
+                "{case}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(entries(directory), 1, "{case}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seeded_stage_is_a_new_file_even_where_a_leftover_looks_new() {
+        // Permissions are checked only at open: whoever opened a sidecar
+        // while its mode was wider still reads it through that descriptor.
+        // An earlier attempt at the same file that failed for want of space
+        // left an empty sidecar in the file's final mode; one narrowed to
+        // 0600 and emptied by a later attempt looks just like a new private
+        // file. The patch's stage must be neither: it is created
+        // exclusively, and still takes a clone or copy of the old file.
+        let block = MIN_HASH_BLOCK_BYTES;
+        let secret = b"only the old file holds these bytes";
+        for (origin, cloning) in [
+            ("full disk", true),
+            ("full disk", false),
+            ("narrowed", true),
+            ("narrowed", false),
+        ] {
+            let case = format!("{origin} cloning {cloning}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let path = directory.join("file");
+            let (_, new) = private_old_file(&path, secret);
+            let mut ops = receiver(directory);
+            let algorithm = ops.hash_policy.algorithm;
+            let hashed = ops
+                .hash_existing_batch(
+                    block,
+                    &[ExistingRead {
+                        path: b"file".to_vec(),
+                        len: new.len() as u64,
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    }],
+                )
+                .remove(0)
+                .unwrap();
+            let mut patch = patch_from("file", &new, block, &hashed, algorithm);
+            patch.meta.mode = 0o644;
+            patch.flags = flags::MODE;
+            let mut whole = put("file", &new);
+            whole.copy_id = patch.copy_id;
+            whole.meta = patch.meta.clone();
+            whole.flags = patch.flags;
+            whole.replaces = true;
+            let failed = without_space(|| ops.put_small_batch(&[whole]));
+            assert!(failed[0].is_err(), "{case}: {:?}", failed[0]);
+            let target = ops.destination_mutation_target(b"file", None).unwrap();
+            let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
+            let sidecar = directory.join(relative.to_path_buf());
+            let reader = File::open(&sidecar).unwrap();
+            assert_eq!(reader.metadata().unwrap().len(), 0, "{case}");
+            if origin == "narrowed" {
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let read_all = |file: &File| {
+                let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+                file.read_exact_at(&mut bytes, 0).unwrap();
+                bytes
+            };
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let (held, observed) = (reader.try_clone().unwrap(), seen.clone());
+            CLONED_PATCHES.set(0);
+            let results = after_seeding(
+                move || observed.borrow_mut().push(read_all(&held)),
+                || refusing_clones(!cloning, || ops.patch_small_batch(&[patch])),
+            )
+            .unwrap();
+            assert!(results[0].is_ok(), "{case}: {:?}", results[0]);
+            assert_eq!(CLONED_PATCHES.get(), 1, "{case}: the stage takes a copy");
+            seen.borrow_mut().push(read_all(&reader));
+            for bytes in seen.borrow().iter() {
+                assert!(
+                    !bytes.windows(secret.len()).any(|bytes| bytes == secret),
+                    "{case}: the held descriptor reads the old file's bytes"
+                );
+            }
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                0o644,
+                "{case}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(entries(directory), 1, "{case}");
+        }
     }
 
     #[cfg(target_os = "linux")]
