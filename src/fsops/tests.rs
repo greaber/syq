@@ -1889,6 +1889,29 @@ fn access_acl(file: &File) -> Option<Vec<u8>> {
     Some(value)
 }
 
+/// Set a POSIX ACL xattr on `path`, or say why the test is skipped when the
+/// test filesystem has no POSIX ACLs.
+#[cfg(target_os = "linux")]
+fn set_acl_or_skip(path: &Path, name: &std::ffi::CStr, acl: &[u8]) -> bool {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    if unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    } == 0
+    {
+        return true;
+    }
+    let error = io::Error::last_os_error();
+    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+    eprintln!("skipping: the test filesystem has no POSIX ACLs ({error})");
+    false
+}
+
 /// What an ACL grants a named user once its mask applies.
 #[cfg(target_os = "linux")]
 fn granted_to_user(acl: &[u8], uid: u32) -> u16 {
@@ -1932,20 +1955,7 @@ fn acls_are_set_before_the_mode_so_inherited_entries_stay_masked() {
         (0x10, 6, ANY),
         (0x20, 0, ANY),
     ]);
-    let parent_path = CString::new(parent.as_os_str().as_bytes()).unwrap();
-    if unsafe {
-        libc::setxattr(
-            parent_path.as_ptr(),
-            c"system.posix_acl_default".as_ptr(),
-            default.as_ptr().cast(),
-            default.len(),
-            0,
-        )
-    } != 0
-    {
-        let error = io::Error::last_os_error();
-        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
-        eprintln!("skipping: the test filesystem has no POSIX ACLs ({error})");
+    if !set_acl_or_skip(&parent, c"system.posix_acl_default", &default) {
         return;
     }
     let source = |mode: u32| {
@@ -2019,6 +2029,189 @@ fn acls_are_set_before_the_mode_so_inherited_entries_stay_masked() {
     assert!(
         exposed.is_empty(),
         "the inherited entry was granted permissions on the way: {exposed:?}"
+    );
+}
+
+/// A file's ACL with the owner, mask and other entries of `mode`, a named
+/// user granted `r--`, and the owning group `r--`.
+#[cfg(target_os = "linux")]
+fn acl_for_mode(mode: u32) -> Vec<u8> {
+    posix_acl(&[
+        (0x01, (mode >> 6) as u16 & 7, u32::MAX),
+        (0x02, 4, 54_322),
+        (0x04, 4, u32::MAX),
+        (0x10, (mode >> 3) as u16 & 7, u32::MAX),
+        (0x20, mode as u16 & 7, u32::MAX),
+    ])
+}
+
+#[cfg(target_os = "linux")]
+fn meta_with_access_acl(mode: u32, access: Option<Vec<u8>>) -> Meta {
+    Meta {
+        inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+            acls: Some(crate::inode_metadata::PosixAcls {
+                access,
+                default: None,
+            }),
+            ..Default::default()
+        })),
+        mode,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_mode_is_set_where_setting_an_acl_leaves_it_alone() {
+    // A FUSE daemon such as s3fs can keep an ACL apart from the mode, so
+    // setting the source's ACL need not set the permission bits. The mode
+    // must still end as requested, for a new stage and for an existing
+    // file that had another mode.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let probe = temporary.path().join("probe");
+    fs::write(&probe, b"").unwrap();
+    if !set_acl_or_skip(&probe, c"system.posix_acl_access", &acl_for_mode(0o640)) {
+        return;
+    }
+    let mut wrong = Vec::new();
+    for (name, created) in [("new stage", 0o600), ("existing file", 0o644)] {
+        let path = temporary.path().join(name);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(created)
+            .open(&path)
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(created)).unwrap();
+        let meta = meta_with_access_acl(0o640, Some(acl_for_mode(0o777)));
+        let current = file.metadata().unwrap();
+        crate::inode_metadata::ACL_KEEPS_MODE.set(true);
+        let applied = if name == "new stage" {
+            set_meta_written_file_for_publication(&file, &meta, flags::MODE, &current)
+        } else {
+            set_meta_file(&file, &meta, flags::MODE)
+        };
+        crate::inode_metadata::ACL_KEEPS_MODE.set(false);
+        applied.unwrap();
+        let mode = file.metadata().unwrap().mode() & 0o7777;
+        if mode != 0o640 || access_acl(&file) != Some(acl_for_mode(0o640)) {
+            wrong.push(format!("{name}: {mode:o}"));
+        }
+    }
+    assert!(wrong.is_empty(), "the requested 640 was not set: {wrong:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn acl_preservation_reads_a_files_access_acl_once() {
+    // Under -A every file's access ACL is compared before it is changed.
+    // One read serves both the comparison and the decision to remove one.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let probe = temporary.path().join("probe");
+    fs::write(&probe, b"").unwrap();
+    if !set_acl_or_skip(&probe, c"system.posix_acl_access", &acl_for_mode(0o640)) {
+        return;
+    }
+    let mut reads = Vec::new();
+    for (name, has, wanted) in [
+        ("neither has an ACL", false, false),
+        ("the source's ACL is added", false, true),
+        ("the file's ACL is removed", true, false),
+        ("the ACL is replaced", true, true),
+    ] {
+        let path = temporary.path().join(name);
+        fs::write(&path, b"contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        if has {
+            assert!(set_acl_or_skip(
+                &path,
+                c"system.posix_acl_access",
+                &posix_acl(&[
+                    (0x01, 6, u32::MAX),
+                    (0x02, 6, 54_321),
+                    (0x04, 0, u32::MAX),
+                    (0x10, 6, u32::MAX),
+                    (0x20, 0, u32::MAX),
+                ])
+            ));
+        }
+        let file = File::open(&path).unwrap();
+        let meta = meta_with_access_acl(0o640, wanted.then(|| acl_for_mode(0o777)));
+        crate::inode_metadata::ACCESS_ACL_READS.set(0);
+        set_meta_file(&file, &meta, flags::MODE).unwrap();
+        let count = crate::inode_metadata::ACCESS_ACL_READS.get();
+        assert_eq!(
+            access_acl(&file),
+            wanted.then(|| acl_for_mode(0o640)),
+            "{name}"
+        );
+        assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640, "{name}");
+        if count != 1 {
+            reads.push(format!("{name}: {count}"));
+        }
+    }
+    assert!(reads.is_empty(), "access ACL reads per file: {reads:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn removing_an_acl_never_widens_the_file_on_the_way() {
+    // An existing file has an ACL the source lacks, with a mask (rw-) wider
+    // than its owning group's entry (---) and than the requested group bits
+    // (r--). Removing the ACL makes its mask the group bits until a chmod,
+    // so the mode is narrowed first: nobody gets more than the file granted
+    // before or grants after.
+    const NAMED: u32 = 54_321;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("file");
+    fs::write(&path, b"contents").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let acl = posix_acl(&[
+        (0x01, 6, u32::MAX),
+        (0x02, 6, NAMED),
+        (0x04, 0, u32::MAX),
+        (0x10, 6, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ]);
+    if !set_acl_or_skip(&path, c"system.posix_acl_access", &acl) {
+        return;
+    }
+    let file = File::open(&path).unwrap();
+    // The owning group's grant: its entry under the mask, or the group bits.
+    let group_grant = |file: &File| match access_acl(file) {
+        Some(acl) => {
+            let entry = |tag: u16| {
+                acl[4..]
+                    .chunks_exact(8)
+                    .find(|entry| u16::from_le_bytes([entry[0], entry[1]]) == tag)
+                    .map(|entry| u16::from_le_bytes([entry[2], entry[3]]))
+            };
+            entry(0x04).unwrap() & entry(0x10).unwrap_or(7)
+        }
+        None => (file.metadata().unwrap().mode() >> 3) as u16 & 7,
+    };
+    let granted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = granted.clone();
+    ACCESS_CHANGED.set(Some(Box::new(move |file: &File| {
+        let named = access_acl(file).map_or(0, |acl| granted_to_user(&acl, NAMED));
+        observed.borrow_mut().push((named, group_grant(file)));
+    })));
+    let applied = set_meta_file(&file, &meta_with_access_acl(0o640, None), flags::MODE);
+    ACCESS_CHANGED.set(None);
+    applied.unwrap();
+    assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640);
+    assert_eq!(access_acl(&file), None);
+    let granted = granted.borrow();
+    assert!(!granted.is_empty());
+    // Before: the named user rw-, the group nothing. After: the group r--.
+    assert!(
+        granted
+            .iter()
+            .all(|&(named, group)| named & !6 == 0 && group & !4 == 0),
+        "(named user, owning group) grants on the way: {granted:?}"
     );
 }
 

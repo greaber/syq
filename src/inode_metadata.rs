@@ -118,6 +118,17 @@ impl InodeMetadata {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Leaves the mode as it was when this thread sets an access ACL, as a
+    /// FUSE daemon that keeps ACLs apart from the mode does.
+    pub(crate) static ACL_KEEPS_MODE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The access ACL reads this thread has made.
+    pub(crate) static ACCESS_ACL_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
@@ -183,6 +194,10 @@ mod platform {
         Ok(names)
     }
     fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        if name == ACCESS {
+            ACCESS_ACL_READS.set(ACCESS_ACL_READS.get() + 1);
+        }
         let path = handle(file);
         let name = CString::new(name)?;
         match read_bytes(|buffer, len| unsafe {
@@ -198,12 +213,20 @@ mod platform {
         if get(file, name)?.as_deref() == value {
             return Ok(());
         }
+        write(file, name, value)
+    }
+    /// Set or remove an attribute already read to differ from `value`.
+    fn write(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_XATTR")
             .is_some_and(|selected| selected.as_encoded_bytes() == name)
         {
             anyhow::bail!("injected attribute reconciliation failure: {:?}", name);
         }
+        #[cfg(test)]
+        let kept_mode = (ACL_KEEPS_MODE.get() && name == ACCESS && value.is_some())
+            .then(|| file.metadata().map(|metadata| metadata.mode() & 0o7777))
+            .transpose()?;
         let path = handle(file);
         let name = CString::new(name)?;
         let result = if let Some(value) = value {
@@ -225,6 +248,10 @@ mod platform {
                 return Ok(());
             }
             return Err(error).with_context(|| format!("reconcile attribute {:?}", name));
+        }
+        #[cfg(test)]
+        if let Some(mode) = kept_mode {
+            crate::fsops::set_mode_handle(file, mode)?;
         }
         crate::fsops::access_changed(file);
         Ok(())
@@ -338,31 +365,18 @@ mod platform {
         }
         Ok(acl)
     }
-    /// The access ACL with only the owner, group and other entries of
-    /// `mode`, which the kernel stores as those mode bits alone.
-    fn base_access(mode: u32) -> Vec<u8> {
-        let mut acl = 2u32.to_le_bytes().to_vec();
-        for (tag, permissions) in [(0x01u16, mode >> 6), (0x04, mode >> 3), (0x20, mode)] {
-            acl.extend(tag.to_le_bytes());
-            acl.extend(((permissions & 7) as u16).to_le_bytes());
-            acl.extend(u32::MAX.to_le_bytes());
-        }
-        acl
-    }
-
-    /// Set the POSIX ACLs. An access ACL's owner, mask (or group) and other
-    /// entries are the file's permission bits, so this sets those of `mode`
-    /// too, and returns whether it did. With `mode_selected`, an access ACL
-    /// the file should lose is replaced by the one holding just `mode`, which
-    /// the kernel stores as the mode alone: one step that drops the ACL and
-    /// sets the bits. Removing the ACL would leave its mask as the group bits
-    /// until a chmod.
+    /// Set the POSIX ACLs, reading the access ACL once. The caller then sets
+    /// the mode, which the access ACL's owner, mask (or group) and other
+    /// entries share on most filesystems. With `mode_selected`, an access ACL
+    /// is removed only after the mode is narrowed to what both it and `mode`
+    /// grant: removing it makes its mask the group bits until the chmod.
+    /// Returns the mode that narrowing set, when it changed it.
     pub(super) fn apply_acls(
         file: &File,
         acls: &PosixAcls,
         mode: u32,
         mode_selected: bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<u32>> {
         let current = file.metadata()?;
         anyhow::ensure!(
             !current.file_type().is_symlink(),
@@ -376,24 +390,23 @@ mod platform {
             .as_deref()
             .map(|a| access_for_mode(a, mode))
             .transpose()?;
-        let carried = match access {
-            Some(access) => {
-                set(file, ACCESS, Some(&access))?;
-                true
+        let existing = get(file, ACCESS)?;
+        let mut narrowed = None;
+        if existing != access {
+            if access.is_none() && mode_selected {
+                let bits = current.mode() & 0o7000 | current.mode() & mode & 0o777;
+                if bits != current.mode() & 0o7777 {
+                    crate::fsops::set_mode_handle(file, bits)?;
+                    crate::fsops::access_changed(file);
+                    narrowed = Some(bits);
+                }
             }
-            None if mode_selected && get(file, ACCESS)?.is_some() => {
-                set(file, ACCESS, Some(&base_access(mode)))?;
-                true
-            }
-            None => {
-                set(file, ACCESS, None)?;
-                false
-            }
-        };
+            write(file, ACCESS, access.as_deref())?;
+        }
         if current.is_dir() {
             set(file, DEFAULT, acls.default.as_deref())?;
         }
-        Ok(carried)
+        Ok(narrowed)
     }
 
     pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
@@ -520,19 +533,19 @@ pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) ->
     apply_inner(file, metadata, mode, false)
 }
 
-/// Set the Linux POSIX ACLs. Call this before any chmod: a stage is created
-/// private, which masks the entries it inherits from its directory's default
-/// ACL, and a chmod to the final mode first would widen that mask, letting
-/// those entries in until the ACL is replaced. Returns whether the permission
-/// bits now are those of `mode`, so that a chmod is needed only for set-id
-/// and sticky bits. `mode_selected` says the caller sets `mode` in any case.
-/// Apply the rest with `apply_after_acls`.
+/// Set the Linux POSIX ACLs. Call this before setting the mode: a stage is
+/// created private, which masks the entries it inherits from its directory's
+/// default ACL, and a chmod to the final mode first would widen that mask,
+/// letting those entries in until the ACL is replaced. `mode_selected` says
+/// the caller sets `mode` next. Returns the mode this set on the way, when
+/// it did, for the caller's chmod to start from. Apply the rest with
+/// `apply_after_acls`.
 pub(crate) fn apply_acls(
     file: &File,
     metadata: Option<&InodeMetadata>,
     mode: u32,
     mode_selected: bool,
-) -> Result<bool> {
+) -> Result<Option<u32>> {
     #[cfg(target_os = "linux")]
     if let Some(metadata) = metadata {
         if let Some(acls) = &metadata.acls {
@@ -541,7 +554,7 @@ pub(crate) fn apply_acls(
         }
     }
     let _ = (file, metadata, mode, mode_selected);
-    Ok(false)
+    Ok(None)
 }
 
 /// Apply the metadata other than the ACLs `apply_acls` has set.

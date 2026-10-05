@@ -3856,8 +3856,8 @@ fn set_meta_file_inner(
             return Err(io::Error::last_os_error().into());
         }
     }
-    // A Linux ACL before the mode, which it carries (see `apply_acls`).
-    let acl_set_mode = crate::inode_metadata::apply_acls(
+    // A Linux ACL before the mode (see `apply_acls`).
+    let narrowed = crate::inode_metadata::apply_acls(
         f,
         meta.inode_metadata.as_deref(),
         meta.mode,
@@ -3868,11 +3868,7 @@ fn set_meta_file_inner(
         // the mode is already right. Always run it for set-id bits after a
         // chown, which clears them, and when the metadata predates a write,
         // which clears them for an unprivileged writer.
-        let cur = if acl_set_mode {
-            current.mode() & 0o7000 | meta.mode & 0o777
-        } else {
-            current.mode() & 0o7777
-        };
+        let cur = narrowed.unwrap_or(current.mode() & 0o7777);
         let want = meta.mode & 0o7777;
         if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
             f.set_permissions(fs::Permissions::from_mode(want))?;

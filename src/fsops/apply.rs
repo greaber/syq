@@ -899,19 +899,15 @@ pub(super) fn set_meta_handle_known(
     if owner_changed {
         super::access_changed(file);
     }
-    // A Linux ACL before the mode, which it carries (see `apply_acls`).
-    let acl_set_mode = crate::inode_metadata::apply_acls(
+    // A Linux ACL before the mode (see `apply_acls`).
+    let narrowed = crate::inode_metadata::apply_acls(
         file,
         meta.inode_metadata.as_deref(),
         meta.mode,
         flags & flags::MODE_MASK != 0,
     )?;
     if flags & flags::MODE_MASK != 0 {
-        let current = if acl_set_mode {
-            current.mode() & 0o7000 | meta.mode & 0o777
-        } else {
-            current.mode() & 0o7777
-        };
+        let current = narrowed.unwrap_or(current.mode() & 0o7777);
         let wanted = meta.mode & 0o7777;
         if current != wanted || (owner_changed && wanted & 0o6000 != 0) {
             set_mode_handle(file, wanted)?;
