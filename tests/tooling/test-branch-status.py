@@ -15,7 +15,28 @@ PR_CHECKS = SCRIPTS / "pr-checks.py"
 
 FAKE_GH = """#!/bin/sh
 case "$1:$2" in
+  api:--method)
+    python3 - "$@" <<'FAKE_POST'
+import json, os, sys
+from pathlib import Path
+data = Path(os.environ["SYQ_TEST_RUNS_DIR"])
+args = sys.argv[1:]
+assert args[:3] == ["api", "--method", "POST"]
+fields = dict(value.split("=", 1) for value in args[5::2])
+(data / "posted.json").write_text(json.dumps({"endpoint": args[3], **fields}))
+path = data / "statuses.json"
+pages = json.loads(path.read_text()) if path.exists() else [[]]
+pages[0].insert(0, dict(fields, creator={"login": "maintainer"},
+                        created_at="2026-02-04T00:00:00Z", url="https://api.example/status/1"))
+path.write_text(json.dumps(pages))
+print("{}")
+FAKE_POST
+    ;;
   api:repos/*/commits/*)
+    if [ -f "$SYQ_TEST_RUNS_DIR/fail-status-read" ]; then
+      echo 'simulated status read failure' >&2
+      exit 1
+    fi
     printf '%s\\n' "$2" >> "$SYQ_TEST_RUNS_DIR/status-requests"
     file="$SYQ_TEST_RUNS_DIR/statuses.json"
     if [ -f "$file" ]; then cat "$file"; else echo '[[]]'; fi
@@ -130,12 +151,12 @@ class BranchStatusTests(unittest.TestCase):
         path.write_text(content)
         path.chmod(0o755)
 
-    def set_run(self, workflow, status, conclusion, event="push"):
+    def set_run(self, workflow, status, conclusion, event="push", run_id=1, attempt=1):
         """Post-merge (push) runs by default; pass schedule for the nightly run."""
         (self.runs / f"{workflow}.{event}.json").write_text(json.dumps([{
             "headSha": self.master, "status": status, "conclusion": conclusion or None,
             "url": f"https://example.invalid/{workflow}/{event}",
-            "createdAt": "2026-01-01T00:00:00Z", "databaseId": 1}]))
+            "createdAt": "2026-01-01T00:00:00Z", "databaseId": run_id, "attempt": attempt}]))
 
     def dispatch(self, workflow, run_id, created, jobs, branch="task", status="completed",
                  head=None):
@@ -270,6 +291,97 @@ class BranchStatusTests(unittest.TestCase):
         self.assertEqual(report["master_ci"][1]["nightly"]["state"], "failure")
         self.assertEqual(len(report["notes"]), 1)
         self.assertEqual(report["exit_status"], 0)
+
+    def address(self, run_id=101, reason="Repair merged; focused checks passed",
+                fix="https://example.invalid/pull/9", expected=0):
+        return self.status("--address-master-run", str(run_id), "--reason", reason,
+                           "--fix", fix, expected=expected)
+
+    def test_addressed_nightly_preserves_failure_without_repeating_note(self):
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=101)
+        self.address()
+        posted = json.loads((self.runs / "posted.json").read_text())
+        self.assertEqual(posted, {
+            "endpoint": f"repos/greaber/syq/statuses/{self.master}",
+            "state": "success", "context": "master-ci-addressed/101/1",
+            "description": "Repair merged; focused checks passed",
+            "target_url": "https://example.invalid/pull/9"})
+        report = json.loads(self.status("--json"))
+        nightly = report["master_ci"][2]["nightly"]
+        self.assertEqual(nightly["state"], "failure")
+        self.assertEqual(nightly["run"]["conclusion"], "failure")
+        self.assertEqual(nightly["run"]["resolution"]["actor"], "maintainer")
+        self.assertEqual(report["notes"], [])
+        text = self.status()
+        self.assertIn("nightly        addressed", text)
+        self.assertIn("original result: failure", text)
+        self.assertIn("https://example.invalid/pull/9", text)
+        self.assertNotIn("master is red", text)
+
+    def test_addressing_does_not_hide_other_runs_reruns_or_branch_failures(self):
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=101)
+        self.address()
+        self.set_run("ci.yml", "completed", "failure", run_id=102)
+        self.dispatch("ci.yml", 201, "2026-02-01T00:00:00Z", {"rust": "failure"})
+        report = json.loads(self.status("--json", pr=self.pr, expected=1))
+        self.assertEqual(len(report["notes"]), 1)
+        self.assertIn("ci.yml post-merge failure", report["notes"][0])
+        self.assertEqual(len(report["dispatched"]["failed"]), 1)
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=101, attempt=2)
+        report = json.loads(self.status("--json", expected=1))
+        self.assertEqual(len(report["notes"]), 2)
+        self.assertNotIn("resolution", report["master_ci"][2]["nightly"]["run"])
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=103)
+        self.assertIn("macos.yml nightly failure", self.status(expected=1))
+
+    def test_addressing_post_merge_run_and_revoking_acknowledgment(self):
+        self.set_run("ci.yml", "completed", "failure", run_id=101)
+        self.address()
+        self.assertNotIn("master is red", self.status())
+        path = self.runs / "statuses.json"
+        pages = json.loads(path.read_text())
+        pages[0].insert(0, dict(pages[0][0], state="failure"))
+        path.write_text(json.dumps(pages))
+        self.assertIn("ci.yml post-merge failure", self.status())
+
+    def test_invalid_or_unreadable_acknowledgments_do_not_suppress_failure(self):
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=101)
+        self.address()
+        path = self.runs / "statuses.json"
+        resolution = json.loads(path.read_text())[0][0]
+        for change in ({"description": ""}, {"target_url": None}, {"state": "pending"},
+                       {"context": "dispatched-resolution/7/101"}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps([[dict(resolution, **change)]]))
+                self.assertIn("macos.yml nightly failure", self.status())
+        (self.runs / "fail-status-read").touch()
+        result = self.status("--json", expected=2, split=True)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("simulated status read failure", result.stderr)
+
+    def test_address_requires_current_failed_master_run(self):
+        self.address(expected=2)
+        self.set_run("macos.yml", "in_progress", "", "schedule", run_id=101)
+        self.address(expected=2)
+        self.set_run("macos.yml", "completed", "success", "schedule", run_id=101)
+        self.address(expected=2)
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=102)
+        self.address(expected=2)
+        self.assertFalse((self.runs / "posted.json").exists())
+
+    def test_address_requires_reason_fix_and_no_report_flags(self):
+        self.set_run("macos.yml", "completed", "failure", "schedule", run_id=101)
+        for reason in ("", "two\nlines", "x" * 141):
+            self.address(reason=reason, expected=2)
+        for fix in ("", "http://example.invalid/fix", "https://example.invalid/two words"):
+            self.address(fix=fix, expected=2)
+        self.address(run_id=-1, expected=2)
+        self.status("--reason", "missing run", expected=2)
+        self.status("--address-master-run", "101", expected=2)
+        for flag in ("--json", "--check"):
+            self.status("--address-master-run", "101", "--reason", "fixed", "--fix",
+                        "https://example.invalid/fix", flag, expected=2)
+        self.assertFalse((self.runs / "posted.json").exists())
 
     def test_nightly_in_progress_is_not_an_alert(self):
         self.set_run("rsync-compat.yml", "in_progress", "", "schedule")

@@ -175,8 +175,10 @@ the conversation instead.
   paths, so a green one does not show that an earlier failure was fixed; the
   nightly run executes the full suite when test inputs changed. The script
   lists a red post-merge or nightly `master` run, and failures left by
-  recently merged branches, as notes without failing; report them to the user
-  even when the current task did not cause them. A failed check in a run
+  recently merged branches, as notes without failing; report unresolved notes
+  even when the current task did not cause them. Do not repeat master failures
+  marked `addressed`; the linked repair has already been reported. A new failed
+  run or rerun needs attention again. A failed check in a run
   dispatched on this branch makes it exit 1 until a later run of that check
   passes or that exact failed job is explicitly resolved as described below.
   It lists the latest result of each check dispatched on the branch
@@ -579,6 +581,24 @@ This records a separate GitHub status with the author and time, then refreshes
 the gate. It covers only that PR and exact failed job, not other or future
 failures. The command needs permission to write commit statuses.
 Resolutions do not count as passing tests or release validation.
+
+After repairs merge into `master`, stop repeated reminders for a failed nightly
+or post-merge run once all of that run's failures are accounted for by the repairs
+and focused checks passed. A full nightly rerun is not required to acknowledge
+those repairs. Record the reason and link to the merged repair (including its
+validation) or replacement evidence:
+
+```bash
+scripts/branch-status.py --address-master-run <run-id> \
+  --reason 'Failures addressed by the merged repair; focused checks passed' \
+  --fix <https-url>
+```
+
+This is authorized as part of completing the repair. It records a separate
+GitHub status for that exact run attempt; the original failure remains visible,
+and a new failed run or rerun is reported normally. It only suppresses repeated
+reminders, without changing PR gates, test conclusions, or release validation.
+Do not acknowledge a whole run while some failures still need repair.
 
 Weigh cost as well as relevance. For changes to code, tooling, tests, or
 executable documentation, run `scripts/run-tooling-tests.py --quick` once on
