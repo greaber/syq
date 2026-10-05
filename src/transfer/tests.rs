@@ -4787,11 +4787,13 @@ fn run_workers(sched: &Sched, workers: Vec<Worker>) {
 }
 
 /// What a restricted receiver carried out for a copy: how many times it
-/// compared each file, in the order the files were given, and how many
-/// batches of whole files it published.
-#[derive(Debug, PartialEq)]
+/// compared each file, in the order the files were given, how many hash
+/// requests it carried out, and how many batches of whole files it
+/// published.
+#[derive(Debug)]
 struct Executed {
     compared: Vec<usize>,
+    hash_batches: usize,
     whole: usize,
 }
 
@@ -4804,6 +4806,18 @@ fn copy_through_restricted_receiver(
     root: &std::path::Path,
     files: &[(&str, i64)],
     workers: usize,
+    before_patch: impl Fn() + Send + Sync + 'static,
+) -> Executed {
+    copy_through_restricted_receiver_with(root, files, workers, false, before_patch)
+}
+
+/// The same, also preserving the sources' permissions when `permissions`
+/// is set.
+fn copy_through_restricted_receiver_with(
+    root: &std::path::Path,
+    files: &[(&str, i64)],
+    workers: usize,
+    permissions: bool,
     before_patch: impl Fn() + Send + Sync + 'static,
 ) -> Executed {
     use std::os::unix::fs::MetadataExt;
@@ -4834,10 +4848,14 @@ fn copy_through_restricted_receiver(
         sched.push_file(job);
     }
     sched.scan_done();
-    let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
-        root,
-        64 << 20,
-    ));
+    let authority = Arc::new(
+        crate::restricted::tests::time_preserving_test_authority_for(
+            root,
+            64 << 20,
+            files.len().max(8) as u64,
+            permissions,
+        ),
+    );
     let requests = Arc::new(Mutex::new(Vec::new()));
     let before_patch = Arc::new(before_patch);
     let gate = Gate::new(workers);
@@ -4859,6 +4877,11 @@ fn copy_through_restricted_receiver(
             opts.block = 1 << 20;
             opts.flags = flags::TIMES;
             opts.matching_flags = flags::TIMES;
+            if permissions {
+                opts.perms = true;
+                opts.flags |= flags::MODE;
+                opts.matching_flags |= flags::MODE;
+            }
             worker
         })
         .collect();
@@ -4880,12 +4903,11 @@ fn copy_through_restricted_receiver(
                 .sum()
         })
         .collect();
+    let count = |kind: fn(&Request) -> bool| requests.iter().filter(|r| kind(r)).count();
     Executed {
         compared,
-        whole: requests
-            .iter()
-            .filter(|request| matches!(request, Request::PutSmallBatch(_)))
-            .count(),
+        hash_batches: count(|r| matches!(r, Request::HashExistingBatch { .. })),
+        whole: count(|r| matches!(r, Request::PutSmallBatch(_))),
     }
 }
 
@@ -4925,13 +4947,7 @@ fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
     // Each name was compared once and neither was copied whole: the second
     // name's patch was authorized after the first name was kept, against
     // the file as keeping it left it.
-    assert_eq!(
-        executed,
-        Executed {
-            compared: vec![1, 1],
-            whole: 0
-        }
-    );
+    assert_eq!((executed.compared, executed.whole), (vec![1, 1], 0));
 }
 
 #[test]
@@ -4974,11 +4990,8 @@ fn a_restricted_receiver_compares_a_changed_destination_again_only_once() {
         // It is compared again once; a second stale condition copies it
         // whole.
         assert_eq!(
-            executed,
-            Executed {
-                compared: vec![2],
-                whole: changes - 1
-            },
+            (executed.compared, executed.whole),
+            (vec![2], changes - 1),
             "{changes}"
         );
     }
@@ -5109,13 +5122,116 @@ fn a_restricted_receiver_keeps_or_replaces_each_name_of_a_linked_destination() {
     }
     // One worker patches the names in turn, each against the file as the
     // last left it: each is compared once, and none is copied whole.
+    assert_eq!((executed.compared, executed.whole), (vec![1; count], 0));
+}
+
+#[test]
+fn comparison_groups_hold_one_name_of_each_bound_file() {
+    use super::small_compare::compare_groups;
+    // Three names of one file, two of another, two of a third, and a file
+    // without a bound: the first names go together, then the second, then
+    // the third.
+    let bound = [
+        Some((1, 1)),
+        Some((1, 1)),
+        Some((1, 2)),
+        Some((1, 2)),
+        None,
+        Some((1, 3)),
+        Some((1, 3)),
+        Some((1, 3)),
+    ];
     assert_eq!(
-        executed,
-        Executed {
-            compared: vec![1; count],
-            whole: 0
-        }
+        compare_groups(&[1; 8], &bound, 1 << 20),
+        [vec![0, 2, 4, 5], vec![1, 3, 6], vec![7]]
     );
+    // Without bounds, groups keep the batch's order and limits.
+    assert_eq!(
+        compare_groups(&[3; 5], &[None; 5], 6),
+        [vec![0, 1], vec![2, 3], vec![4]]
+    );
+}
+
+#[test]
+fn a_restricted_receiver_compares_many_linked_pairs_in_few_requests() {
+    use std::os::unix::fs::MetadataExt;
+    // Files of two names each and of distinct sizes, in one directory: the
+    // two names of each file are taken one after the other.
+    let pairs = 32;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    for directory in ["source", "target"] {
+        std::fs::create_dir(root.join(directory)).unwrap();
+    }
+    let mut names = Vec::new();
+    let mut inodes = Vec::new();
+    for i in 0..pairs {
+        let contents = vec![b'a' + (i % 26) as u8; 16 + i];
+        let first = root.join("target").join(format!("pair{i:02}a"));
+        std::fs::write(&first, &contents).unwrap();
+        let inode = std::fs::metadata(&first).unwrap().ino();
+        for name in [format!("pair{i:02}a"), format!("pair{i:02}b")] {
+            if name.ends_with('b') {
+                std::fs::hard_link(&first, root.join("target").join(&name)).unwrap();
+            }
+            std::fs::write(root.join("source").join(&name), &contents).unwrap();
+            names.push((name, contents.clone()));
+            inodes.push(inode);
+        }
+    }
+    // Each name has a source time of its own, so keeping either name of a
+    // file changes the change time both share.
+    let files: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.as_str(), 1_600_000_000 + i as i64))
+        .collect();
+    let executed = copy_through_restricted_receiver(root, &files, 1, || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
+    for ((name, contents), inode) in names.iter().zip(&inodes) {
+        let path = root.join("target").join(name);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), *inode, "{name}");
+        assert_eq!(&std::fs::read(&path).unwrap(), contents, "{name}");
+    }
+    // The first names share one request and the second names another, so
+    // each name is compared once.
+    assert_eq!(executed.compared, vec![1; 2 * pairs]);
+    assert_eq!((executed.hash_batches, executed.whole), (2, 0));
+}
+
+#[test]
+fn a_restricted_receiver_preserving_permissions_compares_linked_names_together() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // Preserving the sources' permissions, the receiver chooses no mode, and
+    // binds no patch to the change time its names share.
+    let count = 8;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (names, inode) = linked_destination(root, count, b"same");
+    std::fs::set_permissions(
+        root.join("target").join(&names[0]),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let files: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), 1_600_000_000 + i as i64))
+        .collect();
+    let executed = copy_through_restricted_receiver_with(root, &files, 1, true, || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
+    for name in &names {
+        let path = root.join("target").join(name);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.ino(), inode, "{name}");
+        assert_eq!(metadata.mode() & 0o7777, 0o644, "{name}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"same", "{name}");
+    }
+    // All the names share one request, and each is compared once.
+    assert_eq!(executed.compared, vec![1; count]);
+    assert_eq!((executed.hash_batches, executed.whole), (1, 0));
 }
 
 #[test]
