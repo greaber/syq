@@ -280,12 +280,31 @@ def time_usage(log, system):
 
 
 def linux_group(pgid):
+    # Discover children through /proc's task lists, including helpers adopted
+    # by our subreaper. Scanning every host PID at 50 Hz is costly on busy
+    # machines. Inspect all threads because any thread can launch a child.
+    def children(pid):
+        found = []
+        for path in (Path("/proc") / str(pid) / "task").glob("*/children"):
+            try:
+                found.extend(map(int, path.read_text().split()))
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        return found
+
     members = {}
-    for proc in Path("/proc").glob("[0-9]*/stat"):
+    pending = [pgid] + children(os.getpid())
+    seen = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
         try:
-            fields = proc.read_text().rsplit(")", 1)[1].split()
+            fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
             if int(fields[2]) == pgid:
-                members[int(proc.parent.name)] = fields
+                members[pid] = fields
+                pending.extend(children(pid))
         except (FileNotFoundError, ProcessLookupError):
             pass
     return members
@@ -297,6 +316,8 @@ def sample_linux(launcher):
     ticks = os.sysconf("SC_CLK_TCK")
     for pid, fields in linux_group(launcher).items():
         if pid == launcher:
+            continue
+        if fields[0] == "Z":
             continue
         proc = Path("/proc") / str(pid)
         try:
@@ -602,7 +623,7 @@ def measure_group(command, env, cpus, stem, timeout, operation):
         resources["cpu_seconds"] = resources["user_seconds"] + resources["system_seconds"]
     # Wait accounting's maxrss is the largest process, not a group memory
     # peak. Keep it per accounting record. Never sum per-process peak values.
-    resources["peak_rss_bytes"] = peaks["rss_bytes"]
+    resources["peak_rss_bytes"] = peaks["rss_bytes"] if expected_observed else None
     if operation == "rm":
         resources["peak_rss_bytes"] = coordinator["peak_rss_bytes"]
     observer_after = resource.getrusage(resource.RUSAGE_SELF)
