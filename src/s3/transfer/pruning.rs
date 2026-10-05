@@ -310,6 +310,7 @@ impl Engine {
             bucket: &self.options.bucket,
             concurrency: crate::deletion::Concurrency::s3(&self.args),
             individual: self.authorization.is_some(),
+            retries: self.options.retries,
         }
         .run(
             candidates,

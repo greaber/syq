@@ -962,12 +962,20 @@ struct ConnectionPlan {
     keep: usize,
 }
 
+struct DescriptorNotice {
+    limit: usize,
+    announced: std::sync::atomic::AtomicBool,
+    report: Box<dyn Fn() + Send + Sync>,
+}
+
 /// The worker lifecycle shared by the tuner and workers. `active` controls who
 /// may take work; `connect_target` controls who should establish or recover a
 /// connection. The ordinary-copy driver separately controls which parked
 /// connections to keep. Slot state distinguishes ready, retiring and failed
 /// connections, so a retiring connection cannot be mistaken for a ready one.
 pub struct Gate {
+    descriptor_notice: std::sync::OnceLock<DescriptorNotice>,
+    resource_limit: AtomicUsize,
     active: AtomicUsize,
     connect_target: AtomicUsize,
     keep_target: AtomicUsize,
@@ -1002,6 +1010,8 @@ fn grow_to(slots: &mut Vec<Slot>, n: usize) {
 impl Gate {
     pub fn new(active: usize) -> Arc<Self> {
         Arc::new(Gate {
+            descriptor_notice: std::sync::OnceLock::new(),
+            resource_limit: AtomicUsize::new(usize::MAX),
             active: AtomicUsize::new(active),
             connect_target: AtomicUsize::new(active),
             // Drivers without anticipatory preparation retain their existing
@@ -1051,24 +1061,66 @@ impl Gate {
     }
 
     pub fn set_active(&self, n: usize) {
+        self.notice_descriptors(n);
         let _g = self.slots.lock().unwrap();
+        let n = n.min(self.resource_limit());
         self.active.store(n, Relaxed);
         self.connect_target.fetch_max(n, Relaxed);
         self.cv.notify_all();
     }
 
+    pub fn limit_descriptors(&self, limit: usize, report: impl Fn() + Send + Sync + 'static) {
+        let _ = self.descriptor_notice.set(DescriptorNotice {
+            limit,
+            announced: std::sync::atomic::AtomicBool::new(false),
+            report: Box::new(report),
+        });
+        self.limit_resources(limit);
+    }
+
+    fn notice_descriptors(&self, requested: usize) {
+        if let Some(notice) = self.descriptor_notice.get() {
+            // Policy stops growing at its ceiling. Reaching it is enough to
+            // report it, even when no subsequent request exceeds the ceiling.
+            if requested >= notice.limit && !notice.announced.swap(true, Relaxed) {
+                (notice.report)();
+            }
+        }
+    }
+
+    pub fn resource_limit(&self) -> usize {
+        self.resource_limit.load(Relaxed)
+    }
+
+    /// A failed allocation is a capacity observation, not a throughput sample.
+    /// Retire surplus connections so their descriptors and reader threads can
+    /// be used by the remaining workers. Keep at least one slot for progress.
+    pub fn limit_resources(&self, n: usize) -> bool {
+        let _slots = self.slots.lock().unwrap();
+        let n = n.max(1);
+        let before = self.resource_limit.fetch_min(n, Relaxed);
+        let limit = before.min(n);
+        self.active.fetch_min(limit, Relaxed);
+        self.connect_target.fetch_min(limit, Relaxed);
+        self.keep_target.fetch_min(limit, Relaxed);
+        self.cv.notify_all();
+        before > n
+    }
+
     /// Limit setup/recovery without closing already-connected parked workers.
     pub fn set_connect_target(&self, n: usize) {
         let _g = self.slots.lock().unwrap();
-        self.connect_target.store(n.max(self.active()), Relaxed);
+        self.connect_target
+            .store(n.max(self.active()).min(self.resource_limit()), Relaxed);
         self.cv.notify_all();
     }
 
     fn prepare(&self, plan: ConnectionPlan) {
         let _slots = self.slots.lock().unwrap();
-        let connect = plan.connect.max(self.active());
+        let connect = plan.connect.max(self.active()).min(self.resource_limit());
         self.connect_target.store(connect, Relaxed);
-        self.keep_target.store(plan.keep.max(connect), Relaxed);
+        self.keep_target
+            .store(plan.keep.max(connect).min(self.resource_limit()), Relaxed);
         self.cv.notify_all();
     }
 
@@ -1084,7 +1136,9 @@ impl Gate {
     /// Reserve absent slots through `n`. Workers start timing with
     /// `mark_warming` when they can connect, after any wait for planning.
     pub fn begin_warming(&self, n: usize) -> Vec<usize> {
+        self.notice_descriptors(n);
         let mut slots = self.slots.lock().unwrap();
+        let n = n.min(self.resource_limit());
         grow_to(&mut slots, n);
         let mut ids = Vec::new();
         for (id, slot) in slots.iter_mut().take(n).enumerate() {
@@ -1287,6 +1341,16 @@ fn run_with_interval(
         policy.advance_time(policy_start.elapsed(), sample);
         if sched.is_aborted() || sched.finished() {
             break;
+        }
+        if gate.resource_limit() < policy.max {
+            active = gate.active().min(gate.resource_limit());
+            policy = Policy::refine(active, MIN, gate.resource_limit());
+            meter.set_active(active);
+            sampler.reset();
+            evidence.clear();
+            last = (meter.bytes(), meter.files());
+            sample_start = Instant::now();
+            trace.transition(&policy, "resource_limit");
         }
 
         // Retain fine-grained counters; consumers can construct overlapping

@@ -552,13 +552,15 @@ impl Progress {
             return None;
         }
         let p = self.clone();
-        let thread = std::thread::spawn(move || {
-            while !p.stop.load(Relaxed) {
-                p.render();
-                std::thread::park_timeout(Duration::from_millis(100));
-            }
-            p.clear();
-        });
+        let thread = std::thread::Builder::new()
+            .spawn(move || {
+                while !p.stop.load(Relaxed) {
+                    p.render();
+                    std::thread::park_timeout(Duration::from_millis(100));
+                }
+                p.clear();
+            })
+            .ok()?;
         Some(ProgressTicker {
             progress: self.clone(),
             thread: Some(thread),

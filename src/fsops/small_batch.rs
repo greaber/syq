@@ -12,6 +12,87 @@ pub(super) type SmallOutcome = std::result::Result<Option<(u64, u64)>, WireError
 /// Files one burst stages before it publishes any of them.
 const BURST: usize = 64;
 
+// Filesystem servers may have a much lower limit than this process, and FUSE
+// may translate their exhaustion to EPERM. Learn only for this process. A
+// failed create gets one retry after the staged files have been closed; all
+// checks and atomic publication still run on that retry.
+const REDUCED: usize = 1 << (usize::BITS - 1);
+struct StagingAdmission {
+    // The high bit stops new bursts; the other bits count admitted bursts.
+    state: AtomicUsize,
+    wait: Mutex<()>,
+    drained: std::sync::Condvar,
+}
+impl StagingAdmission {
+    const fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            wait: Mutex::new(()),
+            drained: std::sync::Condvar::new(),
+        }
+    }
+    fn width(&self) -> usize {
+        if self.state.load(Ordering::Relaxed) & REDUCED == 0 {
+            BURST
+        } else {
+            1
+        }
+    }
+    fn enter(&self) -> Option<StagingBurst<'_>> {
+        // The healthy path does not take a process-wide mutex. Admission and
+        // reduction use one atomic so no new burst can slip past a reduction.
+        let mut state = self.state.load(Ordering::Relaxed);
+        while state & REDUCED == 0 {
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(StagingBurst(self)),
+                Err(current) => state = current,
+            }
+        }
+        let mut wait = self.wait.lock().unwrap();
+        while self.state.load(Ordering::Acquire) != REDUCED {
+            wait = self.drained.wait(wait).unwrap();
+        }
+        None
+    }
+    fn reduce(&self) {
+        let before = self.state.fetch_or(REDUCED, Ordering::AcqRel);
+        if before & REDUCED == 0 && crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq: reducing small-file staging after descriptor pressure"
+            );
+        }
+    }
+}
+static STAGING_ADMISSION: StagingAdmission = StagingAdmission::new();
+struct StagingBurst<'a>(&'a StagingAdmission);
+impl Drop for StagingBurst<'_> {
+    fn drop(&mut self) {
+        if self.0.state.fetch_sub(1, Ordering::AcqRel) == REDUCED + 1 {
+            // Pair with the waiter's condition check to avoid a missed wake.
+            let _wait = self.0.wait.lock().unwrap();
+            self.0.drained.notify_all();
+        }
+    }
+}
+
+fn retry_stage_open(error: &anyhow::Error, network: impl FnOnce() -> bool) -> bool {
+    let errno = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error);
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE) => true,
+        // SSHFS can translate the server's EMFILE to EPERM. Inspect only on
+        // failure: local permission errors should not shrink future batches.
+        Some(libc::EPERM) => network(),
+        _ => false,
+    }
+}
 /// Threads a run writes and closes its files on, on a network filesystem.
 /// Creating and renaming stay one at a time per directory, so a few threads
 /// keep the rest shorter than the creates.
@@ -24,6 +105,8 @@ pub(super) struct SmallStage {
     label: PathBuf,
     file: File,
     reused: bool,
+    /// Made as a clone of the file its patch replaces, as macOS clones.
+    cloned: bool,
     /// Read right after the sidecar was opened, when an NFS client answers
     /// from the create's reply; it decides the metadata step and gives the
     /// published identity, which a rename does not change.
@@ -74,6 +157,8 @@ fn on_threads<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> 
 thread_local! {
     /// Refuses the threads this thread starts, as a process limit would.
     static REFUSE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Patched files this thread wrote over a clone of the file they replace.
+    static CLONED_PATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Start `work` on a thread of `scope`, unless the system refuses one.
@@ -150,6 +235,9 @@ pub(super) struct PatchSource<'a> {
     patch: &'a SmallPatch,
 }
 
+/// Clone the file a patch replaces into its created stage. Linux clones into
+/// an open file; macOS clones only into a new name, so there the stage is
+/// made as the clone instead (`clone_patch_stage`).
 fn try_clone_basis(old: &File, stage: &File, len: u64) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -601,9 +689,10 @@ impl FsOps {
     }
 
     /// Write a cloning patch's stage: the file it replaces, cloned, with the
-    /// differing blocks written over it. When the file cannot be cloned, or
-    /// changed after it was hashed, the stage holds the assembled file
-    /// instead, its reused blocks read and checked again.
+    /// differing blocks written over it. A stage made as the clone holds it
+    /// already; any other is cloned into here. When the file cannot be
+    /// cloned, or changed after it was hashed, the stage holds the assembled
+    /// file instead, its reused blocks read and checked again.
     /// Write a patched file, observed unless `unobserved` collects its bytes
     /// for a caller that records them, as `write_small_stage` does.
     fn write_patch_stage(
@@ -614,9 +703,12 @@ impl FsOps {
     ) -> Result<()> {
         let patch = source.patch;
         let file = &stage.file;
-        file.set_len(0)?;
-        let cloned = try_clone_basis(&source.old, file, source.basis.len)
-            && fingerprint(&source.old.metadata()?) == source.basis;
+        let cloned = if stage.cloned {
+            true
+        } else {
+            file.set_len(0)?;
+            try_clone_basis(&source.old, file, source.basis.len)
+        } && fingerprint(&source.old.metadata()?) == source.basis;
         if !cloned {
             file.set_len(0)?;
             let data = assemble(Some(&source.old), self.hash_policy.algorithm, patch)?;
@@ -628,6 +720,8 @@ impl FsOps {
             }
             .with_context(|| format!("write {}", stage.label.display()));
         }
+        #[cfg(test)]
+        CLONED_PATCHES.set(CLONED_PATCHES.get() + 1);
         let writing = unobserved.is_none().then(|| {
             self.operation
                 .span(crate::transfer_observations::Stage::DestinationWrite)
@@ -686,7 +780,7 @@ impl FsOps {
                 next += 1;
                 continue;
             }
-            let reserved = ReservedDescriptors::up_to(BURST - 1);
+            let reserved = ReservedDescriptors::up_to(STAGING_ADMISSION.width() - 1);
             let mut run: Vec<(usize, RootedTarget)> = Vec::with_capacity(1 + reserved.0);
             // A run stays in one directory and names each target once: a
             // repeated target would share its sidecar with the earlier one.
@@ -744,15 +838,59 @@ impl FsOps {
         let Some((_, first)) = run.first() else {
             return;
         };
+        let Some(burst) = STAGING_ADMISSION.enter() else {
+            for (index, _) in run {
+                results[index] = self
+                    .put_small_with_source(
+                        &puts[index],
+                        sources.get(index).and_then(Option::as_ref),
+                    )
+                    .map_err(|error| wire_error(&error));
+            }
+            return;
+        };
         let (root, directory) = (first.root.clone(), first.relative.clone());
+        let source = |index: usize| sources.get(index).and_then(Option::as_ref);
         let mut stages = Vec::with_capacity(run.len());
+        let mut retry = Vec::new();
         {
             // A turn only schedules. If it cannot be taken, the operations
             // themselves report what is wrong with the path.
             let _turn = root.mutation_turn(&directory).ok();
-            for (index, target) in run {
-                match self.create_small_stage(&puts[index], target) {
+            let mut remaining = run.into_iter();
+            while let Some((index, target)) = remaining.next() {
+                #[cfg(debug_assertions)]
+                let refuse = std::env::var("SYQ_TEST_STAGING_LIMIT")
+                    .ok()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|limit| stages.len() >= limit);
+                #[cfg(not(debug_assertions))]
+                let refuse = false;
+                let created = if refuse {
+                    Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
+                } else {
+                    self.create_stage(&puts[index], source(index), target)
+                };
+                match created {
                     Ok(stage) => stages.push((index, stage)),
+                    Err(error)
+                        if retry_stage_open(&error, || {
+                            if let Some((_, stage)) = stages.first() {
+                                on_network_file_system(&stage.file, stage.created.dev())
+                            } else {
+                                root.resolve_parent(&directory).ok().is_some_and(|parent| {
+                                    parent.directory().metadata().ok().is_some_and(|meta| {
+                                        on_network_file_system(parent.directory(), meta.dev())
+                                    })
+                                })
+                            }
+                        }) =>
+                    {
+                        STAGING_ADMISSION.reduce();
+                        retry.push(index);
+                        retry.extend(remaining.map(|(index, _)| index));
+                        break;
+                    }
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
             }
@@ -766,7 +904,6 @@ impl FsOps {
         let network = stages.first().is_some_and(|(_, stage)| {
             stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
         });
-        let source = |index: usize| sources.get(index).and_then(Option::as_ref);
         let written: Vec<Result<()>> = if network {
             let writing = self
                 .operation
@@ -829,6 +966,97 @@ impl FsOps {
         for (index, result) in finished {
             results[index] = result;
         }
+        drop(burst);
+        if !retry.is_empty() {
+            // Other workers must publish and close their existing bursts too.
+            // They never wait while holding a burst or directory turn.
+            drop(STAGING_ADMISSION.enter());
+        }
+        for index in retry {
+            results[index] = self
+                .put_small_with_source(&puts[index], sources.get(index).and_then(Option::as_ref))
+                .map_err(|error| wire_error(&error));
+        }
+    }
+
+    // A patch can carry its contents in an open basis rather than put.data.
+    // The one-file fallback must keep that basis and its validation intact.
+    fn put_small_with_source(
+        &mut self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+    ) -> Result<Option<(u64, u64)>> {
+        if source.is_none() {
+            return self.put_small(put);
+        }
+        let target = self.small_target(put)?;
+        let stage = self.create_stage(put, source, target)?;
+        self.write_small_stage(put, source, &stage, None)?;
+        self.publish_small_stage(put, &stage)?;
+        self.finish_small_stage(put, stage)
+    }
+
+    /// Create the stage of a put, or of a patch with the file it reuses
+    /// blocks of. On macOS, where a clone is a new file, a cloning patch's
+    /// stage is made as a clone of that file when it can be.
+    fn create_stage(
+        &mut self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+        target: RootedTarget,
+    ) -> Result<SmallStage> {
+        #[cfg(target_os = "macos")]
+        if let Some(source) = source {
+            if let Some((partial, label, file)) = self.clone_patch_stage(put, source, &target)? {
+                let created = file.metadata()?;
+                return Ok(SmallStage {
+                    target,
+                    partial,
+                    label,
+                    file,
+                    reused: false,
+                    cloned: true,
+                    created,
+                });
+            }
+        }
+        let _ = source;
+        self.create_small_stage(put, target)
+    }
+
+    /// Clone the file a patch reuses blocks of to the patch's sidecar name,
+    /// as the per-file path clones its basis, and return the clone opened.
+    /// None when the file cannot be cloned there, or when the clone is not
+    /// fit to stage protected data, as a reused sidecar would not be; the
+    /// stage is then created as any other, and replaces the clone.
+    #[cfg(target_os = "macos")]
+    fn clone_patch_stage(
+        &mut self,
+        put: &SmallPut,
+        source: &PatchSource<'_>,
+        target: &RootedTarget,
+    ) -> Result<Option<(RelativePath, PathBuf, File)>> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_BASIS_CLONE_UNSUPPORTED").is_some() {
+            return Ok(None);
+        }
+        self.uncache_rooted(&target.root, &target.relative);
+        let metadata = source.old.metadata()?;
+        let (partial, label, clone) = with_rooted_partial(target, &put.copy_id, |relative, _| {
+            self.uncache_rooted(&target.root, relative);
+            // A clone of a different length fails here; the stage then
+            // assembles the file, which reads its reused blocks again.
+            target
+                .root
+                .clone_file_open(&source.old, &metadata, relative, source.basis.len)
+        })?;
+        let Some(file) = clone else {
+            return Ok(None);
+        };
+        if !self.reusable_partial_permissions(&file)? {
+            return Ok(None);
+        }
+        Ok(Some((partial, label, file)))
     }
 
     pub(super) fn create_small_stage(
@@ -868,6 +1096,7 @@ impl FsOps {
             label,
             file,
             reused: basis_size.is_some(),
+            cloned: false,
             created,
         })
     }
@@ -959,6 +1188,49 @@ impl FsOps {
 mod tests {
     use super::*;
 
+    #[test]
+    fn staging_reduction_drains_admitted_bursts_before_retry() {
+        let admission = StagingAdmission::new();
+        let first = admission.enter().unwrap();
+        let second = admission.enter().unwrap();
+        assert_eq!(admission.width(), BURST);
+        admission.reduce();
+        assert_eq!(admission.width(), 1);
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let admission = &admission;
+            let waiter = scope.spawn(move || {
+                assert!(admission.enter().is_none());
+                tx.send(()).unwrap();
+            });
+            drop(first);
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err());
+            drop(second);
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            waiter.join().unwrap();
+        });
+        assert!(admission.enter().is_none());
+    }
+
+    #[test]
+    fn staging_permission_recovery_requires_network_filesystem() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            let error = io::Error::from_raw_os_error(errno).into();
+            assert!(retry_stage_open(&error, || panic!(
+                "no filesystem query needed"
+            )));
+        }
+        let permission = io::Error::from_raw_os_error(libc::EPERM).into();
+        assert!(!retry_stage_open(&permission, || false));
+        assert!(retry_stage_open(&permission, || true));
+        let denied = io::Error::from_raw_os_error(libc::EACCES).into();
+        assert!(!retry_stage_open(&denied, || panic!(
+            "no filesystem query needed"
+        )));
+    }
+
     fn put(path: &str, data: &[u8]) -> SmallPut {
         SmallPut {
             path: path.as_bytes().to_vec(),
@@ -990,6 +1262,39 @@ mod tests {
 
     fn entries(directory: &Path) -> usize {
         fs::read_dir(directory).unwrap().count()
+    }
+
+    /// Whether the filesystem holding `directory` clones files, probed apart
+    /// from the code under test. Linux clones on some filesystems only;
+    /// macOS CI runs on APFS, which clones.
+    fn clones_files(directory: &Path) -> bool {
+        let probe = directory.join("clone-probe");
+        fs::write(&probe, [1; 4096]).unwrap();
+        let source = File::open(&probe).unwrap();
+        #[cfg(target_os = "linux")]
+        let cloned = crate::local_copy::try_clone(
+            &source,
+            &File::create(directory.join("clone-probe-copy")).unwrap(),
+            4096,
+        );
+        #[cfg(target_os = "macos")]
+        let cloned = unsafe {
+            libc::fclonefileat(
+                source.as_raw_fd(),
+                File::open(directory).unwrap().as_raw_fd(),
+                c"clone-probe-copy".as_ptr(),
+                0,
+            )
+        } == 0;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let cloned = false;
+        let _ = fs::remove_file(directory.join("clone-probe-copy"));
+        fs::remove_file(&probe).unwrap();
+        assert!(
+            cloned || !cfg!(target_os = "macos") || std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "macOS CI requires a TMPDIR that clones files"
+        );
+        cloned
     }
 
     #[test]
@@ -1171,10 +1476,17 @@ mod tests {
                 patch("raced", hashed[1].as_ref().unwrap()),
             ];
             assert_eq!(patches[0].data.len() as u64, 2 * block + 4);
-            // A reused block of "raced" changes after it was hashed.
+            // A reused block of "raced" changes after it was hashed. A clone
+            // keeps reused blocks unread, so only the change time shows the
+            // change: wait until the write gives a new one.
+            std::thread::sleep(std::time::Duration::from_millis(50));
             let mut raced = old.clone();
             raced[0] ^= 1;
             fs::write(directory.join("raced"), &raced).unwrap();
+            let now = fingerprint(&fs::metadata(directory.join("raced")).unwrap());
+            assert_ne!(Some(now), patches[1].basis);
+            let cloned = clones_files(directory);
+            CLONED_PATCHES.set(0);
             let results = ops.patch_small_batch(&patches).unwrap();
             assert!(results[0].is_ok(), "{:?}", results[0]);
             assert_eq!(
@@ -1182,10 +1494,108 @@ mod tests {
                 new,
                 "sparse {sparse}"
             );
+            assert_eq!(CLONED_PATCHES.get(), usize::from(cloned), "sparse {sparse}");
             assert!(results[1].is_err(), "{:?}", results[1]);
             assert_eq!(fs::read(directory.join("raced")).unwrap(), raced);
             assert_eq!(entries(directory), 2);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cloned_patch_publishes_requested_metadata_without_old_xattrs() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let directory = temporary.path();
+        if !clones_files(directory) {
+            return;
+        }
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old = vec![1; 32 * block as usize];
+        let path = directory.join("file");
+        fs::write(&path, &old).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let original = File::open(&path).unwrap();
+        let attribute = c"syq.test.old-metadata";
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    original.as_raw_fd(),
+                    attribute.as_ptr(),
+                    b"old".as_ptr().cast(),
+                    3,
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        let mut ops = receiver(directory);
+        let hashed = ops.hash_existing_batch(
+            block,
+            &[ExistingRead {
+                path: b"file".to_vec(),
+                len: old.len() as u64,
+                condition: TargetCondition::Any,
+                guard: None,
+            }],
+        );
+        let hashed = hashed[0].as_ref().unwrap();
+        let mut reuse: Vec<_> = hashed.hashes.iter().copied().map(Some).collect();
+        reuse[5] = None;
+        let data = vec![2; block as usize];
+        let patch = SmallPatch {
+            path: b"file".to_vec(),
+            copy_id: [5; 16],
+            len: old.len() as u64,
+            block,
+            reuse,
+            hash: content_digest(&data),
+            data,
+            basis: hashed.fingerprint,
+            meta: Meta {
+                // Match the old mode: using its metadata instead of the
+                // private clone's would incorrectly skip restoring this.
+                mode: 0o644,
+                mtime: 1_234_567_890,
+                mtime_nsec: 123_456_789,
+                ..put("file", b"").meta
+            },
+            flags: flags::MODE | flags::TIMES,
+            unchanged_flags: 0,
+            condition: TargetCondition::Any,
+            guard: None,
+        };
+        CLONED_PATCHES.set(0);
+        let results = ops.patch_small_batch(&[patch]).unwrap();
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(CLONED_PATCHES.get(), 1);
+        let published = File::open(&path).unwrap();
+        let metadata = published.metadata().unwrap();
+        assert_ne!(metadata.ino(), original.metadata().unwrap().ino());
+        assert_eq!(metadata.mode() & 0o7777, 0o644);
+        assert_eq!(metadata.mtime(), 1_234_567_890);
+        assert_eq!(metadata.mtime_nsec(), 123_456_789);
+        assert_eq!(
+            unsafe {
+                libc::fgetxattr(
+                    published.as_raw_fd(),
+                    attribute.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOATTR)
+        );
+        let mut expected = old;
+        expected[5 * block as usize..6 * block as usize].fill(2);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(entries(directory), 1);
     }
 
     #[test]
@@ -1263,9 +1673,12 @@ mod tests {
                 assert_eq!(fs::read(directory.join("file")).unwrap(), old);
                 assert_eq!(entries(directory), 1, "{blocks} blocks");
             }
+            let cloned = blocks == 32 && clones_files(directory);
+            CLONED_PATCHES.set(0);
             let results = ops.patch_small_batch(&[valid]).unwrap();
             assert!(results[0].is_ok(), "{blocks} blocks: {:?}", results[0]);
             assert_eq!(fs::read(directory.join("file")).unwrap(), new);
+            assert_eq!(CLONED_PATCHES.get(), usize::from(cloned), "{blocks} blocks");
             assert_eq!(entries(directory), 1);
         }
     }

@@ -2488,3 +2488,189 @@ pub(super) fn seed_start_from_last_run(cache: &std::path::Path, workers: usize) 
         .unwrap();
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_keeps_copying_with_bounded_parallelism() {
+    let t = Tmp::new();
+    // Enough files to exercise workers instead of the small-copy shortcut.
+    for index in 0..512 {
+        write(
+            &t.path(&format!("source/d{}/f{index:04}", index % 8)),
+            format!("content {index}").as_bytes(),
+        );
+    }
+    for (label, fault, value, nofile) in [
+        ("fds", "", "", Some(96)),
+        ("pools", "SYQ_TEST_NO_OPTIONAL_POOLS", "1", None),
+        ("threads", "SYQ_TEST_WORKER_THREAD_LIMIT", "4", None),
+        (
+            "broker",
+            "SYQ_TEST_REFUSE_BROKER_THREAD",
+            "syq-fd-client",
+            None,
+        ),
+        ("staging", "SYQ_TEST_STAGING_LIMIT", "3", None),
+        ("initialize", "SYQ_TEST_LOCAL_SOURCE_EMFILE_ONCE", "1", None),
+    ] {
+        let mut command = compat_command();
+        command.args([
+            "-a",
+            "--no-progress",
+            &t.s("source/"),
+            &t.s(&format!("{label}/")),
+        ]);
+        command.env("SYQ_TUNING_CACHE", "");
+        if !fault.is_empty() {
+            command.env(fault, value);
+        }
+        if let Some(limit) = nofile {
+            set_child_nofile_limit(&mut command, limit);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output =
+            wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+        assert_output_ok(&output);
+        if label == "initialize" {
+            let error = stderr_of(&output);
+            assert!(
+                error.contains("worker setup exhausted resources"),
+                "{error}"
+            );
+            assert!(error.contains("initialize local source worker"), "{error}");
+        }
+        for index in 0..512 {
+            assert_eq!(
+                read(&t.path(&format!("{label}/d{}/f{index:04}", index % 8))),
+                format!("content {index}").as_bytes()
+            );
+        }
+        for directory in 0..8 {
+            assert!(partial_files(&t.path(&format!("{label}/d{directory}"))).is_empty());
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_reports_essential_and_fixed_worker_failures() {
+    let t = Tmp::new();
+    for index in 0..512 {
+        write(&t.path(&format!("source/f{index}")), b"content");
+    }
+    for (label, limit, fixed) in [("essential", "0", false), ("fixed", "1", true)] {
+        let mut command = compat_command();
+        command
+            .args([
+                "-a",
+                "--no-progress",
+                &t.s("source/"),
+                &t.s(&format!("{label}/")),
+            ])
+            .env("SYQ_TEST_WORKER_THREAD_LIMIT", limit);
+        if fixed {
+            command.args(["--performance-tuning", "workers=4"]);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output =
+            wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+        assert!(!output.status.success());
+        let error = stderr_of(&output);
+        assert!(error.contains("cannot start copy worker"), "{error}");
+        assert!(!error.contains("panicked"), "{error}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
+    for (label, limit, tcp, selectors, expected) in [
+        ("tcp-low", 128, true, false, 1..=1),
+        // A ceiling above the SSH start of eight must still report the
+        // reduction from the TCP start of sixteen.
+        ("tcp-notice", 512, true, false, 9..=11),
+        ("ssh-processes", 128, false, false, 8..=8),
+        // Only the local source holds these roots. Charging them to this
+        // receiver's shared process used to reduce its ceiling to five.
+        ("receiver-roots", 4096, true, true, 16..=16),
+    ] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        let script = fs::read_to_string(&rsh).unwrap().replacen(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\nulimit -n {limit}\n"),
+            1,
+        );
+        fs::write(&rsh, script).unwrap();
+        let count = if selectors { 200 } else { 4000 };
+        for index in 0..count {
+            write(
+                &t.path(&format!("source/f{index}")),
+                format!("file {index}").as_bytes(),
+            );
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.arg("cp");
+        if selectors {
+            for index in 0..count {
+                command.arg(t.path(&format!("source/f{index}")));
+            }
+        } else {
+            command.args(["--srcs-in", &t.s("source")]);
+        }
+        command
+            .args([
+                "--to",
+                "host",
+                "--into",
+                &t.s("destination"),
+                "--rsh",
+                rsh.to_str().unwrap(),
+                "--syq-path",
+                env!("CARGO_BIN_EXE_syq"),
+                "--tcp-ports",
+                EPHEMERAL_TCP_PORTS,
+                "--no-progress",
+            ])
+            .env("SYQ_TUNING_CACHE", t.path("unused-tuning.json"))
+            .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("FAKE_SSH_CONNECTION", "127.0.0.1 40000 127.0.0.1 22")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if tcp {
+            command.env("SYQ_TEST_REQUIRE_TCP", "1");
+        } else {
+            command.arg("--no-tcp");
+        }
+        let output =
+            wait_for_child_output(command.start().unwrap(), std::time::Duration::from_secs(30));
+        assert_output_ok(&output);
+        let notice = stderr_of(&output).contains("open-file limits restrict this copy");
+        assert_eq!(
+            notice,
+            label.starts_with("tcp-"),
+            "{label}: {}",
+            stderr_of(&output)
+        );
+        let history = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
+        let initial: i64 = history.query_row(
+            "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='starting_count'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            expected.contains(&initial),
+            "{label}: starting {initial}, expected {expected:?}"
+        );
+        for index in 0..count {
+            assert_eq!(
+                read(&t.path(&format!("destination/f{index}"))),
+                format!("file {index}").as_bytes()
+            );
+        }
+    }
+}

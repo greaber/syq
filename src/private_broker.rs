@@ -83,6 +83,8 @@ pub(crate) struct PrivateBrokerConfig<'a> {
     pub(crate) socket_name: &'a str,
     pub(crate) listener_thread: &'a str,
     pub(crate) client_thread: &'a str,
+    /// Only for bounded handlers that never wait for another broker client.
+    pub(crate) inline_on_thread_failure: bool,
     pub(crate) max_connections: usize,
     pub(crate) io_timeout: Duration,
 }
@@ -173,14 +175,20 @@ impl PrivateBroker {
         let thread_connections = Arc::clone(&connections);
         let handler = Arc::new(handler);
         let max_connections = config.max_connections;
-        let client_thread = config.client_thread.to_owned();
+        let client_threads = ClientThreads {
+            name: config.client_thread.to_owned(),
+            inline_on_failure: config.inline_on_thread_failure,
+            #[cfg(debug_assertions)]
+            refuse: std::env::var("SYQ_TEST_REFUSE_BROKER_THREAD").as_deref()
+                == Ok(config.client_thread),
+        };
         let listener_thread = thread::Builder::new()
             .name(config.listener_thread.to_owned())
             .spawn(move || {
                 accept_connections(
                     listener,
                     max_connections,
-                    &client_thread,
+                    client_threads,
                     thread_shutdown,
                     thread_connections,
                     handler,
@@ -235,10 +243,32 @@ impl Drop for PrivateBroker {
     }
 }
 
+struct ClientThreads {
+    name: String,
+    inline_on_failure: bool,
+    #[cfg(debug_assertions)]
+    refuse: bool,
+}
+
+impl ClientThreads {
+    fn spawn<F>(&self, handler: F) -> io::Result<JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        #[cfg(debug_assertions)]
+        if self.refuse {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+        }
+        thread::Builder::new()
+            .name(self.name.clone())
+            .spawn(handler)
+    }
+}
+
 fn accept_connections<F>(
     listener: UnixListener,
     max_connections: usize,
-    client_thread: &str,
+    client_threads: ClientThreads,
     shutdown: Arc<AtomicBool>,
     connections: Arc<ConnectionRegistry>,
     handler: Arc<F>,
@@ -265,11 +295,31 @@ fn accept_connections<F>(
                 let Ok(stream) = connections.track(stream) else {
                     continue;
                 };
+                // Drop can shut down the registry between accept and track.
+                // Never start an inline handler after that shutdown pass.
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
                 let worker_handler = Arc::clone(&handler);
                 let worker_connections = Arc::clone(&connections);
-                if let Ok(worker) = thread::Builder::new()
-                    .name(client_thread.to_owned())
-                    .spawn(move || worker_handler(stream, worker_connections))
+                if client_threads.inline_on_failure {
+                    // Keep the accepted socket when spawn drops its closure on
+                    // failure. Cloning it here would need another descriptor at
+                    // the very moment the process may be running out of them.
+                    let pending = Arc::new(Mutex::new(Some(stream)));
+                    let worker_pending = Arc::clone(&pending);
+                    match client_threads.spawn(move || {
+                        let stream = worker_pending.lock().unwrap().take().unwrap();
+                        worker_handler(stream, worker_connections);
+                    }) {
+                        Ok(worker) => workers.push(worker),
+                        Err(_) => {
+                            let stream = pending.lock().unwrap().take().unwrap();
+                            handler(stream, Arc::clone(&connections));
+                        }
+                    }
+                } else if let Ok(worker) =
+                    client_threads.spawn(move || worker_handler(stream, worker_connections))
                 {
                     workers.push(worker);
                 }
@@ -428,6 +478,7 @@ mod tests {
                 socket_name: "broker.sock",
                 listener_thread: "syq-private-test-listener",
                 client_thread: "syq-private-test-client",
+                inline_on_thread_failure: false,
                 max_connections: 1,
                 io_timeout: Duration::from_secs(1),
             },

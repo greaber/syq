@@ -595,6 +595,7 @@ fn authorize_expected_inner(
             socket_name: "agent",
             listener_thread: "syq-ssh-agent",
             client_thread: "syq-ssh-sign",
+            inline_on_thread_failure: false,
             max_connections: 1,
             io_timeout: Duration::from_secs(120),
         },

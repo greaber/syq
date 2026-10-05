@@ -171,11 +171,11 @@ pub(crate) struct WriteReplies {
 }
 
 impl WriteReplies {
-    pub fn spawn(rx: Responses) -> Self {
+    pub fn spawn(rx: Responses) -> io::Result<Self> {
         let state = Arc::new(Mutex::new(Completions::default()));
         let abort = Arc::new(AtomicBool::new(false));
         let (status, stopped) = (state.clone(), abort.clone());
-        let thread = std::thread::spawn(move || {
+        let thread = std::thread::Builder::new().spawn(move || {
             while !stopped.load(Ordering::Acquire) {
                 // Normally woken by a reply, not a timer. The timeout only
                 // lets a failed sender cancel without leaking a drain thread.
@@ -202,12 +202,12 @@ impl WriteReplies {
                 }
             }
             rx
-        });
-        Self {
+        })?;
+        Ok(Self {
             state,
             abort,
             thread: Some(thread),
-        }
+        })
     }
 
     pub fn status(&self) -> Completions {

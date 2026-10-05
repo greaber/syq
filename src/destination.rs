@@ -1595,6 +1595,7 @@ pub(crate) fn serve_background(
             socket_name: "r",
             listener_thread: "syq-return-listener",
             client_thread: "syq-return-client",
+            inline_on_thread_failure: false,
             max_connections: 272,
             io_timeout: Duration::from_secs(10),
         },

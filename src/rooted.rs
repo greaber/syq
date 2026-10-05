@@ -651,8 +651,26 @@ impl Root {
         path: &RelativePath,
         size: u64,
     ) -> Result<CopyLocalOutcome> {
+        Ok(
+            match self.clone_file_open(source, source_metadata, path, size)? {
+                Some(_) => CopyLocalOutcome::Copied,
+                None => CopyLocalOutcome::Unsupported,
+            },
+        )
+    }
+
+    /// The same, returning the clone published at `path`, opened for reading
+    /// and writing; None when the file is not cloned.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clone_file_open(
+        &self,
+        source: &File,
+        source_metadata: &std::fs::Metadata,
+        path: &RelativePath,
+        size: u64,
+    ) -> Result<Option<File>> {
         if !clone_flags_can_be_removed(source_metadata) {
-            return Ok(CopyLocalOutcome::Unsupported);
+            return Ok(None);
         }
         let fallback = |error: anyhow::Error| {
             if crate::output::debug() {
@@ -661,7 +679,7 @@ impl Root {
                     path.label()
                 );
             }
-            Ok(CopyLocalOutcome::Unsupported)
+            Ok(None)
         };
         let parent = match self.resolve_parent(path) {
             Ok(parent) => parent,
@@ -670,7 +688,7 @@ impl Root {
         // Reuse the held parent for the partial check and clone publication.
         // RENAME_EXCL below also protects a partial created after this check.
         match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
-            Ok(_) => return Ok(CopyLocalOutcome::Unsupported),
+            Ok(_) => return Ok(None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return fallback(error.into()),
         }
@@ -681,7 +699,7 @@ impl Root {
             Err(error) => return fallback(error.into()),
         };
         if source_metadata.dev() != parent_metadata.dev() {
-            return Ok(CopyLocalOutcome::Unsupported);
+            return Ok(None);
         }
         // Reject non-APFS destinations before inspecting ACLs or staging data.
         let supported = match filesystem_is(&parent.directory, b"apfs") {
@@ -694,12 +712,12 @@ impl Root {
         let supported =
             supported && std::env::var_os("SYQ_TEST_CLONE_UNSUPPORTED_VOLUME").is_none();
         if !supported {
-            return Ok(CopyLocalOutcome::Unsupported);
+            return Ok(None);
         }
         // An extra staging directory must not change destination ACL inheritance.
         match clone_directory_has_no_inheritable_acl(&parent.directory) {
             Ok(true) => {}
-            Ok(false) => return Ok(CopyLocalOutcome::Unsupported),
+            Ok(false) => return Ok(None),
             Err(error) => return fallback(error),
         }
         let temporary = match create_temporary(&parent, |fd, name| {
@@ -712,7 +730,7 @@ impl Root {
         };
         let leaf = c"data";
         let mut trusted_directory = None;
-        let result = (|| -> Result<CopyLocalOutcome> {
+        let result = (|| -> Result<Option<File>> {
             #[cfg(debug_assertions)]
             fail_clone_for_test("SYQ_TEST_FAIL_CLONE_AFTER_MKDIR")
                 .context("test clone directory failure")?;
@@ -723,7 +741,7 @@ impl Root {
                 .context("open private clone directory")?;
             let metadata = directory.metadata()?;
             if metadata.uid() != unsafe { libc::geteuid() } {
-                return Ok(CopyLocalOutcome::Unsupported);
+                return Ok(None);
             }
             // Preserve inherited setgid while restoring owner access.
             let private_mode = 0o700 | (metadata.mode() as libc::mode_t & 0o2000);
@@ -734,7 +752,7 @@ impl Root {
             if directory.metadata()?.mode() & 0o7777 != u32::from(private_mode) {
                 // Some filesystems synthesize permissions. Fall back without
                 // putting source data into a directory we cannot keep private.
-                return Ok(CopyLocalOutcome::Unsupported);
+                return Ok(None);
             }
             trusted_directory = Some(directory);
             let directory = trusted_directory.as_ref().unwrap();
@@ -772,12 +790,12 @@ impl Root {
             .context("set private clone permissions")?;
             let file = open_clone_for_copy(directory, leaf).context("open normalized clone")?;
             if !strip_clone_xattrs(&file)? {
-                return Ok(CopyLocalOutcome::Unsupported);
+                return Ok(None);
             }
             if file.metadata()?.len() != size {
                 // Streaming and the final source re-stat handle concurrent
                 // growth/shrinkage using the same retry policy as other copies.
-                return Ok(CopyLocalOutcome::Unsupported);
+                return Ok(None);
             }
             #[cfg(debug_assertions)]
             fail_clone_for_test("SYQ_TEST_FAIL_CLONE_AFTER_CREATE")
@@ -797,16 +815,14 @@ impl Root {
             if published != 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::AlreadyExists {
-                    return Ok(CopyLocalOutcome::Unsupported);
+                    return Ok(None);
                 }
                 return Err(error).context("stage cloned local file");
             }
-            Ok(CopyLocalOutcome::Copied)
+            Ok(Some(file))
         })();
         let cleanup = (|| -> Result<()> {
-            if let Some(directory) =
-                trusted_directory.filter(|_| !matches!(result, Ok(CopyLocalOutcome::Copied)))
-            {
+            if let Some(directory) = trusted_directory.filter(|_| !matches!(result, Ok(Some(_)))) {
                 match unlink_at(directory.as_raw_fd(), leaf, 0) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}

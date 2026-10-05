@@ -127,6 +127,7 @@ fn config(prefix: &'static str, max_connections: usize) -> PrivateBrokerConfig<'
         socket_name: "s",
         listener_thread: "copy-ssh-listener",
         client_thread: "copy-ssh-client",
+        inline_on_thread_failure: false,
         max_connections,
         io_timeout: TIMEOUT,
     }

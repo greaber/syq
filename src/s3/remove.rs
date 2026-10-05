@@ -464,6 +464,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
                 bucket: &options.bucket,
                 concurrency: crate::deletion::Concurrency::s3(&args),
                 individual: args.s3_remove.individual_deletes(&options, authorization.is_some()),
+                retries: options.retries,
             };
             let identify = |entry: &Entry| delete::Target {
                 key: entry.key.clone(),
