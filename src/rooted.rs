@@ -1718,6 +1718,16 @@ impl Root {
         }
     }
 
+    /// A resolved removal parent is owned for a descendant directory, or
+    /// borrows this root for one of its direct children.
+    pub(crate) fn removal_entry<'a>(
+        &'a self,
+        parent: Option<&'a File>,
+        name: &'a CStr,
+    ) -> RemovalEntry<'a> {
+        RemovalEntry::new(parent.unwrap_or(&self.directory), name)
+    }
+
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
     /// followed. Directories are refused by the kernel.
     pub(crate) fn unlink(&self, path: &RelativePath) -> Result<()> {
@@ -1815,13 +1825,12 @@ impl<'a> RemovalEntry<'a> {
 // still resolve it from Root; retaining this handle must not hide replacement
 // of an ancestor during a metadata update.
 impl ResolvedParent<'_> {
-    /// Transfer the resolved parent into a bounded deletion batch. A direct
-    /// child borrows the root during resolution and needs its own descriptor
-    /// only when that parent is kept across entries.
-    pub(crate) fn into_directory(self) -> io::Result<File> {
+    /// Transfer a descendant's parent into a deletion batch. None means a
+    /// direct child of the caller's retained Root, with no additional fd.
+    pub(crate) fn into_owned_directory(self) -> Option<File> {
         match self.directory {
-            DirectoryHandle::Borrowed(directory) => directory.try_clone(),
-            DirectoryHandle::Owned(directory) => Ok(directory),
+            DirectoryHandle::Borrowed(_) => None,
+            DirectoryHandle::Owned(directory) => Some(directory),
         }
     }
 

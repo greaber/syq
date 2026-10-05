@@ -1,5 +1,5 @@
 //! Deletion admission is measured separately from payload transfers.
-use crate::rooted::{RelativePath, RemovalEntry, Root};
+use crate::rooted::{RelativePath, Root};
 use crate::tune::{Policy, Sampler};
 use anyhow::{bail, Context};
 use std::ffi::CString;
@@ -147,7 +147,7 @@ pub(crate) struct DirectoryBatch {
 struct RemovalParent {
     root: Arc<Root>,
     parents: Vec<Vec<u8>>,
-    directory: File,
+    directory: Option<File>,
 }
 
 #[cfg(target_os = "linux")]
@@ -181,7 +181,7 @@ impl DirectoryBatch {
                 self.held = None;
             }
             self.parent = None;
-            let directory = root.resolve_parent(path)?.into_directory()?;
+            let directory = root.resolve_parent(path)?.into_owned_directory();
             self.parent = Some(RemovalParent {
                 root: root.clone(),
                 parents: parents.to_vec(),
@@ -189,21 +189,23 @@ impl DirectoryBatch {
             });
         }
         let name = CString::new(leaf).expect("RelativePath excludes NUL");
-        let metadata =
-            match RemovalEntry::new(&self.parent.as_ref().unwrap().directory, &name).metadata() {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => {
-                    return Err(error).with_context(|| format!("inspect {}", label.display()))
-                }
-            };
+        let metadata = match root
+            .removal_entry(self.parent.as_ref().unwrap().directory.as_ref(), &name)
+            .metadata()
+        {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", label.display()))
+            }
+        };
         if !directory {
             if metadata.is_dir() {
                 bail!("{}: is now a directory; not deleting it", label.display());
             }
             self.before_unlink(root, path, metadata.len)?;
         }
-        RemovalEntry::new(&self.parent.as_ref().unwrap().directory, &name)
+        root.removal_entry(self.parent.as_ref().unwrap().directory.as_ref(), &name)
             .unlink(directory)
             .with_context(|| format!("remove {}", label.display()))
     }
@@ -372,6 +374,47 @@ mod tests {
             Path::new("test entry"),
             directory,
         )
+    }
+
+    #[test]
+    fn removing_direct_children_needs_no_additional_descriptors() {
+        use crate::process::CommandExt as _;
+        const CHILD_ENV: &str = "SYQ_TEST_DELETION_LOW_FD_CHILD";
+        const TEST: &str =
+            "deletion::tests::removing_direct_children_needs_no_additional_descriptors";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .status_guarded()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::write(base.join("file"), b"selected").unwrap();
+        fs::create_dir(base.join("empty")).unwrap();
+        let root = Arc::new(Root::open(base).unwrap());
+        let mut limit = crate::fsops::nofile_limits().unwrap();
+        limit.rlim_cur = limit.rlim_cur.min(64);
+        crate::fsops::set_nofile_limits(&limit).unwrap();
+        let mut descriptors = Vec::new();
+        loop {
+            match File::open("/dev/null") {
+                Ok(file) => descriptors.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        let mut batch = DirectoryBatch::default();
+        remove(&mut batch, &root, b"file", false).unwrap();
+        remove(&mut batch, &root, b"empty", true).unwrap();
+        drop(descriptors);
+        assert!(!base.join("file").exists());
+        assert!(!base.join("empty").exists());
     }
 
     #[test]
