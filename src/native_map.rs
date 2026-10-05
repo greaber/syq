@@ -575,7 +575,8 @@ fn join_rel(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     if prefix.is_empty() {
         return name.to_vec();
     }
-    let mut joined = prefix.to_vec();
+    let mut joined = Vec::with_capacity(prefix.len() + 1 + name.len());
+    joined.extend_from_slice(prefix);
     joined.push(b'/');
     joined.extend_from_slice(name);
     joined
