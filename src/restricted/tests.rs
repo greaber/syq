@@ -5916,3 +5916,104 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
         ]
     );
 }
+
+#[test]
+fn a_streamed_patch_is_refused_wherever_a_batch_patch_is() {
+    use crate::hashing::{CopyHashing, Digest, HashAlgorithm, HashPolicy};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let file = target.join("file");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(&file, vec![1; 4 << 16]).unwrap();
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let begin = |patch: proto::SmallPatch| Request::PatchBegin {
+        data_len: patch.new_bytes(),
+        patch: Box::new(patch),
+    };
+    let streamed_at = |path: &Path, len: u64, block: u64| {
+        let mut reuse = vec![Some([0; 32]); len.div_ceil(block) as usize];
+        reuse[0] = None;
+        small_patch(path, len, block, reuse, b"")
+    };
+    let streamed = |len: u64, block: u64| streamed_at(&file, len, block);
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1 << 20);
+    authority
+        .authorize(&mut begin(streamed(4 * block, block)), false)
+        .unwrap();
+    let mut flags_differ = streamed(4 * block, block);
+    flags_differ.unchanged_flags = proto::flags::OWNER;
+    for (request, error) in [
+        (
+            begin(streamed(4 * block, 4096)),
+            "comparison block size is outside protocol limits",
+        ),
+        (
+            begin(streamed((1 << 20) + 1, block)),
+            "signed grant per-file byte limit exceeded",
+        ),
+        (
+            begin(flags_differ),
+            "kept and published metadata flags differ beyond times",
+        ),
+        (
+            begin(small_patch(
+                &root.join("outside"),
+                block,
+                block,
+                vec![None],
+                b"",
+            )),
+            "receiver mutation is outside the signed destination scopes",
+        ),
+    ] {
+        let mut request = request;
+        assert_eq!(
+            authority
+                .authorize(&mut request, false)
+                .unwrap_err()
+                .to_string(),
+            error
+        );
+    }
+    authority.hashing = Some(CopyHashing {
+        policy: HashPolicy {
+            algorithm: HashAlgorithm::Blake3,
+            transfer_integrity: true,
+            transfer_hash_type: None,
+        },
+        expected_hash: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"data")),
+    });
+    // The expected hash is the destination's own, a single file.
+    assert_eq!(
+        authority
+            .authorize(&mut begin(streamed_at(&target, 4 * block, block)), false)
+            .unwrap_err()
+            .to_string(),
+        "expected-hash files require checked finalization"
+    );
+    authority.hashing = None;
+    authority.copy.policy.publication = PublicationPolicy::InPlace;
+    assert_eq!(
+        authority
+            .authorize(&mut begin(streamed(4 * block, block)), false)
+            .unwrap_err()
+            .to_string(),
+        "small-file publication does not match the signed publication policy"
+    );
+    // A grant that retains existing files lets a patch neither keep nor
+    // replace one, streamed or not.
+    let retaining = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryAsChild,
+        RootExistence::Any,
+    )
+    .unwrap();
+    assert!(retaining
+        .authorize(&mut begin(streamed(4 * block, block)), false)
+        .is_err());
+    // A refused begin holds none of the grant's bytes; the one admitted
+    // above, never settled, still holds its file's.
+    assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4 * block);
+}
