@@ -2609,11 +2609,14 @@ mod tests {
                     // with a new private file before anything is written.
                     fs::write(&sidecar, b"").unwrap();
                     fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o666)).unwrap();
-                    let planted = fs::metadata(&sidecar).unwrap().ino();
+                    // Held open, its inode number cannot be given to the
+                    // replacement, as ext4 gives a freed one at once.
+                    let planted = File::open(&sidecar).unwrap();
                     let target = ops.small_target(&wanted).unwrap();
                     let stage = ops.create_small_stage(&wanted, target).unwrap();
                     assert!(!stage.reused);
-                    assert_ne!(stage.created.ino(), planted);
+                    assert_ne!(stage.created.ino(), planted.metadata().unwrap().ino());
+                    drop(planted);
                     assert_eq!(stage.created.mode() & 0o777, 0o600);
                     drop(stage);
                 }

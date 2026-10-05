@@ -4239,7 +4239,10 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                 }
                 let sidecar = partial_path(&path, &id).unwrap();
                 fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
-                let staged = fs::metadata(&sidecar).unwrap().ino();
+                // Held open, the first sidecar's inode number cannot be given
+                // to a replacement, as ext4 gives a freed one at once.
+                let held = File::open(&sidecar).unwrap();
+                let staged = held.metadata().unwrap().ino();
                 let mut ops = if connection == "same" {
                     ops
                 } else {
@@ -4270,6 +4273,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                     }
                 }
                 let reused = fs::metadata(&sidecar).unwrap().ino() == staged;
+                drop(held);
                 let meta = Meta {
                     mode: retry_mode,
                     uid: 0,
