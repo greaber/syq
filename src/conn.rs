@@ -668,6 +668,14 @@ fn spawn_observed_reader(
     let receipts = batch_receipts.clone();
     let reader = std::thread::Builder::new()
         .spawn(move || {
+            // Every reply counts against the byte limit from when it is
+            // queued until it is taken, the handshake's included.
+            let send = |msg: std::io::Result<ReceivedResponse>| {
+                if let (Some(queued), Ok(message)) = (&reader_queued, &msg) {
+                    queued.queued(message.bytes);
+                }
+                tx.send(msg).is_ok()
+            };
             let mut r = FrameReader::new(input);
             r.set_limit(MAX_HANDSHAKE_FRAME);
             let hello = r
@@ -679,7 +687,7 @@ fn spawn_observed_reader(
             let accepted = matches!(&hello, Ok(message)
             if matches!(&message.value, Response::HelloOk { identity, .. }
                 if identity == crate::identity::build()));
-            if tx.send(hello).is_err() || !accepted {
+            if !send(hello) || !accepted {
                 return;
             }
             r.set_limit(MAX_FRAME);
@@ -701,10 +709,7 @@ fn spawn_observed_reader(
                     receipts.response(&message.value);
                 }
                 let failed = msg.is_err();
-                if let (Some(queued), Ok(message)) = (&reader_queued, &msg) {
-                    queued.queued(message.bytes);
-                }
-                if tx.send(msg).is_err() || failed {
+                if !send(msg) || failed {
                     break;
                 }
                 if let Some(queued) = &reader_queued {

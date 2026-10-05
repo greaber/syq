@@ -1406,6 +1406,39 @@ fn a_full_reply_byte_limit_still_drains_replies_while_requests_are_sent() {
 }
 
 #[test]
+fn a_handshake_reply_carrying_data_counts_against_the_reply_byte_limit() {
+    // A peer that answers the handshake with file data instead of HelloOk:
+    // taking that reply must not release bytes that were never counted, and
+    // the caller then rejects it as a handshake.
+    let mut wire = Vec::new();
+    FrameWriter::new(&mut wire, false)
+        .write_msg(&Response::Block {
+            off: 0,
+            hash: [0; 32],
+            data: vec![1],
+        })
+        .unwrap();
+    let (rx, reader, _) = spawn_observed_reader(
+        Box::new(std::io::Cursor::new(wire)),
+        16,
+        Some(SOURCE_REPLY_BYTES),
+        Default::default(),
+    )
+    .unwrap();
+    reader.join().unwrap();
+    // A failed count poisons the queue's lock, and dropping the queue would
+    // then panic again while unwinding: keep the first failure.
+    let rx = std::mem::ManuallyDrop::new(rx);
+    let received = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.recv()));
+    assert!(
+        matches!(&received, Ok(Ok(Ok(reply))) if matches!(reply.value, Response::Block { .. })),
+        "{received:?}"
+    );
+    assert_eq!(rx.queued_bytes(), 0);
+    drop(std::mem::ManuallyDrop::into_inner(rx));
+}
+
+#[test]
 fn a_reply_byte_limit_stops_the_reader_until_replies_are_taken() {
     // Without requests being sent, the reader stops once the queued replies
     // carry the limit, and reads on as they are taken.
