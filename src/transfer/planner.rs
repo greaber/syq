@@ -2705,7 +2705,7 @@ impl Planner<'_> {
     fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
         let os_kind = wire_os_kind(error);
         self.progress.error_classified(
-            &format!("syq: {}", self.opts.wire_error_message(&error)),
+            &format!("syq: {}", self.opts.wire_error_message(error)),
             Some("io"),
             os_kind,
         );
