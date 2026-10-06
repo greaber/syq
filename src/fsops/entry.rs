@@ -123,12 +123,15 @@ pub(crate) fn rooted_source_entry(
 /// Build an entry relative to a directory already opened by a descriptor
 /// scanner. Symlink target reads and the confirming stat use that same parent
 /// descriptor, so neither operation has to rewalk a possibly renamed path.
+/// Name-only mappings can omit the target and its consistency check; callers
+/// that copy links or evaluate their targets must request it.
 pub(crate) fn rooted_entry_in_directory(
     root: &Root,
     directory: &File,
     name: &[u8],
     path: PathBytes,
     metadata: RootMetadata,
+    read_symlink_target: bool,
 ) -> Result<Entry> {
     let kind = match metadata.file_type() {
         MODE_DIRECTORY => Kind::Dir,
@@ -140,7 +143,7 @@ pub(crate) fn rooted_entry_in_directory(
         MODE_BLOCK => Kind::BlockDev,
         _ => Kind::Other,
     };
-    let link = if kind == Kind::Symlink {
+    let link = if read_symlink_target && kind == Kind::Symlink {
         let target = root.read_link_in_directory(directory, name)?;
         let after = root.metadata_in_directory(directory, name)?;
         if (after.dev, after.ino, after.file_type())

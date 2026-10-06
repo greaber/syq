@@ -3210,7 +3210,7 @@ fn stat_with_parent(
     // the leaf, so siblings do not need an allocated RelativePath for validation.
     let directory = &parent.as_ref()?.directory;
     let metadata = root.metadata_in_directory(directory, name).ok()?;
-    rooted_entry_in_directory(root, directory, name, Vec::new(), metadata).ok()
+    rooted_entry_in_directory(root, directory, name, Vec::new(), metadata, true).ok()
 }
 
 const PAR_THREADS: usize = 32;

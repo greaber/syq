@@ -212,7 +212,7 @@ fn inspect_descriptor_children(
         let result = (|| {
             let metadata = root.metadata_in_directory(directory, name)?;
             let entry =
-                rooted_entry_in_directory(root, directory, name, relative.clone(), metadata)?;
+                rooted_entry_in_directory(root, directory, name, relative.clone(), metadata, true)?;
             Ok((entry, metadata))
         })();
         (relative, result)

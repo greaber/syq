@@ -255,6 +255,60 @@ fn native_map_contents_emits_identity_parent_first() {
 }
 
 #[test]
+fn native_map_symlink_targets_remain_available_to_filters() {
+    use std::os::unix::{ffi::OsStrExt, fs::symlink};
+
+    let t = Tmp::new();
+    write(&t.path("src/nested/file"), b"data");
+    write(&t.path("outside"), b"outside");
+    symlink("file", t.path("src/nested/keep")).unwrap();
+    symlink("missing", t.path("src/nested/dangling")).unwrap();
+    symlink("../../outside", t.path("src/nested/outside")).unwrap();
+    symlink(
+        std::ffi::OsStr::from_bytes(b"\xff"),
+        t.path("src/nested/raw"),
+    )
+    .unwrap();
+
+    let unfiltered = syq_map_in(&t.path(""), &["--srcs-in", "src", "--include", "kind"]);
+    let all = syq_map_in(
+        &t.path(""),
+        &["--srcs-in", "src", "--include", "kind", "--where", "true"],
+    );
+    assert_output_ok(&unfiltered);
+    assert_output_ok(&all);
+    assert_eq!(unfiltered.stdout, all.stdout);
+    let records = map_lines(&unfiltered);
+    let names: Vec<_> = records.iter().map(|v| map_path(v, "src")).collect();
+    assert_eq!(
+        names,
+        [
+            "nested",
+            "nested/dangling",
+            "nested/file",
+            "nested/keep",
+            "nested/outside",
+            "nested/raw"
+        ]
+    );
+    assert_eq!(records.iter().filter(|v| v["kind"] == "symlink").count(), 4);
+
+    let selected = syq_map_in(
+        &t.path(""),
+        &[
+            "--srcs-in",
+            "src",
+            "--where",
+            "src.kind = 'symlink' and src.link_target = 'file'",
+        ],
+    );
+    let records = map_lines(&selected);
+    let names: Vec<_> = records.iter().map(|v| map_path(v, "src")).collect();
+    // Directories are emitted even when their leaves do not match the filter.
+    assert_eq!(names, ["nested", "nested/keep"]);
+}
+
+#[test]
 fn native_map_uses_the_common_source_follow_policy() {
     use std::os::unix::fs::symlink;
 

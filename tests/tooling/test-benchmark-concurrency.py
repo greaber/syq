@@ -83,6 +83,36 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(sentinel.read_text(), "keep me")
         self.assertFalse(list(self.root.glob("syq-concurrency-*")))
 
+    def test_deep_fixture_verifies_all_directory_levels_and_file_contents(self):
+        case = self.case() | dict(depth=4)
+        with contextlib.redirect_stdout(io.StringIO()):
+            hashes, sizes = bench.fixture(self.root, case, bench.Deadline(10, "setup"))
+            self.assertEqual(sizes["logical_bytes"], 8232)
+            expected = {
+                f"d{index:04d}{suffix}" for index in range(2) for suffix in (
+                    "", "/level0001", "/level0001/level0002", "/level0001/level0002/level0003")
+            }
+            actual = {str(p.relative_to(self.root / "source"))
+                      for p in (self.root / "source").rglob("*") if p.is_dir()}
+            self.assertEqual(actual, expected)
+            self.assertEqual(len(hashes), 6)
+            self.assertTrue(all(len(Path(path).parts) == 5 for path in hashes))
+            shutil.copytree(self.root / "source", self.root / "destination", dirs_exist_ok=True)
+            bench.verify(self.root, case, hashes, bench.Deadline(10, "verify"))
+            file = self.root / "destination/d0001/level0001/level0002/level0003/f000000001"
+            file.write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeError, "changed file"):
+                bench.verify(self.root, case, hashes, bench.Deadline(10, "verify"))
+            shutil.copyfile(self.root / "source" / file.relative_to(self.root / "destination"), file)
+            (self.root / "destination/d0000/unexpected").mkdir()
+            with self.assertRaisesRegex(RuntimeError, "tree differs"):
+                bench.verify(self.root, case, hashes, bench.Deadline(10, "verify"))
+
+    def test_omitting_depth_preserves_the_original_fixture_layout(self):
+        case = self.case()
+        self.assertEqual(bench.filename(case, 3), Path("d0001/f000000003"))
+        self.assertEqual(list(bench.fixture_directories(case)), [Path("d0000"), Path("d0001")])
+
     def test_native_accounting_does_not_inherit_fixture_builder_peak_rss(self):
         # wait4 on a Python-spawned child itself can inherit this memory peak.
         allocation = bytearray(96 * 1024 * 1024)
@@ -235,7 +265,7 @@ print(' '.join(args))
 """)
         binary.chmod(0o755)
         plan = dict(reference="auto-1-fixed", cases=[dict(self.case("rm"), name=n) for n in ("tree", "tree-1-auto")]
-                    + [self.case("prune") | dict(name="prune")], variants=[
+                    + [self.case("prune") | dict(name="prune", depth=3)], variants=[
             dict(name=n, binary=str(binary), workers=w, cpus=None) for n, w in (("auto-1-fixed", None), ("fixed", 8))])
         path = self.root / "plan.json"
         path.write_text(json.dumps(plan))
@@ -295,6 +325,14 @@ print(' '.join(args))
         bad["cases"][0]["filez"] = 1
         with self.assertRaisesRegex(ValueError, "case needs"):
             bench.validate(bad)
+        deep = copy.deepcopy(plan)
+        deep["cases"][0]["depth"] = 12
+        bench.validate(deep)
+        for invalid in (0, -1, True, 1.5, None):
+            bad = copy.deepcopy(deep)
+            bad["cases"][0]["depth"] = invalid
+            with self.assertRaisesRegex(ValueError, "depth must"):
+                bench.validate(bad)
         if hasattr(os, "sched_getaffinity"):
             bad = copy.deepcopy(plan)
             bad["variants"][0]["cpus"] = [max(os.sched_getaffinity(0)) + 1]

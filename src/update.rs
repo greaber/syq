@@ -520,7 +520,7 @@ fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
 }
 
 fn embedded_public_key() -> Result<Cow<'static, str>> {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(key) = std::env::var_os("SYQ_TEST_RELEASE_PUBLIC_KEY").filter(|v| !v.is_empty()) {
         return Ok(Cow::Owned(key.to_string_lossy().into_owned()));
     }
@@ -681,7 +681,7 @@ fn install_release(
 }
 
 fn release_downloads() -> Cow<'static, str> {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(url) = std::env::var_os("SYQ_TEST_RELEASE_DOWNLOADS").filter(|v| !v.is_empty()) {
         return Cow::Owned(url.to_string_lossy().into_owned());
     }
@@ -900,7 +900,7 @@ impl DownloadSink for Vec<u8> {
 }
 
 fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u64) -> Result<()> {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
         let name = url
             .rsplit('/')
