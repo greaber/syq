@@ -2517,7 +2517,7 @@ fn native_remote_container_access_refreshes_cached_existence() {
         return;
     }
     for placement in ["--into", "--as"] {
-        for only_existing in [false, true] {
+        for policy in ["keep", "only-existing", "expression"] {
             for present in [false, true] {
                 let t = Tmp::new();
                 let rsh = fake_rsh(&t);
@@ -2549,20 +2549,26 @@ fn native_remote_container_access_refreshes_cached_existence() {
                     .env("FAKE_RSH_LOG", t.path("rsh.log"))
                     .env("XDG_CONFIG_HOME", t.path("config"))
                     .env("XDG_CACHE_HOME", t.path("cache"));
-                if only_existing {
-                    command.args(["--only-existing", "--if-exists=update"]);
-                } else {
-                    command.arg("--if-exists=keep");
+                match policy {
+                    "only-existing" => {
+                        command.args(["--only-existing", "--if-exists=update"]);
+                    }
+                    "expression" => {
+                        command.args(["--copy-if", "not dst.exists", "--if-exists=update"]);
+                    }
+                    _ => {
+                        command.arg("--if-exists=keep");
+                    }
                 }
                 let output = command.run().unwrap();
                 let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o7777;
                 fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
                 assert_output_ok(&output);
                 assert_eq!(mode, 0o600);
-                if only_existing && !present {
+                if policy == "only-existing" && !present {
                     assert!(!t.path("dst/file").exists());
                 } else {
-                    let expected = if !only_existing && present {
+                    let expected = if policy != "only-existing" && present {
                         b"old destination contents".as_slice()
                     } else {
                         b"new source contents".as_slice()
@@ -2570,7 +2576,7 @@ fn native_remote_container_access_refreshes_cached_existence() {
                     assert_eq!(
                         read(&t.path("dst/file")),
                         expected,
-                        "{placement}, only_existing={only_existing}, present={present}"
+                        "{placement}, policy={policy}, present={present}"
                     );
                 }
             }

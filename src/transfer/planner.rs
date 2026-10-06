@@ -1609,7 +1609,7 @@ impl Planner<'_> {
 
     /// Everything after the mapping loop: stat, create directories, filter,
     /// enqueue.
-    pub(super) fn apply_mapped(&mut self, mut mapped: Mapped) -> Result<()> {
+    pub(super) fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
         if self.opts.inode_preservation.xattrs {
             for entry in mapped
                 .dirs
@@ -1634,15 +1634,7 @@ impl Planner<'_> {
         }
         let root_entry = self.assert_mutation_root()?;
         if !mapped.dirs.is_empty() || !mapped.others.is_empty() {
-            let restorations = self.directory_restorations.len();
             self.prepare_container_access()?;
-            if self.directory_restorations.len() != restorations {
-                // Remote batching may have treated inaccessible children as
-                // absent before this container became searchable. Reinspect
-                // them before deciding whether to keep or replace a file.
-                mapped.dir_stats = None;
-                mapped.other_stats = None;
-            }
         }
         let opts = self.opts;
         let Mapped {
@@ -3116,12 +3108,14 @@ impl Planner<'_> {
     }
 
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
-        // Keep the remote receiver's combined metadata lookup, but no longer
-        // ask it to compute temporary names for every source file.
+        // Keep the remote receiver's combined metadata lookup, but wait for
+        // container access first: an inaccessible child must not be cached as
+        // absent before apply_mapped makes it searchable.
         if self.opts.inode_preservation.any()
             || !self.opts.dst_remote
             || self.buffer.is_some()
             || self.opts.dry_run
+            || self.container_access.is_some()
             || self.destination_children_known_missing
             || self.container_guard.is_some()
         {

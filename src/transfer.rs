@@ -2931,16 +2931,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let (entry, canonical) = stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root)?;
         (canonical.as_os_str().as_bytes().to_vec(), entry)
     } else {
-        let entry = if args.target_existence == Existence::Any {
-            stat_one(&mut *dst_ctl, &operator_dst_root, false)?
-        } else {
-            inspect_placement_target(
-                &mut *dst_ctl,
-                &operator_dst_root,
-                opts.operator_symlink_policy,
-                opts.may_widen_directory_permissions(),
-            )?
-        };
+        let entry =
+            if args.target_existence == Existence::Any && !opts.may_widen_directory_permissions() {
+                stat_one(&mut *dst_ctl, &operator_dst_root, false)?
+            } else {
+                inspect_placement_target(
+                    &mut *dst_ctl,
+                    &operator_dst_root,
+                    opts.operator_symlink_policy,
+                    opts.may_widen_directory_permissions(),
+                )?
+            };
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;
         // exact placement preserves the final directory entry.
