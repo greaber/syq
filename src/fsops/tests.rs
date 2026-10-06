@@ -48,7 +48,7 @@ fn confined_placement_access_rejects_a_symlink_parent_without_widening_its_targe
     let after = fs::metadata(&outside).unwrap();
     fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(
-        matches!(response, Response::EndpointError(_) | Response::Error(_)),
+        matches!(response, Response::EndpointError(_)),
         "{response:?}"
     );
     assert_eq!(after.mode() & 0o7777, 0o600);
