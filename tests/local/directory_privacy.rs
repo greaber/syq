@@ -598,6 +598,43 @@ fn an_existing_directory_is_narrowed_before_it_is_filled() {
 }
 
 #[test]
+fn narrowing_existing_permissions_does_not_implicitly_widen_owner_access() {
+    for widen in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/d/file"), b"private");
+        fs::set_permissions(t.path("src/d"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::create_dir_all(t.path("dst/d")).unwrap();
+        fs::set_permissions(t.path("dst/d"), fs::Permissions::from_mode(0o555)).unwrap();
+        let mut command = syq_command(&[
+            "cp",
+            "--copy-metadata=permissions",
+            "--srcs-in",
+            "src",
+            "--into",
+            "dst",
+        ]);
+        command.current_dir(&t.0);
+        if widen {
+            command.arg("--temporarily-widen-dir-permissions");
+        }
+        let (during, output) = observe_before_finalization(&t, command, || mode(&t.path("dst/d")));
+        let can_copy = widen || unsafe { libc::geteuid() } == 0;
+        assert_eq!(output.status.success(), can_copy, "{output:?}");
+        assert_eq!(
+            during,
+            if widen && unsafe { libc::geteuid() } != 0 {
+                0o700
+            } else {
+                0o500
+            }
+        );
+        assert_eq!(mode(&t.path("dst/d")), 0o500);
+        assert_eq!(t.path("dst/d/file").exists(), can_copy);
+        fs::set_permissions(t.path("dst/d"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[test]
 fn a_mapping_mode_narrower_than_the_source_applies_while_filling() {
     let t = Tmp::new();
     write(&t.path("src/d/file"), b"mapped");

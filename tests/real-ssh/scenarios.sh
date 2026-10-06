@@ -1138,7 +1138,7 @@ for preservation in default permissions; do
     ssh destination "mkdir -p $destination/old; chmod 2775 $destination; chmod 2555 $destination/old"
     set --
     if [ "$preservation" = permissions ]; then set -- --copy-metadata=permissions; fi
-    syq cp "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
+    syq cp --temporarily-widen-dir-permissions "$@" --from source --srcs-in /tmp/syq-real-ssh/expression-modes \
         --to destination --into "$destination" --coordinate-at src --no-progress \
         --where "src.kind = 'file'" --copy-if "src.kind != 'dir'"
     # Expand the fixture path locally; run cat and stat on the destination.

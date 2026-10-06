@@ -699,7 +699,11 @@ pub(crate) fn open_operator_directory_at(parent: &File, component: &[u8]) -> Res
 pub(super) fn open_operator_directory_fd(parent: RawFd, component: &CString) -> Result<File> {
     // O_DIRECTORY is the kernel-enforced type check. Repeating it with
     // fstat costs another metadata operation on network filesystems.
-    Ok(open_at(parent, component, operator_directory_flags(), 0)?)
+    #[cfg(target_os = "macos")]
+    let directory = open_directory_metadata_fd(parent, component)?;
+    #[cfg(not(target_os = "macos"))]
+    let directory = open_at(parent, component, operator_directory_flags(), 0)?;
+    Ok(directory)
 }
 
 pub(super) fn open_operator_metadata_at(parent: RawFd, name: &CString) -> io::Result<File> {

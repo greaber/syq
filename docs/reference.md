@@ -241,7 +241,9 @@ syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
 This makes the contents of `deploy` match `build`: it copies changes, then
 removes extras. Preview with `--dry-run -v` first. If more than 100 removals
 are planned, syq refuses all deletions. Scan or copy errors also prevent deletion.
-Ignored paths are kept.
+Ignored paths are kept. Use `--prune-before` instead of `--prune` to free space
+before copying. Source selection must finish first; a later copy failure does
+not restore removed extras. The same `--max-delete` limit applies.
 
 Placement determines where pruning happens. Compare:
 
@@ -406,8 +408,18 @@ Explicit mapping `metadata.mtime` also sets the requested destination time.
 S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 
-Existing files keep their destination permissions. New files use the
-source read, write, and execute permissions, limited by the destination umask.
+Existing files and directories keep their destination permissions unless you
+request permission or ACL metadata. Native `cp` does not automatically widen
+existing directory permissions to make copying or pruning succeed, even when
+copying permission metadata. The requested final permissions still apply.
+`--temporarily-widen-dir-permissions` allows adding owner read, write and search
+permission to existing directories being copied into, when the receiving user owns them.
+Syq restores only directories it actually widened, after copying and pruning;
+explicitly requested permissions take precedence. Other processes can see the
+temporary permissions, and a crash or forced termination can leave them in place.
+`syq rsync` enables temporary widening without this option. Root skips widening.
+
+New files use the source read, write, and execute permissions, limited by the destination umask.
 For example, a new script with mode `755` stays executable with umask `022`.
 
 To preserve source permissions and ownership as well:

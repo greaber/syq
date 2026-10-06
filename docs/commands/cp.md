@@ -66,7 +66,8 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--copy-if <EXPR>` | Update only entries satisfying a source/destination expression |
 | `--inplace` | Update destination files directly, using no full-sized staging file; interruption can leave them incomplete |
 | `--prune` | After copying, remove target-only objects in mapped directory scopes; ignored source paths remain protected |
-| `--max-delete <N>` | With --prune, refuse all removals if more than N are planned |
+| `--prune-before` | Remove target-only objects before copying to free space. Implies --prune; later copy failures do not restore removed objects |
+| `--max-delete <N>` | With --prune or --prune-before, refuse all removals if more than N are planned |
 
 ## Metadata and symlinks
 
@@ -76,6 +77,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
 | `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Match Content-Type on S3-to-S3 copies<br>- content-encoding: Match Content-Encoding on S3-to-S3 copies<br>- content-language: Match Content-Language on S3-to-S3 copies<br>- content-disposition: Match Content-Disposition on S3-to-S3 copies<br>- cache-control: Match Cache-Control on S3-to-S3 copies<br>- expires: Match Expires on S3-to-S3 copies<br>- website-redirect: Match the website redirect on S3-to-S3 copies<br>- user-metadata: Match application user metadata on S3-to-S3 copies (excluding syq-* keys)<br>- tags: Match the complete tag set on S3-to-S3 copies<br>- storage-class: Use the source storage class on S3-to-S3 copies |
+| `--temporarily-widen-dir-permissions` | Temporarily add owner read, write and search permission to existing destination directories |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
 
@@ -192,6 +194,11 @@ restrictions are listed under [file descriptors](#file-descriptors).
 ## Pruning
 
 `--prune` deletes only within the copied directories, after copying succeeds.
+Use `--prune-before` instead when you need to free disk space first. It waits
+for source selection to finish, then removes extras before copying. A later
+copy failure does not restore those removals. Both modes honor `--max-delete`
+and skip deletions if scanning reports errors.
+
 Ignored paths, syq partial files, and recovery entries are
 kept. This also keeps their parent directories; extra hard links to copied
 files may be kept too. An interruption during deletion can leave some extras

@@ -7602,6 +7602,107 @@ fn native_copy_reports_original_writer_close_error() {
 }
 
 #[test]
+fn temporary_directory_access_is_explicit_and_reports_only_changes() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut operations = destination_ops(temporary.path());
+    assert!(operations
+        .apply(
+            &[Op::Mkdir {
+                path: b"owned".to_vec(),
+                mode: 0o777,
+                condition: TargetCondition::Any
+            }],
+            None
+        )
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    let metadata = fs::metadata(&dir).unwrap();
+    let request = Request::WidenDirectories {
+        directories: vec![(
+            path_bytes(&dir),
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        )],
+        guard: None,
+    };
+    let Response::WidenedDirectories(results) = operations.handle(&request) else {
+        panic!("unexpected response")
+    };
+    let saved = results[0].as_ref().unwrap();
+    if is_superuser() {
+        assert!(saved.is_none());
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    } else {
+        let saved = saved.unwrap();
+        assert_eq!(saved.mode, 0o500);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        let Response::WidenedDirectories(again) = operations.handle(&request) else {
+            panic!("unexpected response")
+        };
+        assert!(matches!(again.as_slice(), [Ok(None)]));
+        restore_directory_mode(
+            &Root::open(temporary.path()).unwrap(),
+            &RelativePath::new(b"owned").unwrap(),
+            saved,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let metadata = fs::metadata(&dir).unwrap();
+    let request = Request::WidenDirectories {
+        directories: vec![(
+            path_bytes(&dir),
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino() + 1,
+            },
+        )],
+        guard: None,
+    };
+    assert!(matches!(FsOps::new().handle(&request), Response::Err(_)));
+    let Response::WidenedDirectories(results) = destination_ops(temporary.path()).handle(&request)
+    else {
+        panic!("unexpected response")
+    };
+    assert!(results[0].is_err());
+    assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn permission_hint_requires_an_owned_directory_missing_needed_bits() {
+    if is_superuser() {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    let root = Root::open(temporary.path()).unwrap();
+    let path = RelativePath::new(b"owned/new").unwrap();
+    assert!(directory_permission_hint(&root, &path, 0o300).is_none());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(directory_permission_hint(&root, &path, 0o300).is_some());
+    assert!(directory_permission_hint(&root, &path, 0o100).is_none());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn creations_wait_for_their_parents_created_in_the_same_request() {
     let mkdir = |path: &[u8]| Op::Mkdir {
         path: path.to_vec(),

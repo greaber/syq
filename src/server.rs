@@ -311,6 +311,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::AnchorDestination { .. }
         | Request::DestinationFilesystemInfo { .. }
         | Request::PartialPaths { .. }
+        | Request::WidenDirectories { .. }
         | Request::Apply { .. }
         | Request::PlanBatch { .. }
         | Request::ProbePartial { .. }

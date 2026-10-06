@@ -400,21 +400,18 @@ impl Root {
     }
 
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
-        let (parent, leaf) = if path.is_empty() {
-            (
-                DirectoryHandle::Borrowed(&self.directory),
-                component_cstring(b"."),
-            )
-        } else {
-            let parent = self.resolve_parent(path)?;
-            (parent.directory, parent.leaf)
-        };
-        ResolvedParent {
-            directory: parent,
-            leaf,
+        if path.is_empty() {
+            // The root is already selected and pinned. Reopening it through
+            // "." requires search permission, including when this handle is
+            // needed to add that permission to an owned directory.
+            return self
+                .directory
+                .try_clone()
+                .context("duplicate confined root metadata handle");
         }
-        .open_metadata()
-        .with_context(|| format!("open confined metadata handle {}", path.label()))
+        self.resolve_parent(path)?
+            .open_metadata()
+            .with_context(|| format!("open confined metadata handle {}", path.label()))
     }
 
     // The Linux syscall resolves the parent and opens the leaf under the same
@@ -1738,6 +1735,16 @@ impl Root {
         }
     }
 
+    /// A resolved removal parent is owned for a descendant directory, or
+    /// borrows this root for one of its direct children.
+    pub(crate) fn removal_entry<'a>(
+        &'a self,
+        parent: Option<&'a File>,
+        name: &'a CStr,
+    ) -> RemovalEntry<'a> {
+        RemovalEntry::new(parent.unwrap_or(&self.directory), name)
+    }
+
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
     /// followed. Directories are refused by the kernel.
     pub(crate) fn unlink(&self, path: &RelativePath) -> Result<()> {
@@ -1746,6 +1753,7 @@ impl Root {
 
     /// Remove one empty directory. Recursive deletion is intentionally not part
     /// of this foundation.
+    #[cfg(test)]
     pub(crate) fn remove_directory(&self, path: &RelativePath) -> Result<()> {
         self.unlink_with_flags(path, libc::AT_REMOVEDIR, "remove directory")
     }
@@ -1805,10 +1813,45 @@ pub(crate) struct ResolvedParent<'a> {
     leaf: CString,
 }
 
+/// One already-validated name beneath an opened directory. Removal callers
+/// choose their own identity and type checks; neither operation follows the
+/// final symlink, and unlink never expands into a recursive removal.
+pub(crate) struct RemovalEntry<'a> {
+    directory: &'a File,
+    name: &'a CStr,
+}
+
+impl<'a> RemovalEntry<'a> {
+    pub(crate) fn new(directory: &'a File, name: &'a CStr) -> Self {
+        Self { directory, name }
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
+        metadata_at(self.directory.as_raw_fd(), self.name)
+    }
+
+    pub(crate) fn unlink(&self, directory: bool) -> io::Result<()> {
+        unlink_at(
+            self.directory.as_raw_fd(),
+            self.name,
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    }
+}
+
 // An operation-local parent handle. Callers that check the final pathname must
 // still resolve it from Root; retaining this handle must not hide replacement
 // of an ancestor during a metadata update.
 impl ResolvedParent<'_> {
+    /// Transfer a descendant's parent into a deletion batch. None means a
+    /// direct child of the caller's retained Root, with no additional fd.
+    pub(crate) fn into_owned_directory(self) -> Option<File> {
+        match self.directory {
+            DirectoryHandle::Borrowed(_) => None,
+            DirectoryHandle::Owned(directory) => Some(directory),
+        }
+    }
+
     pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
         metadata_at(self.directory.as_raw_fd(), &self.leaf)
     }
@@ -2093,22 +2136,31 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     )
 }
 
-/// Inspect a directory's naming rules before search permission is repaired.
-/// macOS O_SEARCH requires search permission on the directory being opened;
-/// Use O_SEARCH for searchable directories, then O_EVTONLY when only read
-/// permission is available. Neither changes permissions during inspection.
-/// Descendant lookups still enforce search permission and never follow links.
+/// Pin a directory before search permission is repaired. macOS O_SEARCH
+/// requires search permission on the directory being opened; O_EVTONLY can
+/// select a readable directory without that permission. Neither changes modes,
+/// follows links, or bypasses search checks on subsequent descendant lookups.
 #[cfg(target_os = "macos")]
-fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
-    match open_directory_at(parent, component) {
+fn open_directory_metadata_fd(parent: RawFd, component: &CStr) -> io::Result<File> {
+    match open_at(
+        parent,
+        component,
+        operator_directory_flags() | libc::O_NOCTTY,
+        0,
+    ) {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
-            parent.as_raw_fd(),
-            &component_cstring(component),
+            parent,
+            component,
             libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         ),
         result => result,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
+    open_directory_metadata_fd(parent.as_raw_fd(), &component_cstring(component))
 }
 
 // Missing entries and exclusive-create collisions already answer the lookup.
@@ -2270,7 +2322,7 @@ pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
     Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
 }
 
-fn metadata_at(parent: RawFd, name: &CString) -> io::Result<RootMetadata> {
+fn metadata_at(parent: RawFd, name: &CStr) -> io::Result<RootMetadata> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     retry_zero(|| unsafe {
         libc::fstatat(parent, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)

@@ -1596,7 +1596,33 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                     matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
                     "{response:?}"
                 );
-                assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o2750);
+                assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
+                let mut access = Request::WidenDirectories {
+                    directories: vec![(
+                        path_bytes(&parent),
+                        proto::TargetCondition::Matches {
+                            dev: original.dev(),
+                            ino: original.ino(),
+                        },
+                    )],
+                    guard: None,
+                };
+                let settlement = authority.authorize(&mut access, false).unwrap();
+                let response = crate::fsops::FsOps::new().handle(&access);
+                authority.settle(settlement, &response);
+                assert!(
+                    matches!(response, proto::Response::WidenedDirectories(ref outcomes)
+                        if outcomes.len() == 1 && outcomes[0].is_ok()),
+                    "{response:?}"
+                );
+                assert_eq!(
+                    fs::metadata(&parent).unwrap().mode() & 0o7777,
+                    if unsafe { libc::geteuid() } == 0 {
+                        0o2550
+                    } else {
+                        0o2750
+                    }
+                );
                 let mut restore = apply(Op::SetMeta {
                     path: path_bytes(&parent),
                     meta: proto::Meta {
@@ -3535,9 +3561,28 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
         .all(|error| error.is_none()));
     assert_eq!(
         fs::metadata(&existing_directory).unwrap().mode() & 0o7777,
-        0o700
+        0o500
     );
     assert_eq!(fs::metadata(&new_directory).unwrap().mode() & 0o7777, 0o700);
+
+    let observed = fs::metadata(&existing_directory).unwrap();
+    let mut access = Request::WidenDirectories {
+        directories: vec![(
+            path(&existing_directory),
+            proto::TargetCondition::Matches {
+                dev: observed.dev(),
+                ino: observed.ino(),
+            },
+        )],
+        guard: None,
+    };
+    authority.authorize(&mut access, false).unwrap();
+    let response = crate::fsops::FsOps::new().handle(&access);
+    assert!(
+        matches!(response, proto::Response::WidenedDirectories(ref outcomes)
+        if outcomes.len() == 1 && outcomes[0].is_ok()),
+        "{response:?}"
+    );
 
     let receiver_meta = |path: &Path| Op::SetMeta {
         path: path.as_os_str().as_bytes().to_vec(),

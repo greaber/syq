@@ -257,8 +257,10 @@ fn failed_attached_emit_cancels_pending_mutation() {
     });
 
     let mut heartbeat = Vec::new();
-    let error =
-        emit_attached(&pool, &mut heartbeat, &mut |_| bail!("client disconnected")).unwrap_err();
+    let error = crate::deletion::workers::emit(&pool, &mut heartbeat, &mut |_| {
+        bail!("client disconnected")
+    })
+    .unwrap_err();
     assert!(error.to_string().contains("client disconnected"));
     assert!(pool.is_cancelled());
 
@@ -533,7 +535,7 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             NativeRemoveDisposition::Removed,
             Some(1),
         ));
-        assert!(matches!(event_rx.try_recv(), Ok(Some(_))));
+        assert!(matches!(event_rx.try_recv(), Ok(Ok(Some(_)))));
         assert!(!pool.is_done());
         // Force the problematic ordering: the coordinator already consumed
         // the last outcome while its worker still counted as pending.
@@ -542,7 +544,7 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
         }
         pool.task_done();
         assert!(pool.is_done());
-        assert!(matches!(event_rx.try_recv(), Ok(None)));
+        assert!(matches!(event_rx.try_recv(), Ok(Ok(None))));
     }
 }
 
@@ -747,7 +749,7 @@ fn retirement_pauses_inline_scanning_before_the_directory_finishes() {
     assert_eq!(
         outcomes
             .try_iter()
-            .flatten()
+            .filter_map(Result::unwrap)
             .filter(|o| o.disposition == NativeRemoveDisposition::Removed)
             .count(),
         512,
@@ -826,7 +828,7 @@ fn reduced_scans_finish_with_idle_workers_waiting_on_the_queue() {
     assert_eq!(
         outcomes
             .try_iter()
-            .flatten()
+            .filter_map(Result::unwrap)
             .filter(|o| o.disposition == NativeRemoveDisposition::Removed)
             .count(),
         1024,

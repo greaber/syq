@@ -148,6 +148,7 @@ pub struct Opts {
     pub links: bool,
     pub perms: bool,
     pub rsync_creation: bool,
+    pub widen_directory_permissions: bool,
     pub hardlinks: bool,
     pub sparse: bool,
     pub inode_preservation: crate::inode_metadata::Selection,
@@ -1313,7 +1314,16 @@ fn attempt_small_copy(
         let failure = match result.error {
             Some(error) => {
                 let error = endpoint_error(error).context("put");
-                Some(("unknown", os_kind_of(&error), format!("{error:#}")))
+                Some((
+                    "unknown",
+                    os_kind_of(&error),
+                    copy_error_message(
+                        &error,
+                        args.interface == Interface::NativeCp
+                            && !args.temporarily_widen_dir_permissions
+                            && !args.only_new_native_entries(),
+                    ),
+                ))
             }
             None => None,
         };
@@ -1739,7 +1749,7 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
 fn wire_os_kind(error: &WireError) -> Option<&'static str> {
     Some(match error.io_kind? {
         WireIoKind::NotFound => "not_found",
-        WireIoKind::PermissionDenied => "permission_denied",
+        WireIoKind::PermissionDenied | WireIoKind::OwnedDirectoryPermissions => "permission_denied",
         WireIoKind::AlreadyExists => "already_exists",
         WireIoKind::InvalidInput => "invalid_input",
         WireIoKind::NoSpace => "no_space",
@@ -1747,6 +1757,38 @@ fn wire_os_kind(error: &WireError) -> Option<&'static str> {
         WireIoKind::ReadOnly => "read_only",
         WireIoKind::Other => "other",
     })
+}
+
+pub(crate) const DIRECTORY_ACCESS_HINT: &str = "--temporarily-widen-dir-permissions may help";
+
+fn permission_error_message(message: String, kind: Option<WireIoKind>, may_widen: bool) -> String {
+    if may_widen && kind == Some(WireIoKind::OwnedDirectoryPermissions) {
+        format!("{message}; {DIRECTORY_ACCESS_HINT}")
+    } else {
+        message
+    }
+}
+
+fn copy_error_message(error: &anyhow::Error, may_widen: bool) -> String {
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WireError>())
+        .and_then(|error| error.io_kind);
+    permission_error_message(format!("{error:#}"), kind, may_widen)
+}
+
+impl Opts {
+    fn may_suggest_directory_access(&self) -> bool {
+        !self.widen_directory_permissions && !self.preserve_existing_directory_metadata
+    }
+
+    fn wire_error_message(&self, error: &WireError) -> String {
+        permission_error_message(
+            error.to_string(),
+            error.io_kind,
+            self.may_suggest_directory_access(),
+        )
+    }
 }
 
 fn capacity_os_kind(kind: Option<&str>) -> bool {
@@ -2042,6 +2084,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         links: args.links,
         perms: args.perms,
         rsync_creation: args.interface == Interface::Rsync,
+        widen_directory_permissions: args.interface == Interface::Rsync
+            || args.temporarily_widen_dir_permissions,
         hardlinks: args.hardlinks,
         sparse: args.sparse,
         inode_preservation: crate::inode_metadata::Selection {
@@ -3130,7 +3174,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             hardlink_inodes: Default::default(),
         })
     });
-    let defer_destination_mutations = args.hardlinks || multiple_distinct_sources;
+    let defer_destination_mutations =
+        args.hardlinks || multiple_distinct_sources || args.prune_before;
     // Native new/existing forms are intentionally only the lightweight
     // pathname checks above. Once they pass, use the ordinary engine's target
     // conditions and publication behavior; this adapter does not add an
@@ -3343,6 +3388,36 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && directory_selection.is_none()
         && may_create_directories
         && defer_destination_mutations;
+    // Selection already inspected the container. Carry its identity into
+    // planning, so file-only copies can request access without another lookup
+    // on the ordinary writable-directory path.
+    let container_access = if args.temporarily_widen_dir_permissions
+        && !opts.dry_run
+        && !opts.preserve_existing_directory_metadata
+    {
+        if let Some(selection) = &directory_selection {
+            selection.needs_owner_access.then(|| {
+                (
+                    request_prefix.clone(),
+                    TargetCondition::Matches {
+                        dev: selection.dev,
+                        ino: selection.ino,
+                    },
+                )
+            })
+        } else if dst_is_dir {
+            dst_root_entry
+                .as_ref()
+                .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+                .map(|entry| (dst_root.clone(), target_identity(entry)))
+        } else if opts.restricted_receiver {
+            Some((parent_path(&dst_root), TargetCondition::Any))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && may_create_directories
@@ -3741,7 +3816,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         implicit_dirs: std::collections::HashSet::new(),
         mapping_explicit_parents: std::collections::HashSet::new(),
         blocked_mapping_parents: std::collections::HashSet::new(),
-        implicit_restorations: Vec::new(),
+        directory_restorations: Default::default(),
+        container_access,
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root {
             std::collections::HashSet::from([dst_root.clone()])
@@ -3891,6 +3967,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             Err(error) => scan_err = Some(error),
         }
     }
+    let mut deleted = 0u64;
+    let mut delete_plan = if opts.delete {
+        DeletePlan::Skipped("the copy plan did not complete")
+    } else {
+        DeletePlan::Disabled
+    };
     if scan_err.is_none() && !st.collision {
         // Multiple sources still settle final-path conflicts before writing.
         // Once settled, overlap replay with copying just as for a single scan.
@@ -3919,17 +4001,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             None
         };
-        if let Err(error) = st.replay_buffered(|| {
-            // Replay has created a deferred root by now. Without one (for
-            // example --existing against a missing destination) there is
-            // nothing for workers to anchor to and nothing for them to do.
-            let anchored = !destination_anchor_required || destination_anchor.get().is_some();
-            if let (Some(initial), true) = (local_start, anchored) {
-                spawn_workers(initial, refine_start);
-                workers_started.set(true);
-                sched.release_preflighted_work();
-            }
-        }) {
+        if let Err(error) = st.replay_buffered(
+            args.prune_before,
+            |planner| {
+                if args.prune_before {
+                    (deleted, delete_plan) = planner.prune(prune_overlap_unsearchable, true)?;
+                }
+                Ok(())
+            },
+            || {
+                // Replay has created a deferred root by now. Without one (for
+                // example --existing against a missing destination) there is
+                // nothing for workers to anchor to and nothing for them to do.
+                let anchored = !destination_anchor_required || destination_anchor.get().is_some();
+                if let (Some(initial), true) = (local_start, anchored) {
+                    spawn_workers(initial, refine_start);
+                    workers_started.set(true);
+                    sched.release_preflighted_work();
+                }
+            },
+        ) {
             scan_err = Some(error);
         }
     }
@@ -3996,7 +4087,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     progress.scan_done.store(true, Relaxed);
     if let Some(e) = &scan_err {
         let os_kind = os_kind_of(e);
-        progress.error_classified(&format!("syq: {e:#}"), os_kind.map(|_| "io"), os_kind);
+        progress.error_classified(
+            &format!(
+                "syq: {}",
+                copy_error_message(e, opts.may_suggest_directory_access())
+            ),
+            os_kind.map(|_| "io"),
+            os_kind,
+        );
         sched.abort();
     } else if collision {
         sched.abort();
@@ -4161,47 +4259,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
     }
     sched.clear_finished_work();
-    let mut deleted = 0u64;
-    let mut delete_plan = if opts.delete {
-        DeletePlan::Skipped("the copy plan did not complete")
-    } else {
-        DeletePlan::Disabled
-    };
-    // --delete runs once the workers are done, so the destination walk sees a
-    // quiescent tree (no partials being renamed, no entries being replaced),
-    // and before apply_deferred, since unlinking bumps directory mtimes. Any
-    // source-side scan problem disables deletion: a directory we couldn't
-    // read would otherwise look like one whose contents vanished.
-    if !aborted && opts.delete && scan_err.is_none() && !collision {
-        if st.scan_warned {
-            delete_plan = DeletePlan::Skipped("source scan errors");
-            progress.eprintln("syq: source scan reported errors; skipping deletions");
-        } else if prune_overlap_unsearchable {
-            delete_plan = DeletePlan::Skipped("source ancestry could not be checked");
-            progress.eprintln("syq: source ancestry could not be checked; skipping deletions");
-        } else if progress.errors.load(Relaxed) != 0 {
-            delete_plan = DeletePlan::Skipped("copy errors");
-            progress.eprintln("syq: copy reported errors; skipping deletions");
-        } else {
-            match st.assert_mutation_root().and_then(|_| st.plan_deletes()) {
-                Ok(()) if st.delete_walk_failed => {
-                    delete_plan = DeletePlan::Skipped("destination walk errors");
-                    progress.eprintln("syq: destination walk reported errors; skipping deletions")
-                }
-                Ok(()) => {
-                    delete_plan = DeletePlan::Planned(st.deletes.len());
-                    st.assert_mutation_root()?;
-                    deleted = st.run_deletes()?;
-                }
-                Err(e) => {
-                    delete_plan = DeletePlan::Skipped("destination planning failed");
-                    progress.error(&format!("syq: delete: {e:#}"));
-                }
-            }
-        }
+    if !args.prune_before && !aborted && opts.delete && scan_err.is_none() && !collision {
+        (deleted, delete_plan) = st.prune(prune_overlap_unsearchable, false)?;
     }
-    if !aborted && !opts.dry_run {
-        st.apply_deferred()?;
+    if !opts.dry_run {
+        if let Err(error) = st.apply_deferred(aborted) {
+            if !aborted {
+                return Err(error);
+            }
+            // Cleanup must not replace the interrupted/aborted terminal result.
+            progress.error(&format!("syq: restore directory permissions: {error:#}"));
+        }
     }
     if debug() {
         crate::output::diagnostic!(

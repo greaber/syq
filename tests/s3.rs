@@ -1367,7 +1367,7 @@ fn serve(
         return;
     }
     if fault.starts_with("prune-") {
-        if fault == "prune-timing" {
+        if fault.starts_with("prune-timing") {
             if method == "HEAD" {
                 reply(&mut socket, 404, &[], b"", true);
                 return;
@@ -1377,6 +1377,9 @@ fn serve(
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).unwrap();
                 assert_eq!(body, b"payload");
+                if fault == "prune-timing-before" {
+                    assert!(gate.1.load(Ordering::Acquire), "uploaded before pruning");
+                }
                 gate.0.store(true, Ordering::Release);
                 reply(&mut socket, 200, &[], b"", false);
                 return;
@@ -1428,6 +1431,10 @@ fn serve(
                 .map(|s| s.split("</Key>").next().unwrap())
                 .collect();
             assert!(!keys.is_empty() && keys.len() <= 1000);
+            if fault == "prune-timing-before" {
+                assert!(!gate.0.load(Ordering::Acquire), "pruned after uploading");
+                gate.1.store(true, Ordering::Release);
+            }
             if fault == "prune-timing" {
                 assert!(gate.0.load(Ordering::Acquire), "pruned before uploading");
                 thread::sleep(Duration::from_millis(2100));
@@ -3365,61 +3372,64 @@ fn s3_transfer_timing_excludes_delayed_pruning() {
 
 #[test]
 fn s3_download_prune_orders_parallel_children_and_preserves_ignored_entries() {
-    let temp = crate::test_support::tempdir().unwrap();
-    let destination = temp.path().join("destination");
-    for directory in 0..32 {
-        let path = destination.join(format!("old/{directory}"));
-        std::fs::create_dir_all(&path).unwrap();
-        for file in 0..64 {
-            std::fs::write(path.join(file.to_string()), b"extra").unwrap();
+    for pruning in ["--prune", "--prune-before"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let destination = temp.path().join("destination");
+        for directory in 0..32 {
+            let path = destination.join(format!("old/{directory}"));
+            std::fs::create_dir_all(&path).unwrap();
+            for file in 0..64 {
+                std::fs::write(path.join(file.to_string()), b"extra").unwrap();
+            }
         }
+        std::fs::write(temp.path().join("outside"), b"keep outside").unwrap();
+        std::os::unix::fs::symlink(temp.path().join("outside"), destination.join("old/link"))
+            .unwrap();
+        std::fs::create_dir(destination.join("ignored")).unwrap();
+        std::fs::write(destination.join("ignored/keep"), b"keep ignored").unwrap();
+        let server = Server::start("prefix-ok");
+        let output = server.cp(
+            temp.path(),
+            &[
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "data",
+                "--into",
+                "destination",
+                pruning,
+                "--ignore",
+                "ignored/",
+                "--results",
+                "results.ndjson",
+            ],
+        );
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(!destination.join("old").exists());
+        assert_eq!(
+            std::fs::read(destination.join("file")).unwrap(),
+            vec![b'x'; 65536]
+        );
+        assert_eq!(
+            std::fs::read(destination.join("ignored/keep")).unwrap(),
+            b"keep ignored"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("outside")).unwrap(),
+            b"keep outside"
+        );
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(temp.path().join("results.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(records.last().unwrap()["deletions_completed"], 2082);
+        assert_eq!(
+            records.iter().filter(|r| r["action"] == "delete").count(),
+            2082
+        );
     }
-    std::fs::write(temp.path().join("outside"), b"keep outside").unwrap();
-    std::os::unix::fs::symlink(temp.path().join("outside"), destination.join("old/link")).unwrap();
-    std::fs::create_dir(destination.join("ignored")).unwrap();
-    std::fs::write(destination.join("ignored/keep"), b"keep ignored").unwrap();
-    let server = Server::start("prefix-ok");
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--from",
-            "s3://bucket",
-            "--srcs-in",
-            "data",
-            "--into",
-            "destination",
-            "--prune",
-            "--ignore",
-            "ignored/",
-            "--results",
-            "results.ndjson",
-        ],
-    );
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert!(!destination.join("old").exists());
-    assert_eq!(
-        std::fs::read(destination.join("file")).unwrap(),
-        vec![b'x'; 65536]
-    );
-    assert_eq!(
-        std::fs::read(destination.join("ignored/keep")).unwrap(),
-        b"keep ignored"
-    );
-    assert_eq!(
-        std::fs::read(temp.path().join("outside")).unwrap(),
-        b"keep outside"
-    );
-    let records: Vec<serde_json::Value> =
-        std::fs::read_to_string(temp.path().join("results.ndjson"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-    assert_eq!(records.last().unwrap()["deletions_completed"], 2082);
-    assert_eq!(
-        records.iter().filter(|r| r["action"] == "delete").count(),
-        2082
-    );
 }
 
 #[test]
@@ -5057,6 +5067,7 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
     for (fault, extra, requests) in [
         ("server-tree-fresh", "--dry-run", 5),
         ("server-tree-prune", "--prune", 8),
+        ("server-tree-prune", "--prune-before", 8),
         ("server-tree-unsupported", "--dry-run", 6),
         ("server-tree-denied", "--dry-run", 6),
     ] {
@@ -6037,4 +6048,25 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
             );
         }
     }
+}
+
+#[test]
+fn s3_prune_before_finishes_deleting_before_uploading() {
+    let temp = crate::test_support::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("source")).unwrap();
+    std::fs::write(temp.path().join("source/file"), b"payload").unwrap();
+    let server = Server::start("prune-timing-before");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "source",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "mirror",
+            "--prune-before",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
 }

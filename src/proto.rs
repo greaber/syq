@@ -656,6 +656,14 @@ impl Op {
     }
 }
 
+/// Receiver-observed mode and identity before temporary directory access.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DirectoryMode {
+    pub mode: u32,
+    pub dev: u64,
+    pub ino: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DestinationRoot {
     pub ticket: DescriptorTicket,
@@ -1300,6 +1308,12 @@ pub enum WireRequest<Data> {
     PatchEnd {
         commit: bool,
     },
+    /// Temporarily add owner access to existing destination directories.
+    /// Returns original modes only for directories actually changed.
+    WidenDirectories {
+        directories: Vec<(PathBytes, TargetCondition)>,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1601,6 +1615,7 @@ pub enum Response {
     ExistingHashes(Vec<std::result::Result<ExistingHashes, WireError>>),
     DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
     PatchedBatch(Vec<std::result::Result<SmallPatched, SmallPatchError>>),
+    WidenedDirectories(Vec<std::result::Result<Option<DirectoryMode>, WireError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1659,6 +1674,8 @@ pub enum WireIoKind {
     QuotaExceeded,
     ReadOnly,
     Other,
+    /// Permission denied, with receiver evidence that owner directory access is missing.
+    OwnedDirectoryPermissions,
 }
 
 impl WireError {
@@ -1696,6 +1713,8 @@ pub struct DirectoryAnchor {
     pub path: PathBytes,
     pub dev: u64,
     pub ino: u64,
+    /// Receiver-observed owner access; avoids another lookup for ordinary copies.
+    pub needs_owner_access: bool,
 }
 
 /// Rough serialized size, so big blocks are encoded without reallocation.
@@ -1823,6 +1842,13 @@ impl SizeHint for Request {
                     .map(|path| path.len() + 8)
                     .sum::<usize>()
                     + 48
+            }
+            Request::WidenDirectories { directories, .. } => {
+                directories
+                    .iter()
+                    .map(|(path, _)| path.len() + 48)
+                    .sum::<usize>()
+                    + 16
             }
             Request::Apply { ops, .. } => ops.iter().map(Op::size_hint).sum::<usize>() + 16,
             Request::NativeMap(options) => {

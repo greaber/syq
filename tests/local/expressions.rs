@@ -551,6 +551,7 @@ fn unselected_readonly_containers_reopen_and_restore_their_modes() {
     fs::set_permissions(t.path("dst/nested"), fs::Permissions::from_mode(0o555)).unwrap();
     let output = native_syq(&[
         "cp",
+        "--temporarily-widen-dir-permissions",
         "--srcs-in",
         &t.s("src"),
         "--into",

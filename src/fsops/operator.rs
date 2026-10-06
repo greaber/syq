@@ -41,6 +41,9 @@ impl OperatorDirectorySelection {
             path: self.path.clone(),
             dev: metadata.dev(),
             ino: metadata.ino(),
+            needs_owner_access: !is_superuser()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o700 != 0o700,
         })
     }
 

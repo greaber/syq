@@ -1388,7 +1388,16 @@ fn native_cp_mapping_restores_only_reopened_implicit_parents() {
             set_mtime(&t.path("dst/parent/file"), 1_500_000_000);
             fs::set_permissions(t.path("dst/parent"), fs::Permissions::from_mode(mode)).unwrap();
             let before = fs::metadata(t.path("dst/parent")).unwrap();
-            let mut args = vec!["--mapping", "-", "-C", "src", "--into", "dst", "-q"];
+            let mut args = vec![
+                "--temporarily-widen-dir-permissions",
+                "--mapping",
+                "-",
+                "-C",
+                "src",
+                "--into",
+                "dst",
+                "-q",
+            ];
             if preserve {
                 args.push("--copy-metadata=permissions");
             }

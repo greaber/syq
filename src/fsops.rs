@@ -507,6 +507,88 @@ fn statvfs_counter<T: Into<u64>>(value: T) -> u64 {
     value.into()
 }
 
+/// Widen only an owned existing directory and report an actual change. The
+/// opened metadata handle pins the inode; a supplied identity prevents a stale
+/// plan from chmodding a replacement. No group/other bits are added.
+pub(crate) fn widen_directory(
+    root: &Root,
+    path: &RelativePath,
+    condition: TargetCondition,
+    label: &Path,
+) -> Result<Option<crate::proto::DirectoryMode>> {
+    let metadata = root.metadata(path)?;
+    apply::require_rooted_condition(metadata, condition, label)?;
+    anyhow::ensure!(metadata.is_dir(), "{} is not a directory", label.display());
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 || uid != metadata.uid || metadata.mode & 0o700 == 0o700 {
+        return Ok(None);
+    }
+    let directory = root.open_metadata(path)?;
+    apply::require_rooted_metadata(&directory, metadata, label)?;
+    set_mode_handle(&directory, metadata.mode | 0o700)?;
+    Ok(Some(crate::proto::DirectoryMode {
+        mode: metadata.mode & 0o7777,
+        dev: metadata.dev,
+        ino: metadata.ino,
+    }))
+}
+
+pub(crate) fn restore_directory_mode(
+    root: &Root,
+    path: &RelativePath,
+    saved: crate::proto::DirectoryMode,
+    label: &Path,
+) -> Result<()> {
+    let directory = root.open_metadata(path)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && (metadata.dev(), metadata.ino()) == (saved.dev, saved.ino),
+        "directory {} changed before restoring permissions",
+        label.display()
+    );
+    set_mode_handle(&directory, saved.mode)
+}
+
+/// Diagnose only a failed operation; the successful path does no extra stats.
+/// Search is needed on ancestors, and `parent_access` on the containing directory.
+pub(crate) fn directory_permission_hint(
+    root: &Root,
+    path: &RelativePath,
+    parent_access: u32,
+) -> Option<String> {
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        return None;
+    }
+    let bytes = path.to_path_buf().into_os_string().into_vec();
+    let parent_end = bytes.iter().rposition(|&c| c == b'/').unwrap_or(0);
+    let mut prefixes = vec![0];
+    prefixes.extend(
+        bytes[..parent_end]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &c)| (c == b'/').then_some(i)),
+    );
+    if parent_end != 0 {
+        prefixes.push(parent_end);
+    }
+    for end in prefixes {
+        let relative = RelativePath::new(&bytes[..end]).ok()?;
+        let metadata = root.metadata(&relative).ok()?;
+        let required = if end == parent_end {
+            parent_access
+        } else {
+            0o100
+        };
+        if metadata.is_dir() && metadata.uid == uid && metadata.mode & required != required {
+            return Some(
+                "an owned destination directory lacks the required owner permissions".into(),
+            );
+        }
+    }
+    None
+}
+
 fn is_superuser() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -1808,6 +1890,7 @@ impl FsOps {
             | Request::PartialPaths { guard, .. }
             | Request::PruneLookup { guard, .. }
             | Request::DefaultPermissions { guard, .. }
+            | Request::WidenDirectories { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -1850,6 +1933,7 @@ impl FsOps {
         }
         let unrooted = match request {
             Request::Apply { guard, .. }
+            | Request::WidenDirectories { guard, .. }
             | Request::Prepare { guard, .. }
             | Request::SeedBasis { guard, .. }
             | Request::StageBasis { guard, .. }
@@ -2143,6 +2227,13 @@ impl FsOps {
             } => {
                 if guard.is_none() {
                     for path in partial_paths.iter_mut().chain(directories).chain(others) {
+                        map(path)?;
+                    }
+                }
+            }
+            Request::WidenDirectories { directories, guard } => {
+                if guard.is_none() {
+                    for (path, _) in directories {
                         map(path)?;
                     }
                 }
@@ -2755,6 +2846,26 @@ impl FsOps {
         .collect()
     }
 
+    fn annotate_permission_failure(
+        &self,
+        path: &[u8],
+        guard: Option<&ContainerGuard>,
+        access: u32,
+        error: &mut WireError,
+    ) {
+        if error.io_kind != Some(WireIoKind::PermissionDenied) {
+            return;
+        }
+        let Ok(Some(target)) = self.rooted_destination_target(path, guard) else {
+            return;
+        };
+        if let Some(hint) = directory_permission_hint(&target.root, &target.relative, access) {
+            error.io_kind = Some(WireIoKind::OwnedDirectoryPermissions);
+            error.message.push_str("; ");
+            error.message.push_str(&hint);
+        }
+    }
+
     /// Ops within a batch run in parallel, except that a creation waits for
     /// its parent's Mkdir in the same batch. Those that change directory
     /// entries share their directory between at most two threads.
@@ -2765,26 +2876,18 @@ impl FsOps {
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
         {
+            let selected =
+                apply::selected_removals(ops, guard, destination_root, destination_prefix);
             return self
                 .deletions
                 .get_or_insert_with(Default::default)
-                .run_init(
-                    ops,
-                    crate::deletion::DirectoryBatch::default,
-                    |deletion, op| {
-                        apply::apply_one_with_deletions(
-                            op,
-                            guard,
-                            destination_root.clone(),
-                            destination_prefix,
-                            Some(deletion),
-                        )
-                        .err()
-                        .as_ref()
-                        .map(wire_error)
-                    },
-                    Option::is_none,
-                )
+                .run(selected)
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .map(|result| result.err().as_ref().map(wire_error))
+                        .collect()
+                })
                 .unwrap_or_else(|error| {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });
