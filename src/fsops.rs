@@ -2800,11 +2800,14 @@ impl FsOps {
         // denied ancestor remains an error, and the retained handle prevents
         // a later pathname replacement from redirecting either chmod.
         let directory = if let Some(target) = self.rooted_destination_target(path, guard)? {
+            let (parents, _) = target.relative.leaf()?;
+            // The final parent needs a metadata handle: macOS search-only
+            // opens require the very permission this operation may repair.
+            // Earlier components retain the usual confined traversal; a final
+            // symlink remains a symlink and fails the directory check below.
             target
                 .root
-                .resolve_parent(&target.relative)?
-                .directory()
-                .try_clone()?
+                .open_metadata(&RelativePath::new(&parents.join(&b'/'))?)?
         } else {
             let parent = requested.parent().unwrap_or_else(|| Path::new(""));
             select_operator_directory(parent.as_os_str().as_bytes(), false, symlink_policy)?

@@ -22,6 +22,48 @@ fn replacement_names_preserve_existing_recovery_format() {
 }
 
 #[test]
+fn confined_placement_access_rejects_a_symlink_parent_without_widening_its_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = crate::test_support::tempdir().unwrap();
+    let root = tree.path().join("root");
+    let outside = tree.path().join("outside");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("file"), b"sentinel").unwrap();
+    symlink(&outside, root.join("link")).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(&outside).unwrap();
+    let root_meta = fs::metadata(&root).unwrap();
+    let request = Request::InspectPlacementTargetWithAccess {
+        path: root.join("link/file").as_os_str().as_bytes().to_vec(),
+        symlink_policy: OperatorSymlinkPolicy::Refuse,
+        parent_condition: TargetCondition::Any,
+        guard: Some(ContainerGuard {
+            root: root.as_os_str().as_bytes().to_vec(),
+            dev: root_meta.dev(),
+            ino: root_meta.ino(),
+        }),
+    };
+    let response = FsOps::new().handle(&request);
+    let after = fs::metadata(&outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(response, Response::EndpointError(_) | Response::Error(_)),
+        "{response:?}"
+    );
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
+    assert_eq!(fs::read(outside.join("file")).unwrap(), b"sentinel");
+    assert!(fs::symlink_metadata(root.join("link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
 fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
     use std::os::unix::fs::PermissionsExt;
     let tree = crate::test_support::tempdir().unwrap();
