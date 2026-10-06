@@ -369,7 +369,14 @@ impl<T: Work> Executor<T> {
             }
         }
         for event in self.events.get_mut().unwrap().try_iter() {
-            let event = event.expect("a panicking task leaves pending work for the receive loop");
+            let event = match event {
+                Ok(event) => event,
+                Err(()) => {
+                    self.failed = true;
+                    self.pool.cancel();
+                    anyhow::bail!("removal worker panicked");
+                }
+            };
             let Some(event) = event else {
                 continue;
             };

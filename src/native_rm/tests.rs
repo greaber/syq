@@ -544,7 +544,7 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
         }
         pool.task_done();
         assert!(pool.is_done());
-        assert!(matches!(event_rx.try_recv(), Ok(None)));
+        assert!(matches!(event_rx.try_recv(), Ok(Ok(None))));
     }
 }
 
