@@ -1,13 +1,15 @@
 //! Executable fixtures that the test process never opens for writing.
 //!
-//! Tests run in parallel threads of one process. A child that another test
-//! forks inherits every open descriptor until it execs, so if this process
-//! writes a script itself, a child forked during the write keeps a writable
-//! descriptor for it after the write finishes. Until that child execs,
-//! running the script fails with ETXTBSY ("Text file busy"). A short-lived
-//! child process writes the file instead, so the test process never holds a
-//! writable descriptor that a fork could inherit. Use these helpers for every
-//! file a test, or product code under test, will execute.
+//! A child that another thread forks inherits every open descriptor until it
+//! execs, so if this process writes a script itself, a child forked during
+//! the write keeps a writable descriptor for it after the write finishes.
+//! Until that child execs, running the script fails with ETXTBSY ("Text file
+//! busy"). Nextest gives each test its own process, but plain `cargo test`
+//! runs tests as threads of one, and tests and product code also start
+//! processes from several threads. A short-lived child process writes the
+//! file instead, so the test process never holds a writable descriptor that
+//! a fork could inherit. Use these helpers for every file a test, or product
+//! code under test, will execute.
 
 use crate::process::CommandExt as _;
 use std::io::Write;
