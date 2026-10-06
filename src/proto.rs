@@ -1243,8 +1243,10 @@ pub enum WireRequest<Data> {
         selection: crate::inode_metadata::Selection,
         sparse: bool,
         destination: bool,
-        /// A new entry's permissions are limited by its directory's default
-        /// ACL, as rsync limits them, rather than by the umask alone.
+        /// Entries are created as `syq rsync` creates them: a new entry's
+        /// permissions are limited by its directory's default ACL rather than
+        /// by the umask alone, and a new directory without owner access is
+        /// narrowed after its contents.
         default_acl_creation: bool,
     },
     NativeMap(crate::native_map::Options),

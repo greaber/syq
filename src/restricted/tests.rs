@@ -6224,8 +6224,8 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                     flags: mode_flag,
                     condition: proto::TargetCondition::Any,
                 },
-                // A new directory whose source lacks owner access is narrowed
-                // to its mode once it is filled.
+                // A native receiver does not narrow a new directory to a
+                // source without owner access; only `syq rsync` does.
                 Op::SetMeta {
                     path: path("new-read-only-dir"),
                     meta: meta(0o555),
@@ -6352,10 +6352,10 @@ fn ordinary_and_restricted_receivers_choose_the_same_modes() {
             assert_eq!(mode("new-read-only"), created(0o444), "{case}");
             assert_eq!(mode("fifo"), created(0o644), "{case}");
             assert_eq!(mode("private-dir"), created(0o755), "{case}");
-            // A new directory ends with its source's mode, as creating it
-            // limits it, and inherits a parent's setgid bit.
+            // A new directory keeps owner access, as native cp has always
+            // created it, and inherits a parent's setgid bit.
             assert_eq!(mode("new-dir"), created(0o755), "{case}");
-            assert_eq!(mode("new-read-only-dir"), created(0o555), "{case}");
+            assert_eq!(mode("new-read-only-dir"), created(0o755), "{case}");
             let inherited_setgid = if cfg!(target_os = "linux") { 0o2000 } else { 0 };
             assert_eq!(
                 mode("setgid/child"),

@@ -88,10 +88,12 @@ fn native_copies_limit_new_entries_by_the_umask_despite_a_permissive_default_acl
 }
 
 #[test]
-fn new_directories_end_with_the_source_mode_limited_by_the_umask() {
-    // Without -p a new directory ends with its source's mode limited by the
-    // umask, read-only ones too, as rsync and cp give it; it is open to its
-    // owner only while it is filled. An existing directory keeps its mode.
+fn new_read_only_directories_follow_cp_and_rsync() {
+    // Without -p a new directory gets its source's mode and owner access,
+    // limited by the umask. `syq rsync` removes the owner access again after
+    // its contents when the source lacks it, as rsync does; native cp keeps
+    // it, so a later copy can update the directory. An existing directory
+    // keeps its mode.
     let t = Tmp::new();
     let names = [
         "read-only",
@@ -110,7 +112,10 @@ fn new_directories_end_with_the_source_mode_limited_by_the_umask() {
     }
     set_modes(&t.path("src"), [0o555, 0o555, 0o500, 0o500]);
     let src = format!("{}/", t.s("src"));
-    for interface in ["cp", "rsync"] {
+    for (interface, expected) in [
+        ("cp", ["755", "755", "700", "700"]),
+        ("rsync", ["755", "555", "500", "500"]),
+    ] {
         let dst = t.path(interface);
         fs::create_dir_all(dst.join("read-only")).unwrap();
         fs::set_permissions(dst.join("read-only"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -122,34 +127,27 @@ fn new_directories_end_with_the_source_mode_limited_by_the_umask() {
         let output = native_copy_with_umask(0o022, &args);
         assert_output_ok(&output);
         assert_eq!(read(&dst.join("owner-only/inner/file")), b"contents");
-        let modes = names.map(|name| format!("{name} {:o}", permission_bits(&dst.join(name))));
-        assert_eq!(
-            modes,
-            [
-                "read-only 755",
-                "read-only/inner 555",
-                "owner-only 500",
-                "owner-only/inner 500"
-            ],
-            "{interface}"
-        );
+        let modes = names.map(|name| format!("{:o}", permission_bits(&dst.join(name))));
+        assert_eq!(modes, expected, "{interface}: {names:?}");
         set_modes(&dst, [0o755; 4]);
     }
     // A destination root this copy creates for a source directory follows
-    // the same rule; one that only contains named sources keeps the default.
+    // the same rules, except that native cp creates the destination of
+    // --srcs-in with the default mode; one that only contains named sources
+    // keeps the default too.
     let read_only = t.s("src/read-only");
     let owner_only = format!("{}/", t.s("src/owner-only"));
     let roots = [
         (
             "cp-as",
             vec!["cp", "--no-progress", &read_only, "--as"],
-            "555",
+            "755",
         ),
         ("rsync-contents", vec!["rsync", "-r", &owner_only], "500"),
         (
             "cp-srcs-in",
             vec!["cp", "--no-progress", "--srcs-in", &owner_only, "--into"],
-            "500",
+            "755",
         ),
         (
             "cp-into",
@@ -165,7 +163,7 @@ fn new_directories_end_with_the_source_mode_limited_by_the_umask() {
         assert_output_ok(&output);
         assert_eq!(format!("{:o}", permission_bits(&root)), expected, "{name}");
         if name == "cp-into" {
-            assert_eq!(permission_bits(&root.join("read-only")), 0o555, "{name}");
+            assert_eq!(permission_bits(&root.join("read-only")), 0o755, "{name}");
             fs::set_permissions(
                 root.join("read-only/inner"),
                 fs::Permissions::from_mode(0o755),

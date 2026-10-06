@@ -644,8 +644,9 @@ pub struct FsOps {
     /// Directories this connection created private or widened, for the
     /// modes it chooses for them later.
     receiver_directories: receiver_mode::ReceiverDirectories,
-    /// New entries' permissions are limited by a default ACL, as rsync
-    /// limits them, rather than by the umask alone.
+    /// Entries are created as `syq rsync` creates them: permissions limited
+    /// by a directory's default ACL rather than by the umask alone, and a
+    /// new directory without owner access narrowed after its contents.
     default_acl_creation: bool,
     /// The permission bits each directory's default ACL lets new files
     /// have, by root and directory, read once per connection.
@@ -952,8 +953,9 @@ impl FsOps {
             .context("no checked destination directory to create")?
             .create_missing(mode | 0o700, require_absent, umask)?;
         // A destination created private is opened once its metadata is set,
-        // and one whose mode lacks owner access is narrowed once it is filled.
-        let narrowing = mode & 0o700 != 0o700;
+        // and under `syq rsync` one whose mode lacks owner access is narrowed
+        // once it is filled.
+        let narrowing = self.default_acl_creation && mode & 0o700 != 0o700;
         if mode & 0o7777 == 0o700 || narrowing {
             let created = self
                 .operator_selection
@@ -3006,7 +3008,7 @@ impl FsOps {
                                 .lock()
                                 .unwrap()
                                 .insert(path.clone(), (*mode, (dev, ino)));
-                            if mode & 0o700 != 0o700 {
+                            if default_acl && mode & 0o700 != 0o700 {
                                 directories.created((dev, ino), created, true);
                             }
                         }
@@ -3014,10 +3016,12 @@ impl FsOps {
                 }
                 // A later receiver-chosen mode opens a directory created
                 // private, as the planner opens the destination root (one
-                // created for a group change is opened above), and narrows
-                // one whose proposal lacks the owner access it is created
-                // with to fill it.
-                Op::Mkdir { mode, .. } if mode & 0o7777 == 0o700 || mode & 0o700 != 0o700 => {
+                // created for a group change is opened above), and under
+                // `syq rsync` narrows one whose proposal lacks the owner
+                // access it is created with to fill it.
+                Op::Mkdir { mode, .. }
+                    if mode & 0o7777 == 0o700 || (default_acl && mode & 0o700 != 0o700) =>
+                {
                     let narrowing = mode & 0o700 != 0o700;
                     apply::create_identified_directory(
                         op,

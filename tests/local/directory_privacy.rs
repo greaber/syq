@@ -121,7 +121,8 @@ fn source_tree(t: &Tmp, root_mode: u32, sub_mode: u32) {
 #[test]
 fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
     // (arguments, destination root's mode after the copy): its source's,
-    // with permissions copied or not.
+    // except that native cp gives a root whose mode is not copied the
+    // default.
     let cases: [(&[&str], u32); 6] = [
         (&["rsync", "-a", "src/", "dst/"], 0o750),
         (&["rsync", "-rp", "src/", "dst/"], 0o750),
@@ -146,7 +147,7 @@ fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
                 "--into",
                 "dst",
             ],
-            0o750,
+            0o755,
         ),
         (&["rsync", "-r", "src/", "dst/"], 0o750),
     ];
@@ -751,7 +752,7 @@ fn an_interrupted_copy_ends_with_the_same_directory_metadata_after_a_retry() {
                 "--into",
                 "dst",
             ],
-            [0o750, 0o775 & !UMASK],
+            [0o755, 0o775 & !UMASK],
         ),
         (&["rsync", "-a", "src/", "dst/"], [0o750, 0o775]),
     ];

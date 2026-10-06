@@ -3056,9 +3056,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
-    // Source roots already inspected, which a new destination root's mode
-    // can come from.
-    let mut source_root_entries: Vec<Option<Entry>> = vec![None; srcs.len()];
     if args.interface != Interface::Rsync {
         // Native selectors are structural: validate every selected root before
         // a missing --into target can be created. The registered selection is
@@ -3071,8 +3068,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source.follows_root(args.follows_native_source_paths()),
             )? {
                 Some(entry) => {
-                    validate_native_source_type(&source.path, source.selection, entry.kind)?;
-                    source_root_entries[source_index] = Some(entry);
+                    validate_native_source_type(&source.path, source.selection, entry.kind)?
                 }
                 None => bail!("source {} does not exist", display(&source.path)),
             }
@@ -3455,9 +3451,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // planner sends only once it has scanned the source root. When its
     // permissions or group are copied, create the root private until they
     // have landed; the value is the mode it would otherwise have been
-    // created with. Otherwise it is created as any new directory is: with
-    // its source's mode and owner access, which it loses at the end if its
-    // source has none, so an interrupted copy leaves it as it ends.
+    // created with. Otherwise `syq rsync` creates it as rsync creates any
+    // new directory: with its source's mode and owner access, which it
+    // loses at the end if its source has none, so an interrupted copy
+    // leaves it as it ends. Native cp creates it with the default mode.
     let contents_source = srcs.iter().position(Location::copies_contents).filter(|_| {
         create_root && dst_is_dir && args.files_from.is_none() && args.native_mapping.is_none()
     });
@@ -3468,23 +3465,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             0o755
         });
-    let root_source_mode = match contents_source.filter(|_| private_root.is_none()) {
-        Some(index) => {
-            let entry = match source_root_entries[index].take() {
-                Some(entry) => Some(entry),
-                None => stat_one_registered(
-                    &mut *src_ctl,
-                    &srcs[index].path,
-                    &source_roots.get().expect("source roots registered")[index].selection,
-                    srcs[index].follows_root(args.follows_native_source_paths()),
-                )?,
-            };
-            entry
-                .filter(|entry| entry.kind == Kind::Dir)
-                .map(|entry| entry.mode & 0o777)
-        }
-        None => None,
-    };
+    let root_source_mode =
+        match contents_source.filter(|_| private_root.is_none() && opts.rsync_creation) {
+            Some(index) => stat_one_registered(
+                &mut *src_ctl,
+                &srcs[index].path,
+                &source_roots.get().expect("source roots registered")[index].selection,
+                srcs[index].follows_root(args.follows_native_source_paths()),
+            )?
+            .filter(|entry| entry.kind == Kind::Dir)
+            .map(|entry| entry.mode & 0o777),
+            None => None,
+        };
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories

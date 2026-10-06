@@ -2500,9 +2500,14 @@ impl Planner<'_> {
                         early_flags |= flags::MODE;
                     } else if flags & flags::GROUP != 0 {
                         // After its group change it is open, with owner
-                        // access, as creating it from its source would have
-                        // left it; it is narrowed at the end.
-                        early.root_default = Some((entry.mode & 0o777) | 0o700);
+                        // access, as creating it would have left it: from its
+                        // source for `syq rsync`, which narrows it at the
+                        // end, and with the default mode for native cp.
+                        early.root_default = if opts.rsync_creation {
+                            Some((entry.mode & 0o777) | 0o700)
+                        } else {
+                            self.private_root
+                        };
                     }
                 } else if flags & flags::MODE != 0 {
                     let wanted = if created && acl {
@@ -2858,18 +2863,28 @@ impl Planner<'_> {
             // requested. Actual temporary changes are merged later. A new
             // private root receives the mode its creation would have given it.
             // Another new directory was created with owner access to fill it;
-            // a source without that access gets its own mode back, limited as
-            // its creation limits it, as rsync and cp give it.
+            // `syq rsync` gives a source without that access its own mode
+            // back, limited as its creation limits it, as rsync does. Native
+            // cp leaves it the owner access, so a later copy can update it.
             if flags & flags::MODE == 0 && self.created_dirs.contains(p) {
-                if p == &self.dst_root && self.private_root.is_some() {
-                    // A private root takes its source's mode as a new
-                    // directory does. Its final mode keeps the setgid bit it
-                    // inherited.
-                    meta.mode = (e.mode & 0o777) | 0o2000;
-                    flags |= flags::RECEIVER_MODE;
-                } else if e.mode & 0o700 != 0o700 {
-                    meta.mode = e.mode & 0o777;
-                    flags |= flags::RECEIVER_MODE;
+                match self.private_root.filter(|_| p == &self.dst_root) {
+                    Some(default) => {
+                        // Under `syq rsync` a private root takes its source's
+                        // mode as a new directory does. Its final mode keeps
+                        // the setgid bit it inherited.
+                        let proposed = if opts.rsync_creation {
+                            e.mode & 0o777
+                        } else {
+                            default
+                        };
+                        meta.mode = proposed | 0o2000;
+                        flags |= flags::RECEIVER_MODE;
+                    }
+                    None if opts.rsync_creation && e.mode & 0o700 != 0o700 => {
+                        meta.mode = e.mode & 0o777;
+                        flags |= flags::RECEIVER_MODE;
+                    }
+                    None => {}
                 }
             }
             self.deferred.push((
