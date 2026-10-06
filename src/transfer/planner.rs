@@ -3960,10 +3960,12 @@ impl Planner<'_> {
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        let entries = if self.opts.expressions.update.is_some() {
+        let strict_preview = self.opts.dry_run && self.opts.restricted_receiver;
+        let entries = if self.opts.expressions.update.is_some() || strict_preview {
             // This existing endpoint operation distinguishes absence from an
-            // unreadable path, unlike ordinary planning stats. It has the same
-            // destination-observation authority and needs no wire extension.
+            // unreadable path, unlike ordinary planning stats. A read-only
+            // grant cannot repair access before a later mutation discovers
+            // that error, so its preview must preserve the error here.
             let mut inspected = Vec::with_capacity(paths.len());
             for chunk in paths.chunks(512) {
                 match ok(
@@ -3971,7 +3973,11 @@ impl Planner<'_> {
                         paths: chunk.to_vec(),
                         guard: self.container_guard.clone(),
                     })?,
-                    "inspect destination for --copy-if",
+                    if strict_preview {
+                        "inspect destination for read-only preview"
+                    } else {
+                        "inspect destination for --copy-if"
+                    },
                 )? {
                     Response::Stats(entries) if entries.len() == chunk.len() => {
                         inspected.extend(entries)
