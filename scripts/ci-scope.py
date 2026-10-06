@@ -367,7 +367,7 @@ def classify(paths, preparation_only):
                      "scripts/pr-checks.py", "tests/tooling/test-dispatched-checks-status.py"):
             path_tooling_checks.append("branch")
         elif matches(path, "scripts/setup.sh", "tests/tooling/test-setup.sh",
-                     "tests/tooling/test-rust-test-timeouts.py"):
+                     "tests/tooling/test-rust-test-timeouts.py", ".config/nextest.toml"):
             path_tooling_checks.append("setup")
         elif path == "scripts/setup.lock":
             path_tooling_checks += ALL_TOOLING.split()
