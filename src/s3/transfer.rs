@@ -493,7 +493,6 @@ impl Engine {
                         }
                         .map_err(|error| {
                             if !engine.args.temporarily_widen_dir_permissions
-                                && !engine.args.only_new_native_entries()
                                 && error.chain().any(|cause| {
                                     cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
                                         e.kind() == std::io::ErrorKind::PermissionDenied
