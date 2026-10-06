@@ -327,10 +327,11 @@ untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts
 follows the selected transfer strategy.
 
-A copy may temporarily make a newly created directory writable while filling it.
-After interruption, syq cannot distinguish that directory from a pre-existing
-writable directory. A retry treats it as an existing container, so its permissions
-and modification time may differ from an uninterrupted copy. Explicit
+A copy may temporarily make a newly created directory writable while filling it,
+or keep it open only to its owner until its copied ACL is applied. After
+interruption, syq cannot distinguish that directory from a pre-existing
+directory. A retry treats it as an existing container, so its permissions and
+modification time may differ from an uninterrupted copy. Explicit
 `--copy-metadata=permissions,mtime` makes those attributes match the source.
 
 Partial files may remain after a successful retry. To remove them:
@@ -426,6 +427,40 @@ To preserve source permissions and ownership as well:
 ```sh
 syq cp --copy-metadata=permissions,ownership project --into backup
 ```
+
+A directory receives its copied permissions and ACLs after its contents: a
+read-only directory could not take them, and adding entries changes its
+modification time anyway. Until then, syq limits who can enter or list it:
+
+- A new directory starts with the source's permissions, limited by the umask.
+  With `--copy-metadata=ownership`, it takes its copied owner and group before
+  syq copies files into it. If it could start out with another group, it is
+  open only to its owner until then.
+- A new directory whose ACL is still to be copied is open only to its owner.
+- When permissions or ownership are copied, the destination of `src/` or
+  `--srcs-in` is open only to its owner until it has its copied permissions,
+  owner and group, which it gets before syq copies files into it.
+- With `--copy-metadata=permissions`, an existing directory that allows more
+  than its source is restricted to the source's permissions before syq
+  creates anything in it; its owner keeps access until the copy finishes.
+  With `--copy-metadata=ownership`, it also takes its copied owner and group
+  then.
+- An S3 download creates a directory that has a directory marker open only to
+  its owner until the marker's metadata is applied.
+
+Some directories get their copied metadata only at the end, or are already
+open:
+
+- Anyone who opened an existing directory before syq restricted it can keep
+  listing the names syq creates in it.
+- With `--copy-metadata=acls` on macOS, a new directory keeps the entries it
+  inherits from its parent's ACL until its own ACL is copied.
+- In an S3 download with `--copy-metadata=permissions`, an existing directory
+  is restricted to its marker's permissions only at the end.
+- A receiver restricted by a [signed grant](security.md#destination-permissions)
+  applies a copied group to an existing directory only at the end. If the
+  grant keeps groups but not permissions, the same is true of a new
+  destination root.
 
 | Syq option | Corresponding rsync option |
 |---|---|

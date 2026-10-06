@@ -2846,9 +2846,6 @@ impl FsOps {
         .collect()
     }
 
-    /// Ops within a batch are independent (the planner orders batches so that
-    /// parents come first), so they run in parallel too. Those that change
-    /// directory entries share their directory between at most two threads.
     fn annotate_permission_failure(
         &self,
         path: &[u8],
@@ -2869,6 +2866,9 @@ impl FsOps {
         }
     }
 
+    /// Ops within a batch run in parallel, except that a creation waits for
+    /// its parent's Mkdir in the same batch. Those that change directory
+    /// entries share their directory between at most two threads.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
@@ -2910,12 +2910,57 @@ impl FsOps {
             .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
-        let gres = parallel_map(&guarded_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
+        // A directory this request creates and then gives a group starts
+        // private when its starting group may differ, so that group cannot
+        // open it, and list what is created in it, before the change. Its
+        // metadata below then gives it the mode it would have been created
+        // with. Otherwise its creation mode is no wider than its final one.
+        let groups: HashMap<&[u8], u32> = meta_idx
+            .iter()
+            .filter_map(|&i| match &ops[i] {
+                Op::SetMeta {
+                    path, meta, flags, ..
+                } if flags & flags::GROUP != 0 => Some((path.as_slice(), meta.gid)),
+                _ => None,
+            })
+            .collect();
+        let parents = apply::CreationParents::default();
+        // Only directories this request actually created, by identity.
+        let private = std::sync::Mutex::new(HashMap::<Vec<u8>, (u32, (u64, u64))>::new());
+        let create = |op: &Op| {
+            let result = match op {
+                Op::Mkdir { path, mode, .. }
+                    if groups.get(path.as_slice()).is_some_and(|&group| {
+                        apply::starting_group_may_differ(
+                            path,
+                            group,
+                            &parents,
+                            guard,
+                            destination_root.clone(),
+                            destination_prefix,
+                        )
+                    }) =>
+                {
+                    apply::create_private_directory(
+                        op,
+                        guard,
+                        destination_root.clone(),
+                        destination_prefix,
+                    )
+                    .map(|created| {
+                        if let Some(created) = created {
+                            private
+                                .lock()
+                                .unwrap()
+                                .insert(path.clone(), (*mode, created));
+                        }
+                    })
+                }
+                _ => apply_one(op, guard, destination_root.clone(), destination_prefix),
+            };
+            result.err().as_ref().map(wire_error)
+        };
+        let gres = parallel_map(&guarded_idx, |&i| create(&ops[i]));
         for (i, r) in guarded_idx.iter().zip(gres) {
             out[*i] = r;
         }
@@ -2926,17 +2971,32 @@ impl FsOps {
             }
             return out;
         }
-        let cres = parallel_by_directory(ops, &create_idx, |op| {
-            apply_one(op, guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
-        for (i, r) in create_idx.iter().zip(cres) {
-            out[*i] = r;
+        for wave in creation_waves(ops, &create_idx) {
+            let cres = parallel_by_directory(ops, &wave, create);
+            for (i, r) in wave.iter().zip(cres) {
+                out[*i] = r;
+            }
         }
+        let private = private.into_inner().unwrap();
         let mres = parallel_map(&meta_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+            let result = apply_one(&ops[i], guard, destination_root.clone(), destination_prefix);
+            // After its group change, even a refused one, as creating it
+            // directly and then changing its group would have left it.
+            let opened = match &ops[i] {
+                Op::SetMeta { path, .. } => private.get(path).map(|&(proposed, created)| {
+                    apply::open_created_directory(
+                        path,
+                        proposed,
+                        created,
+                        guard,
+                        destination_root.clone(),
+                        destination_prefix,
+                    )
+                }),
+                _ => None,
+            };
+            result
+                .and(opened.unwrap_or(Ok(())))
                 .err()
                 .as_ref()
                 .map(wire_error)
@@ -3143,6 +3203,57 @@ fn metadata_pool() -> Option<&'static rayon::ThreadPool> {
 
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     parallel_map_init(items, || (), |_, item| f(item))
+}
+
+/// Split creations so that each runs after the Mkdir of its parent in the
+/// same request. Otherwise a child resolving its missing parent would create
+/// that parent with default permissions first, and the parent's own Mkdir
+/// would then accept it with permissions wider than the copy planned. A
+/// request without such a pair keeps one wave.
+fn creation_waves(ops: &[Op], selected: &[usize]) -> Vec<Vec<usize>> {
+    let directories: HashMap<&[u8], usize> = selected
+        .iter()
+        .filter_map(|&index| match &ops[index] {
+            Op::Mkdir { path, .. } => Some((path.as_slice(), index)),
+            _ => None,
+        })
+        .collect();
+    let parent = |path: &[u8]| -> Option<usize> {
+        let separator = path.iter().rposition(|byte| *byte == b'/')?;
+        directories.get(&path[..separator]).copied()
+    };
+    if !selected
+        .iter()
+        .any(|&index| parent(op_path(&ops[index])).is_some())
+    {
+        return vec![selected.to_vec()];
+    }
+    let mut levels = HashMap::<usize, usize>::new();
+    fn level(
+        index: usize,
+        ops: &[Op],
+        parent: &dyn Fn(&[u8]) -> Option<usize>,
+        levels: &mut HashMap<usize, usize>,
+    ) -> usize {
+        if let Some(level) = levels.get(&index) {
+            return *level;
+        }
+        // Paths are unique per Mkdir, so a parent is always a shorter path.
+        let level = parent(op_path(&ops[index])).map_or(0, |parent_index| {
+            1 + level(parent_index, ops, parent, levels)
+        });
+        levels.insert(index, level);
+        level
+    }
+    let mut waves: Vec<Vec<usize>> = Vec::new();
+    for &index in selected {
+        let level = level(index, ops, &parent, &mut levels);
+        if waves.len() <= level {
+            waves.resize_with(level + 1, Vec::new);
+        }
+        waves[level].push(index);
+    }
+    waves
 }
 
 /// Run the selected operations, which add or remove directory entries. The

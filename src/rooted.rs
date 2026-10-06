@@ -871,12 +871,31 @@ impl Root {
         self.resolve_parent_creating(path, mode).map(drop)
     }
 
+    /// The same, asking `mode_for` for each missing parent's creation mode
+    /// just before creating it. It receives that parent's path beneath this
+    /// root, with components joined by `/`.
+    pub(crate) fn create_missing_parents_with(
+        &self,
+        path: &RelativePath,
+        mode_for: &mut dyn FnMut(&[u8]) -> u32,
+    ) -> Result<()> {
+        self.resolve_parent_creating_with(path, mode_for).map(drop)
+    }
+
     /// Keep the parent opened while creating missing ancestors so the caller
     /// can create the leaf without resolving and opening that parent again.
     pub(crate) fn resolve_parent_creating(
         &self,
         path: &RelativePath,
         mode: u32,
+    ) -> Result<ResolvedParent<'_>> {
+        self.resolve_parent_creating_with(path, &mut |_| mode)
+    }
+
+    fn resolve_parent_creating_with(
+        &self,
+        path: &RelativePath,
+        mode_for: &mut dyn FnMut(&[u8]) -> u32,
     ) -> Result<ResolvedParent<'_>> {
         let (parents, leaf) = path.leaf()?;
         if parents.is_empty() {
@@ -891,7 +910,7 @@ impl Root {
             });
         }
         let mut directory = self.directory.try_clone().context("duplicate root fd")?;
-        for component in parents {
+        for (index, component) in parents.iter().enumerate() {
             match open_directory_at(&directory, component) {
                 Ok(child) => {
                     directory = child;
@@ -903,6 +922,7 @@ impl Root {
                         .with_context(|| format!("resolve confined parent for {}", path.label()));
                 }
             }
+            let mode = mode_for(&parents[..=index].join(&b'/'));
             let component = component_cstring(component);
             loop {
                 let result = unsafe {
