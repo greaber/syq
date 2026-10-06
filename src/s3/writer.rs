@@ -224,7 +224,7 @@ fn write_batch_with(
 pub(super) fn allocate(file: &File, size: u64) -> Result<()> {
     file.set_len(size)?;
     #[cfg(target_os = "linux")]
-    if size > 0 {
+    if size > 0 && !crate::fsops::uses_btrfs_compression(file) {
         use std::os::fd::AsRawFd;
         let length = libc::off_t::try_from(size).context("S3 destination is too large")?;
         if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) } != 0 {

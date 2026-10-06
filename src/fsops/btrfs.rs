@@ -19,13 +19,27 @@ pub(super) enum Compression {
 impl Compression {
     /// Mount options share the existing filesystem-trait cache. File flags
     /// must be read from each new sidecar: sibling directories can differ.
-    pub(super) fn for_mount(key: FileSystemKey) -> Self {
+    pub(super) fn for_mount(file: &File, key: FileSystemKey) -> Self {
+        let mount = match key {
+            FileSystemKey::Mount(id) => id,
+            // Btrfs st_dev names a subvolume, not mountinfo's filesystem device.
+            // fdinfo has supplied the actual mount ID since Linux 3.15, before
+            // statx gained STATX_MNT_ID in 5.8. This is only read on a cache miss.
+            FileSystemKey::Device(_) => match fdinfo_mount_id(file) {
+                Some(id) => id,
+                None => return Self::Off,
+            },
+        };
         std::fs::read("/proc/self/mountinfo")
-            .map(|mounts| Self::from_mountinfo(&mounts, key))
+            .map(|mounts| Self::from_mountinfo(&mounts, mount))
             .unwrap_or_default()
     }
 
     pub(super) fn enabled_for(self, file: &File) -> bool {
+        #[cfg(test)]
+        if let Some(flags) = FILE_FLAGS.get() {
+            return self.enabled_with_flags(flags);
+        }
         // GETFLAGS encodes sizeof(long) in its request but returns an int.
         let mut flags: libc::c_int = 0;
         let result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
@@ -40,30 +54,14 @@ impl Compression {
                 || (flags & FS_NOCOMP_FL == 0 && (self == Self::On || flags & FS_COMPR_FL != 0)))
     }
 
-    fn from_mountinfo(mounts: &[u8], key: FileSystemKey) -> Self {
-        // Older kernels lack statx mount IDs. Their stat device number still
-        // identifies the btrfs subvolume in mountinfo, including bind mounts.
-        let device = match key {
-            FileSystemKey::Device(dev) => {
-                Some(format!("{}:{}", libc::major(dev), libc::minor(dev)))
-            }
-            FileSystemKey::Mount(_) => None,
-        };
+    fn from_mountinfo(mounts: &[u8], mount: u64) -> Self {
         for line in mounts.split(|b| *b == b'\n') {
             let mut fields = line.split(|b| b.is_ascii_whitespace());
             let Some(id) = fields.next() else { continue };
-            fields.next(); // parent mount ID
-            let Some(dev) = fields.next() else { continue };
-            let matches = match key {
-                FileSystemKey::Mount(expected) => {
-                    std::str::from_utf8(id)
-                        .ok()
-                        .and_then(|id| id.parse::<u64>().ok())
-                        == Some(expected)
-                }
-                FileSystemKey::Device(_) => device.as_deref().map(str::as_bytes) == Some(dev),
-            };
-            if !matches || !fields.any(|field| field == b"-") {
+            let id = std::str::from_utf8(id)
+                .ok()
+                .and_then(|id| id.parse::<u64>().ok());
+            if id != Some(mount) || !fields.any(|field| field == b"-") {
                 continue;
             }
             if fields.next() != Some(b"btrfs".as_slice()) {
@@ -94,44 +92,58 @@ impl Compression {
     }
 }
 
+fn fdinfo_mount_id(file: &File) -> Option<u64> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
+    mount_id_from_fdinfo(&info)
+}
+
+fn mount_id_from_fdinfo(info: &str) -> Option<u64> {
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    // Keep allocation tests independent of flags inherited from their TMPDIR.
+    pub(super) static FILE_FLAGS: std::cell::Cell<Option<libc::c_int>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mount_compression_matches_ids_and_old_kernel_device_numbers() {
+    fn fdinfo_reads_the_mount_id_not_the_subvolume_device() {
+        assert_eq!(
+            mount_id_from_fdinfo("pos:\t0\nflags:\t02100000\nmnt_id:\t22\nino:\t256\n"),
+            Some(22)
+        );
+        assert_eq!(mount_id_from_fdinfo("pos:\t0\nino:\t22\n"), None);
+        assert_eq!(mount_id_from_fdinfo("mnt_id:\tinvalid\n"), None);
+        let directory = crate::test_support::tempdir().unwrap();
+        let file = File::create(directory.path().join("file")).unwrap();
+        let id = fdinfo_mount_id(&file).unwrap();
+        if let Some(statx_id) = super::super::mount_id(&file) {
+            assert_eq!(id, statx_id);
+        }
+        // Force the old-kernel branch with a device that cannot name a mount.
+        assert_eq!(
+            Compression::for_mount(&file, FileSystemKey::Device(u64::MAX)),
+            Compression::for_mount(&file, FileSystemKey::Mount(id))
+        );
+    }
+
+    #[test]
+    fn mount_compression_matches_mount_ids() {
         let mounts = b"11 1 8:1 / / rw - ext4 /dev/a rw\n\
 22 1 0:42 /sub /mnt/with\\040space rw shared:1 - btrfs /dev/b rw,compress=zstd:3,subvol=/sub\n\
 23 1 0:43 / /mnt/other rw - btrfs /dev/c rw,compress-force=lzo\n\
 24 1 0:44 / /mnt/plain rw - btrfs /dev/d rw,ssd\n";
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Mount(22)),
-            Compression::On
-        );
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Mount(23)),
-            Compression::Forced
-        );
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Mount(24)),
-            Compression::Off
-        );
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Mount(11)),
-            Compression::Off
-        );
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Mount(99)),
-            Compression::Off
-        );
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Device(libc::makedev(0, 42))),
-            Compression::On
-        );
-        assert_eq!(
-            Compression::from_mountinfo(mounts, FileSystemKey::Device(libc::makedev(0, 43))),
-            Compression::Forced
-        );
+        assert_eq!(Compression::from_mountinfo(mounts, 22), Compression::On);
+        assert_eq!(Compression::from_mountinfo(mounts, 23), Compression::Forced);
+        assert_eq!(Compression::from_mountinfo(mounts, 24), Compression::Off);
+        assert_eq!(Compression::from_mountinfo(mounts, 11), Compression::Off);
+        assert_eq!(Compression::from_mountinfo(mounts, 99), Compression::Off);
     }
 
     #[test]
@@ -146,7 +158,7 @@ mod tests {
         ] {
             let line = format!("7 1 0:42 / /mnt rw - btrfs /dev/a {options}\n");
             assert_eq!(
-                Compression::from_mountinfo(line.as_bytes(), FileSystemKey::Mount(7)),
+                Compression::from_mountinfo(line.as_bytes(), 7),
                 expected,
                 "{options}"
             );

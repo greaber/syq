@@ -361,7 +361,7 @@ fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
             btrfs_compression: (file_system_type == libc::BTRFS_SUPER_MAGIC as u32)
-                .then(|| btrfs::Compression::for_mount(key)),
+                .then(|| btrfs::Compression::for_mount(file, key)),
             network: network_file_system_type(file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
@@ -407,14 +407,28 @@ fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
     mount_id(file).map_or(FileSystemKey::Device(dev), FileSystemKey::Mount)
 }
 
-/// The filesystem a new entry of `directory` would live on, with its traits.
+/// The filesystem of an opened file or directory, with its cached traits.
 #[cfg(target_os = "linux")]
-fn directory_file_system(directory: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
-    let key = match mount_id(directory) {
+fn opened_file_system(file: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
+    let key = match mount_id(file) {
         Some(mount) => FileSystemKey::Mount(mount),
-        None => FileSystemKey::Device(directory.metadata()?.dev()),
+        None => FileSystemKey::Device(file.metadata()?.dev()),
     };
-    Ok((key, file_system_traits(directory, key)))
+    Ok((key, file_system_traits(file, key)))
+}
+
+/// Physical preallocation would prevent these writes from being compressed.
+#[cfg(target_os = "linux")]
+pub(crate) fn uses_btrfs_compression(file: &File) -> bool {
+    opened_file_system(file).is_ok_and(|(_, traits)| traits.uses_btrfs_compression(file))
+}
+
+#[cfg(target_os = "linux")]
+impl FileSystemTraits {
+    fn uses_btrfs_compression(self, file: &File) -> bool {
+        self.btrfs_compression
+            .is_some_and(|compression| compression.enabled_for(file))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3145,7 +3159,7 @@ fn list_nfs_directories_before_stats(
         let Ok(directory) = root.open_directory(&relative) else {
             return false;
         };
-        let Ok((_, traits)) = directory_file_system(&directory) else {
+        let Ok((_, traits)) = opened_file_system(&directory) else {
             return false;
         };
         if !traits.is_nfs {

@@ -1184,7 +1184,7 @@ impl FsOps {
         // A new entry lives on its directory's filesystem, so the directory
         // answers every filesystem question before a sidecar exists.
         let (s, source_metadata, target, destination) =
-            self.prepare_local_copy(source, dst, directory_file_system)?;
+            self.prepare_local_copy(source, dst, opened_file_system)?;
         let (destination_key, destination_fs) =
             destination.context("inspect the destination filesystem")?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
@@ -3880,10 +3880,7 @@ pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits
     }
     // Btrfs fallocate disables compression, even when explicitly requested.
     // Keep the logical sizing without reserving uncompressed physical extents.
-    if traits
-        .btrfs_compression
-        .is_some_and(|compression| compression.enabled_for(f))
-    {
+    if traits.uses_btrfs_compression(f) {
         return f
             .set_len(size)
             .context("set compressed destination file length");

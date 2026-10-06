@@ -4718,6 +4718,7 @@ fn compressed_btrfs_partial_is_sized_without_reserving_space() {
     let dir = crate::test_support::tempdir().unwrap();
     let file = File::create(dir.path().join("partial")).unwrap();
     super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+    super::btrfs::FILE_FLAGS.set(Some(0));
     let result = preallocate_new_file(
         &file,
         1024 * 1024,
@@ -4727,6 +4728,7 @@ fn compressed_btrfs_partial_is_sized_without_reserving_space() {
         },
     );
     super::partial::FALLOCATE_ERRNO.set(None);
+    super::btrfs::FILE_FLAGS.set(None);
     result.unwrap();
     assert_eq!(file.metadata().unwrap().len(), 1024 * 1024);
     // Some filesystems charge a metadata block even for an entirely sparse file.
@@ -4748,6 +4750,7 @@ fn ordinary_files_still_report_preallocation_failures() {
     for btrfs_compression in [None, Some(super::btrfs::Compression::Off)] {
         let file = File::create(dir.path().join("partial")).unwrap();
         super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+        super::btrfs::FILE_FLAGS.set(Some(0));
         let result = preallocate_new_file(
             &file,
             1024 * 1024,
@@ -4757,6 +4760,7 @@ fn ordinary_files_still_report_preallocation_failures() {
             },
         );
         super::partial::FALLOCATE_ERRNO.set(None);
+        super::btrfs::FILE_FLAGS.set(None);
         let error = result.unwrap_err();
         assert!(error.chain().any(|cause| cause
             .downcast_ref::<io::Error>()
