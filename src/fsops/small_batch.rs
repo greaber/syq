@@ -534,8 +534,10 @@ impl FsOps {
         }
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;
-        set_meta_file_known(file, meta, flags, &current)
-            .with_context(|| format!("set metadata {}", target.label.display()))?;
+        own_metadata_change(file, condition, set_mtime(meta, flags), || {
+            set_meta_file_known(file, meta, flags, &current)
+        })
+        .with_context(|| format!("set metadata {}", target.label.display()))?;
         if guarded || condition != TargetCondition::Any {
             require_rooted_named_identity(
                 &target.root,

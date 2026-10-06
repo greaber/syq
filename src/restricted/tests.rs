@@ -5065,9 +5065,21 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
 fn execute_authorized(
     authority: &RestrictedAuthority,
     ops: &mut crate::fsops::FsOps,
+    request: Request,
+) -> proto::Response {
+    execute_authorized_after(authority, ops, request, || {})
+}
+
+/// The same, running `between` after the request's authorization and
+/// before its execution.
+fn execute_authorized_after(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
     mut request: Request,
+    between: impl FnOnce(),
 ) -> proto::Response {
     let settlement = authority.authorize(&mut request, false).unwrap();
+    between();
     let response = ops.handle(&request);
     authority.settle(settlement, &response);
     response
@@ -5079,6 +5091,17 @@ fn compare_and_keep(
     authority: &RestrictedAuthority,
     ops: &mut crate::fsops::FsOps,
     paths: &[&Path],
+) -> Vec<std::result::Result<proto::SmallPatched, proto::SmallPatchError>> {
+    compare_and_keep_after(authority, ops, paths, || {})
+}
+
+/// The same, running `between` after the patches' authorization and before
+/// their execution.
+fn compare_and_keep_after(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    paths: &[&Path],
+    between: impl FnOnce(),
 ) -> Vec<std::result::Result<proto::SmallPatched, proto::SmallPatchError>> {
     let block = proto::MIN_HASH_BLOCK_BYTES;
     let hash = Request::HashExistingBatch {
@@ -5101,14 +5124,33 @@ fn compare_and_keep(
             patch
         })
         .collect();
-    match execute_authorized(authority, ops, Request::PatchSmallBatch(patches)) {
+    match execute_authorized_after(authority, ops, Request::PatchSmallBatch(patches), between) {
         proto::Response::PatchedBatch(results) => results,
         other => panic!("unexpected patch response {other:?}"),
     }
 }
 
+/// Whether `result` refused a patch as stale, with nothing written.
+fn is_stale(result: &std::result::Result<proto::SmallPatched, proto::SmallPatchError>) -> bool {
+    matches!(
+        result,
+        Err(proto::SmallPatchError {
+            matched: false,
+            stale_condition: true,
+            ..
+        })
+    )
+}
+
+/// Change the mode of `path` from outside the copy once the clock has moved
+/// on, so that its change time changes too.
+fn change_mode_outside(path: &Path, mode: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
 #[test]
-fn keeping_one_name_of_a_file_leaves_its_other_names_stale_until_compared_again() {
+fn keeping_one_name_of_a_file_leaves_the_conditions_of_its_other_names_holding() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -5125,28 +5167,30 @@ fn keeping_one_name_of_a_file_leaves_its_other_names_stale_until_compared_again(
     });
     // Both conditions hold the change time of the one file. Keeping the
     // first name sets its times, which changes that once the clock has
-    // moved on, so the second is refused as stale with nothing written.
+    // moved on. The change is the receiver's own, so the second name's
+    // condition still holds and it is kept too.
     std::thread::sleep(std::time::Duration::from_millis(50));
     let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
-    assert_eq!(results[0], kept);
-    assert!(
-        matches!(
-            &results[1],
-            Err(proto::SmallPatchError {
-                matched: false,
-                stale_condition: true,
-                ..
-            })
-        ),
-        "{:?}",
-        results[1]
-    );
-    // Compared again, under a fresh condition, it is kept too.
-    assert_eq!(compare_and_keep(&authority, &mut ops, &[&b]), vec![kept]);
+    assert_eq!(results, vec![kept.clone(), kept.clone()]);
     for path in [&a, &b] {
         let metadata = fs::metadata(path).unwrap();
         assert_eq!((metadata.ino(), metadata.mtime()), (inode, 1_600_000_000));
         assert_eq!(fs::read(path).unwrap(), b"same");
+    }
+    // A change from outside after authorization leaves both conditions
+    // stale, with nothing written. Compared again under fresh conditions,
+    // both names are kept with the mode the file has now.
+    let results = compare_and_keep_after(&authority, &mut ops, &[&a, &b], || {
+        change_mode_outside(&a, 0o600)
+    });
+    assert!(results.iter().all(is_stale), "{results:?}");
+    assert_eq!(
+        compare_and_keep(&authority, &mut ops, &[&a, &b]),
+        vec![kept.clone(), kept]
+    );
+    for path in [&a, &b] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!((metadata.ino(), metadata.mode() & 0o7777), (inode, 0o600));
     }
 
     // Contents changed after they were hashed, under a condition that still
@@ -5218,25 +5262,18 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
         kept: true,
         identity: None,
     });
-    // Keeping the first name changes the change time the second's
-    // condition holds, so the second is refused as stale.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
-    assert_eq!(results[0], kept);
-    assert!(
-        matches!(
-            &results[1],
-            Err(proto::SmallPatchError {
-                stale_condition: true,
-                ..
-            })
-        ),
-        "{:?}",
-        results[1]
-    );
-    // Nothing was written for it, so it holds none of the grant's bytes.
+    // A change from outside after authorization changes the change time
+    // both conditions hold, so both names are refused as stale.
+    let results = compare_and_keep_after(&authority, &mut ops, &[&a, &b], || {
+        change_mode_outside(&a, 0o640)
+    });
+    assert!(results.iter().all(is_stale), "{results:?}");
+    // Nothing was written for them, so they hold none of the grant's bytes.
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, 0);
-    assert_eq!(compare_and_keep(&authority, &mut ops, &[&b]), vec![kept]);
+    assert_eq!(
+        compare_and_keep(&authority, &mut ops, &[&a, &b]),
+        vec![kept.clone(), kept]
+    );
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, 0);
 
     // The receipt shows each name kept once, and no failure.

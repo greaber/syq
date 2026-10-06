@@ -1,4 +1,5 @@
 use super::*;
+use crate::rooted::own_changes::pin_holds;
 
 pub(super) fn op_path(op: &Op) -> &[u8] {
     match op {
@@ -296,8 +297,12 @@ pub(super) fn observe_rooted_condition(
             Some(metadata),
         ) if metadata.dev == dev
             && metadata.ino == ino
-            && metadata.ctime == ctime
-            && metadata.ctime_nsec == ctime_nsec =>
+            && pin_holds(
+                dev,
+                ino,
+                (ctime, ctime_nsec),
+                (metadata.ctime, metadata.ctime_nsec),
+            ) =>
         {
             Ok(Some(metadata))
         }
@@ -468,7 +473,9 @@ fn apply_one_rooted_with_deletions(
                 );
             }
             require_open_target_known(&opened, &target.label, *condition)?;
-            set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
+            own_metadata_change(&file, *condition, set_mtime(meta, *flags), || {
+                set_meta_handle_known_portable(&file, meta, *flags, &opened)
+            })?;
             require_rooted_named_identity_known(
                 &target.root,
                 &target.relative,
@@ -591,21 +598,24 @@ pub(super) fn set_meta_rooted(
             );
         }
         require_open_target_known(&opened, &target.label, condition)?;
-        // Timestamp mutation is performed separately with no-follow
-        // descriptor-relative semantics. All other metadata is applied to
-        // the stable opened inode, so a raced leaf symlink cannot redirect it.
-        if time_differs {
-            let times = [
-                timespec(0, libc::UTIME_OMIT as u32),
-                timespec(meta.mtime, meta.mtime_nsec),
-            ];
-            parent.set_times(&times).with_context(|| {
-                format!("set times on confined path {}", target.label.display())
-            })?;
-        }
-        // Birth time follows mtime: macOS may lower birth time when setting
-        // an older modification time.
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
+        own_metadata_change(&handle, condition, set_mtime(meta, flags), || {
+            // Timestamp mutation is performed separately with no-follow
+            // descriptor-relative semantics. All other metadata is applied
+            // to the stable opened inode, so a raced leaf symlink cannot
+            // redirect it.
+            if time_differs {
+                let times = [
+                    timespec(0, libc::UTIME_OMIT as u32),
+                    timespec(meta.mtime, meta.mtime_nsec),
+                ];
+                parent.set_times(&times).with_context(|| {
+                    format!("set times on confined path {}", target.label.display())
+                })?;
+            }
+            // Birth time follows mtime: macOS may lower birth time when
+            // setting an older modification time.
+            set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)
+        })?;
         // The final lookup resolves from Root again. Release the reused
         // parent first so that check does not raise peak descriptor usage.
         drop(parent);
@@ -652,6 +662,43 @@ pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u
         }
         Err(error) => Err(error),
     }
+}
+
+/// Change the metadata of the existing `file` with `change`, which sets its
+/// modification time to `mtime` if any. When `condition` pins the file to its
+/// change time, other names of it may be pinned too: the change is then
+/// recorded as this process's own (see `crate::rooted::own_changes`).
+pub(super) fn own_metadata_change<T>(
+    file: &File,
+    condition: TargetCondition,
+    mtime: Option<i64>,
+    change: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let observe = || {
+        file.metadata()
+            .ok()
+            .and_then(|metadata| crate::rooted::root_metadata_from_std(&metadata).ok())
+    };
+    let own = match (condition, observe()) {
+        (TargetCondition::MatchesFingerprint { .. }, Some(seen)) => {
+            crate::rooted::own_changes::begin(&seen)
+        }
+        _ => None,
+    };
+    let Some(own) = own else {
+        return change();
+    };
+    let before = observe();
+    let changed = change()?;
+    if let (Some(before), Some(after)) = (before, observe()) {
+        own.finish(&before, &after, 0, mtime);
+    }
+    Ok(changed)
+}
+
+/// The modification time `flags` have metadata set from `meta`, if any.
+pub(super) fn set_mtime(meta: &Meta, flags: u8) -> Option<i64> {
+    (flags & flags::TIMES != 0).then_some(meta.mtime)
 }
 
 pub(super) fn require_rooted_identity(
@@ -703,12 +750,13 @@ pub(super) fn require_rooted_condition(
             ino,
             ctime,
             ctime_nsec,
-        } if (
-            metadata.dev,
-            metadata.ino,
-            metadata.ctime,
-            metadata.ctime_nsec,
-        ) == (dev, ino, ctime, ctime_nsec) =>
+        } if (metadata.dev, metadata.ino) == (dev, ino)
+            && pin_holds(
+                dev,
+                ino,
+                (ctime, ctime_nsec),
+                (metadata.ctime, metadata.ctime_nsec),
+            ) =>
         {
             Ok(())
         }
@@ -856,8 +904,12 @@ pub(super) fn require_open_target_known(
         } => {
             if metadata.dev() != dev
                 || metadata.ino() != ino
-                || metadata.ctime() != ctime
-                || metadata.ctime_nsec() as u32 != ctime_nsec
+                || !pin_holds(
+                    dev,
+                    ino,
+                    (ctime, ctime_nsec),
+                    (metadata.ctime(), metadata.ctime_nsec() as u32),
+                )
             {
                 bail!(
                     "destination {} changed after the existing-path precondition was checked",

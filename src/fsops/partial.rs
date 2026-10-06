@@ -677,8 +677,10 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
-        set_meta_file(&held.file, meta, flags)
-            .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+        own_metadata_change(&held.file, condition, set_mtime(meta, flags), || {
+            set_meta_file(&held.file, meta, flags)
+        })
+        .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
         if guard.is_some() {
             // A signed receiver keeps the pre-existing guarded behavior:
             // even an `Any` update must still be attached to its enrolled

@@ -1013,9 +1013,15 @@ printf 'case: restricted receiver keeps or replaces each name of a linked destin
 # Eight names of one destination file. The odd names' sources changed in
 # their second block; the even names' did not. Keeping an even name sets the
 # times they share, and replacing an odd name takes a link from the file.
-ssh source python3 - <<'PY_LINKED_SOURCE'
-import os
-root = '/tmp/syq-real-ssh/linked-source'
+# With several workers, other connections keep or replace names of the file
+# while a patch waits between its authorization and its execution.
+for linked_workers in 1 4; do
+    linked_source=/tmp/syq-real-ssh/linked-source-$linked_workers
+    linked_destination=/tmp/syq-real-ssh/linked-destination-$linked_workers
+    # shellcheck disable=SC2029
+    ssh source python3 - "$linked_source" <<'PY_LINKED_SOURCE'
+import os, sys
+root = sys.argv[1]
 os.makedirs(root)
 block = 64 * 1024
 old = bytes(i % 251 for i in range(2 * block))
@@ -1027,9 +1033,10 @@ for i in range(8):
     mtime = 1_600_000_000 + (i if i % 2 else 0)
     os.utime(path, (mtime, mtime))
 PY_LINKED_SOURCE
-ssh destination python3 - <<'PY_LINKED_DESTINATION'
-import os
-root = '/tmp/syq-real-ssh/linked-destination'
+    # shellcheck disable=SC2029
+    ssh destination python3 - "$linked_destination" <<'PY_LINKED_DESTINATION'
+import os, sys
+root = sys.argv[1]
 os.makedirs(root)
 block = 64 * 1024
 first = f'{root}/name0'
@@ -1038,22 +1045,22 @@ with open(first, 'wb') as f:
 os.utime(first, (1_500_000_000, 1_500_000_000))
 for i in range(1, 8):
     os.link(first, f'{root}/name{i}')
-with open('/tmp/syq-real-ssh/linked-inode', 'w') as f:
+with open(f'{root}.inode', 'w') as f:
     f.write(str(os.stat(first).st_ino))
 PY_LINKED_DESTINATION
-# One worker, whose requests the receiver carries out in turn: each name is
-# compared once, and each changed name is sent only its second block.
-linked_results=/tmp/syq-real-ssh-linked.ndjson
-linked_debug=/tmp/syq-real-ssh-linked.debug
-if ! SYQ_DEBUG=1 syq cp --copy-metadata=mtime --no-progress \
-    --performance-tuning workers=1 --results "$linked_results" \
-    --from source --srcs-in /tmp/syq-real-ssh/linked-source \
-    --to destination --into /tmp/syq-real-ssh/linked-destination \
-    2>"$linked_debug"; then
-    cat "$linked_debug" >&2
-    exit 1
-fi
-python3 - "$linked_results" "$linked_debug" <<'PY_LINKED_RESULTS'
+    # Each name is compared once, and each changed name is sent only its
+    # second block.
+    linked_results=/tmp/syq-real-ssh-linked-$linked_workers.ndjson
+    linked_debug=/tmp/syq-real-ssh-linked-$linked_workers.debug
+    if ! SYQ_DEBUG=1 syq cp --copy-metadata=mtime --no-progress \
+        --performance-tuning "workers=$linked_workers" --results "$linked_results" \
+        --from source --srcs-in "$linked_source" \
+        --to destination --into "$linked_destination" \
+        2>"$linked_debug"; then
+        cat "$linked_debug" >&2
+        exit 1
+    fi
+    python3 - "$linked_results" "$linked_debug" <<'PY_LINKED_RESULTS'
 import json, sys
 from pathlib import Path
 records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
@@ -1071,10 +1078,11 @@ assert any(
     for counts in observed
 ), observed
 PY_LINKED_RESULTS
-ssh destination python3 - <<'PY_LINKED_CHECK'
-import os
-root = '/tmp/syq-real-ssh/linked-destination'
-inode = int(open('/tmp/syq-real-ssh/linked-inode').read())
+    # shellcheck disable=SC2029
+    ssh destination python3 - "$linked_destination" <<'PY_LINKED_CHECK'
+import os, sys
+root = sys.argv[1]
+inode = int(open(f'{root}.inode').read())
 block = 64 * 1024
 old = bytes(i % 251 for i in range(2 * block))
 new = old[:block] + bytes([7]) * block
@@ -1095,6 +1103,53 @@ for i in range(8):
         assert contents == old and status.st_ino == inode, (i, status)
         assert int(status.st_mtime) == 1_600_000_000, (i, status)
 PY_LINKED_CHECK
+done
+# Destinations of another size are not compared: each name of a small linked
+# file is copied whole, several in one request, by several workers.
+ssh source python3 - <<'PY_LINKED_WHOLE_SOURCE'
+import os
+root = '/tmp/syq-real-ssh/linked-whole-source'
+os.makedirs(root)
+for i in range(8):
+    path = f'{root}/name{i}'
+    with open(path, 'wb') as f:
+        f.write(bytes([65 + i]) * 4096)
+    os.utime(path, (1_600_000_000 + i, 1_600_000_000 + i))
+PY_LINKED_WHOLE_SOURCE
+ssh destination python3 - <<'PY_LINKED_WHOLE_DESTINATION'
+import os
+root = '/tmp/syq-real-ssh/linked-whole-destination'
+os.makedirs(root)
+first = f'{root}/name0'
+with open(first, 'wb') as f:
+    f.write(b'old' * 600)
+for i in range(1, 8):
+    os.link(first, f'{root}/name{i}')
+PY_LINKED_WHOLE_DESTINATION
+syq cp --no-progress --performance-tuning workers=4 \
+    --results /tmp/syq-real-ssh-linked-whole.ndjson \
+    --from source --srcs-in /tmp/syq-real-ssh/linked-whole-source \
+    --to destination --into /tmp/syq-real-ssh/linked-whole-destination
+python3 - /tmp/syq-real-ssh-linked-whole.ndjson <<'PY_LINKED_WHOLE_RESULTS'
+import json, sys
+from pathlib import Path
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+assert records[-1]['errors'] == 0, records[-1]
+PY_LINKED_WHOLE_RESULTS
+ssh destination python3 - <<'PY_LINKED_WHOLE_CHECK'
+import os
+root = '/tmp/syq-real-ssh/linked-whole-destination'
+inodes = set()
+for i in range(8):
+    path = f'{root}/name{i}'
+    status = os.stat(path)
+    with open(path, 'rb') as f:
+        assert f.read() == bytes([65 + i]) * 4096, i
+    assert int(status.st_mtime) == 1_600_000_000 + i, (i, status)
+    assert status.st_nlink == 1 and status.st_ino not in inodes, (i, status)
+    inodes.add(status.st_ino)
+PY_LINKED_WHOLE_CHECK
 
 printf 'case: expression selection on source, destination, and local coordinators\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'

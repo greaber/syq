@@ -1930,3 +1930,75 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
         .is_err());
     assert!(tree.path().join("directory").is_dir());
 }
+
+/// A file named `a`, `b` and `c` in a fresh tree, and its metadata: the pin
+/// the names' publications hold.
+fn linked_publication_tree(name: &str) -> (TestDir, Root, RootMetadata) {
+    let tree = TestDir::new(name);
+    let root = Root::open(tree.path()).unwrap();
+    fs::write(tree.path().join("a"), b"old").unwrap();
+    for name in ["b", "c"] {
+        fs::hard_link(tree.path().join("a"), tree.path().join(name)).unwrap();
+    }
+    let pinned = root.metadata(&relative(b"a")).unwrap();
+    // Each replacement then takes a link from the file in a later clock tick,
+    // which changes its change time.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    (tree, root, pinned)
+}
+
+/// Replace `name` with new contents if the file it names is still the one
+/// `pinned` describes.
+fn replace_pinned(tree: &TestDir, root: &Root, name: &str, pinned: RootMetadata) -> Result<()> {
+    let staged = format!("staged-{name}");
+    fs::write(tree.path().join(&staged), name).unwrap();
+    let staged_metadata = fs::metadata(tree.path().join(&staged)).unwrap();
+    root.replace_regular_if_same(
+        &relative(staged.as_bytes()),
+        &relative(name.as_bytes()),
+        (staged_metadata.dev(), staged_metadata.ino()),
+        pinned.dev,
+        pinned.ino,
+        Some((pinned.ctime, pinned.ctime_nsec)),
+    )
+}
+
+#[test]
+fn replacing_one_name_leaves_the_pins_of_the_files_other_names_holding() {
+    let (tree, root, pinned) = linked_publication_tree("own-change-publication");
+    for name in ["a", "b", "c"] {
+        replace_pinned(&tree, &root, name, pinned).unwrap();
+        assert_eq!(fs::read(tree.path().join(name)).unwrap(), name.as_bytes());
+    }
+}
+
+#[test]
+fn an_outside_change_between_own_replacements_breaks_the_pins() {
+    // A change of mode after one name was replaced.
+    let (tree, root, pinned) = linked_publication_tree("own-change-then-outside");
+    replace_pinned(&tree, &root, "a", pinned).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::set_permissions(tree.path().join("c"), fs::Permissions::from_mode(0o600)).unwrap();
+    let error = replace_pinned(&tree, &root, "b", pinned).unwrap_err();
+    assert!(format!("{error:#}").contains("changed before publication"));
+    assert_eq!(fs::read(tree.path().join("b")).unwrap(), b"old");
+
+    // A change of mode between the exchange that replaces one name and the
+    // removal of the name it displaced, the two changes that replacement
+    // makes to the file.
+    let (tree, root, pinned) = linked_publication_tree("own-change-around-outside");
+    let other = tree.path().join("c");
+    let _after_exchange = install_publication_test_hook(
+        root.identity(),
+        &relative(b"a"),
+        PublicationTestPoint::AfterMatchedExchange,
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+        },
+    );
+    replace_pinned(&tree, &root, "a", pinned).unwrap();
+    let error = replace_pinned(&tree, &root, "b", pinned).unwrap_err();
+    assert!(format!("{error:#}").contains("changed before publication"));
+    assert_eq!(fs::read(tree.path().join("b")).unwrap(), b"old");
+}

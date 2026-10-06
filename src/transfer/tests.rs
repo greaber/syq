@@ -5578,6 +5578,82 @@ fn a_restricted_receiver_preserving_permissions_compares_linked_names_together()
     assert_eq!((executed.hash_batches, executed.whole), (1, 0));
 }
 
+/// Copy `count` names of one destination file, each from a source of its own
+/// holding `new` and a modification time of its own, through a restricted
+/// receiver with `workers` workers, and check that each name ends with the
+/// source's contents and time as a file of its own: none is left on the old
+/// file, and no two share one.
+fn replace_linked_names(
+    count: usize,
+    old: &[u8],
+    new: &[u8],
+    workers: usize,
+    before_patch: impl Fn() + Send + Sync + 'static,
+) -> Executed {
+    use std::os::unix::fs::MetadataExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let (names, inode) = linked_destination(root, count, old);
+    for name in &names {
+        std::fs::write(root.join("source").join(name), new).unwrap();
+    }
+    let files: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), 1_600_000_000 + i as i64))
+        .collect();
+    let executed = copy_through_restricted_receiver(root, &files, workers, before_patch);
+    let mut inodes = std::collections::HashSet::new();
+    for (name, mtime) in &files {
+        let path = root.join("target").join(name);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let case = format!("{workers} workers: {name}");
+        assert_eq!(std::fs::read(&path).unwrap(), new, "{case}");
+        assert_eq!(metadata.mtime(), *mtime, "{case}");
+        assert_ne!(metadata.ino(), inode, "{case}");
+        assert!(inodes.insert(metadata.ino()), "{case}");
+    }
+    executed
+}
+
+#[test]
+fn a_restricted_receiver_patches_every_name_of_a_changed_linked_destination_with_several_workers() {
+    // Two blocks, the second changed: each name's patch sends that block
+    // and reuses the first.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
+    let mut new = old.clone();
+    new[block..].fill(7);
+    for workers in [2, 4] {
+        // Replacing a name takes a link from the file the others share,
+        // which changes its change time once the clock has moved on, while
+        // other workers' patches of its names are authorized and waiting.
+        let executed = replace_linked_names(8, &old, &new, workers, || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        // Each name is patched once: the receiver's own replacements of
+        // other names leave its condition holding.
+        assert_eq!(
+            (executed.compared, executed.whole),
+            (vec![1; 8], 0),
+            "{workers} workers"
+        );
+    }
+}
+
+#[test]
+fn a_restricted_receiver_replaces_small_linked_files_whole() {
+    // Destinations of another size are not compared: each name is copied
+    // whole, in batches of small files.
+    let old = vec![b'o'; 2048];
+    let new = vec![b'n'; 4096];
+    for workers in [1, 4] {
+        let executed = replace_linked_names(8, &old, &new, workers, || {});
+        assert_eq!(executed.compared, vec![0; 8], "{workers} workers");
+        assert_ne!(executed.whole, 0, "{workers} workers");
+    }
+}
+
 #[test]
 fn a_restricted_receiver_keeps_a_linked_destination_mode_changed_outside() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

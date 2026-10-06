@@ -58,6 +58,7 @@ mod macos_clone_support;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod directory_gate;
 mod operator;
+pub(crate) mod own_changes;
 
 pub(crate) use operator::*;
 
@@ -1642,8 +1643,13 @@ impl Root {
             metadata.is_file() && metadata.dev == expected_dev && metadata.ino == expected_ino
         };
         if !has_expected_identity(before)
-            || !expected_ctime.is_none_or(|(ctime, ctime_nsec)| {
-                (before.ctime, before.ctime_nsec) == (ctime, ctime_nsec)
+            || !expected_ctime.is_none_or(|pinned| {
+                own_changes::pin_holds(
+                    expected_dev,
+                    expected_ino,
+                    pinned,
+                    (before.ctime, before.ctime_nsec),
+                )
             })
         {
             bail!(
@@ -1659,6 +1665,15 @@ impl Root {
         );
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
+        // Other names of the replaced file may be pinned to its change time,
+        // which the exchange and the removal of its displaced name change:
+        // record both as this process's own (see `own_changes`).
+        let pinned = expected_ctime.is_some();
+        let exchange = pinned.then(|| own_changes::begin(&before)).flatten();
+        let exchanged = exchange
+            .as_ref()
+            .map(|_| metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf))
+            .transpose()?;
         rename_exchange(
             source_parent.directory.as_raw_fd(),
             &source_parent.leaf,
@@ -1666,6 +1681,12 @@ impl Root {
             &target_parent.leaf,
         )
         .with_context(|| format!("atomically publish confined path {}", target.label()))?;
+        if let (Some(exchange), Some(before)) = (exchange, exchanged) {
+            if let Ok(after) = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)
+            {
+                exchange.finish(&before, &after, 0, None);
+            }
+        }
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
         #[cfg(test)]
@@ -1696,8 +1717,28 @@ impl Root {
         }
         #[cfg(any(target_os = "linux", test))]
         let _permit = self.mutation_permit(source)?;
+        let removal = pinned.then(|| own_changes::begin(&displaced)).flatten();
+        let removed = removal
+            .as_ref()
+            .and_then(|_| source_parent.open_metadata().ok())
+            .and_then(|handle| {
+                Some((
+                    root_metadata_from_std(&handle.metadata().ok()?).ok()?,
+                    handle,
+                ))
+            });
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
-            .with_context(|| format!("remove displaced confined path {}", target.label()))
+            .with_context(|| format!("remove displaced confined path {}", target.label()))?;
+        if let (Some(removal), Some((before, handle))) = (removal, removed) {
+            if let Some(after) = handle
+                .metadata()
+                .ok()
+                .and_then(|after| root_metadata_from_std(&after).ok())
+            {
+                removal.finish(&before, &after, 1, None);
+            }
+        }
+        Ok(())
     }
 
     fn resolve_publish_target<'a>(
