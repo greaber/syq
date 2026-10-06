@@ -3574,14 +3574,14 @@ fn probe_mode_change(file: &File, mode: u32) -> io::Result<()> {
 /// reports one fixed mode for every file with `SYQ_TEST_FORCED_MODE`, the
 /// permission bits in octal.
 fn reported_mode(mode: u32) -> u32 {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(forced) = test_forced_mode() {
         return mode & !0o7777 | forced;
     }
     mode
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 fn test_forced_mode() -> Option<u32> {
     #[cfg(test)]
     if let Some(mode) = FORCED_MODE.get() {
@@ -3773,7 +3773,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(target_os = "linux", debug_assertions))]
+#[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 pub(super) fn test_fallocate_errno() -> Option<i32> {
     #[cfg(test)]
     if let Some(errno) = FALLOCATE_ERRNO.get() {
@@ -3788,7 +3788,7 @@ pub(super) fn test_fallocate_errno() -> Option<i32> {
     }
 }
 
-#[cfg(all(target_os = "linux", not(debug_assertions)))]
+#[cfg(all(target_os = "linux", not(any(test, debug_assertions))))]
 pub(super) fn test_fallocate_errno() -> Option<i32> {
     None
 }
