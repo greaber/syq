@@ -471,17 +471,13 @@ fn walk_directory(
     }) = pending.pop()
     {
         let relative = &entry.path;
-        let source = if contents {
-            relative.clone()
+        if contents {
+            emit(out, relative, relative, &entry)?;
         } else {
-            join_rel(source_prefix, relative)
-        };
-        let destination = if contents {
-            relative.clone()
-        } else {
-            join_rel(destination_prefix, relative)
-        };
-        emit(out, &source, &destination, &entry)?;
+            let source = join_rel(source_prefix, relative);
+            let destination = join_rel(destination_prefix, relative);
+            emit(out, &source, &destination, &entry)?;
+        }
         if entry.kind == Kind::Dir {
             push_directory_children(root, &root_relative, relative, metadata, &mut pending)?;
         }
