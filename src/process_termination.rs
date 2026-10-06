@@ -97,14 +97,18 @@ fn insert(later: bool, action: Action) -> io::Result<Cleanup> {
 
 /// Run `work` on this thread with the cap enforced: unless a termination
 /// signal is ending the process anyway, a watchdog ends it with status 1
-/// if the work has not finished by then. `work` receives the time by which
-/// it should stop. When no watchdog can be started the work is skipped.
+/// if the work has not finished by then, after giving the `add_first`
+/// cleanups the last tenth of the cap. `work` receives the time by which it
+/// should stop. When no watchdog can be started the work is skipped.
 pub(crate) fn bounded(work: impl FnOnce(Instant)) {
     let started = Instant::now();
     let cap = cap();
     let (done, finished) = std::sync::mpsc::channel::<()>();
     let watchdog = spawn("cleanup-watchdog", move || {
-        if finished.recv_timeout(cap) == Err(RecvTimeoutError::Timeout) && !STARTED.load(SeqCst) {
+        if finished.recv_timeout(cap - cap / 10) == Err(RecvTimeoutError::Timeout)
+            && !STARTED.load(SeqCst)
+        {
+            run_first(cap / 10);
             unsafe { libc::_exit(STALLED) }
         }
     });
@@ -113,6 +117,30 @@ pub(crate) fn bounded(work: impl FnOnce(Instant)) {
     }
     work(started + cap * 4 / 5);
     drop(done);
+}
+
+/// Run the `add_first` cleanups on a thread of their own, waiting for them
+/// at most `limit`, so that one that stalls cannot hold the process.
+fn run_first(limit: Duration) {
+    let first: Vec<Action> = cleanups()
+        .iter()
+        .filter(|((later, _), _)| !later)
+        .map(|(_, action)| Arc::clone(action))
+        .collect();
+    if first.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + limit;
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let running = spawn("termination-first", move || {
+        for action in first {
+            action(deadline);
+        }
+        let _ = done.send(());
+    });
+    if running.is_ok() {
+        let _ = finished.recv_timeout(limit);
+    }
 }
 
 /// While a termination signal is being handled, wait for its cleanup to end
@@ -271,6 +299,17 @@ mod tests {
                 bounded(stall);
                 panic!("the watchdog did not end the process");
             }
+            "watchdog-first" => {
+                cleanups.push(add(mark("later")).unwrap());
+                cleanups.push(add_first(mark("first")).unwrap());
+                bounded(stall);
+                panic!("the watchdog did not end the process");
+            }
+            "watchdog-first-stalls" => {
+                cleanups.push(add_first(stall).unwrap());
+                bounded(stall);
+                panic!("the watchdog did not end the process");
+            }
             "watchdog-finished" | "watchdog-refused" => {
                 bounded(mark("cleaned"));
                 std::process::exit(7);
@@ -339,6 +378,23 @@ mod tests {
             // longer than the test waits.
             ("refused", Signal(libc::SIGTERM), None, Some(60_000), true),
             ("watchdog", Code(STALLED), None, Some(200), false),
+            // A stalled process still removes what must not outlive it,
+            // such as its socket directory, but nothing slower.
+            (
+                "watchdog-first",
+                Code(STALLED),
+                Some("first"),
+                Some(200),
+                false,
+            ),
+            // That quick cleanup cannot hold the process either.
+            (
+                "watchdog-first-stalls",
+                Code(STALLED),
+                None,
+                Some(200),
+                false,
+            ),
             ("watchdog-finished", Code(7), Some("cleaned"), None, false),
             ("watchdog-refused", Code(7), None, None, true),
         ] {

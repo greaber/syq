@@ -387,34 +387,57 @@ fn an_interrupted_pull_removes_its_streamed_patch_stage() {
 }
 
 /// Interrupt a copy whose receiver's cleanup then stalls in a test barrier,
-/// so that only its cap can end it: a local copy interrupted as a terminal
-/// does, or a push whose coordinator is killed, so that the remote receiver
-/// cleans up because its connection was lost.
-fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str) -> (Child, i32) {
+/// so that only its cap can end it:
+///
+/// - `local`: a local copy interrupted as a terminal does;
+/// - `local-lost`: a local copy whose coordinator alone gets SIGTERM, so
+///   that the receiver cleans up because its connection was lost;
+/// - `push`: a push whose coordinator is killed, so that the remote
+///   receiver cleans up because its connection was lost.
+///
+/// Their private temporary directories go in `tmp`.
+fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str, tmp: &Path) -> (Child, i32) {
     small_tree(t, 20);
     let staged = t.path("staged");
     let sweeping = t.path("sweeping");
     let tuning = "workers=1,batch-files=8";
     let mut command = match route {
-        "local" => local_copy(t, tuning),
-        _ => remote_copy(t, route, tuning),
+        "push" => remote_copy(t, route, tuning),
+        _ => local_copy(t, tuning),
     };
     command
+        .env("TMPDIR", tmp)
         .env("SYQ_TEST_SMALL_STAGE_READY_FILE", &staged)
         .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", t.path("never"))
         .env("SYQ_TEST_SIDECAR_SWEEP_READY_FILE", &sweeping)
         .env("SYQ_TEST_SIDECAR_SWEEP_CONTINUE_FILE", t.path("never"));
     let mut child = start_job(&mut command);
     wait_for_confinement_marker(&mut child, &staged, "staged small files");
-    let signal = if route == "local" {
-        signal_group(&child, libc::SIGINT);
-        libc::SIGINT
-    } else {
-        signal_process(&child, libc::SIGKILL);
-        libc::SIGKILL
+    let signal = match route {
+        "local" => {
+            signal_group(&child, libc::SIGINT);
+            libc::SIGINT
+        }
+        "local-lost" => {
+            signal_process(&child, libc::SIGTERM);
+            libc::SIGTERM
+        }
+        _ => {
+            signal_process(&child, libc::SIGKILL);
+            libc::SIGKILL
+        }
     };
     wait_until("the receiver's cleanup", || sweeping.exists());
     (child, signal)
+}
+
+/// The private socket directories left in `tmp`.
+fn broker_directories(tmp: &Path) -> Vec<String> {
+    fs::read_dir(tmp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("syq-fd-"))
+        .collect()
 }
 
 #[test]
@@ -422,9 +445,10 @@ fn an_interrupted_receiver_ends_by_its_cap_when_cleanup_stalls() {
     // The barrier would hold the cleanup for a minute; the cap of half a
     // second ends the receiver long before, whether a signal or a lost
     // connection started the cleanup.
-    for route in ["local", "push"] {
+    for route in ["local", "local-lost", "push"] {
         let t = Tmp::new();
-        let (child, signal) = interrupt_with_stalled_cleanup(&t, route);
+        let tmp = test_support::short_tempdir().unwrap();
+        let (child, signal) = interrupt_with_stalled_cleanup(&t, route, tmp.path());
         let (status, stderr, elapsed) = finish(child, Duration::from_secs(30));
         assert_eq!(status.signal(), Some(signal), "{route}: {stderr}");
         assert!(
@@ -433,6 +457,15 @@ fn an_interrupted_receiver_ends_by_its_cap_when_cleanup_stalls() {
         );
         // It ended without removing what the stalled cleanup had not reached.
         assert!(!own_sidecars(&t.path("dst")).is_empty(), "{route}");
+        // A killed coordinator leaves its own socket directory behind; the
+        // others, the receiver's included, are removed first.
+        if route != "push" {
+            assert_eq!(
+                broker_directories(tmp.path()),
+                Vec::<String>::new(),
+                "{route}"
+            );
+        }
     }
 }
 
