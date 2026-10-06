@@ -1348,3 +1348,29 @@ fn native_mtime_metadata_is_explicit_on_unchanged_files() {
     ]);
     assert_eq!(fs::metadata(t.path("dst/file")).unwrap().mtime(), 123);
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_network_destination_gives_a_few_directories_their_metadata_at_once() {
+    // On a network filesystem each change waits a round trip, so even a few
+    // directories take their final metadata in parallel. The receiver fails
+    // each change to a `together` directory unless all four start at once.
+    let t = Tmp::new();
+    for index in 0..4 {
+        write(&t.path(&format!("src/together{index}/file")), b"x");
+        set_mtime(&t.path(&format!("src/together{index}")), 1_000_000_000);
+    }
+    let output = compat_command()
+        .args(["-rt", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_TEST_NETWORK_FILESYSTEM", "1")
+        .env("SYQ_TEST_CONCURRENT_SET_META_PREFIX", "together")
+        .env("SYQ_TEST_CONCURRENT_SET_META_COUNT", "4")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    for index in 0..4 {
+        let path = t.path(&format!("dst/together{index}"));
+        assert_eq!(fs::metadata(&path).unwrap().mtime(), 1_000_000_000);
+        assert_eq!(read(&path.join("file")), b"x");
+    }
+}

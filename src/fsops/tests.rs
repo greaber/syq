@@ -5589,6 +5589,53 @@ fn small_metadata_batches_run_inline() {
 }
 
 #[test]
+fn short_batches_run_in_parallel_on_a_network_filesystem() {
+    // Each operation waits until all of them have started, so the batch can
+    // only finish if they run at once.
+    let started = (Mutex::new(0), std::sync::Condvar::new());
+    let together = |count: usize| {
+        let (mutex, changed) = &started;
+        let mut arrived = mutex.lock().unwrap();
+        *arrived += 1;
+        changed.notify_all();
+        let (_arrived, waited) = changed
+            .wait_timeout_while(arrived, std::time::Duration::from_secs(30), |arrived| {
+                *arrived < count
+            })
+            .unwrap();
+        !waited.timed_out()
+    };
+    let network = parallel_minimum(true);
+    assert!(parallel_map_from(network, &[(); 3], |_| together(3))
+        .into_iter()
+        .all(|met| met));
+    // Directories in different parents are created at once as well.
+    let ops: Vec<Op> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|parent| Op::Mkdir {
+            path: format!("{parent}/new").into_bytes(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        })
+        .collect();
+    let selected: Vec<usize> = (0..ops.len()).collect();
+    *started.0.lock().unwrap() = 0;
+    assert!(
+        parallel_by_directory(network, &ops, &selected, |_| together(4))
+            .into_iter()
+            .all(|met| met)
+    );
+    // A local filesystem keeps a short batch on the calling thread.
+    let caller = std::thread::current().id();
+    assert_eq!(
+        parallel_map_from(parallel_minimum(false), &[(); 3], |_| std::thread::current(
+        )
+        .id()),
+        vec![caller; 3]
+    );
+}
+
+#[test]
 fn parallel_metadata_batches_share_a_bounded_pool() {
     let mut threads = std::collections::HashSet::new();
     let items: Vec<_> = (0..PAR_MIN).collect();
@@ -7204,7 +7251,7 @@ fn directory_changes_share_each_directory_between_two_threads() {
     let selected: Vec<usize> = (0..ops.len()).filter(|index| index % 5 != 1).collect();
     let active = [AtomicUsize::new(0), AtomicUsize::new(0)];
     let peak = [AtomicUsize::new(0), AtomicUsize::new(0)];
-    let results = parallel_by_directory(&ops, &selected, |op| {
+    let results = parallel_by_directory(PAR_MIN, &ops, &selected, |op| {
         let path = op_path(op);
         let busy = [&b"busy/a"[..], b"other/"]
             .iter()
