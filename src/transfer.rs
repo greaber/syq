@@ -2937,7 +2937,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             &operator_dst_root,
             opts.operator_symlink_policy,
-            opts.may_widen_directory_permissions(),
+            // Only exact placement selects the parent for mutation. For a
+            // container (or rsync's inferred placement), a denied ancestor
+            // must remain untouched; opening it briefly cannot provide the
+            // access later traversal would need anyway.
+            args.placement == Placement::As && opts.may_widen_directory_permissions(),
         )?;
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;

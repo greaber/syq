@@ -803,6 +803,46 @@ fn explicit_directory_access_covers_file_destination_containers() {
 }
 
 #[test]
+fn directory_access_does_not_widen_ancestors_of_a_destination_container() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for interface in ["cp", "rsync"] {
+        for dry_run in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"new contents");
+            write(&t.path("parent/dst/sentinel"), b"keep contents");
+            fs::set_permissions(t.path("parent"), fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::metadata(t.path("parent")).unwrap();
+            let src = t.s("src/file");
+            let dst = t.s("parent/dst/");
+            let mut args = vec![interface];
+            if interface == "cp" {
+                args.extend(["--temporarily-widen-dir-permissions", &src, "--into", &dst]);
+            } else {
+                args.extend([&src, &dst]);
+            }
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = native_syq(&args);
+            let after = fs::metadata(t.path("parent")).unwrap();
+            fs::set_permissions(t.path("parent"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!out.status.success(), "{interface}, dry={dry_run}: {out:?}");
+            assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+            assert_eq!(after.mode() & 0o777, 0o600);
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec()),
+                "{interface}, dry={dry_run}: the ancestor must not be chmodded"
+            );
+            assert_eq!(read(&t.path("parent/dst/sentinel")), b"keep contents");
+            assert!(!t.path("parent/dst/file").exists());
+        }
+    }
+}
+
+#[test]
 fn readonly_container_allows_inplace_updates_without_widening() {
     let t = Tmp::new();
     write(&t.path("src/file"), b"updated contents");
