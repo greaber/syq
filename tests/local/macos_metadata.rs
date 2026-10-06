@@ -487,6 +487,81 @@ fn acl_staging_is_private_before_small_and_ranged_writes() {
     }
 }
 
+/// Without -A a new sidecar takes its directory's inheritable ACL entries
+/// whatever its mode, so it can be readable by someone who could not read
+/// the old file or an earlier copy's partial. Neither one's own bytes may be
+/// copied into it then; a partial that inherited the same entries may.
+#[cfg(debug_assertions)]
+#[test]
+fn an_inheriting_sidecar_takes_no_bytes_its_readers_could_not_read() {
+    let half = 4 << 20;
+    // No partial; one from before the directory's policy; one under it.
+    for partial in [None, Some(false), Some(true)] {
+        let t = Tmp::new();
+        fs::create_dir(t.path("dst")).unwrap();
+        let old = [vec![b'a'; half], vec![b's'; half]].concat();
+        let new = [vec![b'b'; half], vec![b's'; half]].concat();
+        write(&t.path("dst/file"), &old);
+        fs::set_permissions(t.path("dst/file"), fs::Permissions::from_mode(0o600)).unwrap();
+        set_mtime(&t.path("dst/file"), 1);
+        write(&t.path("src"), &new);
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+        let stale = t.path("dst/.file.syq-tmp.abcdefghijklmnop");
+        let leave_partial = || {
+            write(&stale, &vec![b'c'; 2 * half]);
+            fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        if partial == Some(false) {
+            leave_partial();
+        }
+        chmod(
+            &t.path("dst"),
+            &["+a", "user:nobody allow read,file_inherit"],
+        );
+        if partial == Some(true) {
+            leave_partial();
+        }
+        assert!(acl(&t.path("dst/file")).is_empty());
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut child = compat_command()
+            .args([
+                "-a",
+                "--no-progress",
+                "--no-whole-file",
+                "--performance-tuning=workers=1,copy-path=ranges",
+                &t.s("src"),
+                &t.s("dst/file"),
+            ])
+            .env("SYQ_TEST_STAGED_BASIS_READY_FILE", &ready)
+            .env("SYQ_TEST_STAGED_BASIS_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .start()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "staged comparison basis");
+        let stages: Vec<_> = partial_files(&t.path("dst"))
+            .into_iter()
+            .filter(|path| *path != stale)
+            .collect();
+        assert_eq!(stages.len(), 1, "{stages:?}");
+        let staged = read(&stages[0]);
+        let staged_acl = acl(&stages[0]);
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/file")), new);
+        assert!(!staged_acl.is_empty(), "the sidecar inherited no entry");
+        assert!(!staged.contains(&b'a'), "the old file's bytes were staged");
+        let seeded = staged.iter().filter(|byte| **byte == b'c').count();
+        assert_eq!(
+            seeded,
+            if partial == Some(true) { 2 * half } else { 0 },
+            "partial {partial:?}"
+        );
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 #[ignore = "requires root to exercise recovery reads through mode-000 publication"]
