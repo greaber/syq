@@ -468,6 +468,20 @@ pub(crate) fn time_preserving_test_authority_of(
     authority
 }
 
+/// The same, for up to `entries` paths, preserving the sources' permissions
+/// when `permissions` is set.
+pub(crate) fn time_preserving_test_authority_for(
+    root: &Path,
+    maximum_bytes: u64,
+    entries: u64,
+    permissions: bool,
+) -> RestrictedAuthority {
+    let mut authority = time_preserving_test_authority_of(root, maximum_bytes);
+    authority.copy.limits.max_entries = entries;
+    authority.copy.options.preserve_permissions = permissions;
+    authority
+}
+
 fn test_authority_with_rate(
     root: &Path,
     deletion: DeletionPolicy,

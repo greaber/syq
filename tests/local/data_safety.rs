@@ -832,3 +832,201 @@ fn rsync_permission_failures_do_not_suggest_a_native_only_option() {
         "{out:?}"
     );
 }
+
+/// In-place lengths of interest beside a new length that is not a multiple
+/// of any block: longer, equal and shorter old files.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+const INPLACE_NEW_LEN: usize = (3 << 20) + 123;
+#[cfg(all(debug_assertions, target_os = "linux"))]
+const INPLACE_OLD_LENS: [usize; 3] = [5 << 20, INPLACE_NEW_LEN, 1 << 20];
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn inplace_local_copy_failure_keeps_old_data_within_the_new_length() {
+    for old_len in INPLACE_OLD_LENS {
+        // The kernel copy is refused, and then whatever replaces it fails:
+        // the range writes, or the userspace copy after its first write.
+        for userspace in [false, true] {
+            let t = Tmp::new();
+            let new = prng(INPLACE_NEW_LEN, 71);
+            let old = prng(old_len, 72);
+            write(&t.path("src/file"), &new);
+            // A distinct time, so that an equally long file is copied.
+            set_mtime(&t.path("src/file"), 1_700_000_000);
+            write(&t.path("dst/file"), &old);
+            let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
+            let mut command = compat_command();
+            command
+                .args(["-a", "--inplace", "--no-progress"])
+                .args([t.s("src/"), t.s("dst/")])
+                .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1");
+            if userspace {
+                // A second file lets a refused kernel copy fall back to
+                // the userspace copy rather than to ranges.
+                write(&t.path("src/small"), b"another file");
+                command
+                    .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+                    .env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1");
+            } else {
+                command
+                    .env("SYQ_TEST_COPY_LOCAL_FS", "unsupported")
+                    .env("SYQ_TEST_FAIL_WRITE_RANGE_NAME", "file");
+            }
+            let out = command.run().unwrap();
+            let context = format!("old {old_len}, userspace {userspace}");
+            assert!(!out.status.success(), "{context}: {}", stderr_of(&out));
+            assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+            // Old bytes within the new length survive until new data
+            // replaces them; only bytes past the new end may go early.
+            let after = read(&t.path("dst/file"));
+            let kept = old_len.min(INPLACE_NEW_LEN);
+            let written = if userspace { (1 << 20).min(kept) } else { 0 };
+            assert!(after.len() >= kept, "{context}: {} bytes left", after.len());
+            assert!(after[..written] == new[..written], "{context}");
+            assert!(
+                after[written..kept] == old[written..kept],
+                "{context}: old data within the new length was lost"
+            );
+            assert!(partial_files(&t.0).is_empty(), "{context}");
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn inplace_local_copies_end_at_the_new_length() {
+    // The kernel copy, a clone where this filesystem has one, the userspace
+    // copy and the range copy each write over the old file.
+    let paths: [(&str, &[(&str, &str)]); 4] = [
+        ("kernel", &[]),
+        ("clone", &[("SYQ_TEST_COPY_LOCAL_FS", "local")]),
+        (
+            "userspace",
+            &[
+                ("SYQ_TEST_COPY_LOCAL_FS", "local"),
+                ("SYQ_TEST_COPY_LOCAL_EXDEV", "1"),
+            ],
+        ),
+        (
+            "ranges",
+            &[
+                ("SYQ_TEST_COPY_LOCAL_FS", "unsupported"),
+                ("SYQ_TEST_COPY_LOCAL_EXDEV", "1"),
+            ],
+        ),
+    ];
+    for (path, environment) in paths {
+        for old_len in INPLACE_OLD_LENS.into_iter().chain([0]) {
+            let t = Tmp::new();
+            let new = prng(INPLACE_NEW_LEN, 73);
+            write(&t.path("src/file"), &new);
+            write(&t.path("src/small"), b"another file");
+            set_mtime(&t.path("src/file"), 1_700_000_000);
+            write(&t.path("dst/file"), &prng(old_len, 74));
+            let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
+            let out = compat_command()
+                .args(["-a", "--inplace", "--no-progress"])
+                .args([t.s("src/"), t.s("dst/")])
+                .envs(environment.iter().copied())
+                .run()
+                .unwrap();
+            assert_output_ok(&out);
+            let context = format!("{path}, old {old_len}");
+            assert!(read(&t.path("dst/file")) == new, "{context}");
+            let metadata = fs::metadata(t.path("dst/file")).unwrap();
+            assert_eq!(metadata.ino(), inode, "{context}");
+            assert_eq!(metadata.mtime(), 1_700_000_000, "{context}");
+            assert!(partial_files(&t.0).is_empty(), "{context}");
+        }
+    }
+}
+
+/// Whether this filesystem clones a file with an unaligned length over the
+/// start of an equally long one, as an in-place clone of a shrinking file
+/// does once the file is cut to its new length.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn clones_unaligned_files(directory: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    write(&directory.join("probe-source"), &prng(1_000_000, 1));
+    write(&directory.join("probe-destination"), &prng(1_000_000, 2));
+    let source = File::open(directory.join("probe-source")).unwrap();
+    let destination = OpenOptions::new()
+        .write(true)
+        .open(directory.join("probe-destination"))
+        .unwrap();
+    let range = libc::file_clone_range {
+        src_fd: source.as_raw_fd().into(),
+        src_offset: 0,
+        src_length: 1_000_000,
+        dest_offset: 0,
+    };
+    let cloned = unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONERANGE, &range) } == 0;
+    fs::remove_file(directory.join("probe-source")).unwrap();
+    fs::remove_file(directory.join("probe-destination")).unwrap();
+    cloned
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn inplace_clone_of_a_shrinking_unaligned_file_still_clones() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("dst")).unwrap();
+    if !clones_unaligned_files(&t.path("dst")) {
+        return;
+    }
+    // A clone of an unaligned length cannot end inside a longer file, so
+    // the file is cut to its new length before the clone.
+    let new = prng(1_000_000, 75);
+    write(&t.path("src/file"), &new);
+    write(&t.path("dst/file"), &prng(2_000_000, 76));
+    let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
+    let out = compat_command()
+        .args(["-a", "--inplace", "--no-progress"])
+        .args([t.s("src/file"), t.s("dst/file")])
+        .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+        .env("SYQ_TEST_COPY_LOCAL_CLONES", t.path("clones"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(read(&t.path("dst/file")) == new);
+    assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+    assert_eq!(
+        fs::read_to_string(t.path("clones")).unwrap(),
+        "clone 1000000\n"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn inplace_small_files_write_before_cutting_and_keep_old_data_on_failure() {
+    for fail in [false, true] {
+        for old_len in [60_000, 20_000, 0] {
+            let t = Tmp::new();
+            let new = prng(20_000, 77);
+            let old = prng(old_len, 78);
+            write(&t.path("src/file"), &new);
+            set_mtime(&t.path("src/file"), 1_700_000_000);
+            write(&t.path("dst/file"), &old);
+            let inode = fs::metadata(t.path("dst/file")).unwrap().ino();
+            let mut command = compat_command();
+            command
+                .args(["-a", "--inplace", "--no-progress"])
+                .args([t.s("src/"), t.s("dst/")]);
+            if fail {
+                command.env("SYQ_TEST_FAIL_INPLACE_PUT", "1");
+            }
+            let out = command.run().unwrap();
+            let context = format!("old {old_len}, fail {fail}");
+            assert_eq!(
+                out.status.success(),
+                !fail,
+                "{context}: {}",
+                stderr_of(&out)
+            );
+            let expected = if fail { &old } else { &new };
+            assert!(read(&t.path("dst/file")) == *expected, "{context}");
+            assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
+            assert!(partial_files(&t.0).is_empty(), "{context}");
+        }
+    }
+}

@@ -1178,6 +1178,9 @@ impl FsOps {
         self.uncache_rooted(&destination_root, &target.relative);
         let (mut target_relative, mut target_label) =
             (target.relative.clone(), target.label.clone());
+        // The bytes at the start of the output that hold old contents until
+        // the copy writes over them: an in-place file's, within its new length.
+        let mut old_len = 0;
         let d = if inplace {
             let mut opened = None;
             for _ in 0..8 {
@@ -1194,9 +1197,18 @@ impl FsOps {
                                 target_label.display()
                             );
                         }
-                        file.set_len(0).with_context(|| {
-                            format!("truncate confined file {}", target_label.display())
-                        })?;
+                        // Never empty the file before its new contents are
+                        // written: a copy that fails part way, or a
+                        // destination that refuses these writes, then
+                        // leaves old data rather than nothing. Only bytes
+                        // past the new end go now, which also lets a clone
+                        // of a shorter, unaligned source replace the rest.
+                        if metadata.len() > size {
+                            file.set_len(size).with_context(|| {
+                                format!("shorten confined file {}", target_label.display())
+                            })?;
+                        }
+                        old_len = metadata.len().min(size);
                         opened = Some(file);
                         break;
                     }
@@ -1290,6 +1302,10 @@ impl FsOps {
         let cloned = (local_read_ahead || self.sparse)
             && !userspace_fallback
             && crate::local_copy::try_clone(&s, &d, size);
+        #[cfg(debug_assertions)]
+        if cloned && size > 0 {
+            record_test_event("SYQ_TEST_COPY_LOCAL_CLONES", format_args!("clone {size}"))?;
+        }
         userspace_fallback |= self.sparse && !cloned;
         let preparation = &mut self.read_ahead;
         let mut read_ahead = (local_read_ahead && !cloned).then(|| preparation.range(&s, 0..size));
@@ -1410,7 +1426,9 @@ impl FsOps {
                     crate::read_ahead::Activity::sample().read_wait_since(before)
                 });
                 if self.sparse {
-                    crate::sparse::write_at(&d, &buffer[..n], size - remaining, false)
+                    // Zeros over an in-place file's old bytes must clear them.
+                    let off = size - remaining;
+                    crate::sparse::write_at(&d, &buffer[..n], off, off < old_len)
                 } else {
                     destination.write_all(&buffer[..n])
                 }
@@ -1766,6 +1784,10 @@ impl FsOps {
             // nothing, and it serves the metadata step and the identity
             // afterwards.
             let mut created = None;
+            // How far the file's old contents may extend. They are written
+            // over and only then cut to the new length, so a write that
+            // fails leaves old data rather than an emptied file.
+            let mut old_len = 0;
             let file = match condition {
                 // The whole file is written here and never read back.
                 TargetCondition::Absent => {
@@ -1779,7 +1801,7 @@ impl FsOps {
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
                     let file = rooted.root.open_regular_write(&rooted.relative, false)?;
                     require_open_target(&file, &rooted.label, condition)?;
-                    file.set_len(0)?;
+                    old_len = u64::MAX;
                     file
                 }
                 TargetCondition::Any => {
@@ -1794,9 +1816,7 @@ impl FsOps {
                         .open_or_create_write_only_file(&rooted.relative, meta.mode)
                     {
                         Ok((file, metadata)) if metadata.is_file() => {
-                            if metadata.len() != 0 {
-                                file.set_len(0)?;
-                            }
+                            old_len = metadata.len();
                             created = Some(metadata);
                             Some(file)
                         }
@@ -1813,7 +1833,7 @@ impl FsOps {
                                 let file =
                                     rooted.root.open_regular_write(&rooted.relative, false)?;
                                 require_rooted_metadata(&file, metadata, &rooted.label)?;
-                                file.set_len(0)?;
+                                old_len = metadata.len;
                                 opened = Some(file);
                                 break;
                             }
@@ -1844,8 +1864,14 @@ impl FsOps {
                     })?
                 }
             };
-            observed_write(&self.operation, &file, data, 0, self.sparse)
+            observed_overwrite(&self.operation, &file, data, old_len, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
+            let len = data.len() as u64;
+            // A sparse write may end in a hole that only the length makes.
+            if self.sparse || old_len > len {
+                file.set_len(len)
+                    .with_context(|| format!("set length of {}", rooted.label.display()))?;
+            }
             check_destination_writes(&file, &rooted.label)?;
             match &created {
                 Some(created) => set_meta_written_file(&file, meta, flags, created),

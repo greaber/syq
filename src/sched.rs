@@ -126,7 +126,7 @@ pub struct Jobs {
 }
 
 /// The device and inode of a destination file other names may share.
-fn linked_identity(entry: &Entry) -> Option<(u64, u64)> {
+pub(crate) fn linked_identity(entry: &Entry) -> Option<(u64, u64)> {
     (entry.kind == crate::proto::Kind::File && entry.nlink > 1).then_some((entry.dev, entry.ino))
 }
 
