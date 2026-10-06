@@ -324,60 +324,7 @@ fn apply_one_rooted_with_deletions(
     match op {
         Op::Mkdir {
             mode, condition, ..
-        } => {
-            if path.is_empty() {
-                if *condition == TargetCondition::Absent {
-                    bail!("destination root {} already exists", target.label.display());
-                }
-                let metadata = root.metadata(path)?;
-                require_rooted_condition(metadata, *condition, &target.label)?;
-                if metadata.mode & 0o700 != 0o700 {
-                    let directory = root.open_metadata(path)?;
-                    require_rooted_metadata(&directory, metadata, &target.label)?;
-                    set_mode_handle(&directory, metadata.mode | 0o700)?;
-                }
-                return Ok(());
-            }
-            let parent = if target.create_missing_parents {
-                root.resolve_parent_creating(path, 0o777)?
-            } else {
-                root.resolve_parent(path)?
-            };
-            if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match parent
-                    .create_directory((*mode & 0o7777) | 0o700)
-                    .with_context(|| {
-                        format!("create confined directory {}", target.label.display())
-                    }) {
-                    Ok(()) => return hold_after_directory_creation_for_test(&target.label),
-                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
-                        if *condition == TargetCondition::Absent {
-                            bail!(
-                                "destination {} appeared before no-replace creation",
-                                target.label.display()
-                            );
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            drop(parent);
-            match observe_rooted_condition(target, *condition)? {
-                Some(metadata) if metadata.is_dir() => {
-                    if metadata.mode & 0o700 != 0o700 {
-                        let directory = root.open_metadata(path)?;
-                        require_rooted_metadata(&directory, metadata, &target.label)?;
-                        set_mode_handle(&directory, metadata.mode | 0o700)?;
-                    }
-                    Ok(())
-                }
-                Some(_) => bail!(
-                    "cannot replace non-directory {} with a directory",
-                    target.label.display()
-                ),
-                None => create_rooted_directory_or_existing(target, *mode),
-            }
-        }
+        } => mkdir_rooted(target, *mode, *condition, false).map(drop),
         Op::Symlink {
             target: link,
             condition,
@@ -692,13 +639,40 @@ pub(super) fn starting_group_may_differ(
     }
 }
 
-/// Give a directory created private, once it has taken its group, the mode
-/// its creation with `proposed` would have given it. Like such a creation
-/// followed by that group change, it keeps a setgid bit only if the change
-/// left it in place.
+/// Run a Mkdir with mode 0700, as `apply_one` runs it, and return the
+/// identity of the directory if this call created it rather than finding
+/// one already there.
+pub(super) fn create_private_directory(
+    op: &Op,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<Option<(u64, u64)>> {
+    let Op::Mkdir {
+        path, condition, ..
+    } = op
+    else {
+        bail!("private creation requires a Mkdir");
+    };
+    let target = match guard {
+        Some(guard) => guarded_target(path, guard)?.as_rooted(),
+        None => operation_target(path, None, destination_root, destination_prefix)?,
+    };
+    #[cfg(debug_assertions)]
+    fail_apply_capacity_for_test(&target.label)?;
+    mkdir_rooted(&target, 0o700, *condition, true)
+}
+
+/// Give a directory this receiver created private, once it has taken its
+/// group, the mode its creation with `proposed` would have given it. Like
+/// such a creation followed by that group change, it keeps a setgid bit
+/// only if the change left it in place. Only the directory with the
+/// `created` identity is changed: another one now at its name is left as
+/// it is, even though the group change already reached it.
 pub(super) fn open_created_directory(
     path: &[u8],
     proposed: u32,
+    created: (u64, u64),
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
@@ -706,13 +680,7 @@ pub(super) fn open_created_directory(
     let target = operation_target(path, guard, destination_root, destination_prefix)?;
     let directory = target.root.open_metadata(&target.relative)?;
     let current = directory.metadata()?;
-    anyhow::ensure!(
-        current.is_dir(),
-        "created directory {} was replaced",
-        target.label.display()
-    );
-    // A directory someone else created first is not ours to open.
-    if current.mode() & 0o777 != 0o700 || current.uid() != unsafe { libc::geteuid() } {
+    if (current.dev(), current.ino()) != created || !current.is_dir() {
         return Ok(());
     }
     set_mode_handle(
@@ -730,16 +698,106 @@ pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u
     Ok((proposed & permitted & 0o777) | (current & 0o2000))
 }
 
+/// Create the directory `target` names, or accept an existing one as the
+/// condition allows, making sure its owner can write it. With `identify`,
+/// return the identity of a directory this call created; `None` means it
+/// found one already there.
+fn mkdir_rooted(
+    target: &RootedTarget,
+    mode: u32,
+    condition: TargetCondition,
+    identify: bool,
+) -> Result<Option<(u64, u64)>> {
+    let root = &target.root;
+    let path = &target.relative;
+    if path.is_empty() {
+        if condition == TargetCondition::Absent {
+            bail!("destination root {} already exists", target.label.display());
+        }
+        let metadata = root.metadata(path)?;
+        require_rooted_condition(metadata, condition, &target.label)?;
+        if metadata.mode & 0o700 != 0o700 {
+            let directory = root.open_metadata(path)?;
+            require_rooted_metadata(&directory, metadata, &target.label)?;
+            set_mode_handle(&directory, metadata.mode | 0o700)?;
+        }
+        return Ok(None);
+    }
+    let parent = if target.create_missing_parents {
+        root.resolve_parent_creating(path, 0o777)?
+    } else {
+        root.resolve_parent(path)?
+    };
+    if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
+        match parent
+            .create_directory((mode & 0o7777) | 0o700)
+            .with_context(|| format!("create confined directory {}", target.label.display()))
+        {
+            Ok(()) => {
+                let created = identify
+                    .then(|| {
+                        parent
+                            .metadata()
+                            .map(|metadata| (metadata.dev, metadata.ino))
+                    })
+                    .transpose()?;
+                hold_after_directory_creation_for_test(&target.label)?;
+                return Ok(created);
+            }
+            Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
+                if condition == TargetCondition::Absent {
+                    bail!(
+                        "destination {} appeared before no-replace creation",
+                        target.label.display()
+                    );
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    drop(parent);
+    match observe_rooted_condition(target, condition)? {
+        Some(metadata) if metadata.is_dir() => {
+            if metadata.mode & 0o700 != 0o700 {
+                let directory = root.open_metadata(path)?;
+                require_rooted_metadata(&directory, metadata, &target.label)?;
+                set_mode_handle(&directory, metadata.mode | 0o700)?;
+            }
+            Ok(None)
+        }
+        Some(_) => bail!(
+            "cannot replace non-directory {} with a directory",
+            target.label.display()
+        ),
+        None => create_rooted_directory_or_existing(target, mode, identify),
+    }
+}
+
 /// `TargetCondition::Any` mkdir operations can race each other because apply
 /// batches are parallel and deeper paths create implicit parents. Accept the
 /// winner only when the conflicting name is a real directory beneath the
 /// retained root; a symlink or any other type remains an error.
-pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u32) -> Result<()> {
+pub(super) fn create_rooted_directory_or_existing(
+    target: &RootedTarget,
+    mode: u32,
+    identify: bool,
+) -> Result<Option<(u64, u64)>> {
     match target
         .root
         .create_directory(&target.relative, (mode & 0o7777) | 0o700)
     {
-        Ok(()) => hold_after_directory_creation_for_test(&target.label),
+        Ok(()) => {
+            let created = identify
+                .then(|| {
+                    target
+                        .root
+                        .metadata(&target.relative)
+                        .map(|metadata| (metadata.dev, metadata.ino))
+                })
+                .transpose()?;
+            hold_after_directory_creation_for_test(&target.label)?;
+            Ok(created)
+        }
         Err(error)
             if error.chain().any(|cause| {
                 cause
@@ -756,7 +814,7 @@ pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u
                 require_rooted_metadata(&directory, metadata, &target.label)?;
                 set_mode_handle(&directory, metadata.mode | 0o700)?;
             }
-            Ok(())
+            Ok(None)
         }
         Err(error) => Err(error),
     }

@@ -2793,42 +2793,40 @@ impl FsOps {
             })
             .collect();
         let parents = apply::CreationParents::default();
-        let private = std::sync::Mutex::new(HashMap::<Vec<u8>, u32>::new());
+        // Only directories this request actually created, by identity.
+        let private = std::sync::Mutex::new(HashMap::<Vec<u8>, (u32, (u64, u64))>::new());
         let create = |op: &Op| {
-            let private_op = match op {
-                Op::Mkdir {
-                    path,
-                    mode,
-                    condition,
-                } if groups.get(path.as_slice()).is_some_and(|&group| {
-                    apply::starting_group_may_differ(
-                        path,
-                        group,
-                        &parents,
+            let result = match op {
+                Op::Mkdir { path, mode, .. }
+                    if groups.get(path.as_slice()).is_some_and(|&group| {
+                        apply::starting_group_may_differ(
+                            path,
+                            group,
+                            &parents,
+                            guard,
+                            destination_root.clone(),
+                            destination_prefix,
+                        )
+                    }) =>
+                {
+                    apply::create_private_directory(
+                        op,
                         guard,
                         destination_root.clone(),
                         destination_prefix,
                     )
-                }) =>
-                {
-                    private.lock().unwrap().insert(path.clone(), *mode);
-                    Some(Op::Mkdir {
-                        path: path.clone(),
-                        mode: 0o700,
-                        condition: *condition,
+                    .map(|created| {
+                        if let Some(created) = created {
+                            private
+                                .lock()
+                                .unwrap()
+                                .insert(path.clone(), (*mode, created));
+                        }
                     })
                 }
-                _ => None,
+                _ => apply_one(op, guard, destination_root.clone(), destination_prefix),
             };
-            apply_one(
-                private_op.as_ref().unwrap_or(op),
-                guard,
-                destination_root.clone(),
-                destination_prefix,
-            )
-            .err()
-            .as_ref()
-            .map(wire_error)
+            result.err().as_ref().map(wire_error)
         };
         let gres = parallel_map(&guarded_idx, |&i| create(&ops[i]));
         for (i, r) in guarded_idx.iter().zip(gres) {
@@ -2853,10 +2851,11 @@ impl FsOps {
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {
-                Op::SetMeta { path, .. } => private.get(path).map(|&proposed| {
+                Op::SetMeta { path, .. } => private.get(path).map(|&(proposed, created)| {
                     apply::open_created_directory(
                         path,
                         proposed,
+                        created,
                         guard,
                         destination_root.clone(),
                         destination_prefix,

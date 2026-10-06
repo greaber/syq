@@ -2460,6 +2460,19 @@ impl Planner<'_> {
         let opts = self.opts;
         let mut early = EarlyMetadata::default();
         for (path, dst_rel, entry, destination) in planned {
+            // An unselected private root takes no source metadata, so it
+            // has nothing to protect: give it its default mode right away.
+            if self.unselected_dirs.contains(path)
+                && path == &self.dst_root
+                && self.private_root.is_some()
+                && self.created_dirs.contains(path)
+                && !opts.restricted_receiver
+            {
+                if let Some(d) = destination.as_ref().filter(|d| d.kind == Kind::Dir) {
+                    early.root_default = Some((d.clone(), false));
+                }
+                continue;
+            }
             if self.implicit_dirs.contains(path) || self.unselected_dirs.contains(path) {
                 continue;
             }

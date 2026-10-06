@@ -379,6 +379,32 @@ fn a_new_directory_never_opens_to_its_starting_group() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn an_existing_directory_found_at_a_new_path_is_never_widened() {
+    let Some(group) = other_group() else {
+        eprintln!("skipped: this process has no supplementary group");
+        return;
+    };
+    let t = Tmp::new();
+    source_tree(&t, 0o755, 0o755);
+    fs::create_dir(t.path("shared")).unwrap();
+    std::os::unix::fs::chown(t.path("shared"), None, Some(group)).unwrap();
+    fs::set_permissions(t.path("shared"), fs::Permissions::from_mode(0o2775)).unwrap();
+    let mut command = syq_command(&["rsync", "-rg", "src/", "shared/dst/"]);
+    command.current_dir(&t.0);
+    // Someone creates a private directory where syq planned a new one,
+    // after the destination appears and before syq creates it.
+    let ((), output) = observe_at_creation(&t, command, "shared/dst", || {
+        fs::create_dir(t.path("shared/dst/sub")).unwrap();
+        fs::set_permissions(t.path("shared/dst/sub"), fs::Permissions::from_mode(0o700)).unwrap();
+    });
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("shared/dst/sub/file")), b"nested file");
+    let after = mode(&t.path("shared/dst/sub"));
+    assert_eq!(after & 0o777, 0o700, "{after:o}");
+}
+
 #[test]
 fn an_existing_directory_is_narrowed_before_anything_is_created_in_it() {
     let t = Tmp::new();
@@ -628,7 +654,21 @@ fn a_remote_receiver_grants_no_more_than_the_source_while_filling() {
 #[test]
 fn an_interrupted_copy_ends_with_the_same_directory_metadata_after_a_retry() {
     // (arguments, modes of the root and the nested directory)
-    let cases: [(&[&str], [u32; 2]); 3] = [
+    let cases: [(&[&str], [u32; 2]); 4] = [
+        // An unselected root takes no source metadata.
+        (
+            &[
+                "cp",
+                "--copy-metadata=ownership",
+                "--copy-if",
+                "src.kind == 'file'",
+                "--srcs-in",
+                "src",
+                "--into",
+                "dst",
+            ],
+            [0o755, 0o777 & !UMASK],
+        ),
         (
             &["rsync", "-rg", "src/", "dst/"],
             [0o777 & !UMASK, 0o775 & !UMASK],

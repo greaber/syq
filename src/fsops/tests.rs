@@ -3207,8 +3207,12 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
         query_partial_name_limit: false,
     };
 
-    assert!(create_rooted_directory_or_existing(&target(b"winner"), 0o755).is_ok());
-    assert!(create_rooted_directory_or_existing(&target(b"link"), 0o755).is_err());
+    assert!(
+        create_rooted_directory_or_existing(&target(b"winner"), 0o755, true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(create_rooted_directory_or_existing(&target(b"link"), 0o755, true).is_err());
     assert!(fs::read_dir(&outside).unwrap().next().is_none());
 
     fs::remove_dir_all(&dir).unwrap();
