@@ -9,8 +9,11 @@
 Manual only; no global cache drops or machine configuration changes. Each trial
 gets a fresh, fully written and fsynced fixture, with warm caches. Setup and exact
 result verification are outside the timer. Larger files contain random bytes,
-not holes. Increase case sizes to observe sustained tuning; short runs also
-matter but cannot establish steady-state behavior. Run without other benchmarks.
+not holes; each trial records logical and allocated fixture bytes. Cases may
+set depth (default 1): directories is the number of independent branches, each
+with depth directory levels and files at its leaf. Increase case sizes to observe
+sustained tuning; short runs also matter but cannot establish steady-state
+behavior. Run without other benchmarks.
 
 The reference is another measured variant, normally the old automatic tuner.
 Fixed counts are controls, not substitutes for testing the automatic candidate.
@@ -106,12 +109,15 @@ def validate(plan):
     if plan["reference"] not in [v["name"] for v in plan["variants"]]:
         raise ValueError("reference must name a variant")
     for case in plan["cases"]:
-        if set(case) != {"name", "operation", "root", "files", "directories", "sizes"}:
-            raise ValueError("case needs name, operation, root, files, directories and sizes only")
+        required = {"name", "operation", "root", "files", "directories", "sizes"}
+        if not required <= case.keys() or case.keys() - required - {"depth"}:
+            raise ValueError("case needs name, operation, root, files, directories and sizes; optional depth")
         if case["operation"] not in ("rm", "cp", "prune"):
             raise ValueError("operation must be rm, cp or prune")
         if not positive(case["files"]) or not positive(case["directories"]) or case["directories"] > case["files"]:
             raise ValueError("files and directories must be positive, with directories <= files")
+        if not positive(case.get("depth", 1)):
+            raise ValueError("depth must be a positive integer")
         if not isinstance(case["sizes"], list) or not case["sizes"] or any(type(n) is not int or n < 0 for n in case["sizes"]):
             raise ValueError("sizes must be a nonempty list of nonnegative byte counts")
         case["root"] = str(Path(case["root"]).resolve(strict=True))
@@ -172,8 +178,19 @@ class Deadline:
             self.next_message = now + 10
 
 
+def leaf_directory(case, index):
+    return Path(f"d{index:04d}", *(f"level{level:04d}" for level in range(1, case.get("depth", 1))))
+
+
+def fixture_directories(case):
+    for index in range(case["directories"]):
+        leaf = leaf_directory(case, index)
+        yield from reversed(leaf.parents[:-1])
+        yield leaf
+
+
 def filename(case, index):
-    return Path(f"d{index % case['directories']:04d}") / f"f{index:09d}"
+    return leaf_directory(case, index % case["directories"]) / f"f{index:09d}"
 
 
 def fixture(root, case, deadline):
@@ -181,8 +198,9 @@ def fixture(root, case, deadline):
     source.mkdir()
     destination.mkdir()
     tree = destination if case["operation"] == "prune" else source
-    for index in range(case["directories"]):
-        (tree / f"d{index:04d}").mkdir()
+    for directory in fixture_directories(case):
+        deadline.check("creating fixture directories")
+        (tree / directory).mkdir()
     rng = random.Random(0)
     hashes = {}
     allocated = logical = 0
@@ -212,7 +230,7 @@ def fixture(root, case, deadline):
         logical += size
     # Persist directory entries too, outside the timed operation. This does
     # not drop caches or turn the timed operation into a durability benchmark.
-    for directory in [tree / f"d{i:04d}" for i in range(case["directories"])] + [source, destination, root]:
+    for directory in [tree / path for path in fixture_directories(case)] + [source, destination, root]:
         deadline.check("syncing fixture directories")
         fd = os.open(directory, os.O_RDONLY)
         try:
@@ -231,7 +249,7 @@ def verify(root, case, hashes, deadline):
         if case["operation"] == "prune" and (not source.is_dir() or next(source.iterdir(), None) is not None):
             raise RuntimeError("pruning changed the empty source")
         return
-    expected_dirs = {f"d{i:04d}" for i in range(case["directories"])}
+    expected_dirs = {str(path) for path in fixture_directories(case)}
     # Both source preservation and destination contents are checked, including
     # unexpected directories/files and symlinks, without following any links.
     for tree in (source, destination):
