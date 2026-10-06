@@ -88,6 +88,13 @@ impl FsOps {
         Ok(true)
     }
 
+    /// Open the sidecar at `relative` to resume from or overwrite, creating
+    /// it exclusively in `create_mode` when absent and `create_if_missing`.
+    /// A sidecar found there keeps its group and other bits: whoever they
+    /// let open it may still hold it open, and a chmod does not stop them
+    /// reading. One whose group or other bits exceed `widest`, the mode this
+    /// attempt would create it in, is replaced instead. `None` leaves that
+    /// check to the Prepare that came first in the attempt.
     pub(super) fn open_private_partial_rooted(
         &mut self,
         root: &Root,
@@ -95,13 +102,16 @@ impl FsOps {
         label: &Path,
         create_if_missing: bool,
         create_mode: u32,
+        widest: Option<u32>,
     ) -> Result<Option<(File, Option<u64>)>> {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
             match self.create_partial_rooted(root, relative, create_mode) {
                 Ok(file) => {
-                    note_created_owner(&file.metadata()?);
+                    let created = file.metadata()?;
+                    note_created_owner(&created);
+                    self.note_created_mode(&file, &created, create_mode);
                     return Ok(Some((file, None)));
                 }
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
@@ -122,7 +132,9 @@ impl FsOps {
                             {
                                 continue;
                             }
-                            if !self.reusable_partial_permissions(&file)? {
+                            if !self.reusable_partial_permissions(&file)?
+                                || self.wider_than(opened.mode(), opened.dev(), widest)
+                            {
                                 drop(file);
                                 discard_safe_rooted_partial_if_same(
                                     root,
@@ -133,10 +145,12 @@ impl FsOps {
                                 )?;
                                 continue;
                             }
-                            if opened.mode() & 0o7777 != 0o600 {
+                            let reported = reported_mode(opened.mode());
+                            let repaired = reported & 0o777 | 0o600;
+                            if reported & 0o7777 != repaired {
                                 let repair = (|| -> Result<()> {
                                     fail_partial_chmod_for_test()?;
-                                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                                    file.set_permissions(fs::Permissions::from_mode(repaired))?;
                                     Ok(())
                                 })();
                                 if let Err(error) = repair {
@@ -204,7 +218,9 @@ impl FsOps {
                                 continue;
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
-                            if !self.reusable_partial_permissions(&handle)? {
+                            if !self.reusable_partial_permissions(&handle)?
+                                || self.wider_than(metadata.mode, metadata.dev, widest)
+                            {
                                 drop(handle);
                                 discard_safe_rooted_partial_if_same(
                                     root,
@@ -217,7 +233,7 @@ impl FsOps {
                             }
                             let repair = (|| -> Result<()> {
                                 fail_partial_chmod_for_test()?;
-                                set_mode_handle(&handle, 0o600)?;
+                                set_mode_handle(&handle, metadata.mode & 0o777 | 0o600)?;
                                 Ok(())
                             })();
                             if let Err(error) = repair {
@@ -248,7 +264,9 @@ impl FsOps {
                 None if !create_if_missing => return Ok(None),
                 None => match self.create_partial_rooted(root, relative, create_mode) {
                     Ok(file) => {
-                        note_created_owner(&file.metadata()?);
+                        let created = file.metadata()?;
+                        note_created_owner(&created);
+                        self.note_created_mode(&file, &created, create_mode);
                         return Ok(Some((file, None)));
                     }
                     Err(error)
@@ -266,6 +284,35 @@ impl FsOps {
             "partial {} changed repeatedly while opening it",
             label.display()
         )
+    }
+
+    /// Remove this copy's sidecar when its group or other bits exceed
+    /// `widest`, as `open_private_partial_rooted` replaces such a sidecar.
+    fn discard_wider_partial(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        widest: u32,
+    ) -> Result<()> {
+        with_rooted_partial(target, copy_id, |relative, label| {
+            self.uncache_rooted(&target.root, relative);
+            match target.root.metadata_optional(relative)? {
+                Some(metadata)
+                    if is_owned_rooted_partial(metadata)
+                        && self.wider_than(metadata.mode, metadata.dev, Some(widest)) =>
+                {
+                    discard_safe_rooted_partial_if_same(
+                        &target.root,
+                        relative,
+                        metadata.dev,
+                        metadata.ino,
+                        label,
+                    )
+                }
+                _ => Ok(()),
+            }
+        })?;
+        Ok(())
     }
 
     /// Bounded, best-effort discovery using equality on the readable prefix.
@@ -363,6 +410,11 @@ impl FsOps {
         // mistaken for bytes already written by this invocation on a retry.
         if !inplace && create_if_missing && size > 0 && !self.candidate_partials(&target).is_empty()
         {
+            if attempt > 0 {
+                // Seeding resumes from a sidecar an earlier attempt left,
+                // without this attempt's mode to check it against.
+                self.discard_wider_partial(&target, copy_id, mode | 0o600)?;
+            }
             return Ok(Preparation {
                 partial_size: None,
                 has_candidates: true,
@@ -513,6 +565,7 @@ impl FsOps {
                     label,
                     create_if_missing,
                     PRIVATE_PARTIAL_MODE,
+                    Some(mode | 0o600),
                 )
                 .map(|opened| opened.map(|(file, basis_size)| (file, basis_size, None)))
             })?;
@@ -766,12 +819,16 @@ impl FsOps {
         }
         let (relative, label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
+                // Prepare has replaced an earlier attempt's sidecar that is
+                // wider than this attempt's staged mode, which is not sent
+                // here. One that is not is resumed as it is.
                 self.open_private_partial_rooted(
                     &target.root,
                     relative,
                     label,
                     true,
                     PRIVATE_PARTIAL_MODE,
+                    None,
                 )
             })?;
         let (output, basis_size) = opened.context("sidecar creation was requested")?;
@@ -1246,6 +1303,7 @@ impl FsOps {
                         label,
                         true,
                         PRIVATE_PARTIAL_MODE,
+                        Some(PRIVATE_PARTIAL_MODE),
                     )
                 })?;
             target_relative = relative;
@@ -3430,10 +3488,109 @@ pub(super) fn is_safe_partial(metadata: &fs::Metadata) -> bool {
 /// including an older sidecar with data or a wider mode, takes the checked
 /// path, which repairs or replaces it before anything is written.
 pub(super) fn is_fresh_partial(metadata: &fs::Metadata, mode: u32) -> bool {
+    let reported = reported_mode(metadata.mode());
     is_owned_partial(metadata)
         && metadata.len() == 0
-        && metadata.mode() & 0o7000 == 0
-        && metadata.mode() & 0o777 & !(mode & 0o777) == 0
+        && reported & 0o7000 == 0
+        && reported & 0o777 & !(mode & 0o777) == 0
+}
+
+impl FsOps {
+    /// Whether a sidecar's mode lets its group or others in beyond `widest`,
+    /// so that someone may hold it open who could not open a new one. On
+    /// Linux an ACL's mask is the group bits, so the mode also bounds what
+    /// the ACL's named entries grant. Never on a device where this connection
+    /// found that a new file cannot be narrowed: one there would be no less
+    /// readable.
+    pub(super) fn wider_than(&self, mode: u32, dev: u64, widest: Option<u32>) -> bool {
+        widest.is_some_and(|widest| reported_mode(mode) & 0o077 & !widest != 0)
+            && self.fixed_wide_modes(dev) != Some(true)
+    }
+
+    /// Whether a device this connection probed cannot narrow a new file:
+    /// `Some(true)` for one that ignores a chmod, such as a Linux CIFS mount
+    /// without POSIX extensions, which reports one fixed mode for every file.
+    /// Mode bits restrict nobody there. Every file, new or reused, admits
+    /// whoever that mode admits, so replacing a reused sidecar that looks
+    /// wider than its attempt's mode could not make it any less readable; it
+    /// would only cost the sidecar's resumable bytes and several requests.
+    ///
+    /// The answer is kept per connection, never per process: a persistent
+    /// receiving service handles copies for days, and the number of an
+    /// unmounted device is given to the next network, FUSE or tmpfs mount.
+    /// A sidecar on another device keeps the check, and so does one on a
+    /// device whose new file could be narrowed, or whose chmod was refused.
+    pub(super) fn fixed_wide_modes(&self, dev: u64) -> Option<bool> {
+        self.fixed_wide_mode_devices.get(&dev).copied()
+    }
+
+    /// Probe the device of a sidecar just created exclusively with
+    /// `requested` when it came out wider: narrow it to `requested`, which
+    /// only takes an empty file of ours to the mode it was created with. The
+    /// device counts as unable to narrow a new file only when that succeeds
+    /// and the mode stays wider, as a filesystem that ignores chmod leaves
+    /// it. A refusal proves nothing about the device, since whether a file's
+    /// mode may change can depend on that file's own ACL (NFSv4
+    /// ACE4_WRITE_ACL), so the device keeps the check. Either way the device
+    /// is probed once per connection.
+    pub(super) fn note_created_mode(
+        &mut self,
+        file: &File,
+        created: &fs::Metadata,
+        requested: u32,
+    ) {
+        let requested = requested & 0o777;
+        let wider = |mode: u32| reported_mode(mode) & 0o777 & !requested != 0;
+        if !wider(created.mode()) || self.fixed_wide_modes(created.dev()).is_some() {
+            return;
+        }
+        let fixed = probe_mode_change(file, requested).is_ok()
+            && file.metadata().is_ok_and(|now| wider(now.mode()));
+        self.fixed_wide_mode_devices.insert(created.dev(), fixed);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A mode this thread's sidecars report, as a device that reports one
+    /// fixed mode does, like `SYQ_TEST_FORCED_MODE` for a whole process.
+    pub(super) static FORCED_MODE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    /// Refuses the mode change that probes a device, as a file's own ACL can.
+    pub(super) static REFUSE_MODE_PROBE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Change the mode of a probed file, or refuse as a test asks.
+fn probe_mode_change(file: &File, mode: u32) -> io::Result<()> {
+    #[cfg(test)]
+    if REFUSE_MODE_PROBE.get() {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+/// A sidecar's mode as reported. Debug builds simulate a device that
+/// reports one fixed mode for every file with `SYQ_TEST_FORCED_MODE`, the
+/// permission bits in octal.
+fn reported_mode(mode: u32) -> u32 {
+    #[cfg(debug_assertions)]
+    if let Some(forced) = test_forced_mode() {
+        return mode & !0o7777 | forced;
+    }
+    mode
+}
+
+#[cfg(debug_assertions)]
+fn test_forced_mode() -> Option<u32> {
+    #[cfg(test)]
+    if let Some(mode) = FORCED_MODE.get() {
+        return Some(mode & 0o777);
+    }
+    let value = std::env::var_os("SYQ_TEST_FORCED_MODE")?;
+    u32::from_str_radix(value.to_str()?, 8)
+        .ok()
+        .map(|mode| mode & 0o777)
 }
 
 /// Whether the open or create of the sidecar was refused because of what
@@ -3800,6 +3957,9 @@ fn set_meta_file_inner(
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
             std::os::unix::fs::fchown(f, uid, gid)
         })?;
+    if owner_changed {
+        super::access_changed(f);
+    }
     #[cfg(debug_assertions)]
     if before_publication && atomic_acl_mode && owner_changed {
         test_race_barrier(
@@ -3807,17 +3967,6 @@ fn set_meta_file_inner(
             "SYQ_TEST_ACL_OWNER_CONTINUE_FILE",
             "ACL stage after ownership change",
         )?;
-    }
-    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
-        // On network filesystems every setattr is a round trip; skip it when
-        // the mode is already right. Always run it for set-id bits after a
-        // chown, which clears them, and when the metadata predates a write,
-        // which clears them for an unprivileged writer.
-        let cur = current.mode() & 0o7777;
-        let want = meta.mode & 0o7777;
-        if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
-            f.set_permissions(fs::Permissions::from_mode(want))?;
-        }
     }
     if flags & flags::TIMES != 0
         && (!times_current
@@ -3833,14 +3982,33 @@ fn set_meta_file_inner(
             return Err(io::Error::last_os_error().into());
         }
     }
+    // A Linux ACL before the mode (see `apply_acls`).
+    let narrowed = crate::inode_metadata::apply_acls(
+        f,
+        meta.inode_metadata.as_deref(),
+        meta.mode,
+        flags & flags::MODE_MASK != 0,
+    )?;
+    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
+        // On network filesystems every setattr is a round trip; skip it when
+        // the mode is already right. Always run it for set-id bits after a
+        // chown, which clears them, and when the metadata predates a write,
+        // which clears them for an unprivileged writer.
+        let cur = narrowed.unwrap_or(current.mode() & 0o7777);
+        let want = meta.mode & 0o7777;
+        if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
+            f.set_permissions(fs::Permissions::from_mode(want))?;
+            super::access_changed(f);
+        }
+    }
     if before_publication {
-        crate::inode_metadata::apply_before_publication(
+        crate::inode_metadata::apply_after_acls_before_publication(
             f,
             meta.inode_metadata.as_deref(),
             meta.mode,
         )
     } else {
-        crate::inode_metadata::apply(f, meta.inode_metadata.as_deref(), meta.mode)
+        crate::inode_metadata::apply_after_acls(f, meta.inode_metadata.as_deref(), meta.mode)
     }
 }
 

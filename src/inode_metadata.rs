@@ -118,6 +118,17 @@ impl InodeMetadata {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    /// Leaves the mode as it was when this thread sets an access ACL, as a
+    /// FUSE daemon that keeps ACLs apart from the mode does.
+    pub(crate) static ACL_KEEPS_MODE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The access ACL reads this thread has made.
+    pub(crate) static ACCESS_ACL_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
@@ -183,6 +194,10 @@ mod platform {
         Ok(names)
     }
     fn get(file: &File, name: &[u8]) -> Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        if name == ACCESS {
+            ACCESS_ACL_READS.set(ACCESS_ACL_READS.get() + 1);
+        }
         let path = handle(file);
         let name = CString::new(name)?;
         match read_bytes(|buffer, len| unsafe {
@@ -198,12 +213,20 @@ mod platform {
         if get(file, name)?.as_deref() == value {
             return Ok(());
         }
+        write(file, name, value)
+    }
+    /// Set or remove an attribute already read to differ from `value`.
+    fn write(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_XATTR")
             .is_some_and(|selected| selected.as_encoded_bytes() == name)
         {
             anyhow::bail!("injected attribute reconciliation failure: {:?}", name);
         }
+        #[cfg(test)]
+        let kept_mode = (ACL_KEEPS_MODE.get() && name == ACCESS && value.is_some())
+            .then(|| file.metadata().map(|metadata| metadata.mode() & 0o7777))
+            .transpose()?;
         let path = handle(file);
         let name = CString::new(name)?;
         let result = if let Some(value) = value {
@@ -226,6 +249,11 @@ mod platform {
             }
             return Err(error).with_context(|| format!("reconcile attribute {:?}", name));
         }
+        #[cfg(test)]
+        if let Some(mode) = kept_mode {
+            crate::fsops::set_mode_handle(file, mode)?;
+        }
+        crate::fsops::access_changed(file);
         Ok(())
     }
     pub(super) fn capture(file: &File, selection: Selection) -> Result<InodeMetadata> {
@@ -337,33 +365,51 @@ mod platform {
         }
         Ok(acl)
     }
-    pub(super) fn apply(file: &File, metadata: &InodeMetadata, mode: u32) -> Result<()> {
-        anyhow::ensure!(
-            metadata.size_hint() <= MAX_INODE_METADATA,
-            "inode metadata exceeds the 4 MiB transfer limit"
-        );
-        anyhow::ensure!(
-            metadata.macos_acl.is_none(),
-            "macOS ACLs cannot be converted to Linux POSIX ACLs"
-        );
+    /// Set the POSIX ACLs, reading the access ACL once. The caller then sets
+    /// the mode, which the access ACL's owner, mask (or group) and other
+    /// entries share on most filesystems. With `mode_selected`, an access ACL
+    /// is removed only after the mode is narrowed to what both it and `mode`
+    /// grant: removing it makes its mask the group bits until the chmod.
+    /// Returns the mode that narrowing set, when it changed it.
+    pub(super) fn apply_acls(
+        file: &File,
+        acls: &PosixAcls,
+        mode: u32,
+        mode_selected: bool,
+    ) -> Result<Option<u32>> {
         let current = file.metadata()?;
-        if let Some(acls) = &metadata.acls {
-            anyhow::ensure!(
-                !current.file_type().is_symlink(),
-                "POSIX ACLs cannot be applied to a symlink"
-            );
-            let access = acls
-                .access
-                .as_deref()
-                .map(|a| access_for_mode(a, mode))
-                .transpose()?;
-            set(file, ACCESS, access.as_deref())?;
-            if current.is_dir() {
-                set(file, DEFAULT, acls.default.as_deref())?;
-            } else {
-                anyhow::ensure!(acls.default.is_none(), "default ACL requires a directory");
-            }
+        anyhow::ensure!(
+            !current.file_type().is_symlink(),
+            "POSIX ACLs cannot be applied to a symlink"
+        );
+        if !current.is_dir() {
+            anyhow::ensure!(acls.default.is_none(), "default ACL requires a directory");
         }
+        let access = acls
+            .access
+            .as_deref()
+            .map(|a| access_for_mode(a, mode))
+            .transpose()?;
+        let existing = get(file, ACCESS)?;
+        let mut narrowed = None;
+        if existing != access {
+            if access.is_none() && mode_selected {
+                let bits = current.mode() & 0o7000 | current.mode() & mode & 0o777;
+                if bits != current.mode() & 0o7777 {
+                    crate::fsops::set_mode_handle(file, bits)?;
+                    crate::fsops::access_changed(file);
+                    narrowed = Some(bits);
+                }
+            }
+            write(file, ACCESS, access.as_deref())?;
+        }
+        if current.is_dir() {
+            set(file, DEFAULT, acls.default.as_deref())?;
+        }
+        Ok(narrowed)
+    }
+
+    pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
         if let Some(attributes) = &metadata.xattrs {
             let mut previous: Option<&[u8]> = None;
             for (name, value) in &attributes.values {
@@ -483,10 +529,45 @@ pub(crate) fn default_permissions(directory: &File) -> Result<u32> {
 }
 
 pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
+    apply_acls(file, metadata, mode, false)?;
     apply_inner(file, metadata, mode, false)
 }
 
-pub(crate) fn apply_before_publication(
+/// Set the Linux POSIX ACLs. Call this before setting the mode: a stage is
+/// created private, which masks the entries it inherits from its directory's
+/// default ACL, and a chmod to the final mode first would widen that mask,
+/// letting those entries in until the ACL is replaced. `mode_selected` says
+/// the caller sets `mode` next. Returns the mode this set on the way, when
+/// it did, for the caller's chmod to start from. Apply the rest with
+/// `apply_after_acls`.
+pub(crate) fn apply_acls(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+    mode_selected: bool,
+) -> Result<Option<u32>> {
+    #[cfg(target_os = "linux")]
+    if let Some(metadata) = metadata {
+        if let Some(acls) = &metadata.acls {
+            validate_apply(metadata)?;
+            return platform::apply_acls(file, acls, mode, mode_selected);
+        }
+    }
+    let _ = (file, metadata, mode, mode_selected);
+    Ok(None)
+}
+
+/// Apply the metadata other than the ACLs `apply_acls` has set.
+pub(crate) fn apply_after_acls(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<()> {
+    apply_inner(file, metadata, mode, false)
+}
+
+/// The same for a staged file about to be published.
+pub(crate) fn apply_after_acls_before_publication(
     file: &File,
     metadata: Option<&InodeMetadata>,
     mode: u32,
@@ -518,6 +599,24 @@ pub(crate) fn finish_publication(
     Ok(())
 }
 
+fn validate_apply(metadata: &InodeMetadata) -> Result<()> {
+    anyhow::ensure!(
+        metadata.size_hint() <= MAX_INODE_METADATA,
+        "inode metadata exceeds the 4 MiB transfer limit"
+    );
+    anyhow::ensure!(
+        metadata.crtime.is_none() || cfg!(target_os = "macos"),
+        "birth-time preservation requires a macOS destination"
+    );
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        metadata.macos_acl.is_none(),
+        "macOS ACLs cannot be converted to Linux POSIX ACLs"
+    );
+    Ok(())
+}
+
+/// Everything but the Linux POSIX ACLs, which `apply_acls` sets first.
 fn apply_inner(
     file: &File,
     metadata: Option<&InodeMetadata>,
@@ -528,19 +627,11 @@ fn apply_inner(
     let Some(metadata) = metadata else {
         return Ok(());
     };
-    anyhow::ensure!(
-        metadata.size_hint() <= MAX_INODE_METADATA,
-        "inode metadata exceeds the 4 MiB transfer limit"
-    );
-    anyhow::ensure!(
-        metadata.crtime.is_none() || cfg!(target_os = "macos"),
-        "birth-time preservation requires a macOS destination"
-    );
+    validate_apply(metadata)?;
     #[cfg(target_os = "linux")]
     {
-        if metadata.acls.is_some() || metadata.macos_acl.is_some() || metadata.xattrs.is_some() {
-            platform::apply(file, metadata, mode)?;
-        }
+        let _ = mode;
+        platform::apply_xattrs(file, metadata)?;
     }
     #[cfg(target_os = "macos")]
     {

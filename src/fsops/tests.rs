@@ -1854,6 +1854,367 @@ fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() 
     assert_eq!(staged_mode(0o660, flags::MODE, false), 0o660);
 }
 
+/// A Linux POSIX ACL as the kernel stores it: (tag, permissions, id) entries.
+#[cfg(target_os = "linux")]
+fn posix_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in entries {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    acl
+}
+
+#[cfg(target_os = "linux")]
+fn access_acl(file: &File) -> Option<Vec<u8>> {
+    let path = CString::new(crate::sys::proc_fd_path(file)).unwrap();
+    let mut value = vec![0u8; 4096];
+    let count = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if count < 0 {
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA)
+        );
+        return None;
+    }
+    value.truncate(count as usize);
+    Some(value)
+}
+
+/// Set a POSIX ACL xattr on `path`, or say why the test is skipped when the
+/// test filesystem has no POSIX ACLs.
+#[cfg(target_os = "linux")]
+fn set_acl_or_skip(path: &Path, name: &std::ffi::CStr, acl: &[u8]) -> bool {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    if unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    } == 0
+    {
+        return true;
+    }
+    let error = io::Error::last_os_error();
+    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP), "{error}");
+    eprintln!("skipping: the test filesystem has no POSIX ACLs ({error})");
+    false
+}
+
+/// What an ACL grants a named user once its mask applies.
+#[cfg(target_os = "linux")]
+fn granted_to_user(acl: &[u8], uid: u32) -> u16 {
+    let entries = acl[4..].chunks_exact(8).map(|entry| {
+        (
+            u16::from_le_bytes([entry[0], entry[1]]),
+            u16::from_le_bytes([entry[2], entry[3]]),
+            u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]),
+        )
+    });
+    let mask = entries
+        .clone()
+        .find(|(tag, _, _)| *tag == 0x10)
+        .map_or(7, |(_, permissions, _)| permissions);
+    entries
+        .filter(|(tag, _, id)| *tag == 0x02 && *id == uid)
+        .map(|(_, permissions, _)| permissions & mask)
+        .sum()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn acls_are_set_before_the_mode_so_inherited_entries_stay_masked() {
+    use std::os::unix::fs::DirBuilderExt;
+    // A stage is created private, so the entries it inherits from the
+    // destination directory's default ACL are masked. Setting its final mode
+    // before the source's ACL widens that mask, and the inherited entries
+    // grant access until the ACL replaces them. Files and directories go
+    // through different metadata steps; both must set the ACL first, and
+    // leave exactly the mode and ACL they did before.
+    const INHERITED: u32 = 54_321;
+    const SOURCE_USER: u32 = 54_322;
+    const ANY: u32 = u32::MAX;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let parent = temporary.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let default = posix_acl(&[
+        (0x01, 7, ANY),
+        (0x02, 6, INHERITED),
+        (0x04, 0, ANY),
+        (0x10, 6, ANY),
+        (0x20, 0, ANY),
+    ]);
+    if !set_acl_or_skip(&parent, c"system.posix_acl_default", &default) {
+        return;
+    }
+    let source = |mode: u32| {
+        posix_acl(&[
+            (0x01, (mode >> 6) as u16 & 7, ANY),
+            (0x02, 4, SOURCE_USER),
+            (0x04, 4, ANY),
+            (0x10, (mode >> 3) as u16 & 7, ANY),
+            (0x20, mode as u16 & 7, ANY),
+        ])
+    };
+    let mut exposed = Vec::new();
+    for (name, directory, mode, has_acl) in [
+        ("file", false, 0o640, true),
+        ("setuid", false, 0o4750, true),
+        ("plain", false, 0o640, false),
+        ("directory", true, 0o750, true),
+        ("plain-directory", true, 0o750, false),
+    ] {
+        let path = parent.join(name);
+        let stage = if directory {
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            File::open(&path).unwrap()
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap()
+        };
+        let inherited = access_acl(&stage).expect("the stage inherits an ACL");
+        assert_eq!(granted_to_user(&inherited, INHERITED), 0, "{name}");
+        let meta = Meta {
+            inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+                acls: Some(crate::inode_metadata::PosixAcls {
+                    access: has_acl.then(|| source(0o777)),
+                    default: None,
+                }),
+                ..Default::default()
+            })),
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        let granted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = granted.clone();
+        ACCESS_CHANGED.set(Some(Box::new(move |file: &File| {
+            observed
+                .borrow_mut()
+                .push(access_acl(file).map_or(0, |acl| granted_to_user(&acl, INHERITED)));
+        })));
+        let current = stage.metadata().unwrap();
+        let applied = if directory {
+            set_meta_handle_known(&stage, &meta, flags::MODE, &current)
+        } else {
+            set_meta_written_file_for_publication(&stage, &meta, flags::MODE, &current)
+        };
+        ACCESS_CHANGED.set(None);
+        applied.unwrap();
+        assert_eq!(stage.metadata().unwrap().mode() & 0o7777, mode, "{name}");
+        assert_eq!(access_acl(&stage), has_acl.then(|| source(mode)), "{name}");
+        let granted = granted.borrow();
+        assert!(!granted.is_empty(), "{name}");
+        if granted.iter().any(|&permissions| permissions != 0) {
+            exposed.push(format!("{name}: {granted:?}"));
+        }
+    }
+    assert!(
+        exposed.is_empty(),
+        "the inherited entry was granted permissions on the way: {exposed:?}"
+    );
+}
+
+/// A file's ACL with the owner, mask and other entries of `mode`, a named
+/// user granted `r--`, and the owning group `r--`.
+#[cfg(target_os = "linux")]
+fn acl_for_mode(mode: u32) -> Vec<u8> {
+    posix_acl(&[
+        (0x01, (mode >> 6) as u16 & 7, u32::MAX),
+        (0x02, 4, 54_322),
+        (0x04, 4, u32::MAX),
+        (0x10, (mode >> 3) as u16 & 7, u32::MAX),
+        (0x20, mode as u16 & 7, u32::MAX),
+    ])
+}
+
+#[cfg(target_os = "linux")]
+fn meta_with_access_acl(mode: u32, access: Option<Vec<u8>>) -> Meta {
+    Meta {
+        inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+            acls: Some(crate::inode_metadata::PosixAcls {
+                access,
+                default: None,
+            }),
+            ..Default::default()
+        })),
+        mode,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_mode_is_set_where_setting_an_acl_leaves_it_alone() {
+    // A FUSE daemon such as s3fs can keep an ACL apart from the mode, so
+    // setting the source's ACL need not set the permission bits. The mode
+    // must still end as requested, for a new stage and for an existing
+    // file that had another mode.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let probe = temporary.path().join("probe");
+    fs::write(&probe, b"").unwrap();
+    if !set_acl_or_skip(&probe, c"system.posix_acl_access", &acl_for_mode(0o640)) {
+        return;
+    }
+    let mut wrong = Vec::new();
+    for (name, created) in [("new stage", 0o600), ("existing file", 0o644)] {
+        let path = temporary.path().join(name);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(created)
+            .open(&path)
+            .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(created)).unwrap();
+        let meta = meta_with_access_acl(0o640, Some(acl_for_mode(0o777)));
+        let current = file.metadata().unwrap();
+        crate::inode_metadata::ACL_KEEPS_MODE.set(true);
+        let applied = if name == "new stage" {
+            set_meta_written_file_for_publication(&file, &meta, flags::MODE, &current)
+        } else {
+            set_meta_file(&file, &meta, flags::MODE)
+        };
+        crate::inode_metadata::ACL_KEEPS_MODE.set(false);
+        applied.unwrap();
+        let mode = file.metadata().unwrap().mode() & 0o7777;
+        if mode != 0o640 || access_acl(&file) != Some(acl_for_mode(0o640)) {
+            wrong.push(format!("{name}: {mode:o}"));
+        }
+    }
+    assert!(wrong.is_empty(), "the requested 640 was not set: {wrong:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn acl_preservation_reads_a_files_access_acl_once() {
+    // Under -A every file's access ACL is compared before it is changed.
+    // One read serves both the comparison and the decision to remove one.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let probe = temporary.path().join("probe");
+    fs::write(&probe, b"").unwrap();
+    if !set_acl_or_skip(&probe, c"system.posix_acl_access", &acl_for_mode(0o640)) {
+        return;
+    }
+    let mut reads = Vec::new();
+    for (name, has, wanted) in [
+        ("neither has an ACL", false, false),
+        ("the source's ACL is added", false, true),
+        ("the file's ACL is removed", true, false),
+        ("the ACL is replaced", true, true),
+    ] {
+        let path = temporary.path().join(name);
+        fs::write(&path, b"contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        if has {
+            assert!(set_acl_or_skip(
+                &path,
+                c"system.posix_acl_access",
+                &posix_acl(&[
+                    (0x01, 6, u32::MAX),
+                    (0x02, 6, 54_321),
+                    (0x04, 0, u32::MAX),
+                    (0x10, 6, u32::MAX),
+                    (0x20, 0, u32::MAX),
+                ])
+            ));
+        }
+        let file = File::open(&path).unwrap();
+        let meta = meta_with_access_acl(0o640, wanted.then(|| acl_for_mode(0o777)));
+        crate::inode_metadata::ACCESS_ACL_READS.set(0);
+        set_meta_file(&file, &meta, flags::MODE).unwrap();
+        let count = crate::inode_metadata::ACCESS_ACL_READS.get();
+        assert_eq!(
+            access_acl(&file),
+            wanted.then(|| acl_for_mode(0o640)),
+            "{name}"
+        );
+        assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640, "{name}");
+        if count != 1 {
+            reads.push(format!("{name}: {count}"));
+        }
+    }
+    assert!(reads.is_empty(), "access ACL reads per file: {reads:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn removing_an_acl_never_widens_the_file_on_the_way() {
+    // An existing file has an ACL the source lacks, with a mask (rw-) wider
+    // than its owning group's entry (---) and than the requested group bits
+    // (r--). Removing the ACL makes its mask the group bits until a chmod,
+    // so the mode is narrowed first: nobody gets more than the file granted
+    // before or grants after.
+    const NAMED: u32 = 54_321;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("file");
+    fs::write(&path, b"contents").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let acl = posix_acl(&[
+        (0x01, 6, u32::MAX),
+        (0x02, 6, NAMED),
+        (0x04, 0, u32::MAX),
+        (0x10, 6, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ]);
+    if !set_acl_or_skip(&path, c"system.posix_acl_access", &acl) {
+        return;
+    }
+    let file = File::open(&path).unwrap();
+    // The owning group's grant: its entry under the mask, or the group bits.
+    let group_grant = |file: &File| match access_acl(file) {
+        Some(acl) => {
+            let entry = |tag: u16| {
+                acl[4..]
+                    .chunks_exact(8)
+                    .find(|entry| u16::from_le_bytes([entry[0], entry[1]]) == tag)
+                    .map(|entry| u16::from_le_bytes([entry[2], entry[3]]))
+            };
+            entry(0x04).unwrap() & entry(0x10).unwrap_or(7)
+        }
+        None => (file.metadata().unwrap().mode() >> 3) as u16 & 7,
+    };
+    let granted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = granted.clone();
+    ACCESS_CHANGED.set(Some(Box::new(move |file: &File| {
+        let named = access_acl(file).map_or(0, |acl| granted_to_user(&acl, NAMED));
+        observed.borrow_mut().push((named, group_grant(file)));
+    })));
+    let applied = set_meta_file(&file, &meta_with_access_acl(0o640, None), flags::MODE);
+    ACCESS_CHANGED.set(None);
+    applied.unwrap();
+    assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o640);
+    assert_eq!(access_acl(&file), None);
+    let granted = granted.borrow();
+    assert!(!granted.is_empty());
+    // Before: the named user rw-, the group nothing. After: the group r--.
+    assert!(
+        granted
+            .iter()
+            .all(|&(named, group)| named & !6 == 0 && group & !4 == 0),
+        "(named user, owning group) grants on the way: {granted:?}"
+    );
+}
+
 #[test]
 fn small_copy_leaf_accepts_root_and_relative_prefixes_without_nested_paths() {
     for (prefix, path) in [
@@ -3665,6 +4026,490 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
         assert_eq!(fs::read(&path).unwrap(), new, "{donor}");
         assert!(!sidecar.exists(), "{donor}");
     }
+}
+
+#[test]
+fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
+    // The first attempt stages the file in its mode, 0644, so anyone may open
+    // the sidecar. Then the source changes, and so does its mode. Permissions
+    // are checked only at open, so a narrower retry must not write the new
+    // contents through that inode, which a reader may hold open; a retry in
+    // the same mode resumes from it. A retry on the same connection finds the
+    // sidecar when it prepares, one on another connection among the
+    // candidates it seeds from.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let secret = b"contents for the owner alone";
+    let old: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8 | 1).collect();
+    let mut new = old.clone();
+    for chunk in new[block..].chunks_mut(secret.len()) {
+        chunk.copy_from_slice(&secret[..chunk.len()]);
+    }
+    let read_all = |file: &File| {
+        let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        bytes
+    };
+    let mut exposed = Vec::new();
+    for connection in ["same", "another"] {
+        for retry_mode in [0o600, 0o644] {
+            let case = format!("{connection} connection, retry mode {retry_mode:o}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let path = temporary.path().join("file");
+            let id = [41; 16];
+            let target = || PartialTarget {
+                path: b"file",
+                id: &id,
+                guard: None,
+            };
+            let mut ops = destination_ops(temporary.path());
+            let prepared = ops
+                .prepare(
+                    target(),
+                    PrepareOptions {
+                        size: old.len() as u64,
+                        inplace: false,
+                        mode: 0o644,
+                        attempt: 0,
+                        create_if_missing: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(prepared.partial_size, None, "{case}");
+            for (index, chunk) in old.chunks(block).enumerate() {
+                ops.write_range(
+                    target(),
+                    false,
+                    0,
+                    (index * block) as u64,
+                    content_digest(chunk),
+                    chunk,
+                )
+                .unwrap();
+            }
+            let sidecar = partial_path(&path, &id).unwrap();
+            // As created under the usual umask.
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            let reader = File::open(&sidecar).unwrap();
+            let staged = reader.metadata().unwrap().ino();
+            let mut ops = if connection == "same" {
+                ops
+            } else {
+                destination_ops(temporary.path())
+            };
+            // The retry as the worker makes it: resume from what Prepare
+            // reports, otherwise write every range.
+            let prepared = ops
+                .prepare(
+                    target(),
+                    PrepareOptions {
+                        size: new.len() as u64,
+                        inplace: false,
+                        mode: retry_mode,
+                        attempt: 1,
+                        create_if_missing: true,
+                    },
+                )
+                .unwrap();
+            let reusable = if prepared.partial_size.is_some() || prepared.has_candidates {
+                ops.seed_basis(target(), new.len() as u64, block as u64, None, 1)
+                    .unwrap()
+                    .hashes
+            } else {
+                Vec::new()
+            };
+            let algorithm = ops.hash_policy.algorithm;
+            let mut written = 0;
+            for (index, chunk) in new.chunks(block).enumerate() {
+                if reusable.get(index) != Some(&algorithm.hash(chunk)) {
+                    ops.write_range(
+                        target(),
+                        false,
+                        1,
+                        (index * block) as u64,
+                        content_digest(chunk),
+                        chunk,
+                    )
+                    .unwrap();
+                    written += 1;
+                }
+            }
+            let resumed = fs::metadata(&sidecar).unwrap().ino() == staged;
+            let meta = Meta {
+                mode: retry_mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+                inode_metadata: None,
+            };
+            ops.finalize(
+                b"file",
+                false,
+                &id,
+                &meta,
+                flags::MODE,
+                TargetMutation {
+                    condition: TargetCondition::Any,
+                    guard: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().mode() & 0o7777,
+                retry_mode,
+                "{case}"
+            );
+            if retry_mode == 0o644 {
+                // Anyone may open the published file anyway: resume.
+                assert!(resumed, "{case}");
+                assert_eq!(written, 1, "{case}");
+            } else {
+                if read_all(&reader)
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret)
+                {
+                    exposed.push(case);
+                }
+            }
+        }
+    }
+    assert!(
+        exposed.is_empty(),
+        "the retry wrote through a descriptor opened at 0644: {exposed:?}"
+    );
+}
+
+#[test]
+fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
+    // Some filesystems report one fixed mode for every file, such as Linux
+    // CIFS without POSIX extensions (0755 by default). Mode bits restrict
+    // nobody there, so a retry reuses and resumes from the sidecar an
+    // earlier attempt left however wide it looks, as before the rule that
+    // replaces a wider one, once its connection has found that the device
+    // cannot narrow a new file. The first attempt's connection finds that
+    // creating its sidecar; another connection when it creates one of its
+    // own, so a retry that is its first sidecar there replaces. Elsewhere
+    // the rule holds: a sidecar wider than a narrower retry's mode is
+    // replaced, and a same-mode retry resumes.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8 | 1).collect();
+    let mut new = old.clone();
+    new[block..].fill(0x5a);
+    let mut wrong = Vec::new();
+    for forced in [None, Some(0o755)] {
+        for connection in ["same", "another", "another with a sidecar of its own"] {
+            for retry_mode in [0o600, 0o644] {
+                let shown = forced.map_or("none".into(), |mode: u32| format!("{mode:o}"));
+                let case =
+                    format!("forced {shown}, {connection} connection, retry mode {retry_mode:o}");
+                FORCED_MODE.set(forced);
+                let temporary = crate::test_support::tempdir().unwrap();
+                let path = temporary.path().join("file");
+                let id = [43; 16];
+                let target = || PartialTarget {
+                    path: b"file",
+                    id: &id,
+                    guard: None,
+                };
+                let prepare = |ops: &mut FsOps, mode, attempt, len: usize| {
+                    ops.prepare(
+                        target(),
+                        PrepareOptions {
+                            size: len as u64,
+                            inplace: false,
+                            mode,
+                            attempt,
+                            create_if_missing: true,
+                        },
+                    )
+                    .unwrap()
+                };
+                let mut ops = destination_ops(temporary.path());
+                prepare(&mut ops, 0o644, 0, old.len());
+                for (index, chunk) in old.chunks(block).enumerate() {
+                    ops.write_range(
+                        target(),
+                        false,
+                        0,
+                        (index * block) as u64,
+                        content_digest(chunk),
+                        chunk,
+                    )
+                    .unwrap();
+                }
+                let sidecar = partial_path(&path, &id).unwrap();
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+                // Held open, the first sidecar's inode number cannot be given
+                // to a replacement, as ext4 gives a freed one at once.
+                let held = File::open(&sidecar).unwrap();
+                let staged = held.metadata().unwrap().ino();
+                let mut ops = if connection == "same" {
+                    ops
+                } else {
+                    destination_ops(temporary.path())
+                };
+                if connection == "another with a sidecar of its own" {
+                    let other = PartialTarget {
+                        path: b"other",
+                        id: &id,
+                        guard: None,
+                    };
+                    let options = PrepareOptions {
+                        size: 1,
+                        inplace: false,
+                        mode: 0o644,
+                        attempt: 0,
+                        create_if_missing: true,
+                    };
+                    ops.prepare(other, options).unwrap();
+                }
+                let prepared = prepare(&mut ops, retry_mode, 1, new.len());
+                let reusable = if prepared.partial_size.is_some() || prepared.has_candidates {
+                    ops.seed_basis(target(), new.len() as u64, block as u64, None, 1)
+                        .unwrap()
+                        .hashes
+                } else {
+                    Vec::new()
+                };
+                let algorithm = ops.hash_policy.algorithm;
+                let mut written = 0;
+                for (index, chunk) in new.chunks(block).enumerate() {
+                    if reusable.get(index) != Some(&algorithm.hash(chunk)) {
+                        ops.write_range(
+                            target(),
+                            false,
+                            1,
+                            (index * block) as u64,
+                            content_digest(chunk),
+                            chunk,
+                        )
+                        .unwrap();
+                        written += 1;
+                    }
+                }
+                let reused = fs::metadata(&sidecar).unwrap().ino() == staged;
+                drop(held);
+                let meta = Meta {
+                    mode: retry_mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    inode_metadata: None,
+                };
+                ops.finalize(
+                    b"file",
+                    false,
+                    &id,
+                    &meta,
+                    flags::MODE,
+                    TargetMutation {
+                        condition: TargetCondition::Any,
+                        guard: None,
+                    },
+                )
+                .unwrap();
+                FORCED_MODE.set(None);
+                assert_eq!(fs::read(&path).unwrap(), new, "{case}");
+                assert_eq!(
+                    fs::metadata(&path).unwrap().mode() & 0o7777,
+                    retry_mode,
+                    "{case}"
+                );
+                let expected = match forced {
+                    None => retry_mode == 0o644,
+                    Some(_) => connection != "another",
+                };
+                if reused != expected || (reused && written != 1) {
+                    wrong.push(format!("{case}: reused {reused}, wrote {written} blocks"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn a_refused_mode_probe_leaves_the_device_checked() {
+    // Whether a file's mode may be changed can depend on that file's own
+    // ACL (NFSv4 ACE4_WRITE_ACL), so one new file that came out wider and
+    // whose chmod is refused says nothing about the device. A later retry
+    // there must still replace a sidecar opened while it was wider.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let secret = b"contents for the owner alone";
+    let old: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8 | 1).collect();
+    let mut new = old.clone();
+    for chunk in new[block..].chunks_mut(secret.len()) {
+        chunk.copy_from_slice(&secret[..chunk.len()]);
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(temporary.path());
+    let root = Root::open(temporary.path()).unwrap();
+    FORCED_MODE.set(Some(0o644));
+    REFUSE_MODE_PROBE.set(true);
+    let probed = ops.open_private_partial_rooted(
+        &root,
+        &RelativePath::new(b"probe").unwrap(),
+        &temporary.path().join("probe"),
+        true,
+        0o600,
+        Some(0o600),
+    );
+    FORCED_MODE.set(None);
+    REFUSE_MODE_PROBE.set(false);
+    probed.unwrap().unwrap();
+    // A retry on the same connection, with a narrower mode.
+    let path = temporary.path().join("file");
+    let id = [44; 16];
+    let target = || PartialTarget {
+        path: b"file",
+        id: &id,
+        guard: None,
+    };
+    let options = |mode, attempt| PrepareOptions {
+        size: old.len() as u64,
+        inplace: false,
+        mode,
+        attempt,
+        create_if_missing: true,
+    };
+    ops.prepare(target(), options(0o644, 0)).unwrap();
+    for (index, chunk) in old.chunks(block).enumerate() {
+        ops.write_range(
+            target(),
+            false,
+            0,
+            (index * block) as u64,
+            content_digest(chunk),
+            chunk,
+        )
+        .unwrap();
+    }
+    let sidecar = partial_path(&path, &id).unwrap();
+    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+    let reader = File::open(&sidecar).unwrap();
+    let prepared = ops.prepare(target(), options(0o600, 1)).unwrap();
+    let reusable = if prepared.partial_size.is_some() || prepared.has_candidates {
+        ops.seed_basis(target(), new.len() as u64, block as u64, None, 1)
+            .unwrap()
+            .hashes
+    } else {
+        Vec::new()
+    };
+    let algorithm = ops.hash_policy.algorithm;
+    for (index, chunk) in new.chunks(block).enumerate() {
+        if reusable.get(index) != Some(&algorithm.hash(chunk)) {
+            ops.write_range(
+                target(),
+                false,
+                1,
+                (index * block) as u64,
+                content_digest(chunk),
+                chunk,
+            )
+            .unwrap();
+        }
+    }
+    let mut seen = vec![0; reader.metadata().unwrap().len() as usize];
+    reader.read_exact_at(&mut seen, 0).unwrap();
+    assert!(
+        !seen.windows(secret.len()).any(|bytes| bytes == secret),
+        "the retry wrote through a descriptor opened at 0644"
+    );
+}
+
+#[test]
+fn one_connections_probe_does_not_decide_for_another() {
+    // A persistent receiving service handles every copy in one process for
+    // days, and a device number freed by an unmount is given to the next
+    // network, FUSE or tmpfs mount. So a device one connection found unable
+    // to narrow a new file is not taken as such by another connection, which
+    // finds out for itself.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = Root::open(temporary.path()).unwrap();
+    let open = |ops: &mut FsOps, name: &str| {
+        let (file, basis) = ops
+            .open_private_partial_rooted(
+                &root,
+                &RelativePath::new(name.as_bytes()).unwrap(),
+                &temporary.path().join(name),
+                true,
+                0o600,
+                Some(0o600),
+            )
+            .unwrap()
+            .unwrap();
+        (file.metadata().unwrap().ino(), basis.is_some())
+    };
+    let leftover = |name: &str| {
+        let path = temporary.path().join(name);
+        fs::write(&path, b"an earlier attempt").unwrap();
+        // Held open, its inode number cannot be given to a replacement.
+        File::open(&path).unwrap()
+    };
+    FORCED_MODE.set(Some(0o755));
+    let mut first = destination_ops(temporary.path());
+    open(&mut first, "probe");
+    let held = leftover("for-the-second");
+    let mut second = destination_ops(temporary.path());
+    let (inode, reused) = open(&mut second, "for-the-second");
+    let replaced_by_second = !reused && inode != held.metadata().unwrap().ino();
+    let held = leftover("for-the-first");
+    let (inode, reused) = open(&mut first, "for-the-first");
+    let reused_by_first = reused && inode == held.metadata().unwrap().ino();
+    FORCED_MODE.set(None);
+    assert!(
+        replaced_by_second,
+        "the second connection took the first's probe"
+    );
+    assert!(
+        reused_by_first,
+        "the first connection did not keep its probe"
+    );
+}
+
+#[test]
+fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
+    // The probe marks a device only when a new file there stays wider after
+    // a chmod to the mode it was created with succeeds. A file a directory's
+    // inherited ACL widened can be narrowed, and a refused chmod proves
+    // nothing, so their devices keep the check. A mark is for its own device
+    // number alone.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("new");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    let dev = file.metadata().unwrap().dev();
+    // Widened after creation, as an inherited ACL can widen a new file.
+    let widen = || fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    widen();
+    let mut ops = FsOps::new();
+    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    assert_eq!(ops.fixed_wide_modes(dev), Some(false));
+    assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
+    assert!(ops.wider_than(0o644, dev, Some(0o600)));
+    // A refused chmod.
+    widen();
+    let mut ops = FsOps::new();
+    REFUSE_MODE_PROBE.set(true);
+    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    REFUSE_MODE_PROBE.set(false);
+    assert_eq!(ops.fixed_wide_modes(dev), Some(false));
+    assert!(ops.wider_than(0o644, dev, Some(0o600)));
+    // Every file reports 0755 and a chmod does not show.
+    let mut ops = FsOps::new();
+    FORCED_MODE.set(Some(0o755));
+    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    FORCED_MODE.set(None);
+    assert_eq!(ops.fixed_wide_modes(dev), Some(true));
+    assert!(!ops.wider_than(0o644, dev, Some(0o600)));
+    assert!(ops.wider_than(0o644, dev.wrapping_add(1), Some(0o600)));
+    assert!(!ops.wider_than(0o600, dev.wrapping_add(1), Some(0o600)));
 }
 
 #[test]
@@ -5860,7 +6705,7 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
         let mut ops = FsOps::new();
         ops.inode_preservation.acls = true;
         let (mut file, basis) = ops
-            .open_private_partial_rooted(&root, &relative, &path, true, 0o644)
+            .open_private_partial_rooted(&root, &relative, &path, true, 0o644, None)
             .unwrap()
             .unwrap();
         assert!(basis.is_none());

@@ -896,17 +896,28 @@ pub(super) fn set_meta_handle_known(
                 Err(io::Error::last_os_error())
             }
         })?;
+    if owner_changed {
+        super::access_changed(file);
+    }
+    // A Linux ACL before the mode (see `apply_acls`).
+    let narrowed = crate::inode_metadata::apply_acls(
+        file,
+        meta.inode_metadata.as_deref(),
+        meta.mode,
+        flags & flags::MODE_MASK != 0,
+    )?;
     if flags & flags::MODE_MASK != 0 {
-        let current = current.mode() & 0o7777;
+        let current = narrowed.unwrap_or(current.mode() & 0o7777);
         let wanted = meta.mode & 0o7777;
         if current != wanted || (owner_changed && wanted & 0o6000 != 0) {
             set_mode_handle(file, wanted)?;
+            super::access_changed(file);
         }
     }
     if flags & flags::TIMES != 0 {
         bail!("metadata-only O_PATH repair does not support timestamp changes");
     }
-    crate::inode_metadata::apply(file, meta.inode_metadata.as_deref(), meta.mode)
+    crate::inode_metadata::apply_after_acls(file, meta.inode_metadata.as_deref(), meta.mode)
 }
 
 #[cfg(target_os = "linux")]
