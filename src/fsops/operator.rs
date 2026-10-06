@@ -1,5 +1,76 @@
 use super::*;
 
+/// Search access used only while checking a selected destination. Restore through
+/// the same handles before replying, including when ancestry rejects the copy.
+#[derive(Default)]
+pub(crate) struct TemporaryDirectorySearchAccess {
+    enabled: bool,
+    changed: Vec<(File, u32)>,
+}
+
+impl TemporaryDirectorySearchAccess {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            changed: Vec::new(),
+        }
+    }
+
+    pub(crate) fn prepare(&mut self, directory: &File) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let metadata = directory.metadata()?;
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 || metadata.uid() != uid || metadata.mode() & 0o100 != 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "temporary search access requires a directory"
+        );
+        // Clone before chmod so a descriptor-limit failure cannot leave an
+        // unrecorded permission change behind.
+        let retained = directory.try_clone()?;
+        set_mode_handle(&retained, metadata.mode() | 0o100)?;
+        self.changed.push((retained, metadata.mode() & 0o7777));
+        Ok(())
+    }
+
+    fn open(&mut self, directory: &File, name: &[u8]) -> Result<File> {
+        match open_operator_directory_at(directory, name) {
+            Err(error)
+                if self.enabled && error_is_kind(&error, io::ErrorKind::PermissionDenied) =>
+            {
+                self.prepare(directory)?;
+                open_operator_directory_at(directory, name)
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn restore(&mut self) -> Result<()> {
+        let mut failure = None;
+        while let Some((directory, mode)) = self.changed.pop() {
+            if let Err(error) = set_mode_handle(&directory, mode) {
+                if failure.is_none() {
+                    failure =
+                        Some(error.context("restore directory permissions after ancestry check"));
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for TemporaryDirectorySearchAccess {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            crate::output::diagnostic!("syq: {error:#}");
+        }
+    }
+}
+
 /// Completion follows the same operator-path symlink policy as the command.
 /// Keep the explicit root check even when following symlinks is requested.
 pub(crate) fn check_completion_directory(
