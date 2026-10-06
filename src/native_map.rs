@@ -463,7 +463,15 @@ fn walk_directory(
     out: &mut Emitter<'_, impl Write>,
 ) -> Result<()> {
     let mut pending = Vec::new();
-    push_directory_children(root, scan_root, b"", scan_root_metadata, &mut pending)?;
+    let read_symlink_target = out.policy.selection.is_some();
+    push_directory_children(
+        root,
+        scan_root,
+        b"",
+        scan_root_metadata,
+        read_symlink_target,
+        &mut pending,
+    )?;
     while let Some(PendingMapEntry {
         root_relative,
         entry,
@@ -479,7 +487,14 @@ fn walk_directory(
             emit(out, &source, &destination, &entry)?;
         }
         if entry.kind == Kind::Dir {
-            push_directory_children(root, &root_relative, relative, metadata, &mut pending)?;
+            push_directory_children(
+                root,
+                &root_relative,
+                relative,
+                metadata,
+                read_symlink_target,
+                &mut pending,
+            )?;
         }
     }
     Ok(())
@@ -490,6 +505,7 @@ fn push_directory_children(
     root_relative: &[u8],
     output_relative: &[u8],
     expected: crate::rooted::RootMetadata,
+    read_symlink_target: bool,
     pending: &mut Vec<PendingMapEntry>,
 ) -> Result<()> {
     let directory_relative = RelativePath::new(root_relative)?;
@@ -501,7 +517,14 @@ fn push_directory_children(
     for name in names {
         let metadata = root.metadata_in_directory(&directory, &name)?;
         let output_relative = join_rel(output_relative, &name);
-        let entry = rooted_entry_in_directory(root, &directory, &name, output_relative, metadata)?;
+        let entry = rooted_entry_in_directory(
+            root,
+            &directory,
+            &name,
+            output_relative,
+            metadata,
+            read_symlink_target,
+        )?;
         pending.push(PendingMapEntry {
             root_relative: join_rel(root_relative, &name),
             entry,
