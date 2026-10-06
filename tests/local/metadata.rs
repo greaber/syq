@@ -1424,6 +1424,46 @@ fn later_sources_stamp_shared_directories_on_a_network_filesystem() {
     later_sources_stamp_shared_directories(2, true);
 }
 
+#[test]
+fn a_later_source_changes_only_the_shared_directory_metadata_it_sets() {
+    // `--copy-if` leaves out the later source's root, so for the shared
+    // destination root that source sets only the mode it would have been
+    // created with. The earlier source's time stays.
+    let t = Tmp::new();
+    for (source, mode, time) in [("a", 0o750, 1_000_000_000), ("b", 0o711, 1_600_000_000)] {
+        write(&t.path(&format!("{source}/{source}")), source.as_bytes());
+        set_mtime(&t.path(&format!("{source}/{source}")), 1_000_000_000);
+        fs::set_permissions(t.path(source), fs::Permissions::from_mode(mode)).unwrap();
+        set_mtime(&t.path(source), time);
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args([
+        "cp",
+        "--copy-metadata=permissions",
+        "--copy-if",
+        r#"src.mtime < timestamp("2020-01-01T00:00:00Z")"#,
+        "--srcs-in",
+        &t.s("a"),
+        "--srcs-in",
+        &t.s("b"),
+        "--into",
+        &t.s("dst"),
+        "--no-progress",
+    ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    assert_output_ok(&command.run().unwrap());
+    let meta = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!((meta.mode() & 0o777, meta.mtime()), (0o755, 1_000_000_000));
+    for source in ["a", "b"] {
+        assert_eq!(read(&t.path(&format!("dst/{source}"))), source.as_bytes());
+    }
+}
+
 fn later_sources_stamp_shared_directories(count: usize, network: bool) {
     use std::os::unix::fs::PermissionsExt;
     let t = Tmp::new();
