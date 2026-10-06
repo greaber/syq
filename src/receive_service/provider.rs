@@ -258,8 +258,23 @@ pub(crate) fn snapshot(domain: &Domain) -> Result<Option<Snapshot>> {
     }
 }
 pub(super) fn refresh(domain: &Domain) -> Result<()> {
-    if is_running(domain)? {
-        query(domain, Control::Refresh)?;
+    // Like a receiving service, the provider takes its lock before binding
+    // its socket. Give one that another process is starting time to answer.
+    let deadline = Instant::now() + ANSWER_TIMEOUT;
+    while is_running(domain)? {
+        match query(domain, Control::Refresh) {
+            Ok(_) => return Ok(()),
+            Err(error) if unanswered(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(error.context(format!(
+                        "SSH authorization provider is running but not answering in {}",
+                        domain.runtime_path().display()
+                    )));
+                }
+                std::thread::sleep(ANSWER_POLL);
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

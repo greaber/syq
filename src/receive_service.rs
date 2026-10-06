@@ -31,6 +31,12 @@ const SOCKET: &[u8] = b".recv";
 const LOCK: &[u8] = b".recv-lock";
 const RECORD: &[u8] = b".recv-json";
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// A service holds its lock from before it binds its socket until after it
+/// removes it, so a locked control may briefly not answer. Between lock and
+/// bind a starting service only reads its preferences and endpoint record;
+/// a stopping one leaves at most one 1-second query unanswered.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+const ANSWER_POLL: Duration = Duration::from_millis(20);
 pub(crate) const CLOSING: &str = ".syq-persistence-closing";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -601,6 +607,46 @@ fn query_retry(
     }
     Ok(result)
 }
+/// Whether nothing answered on a control socket, as while a locked service
+/// is starting or stopping, rather than the service replying with an error.
+fn unanswered(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                NotFound
+                    | ConnectionRefused
+                    | ConnectionReset
+                    | BrokenPipe
+                    | UnexpectedEof
+                    | WouldBlock
+                    | TimedOut
+            )
+        })
+    })
+}
+/// Query the service holding this control's lock, waiting up to `timeout` for
+/// it to answer while it starts or stops. None once no service holds the lock.
+fn running_status(control: &Path, retry: bool, timeout: Duration) -> Result<Option<Status>> {
+    let deadline = Instant::now() + timeout;
+    while is_running(control) {
+        match query_retry(control, false, None, retry) {
+            Ok(state) => return Ok(Some(state)),
+            Err(error) if unanswered(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(error.context(format!(
+                        "receiving service is running but not answering at {}",
+                        suffixed(control, SOCKET).display()
+                    )));
+                }
+                std::thread::sleep(ANSWER_POLL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
 // Status contains up to 32 full approval summaries, both aggregated and per
 // profile. Keep its local-only bound separate from the remote request envelope.
 const MAX_STATUS: usize = 16 * 1024 * 1024;
@@ -761,13 +807,13 @@ fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpe
         .profiles
         .iter()
         .any(|p| p.allows_server(&remote.label()));
-    if allowed && is_running(control) {
-        let state = status(control, false)?;
-        if state.identity != crate::identity::build() {
-            stop_inner(control, false)?;
-        } else {
-            query_retry(control, false, None, true)?;
-            return Ok(true);
+    if allowed {
+        if let Some(state) = running_status(control, false, ANSWER_TIMEOUT)? {
+            if state.identity != crate::identity::build() {
+                stop_inner(control, false)?;
+            } else if running_status(control, true, ANSWER_TIMEOUT)?.is_some() {
+                return Ok(true);
+            }
         }
     }
     let spec = ServiceSpec {
@@ -791,7 +837,15 @@ fn ensure_inner(domain: &Domain, control: &Path, remote: &crate::conn::RemoteSpe
     spawn(control)?;
     Ok(true)
 }
-fn spawn(control: &Path) -> Result<()> {
+/// A service process this call started. Its reaper drops the sender once the
+/// process has exited, which it does at once if another service owns the lock.
+struct Started(std::sync::mpsc::Receiver<()>);
+impl Started {
+    fn alive(&self) -> bool {
+        matches!(self.0.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+    }
+}
+fn spawn(control: &Path) -> Result<Started> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--receive-service")
@@ -810,10 +864,12 @@ fn spawn(control: &Path) -> Result<()> {
     let mut child = command
         .spawn_guarded()
         .context("start background receiving")?;
+    let (reaped, started) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = child.wait();
+        drop(reaped);
     });
-    Ok(())
+    Ok(Started(started))
 }
 /// Stop before deleting a scope or changing its policy; wait for the daemon to
 /// drop its lock only after its receiver thread and owned SSH groups have ended.
@@ -1000,12 +1056,12 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             stop_inner(&control, false)?;
             continue;
         }
-        if is_running(&control) {
-            let state = status(&control, false)?;
-            if state.identity != crate::identity::build() {
-                stop_inner(&control, false)?;
-            }
+        if running_status(&control, false, ANSWER_TIMEOUT)?
+            .is_some_and(|state| state.identity != crate::identity::build())
+        {
+            stop_inner(&control, false)?;
         }
+        let mut started = None;
         if !is_running(&control)
             && config.enabled()
             && domain.enabled()?
@@ -1015,11 +1071,12 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
             // --connection endpoints are connected separately by configure.
             && crate::persistence::socket_is_ready(&control).unwrap_or(false)
         {
-            spawn(&control)?;
+            started = Some(spawn(&control)?);
         }
         let deadline = Instant::now() + STOP_TIMEOUT;
         let mut progress = Instant::now();
-        while is_running(&control) {
+        // The service started here may not hold its lock yet; wait for it too.
+        while is_running(&control) || started.as_ref().is_some_and(Started::alive) {
             let state = status(&control, false);
             let endpoint = read_spec(&control)?.endpoint.label();
             let enabled: Vec<_> = config
@@ -1036,7 +1093,17 @@ fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
                 break;
             }
             if Instant::now() >= deadline {
-                bail!("receiving profiles have not been applied; check syq persist receive status");
+                let unapplied =
+                    "receiving profiles have not been applied; check syq persist receive status";
+                return Err(match state {
+                    Ok(_) => anyhow::anyhow!(unapplied),
+                    Err(error) => error
+                        .context(format!(
+                            "receiving service is not answering at {}",
+                            suffixed(&control, SOCKET).display()
+                        ))
+                        .context(unapplied),
+                });
             }
             if progress.elapsed() >= Duration::from_secs(5) {
                 crate::output::diagnostic!("syq: waiting for receiving profiles to be applied");
@@ -2201,5 +2268,89 @@ mod tests {
             assert_eq!(decoded.stop, stop);
             assert!(decoded.decision.is_none());
         }
+    }
+
+    /// Hold the control's lock as a service does between taking it and binding
+    /// its socket, or after removing the socket while it stops.
+    fn locked_control() -> (impl Sized, PathBuf, File) {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let control = root.path().join("cm-test");
+        let lock = try_lock(&control, true).unwrap().unwrap();
+        assert!(is_running(&control));
+        (root, control, lock)
+    }
+
+    #[test]
+    fn a_locked_service_is_queried_once_it_binds_its_socket() {
+        let (_root, control, _lock) = locked_control();
+        let socket = suffixed(&control, SOCKET);
+        let service = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut client = loop {
+                match listener.accept() {
+                    Ok((client, _)) => break client,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no status query arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            let request = read_control_request(&mut client).unwrap();
+            assert!(!request.stop && !request.retry);
+            let state = Status {
+                version: VERSION,
+                identity: crate::identity::build().into(),
+                pid: 4242,
+                endpoint: "example".into(),
+                name: "laptop".into(),
+                connection: ConnectionState::default(),
+                approval: None,
+                pending: Vec::new(),
+                decision_error: None,
+                profiles: Vec::new(),
+            };
+            write_status(&mut client, &state).unwrap();
+        });
+        let state = running_status(&control, false, ANSWER_TIMEOUT).unwrap();
+        service.join().unwrap();
+        assert_eq!(state.unwrap().pid, 4242);
+    }
+
+    #[test]
+    fn a_locked_service_that_never_answers_fails_with_its_socket() {
+        let (_root, control, _lock) = locked_control();
+        let started = Instant::now();
+        let error = running_status(&control, false, Duration::from_millis(200)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(&format!(
+                "receiving service is running but not answering at {}: ",
+                suffixed(&control, SOCKET).display()
+            )),
+            "{message}"
+        );
+        assert!(unanswered(&error), "{message}");
+    }
+
+    #[test]
+    fn a_service_that_stops_before_answering_is_not_running() {
+        let (_root, control, lock) = locked_control();
+        let stopped = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(lock);
+        });
+        assert!(running_status(&control, false, Duration::from_secs(10))
+            .unwrap()
+            .is_none());
+        stopped.join().unwrap();
     }
 }
