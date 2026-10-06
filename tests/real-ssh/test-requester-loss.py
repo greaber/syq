@@ -5,8 +5,9 @@ The runner starts a slow copy from source into a command-restricted receiver
 on destination, then ends the requesting syq: once with SIGINT to its process
 group, as Ctrl-C does, and once with SIGKILL to that syq alone, which leaves
 its SSH client running. The source coordinator, its processes, and the
-destination receiver must exit within seconds, without publishing either
-file, and a rerun must complete.
+destination receiver must exit within seconds without publishing either file.
+The receiver then sees an interrupted copy: it removes the partial shorter
+than 1 MiB and keeps the longer one, and a rerun completes.
 """
 import hashlib
 import json
@@ -74,8 +75,8 @@ print(json.dumps(alive))
 ''',
     "partials": r'''
 root = Path(v["root"])
-names = sorted(p.name for p in root.glob(".*.syq-tmp.*")) if root.is_dir() else []
-print(json.dumps(names))
+found = sorted([p.name, p.stat().st_size] for p in root.glob(".*.syq-tmp.*")) if root.is_dir() else []
+print(json.dumps(found))
 ''',
     "published": r'''
 root = Path(v["root"])
@@ -154,6 +155,9 @@ def interrupt_copy(name, end_requester):
             raise
     published = probe("destination", "published", root=destination, names=list(FILES))
     assert not published, f"an interrupted copy published {published}"
+    partials = probe("destination", "partials", root=destination)
+    assert [(name.split(".syq-tmp.")[0], size) for name, size in partials] == [
+        (".long", FILES["long"])], f"the receiver did not keep only the resumable partial: {partials}"
     subprocess.run(copy(destination), check=True, timeout=120)
     expected = probe("source", "digests", root=SOURCE, names=list(FILES))
     assert probe("destination", "digests", root=destination, names=list(FILES)) == expected
