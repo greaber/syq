@@ -211,3 +211,41 @@ fn download_error_restores_selected_container() {
     drop(restricted);
     assert_eq!(fs::read(directory.join("file")).unwrap(), b"sentinel");
 }
+
+#[test]
+fn readable_download_preview_preserves_directory_ctime() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let server = Server::start("prefix-ok");
+    let temp = crate::test_support::tempdir().unwrap();
+    let directory = temp.path().join("dst");
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("extra"), b"keep").unwrap();
+    let restricted = RestrictedDirectory::new(directory.clone(), 0o500);
+    let before = fs::metadata(&directory).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "data",
+            "--into",
+            "dst",
+            "--prune",
+            "--dry-run",
+            "--temporarily-widen-dir-permissions",
+        ],
+    );
+    let after = fs::metadata(&directory).unwrap();
+    drop(restricted);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(after.mode(), before.mode());
+    assert_eq!(
+        (after.ctime(), after.ctime_nsec()),
+        (before.ctime(), before.ctime_nsec())
+    );
+    assert_eq!(fs::read(directory.join("extra")).unwrap(), b"keep");
+    assert!(!directory.join("file").exists());
+}

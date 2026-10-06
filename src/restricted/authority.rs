@@ -2558,7 +2558,8 @@ impl RestrictedAuthority {
                 }
                 *guard = Some(self.guard.clone());
             }
-            Request::WidenDirectories { directories, guard } => {
+            Request::WidenDirectories { directories, guard }
+            | Request::WidenDirectoriesForInspection { directories, guard } => {
                 for (index, (path, condition)) in directories.iter_mut().enumerate() {
                     // Widening is the existing-directory part of EnsureDirectory.
                     // Apply exactly the same signed path/policy/quota checks,

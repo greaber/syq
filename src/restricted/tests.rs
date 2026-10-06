@@ -4146,6 +4146,18 @@ fn placement_access_uses_signed_directory_mutation_authority_and_restores_search
         .authorize(&mut request("file"), false)
         .unwrap_err();
     assert!(format!("{error:#}").contains("read-only"), "{error:#}");
+    let mut preview_access = Request::WidenDirectoriesForInspection {
+        directories: vec![(
+            path_bytes(&parent),
+            proto::TargetCondition::Matches {
+                dev: before.dev(),
+                ino: before.ino(),
+            },
+        )],
+        guard: None,
+    };
+    let error = authority.authorize(&mut preview_access, false).unwrap_err();
+    assert!(format!("{error:#}").contains("read-only"), "{error:#}");
     authority.copy.options.dry_run = false;
     authority.copy.mutation_scopes = vec![MutationScope {
         path: parent.join("file").as_os_str().as_bytes().to_vec(),

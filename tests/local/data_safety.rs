@@ -1269,3 +1269,99 @@ fn dry_run_compares_requested_modes_with_original_directory_permissions() {
         fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
+
+#[test]
+fn readable_directory_dry_runs_preserve_permissions_and_ctime() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for selection in ["single", "tree", "contents", "files-from"] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/file"), b"new");
+        write(&t.path("dst/sub/file"), b"old");
+        write(&t.path("manifest"), b"sub/file\n");
+        let paths = [t.path("dst"), t.path("dst/sub")];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+                fs::metadata(path).unwrap()
+            })
+            .collect();
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let manifest = t.s("manifest");
+        let source_file = t.s("src/sub/file");
+        let destination_file = t.s("dst/sub/file");
+        let mut args = vec!["cp", "--dry-run", "--temporarily-widen-dir-permissions"];
+        match selection {
+            "single" => args.extend([&source_file, "--as", &destination_file]),
+            "tree" => args.extend([&src, "--as", &dst]),
+            "contents" => args.extend(["--srcs-in", &src, "--into", &dst, "--prune"]),
+            _ => args = vec!["rsync", "-rn", "--files-from", &manifest, &src, &dst],
+        }
+        let output = native_syq(&args);
+        let after: Vec<_> = paths
+            .iter()
+            .map(|path| fs::metadata(path).unwrap())
+            .collect();
+        for path in &paths {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_output_ok(&output);
+        for (before, after) in before.iter().zip(after) {
+            assert_eq!(after.mode(), before.mode(), "{selection}");
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec()),
+                "{selection}"
+            );
+        }
+        assert_eq!(read(&t.path("dst/sub/file")), b"old");
+        assert_eq!(listing(&t.path("dst")), ["sub", "sub/file"]);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn directory_dry_run_adds_search_without_write_until_restoration() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"new");
+    write(&t.path("dst/file"), b"old");
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o400)).unwrap();
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+            "--dry-run",
+            "--temporarily-widen-dir-permissions",
+        ])
+        .env("SYQ_TEST_FINALIZATION_READY_FILE", &ready)
+        .env("SYQ_TEST_FINALIZATION_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(
+        "dry-run finalization",
+        std::time::Duration::from_secs(10),
+        || ready.exists(),
+    );
+    let during = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+    fs::write(continuation, b"continue").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let restored = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_output_ok(&output);
+    assert_eq!(during, 0o500);
+    assert_eq!(restored, 0o400);
+    assert_eq!(read(&t.path("dst/file")), b"old");
+}

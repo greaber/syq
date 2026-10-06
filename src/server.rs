@@ -408,6 +408,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::DestinationFilesystemInfo { .. }
         | Request::PartialPaths { .. }
         | Request::WidenDirectories { .. }
+        | Request::WidenDirectoriesForInspection { .. }
         | Request::Apply { .. }
         | Request::PlanBatch { .. }
         | Request::ProbePartial { .. }

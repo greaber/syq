@@ -1143,7 +1143,7 @@ fn stream_directory_permission_mode_respects_placement_and_dry_run() {
                         let succeeds = placement_ok && (widen || (dry_run && mode == 0o500));
                         assert_eq!(output.status.success(), succeeds, "{mode:o} dry={dry_run} widen={widen} {placement} exists={exists}: {output:?}");
                         assert_eq!(after.mode() & 0o7777, mode);
-                        if !widen {
+                        if !widen || (dry_run && mode == 0o500) {
                             assert_eq!(
                                 (before.ctime(), before.ctime_nsec()),
                                 (after.ctime(), after.ctime_nsec())

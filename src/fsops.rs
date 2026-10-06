@@ -527,16 +527,35 @@ pub(crate) fn widen_directory(
     condition: TargetCondition,
     label: &Path,
 ) -> Result<Option<crate::proto::DirectoryMode>> {
+    widen_directory_access(root, path, condition, label, 0o700)
+}
+
+pub(crate) fn widen_directory_for_inspection(
+    root: &Root,
+    path: &RelativePath,
+    condition: TargetCondition,
+    label: &Path,
+) -> Result<Option<crate::proto::DirectoryMode>> {
+    widen_directory_access(root, path, condition, label, 0o500)
+}
+
+fn widen_directory_access(
+    root: &Root,
+    path: &RelativePath,
+    condition: TargetCondition,
+    label: &Path,
+    access: u32,
+) -> Result<Option<crate::proto::DirectoryMode>> {
     let metadata = root.metadata(path)?;
     apply::require_rooted_condition(metadata, condition, label)?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", label.display());
     let uid = unsafe { libc::geteuid() };
-    if uid == 0 || uid != metadata.uid || metadata.mode & 0o700 == 0o700 {
+    if uid == 0 || uid != metadata.uid || metadata.mode & access == access {
         return Ok(None);
     }
     let directory = root.open_metadata(path)?;
     apply::require_rooted_metadata(&directory, metadata, label)?;
-    set_mode_handle(&directory, metadata.mode | 0o700)?;
+    set_mode_handle(&directory, metadata.mode | access)?;
     Ok(Some(crate::proto::DirectoryMode {
         mode: metadata.mode & 0o7777,
         dev: metadata.dev,
@@ -1936,6 +1955,7 @@ impl FsOps {
             | Request::PruneLookup { guard, .. }
             | Request::DefaultPermissions { guard, .. }
             | Request::WidenDirectories { guard, .. }
+            | Request::WidenDirectoriesForInspection { guard, .. }
             | Request::InspectPlacementTargetWithAccess { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
@@ -1980,6 +2000,7 @@ impl FsOps {
         let unrooted = match request {
             Request::Apply { guard, .. }
             | Request::WidenDirectories { guard, .. }
+            | Request::WidenDirectoriesForInspection { guard, .. }
             | Request::Prepare { guard, .. }
             | Request::SeedBasis { guard, .. }
             | Request::StageBasis { guard, .. }
@@ -2278,7 +2299,8 @@ impl FsOps {
                     }
                 }
             }
-            Request::WidenDirectories { directories, guard } => {
+            Request::WidenDirectories { directories, guard }
+            | Request::WidenDirectoriesForInspection { directories, guard } => {
                 if guard.is_none() {
                     for (path, _) in directories {
                         map(path)?;

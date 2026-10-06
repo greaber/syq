@@ -1664,10 +1664,11 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             if opts.may_widen_directory_permissions()
-                && stats
-                    .iter()
-                    .flatten()
-                    .any(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+                && stats.iter().flatten().any(|entry| {
+                    entry.kind == Kind::Dir
+                        && entry.mode & self.opts.directory_access_mode()
+                            != self.opts.directory_access_mode()
+                })
             {
                 self.prepare_existing_directories(
                     dirs.iter().map(|(path, _, _)| path.clone()).collect(),
@@ -4166,7 +4167,9 @@ impl Planner<'_> {
                     .zip(stats)
                     .filter_map(|(path, entry)| {
                         let entry = entry.filter(|entry| {
-                            entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700
+                            entry.kind == Kind::Dir
+                                && entry.mode & self.opts.directory_access_mode()
+                                    != self.opts.directory_access_mode()
                         })?;
                         (!self.directory_restorations.contains_key(path)).then(|| {
                             (
@@ -4192,13 +4195,13 @@ impl Planner<'_> {
 
     fn widen_directories(&mut self, directories: Vec<(PathBytes, TargetCondition)>) -> Result<()> {
         let names: Vec<_> = directories.iter().map(|(path, _)| path.clone()).collect();
-        let response = ok(
-            self.dst.call(Request::WidenDirectories {
-                directories,
-                guard: self.container_guard.clone(),
-            })?,
-            "prepare directory permissions",
-        )?;
+        let guard = self.container_guard.clone();
+        let request = if self.opts.dry_run {
+            Request::WidenDirectoriesForInspection { directories, guard }
+        } else {
+            Request::WidenDirectories { directories, guard }
+        };
+        let response = ok(self.dst.call(request)?, "prepare directory permissions")?;
         let Response::WidenedDirectories(results) = response else {
             bail!("unexpected directory access response {response:?}");
         };

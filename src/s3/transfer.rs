@@ -467,6 +467,7 @@ impl Engine {
             let directories = Arc::new(Directories::new(&plan)?);
             let mut directory_access = directory_permissions::TemporaryAccess::new(
                 self.args.temporarily_widen_dir_permissions,
+                self.args.dry_run,
             );
             let mut copies_finished = false;
             let transferred = async {

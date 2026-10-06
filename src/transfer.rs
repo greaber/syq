@@ -1838,6 +1838,14 @@ fn copy_error_message(error: &anyhow::Error, may_widen: bool) -> String {
 }
 
 impl Opts {
+    fn directory_access_mode(&self) -> u32 {
+        if self.dry_run {
+            0o500
+        } else {
+            0o700
+        }
+    }
+
     fn may_widen_directory_permissions(&self) -> bool {
         // Existing signed dry-run grants authorize observations only. Do not
         // turn an otherwise valid preview into an unauthorized chmod attempt.
@@ -3491,7 +3499,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else if dst_is_dir {
             dst_root_entry
                 .as_ref()
-                .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+                .filter(|entry| {
+                    entry.kind == Kind::Dir
+                        && entry.mode & opts.directory_access_mode() != opts.directory_access_mode()
+                })
                 .map(|entry| (dst_root.clone(), target_identity(entry)))
         } else if opts.restricted_receiver {
             Some((parent_path(&dst_root), TargetCondition::Any))

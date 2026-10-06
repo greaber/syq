@@ -42,6 +42,7 @@ impl Drop for DirectoryLease {
 }
 struct DirectoryAccess<'a> {
     enabled: bool,
+    required: u32,
     permissions: &'a mut std::collections::HashMap<(u64, u64), DirectoryLease>,
     held: &'a mut Vec<(u64, u64)>,
 }
@@ -57,18 +58,21 @@ impl DirectoryAccess<'_> {
         }
         self.held.try_reserve(1)?;
         // Consult existing leases before examining mode: another entry may
-        // already have added the permissions this entry will rely on.
+        // already have added the permissions this entry will rely on. Preview
+        // leases are released synchronously before handle() returns, so only
+        // live-copy leases can be shared with a later entry.
         if let Some(lease) = self.permissions.get_mut(&identity) {
             lease.users += 1;
         } else {
             let uid = unsafe { libc::geteuid() };
-            if uid == 0 || metadata.uid() != uid || metadata.mode() & 0o700 == 0o700 {
+            if uid == 0 || metadata.uid() != uid || metadata.mode() & self.required == self.required
+            {
                 return Ok(());
             }
             anyhow::ensure!(metadata.is_dir(), "stream access requires a directory");
             self.permissions.try_reserve(1)?;
             let directory = directory.try_clone()?;
-            crate::fsops::set_mode_handle(&directory, metadata.mode() | 0o700)?;
+            crate::fsops::set_mode_handle(&directory, metadata.mode() | self.required)?;
             self.permissions.insert(
                 identity,
                 DirectoryLease {
@@ -122,6 +126,15 @@ impl Session {
             .unwrap_or_default();
         let mut access = DirectoryAccess {
             enabled: matches!(operation, Operation::OpenWithDirectoryAccess { .. }),
+            // Named-file inspection never enumerates or writes its parent.
+            required: if matches!(
+                operation,
+                Operation::OpenWithDirectoryAccess { dry_run: true, .. }
+            ) {
+                0o100
+            } else {
+                0o700
+            },
             permissions: &mut slot.permissions,
             held: &mut held,
         };
@@ -794,6 +807,41 @@ mod tests {
     }
 
     #[test]
+    fn stream_preview_access_adds_only_search_permission() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let parent = temporary.path().join("dst");
+        std::fs::create_dir(&parent).unwrap();
+        let directory = File::open(&parent).unwrap();
+        let mut session = Session::default();
+        for mode in [0o100, 0o500, 0o400, 0o600] {
+            std::fs::set_permissions(&parent, Permissions::from_mode(mode)).unwrap();
+            let before = directory.metadata().unwrap();
+            let mut held = Vec::new();
+            let mut access = DirectoryAccess {
+                enabled: true,
+                required: 0o100,
+                permissions: &mut session.permissions,
+                held: &mut held,
+            };
+            access.acquire(&directory).unwrap();
+            let during = directory.metadata().unwrap();
+            assert_eq!(during.mode() & 0o777, mode | 0o100);
+            if mode & 0o100 != 0 {
+                assert_eq!(
+                    (during.ctime(), during.ctime_nsec()),
+                    (before.ctime(), before.ctime_nsec())
+                );
+            }
+            access.release().unwrap();
+            assert_eq!(directory.metadata().unwrap().mode() & 0o777, mode);
+        }
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
     fn shared_directory_access_outlasts_each_stream_and_restores_after_cleanup() {
         if unsafe { libc::geteuid() } == 0 {
             return;
@@ -806,6 +854,15 @@ mod tests {
                 std::fs::set_permissions(&parent, Permissions::from_mode(mode)).unwrap();
                 let descriptors = DescriptorSessionSlot::default();
                 let mut session = Session::default();
+                let mut preview = access_open(3, &parent.join("preview"));
+                let Operation::OpenWithDirectoryAccess { dry_run, .. } = &mut preview else {
+                    unreachable!()
+                };
+                *dry_run = true;
+                Session::handle(&mut session, &preview, &descriptors).unwrap();
+                assert!(session.entries.is_empty());
+                assert!(session.permissions.is_empty());
+                assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o7777, mode);
                 for entry in [1, 2] {
                     let Response::DescriptorOpened { ticket, .. } = Session::handle(
                         &mut session,
@@ -821,8 +878,14 @@ mod tests {
                         .write_all_at(b"new", 0)
                         .unwrap();
                 }
+                // A preview may join active writers, but cannot narrow their
+                // shared directory or leave its own lease behind.
+                Session::handle(&mut session, &preview, &descriptors).unwrap();
+                assert_eq!(session.entries.len(), 2);
                 assert_eq!(session.permissions.len(), 1);
                 assert_eq!(session.permissions.values().next().unwrap().users, 2);
+                assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o7777, 0o700);
+                assert!(!parent.join("preview").exists());
                 Session::handle(
                     &mut session,
                     &Operation::Finish { entry: 1, size: 3 },

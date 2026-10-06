@@ -1327,6 +1327,12 @@ pub enum WireRequest<Data> {
         parent_condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
+    /// Temporarily add owner read/search access for destination inspection.
+    /// The live-copy request above keeps its original encoding and semantics.
+    WidenDirectoriesForInspection {
+        directories: Vec<(PathBytes, TargetCondition)>,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1860,7 +1866,8 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 48
             }
-            Request::WidenDirectories { directories, .. } => {
+            Request::WidenDirectories { directories, .. }
+            | Request::WidenDirectoriesForInspection { directories, .. } => {
                 directories
                     .iter()
                     .map(|(path, _)| path.len() + 48)

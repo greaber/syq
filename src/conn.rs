@@ -292,7 +292,8 @@ fn reply_shape(req: &Request) -> Option<(&'static str, usize)> {
         Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
             Some(("stat", paths.len()))
         }
-        Request::WidenDirectories { directories, .. } => {
+        Request::WidenDirectories { directories, .. }
+        | Request::WidenDirectoriesForInspection { directories, .. } => {
             Some(("widen directories", directories.len()))
         }
         Request::Apply { ops, .. } => Some(("apply", ops.len())),

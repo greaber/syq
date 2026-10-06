@@ -7737,6 +7737,55 @@ fn temporary_directory_access_is_explicit_and_reports_only_changes() {
 }
 
 #[test]
+fn directory_inspection_access_adds_no_write_permission() {
+    if is_superuser() {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    let root = Root::open(temporary.path()).unwrap();
+    let relative = RelativePath::new(b"owned").unwrap();
+    for mode in [0o500, 0o555, 0o400, 0o600] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        let before = fs::metadata(&dir).unwrap();
+        let request = Request::WidenDirectoriesForInspection {
+            directories: vec![(
+                path_bytes(&dir),
+                TargetCondition::Matches {
+                    dev: before.dev(),
+                    ino: before.ino(),
+                },
+            )],
+            guard: None,
+        };
+        assert!(matches!(FsOps::new().handle(&request), Response::Err(_)));
+        let Response::WidenedDirectories(results) =
+            destination_ops(temporary.path()).handle(&request)
+        else {
+            panic!("unexpected response")
+        };
+        let saved = *results[0].as_ref().unwrap();
+        let during = fs::metadata(&dir).unwrap();
+        assert_eq!(during.mode() & 0o777, mode | 0o500);
+        assert_eq!(during.mode() & 0o222, before.mode() & 0o222);
+        if mode & 0o500 == 0o500 {
+            assert!(saved.is_none());
+            assert_eq!(
+                (during.ctime(), during.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec())
+            );
+        } else {
+            let saved = saved.expect("missing inspection access was not prepared");
+            assert_eq!(saved.mode, mode);
+            restore_directory_mode(&root, &relative, saved, &dir).unwrap();
+        }
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, mode);
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
     let temporary = crate::test_support::tempdir().unwrap();
     let dir = temporary.path().join("owned");

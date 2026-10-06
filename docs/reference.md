@@ -426,9 +426,10 @@ existing directory permissions to make copying or pruning succeed, even when
 copying permission metadata. The requested final permissions still apply.
 `--temporarily-widen-dir-permissions` allows adding owner read, write and search
 permission to existing directories being copied into, when the receiving user owns them.
-This permission mode also applies during safety checks and dry runs. A dry run
-may temporarily widen directories so it can inspect them, but does not copy or
-remove data or apply requested final metadata. Signed read-only receiver grants
+This permission mode also applies with `--if-exists=keep`, during safety checks
+and in dry runs. A dry run adds only read or search access needed for inspection, never write access; a
+directory that is already readable and searchable keeps its permissions unchanged.
+Dry runs do not copy or remove data or apply requested final metadata. Signed read-only receiver grants
 permit inspection only, so previews using those grants cannot widen directories.
 Syq restores permissions after each safety check and after copying, pruning or a
 dry run, including when the
