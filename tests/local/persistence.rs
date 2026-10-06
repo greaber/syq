@@ -402,6 +402,12 @@ fn native_detach_waits_for_coordinator_readiness() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert_eq!(read(&t.path("dst")), b"detached");
+    // A detached coordinator outlives this command by design.
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        !log.contains("SYQ_INTERNAL_NATIVE_REQUESTER_STDIN"),
+        "{log}"
+    );
     let ready_files = fs::read_dir(t.path("remote-home/.syq"))
         .unwrap()
         .filter_map(Result::ok)

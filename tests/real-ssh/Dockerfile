@@ -105,6 +105,7 @@ COPY tests/real-ssh/test-handoff-timing.py /usr/local/libexec/syq-test-handoff-t
 COPY tests/real-ssh/test-root-security.py /usr/local/libexec/syq-test-root-security.py
 
 COPY tests/real-ssh/test-receiver-revoke.py /usr/local/libexec/syq-test-receiver-revoke.py
+COPY tests/real-ssh/test-requester-loss.py /usr/local/libexec/syq-test-requester-loss.py
 
 COPY tests/real-ssh/test-restricted-mapping.py /usr/local/libexec/syq-test-restricted-mapping.py
 
