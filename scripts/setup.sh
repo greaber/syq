@@ -256,11 +256,20 @@ EOF
     if [ -n "$uv_python" ]; then
       printf 'export UV_PYTHON=%s\n' "$(shell_quote "$uv_python")"
     fi
+    # nextest otherwise starts a second copy of itself before every test,
+    # a large share of the CPU a unit-test run uses on a many-core host.
+    printf 'export NEXTEST_DOUBLE_SPAWN=0\n'
     ;;
   github)
     [ -n "${GITHUB_PATH:-}" ] && [ -n "${GITHUB_ENV:-}" ] ||
       die 'github needs GITHUB_PATH and GITHUB_ENV'
-    for tool in "$@"; do bin_directory "$tool" >> "$GITHUB_PATH"; done
+    for tool in "$@"; do
+      bin_directory "$tool" >> "$GITHUB_PATH"
+      # See env above.
+      if [ "$tool" = cargo-nextest ]; then
+        printf 'NEXTEST_DOUBLE_SPAWN=0\n' >> "$GITHUB_ENV"
+      fi
+    done
     if [ -n "$uv_python" ]; then
       printf 'UV_PYTHON=%s\n' "$uv_python" >> "$GITHUB_ENV"
     fi
