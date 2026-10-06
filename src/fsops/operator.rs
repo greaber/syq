@@ -32,6 +32,7 @@ impl TemporaryDirectorySearchAccess {
         // Clone before chmod so a descriptor-limit failure cannot leave an
         // unrecorded permission change behind.
         let retained = directory.try_clone()?;
+        self.changed.try_reserve(1)?;
         set_mode_handle(&retained, metadata.mode() | 0o100)?;
         self.changed.push((retained, metadata.mode() & 0o7777));
         Ok(())
@@ -54,8 +55,9 @@ impl TemporaryDirectorySearchAccess {
         while let Some((directory, mode)) = self.changed.pop() {
             if let Err(error) = set_mode_handle(&directory, mode) {
                 if failure.is_none() {
-                    failure =
-                        Some(error.context("restore directory permissions after ancestry check"));
+                    failure = Some(
+                        error.context("restore directory permissions after destination inspection"),
+                    );
                 }
             }
         }
