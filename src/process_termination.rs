@@ -1,11 +1,12 @@
 //! Work a process finishes before SIGINT or SIGTERM ends it.
 //!
-//! The first such signal runs every registered cleanup, in the order they
-//! were added, on a thread of its own. Together they get at most `CAP`;
-//! then the process ends by that signal, so its exit status is the one the
-//! signal alone would give. A second SIGINT ends it at once, whatever the
-//! cleanup has reached. A signal the process inherited as ignored, as a
-//! background job does, stays ignored.
+//! The first such signal runs every registered cleanup on a thread of its
+//! own: first those added with `add_first`, then the rest, each group in
+//! the order they were added. Together they get at most `CAP`; then the
+//! process ends by that signal, so its exit status is the one the signal
+//! alone would give. Signals that arrive meanwhile change nothing. A
+//! signal the process inherited as ignored, as a background job does, stays
+//! ignored.
 //!
 //! Once a cleanup has been added, the process keeps these listeners: a
 //! signal with no cleanup left still ends it the same way.
@@ -13,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::SeqCst};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -21,15 +23,21 @@ use std::time::{Duration, Instant};
 /// well inside that.
 const CAP: Duration = Duration::from_millis(500);
 
+/// The exit status of a process whose cleanup outside a signal did not
+/// finish within the cap.
+const STALLED: i32 = 1;
+
 type Action = Arc<dyn Fn(Instant) + Send + Sync>;
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(0);
-static CLEANUPS: Mutex<BTreeMap<u64, Action>> = Mutex::new(BTreeMap::new());
+/// Keyed by whether the cleanup runs after the `add_first` ones, then by
+/// the order of adding.
+static CLEANUPS: Mutex<BTreeMap<(bool, u64), Action>> = Mutex::new(BTreeMap::new());
 static LISTENING: OnceLock<io::Result<()>> = OnceLock::new();
 
-fn cleanups() -> std::sync::MutexGuard<'static, BTreeMap<u64, Action>> {
+fn cleanups() -> std::sync::MutexGuard<'static, BTreeMap<(bool, u64), Action>> {
     CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -44,14 +52,22 @@ fn cap() -> Duration {
     CAP
 }
 
-/// When cleanup that starts now must stop: four fifths of the cap, leaving
-/// the rest for ending the process.
-pub(crate) fn cleanup_deadline() -> Instant {
-    Instant::now() + cap() * 4 / 5
+/// Start a thread that runs or bounds cleanup. Cleanup is best effort: a
+/// caller whose thread the system refuses skips it rather than running it
+/// unbounded.
+fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_REFUSE_TERMINATION_THREADS").is_some() {
+        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(work)
+        .map(drop)
 }
 
 /// A cleanup registered with `add`. Dropping it removes it.
-pub(crate) struct Cleanup(u64);
+pub(crate) struct Cleanup((bool, u64));
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -60,13 +76,43 @@ impl Drop for Cleanup {
     }
 }
 
-/// Run `action` before a termination signal ends this process. It receives
-/// the time by which it should stop.
+/// Run `action` before a termination signal ends this process, after any
+/// added with `add_first`. It receives the time by which it should stop.
 pub(crate) fn add(action: impl Fn(Instant) + Send + Sync + 'static) -> io::Result<Cleanup> {
+    insert(true, Arc::new(action))
+}
+
+/// Like `add`, for quick cleanup that must not wait behind slower work,
+/// such as removing a private socket directory.
+pub(crate) fn add_first(action: impl Fn(Instant) + Send + Sync + 'static) -> io::Result<Cleanup> {
+    insert(false, Arc::new(action))
+}
+
+fn insert(later: bool, action: Action) -> io::Result<Cleanup> {
     listen()?;
-    let id = NEXT.fetch_add(1, SeqCst);
-    cleanups().insert(id, Arc::new(action));
-    Ok(Cleanup(id))
+    let key = (later, NEXT.fetch_add(1, SeqCst));
+    cleanups().insert(key, action);
+    Ok(Cleanup(key))
+}
+
+/// Run `work` on this thread with the cap enforced: unless a termination
+/// signal is ending the process anyway, a watchdog ends it with status 1
+/// if the work has not finished by then. `work` receives the time by which
+/// it should stop. When no watchdog can be started the work is skipped.
+pub(crate) fn bounded(work: impl FnOnce(Instant)) {
+    let started = Instant::now();
+    let cap = cap();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = spawn("cleanup-watchdog", move || {
+        if finished.recv_timeout(cap) == Err(RecvTimeoutError::Timeout) && !STARTED.load(SeqCst) {
+            unsafe { libc::_exit(STALLED) }
+        }
+    });
+    if watchdog.is_err() {
+        return;
+    }
+    work(started + cap * 4 / 5);
+    drop(done);
 }
 
 /// While a termination signal is being handled, wait for its cleanup to end
@@ -97,13 +143,9 @@ fn listen() -> io::Result<()> {
         let listeners = super::signals::owned(&signals, || {
             let mut registrations = super::signals::Registrations::default();
             for &signal in &signals {
-                // Only atomics, write(2) and signal-hook's signal-safe
-                // default emulation run here.
+                // Only atomics and write(2) run here.
                 let action = move || {
                     if STARTED.swap(true, SeqCst) {
-                        if signal == libc::SIGINT {
-                            let _ = signal_hook::low_level::emulate_default_handler(signal);
-                        }
                         return;
                     }
                     RECEIVED.store(signal, SeqCst);
@@ -120,7 +162,11 @@ fn listen() -> io::Result<()> {
                 let mut byte = [0u8];
                 loop {
                     match wait.read(&mut byte) {
-                        Ok(1) => break,
+                        // A child forked by this process shares the socket
+                        // until it execs, so the signal may have been that
+                        // child's: act only on one this process received.
+                        Ok(1) if STARTED.load(SeqCst) => break,
+                        Ok(1) => {}
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                         _ => return,
                     }
@@ -146,28 +192,17 @@ fn terminate(signal: i32) -> ! {
     let deadline = started + cap * 4 / 5;
     let actions: Vec<Action> = cleanups().values().cloned().collect();
     // Cleanup runs on its own thread, so that a filesystem that stops
-    // answering cannot hold the process past the cap.
+    // answering cannot hold the process past the cap. Without that thread
+    // there is nothing to bound it, so it is skipped.
     let (done, finished) = std::sync::mpsc::channel();
-    let running = {
-        let actions = actions.clone();
-        std::thread::Builder::new()
-            .name("termination-cleanup".into())
-            .spawn(move || {
-                for action in actions {
-                    action(deadline);
-                }
-                let _ = done.send(());
-            })
-    };
-    match running {
-        Ok(_) => {
-            let _ = finished.recv_timeout(cap.saturating_sub(started.elapsed()));
+    let running = spawn("termination-cleanup", move || {
+        for action in actions {
+            action(deadline);
         }
-        Err(_) => {
-            for action in actions {
-                action(deadline);
-            }
-        }
+        let _ = done.send(());
+    });
+    if running.is_ok() {
+        let _ = finished.recv_timeout(cap.saturating_sub(started.elapsed()));
     }
     let _ = signal_hook::low_level::emulate_default_handler(signal);
     // Not reached: both signals end a process by default.
@@ -177,6 +212,7 @@ fn terminate(signal: i32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
 
@@ -187,27 +223,60 @@ mod tests {
         assert_eq!(unsafe { libc::raise(signal) }, 0);
     }
 
+    /// A cleanup that appends `text` to the marker file.
+    fn mark(text: &'static str) -> impl Fn(Instant) + Send + Sync + 'static {
+        let marker = std::path::PathBuf::from(std::env::var_os(MARKER).unwrap());
+        move |_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&marker)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap()
+        }
+    }
+
+    fn stall(_: Instant) {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
     #[test]
     fn termination_subprocess() {
         let Ok(mode) = std::env::var(CHILD) else {
             return;
         };
-        let marker = std::path::PathBuf::from(std::env::var_os(MARKER).unwrap());
-        let mark = move |_: Instant| std::fs::write(&marker, b"cleaned").unwrap();
-        let _cleanup = match mode.as_str() {
-            "cleanup" | "inherited-ignore" => add(mark).unwrap(),
+        let mut cleanups = Vec::new();
+        match mode.as_str() {
+            "cleanup" | "inherited-ignore" => cleanups.push(add(mark("cleaned")).unwrap()),
             "removed" => {
-                drop(add(mark).unwrap());
-                add(|_| {}).unwrap()
+                drop(add(mark("cleaned")).unwrap());
+                cleanups.push(add(|_| {}).unwrap());
             }
-            // A cleanup that never finishes: only the cap or a second
-            // interrupt ends the process.
-            "cap" | "second-interrupt" => add(|_| loop {
-                std::thread::sleep(Duration::from_secs(60));
-            })
-            .unwrap(),
+            "first" => {
+                cleanups.push(add(mark("later")).unwrap());
+                cleanups.push(add_first(mark("first,")).unwrap());
+            }
+            "repeated" => cleanups.push(
+                add(|deadline| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    mark("cleaned")(deadline)
+                })
+                .unwrap(),
+            ),
+            "cap" | "refused" => cleanups.push(add(stall).unwrap()),
+            "watchdog" => {
+                bounded(stall);
+                panic!("the watchdog did not end the process");
+            }
+            "watchdog-finished" | "watchdog-refused" => {
+                bounded(mark("cleaned"));
+                std::process::exit(7);
+            }
             _ => panic!("unknown termination test mode"),
-        };
+        }
         match mode.as_str() {
             "inherited-ignore" => {
                 // Ignored, it runs nothing; the next SIGTERM still cleans up.
@@ -215,9 +284,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(200));
                 raise(libc::SIGTERM);
             }
-            "second-interrupt" => {
+            "repeated" => {
+                // A second interrupt does not cut the cleanup short.
                 raise(libc::SIGINT);
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(50));
                 raise(libc::SIGINT);
             }
             _ => raise(libc::SIGTERM),
@@ -226,14 +296,51 @@ mod tests {
         panic!("the signal did not end the process");
     }
 
+    enum Ending {
+        Signal(i32),
+        Code(i32),
+    }
+
     #[test]
     fn termination_runs_cleanup_and_ends_by_the_signal() {
-        for (mode, signal, cleaned, cap_ms) in [
-            ("cleanup", libc::SIGTERM, true, None),
-            ("removed", libc::SIGTERM, false, None),
-            ("inherited-ignore", libc::SIGTERM, true, None),
-            ("cap", libc::SIGTERM, false, Some(200)),
-            ("second-interrupt", libc::SIGINT, false, Some(60_000)),
+        use Ending::*;
+        for (mode, ending, marked, cap_ms, refused) in [
+            (
+                "cleanup",
+                Signal(libc::SIGTERM),
+                Some("cleaned"),
+                None,
+                false,
+            ),
+            ("removed", Signal(libc::SIGTERM), None, None, false),
+            (
+                "inherited-ignore",
+                Signal(libc::SIGTERM),
+                Some("cleaned"),
+                None,
+                false,
+            ),
+            (
+                "first",
+                Signal(libc::SIGTERM),
+                Some("first,later"),
+                None,
+                false,
+            ),
+            (
+                "repeated",
+                Signal(libc::SIGINT),
+                Some("cleaned"),
+                None,
+                false,
+            ),
+            ("cap", Signal(libc::SIGTERM), None, Some(200), false),
+            // Unbounded, the stalled cleanup would hold the process for
+            // longer than the test waits.
+            ("refused", Signal(libc::SIGTERM), None, Some(60_000), true),
+            ("watchdog", Code(STALLED), None, Some(200), false),
+            ("watchdog-finished", Code(7), Some("cleaned"), None, false),
+            ("watchdog-refused", Code(7), None, None, true),
         ] {
             let directory = crate::test_support::tempdir().unwrap();
             let marker = directory.path().join("cleaned");
@@ -249,6 +356,9 @@ mod tests {
             if let Some(cap) = cap_ms {
                 command.env("SYQ_TEST_TERMINATION_CAP_MS", cap.to_string());
             }
+            if refused {
+                command.env("SYQ_TEST_REFUSE_TERMINATION_THREADS", "1");
+            }
             if mode == "inherited-ignore" {
                 use std::os::unix::process::CommandExt;
                 unsafe {
@@ -260,25 +370,30 @@ mod tests {
                     });
                 }
             }
-            let started = Instant::now();
-            // Well short of the child's own 30-second wait and of the
-            // minute-long cap the second interrupt has to cut short.
+            // Well short of the child's own 30-second wait and of a stalled
+            // cleanup's minute.
             let output = super::super::capture_output_bounded(
                 &mut command,
-                started + Duration::from_secs(20),
+                Instant::now() + Duration::from_secs(20),
                 &|| false,
                 64 * 1024,
             )
             .unwrap();
-            assert_eq!(
-                output.status.signal(),
-                Some(signal),
+            let context = format!(
                 "{mode}: status={:?}, stdout={}, stderr={}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert_eq!(marker.exists(), cleaned, "{mode}");
+            match ending {
+                Signal(signal) => assert_eq!(output.status.signal(), Some(signal), "{context}"),
+                Code(code) => assert_eq!(output.status.code(), Some(code), "{context}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(&marker).ok().as_deref(),
+                marked,
+                "{mode}"
+            );
         }
     }
 }

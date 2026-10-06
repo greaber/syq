@@ -27,7 +27,9 @@ fn register_signal_cleanup(path: &Path) -> Result<()> {
         .clone();
     let result = SIGNAL_CLEANUP.get_or_init(|| {
         let cleanup_paths = Arc::clone(&paths);
-        let cleanup = crate::process::termination::add(move |_| {
+        // Removing a socket directory is quick; it runs before slower
+        // cleanup, such as removing a copy's temporary files.
+        let cleanup = crate::process::termination::add_first(move |_| {
             let paths: Vec<_> = cleanup_paths
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

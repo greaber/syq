@@ -1316,13 +1316,13 @@ impl FsOps {
         label: &Path,
         mode: u32,
     ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
-        let Some((file, basis_size)) =
+        let Some((file, opened)) =
             self.open_private_partial_rooted(root, relative, label, true, mode, Some(mode))?
         else {
             return Ok(None);
         };
         let metadata = file.metadata()?;
-        Ok(Some((file, metadata, basis_size)))
+        Ok(Some((file, metadata, opened.basis_size())))
     }
 
     /// Write a staged file's data and metadata, from a patch source when

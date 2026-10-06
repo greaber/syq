@@ -334,11 +334,15 @@ and modification time may differ from an uninterrupted copy. Explicit
 If you interrupt a copy with Ctrl-C or stop it with SIGTERM, or its
 connection to a remote syq is lost, the receiving side removes the temporary
 files it created before it exits, taking at most half a second. It keeps
-partial files of 1 MiB or more, so that rerunning the copy can reuse their
-contents. A second Ctrl-C stops syq immediately, without this cleanup.
+partial files of 1 MiB or more for a later copy to resume from. Syq creates a
+partial file at the file's full size, so one is kept even when little was
+written to it. Remote copies, and copies with a bandwidth cap or
+`--performance-tuning copy-path=ranges`, reuse matching data from them. A copy
+within one machine that copies files whole does not: rerunning it copies those
+files whole again, so their partial files are removed.
 
 Partial files may remain after a successful retry, as can temporary files
-left by a copy that was stopped immediately or killed. To remove them:
+left by a copy that was killed. To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup

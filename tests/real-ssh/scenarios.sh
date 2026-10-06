@@ -953,6 +953,66 @@ assert_same_tree \
     destination /tmp/syq-real-ssh/direct-destination \
     direct
 
+printf 'case: a killed copy leaves a restricted receiver only partials worth resuming\n'
+# Partials written in ranges at a low capped rate stay on the receiver, and
+# unfinished, for tens of seconds. Killing the source coordinator, the
+# newest syq on the source, ends the command-restricted receiver's control
+# connection: the receiver removes the partial shorter than 1 MiB and keeps
+# the longer one for resuming.
+killed_root=/tmp/syq-real-ssh/killed-destination
+ssh source 'mkdir -p /tmp/syq-real-ssh/killed-source &&
+    head -c 921600 /dev/urandom >/tmp/syq-real-ssh/killed-source/short &&
+    head -c 6291456 /dev/urandom >/tmp/syq-real-ssh/killed-source/long'
+killed_partials() {
+    # shellcheck disable=SC2029
+    ssh destination "find $killed_root -maxdepth 1 -type f -name '.*.syq-tmp.*' -printf '%f %s\\n' 2>/dev/null | sort"
+}
+wait_for_killed_partials() {
+    wanted=$1
+    deadline=$(($(date +%s) + 30))
+    next_progress=$(($(date +%s) + 5))
+    while :; do
+        listing=$(killed_partials)
+        if [ "$(printf '%s' "$listing" | grep -c .)" -eq "$wanted" ]; then
+            break
+        fi
+        now=$(date +%s)
+        if [ "$now" -ge "$deadline" ]; then
+            printf 'timed out waiting for %s partials; found:\n%s\n' "$wanted" "$listing" >&2
+            exit 1
+        fi
+        if [ "$now" -ge "$next_progress" ]; then
+            printf 'waiting for %s partials; found:\n%s\n' "$wanted" "$listing" >&2
+            next_progress=$((now + 5))
+        fi
+        sleep 0.2
+    done
+}
+syq cp --no-progress --resource-limits bandwidth=32 \
+    --performance-tuning workers=2,copy-path=ranges \
+    --from source --srcs-in /tmp/syq-real-ssh/killed-source \
+    --to destination --into "$killed_root" &
+killed_copy_pid=$!
+wait_for_killed_partials 2
+ssh source 'pkill -KILL -n -x syq'
+if wait "$killed_copy_pid"; then
+    echo 'a copy whose coordinator was killed reported success' >&2
+    exit 1
+fi
+wait_for_killed_partials 1
+# shellcheck disable=SC2029
+test "$(ssh destination "find $killed_root -maxdepth 1 -type f -name '.long.syq-tmp.*' -size 6291456c" | grep -c .)" -eq 1
+# shellcheck disable=SC2029
+ssh destination "test ! -e $killed_root/short && test ! -e $killed_root/long"
+syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/killed-source \
+    --to destination --into "$killed_root"
+for name in short long; do
+    # shellcheck disable=SC2029
+    ssh source "sha256sum </tmp/syq-real-ssh/killed-source/$name" >/tmp/syq-killed-source.sum
+    # shellcheck disable=SC2029
+    ssh destination "sha256sum <$killed_root/$name" | cmp - /tmp/syq-killed-source.sum
+done
+
 printf 'case: native remote removal follows parents but preserves final link identity\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/rm-policy/real; printf keep > /tmp/syq-real-ssh/rm-policy/real/file; ln -s real /tmp/syq-real-ssh/rm-policy/link'
 syq rm --on source --root /tmp/syq-real-ssh/rm-policy --follow-src --src-non-dir link

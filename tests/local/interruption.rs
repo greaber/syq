@@ -386,49 +386,84 @@ fn an_interrupted_pull_removes_its_streamed_patch_stage() {
     }
 }
 
-/// Interrupt a local copy whose receiver's cleanup then stalls in a test
-/// barrier, so that only the cap or a second interrupt can end it.
-fn interrupt_with_stalled_cleanup(t: &Tmp, cap_ms: Option<u64>) -> Child {
+/// Interrupt a copy whose receiver's cleanup then stalls in a test barrier,
+/// so that only its cap can end it: a local copy interrupted as a terminal
+/// does, or a push whose coordinator is killed, so that the remote receiver
+/// cleans up because its connection was lost.
+fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str) -> (Child, i32) {
     small_tree(t, 20);
     let staged = t.path("staged");
     let sweeping = t.path("sweeping");
-    let mut command = local_copy(t, "workers=1,batch-files=8");
+    let tuning = "workers=1,batch-files=8";
+    let mut command = match route {
+        "local" => local_copy(t, tuning),
+        _ => remote_copy(t, route, tuning),
+    };
     command
         .env("SYQ_TEST_SMALL_STAGE_READY_FILE", &staged)
         .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", t.path("never"))
         .env("SYQ_TEST_SIDECAR_SWEEP_READY_FILE", &sweeping)
         .env("SYQ_TEST_SIDECAR_SWEEP_CONTINUE_FILE", t.path("never"));
-    if let Some(cap) = cap_ms {
-        command.env("SYQ_TEST_TERMINATION_CAP_MS", cap.to_string());
-    }
     let mut child = start_job(&mut command);
     wait_for_confinement_marker(&mut child, &staged, "staged small files");
-    signal_group(&child, libc::SIGINT);
+    let signal = if route == "local" {
+        signal_group(&child, libc::SIGINT);
+        libc::SIGINT
+    } else {
+        signal_process(&child, libc::SIGKILL);
+        libc::SIGKILL
+    };
     wait_until("the receiver's cleanup", || sweeping.exists());
-    child
-}
-
-#[test]
-fn a_second_interrupt_ends_the_copy_at_once() {
-    let t = Tmp::new();
-    // Without the second interrupt, the stalled cleanup would hold the
-    // receiver for its whole cap of a minute.
-    let child = interrupt_with_stalled_cleanup(&t, Some(60_000));
-    signal_group(&child, libc::SIGINT);
-    let (status, stderr, elapsed) = finish(child, Duration::from_secs(30));
-    assert_eq!(status.signal(), Some(libc::SIGINT), "{stderr}");
-    assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
-    // It ended before removing anything.
-    assert!(!own_sidecars(&t.path("dst")).is_empty());
+    (child, signal)
 }
 
 #[test]
 fn an_interrupted_receiver_ends_by_its_cap_when_cleanup_stalls() {
+    // The barrier would hold the cleanup for a minute; the cap of half a
+    // second ends the receiver long before, whether a signal or a lost
+    // connection started the cleanup.
+    for route in ["local", "push"] {
+        let t = Tmp::new();
+        let (child, signal) = interrupt_with_stalled_cleanup(&t, route);
+        let (status, stderr, elapsed) = finish(child, Duration::from_secs(30));
+        assert_eq!(status.signal(), Some(signal), "{route}: {stderr}");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "{route}: took {elapsed:?}"
+        );
+        // It ended without removing what the stalled cleanup had not reached.
+        assert!(!own_sidecars(&t.path("dst")).is_empty(), "{route}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_interrupted_local_copy_removes_its_whole_file_partials() {
+    // A file copied whole on this machine is copied whole again by a rerun,
+    // which never reads this partial, so it goes whatever its length.
     let t = Tmp::new();
-    let child = interrupt_with_stalled_cleanup(&t, None);
-    // The barrier would hold the cleanup for a minute; the default cap of
-    // half a second ends the receiver long before.
-    let (status, stderr, elapsed) = finish(child, Duration::from_secs(30));
+    let data = prng(2 << 20, 34);
+    write(&t.path("src/many/large"), &data);
+    write(
+        &t.path(&format!("dst/many/{FOREIGN}")),
+        b"another run's data",
+    );
+    let ready = t.path("copied");
+    let mut command = local_copy(&t, "workers=1");
+    command
+        .env("SYQ_TEST_COPY_LOCAL_COPIED_READY_FILE", &ready)
+        .env("SYQ_TEST_COPY_LOCAL_COPIED_CONTINUE_FILE", t.path("never"));
+    let mut child = start_job(&mut command);
+    wait_for_confinement_marker(&mut child, &ready, "the local copy's full partial");
+    let partials = own_sidecars(&t.path("dst"));
+    assert_eq!(partials.len(), 1);
+    assert_eq!(fs::metadata(&partials[0]).unwrap().len(), data.len() as u64);
+    signal_group(&child, libc::SIGINT);
+    let (status, stderr, elapsed) = finish(child, Duration::from_secs(20));
     assert_eq!(status.signal(), Some(libc::SIGINT), "{stderr}");
-    assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    assert_eq!(own_sidecars(&t.path("dst")), Vec::<PathBuf>::new());
+    assert!(!t.path("dst/many/large").exists());
+    assert_rerun_completes(local_copy(&t, "workers=1"), &t);
+    assert_eq!(read(&t.path("dst/many/large")), data);
 }

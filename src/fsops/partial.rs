@@ -103,7 +103,7 @@ impl FsOps {
         create_if_missing: bool,
         create_mode: u32,
         widest: Option<u32>,
-    ) -> Result<Option<(File, Option<u64>)>> {
+    ) -> Result<Option<(File, OpenedPartial)>> {
         self.uncache_rooted(root, relative);
         let mut repaired_permissions = false;
         if create_if_missing {
@@ -112,7 +112,7 @@ impl FsOps {
                     let created = file.metadata()?;
                     note_created_owner(&created);
                     self.note_created_mode(&file, &created, create_mode);
-                    return Ok(Some((file, None)));
+                    return Ok(Some((file, OpenedPartial::Created(created))));
                 }
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
                 Err(error) => return Err(error),
@@ -171,7 +171,7 @@ impl FsOps {
                                     continue;
                                 }
                             }
-                            return Ok(Some((file, Some(opened.len()))));
+                            return Ok(Some((file, OpenedPartial::Reused(opened.len()))));
                         }
                         Err(error)
                             if error.downcast_ref::<io::Error>().is_some_and(|error| {
@@ -267,7 +267,7 @@ impl FsOps {
                         let created = file.metadata()?;
                         note_created_owner(&created);
                         self.note_created_mode(&file, &created, create_mode);
-                        return Ok(Some((file, None)));
+                        return Ok(Some((file, OpenedPartial::Created(created))));
                     }
                     Err(error)
                         if error
@@ -554,7 +554,7 @@ impl FsOps {
                                 if is_fresh_partial(&created, staged)
                                     && created.mode() & 0o600 == 0o600 =>
                             {
-                                return Ok(Some((file, None, Some(created))));
+                                return Ok(Some((file, None, Some(created), None)));
                             }
                             Ok(_) => {}
                             Err(error) if existing_leaf_refused(&error) => {}
@@ -570,19 +570,20 @@ impl FsOps {
                     PRIVATE_PARTIAL_MODE,
                     Some(mode | 0o600),
                 )
-                .map(|opened| opened.map(|(file, basis_size)| (file, basis_size, None)))
+                .map(|opened| {
+                    opened
+                        .map(|(file, opened)| (file, opened.basis_size(), None, opened.identity()))
+                })
             })?;
-        let Some((file, basis_size, created)) = opened else {
+        let Some((file, basis_size, created, identity)) = opened else {
             return Ok(Preparation {
                 partial_size: None,
                 has_candidates: !self.candidate_partials(&target).is_empty(),
             });
         };
-        if let (Some(creation), None) = (creation, basis_size) {
-            let identity = match &created {
-                Some(created) => identity_of(created),
-                None => identity_of(&file.metadata()?),
-            };
+        if let (Some(creation), Some(identity)) =
+            (creation, identity.or(created.as_ref().map(identity_of)))
+        {
             creation.register(&target.root, &relative, identity, Sidecar::Partial);
         }
         if let Some(old_size) = basis_size {
@@ -842,7 +843,8 @@ impl FsOps {
                     None,
                 )
             })?;
-        let (output, basis_size) = opened.context("sidecar creation was requested")?;
+        let (output, opened) = opened.context("sidecar creation was requested")?;
+        let (basis_size, created) = (opened.basis_size(), opened.identity());
         let location = FileLocation::Rooted {
             root: target.root.identity(),
             relative: relative.clone(),
@@ -910,13 +912,8 @@ impl FsOps {
             );
             (output, None)
         } else {
-            if basis_size.is_none() {
-                creation.register(
-                    &target.root,
-                    &relative,
-                    identity_of(&output.metadata()?),
-                    Sidecar::Partial,
-                );
+            if let Some(identity) = created {
+                creation.register(&target.root, &relative, identity, Sidecar::Partial);
             }
             (output, basis_size)
         };
@@ -1074,13 +1071,12 @@ impl FsOps {
             // planned output length, including growth and shrinkage.
             target
                 .root
-                .clone_file_open(&file, &metadata, relative, metadata.len())?
-                .map(|clone| clone.metadata().map(|metadata| identity_of(&metadata)))
-                .transpose()
-                .map_err(Into::into)
+                .clone_file_open(&file, &metadata, relative, metadata.len())
         })?;
-        if let Some(identity) = cloned {
-            creation.register(&target.root, &relative, identity, Sidecar::Partial);
+        if let Some(clone) = cloned {
+            creation.register_with(&target.root, &relative, Sidecar::Partial, || {
+                clone.metadata().map(|metadata| identity_of(&metadata))
+            })?;
         }
         Ok(())
     }
@@ -1342,16 +1338,19 @@ impl FsOps {
                 })?;
             target_relative = relative;
             target_label = label;
-            let (d, basis_size) = opened.context("sidecar creation was requested")?;
-            if basis_size.is_none() {
+            let (d, opened) = opened.context("sidecar creation was requested")?;
+            // A later copy on this machine copies the file whole again,
+            // into a partial of its own, so this one is never resumed:
+            // an interrupted copy removes it whatever its length.
+            if let Some(identity) = opened.identity() {
                 creation.register(
                     &destination_root,
                     &target_relative,
-                    identity_of(&d.metadata()?),
-                    Sidecar::Partial,
+                    identity,
+                    Sidecar::Stage,
                 );
             }
-            if basis_size.is_some() {
+            if opened.basis_size().is_some() {
                 if !replace_partial {
                     // Preserve resumable data unless the coordinator chose
                     // whole-file copying for a source-change retry.
@@ -1564,6 +1563,14 @@ impl FsOps {
             close_writer(d, &target_label)?;
         }
         _copy.bytes(size);
+        #[cfg(debug_assertions)]
+        if !inplace {
+            test_race_barrier(
+                "SYQ_TEST_COPY_LOCAL_COPIED_READY_FILE",
+                "SYQ_TEST_COPY_LOCAL_COPIED_CONTINUE_FILE",
+                "local copy written to its partial",
+            )?;
+        }
         Ok(CopyLocalOutcome::Copied)
     }
 
@@ -1610,12 +1617,11 @@ impl FsOps {
         let creation = sidecars::begin()?;
         let outcome = match root.clone_file_open(&source, &source_metadata, &partial, size)? {
             Some(clone) => {
-                creation.register(
-                    &root,
-                    &partial,
-                    identity_of(&clone.metadata()?),
-                    Sidecar::Partial,
-                );
+                // As on Linux, a later copy on this machine clones the file
+                // again rather than resuming this partial.
+                creation.register_with(&root, &partial, Sidecar::Stage, || {
+                    clone.metadata().map(|metadata| identity_of(&metadata))
+                })?;
                 _copy.bytes(size);
                 CopyLocalOutcome::Copied
             }
@@ -4174,6 +4180,32 @@ impl SmallSourceResult for SmallBlock {
 impl SmallSourceResult for DifferingBlocks {
     fn set_source(&mut self, source: Option<Entry>) {
         self.source = source;
+    }
+}
+
+/// How `open_private_partial_rooted` settled on its partial.
+pub(super) enum OpenedPartial {
+    /// It created the file, whose metadata was read as it was created.
+    Created(fs::Metadata),
+    /// It reopened a partial of this length.
+    Reused(u64),
+}
+
+impl OpenedPartial {
+    /// The length of the reopened partial, whose bytes may be resumed.
+    pub(super) fn basis_size(&self) -> Option<u64> {
+        match self {
+            Self::Created(_) => None,
+            Self::Reused(len) => Some(*len),
+        }
+    }
+
+    /// The created file's device and inode.
+    pub(super) fn identity(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Created(created) => Some(identity_of(created)),
+            Self::Reused(_) => None,
+        }
     }
 }
 

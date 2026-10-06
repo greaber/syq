@@ -42,7 +42,7 @@ syq rsync [OPTIONS] SRC... [USER@]HOST:DEST
 | `--numeric-ids` | No-op accepted for rsync compatibility (syq always uses numeric uid/gid) |
 | `--bwlimit <RATE>` | Limit the aggregate file-data rate across all workers (default unit: KiB/s; 0 disables) |
 | `-P` | Same as --progress --partial |
-| `--partial` | No-op accepted for rsync compatibility (syq keeps partial files of 1 MiB or more) |
+| `--partial` | No-op accepted for rsync compatibility (syq keeps partial files a later copy can resume from) |
 | `-c, --checksum` | Skip quick check; compare file contents block by block and repair differences |
 | `-I, --ignore-times` | Don't skip files whose size and modification time match; compare those that block reuse would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest |
 | `--inplace` | Update files in place instead of writing a partial and renaming. Use this to modify a large existing file without copying it first (saves time and disk space when only part of it changes). Cannot be combined with -u or --ignore-existing: an interrupted in-place write leaves a newer-looking final file those filters would then skip forever |

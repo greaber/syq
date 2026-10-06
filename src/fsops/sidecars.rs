@@ -1,11 +1,13 @@
 //! The sidecars this process has created and not yet published or removed.
 //!
-//! A receiver that is interrupted, or whose copy's control connection
-//! closes, removes them before it exits. No later run uses a small file's
-//! stage or a grouped or streamed patch's stage: each run stages under names
-//! of its own. A partial of a file copied on its own is kept when it is at
-//! least `RESUMABLE_PARTIAL_MIN` long, since a rerun compares its blocks with
-//! the source and reuses those that match; a shorter one is removed.
+//! A receiver that is interrupted, or whose copy's control connection is
+//! lost, removes them before it exits. No later run uses a small file's
+//! stage, a grouped or streamed patch's stage, or the partial of a file
+//! copied whole on one machine: each run stages under names of its own,
+//! and a later copy on that machine copies the file whole again. A partial
+//! written in ranges is kept when it is at least `RESUMABLE_PARTIAL_MIN`
+//! long, since a rerun compares its blocks with the source and reuses those
+//! that match; a shorter one is removed.
 //!
 //! Each sidecar is known by the inode it was created as. A sweep removes a
 //! name only while it still holds that inode as a singly linked regular
@@ -45,11 +47,11 @@ const ROOT_SLOTS: usize = 8;
 /// What a sidecar holds, which decides whether an interruption keeps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Sidecar {
-    /// A small file's stage, or a grouped or streamed patch's: always
-    /// removed.
+    /// A small file's stage, a grouped or streamed patch's, or the partial
+    /// of a file copied whole on one machine: always removed.
     Stage,
-    /// The partial of a file copied on its own: kept when long enough to be
-    /// worth resuming.
+    /// A partial written in ranges: kept when long enough to be worth
+    /// resuming.
     Partial,
 }
 
@@ -165,6 +167,22 @@ impl Creation<'_> {
         };
         let replaced = self.registry.lock(thread_shard()).insert(identity, entry);
         drop(replaced);
+    }
+
+    /// Like `register`, reading the sidecar's identity only when this
+    /// process registers sidecars.
+    pub(super) fn register_with(
+        self,
+        root: &Arc<Root>,
+        relative: &RelativePath,
+        kind: Sidecar,
+        identity: impl FnOnce() -> io::Result<(u64, u64)>,
+    ) -> io::Result<()> {
+        if self.shard.is_some() {
+            let identity = identity()?;
+            self.register(root, relative, identity, kind);
+        }
+        Ok(())
     }
 }
 

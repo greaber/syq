@@ -167,15 +167,18 @@ impl SweepOnLoss {
         self.ended.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Within the cap: a removal that stalls, as on a filesystem that stops
+    /// answering, ends the process rather than leaving it running.
     fn run(&self) {
         if self.ended.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let deadline = crate::process::termination::cleanup_deadline();
-        let swept = crate::fsops::sweep_sidecars(self.partials, deadline);
-        if crate::output::debug() && swept != crate::fsops::Swept::default() {
-            crate::output::diagnostic!("syq server: copy lost: temporary files {swept:?}");
-        }
+        crate::process::termination::bounded(|deadline| {
+            let swept = crate::fsops::sweep_sidecars(self.partials, deadline);
+            if crate::output::debug() && swept != crate::fsops::Swept::default() {
+                crate::output::diagnostic!("syq server: copy lost: temporary files {swept:?}");
+            }
+        });
     }
 }
 

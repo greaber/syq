@@ -1373,15 +1373,16 @@ impl FsOps {
                 Some(staged),
             )
         })?;
-        let (file, basis_size) = opened.context("sidecar creation was requested")?;
-        let created = file.metadata()?;
-        creation.register(
-            &rooted.root,
-            &partial,
-            (created.dev(), created.ino()),
-            Sidecar::Stage,
-        );
-        if basis_size.is_some() {
+        let (file, opened) = opened.context("sidecar creation was requested")?;
+        creation.register_with(&rooted.root, &partial, Sidecar::Stage, || {
+            match opened.identity() {
+                Some(identity) => Ok(identity),
+                None => file
+                    .metadata()
+                    .map(|metadata| (metadata.dev(), metadata.ino())),
+            }
+        })?;
+        if opened.basis_size().is_some() {
             file.set_len(0)?;
         }
         observed_write(&self.operation, &file, data, 0, false)
