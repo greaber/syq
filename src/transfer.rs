@@ -120,10 +120,11 @@ impl StartRule {
             })
     }
 
-    /// Workers for `files` totalling `bytes`, every one sent in small-file
-    /// batches: a worker per startup batch of files or bytes. A batched file
-    /// is never split, so even an explicit count starts at most one worker
-    /// per file; a worker with nothing to do still costs a connection.
+    /// Workers for `files` new files totalling `bytes`, every one sent in
+    /// small-file batches: a worker per startup batch of files or bytes. A
+    /// batched file is never split, so even an explicit count starts at most
+    /// one worker per file; a worker with nothing to do still costs a
+    /// connection.
     fn batched(&self, files: usize, bytes: u64) -> usize {
         if !self.automatic {
             return self.workers.min(files.max(1));
