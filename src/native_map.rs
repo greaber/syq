@@ -500,25 +500,19 @@ fn push_directory_children(
     let directory = root.open_directory_verified(&directory_relative, expected)?;
     let mut names = root.read_open_directory(&directory)?;
     names.sort();
-    let mut children = Vec::with_capacity(names.len());
+    let start = pending.len();
+    pending.reserve(names.len());
     for name in names {
         let metadata = root.metadata_in_directory(&directory, &name)?;
         let output_relative = join_rel(output_relative, &name);
         let entry = rooted_entry_in_directory(root, &directory, &name, output_relative, metadata)?;
-        children.push(PendingMapEntry {
+        pending.push(PendingMapEntry {
             root_relative: join_rel(root_relative, &name),
             entry,
             metadata,
         });
     }
-    children.reverse();
-    if pending.is_empty() {
-        // Reuse the completed directory listing instead of allocating a
-        // second buffer large enough to hold every entry again.
-        *pending = children;
-    } else {
-        pending.extend(children);
-    }
+    pending[start..].reverse();
     Ok(())
 }
 
