@@ -168,6 +168,29 @@ pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str
 }
 
 #[cfg(test)]
+pub(crate) type AccessObserver = Box<dyn FnMut(&File)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after each change this thread makes to who may open a file:
+    /// its owner, its mode or an ACL.
+    pub(crate) static ACCESS_CHANGED: std::cell::RefCell<Option<AccessObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Let a test see `file` after a change to its owner, its mode or an ACL.
+#[inline]
+pub(crate) fn access_changed(file: &File) {
+    #[cfg(test)]
+    ACCESS_CHANGED.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(file);
+        }
+    });
+    let _ = file;
+}
+
+#[cfg(test)]
 pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
     *blake3::hash(data).as_bytes()
 }
@@ -525,6 +548,9 @@ pub struct FsOps {
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
+    /// Devices this connection has probed for whether a new file can be
+    /// narrowed below the mode it came out with (`note_created_mode`).
+    fixed_wide_mode_devices: HashMap<u64, bool>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -731,6 +757,7 @@ impl FsOps {
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
+            fixed_wide_mode_devices: HashMap::new(),
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,
@@ -1335,21 +1362,23 @@ impl FsOps {
             .context("small copy requires the destination root")?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         let creation = sidecars::begin()?;
+        let staged = staged_file_mode(meta, flags);
         let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
             self.open_private_partial_rooted(
                 &rooted.root,
                 partial,
                 label,
                 true,
-                staged_file_mode(meta, flags),
+                staged,
+                Some(staged),
             )
         })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
-        let staged = file.metadata()?;
+        let created = file.metadata()?;
         creation.register(
             &rooted.root,
             &partial,
-            (staged.dev(), staged.ino()),
+            (created.dev(), created.ino()),
             Sidecar::Stage,
         );
         if basis_size.is_some() {

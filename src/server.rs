@@ -15,6 +15,9 @@ use std::time::Duration;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
+mod control_lifetime;
+pub(crate) use control_lifetime::ControlLifetime;
+
 mod interfaces;
 use interfaces::{local_addrs, BoundFamilies};
 
@@ -368,67 +371,6 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static, W: Write>(
         crate::process::termination::wait_if_terminating();
     }
     result
-}
-
-/// Revoke even if the protocol reader is blocked behind queued metadata work.
-/// The authenticated control owns this guard; no worker may prolong its life.
-pub(crate) struct ControlLifetime {
-    wake: std::os::unix::net::UnixStream,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl ControlLifetime {
-    pub(crate) fn watch(
-        input: &impl std::os::fd::AsFd,
-        authority: Arc<crate::restricted::RestrictedAuthority>,
-    ) -> Result<Self> {
-        use std::os::fd::AsRawFd;
-        let input = input.as_fd().try_clone_to_owned()?;
-        let (wake, stopped) =
-            crate::process::with_inheritance_guard(std::os::unix::net::UnixStream::pair)?;
-        let thread = std::thread::Builder::new()
-            .name("copy-control-lifetime".into())
-            .spawn(move || loop {
-                let mut descriptors = [
-                    libc::pollfd {
-                        fd: input.as_raw_fd(),
-                        events: 0,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: stopped.as_raw_fd(),
-                        events: 0,
-                        revents: 0,
-                    },
-                ];
-                let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
-                if descriptors[1].revents != 0 {
-                    break;
-                }
-                if result > 0
-                    && descriptors[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
-                        != 0
-                {
-                    authority.close_control();
-                    break;
-                }
-                if result < 0 && io::Error::last_os_error().kind() != ErrorKind::Interrupted {
-                    authority.close_control();
-                    break;
-                }
-            })?;
-        Ok(Self {
-            wake,
-            thread: Some(thread),
-        })
-    }
-}
-impl Drop for ControlLifetime {
-    fn drop(&mut self) {
-        let _ = self.wake.shutdown(std::net::Shutdown::Both);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 fn file_payload_request(request: &Request) -> bool {

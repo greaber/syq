@@ -1317,7 +1317,7 @@ impl FsOps {
         mode: u32,
     ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
         let Some((file, basis_size)) =
-            self.open_private_partial_rooted(root, relative, label, true, mode)?
+            self.open_private_partial_rooted(root, relative, label, true, mode, Some(mode))?
         else {
             return Ok(None);
         };
@@ -2695,13 +2695,19 @@ mod tests {
                 }
                 "wide" => {
                     // An empty file of ours with permissions beyond the staging
-                    // mode is not used as it is: the checked path narrows it
-                    // to 0600 before anything is written.
+                    // mode is not used: someone may have opened it, and keeps
+                    // reading after a chmod, so the checked path replaces it
+                    // with a new private file before anything is written.
                     fs::write(&sidecar, b"").unwrap();
                     fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o666)).unwrap();
+                    // Held open, its inode number cannot be given to the
+                    // replacement, as ext4 gives a freed one at once.
+                    let planted = File::open(&sidecar).unwrap();
                     let target = ops.small_target(&wanted).unwrap();
                     let stage = ops.create_small_stage(&wanted, target).unwrap();
-                    assert!(stage.reused);
+                    assert!(!stage.reused);
+                    assert_ne!(stage.created.ino(), planted.metadata().unwrap().ino());
+                    drop(planted);
                     assert_eq!(stage.created.mode() & 0o777, 0o600);
                     drop(stage);
                 }
