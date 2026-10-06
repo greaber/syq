@@ -1702,6 +1702,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         condition: TargetCondition::Absent,
         guard: None,
         replaces: false,
+        new_file: false,
     }]);
 
     let mut unrooted = FsOps::new();
@@ -1789,6 +1790,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         condition: TargetCondition::Any,
         guard: None,
         replaces: false,
+        new_file: false,
     };
     let response = rooted.handle(&Request::PutSmallBatch(vec![
         put(b"logical/file", 0o640, flags::RECEIVER_MODE),
@@ -2987,6 +2989,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             condition: TargetCondition::Absent,
             guard: None,
             replaces: false,
+            new_file: false,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("small")).unwrap(), b"small-data");
@@ -3011,6 +3014,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             },
             guard: None,
             replaces: false,
+            new_file: false,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("existing")).unwrap(), b"new");
@@ -3131,6 +3135,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             condition: TargetCondition::Absent,
             guard: None,
             replaces: false,
+            new_file: false,
         })
         .is_err());
     assert!(!outside.join("escaped").exists());
@@ -7481,6 +7486,7 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                 condition,
                 guard: None,
                 replaces: true,
+                new_file: false,
             })
             .unwrap_err()
         } else {

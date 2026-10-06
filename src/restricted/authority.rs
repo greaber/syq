@@ -2321,10 +2321,14 @@ impl RestrictedAuthority {
                 inplace,
                 copy_id,
                 flags,
+                new_file,
                 create_if_missing,
                 guard,
                 ..
             } => {
+                // The receiver looks for itself whether a file is new: a
+                // sender's word could give an existing file a new mode.
+                *new_file = false;
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file preparation does not match the signed publication policy");
                 }
@@ -2430,14 +2434,15 @@ impl RestrictedAuthority {
                 copy_id,
                 meta,
                 flags,
-                created,
+                new_file,
                 condition,
                 guard,
                 ..
             } => {
-                // This receiver knows the in-place files it created: all of
-                // the copy's connections are in its process.
-                *created = false;
+                // The receiver looks for itself whether a file is new, and
+                // knows the in-place files it created: all of the copy's
+                // connections are in its process.
+                *new_file = false;
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
@@ -2476,6 +2481,8 @@ impl RestrictedAuthority {
                     }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
+                    // As for `Prepare`, the receiver looks for itself.
+                    put.new_file = false;
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
                     }

@@ -721,6 +721,7 @@ impl FsOps {
             condition: patch.condition,
             guard: patch.guard.clone(),
             replaces: true,
+            new_file: false,
         };
         let reused = patch.len - patch.data.len() as u64;
         let clones = reused >= CLONE_MIN_REUSED && reused * 2 >= patch.len;
@@ -927,6 +928,7 @@ impl FsOps {
                         &mut put.flags,
                         default_acl,
                         &mut held,
+                        receiver_mode::Replaced::claimed(put.new_file),
                     )
                     .map(|()| target)
                 });
@@ -1472,6 +1474,7 @@ mod tests {
             condition: TargetCondition::Any,
             guard: None,
             replaces: false,
+            new_file: false,
         }
     }
 

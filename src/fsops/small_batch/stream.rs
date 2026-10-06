@@ -152,6 +152,7 @@ impl FsOps {
             condition: patch.condition,
             guard: patch.guard.clone(),
             replaces: true,
+            new_file: false,
         };
         let mut stream = Box::new(PatchStream {
             patch: patch.clone(),
@@ -477,6 +478,7 @@ impl FsOps {
             &mut stream.put.flags,
             self.default_acl_creation,
             &mut None,
+            crate::fsops::receiver_mode::Replaced::Unknown,
         )?;
         set_meta_written_file_for_publication(
             &stage.file,

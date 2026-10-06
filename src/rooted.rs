@@ -1006,7 +1006,8 @@ impl Root {
 
     /// The mode creating a file at `path` from `proposed` gives it: the
     /// proposal's permission bits limited by this process's umask or, with
-    /// `default_acl`, by the parent's default ACL when it has one.
+    /// `default_acl`, by the parent's default ACL when it has one. Only the
+    /// default ACL needs the parent.
     pub(crate) fn receiver_creation_mode(
         &self,
         path: &RelativePath,
@@ -1014,6 +1015,9 @@ impl Root {
         default_acl: bool,
         held: &mut Option<HeldParent>,
     ) -> Result<u32> {
+        if !default_acl {
+            return Ok(proposed & 0o777 & !crate::fsops::process_umask());
+        }
         self.hold_parent(path, held)?
             .0
             .creation_mode(proposed, default_acl)

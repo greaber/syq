@@ -20,6 +20,7 @@ fn put(path: &[u8]) -> SmallPut {
         condition: TargetCondition::Any,
         guard: None,
         replaces: false,
+        new_file: false,
     }
 }
 
@@ -295,6 +296,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         mode: 0o600,
         flags: 0,
         acl: false,
+        new_file: false,
         attempt: 0,
         create_if_missing: false,
         guard: None,
@@ -333,7 +335,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         copy_id: [9; 16],
         meta: put(b"unused").meta,
         flags: 0,
-        created: false,
+        new_file: false,
         condition: TargetCondition::Absent,
         guard: None,
         expected_hash: None,

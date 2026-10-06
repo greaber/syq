@@ -59,22 +59,59 @@ pub(super) fn note_inplace_creation(copy_id: &CopyId, created: &fs::Metadata) {
         .insert((*copy_id, created.dev(), created.ino()));
 }
 
-/// Decide `flags` and `meta` for publishing a file at `target`, a new
-/// file's permissions limited by its directory's default ACL with
-/// `default_acl`, and otherwise by the umask.
+/// What a receiver knows of the file a publication replaces.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Replaced {
+    /// Nothing: it looks at the path.
+    Unknown,
+    /// There was no regular file at the path. A sender's word for this
+    /// saves a lookup, which can be a round trip on a network filesystem; a
+    /// file that appeared there since is treated as new, as it would be had
+    /// it appeared just after a lookup. A command-restricted receiver does
+    /// not take the sender's word (its authority clears the claim).
+    Nothing,
+    /// A regular file with this mode, which the receiver observed.
+    File(u32),
+}
+
+impl Replaced {
+    /// A sender's claim that it found no regular file at the path.
+    pub(super) fn claimed(new_file: bool) -> Self {
+        if new_file {
+            Self::Nothing
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Decide `flags` and `meta` for publishing a file at `target` that
+/// replaces `replaced`, a new file's permissions limited by its directory's
+/// default ACL with `default_acl`, and otherwise by the umask.
 pub(super) fn resolve_file_publication(
     target: &RootedTarget,
     meta: &mut Meta,
     flags: &mut u8,
     default_acl: bool,
     held: &mut Option<HeldParent>,
+    replaced: Replaced,
 ) -> Result<()> {
     if *flags & flags::RECEIVER_MODE == 0 {
         return Ok(());
     }
-    meta.mode = target
-        .root
-        .receiver_file_mode(&target.relative, meta.mode, default_acl, held)?;
+    meta.mode = match replaced {
+        Replaced::Unknown => {
+            target
+                .root
+                .receiver_file_mode(&target.relative, meta.mode, default_acl, held)?
+        }
+        Replaced::Nothing => {
+            target
+                .root
+                .receiver_creation_mode(&target.relative, meta.mode, default_acl, held)?
+        }
+        Replaced::File(mode) => mode & 0o7777,
+    };
     *flags = (*flags & !flags::RECEIVER_MODE) | flags::MODE;
     Ok(())
 }
@@ -85,7 +122,7 @@ impl FsOps {
     /// file the copy created gets the mode creating it would have given it,
     /// without the owner access its other writers needed. This process knows
     /// the files it created; a copy whose writers run in other processes says
-    /// which it created. `None` leaves the metadata as it is.
+    /// which it created, as `new_file`. `None` leaves the metadata as it is.
     pub(super) fn inplace_final_mode(
         &self,
         target: &RootedTarget,
@@ -93,7 +130,7 @@ impl FsOps {
         current: &fs::Metadata,
         meta: &Meta,
         flags: u8,
-        created: bool,
+        new_file: bool,
     ) -> Result<Option<(Meta, u8)>> {
         let noted =
             inplace_created()
@@ -104,7 +141,7 @@ impl FsOps {
             return Ok(None);
         }
         let flags = flags & !flags::RECEIVER_MODE;
-        if !noted && !created {
+        if !noted && !new_file {
             return Ok(Some((meta.clone(), flags)));
         }
         let mode = target.root.receiver_creation_mode(
@@ -125,7 +162,8 @@ impl FsOps {
     /// The mode `Prepare` creates its file in: an `--inplace` file in the
     /// publication's mode, which for a receiver-chosen mode is the proposal
     /// creation limits; a sidecar in its staged mode, from the mode
-    /// publication will give it.
+    /// publication will give it, the file it replaces as `replaced` says.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn creation_mode(
         &mut self,
         path: &[u8],
@@ -134,12 +172,12 @@ impl FsOps {
         mut mode: u32,
         mut flags: u8,
         acl: bool,
+        replaced: Replaced,
     ) -> Result<u32> {
         if inplace {
             return Ok(mode);
         }
         if flags & flags::RECEIVER_MODE != 0 {
-            let target = self.destination_mutation_target(path, guard)?;
             let mut meta = Meta {
                 mode,
                 uid: 0,
@@ -148,13 +186,26 @@ impl FsOps {
                 mtime_nsec: 0,
                 inode_metadata: None,
             };
-            resolve_file_publication(
-                &target,
-                &mut meta,
-                &mut flags,
-                self.default_acl_creation,
-                &mut None,
-            )?;
+            // A new file limited only by the umask needs no target, whose
+            // container guard would be opened just to name it.
+            let target = match replaced {
+                Replaced::Nothing if !self.default_acl_creation => None,
+                _ => Some(self.destination_mutation_target(path, guard)?),
+            };
+            match &target {
+                Some(target) => resolve_file_publication(
+                    target,
+                    &mut meta,
+                    &mut flags,
+                    self.default_acl_creation,
+                    &mut None,
+                    replaced,
+                )?,
+                None => {
+                    meta.mode &= 0o777 & !process_umask();
+                    flags = (flags & !flags::RECEIVER_MODE) | flags::MODE;
+                }
+            }
             mode = meta.mode;
         }
         Ok(staged_mode(mode, flags, acl))

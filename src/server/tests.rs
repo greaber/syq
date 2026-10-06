@@ -119,6 +119,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
             mode: 0o600,
             flags: 0,
             acl: false,
+            new_file: false,
             attempt: 0,
             create_if_missing: true,
             guard: None,

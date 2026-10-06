@@ -1302,12 +1302,18 @@ impl FsOps {
                 staged.push(None);
                 continue;
             }
+            // The file it replaces is the one inspected above.
+            let replaced = match &destinations[i] {
+                Some(stat) => receiver_mode::Replaced::File(stat.st_mode as u32),
+                None => receiver_mode::Replaced::Nothing,
+            };
             match self.stage_small_file(
                 &file.path,
                 &copy_id,
                 data[i].unwrap(),
                 file.meta.clone(),
                 request.flags,
+                replaced,
             ) {
                 Ok(item) => staged.push(Some(item)),
                 Err(error) => {
@@ -1452,6 +1458,7 @@ impl FsOps {
         data: &[u8],
         mut meta: Meta,
         mut flags: u8,
+        replaced: receiver_mode::Replaced,
     ) -> Result<StagedSmallFile> {
         let path = self.destination_relative(path)?;
         let rooted = self
@@ -1463,6 +1470,7 @@ impl FsOps {
             &mut flags,
             self.default_acl_creation,
             &mut None,
+            replaced,
         )?;
         let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);

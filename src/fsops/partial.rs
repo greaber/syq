@@ -2571,12 +2571,12 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
-        created: bool,
+        new_file: bool,
         mutation: TargetMutation<'_>,
     ) -> Result<Option<(u64, u64)>> {
         let target = self.destination_mutation_target(path, mutation.guard)?;
         self.finalize_rooted(
-            &target, inplace, copy_id, meta, flags, created, mutation, expected,
+            &target, inplace, copy_id, meta, flags, new_file, mutation, expected,
         )
     }
 
@@ -2588,7 +2588,7 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
-        created: bool,
+        new_file: bool,
         mutation: TargetMutation<'_>,
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
@@ -2626,7 +2626,7 @@ impl FsOps {
                 Self::verify_expected_inode(&file, &reader, expected)?;
             }
             let resolved =
-                self.inplace_final_mode(target, copy_id, &current, meta, flags, created)?;
+                self.inplace_final_mode(target, copy_id, &current, meta, flags, new_file)?;
             let (meta, flags) = resolved
                 .as_ref()
                 .map_or((meta, flags), |(meta, flags)| (meta, *flags));
@@ -2681,6 +2681,7 @@ impl FsOps {
                     &mut flags,
                     self.default_acl_creation,
                     &mut None,
+                    receiver_mode::Replaced::claimed(new_file),
                 )
                 .map(|()| (meta, flags))
             })
@@ -3109,11 +3110,20 @@ impl FsOps {
                 mode,
                 flags,
                 acl,
+                new_file,
                 attempt,
                 create_if_missing,
                 guard,
             } => self
-                .creation_mode(path, guard.as_ref(), *inplace, *mode, *flags, *acl)
+                .creation_mode(
+                    path,
+                    guard.as_ref(),
+                    *inplace,
+                    *mode,
+                    *flags,
+                    *acl,
+                    receiver_mode::Replaced::claimed(*new_file),
+                )
                 .and_then(|mode| {
                     self.prepare(
                         PartialTarget {
@@ -3407,7 +3417,7 @@ impl FsOps {
                 copy_id,
                 meta,
                 flags,
-                created,
+                new_file,
                 condition,
                 guard,
             } => self
@@ -3418,7 +3428,7 @@ impl FsOps {
                     copy_id,
                     meta,
                     *flags,
-                    *created,
+                    *new_file,
                     TargetMutation {
                         condition: *condition,
                         guard: guard.as_ref(),

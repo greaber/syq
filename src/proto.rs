@@ -382,6 +382,9 @@ pub struct SmallPut {
     /// The sender saw a file at this path while planning. The receiver only
     /// schedules by it: what publication does is decided by `condition`.
     pub replaces: bool,
+    /// The sender found no regular file at this path while planning (see
+    /// `Request::Prepare`).
+    pub new_file: bool,
 }
 
 /// An existing file's identity and change time. Any later write to the
@@ -1022,6 +1025,11 @@ pub enum WireRequest<Data> {
     /// proposal under `flags::RECEIVER_MODE`. The receiver creates an
     /// `--inplace` file and a sidecar from them, the sidecar private while
     /// `acl` says an ACL will follow.
+    /// `new_file` says the sender found no regular file at `path` while
+    /// planning. A receiver then takes a receiver-chosen mode as creating the
+    /// file gives it without looking at the path, which can be a round trip
+    /// on a network filesystem. A command-restricted receiver does not take
+    /// the sender's word and clears it.
     Prepare {
         path: PathBytes,
         size: u64,
@@ -1030,6 +1038,7 @@ pub enum WireRequest<Data> {
         mode: u32,
         flags: u8,
         acl: bool,
+        new_file: bool,
         attempt: u32,
         create_if_missing: bool,
         guard: Option<ContainerGuard>,
@@ -1133,9 +1142,9 @@ pub enum WireRequest<Data> {
         copy_id: CopyId,
         meta: Meta,
         flags: u8,
-        /// The copy created this `--inplace` file, which a receiver-chosen
-        /// mode then gives the mode creating it would have.
-        created: bool,
+        /// The sender found no regular file at `path` while planning (see
+        /// `Request::Prepare`), so the copy created it.
+        new_file: bool,
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
