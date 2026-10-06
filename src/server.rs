@@ -306,6 +306,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::StatMany { .. }
         | Request::CheckOperatorDirectory { .. }
         | Request::CheckOperatorDirectoryAncestry { .. }
+        | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
         | Request::RegisterSourceRoots { .. }
         | Request::CreateOperatorDirectory { .. }
         | Request::AnchorDestination { .. }
@@ -851,6 +852,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
+                    | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }

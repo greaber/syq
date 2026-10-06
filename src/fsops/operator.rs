@@ -192,10 +192,24 @@ impl OperatorDirectorySelection {
     /// are opened without following symlinks. Once a missing or non-directory
     /// component is reached, the remaining virtual suffix is interpreted
     /// component by component so `.` and `..` retain kernel path semantics.
+    #[cfg(test)]
     pub(super) fn relation_to_source(
         &self,
         source: &File,
         suffix: &[u8],
+    ) -> Result<DirectoryRelation> {
+        self.relation_to_source_with_access(
+            source,
+            suffix,
+            &mut TemporaryDirectorySearchAccess::default(),
+        )
+    }
+
+    pub(super) fn relation_to_source_with_access(
+        &self,
+        source: &File,
+        suffix: &[u8],
+        access: &mut TemporaryDirectorySearchAccess,
     ) -> Result<DirectoryRelation> {
         if suffix.starts_with(b"/") {
             bail!("destination ancestry suffix must be relative");
@@ -230,7 +244,8 @@ impl OperatorDirectorySelection {
             }
             if component == b".." {
                 if virtual_components.pop().is_none() {
-                    directory = open_operator_directory_at(&directory, b"..")
+                    directory = access
+                        .open(&directory, b"..")
                         .context("open retained destination parent")?;
                 }
                 continue;
@@ -239,7 +254,7 @@ impl OperatorDirectorySelection {
                 virtual_components.push(component);
                 continue;
             }
-            match open_operator_directory_at(&directory, &component) {
+            match access.open(&directory, &component) {
                 Ok(child) => directory = child,
                 Err(error) if absent_or_nondirectory(&error) => {
                     // A missing entry can become a directory; an existing leaf
@@ -263,6 +278,7 @@ impl OperatorDirectorySelection {
             source_metadata.dev(),
             source_metadata.ino(),
             !virtual_components.is_empty(),
+            access,
         )?;
         if relation == DirectoryRelation::Separate && virtual_components.is_empty() {
             match opened_directory_relation(
@@ -270,6 +286,7 @@ impl OperatorDirectorySelection {
                 destination_metadata.dev(),
                 destination_metadata.ino(),
                 false,
+                &mut TemporaryDirectorySearchAccess::default(),
             ) {
                 Ok(DirectoryRelation::Descendant) => return Ok(DirectoryRelation::Ancestor),
                 Ok(_) => {}
@@ -291,8 +308,10 @@ pub(super) fn opened_directory_relation(
     source_dev: u64,
     source_ino: u64,
     virtual_descendant: bool,
+    access: &mut TemporaryDirectorySearchAccess,
 ) -> Result<DirectoryRelation> {
     let mut below_candidate = virtual_descendant;
+    let mut selected_directory = true;
     loop {
         let metadata = directory
             .metadata()
@@ -304,8 +323,15 @@ pub(super) fn opened_directory_relation(
                 DirectoryRelation::Same
             });
         }
-        let parent = open_operator_directory_at(&directory, b"..")
-            .context("walk effective destination ancestry")?;
+        // The selected directory may need search access. Its ancestors are
+        // outside the copy target and must never be widened by this check.
+        let parent = if selected_directory {
+            selected_directory = false;
+            access.open(&directory, b"..")
+        } else {
+            open_operator_directory_at(&directory, b"..")
+        }
+        .context("walk effective destination ancestry")?;
         let parent_metadata = parent
             .metadata()
             .context("inspect effective destination parent")?;

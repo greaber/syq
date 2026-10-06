@@ -1314,6 +1314,11 @@ pub enum WireRequest<Data> {
         directories: Vec<(PathBytes, TargetCondition)>,
         guard: Option<ContainerGuard>,
     },
+    /// Ancestry validation with explicitly authorized temporary owner-search
+    /// access. The receiver restores modes before returning DirectoryRelations.
+    CheckOperatorDirectoryAncestryWithAccess {
+        checks: Vec<DirectoryAncestryCheck>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

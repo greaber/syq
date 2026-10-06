@@ -7728,3 +7728,57 @@ fn creations_wait_for_their_parents_created_in_the_same_request() {
     // Without a parent in the request, everything stays in one wave.
     assert_eq!(creation_waves(&ops, &[0, 2, 3]), vec![vec![0, 2, 3]]);
 }
+
+#[test]
+fn temporary_search_access_restores_retained_inode_after_rename() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let selected = temp.path().join("selected");
+    let moved = temp.path().join("moved");
+    fs::create_dir(&selected).unwrap();
+    let file = File::open(&selected).unwrap();
+    fs::set_permissions(&selected, fs::Permissions::from_mode(0o600)).unwrap();
+    {
+        let mut access = TemporaryDirectorySearchAccess::new(true);
+        access.prepare(&file).unwrap();
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o700);
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o711)).unwrap();
+    }
+    assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&selected).unwrap().mode() & 0o777, 0o711);
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn ancestry_access_restores_after_request_error() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let session = DescriptorSessionSlot::default();
+    let ticket = session.register(File::open(&source).unwrap()).unwrap();
+    let mut ops = FsOps::new();
+    ops.check_operator_directory(
+        destination.as_os_str().as_bytes(),
+        false,
+        OperatorSymlinkPolicy::Refuse,
+    )
+    .unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = ops.check_operator_directory_ancestry_with_access(&[DirectoryAncestryCheck {
+        source_root: ticket,
+        source_is_directory: true,
+        suffixes: vec![Vec::new(), b"invalid\0suffix".to_vec()],
+    }]);
+    assert!(result.unwrap_err().to_string().contains("NUL"));
+    assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o600);
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+}

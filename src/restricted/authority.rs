@@ -2969,6 +2969,7 @@ impl RestrictedAuthority {
             }
             Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
+            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {

@@ -2861,6 +2861,9 @@ impl FsOps {
             Request::CheckOperatorDirectoryAncestry { checks } => self
                 .check_operator_directory_ancestry(checks)
                 .map(Response::DirectoryRelations),
+            Request::CheckOperatorDirectoryAncestryWithAccess { checks } => self
+                .check_operator_directory_ancestry_with_access(checks)
+                .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
                 base,
                 selections,

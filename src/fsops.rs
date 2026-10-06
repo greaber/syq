@@ -864,6 +864,30 @@ impl FsOps {
         &self,
         checks: &[DirectoryAncestryCheck],
     ) -> Result<Vec<Vec<DirectoryRelation>>> {
+        self.check_operator_directory_ancestry_impl(
+            checks,
+            &mut TemporaryDirectorySearchAccess::default(),
+        )
+    }
+
+    fn check_operator_directory_ancestry_with_access(
+        &self,
+        checks: &[DirectoryAncestryCheck],
+    ) -> Result<Vec<Vec<DirectoryRelation>>> {
+        let mut access = TemporaryDirectorySearchAccess::new(true);
+        let result = self.check_operator_directory_ancestry_impl(checks, &mut access);
+        let restored = access.restore();
+        match (result, restored) {
+            (_, Err(error)) => Err(error),
+            (result, Ok(())) => result,
+        }
+    }
+
+    fn check_operator_directory_ancestry_impl(
+        &self,
+        checks: &[DirectoryAncestryCheck],
+        access: &mut TemporaryDirectorySearchAccess,
+    ) -> Result<Vec<Vec<DirectoryRelation>>> {
         if checks.len() > DEFAULT_MAX_ROOTS {
             bail!(
                 "destination ancestry source count ({}) exceeds the endpoint-session limit ({DEFAULT_MAX_ROOTS})",
@@ -897,7 +921,8 @@ impl FsOps {
                     .suffixes
                     .iter()
                     .map(|suffix| {
-                        let relation = selection.relation_to_source(&source, suffix)?;
+                        let relation =
+                            selection.relation_to_source_with_access(&source, suffix, access)?;
                         Ok(if check.source_is_directory {
                             relation
                         } else {
@@ -2325,6 +2350,7 @@ impl FsOps {
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
+            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }

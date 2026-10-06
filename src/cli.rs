@@ -1320,7 +1320,7 @@ struct NativeCopyOperationalArgs {
     /// Match selected source metadata, including on unchanged files (repeatable/comma-separated)
     #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
     copy_metadata: Vec<NativeCopyMetadata>,
-    /// Temporarily add owner read, write and search permission to existing destination directories
+    /// Temporarily add owner read, write and search permission to existing destination directories, including during dry runs
     #[arg(long)]
     temporarily_widen_dir_permissions: bool,
     /// Request reads without access-time updates; warn and continue if unavailable

@@ -3269,7 +3269,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let relations = if ancestry_checks.is_empty() {
             Vec::new()
         } else {
-            check_operator_directory_ancestry(&mut *dst_ctl, ancestry_checks)?
+            check_operator_directory_ancestry(
+                &mut *dst_ctl,
+                ancestry_checks,
+                opts.widen_directory_permissions,
+            )?
         };
         if relations.len() != source_checks.len() {
             bail!(
@@ -3391,10 +3395,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Selection already inspected the container. Carry its identity into
     // planning, so file-only copies can request access without another lookup
     // on the ordinary writable-directory path.
-    let container_access = if args.temporarily_widen_dir_permissions
-        && !opts.dry_run
-        && !opts.preserve_existing_directory_metadata
-    {
+    let container_access = if opts.widen_directory_permissions {
         if let Some(selection) = &directory_selection {
             selection.needs_owner_access.then(|| {
                 (
@@ -4262,8 +4263,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if !args.prune_before && !aborted && opts.delete && scan_err.is_none() && !collision {
         (deleted, delete_plan) = st.prune(prune_overlap_unsearchable, false)?;
     }
-    if !opts.dry_run {
-        if let Err(error) = st.apply_deferred(aborted) {
+    {
+        if let Err(error) = st.apply_deferred(aborted || opts.dry_run) {
             if !aborted {
                 return Err(error);
             }
@@ -4804,11 +4805,14 @@ fn check_operator_directory(
 fn check_operator_directory_ancestry(
     conn: &mut dyn Conn,
     checks: Vec<DirectoryAncestryCheck>,
+    widen: bool,
 ) -> Result<Vec<Vec<DirectoryRelation>>> {
-    match ok(
-        conn.call(Request::CheckOperatorDirectoryAncestry { checks })?,
-        "destination ancestry",
-    )? {
+    let request = if widen {
+        Request::CheckOperatorDirectoryAncestryWithAccess { checks }
+    } else {
+        Request::CheckOperatorDirectoryAncestry { checks }
+    };
+    match ok(conn.call(request)?, "destination ancestry")? {
         Response::DirectoryRelations(relations) => Ok(relations),
         other => bail!("unexpected response {other:?}"),
     }
