@@ -350,8 +350,10 @@ impl<T: Work> Executor<T> {
                     sampled.elapsed(),
                     batch_backlogged || next.is_some() || self.pool.backlogged(),
                 );
-                self.pool.set_limit(limit);
-                self.spawn_to(limit);
+                if limit != self.pool.limit.load(Ordering::Relaxed) {
+                    self.pool.set_limit(limit);
+                    self.spawn_to(limit);
+                }
                 sampled = Instant::now();
                 completed = 0;
             }
