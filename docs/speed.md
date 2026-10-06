@@ -116,6 +116,9 @@ when it can. On filesystems that support cloning, this can avoid physically
 copying every byte. You can also copy to or from a mounted NFS directory using
 its local path.
 
+On Linux, copies of many small files to a network filesystem, such as NFS or
+an SSHFS mount, start with more workers.
+
 Reported bytes count the file's size even when cloning avoids physical I/O,
 so the displayed rate can exceed disk throughput.
 

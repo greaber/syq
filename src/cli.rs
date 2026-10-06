@@ -422,7 +422,7 @@ pub struct Args {
     /// Same as --progress --partial
     #[arg(short = 'P')]
     pub p_flag: bool,
-    /// No-op accepted for rsync compatibility (syq always keeps partial files)
+    /// No-op accepted for rsync compatibility (syq keeps partial files a later copy can resume from)
     #[arg(long)]
     pub partial: bool,
     /// Print transfer statistics, worker waits, endpoint operations and CPU at the end

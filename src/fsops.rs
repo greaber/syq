@@ -38,6 +38,7 @@ mod limits;
 mod operator;
 mod partial;
 mod paths;
+mod sidecars;
 mod small_batch;
 
 pub(crate) use apply::*;
@@ -46,6 +47,8 @@ pub(crate) use limits::*;
 pub(crate) use operator::*;
 pub(crate) use partial::*;
 pub(crate) use paths::*;
+use sidecars::Sidecar;
+pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
 
 /// Compare at the decimal precision suggested by the destination timestamp.
 /// Trailing zeros may reflect either filesystem truncation or a round timestamp;
@@ -114,7 +117,7 @@ fn test_corrupt_payload_once() -> bool {
     })
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
     let continuation = std::env::var_os(continue_env);
@@ -246,6 +249,7 @@ fn discard_rooted_copy_partial(
         {
             root.unlink(relative)
                 .with_context(|| format!("remove {}", label.display()))?;
+            sidecars::forget((expected_dev, expected_ino));
         }
         Some(_) | None => {}
     }
@@ -318,6 +322,21 @@ fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
     })
 }
 
+/// Filesystems where each operation can cost a network round trip. Local
+/// disk and memory filesystems (ext4, XFS, Btrfs, ZFS, tmpfs) are not.
+#[cfg(target_os = "linux")]
+fn network_file_system_type(file_system_type: u32) -> bool {
+    [
+        libc::NFS_SUPER_MAGIC as u32,
+        libc::FUSE_SUPER_MAGIC as u32,
+        libc::SMB_SUPER_MAGIC as u32,
+        0xfe53_4d42, // SMB2
+        0xff53_4d42, // CIFS
+        0x00c3_6400, // Ceph
+    ]
+    .contains(&file_system_type)
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_file_system(file: &File) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -337,15 +356,7 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
-            network: [
-                libc::NFS_SUPER_MAGIC as u32,
-                libc::FUSE_SUPER_MAGIC as u32,
-                libc::SMB_SUPER_MAGIC as u32,
-                0xfe53_4d42, // SMB2
-                0xff53_4d42, // CIFS
-                0x00c3_6400, // Ceph
-            ]
-            .contains(&file_system_type),
+            network: network_file_system_type(file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
             // tmpfs also provides a real cross-filesystem control for this path.
@@ -1464,6 +1475,7 @@ impl FsOps {
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
+        let creation = sidecars::begin()?;
         let staged = staged_file_mode(meta, flags);
         let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
             self.open_private_partial_rooted(
@@ -1475,8 +1487,16 @@ impl FsOps {
                 Some(staged),
             )
         })?;
-        let (file, basis_size) = opened.context("sidecar creation was requested")?;
-        if basis_size.is_some() {
+        let (file, opened) = opened.context("sidecar creation was requested")?;
+        creation.register_with(&rooted.root, &partial, Sidecar::Stage, || {
+            match opened.identity() {
+                Some(identity) => Ok(identity),
+                None => file
+                    .metadata()
+                    .map(|metadata| (metadata.dev(), metadata.ino())),
+            }
+        })?;
+        if opened.basis_size().is_some() {
             file.set_len(0)?;
         }
         observed_write(&self.operation, &file, data, 0, false)
@@ -1486,7 +1506,7 @@ impl FsOps {
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the open
         // descriptor immediately before the rename.
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         Ok(StagedSmallFile {
             root: rooted.root,
@@ -2123,6 +2143,7 @@ impl FsOps {
             available_bytes,
             available_inodes,
             empty,
+            network: on_network_file_system(&directory, metadata.dev()),
         })
     }
 

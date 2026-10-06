@@ -69,6 +69,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
             None,
             Some(socket),
             ServeSession {
+                owns_process: false,
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
@@ -194,6 +195,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
                 None,
                 Some(socket),
                 ServeSession {
+                    owns_process: false,
                     handshake_pending: None,
                     ssh_worker_ticket: None,
                     allow_tcp: true,
@@ -480,6 +482,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
             None,
             Some(socket),
             ServeSession {
+                owns_process: false,
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
@@ -744,6 +747,7 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
             None,
             None,
             ServeSession {
+                owns_process: false,
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
@@ -812,6 +816,7 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
             None,
             None,
             ServeSession {
+                owns_process: false,
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
@@ -1226,6 +1231,7 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
             None,
             Some(socket),
             ServeSession {
+                owns_process: false,
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: false,

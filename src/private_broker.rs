@@ -3,7 +3,7 @@
 //! The socket lives in a mode-0700 temporary directory and is itself mode
 //! 0600. Dropping the broker closes active clients, joins its listener and
 //! client threads, and removes the directory. Signal cleanup removes private
-//! broker directories before restoring the signal's default action.
+//! broker directories before the signal ends the process.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -19,33 +19,30 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 static SIGNAL_CLEANUP_PATHS: OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = OnceLock::new();
-static SIGNAL_CLEANUP_THREAD: OnceLock<io::Result<()>> = OnceLock::new();
+static SIGNAL_CLEANUP: OnceLock<io::Result<()>> = OnceLock::new();
 
 fn register_signal_cleanup(path: &Path) -> Result<()> {
     let paths = SIGNAL_CLEANUP_PATHS
         .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
         .clone();
-    let result = SIGNAL_CLEANUP_THREAD.get_or_init(|| {
-        let mut signals = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
-            signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM])
-        })?;
+    let result = SIGNAL_CLEANUP.get_or_init(|| {
         let cleanup_paths = Arc::clone(&paths);
-        thread::Builder::new()
-            .name("syq-broker-signal-cleanup".into())
-            .spawn(move || {
-                if let Some(signal) = signals.forever().next() {
-                    let paths: Vec<_> = cleanup_paths
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .iter()
-                        .cloned()
-                        .collect();
-                    for path in paths {
-                        let _ = std::fs::remove_dir_all(path);
-                    }
-                    let _ = signal_hook::low_level::emulate_default_handler(signal);
-                }
-            })?;
+        // Removing a socket directory is quick; it runs before slower
+        // cleanup, such as removing a copy's temporary files.
+        let cleanup = crate::process::termination::add_first(move |_| {
+            let paths: Vec<_> = cleanup_paths
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned()
+                .collect();
+            for path in paths {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        })?;
+        // Brokers come and go; the paths they leave registered are removed
+        // whenever the process is interrupted.
+        std::mem::forget(cleanup);
         Ok(())
     });
     if let Err(error) = result {

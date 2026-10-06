@@ -2762,3 +2762,231 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
         }
     }
 }
+
+/// 128 small files in four directories, and four files too large to batch
+/// on Linux (64 KiB) or macOS (4 MiB).
+fn small_and_large_sources(t: &Tmp) {
+    for directory in 0..4 {
+        for file in 0..32 {
+            write(
+                &t.path(&format!("small/d{directory}/f{file}")),
+                &prng(4096, directory * 100 + file),
+            );
+        }
+    }
+    for n in 0..4 {
+        write(&t.path(&format!("large/f{n}")), &prng((4 << 20) + 1, n));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn network_destinations_choose_their_own_starting_counts() {
+    for network in [false, true] {
+        let t = Tmp::new();
+        small_and_large_sources(&t);
+        let copy = |source: &str, destination: &str, controls: &[&str]| {
+            let mut command = history_command(&t);
+            command.env(
+                "SYQ_TUNING_HISTORY",
+                t.path(&format!("history-{destination}.sqlite")),
+            );
+            if network {
+                command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+            }
+            let output = command
+                .args([
+                    "cp",
+                    "--srcs-in",
+                    &t.s(source),
+                    "--into",
+                    &t.s(destination),
+                    "--no-progress",
+                ])
+                .args(controls)
+                .run()
+                .unwrap();
+            assert_output_ok(&output);
+            assert_same_tree(&t.path(source), &t.path(destination));
+            started_workers(&t.path(&format!("history-{destination}.sqlite")))
+        };
+        // A worker per 8 small files on a network filesystem, per 128 elsewhere.
+        let (workers, flagged) = copy("small", "small-auto", &[]);
+        assert_eq!(flagged, network);
+        assert_eq!(workers, if network { 16 } else { 1 });
+        // Trees with files too large to batch start as on a fast destination.
+        let (workers, _) = copy("large", "large-auto", &[]);
+        assert_eq!(workers, expected_local_start() as i64);
+        // Resource ceilings still bound the start.
+        let (workers, _) = copy(
+            "small",
+            "small-limited",
+            &["--resource-limits", "workers=4"],
+        );
+        assert_eq!(workers, if network { 4 } else { 1 });
+        let (workers, _) = copy(
+            "large",
+            "large-limited",
+            &["--resource-limits", "workers=8"],
+        );
+        assert_eq!(workers, 8);
+        // An explicit count starts that many workers, even for small files,
+        // but at most one per small file: batched files are never split.
+        let (workers, _) = copy(
+            "small",
+            "small-fixed",
+            &["--performance-tuning", "workers=8"],
+        );
+        assert_eq!(workers, 8);
+        let (workers, _) = copy(
+            "small",
+            "small-more-than-files",
+            &["--performance-tuning", "workers=200"],
+        );
+        assert_eq!(workers, 128);
+        let (workers, _) = copy(
+            "large",
+            "large-fixed",
+            &["--performance-tuning", "workers=24"],
+        );
+        assert_eq!(workers, 24);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn network_destinations_keep_remembered_starting_counts() {
+    let t = Tmp::new();
+    small_and_large_sources(&t);
+    let copy = |source: &str, destination: &str| {
+        let output = history_command(&t)
+            .env("SYQ_TEST_NETWORK_FILESYSTEM", "1")
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s(source),
+                "--into",
+                &t.s(destination),
+                "--no-progress",
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_same_tree(&t.path(source), &t.path(destination));
+        started_workers(&t.path("history.sqlite"))
+    };
+    assert_eq!(
+        copy("large", "first"),
+        (expected_local_start() as i64, true)
+    );
+    let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
+    // Measurements in which `best` workers beat six.
+    let remember = |best: i64| {
+        db.execute("DELETE FROM measurements", []).unwrap();
+        db.execute("UPDATE runs SET lost=1 WHERE id!=1", [])
+            .unwrap();
+        db.execute("UPDATE runs SET eligible=4 WHERE id=1", [])
+            .unwrap();
+        let mut sequence = 0;
+        for (workers, rate) in [(6, 50.0), (best, 100.0)] {
+            for _ in 0..2 {
+                sequence += 1;
+                db.execute(
+                    "INSERT INTO measurements VALUES(1,?1,?2,0,?3,2.5,?4,1)",
+                    rusqlite::params![sequence, sequence * 2500000, workers, rate],
+                )
+                .unwrap();
+            }
+        }
+    };
+    // A remembered count can lower a small tree's start...
+    remember(2);
+    assert_eq!(copy("small", "small-remembered"), (2, true));
+    // ...and sets the start for larger files.
+    remember(24);
+    assert_eq!(
+        copy("large", "large-remembered").0,
+        24.min(expected_local_start() as i64)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn remote_network_destinations_start_within_the_ssh_limit() {
+    for network in [false, true] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        small_and_large_sources(&t);
+        let mut command = history_command(&t);
+        if network {
+            // The fake remote shell passes this to the receiving helper.
+            command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+        }
+        let output = command
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("small"),
+                "--to",
+                "fake",
+                "--no-tcp",
+                "--no-bootstrap",
+            ])
+            .args(["--into", &t.s("remote"), "--no-progress", "--rsh"])
+            .arg(&rsh)
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_same_tree(&t.path("small"), &t.path("remote"));
+        // At most the SSH starting count, 8, either way.
+        let (workers, flagged) = started_workers(&t.path("history.sqlite"));
+        assert_eq!(flagged, network);
+        assert_eq!(workers, if network { 8 } else { 1 });
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn network_destinations_start_larger_small_file_trees_while_planning() {
+    for network in [false, true] {
+        let t = Tmp::new();
+        // Enough files that workers start while planning continues.
+        for file in 0..600 {
+            write(
+                &t.path(&format!("source/d{}/f{file}", file % 8)),
+                &prng(4096, file),
+            );
+        }
+        let mut command = history_command(&t);
+        if network {
+            command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+        }
+        let output = command
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("source"),
+                "--into",
+                &t.s("destination"),
+                "--no-progress",
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_same_tree(&t.path("source"), &t.path("destination"));
+        let (workers, flagged) = started_workers(&t.path("history.sqlite"));
+        assert_eq!(flagged, network);
+        if network {
+            assert_eq!(workers, expected_local_start() as i64);
+        } else {
+            // A worker per 128 files queued when planning started workers.
+            assert!((4..=5).contains(&workers), "{workers}");
+        }
+    }
+}
