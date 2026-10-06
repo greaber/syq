@@ -191,7 +191,7 @@ def direct():
             for widen in [False, True]:
                 for placement in ["--into", "--as"]:
                     preview_root = root + f"/readonly-preview-{mode:o}-{int(widen)}-{placement[2:]}"
-                    before = ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.mkdir(); (p/'item').write_bytes(b'keep preview'); p.chmod({mode}); print(p.stat().st_ctime_ns)").stdout.strip()
+                    ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.mkdir(); (p/'item').write_bytes(b'keep preview')")
                     if placement == "--into":
                         sources = ["--mapping", "-"]
                         destination = preview_root
@@ -200,6 +200,11 @@ def direct():
                         sources = ["file"]
                         destination = preview_root + "/item"
                         data = None
+                    # Enrollment is fixture setup, not something a signed
+                    # read-only preview may create. Exact-file placement uses
+                    # a different enrolled parent from container placement.
+                    run(["syq", "receiver", "enroll", "destination:" + destination])
+                    before = ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.chmod({mode}); print(p.stat().st_ctime_ns)").stdout.strip()
                     command = prefix + sources + ["--to", "destination", placement, destination,
                                                    "--no-tcp", "--if-exists=update", "--dry-run"]
                     if widen:
