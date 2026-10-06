@@ -19,10 +19,11 @@ omitted. It does not follow symlinks or remove old partial-name formats.
 A regular file deliberately named like a partial is also selected, so preview
 before deleting.
 
-Interrupted replacements and macOS clones can leave `.syq-swap-...` entries
-containing displaced originals or temporary clone data. Neither this command
-nor pruning removes them. Stop copies using the destination, inspect these
-entries, and recover anything you need before removing them manually.
+Interrupted replacements, replacements that race with another program, and
+macOS clones can leave `.syq-swap-...` entries containing displaced files or
+temporary clone data. Neither this command nor pruning removes them. Stop
+copies using the destination, inspect these entries, and recover anything you
+need before removing them manually.
 
 <!-- CLI: clean-partials -->
 ```text

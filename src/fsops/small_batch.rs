@@ -2610,6 +2610,86 @@ mod tests {
         }
     }
 
+    /// Publication exchanges the sidecar with the target it observed. When
+    /// another writer replaced the target first, the exchange leaves that
+    /// writer's file at the sidecar name. A retry must never write into it:
+    /// whoever holds it open would read the new contents, and its
+    /// permissions would carry over to the published file. Nor may anything
+    /// delete it, since it holds the other writer's data.
+    #[test]
+    fn a_file_displaced_by_a_raced_publication_is_kept_where_no_retry_adopts_it() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        for batched in [false, true] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path().to_path_buf();
+            let target = directory.join("file");
+            fs::write(&target, b"old contents").unwrap();
+            let before = fs::metadata(&target).unwrap();
+            let root = fs::metadata(&directory).unwrap();
+            let (opened, held) = std::sync::mpsc::channel();
+            let _hook = crate::rooted::install_publication_test_hook(
+                crate::rooted::RootIdentity {
+                    dev: root.dev(),
+                    ino: root.ino(),
+                },
+                &RelativePath::new(b"file").unwrap(),
+                crate::rooted::PublicationTestPoint::BeforeMatchedExchange,
+                {
+                    let directory = directory.clone();
+                    move || {
+                        // A private file of this account, as a sidecar would
+                        // be, held open by its writer.
+                        let other = directory.join("other");
+                        fs::write(&other, b"other writer").unwrap();
+                        fs::set_permissions(&other, fs::Permissions::from_mode(0o600)).unwrap();
+                        opened.send(File::open(&other).unwrap()).unwrap();
+                        fs::rename(&other, directory.join("file")).unwrap();
+                    }
+                },
+            );
+            let mut ops = receiver(&directory);
+            let mut run = |put: &SmallPut| {
+                if batched {
+                    ops.put_small_batch(std::slice::from_ref(put))
+                        .pop()
+                        .unwrap()
+                } else {
+                    ops.put_small(put).map_err(|error| wire_error(&error))
+                }
+            };
+            let mut first = put("file", b"first attempt");
+            first.condition = TargetCondition::Matches {
+                dev: before.dev(),
+                ino: before.ino(),
+            };
+            let error = run(&first).unwrap_err().message;
+            assert!(error.contains("changed during publication"), "{error}");
+            let mut held = held.recv().unwrap();
+
+            // The same copy retries the file.
+            run(&put("file", b"retried contents")).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"retried contents");
+            let mut seen = Vec::new();
+            held.read_to_end(&mut seen).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&seen),
+                "other writer",
+                "batched: {batched}"
+            );
+
+            let names: Vec<_> = fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(!names.iter().any(|name| is_partial_name(name)), "{names:?}");
+            let kept: Vec<_> = names.iter().filter(|name| is_recovery_name(name)).collect();
+            assert_eq!(kept.len(), 1, "{names:?}");
+            assert!(error.contains(&*kept[0].to_string_lossy()), "{error}");
+            assert_eq!(fs::read(directory.join(kept[0])).unwrap(), b"other writer");
+        }
+    }
+
     #[test]
     fn a_new_sidecar_is_opened_for_writing_only_and_a_leftover_is_reused() {
         let temporary = crate::test_support::tempdir().unwrap();

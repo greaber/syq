@@ -1645,6 +1645,24 @@ fn any_publication_never_rolls_back_a_later_writer() {
     assert_eq!(metadata.ino(), staged_file.metadata().unwrap().ino());
 }
 
+/// The one recovery entry in `directory`, which `error` must name.
+fn only_recovery_entry(directory: &Path, error: &str) -> PathBuf {
+    let kept: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| crate::fsops::is_recovery_name(name))
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(
+        error.contains(&format!(
+            "kept the entry it displaced as {}",
+            kept[0].to_string_lossy()
+        )),
+        "{error}"
+    );
+    directory.join(&kept[0])
+}
+
 #[test]
 fn absent_publication_never_unlinks_a_later_writer() {
     let tree = TestDir::new("absent-publication-race");
@@ -1741,9 +1759,13 @@ fn matched_publication_detects_a_staged_race_during_exchange() {
         )
         .unwrap_err();
 
-    assert!(format!("{error:#}").contains("staged path staged changed during publication"));
+    let error = format!("{error:#}");
+    assert!(error.contains("staged path staged changed during publication"));
     assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"impostor");
-    assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"old");
+    // The displaced target leaves the staged name, which a retry would adopt.
+    assert!(!tree.path().join("staged").exists());
+    let kept = only_recovery_entry(tree.path(), &error);
+    assert_eq!(fs::read(kept).unwrap(), b"old");
     assert_eq!(
         fs::read(tree.path().join("held-staged")).unwrap(),
         b"staged"
@@ -1794,12 +1816,14 @@ fn matched_publication_never_rolls_back_a_later_writer() {
         )
         .unwrap_err();
 
-    assert!(format!("{error:#}").contains("changed during publication"));
+    let error = format!("{error:#}");
+    assert!(error.contains("changed during publication"));
     assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
-    assert_eq!(
-        fs::read(tree.path().join("staged")).unwrap(),
-        b"raced-before-exchange"
-    );
+    // The other writer's file leaves the staged name, which a retry would
+    // adopt, for a recovery name the error reports.
+    assert!(!tree.path().join("staged").exists());
+    let kept = only_recovery_entry(tree.path(), &error);
+    assert_eq!(fs::read(kept).unwrap(), b"raced-before-exchange");
     assert_eq!(fs::read(tree.path().join("old-target")).unwrap(), b"old");
     assert_eq!(
         fs::read(tree.path().join("published-staged")).unwrap(),
@@ -1846,10 +1870,16 @@ fn matched_leaf_replacement_never_rolls_back_a_later_writer() {
         )
         .unwrap_err();
 
-    assert!(format!("{error:#}").contains("changed during replacement"));
+    let error = format!("{error:#}");
+    assert!(error.contains("changed during replacement"));
     assert_eq!(
         fs::read_link(tree.path().join("target")).unwrap(),
         Path::new("later")
+    );
+    let kept = only_recovery_entry(tree.path(), &error);
+    assert_eq!(
+        fs::read_link(kept).unwrap(),
+        Path::new("raced-before-exchange")
     );
     assert_eq!(
         fs::read_link(tree.path().join("old-target")).unwrap(),
