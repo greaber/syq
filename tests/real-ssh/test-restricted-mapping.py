@@ -192,13 +192,16 @@ def direct():
                 for placement in ["--into", "--as"]:
                     preview_root = root + f"/readonly-preview-{mode:o}-{int(widen)}-{placement[2:]}"
                     before = ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.mkdir(); (p/'item').write_bytes(b'keep preview'); p.chmod({mode}); print(p.stat().st_ctime_ns)").stdout.strip()
-                    command = prefix + ["--to", "destination", "--no-tcp", "--if-exists=update", "--dry-run"]
                     if placement == "--into":
-                        command += ["--mapping", "-", placement, preview_root]
+                        sources = ["--mapping", "-"]
+                        destination = preview_root
                         data = manifest([("file", "item", "file")])
                     else:
-                        command += ["file", placement, preview_root + "/item"]
+                        sources = ["file"]
+                        destination = preview_root + "/item"
                         data = None
+                    command = prefix + sources + ["--to", "destination", placement, destination,
+                                                   "--no-tcp", "--if-exists=update", "--dry-run"]
                     if widen:
                         command.append("--temporarily-widen-dir-permissions")
                     expected = 0 if mode == 0o500 else (23 if placement == "--into" else 1)

@@ -1898,20 +1898,39 @@ fn files_from_empty_list_leaves_an_existing_destination_untouched() {
 }
 
 #[test]
-fn files_from_unwritable_destination_root_fails_and_is_left_alone() {
-    // Ordinary copies open up and restore an unwritable root; --files-from
-    // deliberately doesn't (the root isn't listed), so it fails per file.
+fn files_from_restores_unlisted_destination_root_permissions() {
+    // rsync's permission mode also applies to --files-from. The unlisted
+    // container gains temporary access, then recovers its own mode rather
+    // than adopting the source root's metadata.
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
     fs::create_dir_all(t.path("dst")).unwrap();
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+    set_mtime(&t.path("dst"), 1_000);
     write(&t.path("list"), b"a\n");
+    let preview = syq(&[
+        "-a",
+        "--dry-run",
+        "--files-from",
+        &t.s("list"),
+        &t.s("src"),
+        &t.s("dst"),
+    ]);
+    let preview_metadata = fs::metadata(t.path("dst")).unwrap();
+    assert!(preview.status.success(), "{}", stderr_of(&preview));
+    assert_eq!(preview_metadata.mode() & 0o777, 0o500);
+    assert_eq!(preview_metadata.mtime(), 1_000);
+    assert!(
+        !t.path("dst/a").exists(),
+        "the preview must not create files"
+    );
+
     let out = syq(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
     let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert!(out.status.success(), "{}", stderr_of(&out));
     assert_eq!(mode, 0o500, "the unlisted root keeps its mode");
-    assert!(!t.path("dst/a").exists());
+    assert_eq!(read(&t.path("dst/a")), b"a");
 }
 
 #[test]
