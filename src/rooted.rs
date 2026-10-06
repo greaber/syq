@@ -2116,22 +2116,31 @@ fn open_directory_at(parent: &File, component: &[u8]) -> io::Result<File> {
     )
 }
 
-/// Inspect a directory's naming rules before search permission is repaired.
-/// macOS O_SEARCH requires search permission on the directory being opened;
-/// Use O_SEARCH for searchable directories, then O_EVTONLY when only read
-/// permission is available. Neither changes permissions during inspection.
-/// Descendant lookups still enforce search permission and never follow links.
+/// Pin a directory before search permission is repaired. macOS O_SEARCH
+/// requires search permission on the directory being opened; O_EVTONLY can
+/// select a readable directory without that permission. Neither changes modes,
+/// follows links, or bypasses search checks on subsequent descendant lookups.
 #[cfg(target_os = "macos")]
-fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
-    match open_directory_at(parent, component) {
+fn open_directory_metadata_fd(parent: RawFd, component: &CStr) -> io::Result<File> {
+    match open_at(
+        parent,
+        component,
+        operator_directory_flags() | libc::O_NOCTTY,
+        0,
+    ) {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => open_at(
-            parent.as_raw_fd(),
-            &component_cstring(component),
+            parent,
+            component,
             libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0,
         ),
         result => result,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory_metadata_at(parent: &File, component: &[u8]) -> io::Result<File> {
+    open_directory_metadata_fd(parent.as_raw_fd(), &component_cstring(component))
 }
 
 // Missing entries and exclusive-create collisions already answer the lookup.

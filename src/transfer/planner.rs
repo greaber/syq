@@ -3911,16 +3911,19 @@ impl Planner<'_> {
         } else {
             std::mem::take(&mut self.deferred)
         };
+        // The signed grant authorizes either source modes or receiver-managed
+        // modes. Restoration uses the same mode authority as the copy.
+        let restoration_flags = if self.opts.restricted_receiver && !self.opts.perms {
+            flags::RECEIVER_MODE
+        } else {
+            flags::MODE
+        };
         let mut remaining = std::mem::take(&mut self.directory_restorations);
         for (path, meta, flags, _, condition) in &mut d {
             if let Some(saved) = remaining.remove(path) {
                 if *flags & (flags::MODE | flags::RECEIVER_MODE) == 0 {
                     meta.mode = saved.mode;
-                    *flags |= if self.opts.restricted_receiver {
-                        flags::RECEIVER_MODE
-                    } else {
-                        flags::MODE
-                    };
+                    *flags |= restoration_flags;
                 }
                 *condition = TargetCondition::Matches {
                     dev: saved.dev,
@@ -3940,11 +3943,7 @@ impl Planner<'_> {
                     mtime_nsec: 0,
                     inode_metadata: None,
                 },
-                if self.opts.restricted_receiver {
-                    flags::RECEIVER_MODE
-                } else {
-                    flags::MODE
-                },
+                restoration_flags,
                 depth,
                 TargetCondition::Matches {
                     dev: saved.dev,
