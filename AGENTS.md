@@ -545,9 +545,14 @@ must fit Unix socket path limits, use `test_support::short_tempdir()`; it
 centralizes the canonical short-root exception without changing `TMPDIR`.
 Create any file that a test or the product code under test executes with
 `write_executable` or `copy_executable` from `tests/support/executable.rs`.
-They write it in a child process: tests run in parallel threads, and a file
-the test process writes itself can stay open in a child that another test
-forks at that moment, so running it fails with "Text file busy".
+They write it in a child process; a file the test process writes itself can
+stay open in a process that another thread starts at that moment, so running
+it fails with "Text file busy". Nextest gives each test its own process, but
+plain `cargo test` shares one, and tests and product code also start
+processes from several threads. A test that starts a background service, such
+as `persist receive on`, must stop it even when the test fails (for example
+with `PersistenceOff` in `tests/local.rs`); deleting the test's temporary
+directory leaves the service running.
 
 Testing happens in three places, each running more than the one before:
 before merge, after merge (post-merge CI, which selects checks by changed
