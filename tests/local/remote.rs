@@ -2038,6 +2038,218 @@ fn native_direct_remote_to_remote_forwards_copy_policies() {
     }
 }
 
+/// Make the fake remote launcher find this exact build as its helper.
+fn pin_remote_helper(t: &Tmp) {
+    let helper = cached_remote_helper(t);
+    fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_syq"), &helper).unwrap();
+}
+
+/// `syq cp --from fake ... --to fake --into dst` through `rsh`.
+fn remote_to_remote_copy(t: &Tmp, rsh: &Path, arguments: &[String]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .args(["cp", "--rsh"])
+        .arg(rsh)
+        .args(["--tcp-ports", EPHEMERAL_TCP_PORTS, "--no-progress"])
+        .args(["--from", "fake"])
+        .args(arguments)
+        .args(["--to", "fake", "--into", &t.s("dst")])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"));
+    command
+}
+
+/// Members of a process group that have not exited, other than its leader.
+fn live_group_members(group: u32) -> Vec<String> {
+    let listing = Command::new("ps")
+        .args([
+            "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "command=",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&listing);
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.len() >= 3
+                && fields[1] == group.to_string()
+                && fields[0] != group.to_string()
+                && !fields[2].starts_with('Z')
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn remote_to_remote_coordinator_stops_when_its_requester_ends() {
+    for (signal, mapping) in [
+        (libc::SIGINT, false),
+        (libc::SIGKILL, false),
+        (libc::SIGKILL, true),
+    ] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        pin_remote_helper(&t);
+        let contents = prng(4 << 20, 23);
+        write(&t.path("src/file"), &contents);
+        write(
+            &t.path("mapping.ndjson"),
+            br#"{"src":{"encoding":"utf-8","value":"file"},"dst":{"encoding":"utf-8","value":"file"},"kind":"file"}"#,
+        );
+        let selection = if mapping {
+            vec![
+                "--mapping".into(),
+                t.s("mapping.ndjson"),
+                "--cwd".into(),
+                t.s("src"),
+            ]
+        } else {
+            vec!["--srcs-in".into(), t.s("src")]
+        };
+        let log = File::create(t.path("requester.log")).unwrap();
+        let mut slow = selection.clone();
+        // About a minute at this rate: the copy is still running when its
+        // requester ends.
+        slow.extend([
+            "--resource-limits=bandwidth=64".into(),
+            "--performance-tuning=workers=1,copy-path=ranges".into(),
+        ]);
+        let mut command = remote_to_remote_copy(&t, &rsh, &slow);
+        command
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        // A test run started in the background inherits SIGINT ignored.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut requester = process_group::ProcessGroup::spawn(&mut command).unwrap();
+        let group = requester.child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while partial_files(&t.path("dst")).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline
+                    && requester.child.try_wait().unwrap().is_none(),
+                "the copy wrote no partial: {}",
+                fs::read_to_string(t.path("requester.log")).unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!live_group_members(group).is_empty());
+
+        // Signal the requester alone. Leaving it unreaped keeps its process
+        // group ID from being reused while the test watches the group.
+        unsafe { libc::kill(group as i32, signal) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let live = live_group_members(group);
+            if live.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "signal {signal}, mapping {mapping}: the remote copy outlived its requester: {live:#?}"
+            );
+            if std::time::Instant::now() >= next_progress {
+                eprintln!("waiting for the remote copy to stop: {live:#?}");
+                next_progress += std::time::Duration::from_secs(2);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        requester.close().unwrap();
+        assert!(
+            !t.path("dst/file").exists(),
+            "an interrupted copy published its file"
+        );
+
+        let out = remote_to_remote_copy(&t, &rsh, &selection).run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/file")), contents);
+    }
+}
+
+#[test]
+fn remote_to_remote_copy_completes_when_its_input_never_reaches_the_coordinator() {
+    // Like `ssh -n` or `StdinNull yes`: the coordinator's input ends at once,
+    // without the requester's marker, and must not be mistaken for the
+    // requester ending.
+    let t = Tmp::new();
+    let fake = fake_rsh(&t);
+    let rsh = t.path("null-input-rsh");
+    executable(
+        &rsh,
+        format!(
+            "#!/bin/sh\nexec {} \"$@\" </dev/null\n",
+            shell_words::quote(fake.to_str().unwrap())
+        )
+        .as_bytes(),
+    );
+    pin_remote_helper(&t);
+    let contents = prng(1 << 20, 29);
+    write(&t.path("src/file"), &contents);
+    let out = remote_to_remote_copy(&t, &rsh, &["--srcs-in".into(), t.s("src")])
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/file")), contents);
+    let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        log.contains("SYQ_INTERNAL_NATIVE_REQUESTER_STDIN=0 "),
+        "{log}"
+    );
+}
+
+#[test]
+fn remote_to_remote_mapping_shares_coordinator_input_only_with_this_build() {
+    for pinned in [true, false] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        write(&t.path("src/a"), b"first");
+        write(&t.path("src/b"), b"second");
+        let manifest = br#"{"src":{"encoding":"utf-8","value":"a"},"dst":{"encoding":"utf-8","value":"renamed/a"},"kind":"file"}
+{"src":{"encoding":"utf-8","value":"b"},"dst":{"encoding":"utf-8","value":"b"},"kind":"file"}
+"#;
+        write(&t.path("mapping.ndjson"), manifest);
+        let mut arguments = vec![
+            "--mapping".to_string(),
+            t.s("mapping.ndjson"),
+            "--cwd".into(),
+            t.s("src"),
+        ];
+        if pinned {
+            pin_remote_helper(&t);
+        } else {
+            // Another build may read the manifest to the end of its input.
+            arguments.extend(["--syq-path".into(), env!("CARGO_BIN_EXE_syq").into()]);
+        }
+        let out = remote_to_remote_copy(&t, &rsh, &arguments).run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/renamed/a")), b"first");
+        assert_eq!(read(&t.path("dst/b")), b"second");
+        let log = fs::read_to_string(t.path("rsh.log")).unwrap();
+        assert_eq!(
+            log.contains(&format!(
+                "SYQ_INTERNAL_NATIVE_REQUESTER_STDIN={} ",
+                manifest.len()
+            )),
+            pinned,
+            "{log}"
+        );
+        assert_eq!(
+            log.contains("SYQ_INTERNAL_NATIVE_REQUESTER_STDIN"),
+            pinned,
+            "{log}"
+        );
+    }
+}
+
 #[test]
 fn native_coordinate_at_dst_reverses_the_remote_ssh_edge() {
     let t = Tmp::new();

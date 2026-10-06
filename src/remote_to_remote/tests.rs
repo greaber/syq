@@ -445,3 +445,37 @@ fn custom_remote_shell_does_not_get_ssh_agent_flags() {
     assert!(!args.contains(&OsStr::new("-a")));
     assert!(!args.contains(&OsStr::new("-A")));
 }
+
+#[test]
+fn requester_loss_counts_only_input_that_ends_after_the_marker() {
+    struct Reads(std::collections::VecDeque<std::io::Result<Vec<u8>>>);
+    impl Read for Reads {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let bytes = self.0.pop_front().unwrap_or(Ok(Vec::new()))?;
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+    let interrupted = || Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+    let reset = || Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+    for (reads, lost) in [
+        // `ssh -n` or StdinNull: input never reached the coordinator.
+        (vec![], false),
+        (vec![reset()], false),
+        (vec![interrupted()], false),
+        // The requester's marker, then its end, however it is reported.
+        (vec![Ok(vec![REQUESTER_MARKER])], true),
+        (vec![Ok(vec![REQUESTER_MARKER]), reset()], true),
+        (
+            vec![interrupted(), Ok(vec![REQUESTER_MARKER]), interrupted()],
+            true,
+        ),
+    ] {
+        let description = format!("{reads:?}");
+        assert_eq!(
+            wait_for_requester_loss(&mut Reads(reads.into())),
+            lost,
+            "{description}"
+        );
+    }
+}

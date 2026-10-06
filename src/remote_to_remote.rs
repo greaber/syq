@@ -1193,6 +1193,22 @@ fn run_remote(
         ""
     };
     let mut internal_environment = Vec::new();
+    // An attached coordinator ends with this process; see follow_requester.
+    // Detached copies outlive it by design, and an approved peer bridge
+    // watches its own lifetime channel. A mapping arrives on the same input,
+    // so only this exact build, which reads just the manifest, can share it.
+    let follow_requester = !args.detach
+        && peer_bridge.is_none()
+        && (args.mapping_contents.is_none() || spec.runs_this_build());
+    if follow_requester {
+        internal_environment.push((
+            REQUESTER_STDIN,
+            args.mapping_contents
+                .as_ref()
+                .map_or(0, |mapping| mapping.contents.len())
+                .to_string(),
+        ));
+    }
     if let Some(grant) = &restricted_grant {
         internal_environment.push(("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", grant.clone()));
     }
@@ -1310,7 +1326,7 @@ fn run_remote(
             return bridge.run(&remote_cmd, args.mapping_contents.clone(), relay_stdout);
         }
         let mut cmd = make_command();
-        cmd.stdin(if args.mapping_contents.is_some() {
+        cmd.stdin(if follow_requester || args.mapping_contents.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -1324,12 +1340,21 @@ fn run_remote(
             .with_context(|| format!("spawn {:?}", rsh[0]))?;
         // Read stdout while sending the manifest, including for large manifests
         // and setup errors. Reuse the same bytes if helper bootstrap retries.
-        let input = args.mapping_contents.as_ref().map(|contents| {
-            let contents = contents.clone();
-            let mut stdin = child.stdin.take().expect("piped mapping input");
+        // When the coordinator follows this process, keep its input open
+        // after the marker until the coordinator has exited.
+        let input = child.stdin.take().map(|mut stdin| {
+            let mapping = args.mapping_contents.clone();
             std::thread::spawn(move || {
-                use std::io::Write;
-                stdin.write_all(&contents.contents)
+                if let Some(mapping) = mapping {
+                    stdin.write_all(&mapping.contents)?;
+                }
+                if !follow_requester {
+                    return Ok(None);
+                }
+                // Without the marker the coordinator only stops following;
+                // failing to write it must not fail the copy.
+                let _ = stdin.write_all(&[REQUESTER_MARKER]);
+                Ok::<_, std::io::Error>(Some(stdin))
             })
         });
         let relayed = match child.stdout.take() {
@@ -1343,7 +1368,7 @@ fn run_remote(
             .map(|writer| {
                 writer
                     .join()
-                    .map_err(|_| anyhow::anyhow!("mapping input writer panicked"))
+                    .map_err(|_| anyhow::anyhow!("coordinator input writer panicked"))
                     .and_then(|written| written.map_err(anyhow::Error::from))
             })
             .transpose();
@@ -1410,6 +1435,87 @@ fn run_remote(
 
 fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
     automatic && crate::remote_helper::needs_install(code)
+}
+
+/// Set for an attached remote coordinator: its standard input carries this
+/// many mapping manifest bytes, then `REQUESTER_MARKER`, then nothing more
+/// until the syq that started it ends.
+pub(crate) const REQUESTER_STDIN: &str = "SYQ_INTERNAL_NATIVE_REQUESTER_STDIN";
+const REQUESTER_MARKER: u8 = b'\n';
+/// How long a coordinator whose requester ended waits for SIGTERM to end it.
+const REQUESTER_LOSS_KILL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stop this remote coordinator when the attached syq that started it ends.
+///
+/// sshd sends no signal to a command without a terminal when its client goes
+/// away, so nothing else would stop the copy. The requesting syq holds this
+/// process's standard input open without writing to it. Input ends when
+/// that syq exits however it ends, including SIGKILL, or when its SSH
+/// connection closes. The coordinator then sends itself SIGTERM, exactly as
+/// if it had been interrupted: it does not finish the copy, and its
+/// receivers see a lost connection rather than a completed copy.
+pub(crate) fn follow_requester(args: &mut Args) -> Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    let Some(manifest_bytes) = args.requester_stdin.filter(|_| args.delegated) else {
+        return Ok(());
+    };
+    let mut input = std::fs::File::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("take the requesting syq's input")?,
+    );
+    // Child processes keep the empty input they had before.
+    let null = std::fs::File::open("/dev/null").context("open /dev/null")?;
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("replace standard input");
+    }
+    if args.native_mapping.as_deref() == Some(b"-".as_slice()) {
+        let mut contents = Vec::new();
+        (&mut input)
+            .take(manifest_bytes)
+            .read_to_end(&mut contents)
+            .context("--mapping -: read stdin")?;
+        anyhow::ensure!(
+            contents.len() as u64 == manifest_bytes,
+            "--mapping -: the requesting syq ended before sending the whole manifest"
+        );
+        args.parsed_mapping = Some(std::sync::Arc::new(crate::mapping::read_mapping_manifest(
+            contents,
+        )?));
+    } else {
+        anyhow::ensure!(
+            manifest_bytes == 0,
+            "the requesting syq sent a manifest without --mapping -"
+        );
+    }
+    std::thread::Builder::new()
+        .name("requester".into())
+        .spawn(move || {
+            if wait_for_requester_loss(&mut input) {
+                unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                std::thread::sleep(REQUESTER_LOSS_KILL_AFTER);
+                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+            }
+        })
+        .context("watch the requesting syq")?;
+    Ok(())
+}
+
+/// Wait for the end of the requester's input. Returns whether it ended after
+/// the marker: input that ends first never came from the requester, as with
+/// `ssh -n` or `StdinNull`, so it says nothing about the requester.
+fn wait_for_requester_loss(input: &mut impl Read) -> bool {
+    let mut marked = false;
+    let mut buffer = [0u8; 64];
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => return marked,
+            Ok(_) => marked = true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return marked,
+        }
+    }
 }
 
 #[cfg(test)]
