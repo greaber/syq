@@ -466,9 +466,7 @@ impl Engine {
             self.progress.scan_done.store(true, Relaxed);
             let directories = Arc::new(Directories::new(&plan)?);
             let mut directory_access = directory_permissions::TemporaryAccess::new(
-                self.args.temporarily_widen_dir_permissions
-                    && !self.args.dry_run
-                    && !self.args.only_new_native_entries(),
+                self.args.temporarily_widen_dir_permissions,
             );
             let mut copies_finished = false;
             let transferred = async {
@@ -559,10 +557,11 @@ impl Engine {
         mut widened: BTreeMap<String, crate::proto::DirectoryMode>,
         aborted: bool,
     ) -> Result<()> {
-        if self.args.dry_run {
+        let restore_only = aborted || self.args.dry_run;
+        if restore_only && widened.is_empty() {
             return Ok(());
         }
-        let mut entries: BTreeMap<_, _> = if aborted {
+        let mut entries: BTreeMap<_, _> = if restore_only {
             BTreeMap::new()
         } else {
             directories
@@ -579,7 +578,7 @@ impl Engine {
                 })
                 .collect::<Result<_>>()?
         };
-        if !aborted {
+        if !restore_only {
             for path in directories.created.lock().unwrap().iter() {
                 entries
                     .entry(String::from_utf8(path.clone())?)
