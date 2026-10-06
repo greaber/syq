@@ -623,7 +623,7 @@ impl Engine {
                     let current = directory.metadata()?.mode();
                     crate::fsops::set_mode_handle(
                         &directory,
-                        crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                        crate::fsops::created_directory_mode(&directory, 0o777, current, true)?,
                     )?;
                 }
                 Ok::<_, anyhow::Error>(())

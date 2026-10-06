@@ -382,9 +382,26 @@ pub struct SmallPut {
     /// The sender saw a file at this path while planning. The receiver only
     /// schedules by it: what publication does is decided by `condition`.
     pub replaces: bool,
-    /// The sender found no regular file at this path while planning (see
-    /// `Request::Prepare`).
-    pub new_file: bool,
+    /// What the sender's scan found at this path (see `ScannedDestination`).
+    pub scanned: ScannedDestination,
+}
+
+/// What a sender's scan found at the path a file is published to. It spares
+/// a receiver choosing the file's mode (`flags::RECEIVER_MODE`) a lookup of
+/// the path, which can be a round trip on a network filesystem: a new file
+/// gets the proposal as creating it limits it, and a replacement keeps the
+/// mode found. A receiver that takes its sender's word treats a file that
+/// appeared or changed since as the scan found it. A command-restricted
+/// receiver does not: its authority sets `Unknown`, and it looks.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScannedDestination {
+    /// Not known: the receiver looks.
+    #[default]
+    Unknown,
+    /// No regular file.
+    Absent,
+    /// A regular file with these permission bits.
+    File(u32),
 }
 
 /// An existing file's identity and change time. Any later write to the
@@ -1025,11 +1042,7 @@ pub enum WireRequest<Data> {
     /// proposal under `flags::RECEIVER_MODE`. The receiver creates an
     /// `--inplace` file and a sidecar from them, the sidecar private while
     /// `acl` says an ACL will follow.
-    /// `new_file` says the sender found no regular file at `path` while
-    /// planning. A receiver then takes a receiver-chosen mode as creating the
-    /// file gives it without looking at the path, which can be a round trip
-    /// on a network filesystem. A command-restricted receiver does not take
-    /// the sender's word and clears it.
+    /// `scanned` is what the sender's scan found at `path`.
     Prepare {
         path: PathBytes,
         size: u64,
@@ -1038,7 +1051,7 @@ pub enum WireRequest<Data> {
         mode: u32,
         flags: u8,
         acl: bool,
-        new_file: bool,
+        scanned: ScannedDestination,
         attempt: u32,
         create_if_missing: bool,
         guard: Option<ContainerGuard>,
@@ -1142,9 +1155,8 @@ pub enum WireRequest<Data> {
         copy_id: CopyId,
         meta: Meta,
         flags: u8,
-        /// The sender found no regular file at `path` while planning (see
-        /// `Request::Prepare`), so the copy created it.
-        new_file: bool,
+        /// What the sender's scan found at `path`.
+        scanned: ScannedDestination,
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
@@ -1322,9 +1334,13 @@ pub enum WireRequest<Data> {
         commit: bool,
     },
     /// Temporarily add owner access to existing destination directories.
-    /// Returns original modes only for directories actually changed.
+    /// Returns original modes only for directories actually changed. With
+    /// `remember`, the receiver keeps them to restore when it is later asked
+    /// to choose these directories' modes; without, the sender restores them
+    /// with the modes returned.
     WidenDirectories {
         directories: Vec<(PathBytes, TargetCondition)>,
+        remember: bool,
         guard: Option<ContainerGuard>,
     },
 }

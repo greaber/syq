@@ -82,6 +82,10 @@ pub struct FileJobData {
     /// --mapping: the entry's source path relative to the source base, kept
     /// so `--results` records round-trip as retry mapping entries.
     pub src_rel: Option<PathBytes>,
+    /// What the plan's scan found at `dst`, which the receiver chooses the
+    /// file's mode from without looking. A retry over this copy's own output
+    /// keeps it, so the output gets the mode the first attempt gave it.
+    pub scanned: crate::proto::ScannedDestination,
 }
 
 // Snapshots retain a chunk or a private retry version, preserving worker

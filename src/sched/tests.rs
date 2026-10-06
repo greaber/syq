@@ -14,6 +14,7 @@ pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
             rel: String::from_utf8(name.to_vec()).unwrap(),
             rel_bytes: name.to_vec(),
             src_rel: None,
+            scanned: Default::default(),
             entry: Entry {
                 path: Vec::new(),
                 kind: crate::proto::Kind::File,
@@ -254,6 +255,7 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
                 inplace: false,
                 rel_bytes: i.to_string().into_bytes(),
                 src_rel: None,
+                scanned: Default::default(),
             },
         });
         assert_eq!(idx, i);

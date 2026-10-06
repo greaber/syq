@@ -3338,6 +3338,12 @@ impl Planner<'_> {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
         let src_rel = self.mapping_source_rel(&rel_bytes);
+        let scanned = match &dst_entry {
+            Some(d) if d.kind == Kind::File => {
+                crate::proto::ScannedDestination::File(d.mode & 0o7777)
+            }
+            _ => crate::proto::ScannedDestination::Absent,
+        };
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -3362,6 +3368,7 @@ impl Planner<'_> {
                     && target_condition == TargetCondition::Any
                     && self.container_guard.is_none(),
                 src_rel,
+                scanned,
             },
         })
     }
@@ -4045,6 +4052,8 @@ impl Planner<'_> {
         let response = ok(
             self.dst.call(Request::WidenDirectories {
                 directories,
+                // Without -p the receiver restores the modes it saves.
+                remember: !self.opts.perms,
                 guard: self.container_guard.clone(),
             })?,
             "prepare directory permissions",

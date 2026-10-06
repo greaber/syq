@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 /// Bytes of a source a grouped comparison reads at once, rounded down to
 /// whole comparison blocks, or one block when blocks are larger.
@@ -74,7 +75,7 @@ impl FsOps {
         // here: its write permissions still decide whether an update is allowed.
         let file = root.create_file(relative, mode | 0o200)?;
         let created = file.metadata()?;
-        receiver_mode::note_inplace_creation(copy_id, &created);
+        receiver_mode::note_inplace_open(copy_id, &created, true);
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -446,6 +447,7 @@ impl FsOps {
                         ino: metadata.ino(),
                     },
                 )?;
+                receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
@@ -471,8 +473,12 @@ impl FsOps {
             match opened {
                 Ok(Some((file, mut opened))) if opened.is_file() => {
                     let euid = unsafe { libc::geteuid() };
-                    if euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600 {
-                        receiver_mode::note_inplace_creation(copy_id, &opened);
+                    let created =
+                        euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600;
+                    // Created or not, the file has the mode it was found or
+                    // created with until the writes.
+                    receiver_mode::note_inplace_open(copy_id, &opened, created);
+                    if created {
                         // A umask or inherited default ACL can remove even
                         // owner access from a new file; a file of ours that
                         // opened read-write with less can only be new, since
@@ -507,6 +513,7 @@ impl FsOps {
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
                         let opened = file.metadata()?;
+                        receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
@@ -1906,8 +1913,8 @@ impl FsOps {
         };
         let data = &put.data;
         let hash = put.hash;
-        let meta = &put.meta;
-        let flags = put.flags;
+        let mut meta = Cow::Borrowed(&put.meta);
+        let mut flags = put.flags;
         let inplace = put.inplace;
         let condition = put.condition;
         if self.hash_policy.transfer_integrity && self.observed_payload_hash(data) != hash {
@@ -1924,6 +1931,15 @@ impl FsOps {
             // nothing, and it serves the metadata step and the identity
             // afterwards.
             let mut created = None;
+            // The mode of the existing file opened, read before the writes
+            // that clear its set-ID bits, or `None` for a new file.
+            let mut found = None;
+            // A proposal's special bits are never created.
+            let create_mode = if flags & flags::RECEIVER_MODE != 0 {
+                meta.mode & 0o777
+            } else {
+                meta.mode
+            } & !self.creation_umask();
             // How far the file's old contents may extend. They are written
             // over and only then cut to the new length, so a write that
             // fails leaves old data rather than an emptied file.
@@ -1933,7 +1949,7 @@ impl FsOps {
                 TargetCondition::Absent => {
                     let file = rooted
                         .root
-                        .create_write_only_file(&rooted.relative, meta.mode)
+                        .create_write_only_file(&rooted.relative, create_mode)
                         .with_context(|| format!("create {}", rooted.label.display()))?;
                     created = Some(file.metadata()?);
                     file
@@ -1941,6 +1957,9 @@ impl FsOps {
                 TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
                     let file = rooted.root.open_regular_write(&rooted.relative, false)?;
                     require_open_target(&file, &rooted.label, condition)?;
+                    if flags & flags::RECEIVER_MODE != 0 {
+                        found = Some(file.metadata()?.mode());
+                    }
                     old_len = u64::MAX;
                     file
                 }
@@ -1953,10 +1972,15 @@ impl FsOps {
                     // out by the checks below.
                     let mut opened = match rooted
                         .root
-                        .open_or_create_write_only_file(&rooted.relative, meta.mode)
+                        .open_or_create_write_only_file(&rooted.relative, create_mode)
                     {
                         Ok((file, metadata)) if metadata.is_file() => {
                             old_len = metadata.len();
+                            // The open may have created the file; the scan
+                            // says whether one was there.
+                            if put.scanned != ScannedDestination::Absent {
+                                found = Some(metadata.mode());
+                            }
                             created = Some(metadata);
                             Some(file)
                         }
@@ -1973,6 +1997,7 @@ impl FsOps {
                                 let file =
                                     rooted.root.open_regular_write(&rooted.relative, false)?;
                                 require_rooted_metadata(&file, metadata, &rooted.label)?;
+                                found = Some(metadata.mode);
                                 old_len = metadata.len;
                                 opened = Some(file);
                                 break;
@@ -1983,7 +2008,7 @@ impl FsOps {
                             Some(_) => rooted.root.unlink(&rooted.relative)?,
                             None => match rooted
                                 .root
-                                .create_write_only_file(&rooted.relative, meta.mode)
+                                .create_write_only_file(&rooted.relative, create_mode)
                             {
                                 Ok(file) => {
                                     created = Some(file.metadata()?);
@@ -2004,6 +2029,17 @@ impl FsOps {
                     })?
                 }
             };
+            // Without -p a new file gets the mode creating it gives, and an
+            // existing one the mode it had before these writes.
+            if flags & flags::RECEIVER_MODE != 0 {
+                let mode = match found {
+                    Some(mode) => mode & 0o7777,
+                    None => self.new_file_mode(&rooted, meta.mode)?,
+                };
+                meta.to_mut().mode = mode;
+                flags = (flags & !flags::RECEIVER_MODE) | flags::MODE;
+            }
+            let meta = &*meta;
             observed_overwrite(&self.operation, &file, data, old_len, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
             let len = data.len() as u64;
@@ -2559,7 +2595,16 @@ impl FsOps {
         flags: u8,
         mutation: TargetMutation<'_>,
     ) -> Result<Option<(u64, u64)>> {
-        self.finalize_expected(None, path, inplace, copy_id, meta, flags, false, mutation)
+        self.finalize_expected(
+            None,
+            path,
+            inplace,
+            copy_id,
+            meta,
+            flags,
+            ScannedDestination::Unknown,
+            mutation,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2571,12 +2616,12 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
-        new_file: bool,
+        scanned: ScannedDestination,
         mutation: TargetMutation<'_>,
     ) -> Result<Option<(u64, u64)>> {
         let target = self.destination_mutation_target(path, mutation.guard)?;
         self.finalize_rooted(
-            &target, inplace, copy_id, meta, flags, new_file, mutation, expected,
+            &target, inplace, copy_id, meta, flags, scanned, mutation, expected,
         )
     }
 
@@ -2588,7 +2633,7 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
-        new_file: bool,
+        scanned: ScannedDestination,
         mutation: TargetMutation<'_>,
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
@@ -2626,7 +2671,7 @@ impl FsOps {
                 Self::verify_expected_inode(&file, &reader, expected)?;
             }
             let resolved =
-                self.inplace_final_mode(target, copy_id, &current, meta, flags, new_file)?;
+                self.inplace_final_mode(target, copy_id, &current, meta, flags, scanned)?;
             let (meta, flags) = resolved
                 .as_ref()
                 .map_or((meta, flags), |(meta, flags)| (meta, *flags));
@@ -2675,15 +2720,8 @@ impl FsOps {
         let resolved = (flags & flags::RECEIVER_MODE != 0)
             .then(|| {
                 let (mut meta, mut flags) = (meta.clone(), flags);
-                receiver_mode::resolve_file_publication(
-                    target,
-                    &mut meta,
-                    &mut flags,
-                    self.default_acl_creation,
-                    &mut None,
-                    receiver_mode::Replaced::claimed(new_file),
-                )
-                .map(|()| (meta, flags))
+                self.resolve_publication(target, &mut meta, &mut flags, &mut None, scanned)
+                    .map(|()| (meta, flags))
             })
             .transpose()?;
         let (meta, flags) = resolved
@@ -3077,8 +3115,13 @@ impl FsOps {
                     others,
                 })
             })(),
-            Request::WidenDirectories { directories, guard } => Ok(Response::WidenedDirectories(
-                parallel_map(directories, |(path, condition)| {
+            Request::WidenDirectories {
+                directories,
+                remember,
+                guard,
+            } => Ok(Response::WidenedDirectories(parallel_map(
+                directories,
+                |(path, condition)| {
                     (|| {
                         let target = self.destination_mutation_target(path, guard.as_ref())?;
                         let widened = widen_directory(
@@ -3087,15 +3130,15 @@ impl FsOps {
                             *condition,
                             &target.label,
                         )?;
-                        if let Some(widened) = &widened {
+                        if let Some(widened) = widened.as_ref().filter(|_| *remember) {
                             self.receiver_directories
                                 .widened((widened.dev, widened.ino), widened.mode);
                         }
                         Ok(widened)
                     })()
                     .map_err(|error| wire_error(&error))
-                }),
-            )),
+                },
+            ))),
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
             Request::ProbePartial {
                 path,
@@ -3110,7 +3153,7 @@ impl FsOps {
                 mode,
                 flags,
                 acl,
-                new_file,
+                scanned,
                 attempt,
                 create_if_missing,
                 guard,
@@ -3122,7 +3165,7 @@ impl FsOps {
                     *mode,
                     *flags,
                     *acl,
-                    receiver_mode::Replaced::claimed(*new_file),
+                    *scanned,
                 )
                 .and_then(|mode| {
                     self.prepare(
@@ -3417,7 +3460,7 @@ impl FsOps {
                 copy_id,
                 meta,
                 flags,
-                new_file,
+                scanned,
                 condition,
                 guard,
             } => self
@@ -3428,7 +3471,7 @@ impl FsOps {
                     copy_id,
                     meta,
                     *flags,
-                    *new_file,
+                    *scanned,
                     TargetMutation {
                         condition: *condition,
                         guard: guard.as_ref(),

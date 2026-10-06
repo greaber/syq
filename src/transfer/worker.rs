@@ -674,7 +674,7 @@ impl Worker {
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
                         replaces: job.dst_entry.is_some(),
-                        new_file: Self::new_file(job),
+                        scanned: job.scanned,
                     });
                     sent.push(idx);
                 }
@@ -1506,19 +1506,15 @@ impl Worker {
         file_mode(&self.opts, &job.rel_bytes, &job.entry)
     }
 
-    /// The plan found no regular file at the job's destination, which spares
-    /// the receiver a lookup for a mode it chooses.
-    pub(super) fn new_file(job: &WorkerJob) -> bool {
-        job.dst_entry.as_ref().is_none_or(|d| d.kind != Kind::File)
-    }
-
     pub(super) fn copy_id(&self) -> CopyId {
         self.opts.copy_id
     }
 
-    /// Metadata for the whole file just atomically published at the
-    /// destination. A retry can use it as a block-diff basis without changing
-    /// the no-`-p` mode chosen for the first attempt.
+    /// Metadata for the whole file just completed at the destination, which
+    /// a retry uses as its block-diff basis. Without -p its mode is the
+    /// source's proposal rather than the one the receiver chose; the retry's
+    /// publication chooses again from the plan's scan (`scanned`), as the
+    /// first attempt did.
     pub(super) fn published_entry(&self, job: &WorkerJob) -> Entry {
         let mut entry = job.entry.clone();
         entry.path = job.dst.clone();
@@ -1607,7 +1603,7 @@ impl Worker {
                 mode: self.create_mode(job),
                 flags: self.publication_flags(job),
                 acl: crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
-                new_file: Self::new_file(job),
+                scanned: job.scanned,
                 attempt: job.attempt,
                 create_if_missing,
                 guard: job.container_guard.clone(),
@@ -2568,7 +2564,7 @@ impl Worker {
                 copy_id: self.copy_id(),
                 meta,
                 flags: self.publication_flags(&job),
-                new_file: Self::new_file(&job),
+                scanned: job.scanned,
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
             })?,

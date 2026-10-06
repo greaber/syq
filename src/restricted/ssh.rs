@@ -284,7 +284,7 @@ mod tests {
             mode: 0o600,
             flags: 0,
             acl: false,
-            new_file: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
             guard: None,

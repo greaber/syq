@@ -764,7 +764,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &copy_id,
             &meta,
             0,
-            false,
+            crate::proto::ScannedDestination::Unknown,
             TargetMutation {
                 condition: TargetCondition::Any,
                 guard: None
@@ -781,7 +781,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &copy_id,
             &meta,
             0,
-            false,
+            crate::proto::ScannedDestination::Unknown,
             TargetMutation {
                 condition: TargetCondition::Any,
                 guard: None,
@@ -1343,7 +1343,7 @@ fn missing_operator_directory_is_created_under_retained_ancestor() {
 
     fs::rename(dir.join("parent"), dir.join("selected-and-moved")).unwrap();
     symlink(dir.join("outside"), dir.join("parent")).unwrap();
-    selection.create_missing(0o755, false).unwrap();
+    selection.create_missing(0o755, false, 0).unwrap();
 
     assert!(dir.join("selected-and-moved/missing/deeper").is_dir());
     assert!(!dir.join("outside/missing").exists());
@@ -1370,8 +1370,8 @@ fn concurrent_operator_directory_creation_reuses_the_real_directory() {
     assert!(first_anchor.is_none());
     assert!(second_anchor.is_none());
 
-    let first_anchor = first.create_missing(0o755, false).unwrap();
-    let second_anchor = second.create_missing(0o755, false).unwrap();
+    let first_anchor = first.create_missing(0o755, false, 0).unwrap();
+    let second_anchor = second.create_missing(0o755, false, 0).unwrap();
     assert_eq!(
         (first_anchor.dev, first_anchor.ino),
         (second_anchor.dev, second_anchor.ino)
@@ -1394,7 +1394,7 @@ fn new_operator_directory_rejects_a_concurrently_created_final_component() {
     assert!(anchor.is_none());
 
     fs::create_dir(&selected).unwrap();
-    let error = selection.create_missing(0o755, true).unwrap_err();
+    let error = selection.create_missing(0o755, true, 0).unwrap_err();
     assert!(error
         .to_string()
         .contains("appeared after the new-path precondition"));
@@ -1702,7 +1702,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         condition: TargetCondition::Absent,
         guard: None,
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     }]);
 
     let mut unrooted = FsOps::new();
@@ -1790,7 +1790,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         condition: TargetCondition::Any,
         guard: None,
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     };
     let response = rooted.handle(&Request::PutSmallBatch(vec![
         put(b"logical/file", 0o640, flags::RECEIVER_MODE),
@@ -2989,7 +2989,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             condition: TargetCondition::Absent,
             guard: None,
             replaces: false,
-            new_file: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("small")).unwrap(), b"small-data");
@@ -3014,7 +3014,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             },
             guard: None,
             replaces: false,
-            new_file: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("existing")).unwrap(), b"new");
@@ -3135,7 +3135,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             condition: TargetCondition::Absent,
             guard: None,
             replaces: false,
-            new_file: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
         })
         .is_err());
     assert!(!outside.join("escaped").exists());
@@ -7486,7 +7486,7 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                 condition,
                 guard: None,
                 replaces: true,
-                new_file: false,
+                scanned: crate::proto::ScannedDestination::Unknown,
             })
             .unwrap_err()
         } else {
@@ -7670,6 +7670,7 @@ fn temporary_directory_access_is_explicit_and_reports_only_changes() {
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
     let metadata = fs::metadata(&dir).unwrap();
     let request = Request::WidenDirectories {
+        remember: true,
         directories: vec![(
             path_bytes(&dir),
             TargetCondition::Matches {
@@ -7714,6 +7715,7 @@ fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
     let metadata = fs::metadata(&dir).unwrap();
     let request = Request::WidenDirectories {
+        remember: true,
         directories: vec![(
             path_bytes(&dir),
             TargetCondition::Matches {

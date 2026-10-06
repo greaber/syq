@@ -710,6 +710,11 @@ impl FsOps {
         }
         // The patch's new data was checked above, and its put is published
         // without another check, so it carries no payload hash.
+        // The file it replaces is open here, so its mode is known.
+        let scanned = match &old {
+            Some(old) => ScannedDestination::File(old.metadata()?.mode() & 0o7777),
+            None => ScannedDestination::Unknown,
+        };
         let put = |data: Vec<u8>| SmallPut {
             path: patch.path.clone(),
             copy_id: patch.copy_id,
@@ -721,7 +726,7 @@ impl FsOps {
             condition: patch.condition,
             guard: patch.guard.clone(),
             replaces: true,
-            new_file: false,
+            scanned,
         };
         let reused = patch.len - patch.data.len() as u64;
         let clones = reused >= CLONE_MIN_REUSED && reused * 2 >= patch.len;
@@ -892,9 +897,6 @@ impl FsOps {
         let mut held = None;
         while next < puts.len() || carried.is_some() {
             if carried.is_none() && puts[next].inplace {
-                // Written in place, a new file is created from the proposal,
-                // which its creation limits, and an existing one keeps its mode.
-                puts[next].flags &= !flags::RECEIVER_MODE;
                 results[next] = self
                     .put_small(&puts[next])
                     .map_err(|error| wire_error(&error));
@@ -920,15 +922,13 @@ impl FsOps {
                     self.small_target(&puts[index])
                 };
                 let put = &mut puts[index];
-                let default_acl = self.default_acl_creation;
                 let target = target.and_then(|target| {
-                    receiver_mode::resolve_file_publication(
+                    self.resolve_publication(
                         &target,
                         &mut put.meta,
                         &mut put.flags,
-                        default_acl,
                         &mut held,
-                        receiver_mode::Replaced::claimed(put.new_file),
+                        put.scanned,
                     )
                     .map(|()| target)
                 });
@@ -1474,7 +1474,7 @@ mod tests {
             condition: TargetCondition::Any,
             guard: None,
             replaces: false,
-            new_file: false,
+            scanned: ScannedDestination::Unknown,
         }
     }
 

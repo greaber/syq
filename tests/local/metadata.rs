@@ -1,5 +1,130 @@
 use super::*;
 
+/// Run a native copy with `umask`, which is also its receiver's.
+fn native_copy_with_umask(umask: libc::mode_t, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args(args);
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    command.run().unwrap()
+}
+
+fn permission_bits(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().mode() & 0o7777
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_copies_limit_new_entries_by_the_umask_despite_a_permissive_default_acl() {
+    use std::os::unix::ffi::OsStrExt;
+    // A default ACL granting everyone everything replaces the umask for the
+    // kernel; a native copy still limits new entries by the umask, whether
+    // it writes them in place, stages them or creates them directly.
+    let t = Tmp::new();
+    write(&t.path("src/small"), b"small");
+    write(&t.path("src/large"), &prng(3 << 20, 7));
+    fs::create_dir(t.path("src/directory")).unwrap();
+    mkfifo(&t.path("src/fifo"));
+    for name in ["small", "large", "fifo", "directory"] {
+        let mode = if name == "directory" { 0o777 } else { 0o666 };
+        fs::set_permissions(t.path("src").join(name), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    // version 2; USER_OBJ, GROUP_OBJ and OTHER, each rwx.
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for tag in [1u16, 4, 32] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(7u16.to_le_bytes());
+        acl.extend(u32::MAX.to_le_bytes());
+    }
+    let src = t.s("src");
+    for variant in ["inplace", "staged", "ranges"] {
+        let dst = t.path(variant);
+        fs::create_dir(&dst).unwrap();
+        let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
+        if unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        } != 0
+        {
+            eprintln!(
+                "skipped: this filesystem rejected a default ACL: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let mut args = vec![
+            "cp",
+            "--no-progress",
+            "--copy-metadata=specials",
+            "--srcs-in",
+            &src,
+            "--into",
+            dst.to_str().unwrap(),
+        ];
+        match variant {
+            "inplace" => args.push("--inplace"),
+            "ranges" => args.extend(["--inplace", "--performance-tuning", "copy-path=ranges"]),
+            _ => {}
+        }
+        let output = native_copy_with_umask(0o077, &args);
+        assert_output_ok(&output);
+        let modes = ["small", "large", "fifo", "directory"]
+            .map(|name| format!("{name} {:o}", permission_bits(&dst.join(name))));
+        assert_eq!(
+            modes,
+            ["small 600", "large 600", "fifo 600", "directory 700"],
+            "{variant}"
+        );
+    }
+}
+
+#[test]
+fn in_place_updates_keep_existing_set_id_bits() {
+    // Writing to a file clears its set-ID bits; without -p an existing
+    // file keeps its whole mode, so the copy restores them.
+    let t = Tmp::new();
+    for (name, size) in [("small", 100), ("large", 3 << 20)] {
+        write(&t.path("src").join(name), &prng(size, 1));
+    }
+    let src = t.s("src");
+    for variant in ["automatic", "ranges"] {
+        let dst = t.path(variant);
+        for (name, size, mode) in [("small", 100, 0o4755), ("large", 3 << 20, 0o2755)] {
+            write(&dst.join(name), &prng(size, 2));
+            fs::set_permissions(dst.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let mut args = vec![
+            "cp",
+            "--no-progress",
+            "--inplace",
+            "--srcs-in",
+            &src,
+            "--into",
+            dst.to_str().unwrap(),
+        ];
+        if variant == "ranges" {
+            args.extend(["--performance-tuning", "copy-path=ranges"]);
+        }
+        let output = native_copy_with_umask(0o022, &args);
+        assert_output_ok(&output);
+        for name in ["small", "large"] {
+            assert_eq!(read(&dst.join(name)), read(&t.path("src").join(name)));
+        }
+        let modes =
+            ["small", "large"].map(|name| format!("{name} {:o}", permission_bits(&dst.join(name))));
+        assert_eq!(modes, ["small 4755", "large 2755"], "{variant}");
+    }
+}
+
 #[test]
 fn new_remote_entries_use_the_receivers_umask() {
     // The copy runs with umask 022 and its receiver with 077: without -p,

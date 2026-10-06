@@ -982,8 +982,9 @@ impl Root {
 
     /// The mode a regular file published at `path` takes when the receiver
     /// chooses it: a regular file there keeps its mode, and a new one gets
-    /// the mode creating it would (`receiver_creation_mode`). `held` keeps
-    /// the last parent open for the next name in the same directory.
+    /// `proposed` limited as creating it would limit it, with `default_acl`
+    /// by its directory's default ACL. `held` keeps the last parent open for
+    /// the next name in the same directory.
     pub(crate) fn receiver_file_mode(
         &self,
         path: &RelativePath,
@@ -1004,23 +1005,14 @@ impl Root {
         }
     }
 
-    /// The mode creating a file at `path` from `proposed` gives it: the
-    /// proposal's permission bits limited by this process's umask or, with
-    /// `default_acl`, by the parent's default ACL when it has one. Only the
-    /// default ACL needs the parent.
-    pub(crate) fn receiver_creation_mode(
-        &self,
-        path: &RelativePath,
-        proposed: u32,
-        default_acl: bool,
-        held: &mut Option<HeldParent>,
-    ) -> Result<u32> {
-        if !default_acl {
-            return Ok(proposed & 0o777 & !crate::fsops::process_umask());
-        }
-        self.hold_parent(path, held)?
-            .0
-            .creation_mode(proposed, default_acl)
+    /// The permission bits a file created at `path` may have: its
+    /// directory's default ACL's, when it has one, and otherwise those the
+    /// umask leaves.
+    pub(crate) fn creation_permissions(&self, path: &RelativePath) -> Result<u32> {
+        let (parents, _) = path.leaf()?;
+        let directory = open_directory_components(&self.directory, parents)
+            .with_context(|| format!("resolve confined parent for {}", path.label()))?;
+        crate::inode_metadata::default_permissions(&directory)
     }
 
     fn hold_parent<'a, 'p>(

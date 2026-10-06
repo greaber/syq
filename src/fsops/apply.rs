@@ -14,11 +14,14 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
     }
 }
 
+/// Carry out `op`, creating what it creates without the `umask`
+/// permission bits (see `FsOps::creation_umask`).
 pub(super) fn apply_one(
     op: &Op,
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    umask: u32,
 ) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
@@ -71,14 +74,14 @@ pub(super) fn apply_one(
                 dev: *dev,
                 ino: *ino,
             };
-            return apply_one_rooted(&operation, &target.as_rooted());
+            return apply_one_rooted(&operation, &target.as_rooted(), umask);
         }
-        return apply_one_rooted(op, &target.as_rooted());
+        return apply_one_rooted(op, &target.as_rooted(), umask);
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target)
+    apply_one_rooted(op, &target, umask)
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -351,13 +354,13 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
+fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
         Op::Mkdir {
             mode, condition, ..
-        } => mkdir_rooted(target, *mode, *condition, false).map(drop),
+        } => mkdir_rooted(target, *mode, *condition, false, umask).map(drop),
         Op::Symlink {
             target: link,
             condition,
@@ -400,6 +403,8 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
             condition,
             ..
         } => {
+            // Created without the umask bits, whatever a default ACL allows.
+            let mode = &(*mode & !umask);
             if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
                 match root.create_node(path, *mode, *rdev) {
                     Ok(()) => return Ok(()),
@@ -671,6 +676,7 @@ pub(super) fn create_private_directory(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    umask: u32,
 ) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
         path, condition, ..
@@ -684,7 +690,7 @@ pub(super) fn create_private_directory(
     };
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
-    mkdir_rooted(&target, 0o700, *condition, true)
+    mkdir_rooted(&target, 0o700, *condition, true, umask)
 }
 
 /// Give a directory this receiver created private, once it has taken its
@@ -700,6 +706,7 @@ pub(super) fn open_created_directory(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    default_acl: bool,
 ) -> Result<()> {
     let target = operation_target(path, guard, destination_root, destination_prefix)?;
     let directory = target.root.open_metadata(&target.relative)?;
@@ -709,16 +716,31 @@ pub(super) fn open_created_directory(
     }
     set_mode_handle(
         &directory,
-        created_directory_mode(&directory, (proposed & 0o7777) | 0o700, current.mode())?,
+        created_directory_mode(
+            &directory,
+            (proposed & 0o7777) | 0o700,
+            current.mode(),
+            default_acl,
+        )?,
     )
 }
 
 /// The mode creating `directory` with `proposed` would have given it, for a
 /// directory created private instead: permission bits limited by the umask
-/// or by the default ACL it inherited, and the setgid bit of `current`,
-/// which it inherited from its parent. Creation never sets other bits.
-pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u32) -> Result<u32> {
-    let permitted = crate::inode_metadata::default_permissions(directory)?;
+/// or, with `default_acl`, by the default ACL it inherited, and the setgid
+/// bit of `current`, which it inherited from its parent. Creation never sets
+/// other bits.
+pub(crate) fn created_directory_mode(
+    directory: &File,
+    proposed: u32,
+    current: u32,
+    default_acl: bool,
+) -> Result<u32> {
+    let permitted = if default_acl {
+        crate::inode_metadata::default_permissions(directory)?
+    } else {
+        0o777 & !process_umask()
+    };
     Ok((proposed & permitted & 0o777) | (current & 0o2000))
 }
 
@@ -731,9 +753,11 @@ fn mkdir_rooted(
     mode: u32,
     condition: TargetCondition,
     identify: bool,
+    umask: u32,
 ) -> Result<Option<CreatedDirectory>> {
     let root = &target.root;
     let path = &target.relative;
+    let mode = mode & !umask;
     if path.is_empty() {
         if condition == TargetCondition::Absent {
             bail!("destination root {} already exists", target.label.display());
@@ -743,7 +767,7 @@ fn mkdir_rooted(
         return Ok(None);
     }
     let parent = if target.create_missing_parents {
-        root.resolve_parent_creating(path, 0o777)?
+        root.resolve_parent_creating(path, 0o777 & !umask)?
     } else {
         root.resolve_parent(path)?
     };

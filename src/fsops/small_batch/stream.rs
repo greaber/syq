@@ -152,7 +152,7 @@ impl FsOps {
             condition: patch.condition,
             guard: patch.guard.clone(),
             replaces: true,
-            new_file: false,
+            scanned: ScannedDestination::Unknown,
         };
         let mut stream = Box::new(PatchStream {
             patch: patch.clone(),
@@ -472,13 +472,17 @@ impl FsOps {
             stage.file.set_len(stream.patch.len)?;
         }
         check_destination_writes(&stage.file, &stage.label)?;
-        crate::fsops::receiver_mode::resolve_file_publication(
+        // The file a seeded patch reuses is open, so its mode is known.
+        let scanned = match &stream.old {
+            Some(old) => ScannedDestination::File(old.metadata()?.mode() & 0o7777),
+            None => ScannedDestination::Unknown,
+        };
+        self.resolve_publication(
             &stage.target,
             &mut stream.put.meta,
             &mut stream.put.flags,
-            self.default_acl_creation,
             &mut None,
-            crate::fsops::receiver_mode::Replaced::Unknown,
+            scanned,
         )?;
         set_meta_written_file_for_publication(
             &stage.file,

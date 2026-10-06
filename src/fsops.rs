@@ -647,6 +647,9 @@ pub struct FsOps {
     /// New entries' permissions are limited by a default ACL, as rsync
     /// limits them, rather than by the umask alone.
     default_acl_creation: bool,
+    /// The permission bits each directory's default ACL lets new files
+    /// have, by root and directory, read once per connection.
+    creation_permissions: Mutex<receiver_mode::CreationPermissions>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -856,6 +859,7 @@ impl FsOps {
             fixed_wide_mode_devices: HashMap::new(),
             receiver_directories: Default::default(),
             default_acl_creation: false,
+            creation_permissions: Default::default(),
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,
@@ -938,11 +942,12 @@ impl FsOps {
         mode: u32,
         require_absent: bool,
     ) -> Result<DirectoryAnchor> {
+        let umask = self.creation_umask();
         let anchor = self
             .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
-            .create_missing(mode, require_absent)?;
+            .create_missing(mode, require_absent, umask)?;
         // A destination created private is opened once its metadata is set.
         if mode & 0o7777 == 0o700 {
             let created = self
@@ -1304,8 +1309,8 @@ impl FsOps {
             }
             // The file it replaces is the one inspected above.
             let replaced = match &destinations[i] {
-                Some(stat) => receiver_mode::Replaced::File(stat.st_mode as u32),
-                None => receiver_mode::Replaced::Nothing,
+                Some(stat) => crate::proto::ScannedDestination::File(stat.st_mode as u32 & 0o7777),
+                None => crate::proto::ScannedDestination::Absent,
             };
             match self.stage_small_file(
                 &file.path,
@@ -1458,20 +1463,13 @@ impl FsOps {
         data: &[u8],
         mut meta: Meta,
         mut flags: u8,
-        replaced: receiver_mode::Replaced,
+        replaced: crate::proto::ScannedDestination,
     ) -> Result<StagedSmallFile> {
         let path = self.destination_relative(path)?;
         let rooted = self
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
-        receiver_mode::resolve_file_publication(
-            &rooted,
-            &mut meta,
-            &mut flags,
-            self.default_acl_creation,
-            &mut None,
-            replaced,
-        )?;
+        self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
         let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         let creation = sidecars::begin()?;
@@ -2274,7 +2272,9 @@ impl FsOps {
                     }
                 }
             }
-            Request::WidenDirectories { directories, guard } => {
+            Request::WidenDirectories {
+                directories, guard, ..
+            } => {
                 if guard.is_none() {
                     for (path, _) in directories {
                         map(path)?;
@@ -2935,9 +2935,9 @@ impl FsOps {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });
         }
-        let resolved = self.resolve_metadata_ops(ops, guard);
-        let ops = resolved.as_deref().unwrap_or(ops);
         let directories = &self.receiver_directories;
+        let umask = self.creation_umask();
+        let default_acl = self.default_acl_creation;
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
@@ -2992,6 +2992,7 @@ impl FsOps {
                         guard,
                         destination_root.clone(),
                         destination_prefix,
+                        umask,
                     )
                     .map(|created| {
                         if let Some((dev, ino, _)) = created {
@@ -3011,6 +3012,7 @@ impl FsOps {
                         guard,
                         destination_root.clone(),
                         destination_prefix,
+                        umask,
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
@@ -3018,7 +3020,13 @@ impl FsOps {
                         }
                     })
                 }
-                _ => apply_one(op, guard, destination_root.clone(), destination_prefix),
+                _ => apply_one(
+                    op,
+                    guard,
+                    destination_root.clone(),
+                    destination_prefix,
+                    umask,
+                ),
             };
             result.err().as_ref().map(wire_error)
         };
@@ -3041,7 +3049,22 @@ impl FsOps {
         }
         let private = private.into_inner().unwrap();
         let mres = parallel_map(&meta_idx, |&i| {
-            let result = apply_one(&ops[i], guard, destination_root.clone(), destination_prefix);
+            // A receiver-chosen mode is decided here, in parallel, once the
+            // request's creations are done.
+            let op = directories.resolve_op(
+                &ops[i],
+                guard,
+                destination_root.clone(),
+                destination_prefix,
+                default_acl,
+            );
+            let result = apply_one(
+                &op,
+                guard,
+                destination_root.clone(),
+                destination_prefix,
+                umask,
+            );
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {
@@ -3053,6 +3076,7 @@ impl FsOps {
                         guard,
                         destination_root.clone(),
                         destination_prefix,
+                        default_acl,
                     )
                 }),
                 _ => None,

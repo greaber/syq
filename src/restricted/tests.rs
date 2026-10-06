@@ -990,7 +990,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
             ino: 2,
         }),
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     }]);
     authority.authorize(&mut small, false).unwrap();
     let Request::PutSmallBatch(puts) = small else {
@@ -1088,7 +1088,7 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1170,7 +1170,7 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1203,7 +1203,7 @@ fn signed_inplace_policy_requires_inplace_file_mutations() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1257,7 +1257,7 @@ fn prepare_request(path: &Path) -> Request {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1272,7 +1272,7 @@ fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
         copy_id: [1; 16],
         meta: plain_meta(),
         flags: 0,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         condition,
         guard: None,
     }
@@ -1297,7 +1297,7 @@ fn small_put(path: &Path) -> Request {
         condition: proto::TargetCondition::Any,
         guard: None,
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     }])
 }
 
@@ -1616,6 +1616,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                 );
                 assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
                 let mut access = Request::WidenDirectories {
+                    remember: true,
                     directories: vec![(
                         path_bytes(&parent),
                         proto::TargetCondition::Matches {
@@ -2890,7 +2891,7 @@ fn receipt_policy_records_each_outcome_and_closure_state_then_encrypts_it() {
         condition: proto::TargetCondition::Any,
         guard: None,
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     };
     let mut batch = Request::PutSmallBatch(vec![put(&copied), put(&failed)]);
     let settlement = authority.authorize(&mut batch, false).unwrap();
@@ -3008,7 +3009,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -3062,7 +3063,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -3076,7 +3077,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         copy_id: [2; 16],
         meta: plain_meta(),
         flags: 0,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         condition: proto::TargetCondition::Any,
         guard: None,
     };
@@ -3137,7 +3138,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             mode: 0o644,
             flags: 0,
             acl: false,
-            new_file: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
             guard: None,
@@ -3167,7 +3168,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             copy_id,
             meta: plain_meta(),
             flags: proto::flags::RECEIVER_MODE,
-            new_file: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
             condition: proto::TargetCondition::Any,
             guard: None,
         });
@@ -3628,6 +3629,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         &authority,
         &mut ops,
         Request::WidenDirectories {
+            remember: true,
             directories: vec![(
                 path(&existing_directory),
                 proto::TargetCondition::Matches {
@@ -3704,7 +3706,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         condition: proto::TargetCondition::Any,
         guard: None,
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     };
     let mut files =
         Request::PutSmallBatch(vec![put(&existing_file), put(&setuid_file), put(&new_file)]);
@@ -3870,7 +3872,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -4091,7 +4093,7 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
         condition: proto::TargetCondition::Any,
         guard: None,
         replaces: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     }]);
     assert!(authority.authorize(&mut small, false).is_err());
 
@@ -4240,7 +4242,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         mode: 0o600,
         flags: 0,
         acl: false,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -4283,7 +4285,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
             mtime_nsec: 0,
         },
         flags: 0,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         condition: proto::TargetCondition::Any,
         guard: None,
     };
@@ -4303,7 +4305,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
             mtime_nsec: 0,
         },
         flags: 0,
-        new_file: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
         condition: proto::TargetCondition::Any,
         guard: None,
     };
@@ -6190,6 +6192,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
         // their final modes at the end.
         let observed = fs::metadata(target.join("read-only-dir")).unwrap();
         let widened = receiver.send(Request::WidenDirectories {
+            remember: !preserve,
             directories: vec![(
                 path("read-only-dir"),
                 proto::TargetCondition::Matches {
@@ -6237,7 +6240,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 condition: proto::TargetCondition::Any,
                 guard: None,
                 replaces: false,
-                new_file: false,
+                scanned: crate::proto::ScannedDestination::Unknown,
             };
             receiver.send(Request::PutSmallBatch(vec![
                 put("new-file", 0o755),
@@ -6261,7 +6264,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 mode: proposed,
                 flags: mode_flag,
                 acl: false,
-                new_file: false,
+                scanned: crate::proto::ScannedDestination::Unknown,
                 attempt: 0,
                 create_if_missing: true,
                 guard: None,
@@ -6283,7 +6286,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 copy_id: [2; 16],
                 meta: meta(proposed),
                 flags: mode_flag,
-                new_file: false,
+                scanned: crate::proto::ScannedDestination::Unknown,
                 condition: proto::TargetCondition::Any,
                 guard: None,
             });
@@ -6362,80 +6365,145 @@ fn ordinary_and_restricted_receivers_choose_the_same_modes() {
 }
 
 #[test]
-fn only_an_ordinary_receiver_takes_a_senders_word_that_a_file_is_new() {
-    // A sender claims that files already there are new. An ordinary receiver
-    // takes its word and gives them the mode creating them would, sparing a
-    // lookup; a command-restricted one looks and keeps their modes.
+fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
+    // A sender misreports files already there: as absent, or as files of
+    // another mode. An ordinary receiver takes its word, sparing a lookup,
+    // and gives them the mode creating them would give, or the reported
+    // one; a command-restricted receiver looks and keeps their modes.
     let umask = crate::fsops::process_umask();
+    let claims = [
+        (proto::ScannedDestination::Absent, 0o755 & !umask),
+        (proto::ScannedDestination::File(0o640), 0o640),
+    ];
+    for (scanned, ordinary_mode) in claims {
+        for restricted in [false, true] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let root = temporary.path().join("root");
+            let target = root.join("target");
+            fs::create_dir_all(&target).unwrap();
+            for name in ["small", "large"] {
+                fs::write(target.join(name), b"old").unwrap();
+                fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let mut receiver =
+                ParityReceiver::new(&root, restricted, false, PublicationPolicy::AtomicStaged);
+            let path = |name: &str| path_bytes(&target.join(name));
+            let meta = proto::Meta {
+                mode: 0o755,
+                ..plain_meta()
+            };
+            receiver.send(Request::PutSmallBatch(vec![proto::SmallPut {
+                path: path("small"),
+                copy_id: [1; 16],
+                data: b"new".to_vec(),
+                hash: crate::fsops::content_digest(b"new"),
+                meta: meta.clone(),
+                flags: proto::flags::RECEIVER_MODE,
+                inplace: false,
+                condition: proto::TargetCondition::Any,
+                guard: None,
+                replaces: false,
+                scanned,
+            }]));
+            let data = b"contents".to_vec();
+            receiver.send(Request::Prepare {
+                path: path("large"),
+                size: data.len() as u64,
+                inplace: false,
+                copy_id: [2; 16],
+                mode: 0o755,
+                flags: proto::flags::RECEIVER_MODE,
+                acl: false,
+                scanned,
+                attempt: 0,
+                create_if_missing: true,
+                guard: None,
+            });
+            receiver.send(Request::WriteRange {
+                path: path("large"),
+                inplace: false,
+                copy_id: [2; 16],
+                attempt: 0,
+                off: 0,
+                hash: crate::fsops::content_digest(&data),
+                data: data.into(),
+                guard: None,
+            });
+            receiver.send(Request::Finalize {
+                expected_hash: None,
+                path: path("large"),
+                inplace: false,
+                copy_id: [2; 16],
+                meta: meta.clone(),
+                flags: proto::flags::RECEIVER_MODE,
+                scanned,
+                condition: proto::TargetCondition::Any,
+                guard: None,
+            });
+            let expected = if restricted { 0o600 } else { ordinary_mode };
+            for name in ["small", "large"] {
+                let mode = fs::metadata(target.join(name)).unwrap().mode() & 0o7777;
+                assert_eq!(mode, expected, "{scanned:?} restricted={restricted} {name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn both_receivers_restore_set_id_bits_after_writing_in_place() {
+    // Writes clear an existing file's set-ID bits. Without word from the
+    // sender, each receiver restores the mode it found the file with.
     for restricted in [false, true] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
-        for name in ["small", "large"] {
-            fs::write(target.join(name), b"old").unwrap();
-            fs::set_permissions(target.join(name), fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        fs::write(target.join("program"), b"old program").unwrap();
+        fs::set_permissions(target.join("program"), fs::Permissions::from_mode(0o4755)).unwrap();
         let mut receiver =
-            ParityReceiver::new(&root, restricted, false, PublicationPolicy::AtomicStaged);
-        let path = |name: &str| path_bytes(&target.join(name));
-        let meta = proto::Meta {
-            mode: 0o755,
-            ..plain_meta()
-        };
-        receiver.send(Request::PutSmallBatch(vec![proto::SmallPut {
-            path: path("small"),
-            copy_id: [1; 16],
-            data: b"new".to_vec(),
-            hash: crate::fsops::content_digest(b"new"),
-            meta: meta.clone(),
-            flags: proto::flags::RECEIVER_MODE,
-            inplace: false,
-            condition: proto::TargetCondition::Any,
-            guard: None,
-            replaces: false,
-            new_file: true,
-        }]));
-        let data = b"contents".to_vec();
+            ParityReceiver::new(&root, restricted, false, PublicationPolicy::InPlace);
+        let path = path_bytes(&target.join("program"));
+        let data = b"new program".to_vec();
         receiver.send(Request::Prepare {
-            path: path("large"),
+            path: path.clone(),
             size: data.len() as u64,
-            inplace: false,
-            copy_id: [2; 16],
+            inplace: true,
+            copy_id: [3; 16],
             mode: 0o755,
             flags: proto::flags::RECEIVER_MODE,
             acl: false,
-            new_file: true,
+            scanned: proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
             guard: None,
         });
         receiver.send(Request::WriteRange {
-            path: path("large"),
-            inplace: false,
-            copy_id: [2; 16],
+            path: path.clone(),
+            inplace: true,
+            copy_id: [3; 16],
             attempt: 0,
             off: 0,
             hash: crate::fsops::content_digest(&data),
-            data: data.into(),
+            data: data.clone().into(),
             guard: None,
         });
         receiver.send(Request::Finalize {
             expected_hash: None,
-            path: path("large"),
-            inplace: false,
-            copy_id: [2; 16],
-            meta: meta.clone(),
+            path,
+            inplace: true,
+            copy_id: [3; 16],
+            meta: proto::Meta {
+                mode: 0o755,
+                ..plain_meta()
+            },
             flags: proto::flags::RECEIVER_MODE,
-            new_file: true,
+            scanned: proto::ScannedDestination::Unknown,
             condition: proto::TargetCondition::Any,
             guard: None,
         });
-        let expected = if restricted { 0o600 } else { 0o755 & !umask };
-        for name in ["small", "large"] {
-            let mode = fs::metadata(target.join(name)).unwrap().mode() & 0o7777;
-            assert_eq!(mode, expected, "restricted={restricted} {name}");
-        }
+        assert_eq!(fs::read(target.join("program")).unwrap(), data);
+        let mode = fs::metadata(target.join("program")).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o4755, "restricted={restricted}");
     }
 }
 

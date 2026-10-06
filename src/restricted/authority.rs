@@ -2149,7 +2149,15 @@ impl RestrictedAuthority {
                 }
                 *guard = Some(self.guard.clone());
             }
-            Request::WidenDirectories { directories, guard } => {
+            Request::WidenDirectories {
+                directories,
+                remember,
+                guard,
+            } => {
+                // The receiver restores what it widened when asked to choose
+                // a mode, as it always is for a mapping parent, whose
+                // restoration this authority turns into a receiver-chosen mode.
+                *remember = true;
                 for (index, (path, condition)) in directories.iter_mut().enumerate() {
                     // Widening is the existing-directory part of EnsureDirectory.
                     // Apply exactly the same signed path/policy/quota checks,
@@ -2321,14 +2329,14 @@ impl RestrictedAuthority {
                 inplace,
                 copy_id,
                 flags,
-                new_file,
+                scanned,
                 create_if_missing,
                 guard,
                 ..
             } => {
-                // The receiver looks for itself whether a file is new: a
+                // The receiver looks for itself at what a file replaces: a
                 // sender's word could give an existing file a new mode.
-                *new_file = false;
+                *scanned = proto::ScannedDestination::Unknown;
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file preparation does not match the signed publication policy");
                 }
@@ -2434,15 +2442,15 @@ impl RestrictedAuthority {
                 copy_id,
                 meta,
                 flags,
-                new_file,
+                scanned,
                 condition,
                 guard,
                 ..
             } => {
-                // The receiver looks for itself whether a file is new, and
-                // knows the in-place files it created: all of the copy's
-                // connections are in its process.
-                *new_file = false;
+                // The receiver looks for itself, and knows the in-place
+                // files it opened: all of the copy's connections are in its
+                // process.
+                *scanned = proto::ScannedDestination::Unknown;
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
@@ -2482,7 +2490,7 @@ impl RestrictedAuthority {
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
                     // As for `Prepare`, the receiver looks for itself.
-                    put.new_file = false;
+                    put.scanned = proto::ScannedDestination::Unknown;
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
                     }
