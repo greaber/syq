@@ -7,6 +7,7 @@ after every object is written and before any directory metadata is applied.
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 import time
@@ -91,6 +92,28 @@ def check():
             after = {path: mode(destination / path) for path in directories}
             assert after == {path: value & ~UMASK for path, value in expected.items()}, after
             assert private(during), {path: oct(value) for path, value in during.items()}
+
+        # Without -p, a marker directory ends as creating it there would have
+        # left it, as in a local copy: it keeps the setgid bit it inherited,
+        # and an inherited default ACL limits its mode instead of the umask.
+        setgid = root / 'setgid'
+        setgid.mkdir()
+        setgid.chmod(0o2755)
+        c.run(['--from', remote, prefix + '/source', '--into', setgid / 'download'])
+        after = {path: mode(setgid / 'download' / path) for path in directories}
+        assert after == {path: value & ~UMASK | 0o2000 for path, value in expected.items()}, after
+        acl = root / 'acl'
+        acl.mkdir()
+        try:
+            # Owner rwx, owning group r-x, others nothing.
+            os.setxattr(acl, 'system.posix_acl_default', struct.pack(
+                '<I' + 'HHI' * 3, 2, 0x01, 7, 0xffffffff, 0x04, 5, 0xffffffff, 0x20, 0, 0xffffffff))
+        except (AttributeError, OSError) as error:
+            print(f'Skipping the default ACL download check: {error}', flush=True)
+        else:
+            c.run(['--from', remote, prefix + '/source', '--into', acl / 'download'])
+            after = {path: mode(acl / 'download' / path) for path in directories}
+            assert after == {path: value & 0o750 for path, value in expected.items()}, after
 
         # A directory a file's download creates before its own marker's job runs
         # still receives the marker's mode. One object at a time, in mapping order.

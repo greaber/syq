@@ -596,10 +596,16 @@ pub(super) fn apply_metadata(
         } else {
             root.open_regular_read(path)?
         };
+        // Without -p, a directory this download created gets the mode
+        // creating it with its marker's mode would have given it, as a local
+        // copy's does: limited by the default ACL it inherited, or else by
+        // the umask, and keeping the setgid bit it inherited.
         let mode = if args.perms || explicit.mode.is_some() {
             metadata.mode
+        } else if let Some(existing) = existing_mode {
+            existing
         } else {
-            existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
+            crate::fsops::created_directory_mode(&file, metadata.mode, file.metadata()?.mode())?
         };
         crate::fsops::set_mode_handle(&file, mode)?;
     }
