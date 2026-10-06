@@ -2511,6 +2511,73 @@ fn missing_remote_directory_reports_shared_directory_created_once() {
     }
 }
 
+#[test]
+fn native_remote_container_access_refreshes_cached_existence() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for placement in ["--into", "--as"] {
+        for only_existing in [false, true] {
+            for present in [false, true] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                write(&t.path("src/file"), b"new source contents");
+                fs::create_dir(t.path("dst")).unwrap();
+                if present {
+                    write(&t.path("dst/file"), b"old destination contents");
+                }
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command
+                    .args(["cp", &t.s("src/file"), "--to", "fake", placement])
+                    .arg(if placement == "--into" {
+                        t.path("dst")
+                    } else {
+                        t.path("dst/file")
+                    })
+                    .args([
+                        "--temporarily-widen-dir-permissions",
+                        "--no-tcp",
+                        "-q",
+                        "--performance-tuning=workers=1",
+                        "--rsh",
+                    ])
+                    .arg(rsh)
+                    .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+                if only_existing {
+                    command.args(["--only-existing", "--if-exists=update"]);
+                } else {
+                    command.arg("--if-exists=keep");
+                }
+                let output = command.run().unwrap();
+                let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o7777;
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+                assert_output_ok(&output);
+                assert_eq!(mode, 0o600);
+                if only_existing && !present {
+                    assert!(!t.path("dst/file").exists());
+                } else {
+                    let expected = if !only_existing && present {
+                        b"old destination contents".as_slice()
+                    } else {
+                        b"new source contents".as_slice()
+                    };
+                    assert_eq!(
+                        read(&t.path("dst/file")),
+                        expected,
+                        "{placement}, only_existing={only_existing}, present={present}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A signed receiver never answers the emptiness probe, so a fresh tree
 /// there is a missing destination. Its descendants need no lookups either,
 /// whatever existing-file policy the grant forwards.

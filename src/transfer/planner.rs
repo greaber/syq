@@ -1609,7 +1609,7 @@ impl Planner<'_> {
 
     /// Everything after the mapping loop: stat, create directories, filter,
     /// enqueue.
-    pub(super) fn apply_mapped(&mut self, mapped: Mapped) -> Result<()> {
+    pub(super) fn apply_mapped(&mut self, mut mapped: Mapped) -> Result<()> {
         if self.opts.inode_preservation.xattrs {
             for entry in mapped
                 .dirs
@@ -1634,7 +1634,15 @@ impl Planner<'_> {
         }
         let root_entry = self.assert_mutation_root()?;
         if !mapped.dirs.is_empty() || !mapped.others.is_empty() {
+            let restorations = self.directory_restorations.len();
             self.prepare_container_access()?;
+            if self.directory_restorations.len() != restorations {
+                // Remote batching may have treated inaccessible children as
+                // absent before this container became searchable. Reinspect
+                // them before deciding whether to keep or replace a file.
+                mapped.dir_stats = None;
+                mapped.other_stats = None;
+            }
         }
         let opts = self.opts;
         let Mapped {
