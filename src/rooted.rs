@@ -400,21 +400,18 @@ impl Root {
     }
 
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
-        let (parent, leaf) = if path.is_empty() {
-            (
-                DirectoryHandle::Borrowed(&self.directory),
-                component_cstring(b"."),
-            )
-        } else {
-            let parent = self.resolve_parent(path)?;
-            (parent.directory, parent.leaf)
-        };
-        ResolvedParent {
-            directory: parent,
-            leaf,
+        if path.is_empty() {
+            // The root is already selected and pinned. Reopening it through
+            // "." requires search permission, including when this handle is
+            // needed to add that permission to an owned directory.
+            return self
+                .directory
+                .try_clone()
+                .context("duplicate confined root metadata handle");
         }
-        .open_metadata()
-        .with_context(|| format!("open confined metadata handle {}", path.label()))
+        self.resolve_parent(path)?
+            .open_metadata()
+            .with_context(|| format!("open confined metadata handle {}", path.label()))
     }
 
     // The Linux syscall resolves the parent and opens the leaf under the same

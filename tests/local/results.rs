@@ -586,6 +586,7 @@ fn native_cp_results_preexisting_directory_is_not_reported_created() {
     let out = syq_cp_in(
         &t.path(""),
         &[
+            "--temporarily-widen-dir-permissions",
             "--srcs-in",
             "src",
             "--into",

@@ -764,30 +764,40 @@ fn temporary_directory_permissions_restore_after_copy_failure() {
 
 #[test]
 fn explicit_directory_access_covers_file_destination_containers() {
-    for placement in ["--into", "--as"] {
-        for size in [3, 128 << 10] {
-            let t = Tmp::new();
-            let data = vec![b'n'; size];
-            write(&t.path("src/file"), &data);
-            fs::create_dir(t.path("dst")).unwrap();
-            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
-            let destination = if placement == "--into" {
-                "dst"
-            } else {
-                "dst/file"
-            };
-            let out = native_syq(&[
-                "cp",
-                "--temporarily-widen-dir-permissions",
-                &t.s("src/file"),
-                placement,
-                &t.s(destination),
-            ]);
-            let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
-            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(out.status.success(), "{out:?}");
-            assert_eq!(mode, 0o500);
-            assert_eq!(read(&t.path("dst/file")), data);
+    let modes: &[u32] = if cfg!(target_os = "macos") {
+        &[0o500, 0o600]
+    } else {
+        &[0o000, 0o200, 0o400, 0o500, 0o600]
+    };
+    for &mode in modes {
+        for placement in ["--into", "--as"] {
+            for size in [3, 128 << 10] {
+                let t = Tmp::new();
+                let data = vec![b'n'; size];
+                write(&t.path("src/file"), &data);
+                fs::create_dir(t.path("dst")).unwrap();
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(mode)).unwrap();
+                let destination = if placement == "--into" {
+                    "dst"
+                } else {
+                    "dst/file"
+                };
+                let out = native_syq(&[
+                    "cp",
+                    "--temporarily-widen-dir-permissions",
+                    &t.s("src/file"),
+                    placement,
+                    &t.s(destination),
+                ]);
+                let final_mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(
+                    out.status.success(),
+                    "mode {mode:o}, {placement}, size {size}: {out:?}"
+                );
+                assert_eq!(final_mode, mode);
+                assert_eq!(read(&t.path("dst/file")), data);
+            }
         }
     }
 }
