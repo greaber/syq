@@ -1374,3 +1374,57 @@ fn a_network_destination_gives_a_few_directories_their_metadata_at_once() {
         assert_eq!(read(&path.join("file")), b"x");
     }
 }
+
+#[test]
+fn later_sources_stamp_every_shared_directory() {
+    // Enough shared directories that the receiver applies their final
+    // metadata in parallel; each still ends with the later source's.
+    later_sources_stamp_shared_directories(40, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn later_sources_stamp_shared_directories_on_a_network_filesystem() {
+    later_sources_stamp_shared_directories(2, true);
+}
+
+fn later_sources_stamp_shared_directories(count: usize, network: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new();
+    for (source, mode, time) in [("a", 0o750, 1_500_000_000), ("b", 0o711, 1_600_000_000)] {
+        for index in 0..count {
+            let dir = format!("{source}/d{index}");
+            write(&t.path(&format!("{dir}/{source}")), source.as_bytes());
+            fs::set_permissions(t.path(&dir), fs::Permissions::from_mode(mode)).unwrap();
+            set_mtime(&t.path(&dir), time);
+        }
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args([
+        "cp",
+        "--copy-metadata=permissions",
+        "--srcs-in",
+        &t.s("a"),
+        "--srcs-in",
+        &t.s("b"),
+        "--into",
+        &t.s("dst"),
+        "--no-progress",
+    ]);
+    if network {
+        command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+    }
+    assert_output_ok(&command.run().unwrap());
+    for index in 0..count {
+        let dir = format!("dst/d{index}");
+        let meta = fs::metadata(t.path(&dir)).unwrap();
+        assert_eq!(
+            (meta.mode() & 0o777, meta.mtime()),
+            (0o711, 1_600_000_000),
+            "{dir}"
+        );
+        for source in ["a", "b"] {
+            assert_eq!(read(&t.path(&format!("{dir}/{source}"))), source.as_bytes());
+        }
+    }
+}

@@ -4281,17 +4281,21 @@ impl Planner<'_> {
 
 /// Keep ordinary metadata in full batches, even across directory depths. Only
 /// a mode that removes search access needs to wait for deeper operations.
+/// The receiver applies a batch in parallel, so a directory that several
+/// sources give metadata takes each in a later batch, the last source's last.
 fn directory_metadata_batch_len(
     entries: &[(PathBytes, Meta, u8, usize, TargetCondition)],
 ) -> usize {
     let maximum = entries.len().min(1000);
     let deepest = entries[0].3;
+    let mut paths = std::collections::HashSet::new();
     entries[..maximum]
         .iter()
-        .position(|(_, meta, flags, depth, _)| {
-            *depth < deepest
-                && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
-                && meta.mode & 0o100 == 0
+        .position(|(path, meta, flags, depth, _)| {
+            !paths.insert(path.as_slice())
+                || (*depth < deepest
+                    && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
+                    && meta.mode & 0o100 == 0)
         })
         .unwrap_or(maximum)
 }
@@ -4385,5 +4389,33 @@ mod directory_metadata_tests {
         assert_eq!(directory_metadata_batch_len(&entries), 12);
         entries[7].2 = flags::RECEIVER_MODE;
         assert_eq!(directory_metadata_batch_len(&entries), 7);
+    }
+
+    #[test]
+    fn final_metadata_for_one_directory_from_two_sources_goes_in_order() {
+        let entry = |path: &[u8], mtime| {
+            (
+                path.to_vec(),
+                Meta {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    mtime,
+                    mtime_nsec: 0,
+                    inode_metadata: None,
+                },
+                flags::MODE | flags::TIMES,
+                1,
+                TargetCondition::Any,
+            )
+        };
+        let entries = [
+            entry(b"d/a", 1),
+            entry(b"d/b", 1),
+            entry(b"d/a", 2),
+            entry(b"d/b", 2),
+        ];
+        assert_eq!(directory_metadata_batch_len(&entries), 2);
+        assert_eq!(directory_metadata_batch_len(&entries[2..]), 2);
     }
 }
