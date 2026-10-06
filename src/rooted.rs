@@ -1699,8 +1699,25 @@ impl Root {
             target,
             PublicationTestPoint::AfterMatchedExchange,
         );
-        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
-        let displaced = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        // A check that cannot be made, as when another program removes the
+        // published file first, counts as failed: the staged name must not
+        // keep whatever the exchange put there.
+        let checked = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)
+            .and_then(|published| {
+                let displaced =
+                    metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+                Ok((published, displaced))
+            });
+        let (published, displaced) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                let race = format!(
+                    "confined destination {} could not be checked after publication: {error}",
+                    target.label()
+                );
+                return Err(self.keep_displaced(source, &source_parent, race));
+            }
+        };
         if !is_safe_staged_identity(published, staged_dev, staged_ino) {
             return Err(self.keep_displaced(
                 source,

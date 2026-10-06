@@ -2644,12 +2644,13 @@ mod tests {
     /// writer's file at the sidecar name. A retry must never write into it:
     /// whoever holds it open would read the new contents, and its
     /// permissions would carry over to the published file. Nor may anything
-    /// delete it, since it holds the other writer's data.
+    /// delete it, since it holds the other writer's data. That holds as well
+    /// when the published file is removed before syq can check it.
     #[test]
     fn a_file_displaced_by_a_raced_publication_is_kept_where_no_retry_adopts_it() {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
-        for batched in [false, true] {
+        for (batched, removed) in [(false, false), (true, false), (false, true), (true, true)] {
             let temporary = crate::test_support::tempdir().unwrap();
             let directory = temporary.path().to_path_buf();
             let target = directory.join("file");
@@ -2677,6 +2678,19 @@ mod tests {
                     }
                 },
             );
+            // Another program removes the file syq just published.
+            let _removed = removed.then(|| {
+                let directory = directory.clone();
+                crate::rooted::install_publication_test_hook(
+                    crate::rooted::RootIdentity {
+                        dev: root.dev(),
+                        ino: root.ino(),
+                    },
+                    &RelativePath::new(b"file").unwrap(),
+                    crate::rooted::PublicationTestPoint::AfterMatchedExchange,
+                    move || fs::remove_file(directory.join("file")).unwrap(),
+                )
+            });
             let mut ops = receiver(&directory);
             let mut run = |put: &SmallPut| {
                 if batched {
@@ -2693,7 +2707,6 @@ mod tests {
                 ino: before.ino(),
             };
             let error = run(&first).unwrap_err().message;
-            assert!(error.contains("changed during publication"), "{error}");
             let mut held = held.recv().unwrap();
 
             // The same copy retries the file.
@@ -2704,7 +2717,15 @@ mod tests {
             assert_eq!(
                 String::from_utf8_lossy(&seen),
                 "other writer",
-                "batched: {batched}"
+                "batched: {batched}, removed: {removed}"
+            );
+            assert!(
+                error.contains(if removed {
+                    "could not be checked after publication"
+                } else {
+                    "changed during publication"
+                }),
+                "{error}"
             );
 
             let names: Vec<_> = fs::read_dir(&directory)
