@@ -49,3 +49,10 @@ node 24.21.0 linux-x86_64 6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef78978
 node 24.21.0 linux-aarch64 724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5 https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-arm64.tar.gz node-v24.21.0-linux-arm64/bin
 node 24.21.0 macos-arm64 bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057 https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-arm64.tar.gz node-v24.21.0-darwin-arm64/bin
 node 24.21.0 macos-x86_64 1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097 https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-x64.tar.gz node-v24.21.0-darwin-x64/bin
+
+# cargo-nextest: checksums from the release assets; tests run in separate
+# processes so a timeout can terminate one test and continue the suite.
+cargo-nextest 0.9.146 linux-x86_64 682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428 https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-x86_64-unknown-linux-gnu.tar.gz .
+cargo-nextest 0.9.146 linux-aarch64 b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9 https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-aarch64-unknown-linux-gnu.tar.gz .
+cargo-nextest 0.9.146 macos-arm64 39785160b3c2f6ed9a765049cf4fa79f3b39aa02eb7598a5a0e2a1a0b9ffb9a8 https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-universal-apple-darwin.tar.gz .
+cargo-nextest 0.9.146 macos-x86_64 39785160b3c2f6ed9a765049cf4fa79f3b39aa02eb7598a5a0e2a1a0b9ffb9a8 https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-universal-apple-darwin.tar.gz .

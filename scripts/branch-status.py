@@ -55,7 +55,7 @@ BASELINE = [
     ("fmt", ["cargo", "fmt", "--all", "--", "--check"]),
     ("clippy", ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D",
                 "warnings"]),
-    ("unit-tests", ["cargo", "test", "--locked", "--bin", "syq"]),
+    ("unit-tests", ["cargo", "nextest", "run", "--locked", "--bin", "syq"]),
 ]
 CHANGE_CODES = {"M", "A", "D", "R", "C", "T"}
 UNFINISHED = ("queued", "in_progress", "pending", "waiting", "requested")

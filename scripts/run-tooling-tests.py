@@ -29,6 +29,7 @@ QUICK_TESTS = (
     "tests/tooling/test-release-timings.py",
     "tests/tooling/test-run-focused-check.py",
     "tests/tooling/test-setup.sh",
+    "tests/tooling/test-rust-test-timeouts.py",
     "tests/tooling/test-tool-examples.py",
     "tests/tooling/test-tooling-discovery.py",
     "tests/tooling/test-tooling.py",

@@ -1,0 +1,5 @@
+[profile.default]
+# A stuck test fails independently, including when its destructor hangs.
+# Keep running so one failure does not hide the rest of the suite.
+fail-fast = false
+slow-timeout = { period = "30s", terminate-after = 4, grace-period = "5s" }
