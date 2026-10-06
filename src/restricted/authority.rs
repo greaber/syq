@@ -2588,6 +2588,42 @@ impl RestrictedAuthority {
                 }
                 *guard = Some(self.guard.clone());
             }
+            Request::InspectPlacementTargetWithAccess {
+                path,
+                parent_condition,
+                guard,
+                ..
+            } => {
+                self.check_observation_path(path)?;
+                let parent = Path::new(OsStr::from_bytes(path))
+                    .parent()
+                    .context("placement inspection requires a parent directory")?
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec();
+                let observed = self
+                    .rooted_metadata(&parent)?
+                    .filter(|metadata| metadata.is_dir())
+                    .context("placement inspection parent is not an existing directory")?;
+                // Temporary search is a directory mutation, even though it is
+                // restored before the observation returns. Reuse the same
+                // signed policy, identity, budgets and receipt accounting as
+                // explicit directory widening; read-only grants still refuse.
+                let mut op = Op::Mkdir {
+                    path: parent,
+                    mode: 0o700,
+                    condition: proto::TargetCondition::Matches {
+                        dev: observed.dev,
+                        ino: observed.ino,
+                    },
+                };
+                self.authorize_op(&mut op, 0, pending, outcomes, touched)?;
+                let Op::Mkdir { condition, .. } = op else {
+                    unreachable!()
+                };
+                *parent_condition = condition;
+                *guard = Some(self.guard.clone());
+            }
             Request::Apply { ops, guard } => {
                 for (index, operation) in ops.iter_mut().enumerate() {
                     self.authorize_op(operation, index, pending, outcomes, touched)?;

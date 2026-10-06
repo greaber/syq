@@ -1936,6 +1936,7 @@ impl FsOps {
             | Request::PruneLookup { guard, .. }
             | Request::DefaultPermissions { guard, .. }
             | Request::WidenDirectories { guard, .. }
+            | Request::InspectPlacementTargetWithAccess { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
             | Request::ProbePartial { guard, .. }
@@ -2319,6 +2320,11 @@ impl FsOps {
             | Request::FileHash { path, guard, .. }
             | Request::ValidateDigest { path, guard, .. }
             | Request::Canonicalize { path, guard } => {
+                if guard.is_none() {
+                    map(path)?;
+                }
+            }
+            Request::InspectPlacementTargetWithAccess { path, guard, .. } => {
                 if guard.is_none() {
                     map(path)?;
                 }
@@ -2777,6 +2783,55 @@ impl FsOps {
         })
         .into_iter()
         .collect()
+    }
+
+    fn inspect_placement_target_with_access(
+        &self,
+        path: &[u8],
+        symlink_policy: OperatorSymlinkPolicy,
+        parent_condition: TargetCondition,
+        guard: Option<&ContainerGuard>,
+    ) -> Result<Option<Entry>> {
+        let requested = Path::new(OsStr::from_bytes(path));
+        let name = requested
+            .file_name()
+            .context("placement access requires a named destination entry")?;
+        // Only the immediate selected parent may gain search permission. A
+        // denied ancestor remains an error, and the retained handle prevents
+        // a later pathname replacement from redirecting either chmod.
+        let directory = if let Some(target) = self.rooted_destination_target(path, guard)? {
+            target
+                .root
+                .resolve_parent(&target.relative)?
+                .directory()
+                .try_clone()?
+        } else {
+            let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+            select_operator_directory(parent.as_os_str().as_bytes(), false, symlink_policy)?
+                .0
+                .directory
+        };
+        apply::require_rooted_condition(
+            root_metadata_from_std(&directory.metadata()?)?,
+            parent_condition,
+            requested.parent().unwrap_or_else(|| Path::new("")),
+        )?;
+        let root = Root::from_directory(directory.try_clone()?)?;
+        let relative = RelativePath::new(name.as_bytes())?;
+        let mut access = TemporaryDirectorySearchAccess::new(true);
+        access.prepare(&directory)?;
+        let result = (|| {
+            root.metadata_optional(&relative)?
+                .map(|metadata| rooted_entry(&root, &relative, Vec::new(), metadata))
+                .transpose()
+        })();
+        match (result, access.restore()) {
+            (Err(error), Err(restore)) => Err(error.context(format!(
+                "restore placement directory permissions: {restore:#}"
+            ))),
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Ok(entry), Ok(())) => Ok(entry),
+        }
     }
 
     fn stat_many_unadorned_request(

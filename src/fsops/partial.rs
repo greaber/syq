@@ -2982,6 +2982,19 @@ impl FsOps {
                 self.prune_lookup(paths, guard.as_ref())
                     .map(Response::Stats)
             })(),
+            Request::InspectPlacementTargetWithAccess {
+                path,
+                symlink_policy,
+                parent_condition,
+                guard,
+            } => self
+                .inspect_placement_target_with_access(
+                    path,
+                    *symlink_policy,
+                    *parent_condition,
+                    guard.as_ref(),
+                )
+                .map(|entry| Response::Stats(vec![entry])),
             Request::PartialPaths {
                 paths,
                 copy_id,

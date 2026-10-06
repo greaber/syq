@@ -4111,6 +4111,58 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
 }
 
 #[test]
+fn placement_access_uses_signed_directory_mutation_authority_and_restores_search() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let parent = root.join("target");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(parent.join("file"), b"sentinel").unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o600)).unwrap();
+    let request = |leaf: &str| Request::InspectPlacementTargetWithAccess {
+        path: parent.join(leaf).as_os_str().as_bytes().to_vec(),
+        symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+        parent_condition: proto::TargetCondition::Any,
+        guard: None,
+    };
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    for (leaf, exists) in [("file", true), ("missing", false)] {
+        let mut inspection = request(leaf);
+        let settlement = authority.authorize(&mut inspection, false).unwrap();
+        let response = crate::fsops::FsOps::new().handle(&inspection);
+        authority.settle(settlement, &response);
+        assert!(
+            matches!(&response, proto::Response::Stats(entries)
+            if entries.len() == 1 && entries[0].is_some() == exists),
+            "{response:?}"
+        );
+        assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o7777, 0o600);
+    }
+    authority.copy.options.dry_run = true;
+    let before = fs::metadata(&parent).unwrap();
+    let error = authority
+        .authorize(&mut request("file"), false)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("read-only"), "{error:#}");
+    authority.copy.options.dry_run = false;
+    authority.copy.mutation_scopes = vec![MutationScope {
+        path: parent.join("file").as_os_str().as_bytes().to_vec(),
+        descendants: false,
+    }];
+    assert!(authority.authorize(&mut request("file"), false).is_err());
+    let after = fs::metadata(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
+    assert_eq!(fs::read(parent.join("file")).unwrap(), b"sentinel");
+}
+
+#[test]
 fn signed_read_only_modes_reject_every_destination_mutation() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");

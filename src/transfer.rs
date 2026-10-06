@@ -2923,7 +2923,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let (entry, canonical) = stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root)?;
         (canonical.as_os_str().as_bytes().to_vec(), entry)
     } else {
-        let entry = stat_one(&mut *dst_ctl, &operator_dst_root, false)?;
+        let entry = if args.target_existence == Existence::Any {
+            stat_one(&mut *dst_ctl, &operator_dst_root, false)?
+        } else {
+            inspect_placement_target(
+                &mut *dst_ctl,
+                &operator_dst_root,
+                opts.operator_symlink_policy,
+                opts.widen_directory_permissions,
+            )?
+        };
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;
         // exact placement preserves the final directory entry.
@@ -4834,6 +4843,39 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
     Ok(stat_many(conn, vec![path.to_vec()], follow)?
         .pop()
         .flatten())
+}
+
+/// Placement conditions need a real absence result: a denied lookup must not
+/// authorize --as-new to replace an entry after directory access is prepared.
+fn inspect_placement_target(
+    conn: &mut dyn Conn,
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+    widen: bool,
+) -> Result<Option<Entry>> {
+    let lookup = ok(
+        conn.call(Request::PruneLookup {
+            paths: vec![path.to_vec()],
+            guard: None,
+        })?,
+        "inspect placement target",
+    );
+    let response = match lookup {
+        Err(error) if widen && os_kind_of(&error) == Some("permission_denied") => ok(
+            conn.call(Request::InspectPlacementTargetWithAccess {
+                path: path.to_vec(),
+                symlink_policy,
+                parent_condition: TargetCondition::Any,
+                guard: None,
+            })?,
+            "inspect placement target with temporary directory access",
+        )?,
+        result => result?,
+    };
+    match response {
+        Response::Stats(mut entries) if entries.len() == 1 => Ok(entries.pop().flatten()),
+        other => bail!("unexpected placement inspection response {other:?}"),
+    }
 }
 
 fn stat_one_registered(

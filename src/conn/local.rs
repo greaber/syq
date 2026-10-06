@@ -109,6 +109,7 @@ impl Conn for LocalConn {
                     | Request::PrepareSmallFiles(_)
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }
+                    | Request::InspectPlacementTargetWithAccess { .. }
                     | Request::Receipt
             )
         {

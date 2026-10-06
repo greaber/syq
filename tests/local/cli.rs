@@ -123,6 +123,129 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
 }
 
 #[test]
+fn native_copy_placement_checks_preserve_denied_and_missing_distinctions() {
+    check_native_copy_placement_permissions(false);
+}
+
+#[test]
+fn native_copy_dry_run_placement_checks_preserve_denied_and_missing_distinctions() {
+    check_native_copy_placement_permissions(true);
+}
+
+fn check_native_copy_placement_permissions(dry_run: bool) {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for placement in ["--as-new", "--as-existing"] {
+        for exists in [false, true] {
+            for widen in [false, true] {
+                let t = Tmp::new();
+                write(&t.path("src"), b"replacement contents");
+                fs::create_dir(t.path("dst")).unwrap();
+                if exists {
+                    write(&t.path("dst/file"), b"original sentinel");
+                }
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+                let before = fs::metadata(t.path("dst")).unwrap();
+                let src = t.s("src");
+                let dst = t.s("dst/file");
+                let mut args = vec!["cp", "--if-exists=update", &src, placement, &dst];
+                if widen {
+                    args.push("--temporarily-widen-dir-permissions");
+                }
+                if dry_run {
+                    args.push("--dry-run");
+                }
+                let output = native_syq(&args);
+                let after = fs::metadata(t.path("dst")).unwrap();
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+                let succeeds = widen && (exists == (placement == "--as-existing"));
+                assert_eq!(output.status.success(), succeeds, "{args:?}: {output:?}");
+                assert_eq!(after.mode() & 0o7777, 0o600, "{args:?}");
+                if !widen {
+                    assert_eq!(
+                        (before.ctime(), before.ctime_nsec()),
+                        (after.ctime(), after.ctime_nsec())
+                    );
+                    assert!(
+                        stderr_of(&output).contains("Permission denied"),
+                        "{output:?}"
+                    );
+                    assert!(!stderr_of(&output).contains("does not exist"), "{output:?}");
+                }
+                if succeeds && !dry_run {
+                    assert_eq!(read(&t.path("dst/file")), b"replacement contents");
+                } else if exists {
+                    assert_eq!(read(&t.path("dst/file")), b"original sentinel");
+                } else {
+                    assert!(!t.path("dst/file").exists());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_copy_new_placement_counts_dangling_links_as_existing_without_search() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src"), b"replacement contents");
+    fs::create_dir(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink("missing", t.path("dst/file")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+    let output = native_syq(&[
+        "cp",
+        "--temporarily-widen-dir-permissions",
+        &t.s("src"),
+        "--as-new",
+        &t.s("dst/file"),
+    ]);
+    let after = fs::metadata(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr_of(&output).contains("already exists"), "{output:?}");
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(
+        fs::read_link(t.path("dst/file")).unwrap(),
+        Path::new("missing")
+    );
+}
+
+#[test]
+fn native_copy_placement_access_does_not_widen_an_unselected_ancestor() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src"), b"replacement contents");
+    write(&t.path("ancestor/dst/file"), b"original sentinel");
+    fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(t.path("ancestor")).unwrap();
+    let output = native_syq(&[
+        "cp",
+        "--temporarily-widen-dir-permissions",
+        &t.s("src"),
+        "--as-new",
+        &t.s("ancestor/dst/file"),
+    ]);
+    let after = fs::metadata(t.path("ancestor")).unwrap();
+    fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr_of(&output).contains("Permission denied"),
+        "{output:?}"
+    );
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
+    assert_eq!(read(&t.path("ancestor/dst/file")), b"original sentinel");
+}
+
+#[test]
 fn native_copy_requires_sources_before_the_destination() {
     let t = Tmp::new();
     write(&t.path("source"), b"data");

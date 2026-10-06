@@ -1319,6 +1319,14 @@ pub enum WireRequest<Data> {
     CheckOperatorDirectoryAncestryWithAccess {
         checks: Vec<DirectoryAncestryCheck>,
     },
+    /// Retry a denied placement lookup with temporary owner-search access to
+    /// its immediate parent. Restore that directory before returning Stats.
+    InspectPlacementTargetWithAccess {
+        path: PathBytes,
+        symlink_policy: OperatorSymlinkPolicy,
+        parent_condition: TargetCondition,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

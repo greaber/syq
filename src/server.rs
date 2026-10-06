@@ -431,6 +431,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::ListDirNoFollowFinal { .. }
         | Request::MappingChunk { .. }
         | Request::PruneLookup { .. }
+        | Request::InspectPlacementTargetWithAccess { .. }
         | Request::ConfigureHashing(_)
         | Request::ValidateDigest { .. }
         | Request::BindStream(_)
@@ -973,6 +974,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::PrepareSmallFiles(_)
                     | Request::CopySmallFiles(_)
                     | Request::PruneLookup { .. }
+                    | Request::InspectPlacementTargetWithAccess { .. }
                     | Request::Receipt
                     | Request::MappingChunk { .. }
             )
