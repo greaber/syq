@@ -3134,6 +3134,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.operator_symlink_policy,
             dst_root_entry.as_ref().expect("existing destination"),
             request_prefix.clone(),
+            opts.rsync_creation,
         )?;
         prepared_anchor = Some(anchor);
         prepared_filesystem = Some(filesystem);
@@ -3143,6 +3144,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             &operator_directory,
             opts.operator_symlink_policy,
+            opts.rsync_creation,
         )?;
         prepared_filesystem = Some(filesystem);
         selection
@@ -3152,6 +3154,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &operator_directory,
             allow_missing,
             opts.operator_symlink_policy,
+            opts.rsync_creation,
         )?
     } else {
         None
@@ -3367,9 +3370,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
-                // rsync opens its destination before processing copied
-                // directories; it does not repair access during preflight.
-                !opts.rsync_creation && opts.may_widen_directory_permissions(),
+                // rsync's outer container already passed its search check.
+                // Live copies may prepare copied directories beneath it;
+                // previews never change modes.
+                opts.may_widen_directory_permissions(),
             )?
         };
         if relations.len() != source_checks.len() {
@@ -4692,6 +4696,31 @@ fn stat_many_registered(
     }
 }
 
+fn inspect_destination_paths(
+    conn: &mut dyn Conn,
+    mut paths: Vec<PathBytes>,
+    guard: Option<ContainerGuard>,
+    context: &'static str,
+) -> Result<Vec<Option<Entry>>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = paths.iter().fold(0usize, |sum, path| {
+        sum.saturating_add(source_request_bytes(path, None))
+    });
+    if paths.len() > 1 && bytes > SOURCE_BATCH_PATH_BYTES {
+        let tail = paths.split_off(paths.len() / 2);
+        let mut entries = inspect_destination_paths(conn, paths, guard.clone(), context)?;
+        entries.extend(inspect_destination_paths(conn, tail, guard, context)?);
+        return Ok(entries);
+    }
+    let count = paths.len();
+    match ok(conn.call(Request::PruneLookup { paths, guard })?, context)? {
+        Response::Stats(entries) if entries.len() == count => Ok(entries),
+        other => bail!("unexpected destination inspection response {other:?}"),
+    }
+}
+
 fn default_permissions(
     conn: &mut dyn Conn,
     mut paths: Vec<PathBytes>,
@@ -4924,18 +4953,41 @@ fn stat_one_registered(
     .flatten())
 }
 
+fn operator_directory_request(
+    path: &[u8],
+    allow_missing: bool,
+    symlink_policy: OperatorSymlinkPolicy,
+    require_search: bool,
+) -> Request {
+    if require_search {
+        Request::CheckSearchableOperatorDirectory {
+            path: path.to_vec(),
+            allow_missing,
+            symlink_policy,
+        }
+    } else {
+        Request::CheckOperatorDirectory {
+            path: path.to_vec(),
+            allow_missing,
+            symlink_policy,
+        }
+    }
+}
+
 fn check_operator_directory(
     conn: &mut dyn Conn,
     path: &[u8],
     allow_missing: bool,
     symlink_policy: OperatorSymlinkPolicy,
+    require_search: bool,
 ) -> Result<Option<DirectoryAnchor>> {
     match ok(
-        conn.call(Request::CheckOperatorDirectory {
-            path: path.to_vec(),
+        conn.call(operator_directory_request(
+            path,
             allow_missing,
             symlink_policy,
-        })?,
+            require_search,
+        ))?,
         "operator path",
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
@@ -5104,16 +5156,18 @@ fn prepare_existing_destination(
     symlink_policy: OperatorSymlinkPolicy,
     expected: &Entry,
     request_prefix: PathBytes,
+    require_search: bool,
 ) -> Result<(
     Option<DirectoryAnchor>,
     Option<DestinationFilesystemInfo>,
     DestinationAnchor,
 )> {
-    conn.send(Request::CheckOperatorDirectory {
-        path: path.to_vec(),
-        allow_missing: false,
+    conn.send(operator_directory_request(
+        path,
+        false,
         symlink_policy,
-    })?;
+        require_search,
+    ))?;
     conn.send(Request::DestinationFilesystemInfo {
         check_empty: true,
         target: None,
@@ -5158,12 +5212,14 @@ fn check_missing_destination(
     conn: &mut dyn Conn,
     path: &[u8],
     symlink_policy: OperatorSymlinkPolicy,
+    require_search: bool,
 ) -> Result<(Option<DirectoryAnchor>, Option<DestinationFilesystemInfo>)> {
-    conn.send(Request::CheckOperatorDirectory {
-        path: path.to_vec(),
-        allow_missing: true,
+    conn.send(operator_directory_request(
+        path,
+        true,
         symlink_policy,
-    })?;
+        require_search,
+    ))?;
     conn.send(Request::DestinationFilesystemInfo {
         check_empty: false,
         target: None,

@@ -2916,6 +2916,19 @@ impl FsOps {
                 .check_operator_directory(path, *allow_missing, *symlink_policy)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
+            Request::CheckSearchableOperatorDirectory {
+                path,
+                allow_missing,
+                symlink_policy,
+            } => self
+                .check_searchable_operator_directory(path, *allow_missing, *symlink_policy)
+                .with_context(|| {
+                    format!(
+                        "resolve searchable operator directory {}",
+                        resolve(path).display()
+                    )
+                })
+                .map(Response::DirectorySelection),
             Request::CheckOperatorDirectoryAncestry { checks } => self
                 .check_operator_directory_ancestry(checks)
                 .map(Response::DirectoryRelations),

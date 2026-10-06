@@ -3970,25 +3970,16 @@ impl Planner<'_> {
             // unreadable path, unlike ordinary planning stats. Neither an
             // rsync preview nor a signed read-only grant can repair access,
             // so the preview must preserve the error here.
-            let mut inspected = Vec::with_capacity(paths.len());
-            for chunk in paths.chunks(512) {
-                match ok(
-                    self.dst.call(Request::PruneLookup {
-                        paths: chunk.to_vec(),
-                        guard: self.container_guard.clone(),
-                    })?,
-                    if strict_preview {
-                        "inspect destination for read-only preview"
-                    } else {
-                        "inspect destination for --copy-if"
-                    },
-                )? {
-                    Response::Stats(entries) if entries.len() == chunk.len() => {
-                        inspected.extend(entries)
-                    }
-                    other => bail!("unexpected destination inspection response {other:?}"),
-                }
-            }
+            let inspected = inspect_destination_paths(
+                self.dst,
+                paths.clone(),
+                self.container_guard.clone(),
+                if strict_preview {
+                    "inspect destination for read-only preview"
+                } else {
+                    "inspect destination for --copy-if"
+                },
+            )?;
             if self.opts.inode_preservation.any() && inspected.iter().any(Option::is_some) {
                 // Strict lookup supplies expression fields. Rich preservation
                 // still uses the existing metadata capture request.

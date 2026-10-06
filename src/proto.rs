@@ -1334,6 +1334,13 @@ pub enum WireRequest<Data> {
         guard: Option<ContainerGuard>,
         enumerate: bool,
     },
+    /// Select an operator directory and require kernel-checked search access.
+    /// rsync enters its destination before changing any copied directories.
+    CheckSearchableOperatorDirectory {
+        path: PathBytes,
+        allow_missing: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -897,6 +897,21 @@ impl FsOps {
         Ok(anchor)
     }
 
+    fn check_searchable_operator_directory(
+        &mut self,
+        path: &[u8],
+        allow_missing: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    ) -> Result<Option<DirectoryAnchor>> {
+        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
+        // Looking up "." through the retained handle asks the kernel about
+        // search permission, including ACLs and the receiving user's identity.
+        open_operator_directory_at(&selection.directory, b".")
+            .context("search selected destination directory")?;
+        self.operator_selection = Some(selection);
+        Ok(anchor)
+    }
+
     fn check_operator_directory_ancestry(
         &self,
         checks: &[DirectoryAncestryCheck],
@@ -2407,6 +2422,7 @@ impl FsOps {
             | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
+            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::RegisterSourceRoots { .. }

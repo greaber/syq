@@ -7910,3 +7910,55 @@ fn ancestry_access_restores_after_request_error() {
     assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o600);
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[test]
+fn searchable_destination_selection_checks_kernel_access_without_chmod() {
+    if is_superuser() {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let destination = temporary.path().join("selected");
+    fs::create_dir(&destination).unwrap();
+    for mode in [0o100, 0o300, 0o500, 0o600, 0o400] {
+        fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
+        let before = fs::metadata(&destination).unwrap();
+        let mut ops = FsOps::new();
+        let response = ops.handle(&Request::CheckSearchableOperatorDirectory {
+            path: path_bytes(&destination),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        });
+        assert_eq!(
+            matches!(response, Response::DirectorySelection(Some(_))),
+            mode & 0o100 != 0,
+            "mode {mode:o}: {response:?}"
+        );
+        assert_eq!(ops.operator_selection.is_some(), mode & 0o100 != 0);
+        let after = fs::metadata(&destination).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+    }
+    // Native explicit access can still select a readable unsearchable root.
+    assert!(matches!(
+        FsOps::new().handle(&Request::CheckOperatorDirectory {
+            path: path_bytes(&destination),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        }),
+        Response::DirectorySelection(Some(_))
+    ));
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+    let link = temporary.path().join("link");
+    std::os::unix::fs::symlink(&destination, &link).unwrap();
+    assert!(!matches!(
+        FsOps::new().handle(&Request::CheckSearchableOperatorDirectory {
+            path: path_bytes(&link),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        }),
+        Response::DirectorySelection(_)
+    ));
+}

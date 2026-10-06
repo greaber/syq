@@ -3007,6 +3007,7 @@ impl RestrictedAuthority {
                 bail!("directory completion is not valid on a command-restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
+            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::RegisterSourceRoots { .. }
