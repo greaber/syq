@@ -607,7 +607,9 @@ in-place hole punches, especially with small comparison blocks. Unchanged files
 and reused blocks are not rewritten just to change their allocation. Descriptors, streams, S3, and command-restricted or
 receiving destinations reject this option.
 
-Sparse mode avoids full-size preallocation.
+Sparse mode avoids full-size preallocation. Syq also avoids reserving uncompressed
+space for btrfs files that request compression, either through the mount options
+or an inherited directory setting, so writes can use filesystem compression.
 
 ## Symlinks
 

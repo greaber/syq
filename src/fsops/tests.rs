@@ -4712,6 +4712,57 @@ fn fresh_nfs_partial_is_not_allocated_or_sized_before_writes() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn compressed_btrfs_partial_is_sized_without_reserving_space() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let file = File::create(dir.path().join("partial")).unwrap();
+    super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+    let result = preallocate_new_file(
+        &file,
+        1024 * 1024,
+        FileSystemTraits {
+            btrfs_compression: Some(super::btrfs::Compression::On),
+            ..FileSystemTraits::default()
+        },
+    );
+    super::partial::FALLOCATE_ERRNO.set(None);
+    result.unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 1024 * 1024);
+    assert_eq!(file.metadata().unwrap().blocks(), 0);
+    file.write_all_at(b"payload", 1024).unwrap();
+    let mut payload = [0; 7];
+    File::open(dir.path().join("partial"))
+        .unwrap()
+        .read_exact_at(&mut payload, 1024)
+        .unwrap();
+    assert_eq!(&payload, b"payload");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_files_still_report_preallocation_failures() {
+    let dir = crate::test_support::tempdir().unwrap();
+    for btrfs_compression in [None, Some(super::btrfs::Compression::Off)] {
+        let file = File::create(dir.path().join("partial")).unwrap();
+        super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+        let result = preallocate_new_file(
+            &file,
+            1024 * 1024,
+            FileSystemTraits {
+                btrfs_compression,
+                ..FileSystemTraits::default()
+            },
+        );
+        super::partial::FALLOCATE_ERRNO.set(None);
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))));
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+}
+
 #[test]
 fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
     let dir = test_dir();

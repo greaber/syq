@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
 mod basis_copy;
+#[cfg(target_os = "linux")]
+mod btrfs;
 mod entry;
 mod limits;
 mod operator;
@@ -199,6 +201,8 @@ pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileSystemTraits {
     is_nfs: bool,
+    /// None on other filesystems; btrfs also checks each file's inherited flags.
+    btrfs_compression: Option<btrfs::Compression>,
     /// NFS, SMB, Ceph, or a FUSE mount such as sshfs: each operation waits
     /// for a network round trip.
     network: bool,
@@ -338,7 +342,7 @@ fn network_file_system_type(file_system_type: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_file_system(file: &File) -> FileSystemTraits {
+fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     unsafe {
         if libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) != 0 {
@@ -356,6 +360,8 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
+            btrfs_compression: (file_system_type == libc::BTRFS_SUPER_MAGIC as u32)
+                .then(|| btrfs::Compression::for_mount(key)),
             network: network_file_system_type(file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
@@ -419,7 +425,7 @@ fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
     if let Some(traits) = file_systems.lock().unwrap().get(&key).copied() {
         return traits;
     }
-    let traits = inspect_file_system(file);
+    let traits = inspect_file_system(file, key);
     file_systems.lock().unwrap().insert(key, traits);
     traits
 }

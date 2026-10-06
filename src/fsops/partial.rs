@@ -3878,6 +3878,16 @@ pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits
     if traits.is_nfs {
         return Ok(());
     }
+    // Btrfs fallocate disables compression, even when explicitly requested.
+    // Keep the logical sizing without reserving uncompressed physical extents.
+    if traits
+        .btrfs_compression
+        .is_some_and(|compression| compression.enabled_for(f))
+    {
+        return f
+            .set_len(size)
+            .context("set compressed destination file length");
+    }
     let fallocate_error = if let Some(raw) = test_fallocate_errno() {
         Some(io::Error::from_raw_os_error(raw))
     } else {
