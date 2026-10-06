@@ -314,6 +314,8 @@ def classify(paths, preparation_only):
                 native = True
         elif matches(path, "src/*macos*", "tests/macos*"):
             native = macos = True
+        elif matches(path, ".config/nextest.toml", "tests/tooling/test-rust-test-timeouts.py"):
+            native = macos = True
         elif matches(path, "rust-toolchain.toml", "build.rs", "src/*", "tests/*.rs", "schemas/*"):
             native = True
         elif matches(path, ".github/workflows/*"):

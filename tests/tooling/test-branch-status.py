@@ -448,7 +448,7 @@ class BranchStatusTests(unittest.TestCase):
             {"name": "fmt", "command": "cargo fmt --all -- --check", "result": "pass"},
             {"name": "clippy", "command": "cargo clippy --locked --all-targets --all-features -- -D warnings",
              "result": "fail"},
-            {"name": "unit-tests", "command": "cargo test --locked --bin syq", "result": "pass"}])
+            {"name": "unit-tests", "command": "cargo nextest run --locked --bin syq", "result": "pass"}])
         self.assertEqual(report["warnings"], ["clippy failed"])
         self.assertEqual(report["exit_status"], 1)
 

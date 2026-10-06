@@ -15,8 +15,8 @@ eval "$(scripts/setup.sh env)"
 
 `scripts/setup.sh` checks those prerequisites, installs the Rust toolchain
 from `rust-toolchain.toml` with rustfmt and clippy, and installs the tools
-pinned in `scripts/setup.lock`: ShellCheck, jq, mdBook, uv, Python, and
-Node.js. Downloads are checked against the pinned SHA-256 sums; uv installs
+pinned in `scripts/setup.lock`: ShellCheck, jq, mdBook, uv, Python,
+Node.js, and cargo-nextest. Downloads are checked against the pinned SHA-256 sums; uv installs
 Python using the checksums built into the pinned uv. Tools are kept in
 `~/.cache/syq/tools` (or
 `$XDG_CACHE_HOME/syq/tools`) and shared by every checkout; set
@@ -159,8 +159,13 @@ the usual baseline is:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --bin syq
+cargo nextest run --locked --bin syq
 ```
+
+`cargo nextest run` runs each Rust test in a separate process. Tests time out
+at two minutes, with five seconds to stop before forced termination; the
+remaining tests still run. The settings live in `.config/nextest.toml` and
+apply on Linux and macOS. Plain `cargo test` does not enforce these timeouts.
 
 Run integration tests for the affected behavior. Use
 [`scripts/test-real-ssh.py`](tests/real-ssh/README.md) for SSH integration and

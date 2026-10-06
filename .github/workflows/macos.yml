@@ -86,11 +86,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-nextest-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/setup.sh github jq python
+        run: scripts/setup.sh github jq python cargo-nextest
       - name: Run the exact test
         shell: bash
         env:
@@ -108,14 +108,8 @@ jobs:
               target=(--test "$TEST_TARGET") ;;
             *) echo "Unknown test target: $TEST_TARGET" >&2; exit 2 ;;
           esac
-          # Cargo otherwise succeeds when the exact filter matches no test.
-          listing=$(cargo test --locked "${target[@]}" "$TEST_NAME" -- --exact --list)
-          if ! grep -Fx -- "$TEST_NAME: test" <<< "$listing"; then
-            echo "Exact test not found in $TEST_TARGET: $TEST_NAME" >&2
-            exit 1
-          fi
-          # An explicitly selected ignored test must actually run too.
-          cargo test --locked "${target[@]}" "$TEST_NAME" -- --exact --include-ignored
+          # Nextest rejects a missing exact test and times out a hung one.
+          cargo nextest run --locked "${target[@]}" --run-ignored all --no-tests fail -- --exact "$TEST_NAME"
 
   scope:
     if: github.event_name != 'workflow_dispatch' || inputs.test_name == ''
@@ -201,7 +195,7 @@ jobs:
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/setup.sh github jq uv python
+        run: scripts/setup.sh github jq uv python cargo-nextest
       - name: Show toolchain and environment
         run: |
           rustc --version
@@ -211,36 +205,27 @@ jobs:
       - run: rustup component add clippy
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Native tests
-        run: cargo test --locked --all-targets --no-fail-fast
+        run: cargo nextest run --locked --all-targets
       # These ignored tests need the runner's live network or root. Nightly and
       # manual suites run them; post-merge runs skip them.
       - name: Tests that need a live network or root
         if: github.event_name != 'push'
         run: |
           set -euo pipefail
-          executable() {
-            cargo test --locked "$@" --no-run --message-format=json |
-              python3 -c 'import json, sys; print(*[m["executable"] for m in map(json.loads, sys.stdin) if m.get("reason") == "compiler-artifact" and m.get("executable") and m.get("profile", {}).get("test")])'
-          }
-          unit=$(executable --bin syq)
-          local_tests=$(executable --test local)
-          # An exact filter that matches nothing would still exit 0.
-          run_exact() {
-            local as_root=$1 binary=$2 name=$3
-            "$binary" "$name" --exact --ignored --list | grep -Fx -- "$name: test" >/dev/null ||
-              { echo "Exact test not found: $name" >&2; exit 1; }
-            if [[ "$as_root" == root ]]; then
-              sudo -n env PATH="$PATH" "$binary" "$name" --exact --ignored
-            else
-              "$binary" "$name" --exact --ignored
-            fi
-          }
-          run_exact user "$unit" tune::network::macos::tests::native_router_fingerprint
+          cargo nextest run --locked --bin syq --run-ignored only --no-tests fail -- \
+            --exact tune::network::macos::tests::native_router_fingerprint
+          # Reuse the compiled tests under sudo without running Cargo as root.
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+          cargo nextest list --locked --test local --list-type binaries-only \
+            --message-format json > "$RUNNER_TEMP/binaries-metadata.json"
           for test in \
             macos_metadata::acl_restoration_failure_cannot_be_accepted_as_a_content_match \
             macos_metadata::acl_staging_stays_private_when_ownership_changes
           do
-            run_exact root "$local_tests" "$test"
+            sudo -n env PATH="$PATH" cargo-nextest nextest run \
+              --cargo-metadata "$RUNNER_TEMP/cargo-metadata.json" \
+              --binaries-metadata "$RUNNER_TEMP/binaries-metadata.json" \
+              --run-ignored only --no-tests fail -- --exact "$test"
           done
       # Reuse the syq binary built for the integration tests. A plain `cargo
       # build` resolves dependency features without dev-dependencies and
