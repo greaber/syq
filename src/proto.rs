@@ -656,6 +656,14 @@ impl Op {
     }
 }
 
+/// Receiver-observed mode and identity before temporary directory access.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct DirectoryMode {
+    pub mode: u32,
+    pub dev: u64,
+    pub ino: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DestinationRoot {
     pub ticket: DescriptorTicket,
@@ -980,6 +988,12 @@ pub enum WireRequest<Data> {
     PartialPaths {
         paths: Vec<PathBytes>,
         copy_id: CopyId,
+        guard: Option<ContainerGuard>,
+    },
+    /// Temporarily add owner access to existing destination directories.
+    /// Returns original modes only for directories actually changed.
+    WidenDirectories {
+        directories: Vec<(PathBytes, TargetCondition)>,
         guard: Option<ContainerGuard>,
     },
     Apply {
@@ -1518,6 +1532,7 @@ pub enum Response {
         others: Option<Vec<Option<Entry>>>,
     },
     Applied(Vec<Option<WireError>>),
+    WidenedDirectories(Vec<std::result::Result<Option<DirectoryMode>, WireError>>),
     PartialSize(Option<u64>),
     Hashes(Vec<ContentDigest>),
     HeldHashes {
@@ -1823,6 +1838,13 @@ impl SizeHint for Request {
                     .map(|path| path.len() + 8)
                     .sum::<usize>()
                     + 48
+            }
+            Request::WidenDirectories { directories, .. } => {
+                directories
+                    .iter()
+                    .map(|(path, _)| path.len() + 48)
+                    .sum::<usize>()
+                    + 16
             }
             Request::Apply { ops, .. } => ops.iter().map(Op::size_hint).sum::<usize>() + 16,
             Request::NativeMap(options) => {

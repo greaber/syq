@@ -65,10 +65,9 @@ pub(super) struct Planner<'a> {
     pub(super) mapping_explicit_parents: std::collections::HashSet<PathBytes>,
     /// Observed obstructions at implicit parents fail only mapped descendants.
     pub(super) blocked_mapping_parents: std::collections::HashSet<PathBytes>,
-    /// Only implicit parents actually reopened for writing need a final chmod.
-    /// Keep these separate until the manifest is complete: a later explicit
-    /// directory entry supplies its own deferred metadata instead.
-    pub(super) implicit_restorations: Vec<(PathBytes, Meta, u8, usize, TargetCondition)>,
+    /// Original receiver modes, only for directories actually widened.
+    pub(super) directory_restorations:
+        std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
     /// Directories this copy created may receive metadata from later sources.
     pub(super) created_dirs: std::collections::HashSet<PathBytes>,
     /// This run consumes a --mapping manifest (identity entries included).
@@ -1240,14 +1239,6 @@ impl Planner<'_> {
     }
 
     pub(super) fn retire_planning_state(&mut self) {
-        // Resolve late explicit directory promotions before discarding the
-        // implicit-parent index. Only the remaining implicit parents restore
-        // receiver modes; explicit entries already have their own metadata.
-        self.deferred.extend(
-            std::mem::take(&mut self.implicit_restorations)
-                .into_iter()
-                .filter(|(path, ..)| self.implicit_dirs.contains(path)),
-        );
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims.
@@ -1450,6 +1441,7 @@ impl Planner<'_> {
     /// with one stat pass, then apply everything if there was no conflict.
     pub(super) fn replay_buffered(
         &mut self,
+        prepare_for_pruning: bool,
         before_mutations: impl FnOnce(&mut Self) -> Result<()>,
         before_apply: impl FnOnce(),
     ) -> Result<()> {
@@ -1508,6 +1500,17 @@ impl Planner<'_> {
         if self.collision {
             self.retire_planning_state();
             return Ok(());
+        }
+        // Early pruning needs access before walking the destination. Ordinary
+        // buffered copies prepare each batch in apply_mapped, so directories
+        // for later batches are not widened merely because they were planned.
+        if prepare_for_pruning {
+            self.prepare_existing_directories(
+                buffered
+                    .iter()
+                    .flat_map(|mapped| mapped.dirs.iter().map(|(path, _, _)| path.clone()))
+                    .collect(),
+            )?;
         }
         before_mutations(self)?;
         if let Some((root, condition, is_destination_root)) = self.create_root.take() {
@@ -1607,7 +1610,7 @@ impl Planner<'_> {
         // the same filtered list drives creation, listing and deferred
         // metadata so they can't disagree.
         if !dirs.is_empty() {
-            let stats = if self.destination_children_known_missing {
+            let mut stats = if self.destination_children_known_missing {
                 self.stat_fresh_descendants(
                     root_entry.as_ref(),
                     dirs.iter().map(|(path, _, _)| path),
@@ -1617,14 +1620,28 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
+            if opts.widen_directory_permissions
+                && !opts.dry_run
+                && stats
+                    .iter()
+                    .flatten()
+                    .any(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+            {
+                self.prepare_existing_directories(
+                    dirs.iter().map(|(path, _, _)| path.clone()).collect(),
+                )?;
+                stats = self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?;
+                // Previously unsearchable children may now be visible.
+                other_stats = None;
+            }
             let planned = self.filter_dirs(dirs, stats, dst_root)?;
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
             } else {
-                let Some(reopened_dirs) = self.create_directories(&planned, dst_root)? else {
+                if !self.create_directories(&planned, dst_root)? {
                     return Ok(());
-                };
-                self.defer_directory_metadata(&planned, &reopened_dirs);
+                }
+                self.defer_directory_metadata(&planned);
             }
         }
 
@@ -2385,34 +2402,16 @@ impl Planner<'_> {
         Ok(planned)
     }
 
-    /// Create this batch's missing directories and reopen existing ones that
-    /// are not yet writable. Returns the implicit directories reopened that
-    /// way, or `None` when a new destination root could not be created and
-    /// nothing below it may proceed.
-    fn create_directories(
-        &mut self,
-        planned: &[PlannedDir],
-        dst_root: &[u8],
-    ) -> Result<Option<std::collections::HashSet<PathBytes>>> {
+    /// Create missing directories. A failed placement-root condition prevents
+    /// operations below it. Existing directory access is prepared separately.
+    fn create_directories(&mut self, planned: &[PlannedDir], dst_root: &[u8]) -> Result<bool> {
         let opts = self.opts;
-        // Create new dirs; also "create" existing ones we can't yet
-        // write into (0o700 not set) so apply() opens them up. The
-        // latter are not creations: no record, no count.
-        let existing_dirs: std::collections::HashSet<&PathBytes> = planned
-            .iter()
-            .filter(|(_, _, _, st)| matches!(st, Some(d) if d.kind == Kind::Dir))
-            .map(|(p, _, _, _)| p)
-            .collect();
         let mut new_dirs: Vec<Op> = planned
             .iter()
             .filter(|(path, _, _, st)| {
                 let root_must_be_new =
                     self.exact_condition == TargetCondition::Absent && path == &self.dst_root;
-                if opts.preserve_existing_directory_metadata && existing_dirs.contains(path) {
-                    return false;
-                }
-                root_must_be_new
-                    || !matches!(st, Some(d) if d.kind == Kind::Dir && d.mode & 0o700 == 0o700)
+                root_must_be_new || !matches!(st, Some(d) if d.kind == Kind::Dir)
             })
             .map(|(p, _, e, st)| Op::Mkdir {
                 path: p.clone(),
@@ -2454,7 +2453,7 @@ impl Planner<'_> {
                     return Err(endpoint_error(error)).context("apply destination changes");
                 }
                 self.collision = true;
-                return Ok(None);
+                return Ok(false);
             }
             self.created_dirs.insert(self.dst_root.clone());
             self.progress.directories_created.fetch_add(1, Relaxed);
@@ -2473,7 +2472,6 @@ impl Planner<'_> {
                 self.container_guard = Some(target_container(&self.dst_root, &created));
             }
         }
-        let mut reopened_dirs = std::collections::HashSet::new();
         for new_dirs in directory_creation_batches(new_dirs, opts.restricted_receiver) {
             let n = new_dirs.len();
             let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs
@@ -2488,11 +2486,9 @@ impl Planner<'_> {
             let errs = self.apply(new_dirs)?;
             let capacity_error = first_capacity_error(&errs);
             let mut failed = 0;
-            let mut reopened = 0;
             for ((name, condition), err) in op_info.iter().zip(errs) {
-                let preexisting = existing_dirs.contains(name);
                 let succeeded = err.is_none();
-                let created = succeeded && !preexisting;
+                let created = succeeded;
                 if created {
                     self.created_dirs.insert(name.clone());
                 }
@@ -2504,16 +2500,8 @@ impl Planner<'_> {
                     if name == &self.dst_root && *condition != TargetCondition::Any {
                         self.collision = true;
                     }
-                } else if opts.verbose > 0 && !preexisting {
+                } else if opts.verbose > 0 {
                     self.progress.println(&format!("{}/", display(name)));
-                }
-                if preexisting && succeeded {
-                    // Reopened for writability only; nothing was made.
-                    reopened += 1;
-                    if self.implicit_dirs.contains(name) || self.unselected_dirs.contains(name) {
-                        reopened_dirs.insert(name.clone());
-                    }
-                    continue;
                 }
                 if let (Some(results), Some(dst_rel)) = (
                     self.progress.results_writer(),
@@ -2545,12 +2533,12 @@ impl Planner<'_> {
             }
             self.progress
                 .directories_created
-                .fetch_add((n - failed - reopened) as u64, Relaxed);
+                .fetch_add((n - failed) as u64, Relaxed);
             if let Some(error) = capacity_error {
                 return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
-        Ok(Some(reopened_dirs))
+        Ok(true)
     }
 
     /// Record what a live run would do to this batch's directories.
@@ -2616,23 +2604,14 @@ impl Planner<'_> {
 
     /// Queue the final metadata of this batch's directories, applied once
     /// their contents are written.
-    fn defer_directory_metadata(
-        &mut self,
-        planned: &[PlannedDir],
-        reopened_dirs: &std::collections::HashSet<PathBytes>,
-    ) {
+    fn defer_directory_metadata(&mut self, planned: &[PlannedDir]) {
         let opts = self.opts;
         for (p, dst_rel, e, s) in planned {
             if self.unselected_dirs.contains(p) {
-                // Containers keep receiver-created metadata. Only restore a
-                // mode temporarily reopened for their children. A restricted
-                // receiver stages new directories at 0700 and chooses the
-                // final default mode itself, including its umask and setgid.
-                let meta = if reopened_dirs.contains(p) {
-                    let mut meta = s.as_ref().expect("reopened directory was observed").meta();
-                    meta.inode_metadata = None;
-                    meta
-                } else if s.is_none() && opts.restricted_receiver && !opts.perms {
+                // Existing containers keep their metadata. A restricted
+                // receiver chooses new containers' final default modes itself,
+                // including its umask and setgid inheritance.
+                let meta = if s.is_none() && opts.restricted_receiver && !opts.perms {
                     Meta {
                         mode: 0o777,
                         uid: 0,
@@ -2657,23 +2636,7 @@ impl Planner<'_> {
                 ));
                 continue;
             }
-            // New implicit parents already have their final modes.
-            // Restore only those temporarily reopened for writing.
             if self.implicit_dirs.contains(p) {
-                if reopened_dirs.contains(p) {
-                    let existing = s.as_ref().expect("reopened directory was observed");
-                    self.implicit_restorations.push((
-                        p.clone(),
-                        existing.meta(),
-                        if opts.restricted_receiver && !opts.perms {
-                            flags::RECEIVER_MODE
-                        } else {
-                            flags::MODE
-                        },
-                        p.iter().filter(|&&c| c == b'/').count(),
-                        self.metadata_condition_for(p),
-                    ));
-                }
                 continue;
             }
             if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
@@ -2686,23 +2649,14 @@ impl Planner<'_> {
             } else {
                 opts.flags_for(dst_rel)
             };
-            // Without -p, existing directories retain their mode and
-            // new directories receive the source mode through the
-            // receiving side's umask. Only a signed receiver needs to
-            // replace the proposal: an ordinary receiver's Mkdir has
-            // already applied its local umask and any kernel-inherited
-            // setgid bit, which a follow-up chmod must not clear.
-            if flags & flags::MODE == 0 {
-                if opts.restricted_receiver {
-                    meta.mode = s
-                        .as_ref()
-                        .filter(|d| d.kind == Kind::Dir)
-                        .map_or(e.mode & 0o777 & !opts.umask, |d| d.mode & 0o7777);
-                    flags |= flags::RECEIVER_MODE;
-                } else if let Some(existing) = s.as_ref().filter(|d| d.kind == Kind::Dir) {
-                    meta.mode = existing.mode & 0o7777;
-                    flags |= flags::MODE;
-                }
+            // Existing directories need no mode operation unless metadata was
+            // explicitly requested. Actual temporary changes are merged later.
+            if flags & flags::MODE == 0
+                && opts.restricted_receiver
+                && (s.is_none() || self.created_dirs.contains(p))
+            {
+                meta.mode = e.mode & 0o777 & !opts.umask;
+                flags |= flags::RECEIVER_MODE;
             }
             self.deferred.push((
                 p.clone(),
@@ -3467,17 +3421,20 @@ impl Planner<'_> {
         before: bool,
     ) -> Result<(u64, DeletePlan)> {
         let reason = if self.scan_warned {
-            Some("source scan errors")
+            Some(("source scan reported errors", "source scan errors"))
         } else if overlap_unsearchable {
-            Some("source ancestry could not be checked")
+            Some((
+                "source ancestry could not be checked",
+                "source ancestry could not be checked",
+            ))
         } else if self.progress.errors.load(Relaxed) != 0 {
-            Some("copy or scan errors")
+            Some(("copy reported errors", "copy errors"))
         } else {
             None
         };
-        if let Some(reason) = reason {
+        if let Some((message, reason)) = reason {
             self.progress
-                .eprintln(&format!("syq: {reason}; skipping deletions"));
+                .eprintln(&format!("syq: {message}; skipping deletions"));
             return Ok((0, DeletePlan::Skipped(reason)));
         }
         if before && self.destination_root_known_missing {
@@ -3829,11 +3786,138 @@ impl Planner<'_> {
         }
     }
 
-    pub(super) fn apply_deferred(&mut self) -> Result<()> {
+    fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
+        if !self.opts.widen_directory_permissions
+            || self.opts.dry_run
+            || self.opts.preserve_existing_directory_metadata
+            || self.destination_root_known_missing
+        {
+            return Ok(());
+        }
         self.assert_mutation_root()?;
-        let mut d = std::mem::take(&mut self.deferred);
+        paths.sort_by(|a, b| {
+            a.iter()
+                .filter(|&&c| c == b'/')
+                .count()
+                .cmp(&b.iter().filter(|&&c| c == b'/').count())
+                .then(a.cmp(b))
+        });
+        paths.dedup();
+        for depth in paths.chunk_by(|a, b| {
+            a.iter().filter(|&&c| c == b'/').count() == b.iter().filter(|&&c| c == b'/').count()
+        }) {
+            for chunk in depth.chunks(1000) {
+                let stats = self.stat_many(chunk.to_vec())?;
+                let directories: Vec<_> = chunk
+                    .iter()
+                    .zip(stats)
+                    .filter_map(|(path, entry)| {
+                        let entry = entry.filter(|entry| {
+                            entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700
+                        })?;
+                        (!self.directory_restorations.contains_key(path)).then(|| {
+                            (
+                                path.clone(),
+                                TargetCondition::MatchesFingerprint {
+                                    dev: entry.dev,
+                                    ino: entry.ino,
+                                    ctime: entry.ctime,
+                                    ctime_nsec: entry.ctime_nsec,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                if directories.is_empty() {
+                    continue;
+                }
+                let names: Vec<_> = directories.iter().map(|(path, _)| path.clone()).collect();
+                let response = ok(
+                    self.dst.call(Request::WidenDirectories {
+                        directories,
+                        guard: self.container_guard.clone(),
+                    })?,
+                    "prepare directory permissions",
+                )?;
+                let Response::WidenedDirectories(results) = response else {
+                    bail!("unexpected directory access response {response:?}");
+                };
+                anyhow::ensure!(
+                    results.len() == names.len(),
+                    "directory access response count mismatch"
+                );
+                for (path, result) in names.into_iter().zip(results) {
+                    match result {
+                        Ok(Some(mode)) => {
+                            self.directory_restorations.insert(path, mode);
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.progress.error_classified(
+                            &format!("syq: {}: {error}", display(&path)),
+                            Some("io"),
+                            wire_os_kind(&error),
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_deferred(&mut self, aborted: bool) -> Result<()> {
+        self.assert_mutation_root()?;
+        let mut d = if aborted {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.deferred)
+        };
+        let mut remaining = std::mem::take(&mut self.directory_restorations);
+        for (path, meta, flags, _, condition) in &mut d {
+            if let Some(saved) = remaining.remove(path) {
+                if *flags & (flags::MODE | flags::RECEIVER_MODE) == 0 {
+                    meta.mode = saved.mode;
+                    *flags |= if self.opts.restricted_receiver {
+                        flags::RECEIVER_MODE
+                    } else {
+                        flags::MODE
+                    };
+                }
+                *condition = TargetCondition::Matches {
+                    dev: saved.dev,
+                    ino: saved.ino,
+                };
+            }
+        }
+        for (path, saved) in remaining {
+            let depth = path.iter().filter(|&&c| c == b'/').count();
+            d.push((
+                path,
+                Meta {
+                    mode: saved.mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    inode_metadata: None,
+                },
+                if self.opts.restricted_receiver {
+                    flags::RECEIVER_MODE
+                } else {
+                    flags::MODE
+                },
+                depth,
+                TargetCondition::Matches {
+                    dev: saved.dev,
+                    ino: saved.ino,
+                },
+            ));
+        }
+        d.retain(|(_, _, flags, _, _)| *flags != 0);
         d.sort_by(|a, b| b.3.cmp(&a.3));
-        for chunk in d.chunks(1000) {
+        for chunk in d
+            .chunk_by(|a, b| a.3 == b.3)
+            .flat_map(|depth| depth.chunks(1000))
+        {
             let ops: Vec<Op> = chunk
                 .iter()
                 .map(|(p, m, f, _, condition)| Op::SetMeta {

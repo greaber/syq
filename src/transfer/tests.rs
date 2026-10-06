@@ -427,6 +427,7 @@ fn pipeline_worker(
         links: false,
         perms: false,
         rsync_creation: false,
+        widen_directory_permissions: false,
         hardlinks: false,
         sparse: false,
         inode_preservation: Default::default(),

@@ -1307,3 +1307,25 @@ fn prune_before_enables_pruning_and_requires_placement() {
         .to_string()
         .contains("explicit placement"));
 }
+
+#[test]
+fn temporary_directory_permissions_are_native_opt_in() {
+    let argv = ["source", "--into", "destination"].map(std::ffi::OsString::from);
+    assert!(
+        !parse_native_copy(&argv)
+            .unwrap()
+            .temporarily_widen_dir_permissions
+    );
+    let argv = [
+        "source",
+        "--into",
+        "destination",
+        "--temporarily-widen-dir-permissions",
+    ]
+    .map(std::ffi::OsString::from);
+    assert!(
+        parse_native_copy(&argv)
+            .unwrap()
+            .temporarily_widen_dir_permissions
+    );
+}

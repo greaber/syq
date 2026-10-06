@@ -225,6 +225,7 @@ fn prune_rechecks_names_after_destination_permissions_are_repaired() {
     run_native_ok(&[
         "cp",
         "--prune",
+        "--temporarily-widen-dir-permissions",
         "--srcs-in",
         &t.s("src"),
         "--into",
@@ -248,7 +249,14 @@ fn copy_repairs_destination_directories_without_search_permission() {
                     .unwrap();
                 let src = t.s("src");
                 let dst = t.s("dst");
-                let mut args = vec!["cp", "--srcs-in", &src, "--into", &dst];
+                let mut args = vec![
+                    "cp",
+                    "--temporarily-widen-dir-permissions",
+                    "--srcs-in",
+                    &src,
+                    "--into",
+                    &dst,
+                ];
                 if prune {
                     args.push("--prune");
                 }
@@ -618,4 +626,138 @@ fn prune_before_preserves_extras_when_source_selection_fails() {
         assert!(!out.status.success(), "{out:?}");
         assert_eq!(read(&t.path("dst/extra")), b"keep");
     }
+}
+
+#[test]
+fn native_copy_leaves_existing_directory_permissions_alone_by_default() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for pruning in [None, Some("--prune"), Some("--prune-before")] {
+        let t = Tmp::new();
+        write(&t.path("src/new"), &vec![b'n'; 128 << 10]);
+        write(&t.path("dst/extra"), b"keep");
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec![
+            "cp",
+            "--performance-tuning=copy-path=ranges",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        args.extend(pruning);
+        let out = native_syq(&args);
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
+        assert_eq!(read(&t.path("dst/extra")), b"keep");
+        assert!(!t.path("dst/new").exists());
+        assert!(
+            stderr_of(&out).contains("--temporarily-widen-dir-permissions"),
+            "{out:?}"
+        );
+    }
+}
+
+#[test]
+fn temporary_directory_permissions_restore_nested_parents_after_copy_and_prune() {
+    for pruning in [None, Some("--prune"), Some("--prune-before")] {
+        let t = Tmp::new();
+        write(&t.path("src/p/q/new"), b"new");
+        write(&t.path("dst/p/q/extra"), b"extra");
+        for name in ["dst/p/q", "dst/p"] {
+            fs::set_permissions(t.path(name), fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec![
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        args.extend(pruning);
+        let out = native_syq(&args);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(read(&t.path("dst/p/q/new")), b"new");
+        assert_eq!(t.path("dst/p/q/extra").exists(), pruning.is_none());
+        for name in ["dst/p", "dst/p/q"] {
+            assert_eq!(fs::metadata(t.path(name)).unwrap().mode() & 0o777, 0o500);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn copy_does_not_restore_a_directory_it_never_widened() {
+    for native in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/new"), b"new");
+        fs::create_dir(t.path("dst")).unwrap();
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_syq"));
+        if native {
+            cmd.args([
+                "cp",
+                "--temporarily-widen-dir-permissions",
+                "--srcs-in",
+                &t.s("src"),
+                "--into",
+                &t.s("dst"),
+            ]);
+        } else {
+            cmd.args(["rsync", "-r", &format!("{}/", t.s("src")), &t.s("dst")]);
+        }
+        let child = cmd
+            .env("SYQ_TEST_FINALIZATION_READY_FILE", &ready)
+            .env("SYQ_TEST_FINALIZATION_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for(
+            "copy finalization",
+            std::time::Duration::from_secs(10),
+            || ready.exists(),
+        );
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&continuation, b"continue").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o700);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn temporary_directory_permissions_restore_after_copy_failure() {
+    let t = Tmp::new();
+    write(&t.path("src/new"), &vec![b'n'; 128 << 10]);
+    fs::create_dir(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--performance-tuning=copy-path=ranges",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ])
+        .env("SYQ_TEST_FAIL_READ_RANGE", "1")
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("test read-range failure"),
+        "{out:?}"
+    );
+    assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
 }

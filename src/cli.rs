@@ -541,6 +541,8 @@ pub struct Args {
     pub delete: bool,
     #[arg(skip)]
     pub prune_before: bool,
+    #[arg(skip)]
+    pub temporarily_widen_dir_permissions: bool,
     /// With --delete, also remove destination paths that the --syq-ignore patterns exclude
     #[arg(long, requires = "delete")]
     pub delete_excluded: bool,
@@ -1318,6 +1320,9 @@ struct NativeCopyOperationalArgs {
     /// Match selected source metadata, including on unchanged files (repeatable/comma-separated)
     #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
     copy_metadata: Vec<NativeCopyMetadata>,
+    /// Temporarily add owner read, write and search permission to existing destination directories
+    #[arg(long)]
+    temporarily_widen_dir_permissions: bool,
     /// Request reads without access-time updates; warn and continue if unavailable
     #[arg(long)]
     open_noatime: bool,
@@ -3004,6 +3009,7 @@ fn apply_native_copy_operational(
         ignore,
         ignore_from,
         copy_metadata,
+        temporarily_widen_dir_permissions,
         open_noatime,
         sparse,
         inplace,
@@ -3044,6 +3050,7 @@ fn apply_native_copy_operational(
         "--inplace cannot combine with --if-exists=keep or --if-exists=update-if-older"
     );
     args.inplace = inplace;
+    args.temporarily_widen_dir_permissions = temporarily_widen_dir_permissions;
     args.open_noatime = open_noatime;
     args.sparse = sparse;
     for attribute in copy_metadata {

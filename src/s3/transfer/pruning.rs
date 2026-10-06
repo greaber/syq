@@ -49,7 +49,11 @@ impl Engine {
             for c in &found {
                 self.deletion_record(c, "blocked", Some("safety_limit"), None);
             }
-            return Err(prune::Limit.into());
+            return if self.args.prune_before {
+                Ok(())
+            } else {
+                Err(prune::Limit.into())
+            };
         }
         if destination.is_none() && !self.args.dry_run {
             self.delete_objects(&found).await?;

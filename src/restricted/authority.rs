@@ -1059,6 +1059,9 @@ impl RestrictedAuthority {
             match response {
                 proto::Response::Err(error) => Some(error.as_str()),
                 proto::Response::EndpointError(error) => Some(error.as_str()),
+                proto::Response::WidenedDirectories(results) => results
+                    .get(index)
+                    .and_then(|result| result.as_ref().err().map(proto::WireError::as_str)),
                 proto::Response::Applied(results) => results
                     .get(index)
                     .and_then(|error| error.as_ref().map(proto::WireError::as_str)),
@@ -2552,6 +2555,36 @@ impl RestrictedAuthority {
                     .chain(others.iter())
                 {
                     self.check_observation_path(path)?;
+                }
+                *guard = Some(self.guard.clone());
+            }
+            Request::WidenDirectories { directories, guard } => {
+                for (index, (path, condition)) in directories.iter_mut().enumerate() {
+                    // Widening is the existing-directory part of EnsureDirectory.
+                    // Apply exactly the same signed path/policy/quota checks,
+                    // but require an observed directory: this request cannot create.
+                    anyhow::ensure!(
+                        matches!(
+                            condition,
+                            proto::TargetCondition::Matches { .. }
+                                | proto::TargetCondition::MatchesFingerprint { .. }
+                        ),
+                        "temporary directory access requires an existing identity"
+                    );
+                    let mut op = Op::Mkdir {
+                        path: path.clone(),
+                        mode: 0o700,
+                        condition: *condition,
+                    };
+                    self.authorize_op(&mut op, index, pending, outcomes, touched)?;
+                    let Op::Mkdir {
+                        condition: authorized,
+                        ..
+                    } = op
+                    else {
+                        unreachable!()
+                    };
+                    *condition = authorized;
                 }
                 *guard = Some(self.guard.clone());
             }

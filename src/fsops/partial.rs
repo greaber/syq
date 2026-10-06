@@ -2890,6 +2890,15 @@ impl FsOps {
                     others,
                 })
             })(),
+            Request::WidenDirectories { directories, guard } => Ok(Response::WidenedDirectories(
+                parallel_map(directories, |(path, condition)| {
+                    (|| {
+                        let target = self.destination_mutation_target(path, guard.as_ref())?;
+                        widen_directory(&target.root, &target.relative, *condition, &target.label)
+                    })()
+                    .map_err(|error| wire_error(&error))
+                }),
+            )),
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
             Request::ProbePartial {
                 path,
@@ -3246,10 +3255,73 @@ impl FsOps {
             | Request::CreateSendBudget { .. }
             | Request::StopReadStream => Err(anyhow!("unexpected request")),
         };
-        match r {
-            Ok(resp) => self.rebase_response(resp),
-            Err(e) => Response::EndpointError(wire_error(&e)),
+        let mut response = r.unwrap_or_else(|error| Response::EndpointError(wire_error(&error)));
+        match (&*req, &mut response) {
+            (Request::Apply { ops, guard }, Response::Applied(errors)) => {
+                for (op, error) in ops.iter().zip(errors) {
+                    if let Some(error) = error {
+                        let access =
+                            if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
+                                0o100
+                            } else {
+                                0o300
+                            };
+                        self.annotate_permission_failure(
+                            apply::op_path(op),
+                            guard.as_ref(),
+                            access,
+                            error,
+                        );
+                    }
+                }
+            }
+            (
+                Request::Prepare {
+                    path,
+                    guard,
+                    inplace,
+                    ..
+                },
+                Response::EndpointError(error),
+            ) => self.annotate_permission_failure(
+                path,
+                guard.as_ref(),
+                if *inplace { 0o100 } else { 0o300 },
+                error,
+            ),
+            (
+                Request::Finalize { path, guard, .. }
+                | Request::SeedBasis { path, guard, .. }
+                | Request::StageBasis { path, guard, .. },
+                Response::EndpointError(error),
+            ) => self.annotate_permission_failure(path, guard.as_ref(), 0o300, error),
+            (Request::PutSmallBatch(puts), Response::Applied(errors)) => {
+                for (put, error) in puts.iter().zip(errors) {
+                    if let Some(error) = error {
+                        self.annotate_permission_failure(
+                            &put.path,
+                            put.guard.as_ref(),
+                            0o300,
+                            error,
+                        );
+                    }
+                }
+            }
+            (Request::PatchSmallBatch(patches), Response::PatchedBatch(results)) => {
+                for (patch, result) in patches.iter().zip(results) {
+                    if let Err(error) = result {
+                        self.annotate_permission_failure(
+                            &patch.path,
+                            patch.guard.as_ref(),
+                            0o300,
+                            &mut error.error,
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
+        self.rebase_response(response)
     }
 }
 

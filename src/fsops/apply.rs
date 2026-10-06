@@ -360,11 +360,6 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 }
                 let metadata = root.metadata(path)?;
                 require_rooted_condition(metadata, *condition, &target.label)?;
-                if metadata.mode & 0o700 != 0o700 {
-                    let directory = root.open_metadata(path)?;
-                    require_rooted_metadata(&directory, metadata, &target.label)?;
-                    set_mode_handle(&directory, metadata.mode | 0o700)?;
-                }
                 return Ok(());
             }
             let parent = if target.create_missing_parents {
@@ -392,14 +387,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
             }
             drop(parent);
             match observe_rooted_condition(target, *condition)? {
-                Some(metadata) if metadata.is_dir() => {
-                    if metadata.mode & 0o700 != 0o700 {
-                        let directory = root.open_metadata(path)?;
-                        require_rooted_metadata(&directory, metadata, &target.label)?;
-                        set_mode_handle(&directory, metadata.mode | 0o700)?;
-                    }
-                    Ok(())
-                }
+                Some(metadata) if metadata.is_dir() => Ok(()),
                 Some(_) => bail!(
                     "cannot replace non-directory {} with a directory",
                     target.label.display()
@@ -663,11 +651,6 @@ pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u
             let metadata = target.root.metadata(&target.relative)?;
             if !metadata.is_dir() {
                 return Err(error);
-            }
-            if metadata.mode & 0o700 != 0o700 {
-                let directory = target.root.open_metadata(&target.relative)?;
-                require_rooted_metadata(&directory, metadata, &target.label)?;
-                set_mode_handle(&directory, metadata.mode | 0o700)?;
             }
             Ok(())
         }

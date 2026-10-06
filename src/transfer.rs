@@ -148,6 +148,7 @@ pub struct Opts {
     pub links: bool,
     pub perms: bool,
     pub rsync_creation: bool,
+    pub widen_directory_permissions: bool,
     pub hardlinks: bool,
     pub sparse: bool,
     pub inode_preservation: crate::inode_metadata::Selection,
@@ -2042,6 +2043,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         links: args.links,
         perms: args.perms,
         rsync_creation: args.interface == Interface::Rsync,
+        widen_directory_permissions: args.interface == Interface::Rsync
+            || args.temporarily_widen_dir_permissions,
         hardlinks: args.hardlinks,
         sparse: args.sparse,
         inode_preservation: crate::inode_metadata::Selection {
@@ -3719,7 +3722,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         implicit_dirs: std::collections::HashSet::new(),
         mapping_explicit_parents: std::collections::HashSet::new(),
         blocked_mapping_parents: std::collections::HashSet::new(),
-        implicit_restorations: Vec::new(),
+        directory_restorations: Default::default(),
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root {
             std::collections::HashSet::from([dst_root.clone()])
@@ -3902,6 +3905,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             None
         };
         if let Err(error) = st.replay_buffered(
+            args.prune_before,
             |planner| {
                 if args.prune_before {
                     (deleted, delete_plan) = planner.prune(prune_overlap_unsearchable, true)?;
@@ -4154,8 +4158,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if !args.prune_before && !aborted && opts.delete && scan_err.is_none() && !collision {
         (deleted, delete_plan) = st.prune(prune_overlap_unsearchable, false)?;
     }
-    if !aborted && !opts.dry_run {
-        st.apply_deferred()?;
+    if !opts.dry_run {
+        st.apply_deferred(aborted)?;
     }
     if debug() {
         crate::output::diagnostic!(

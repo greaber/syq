@@ -1,5 +1,6 @@
 use super::Route;
 mod authorization;
+mod directory_permissions;
 mod fast;
 mod pruning;
 mod server_copy;
@@ -235,7 +236,11 @@ impl Engine {
         tokio::pin!(work);
         let outage = self.outage.clone();
         let interrupted = tokio::select! {
-            result = &mut work => return result,
+            result = &mut work => return result.and_then(|()| {
+                if self.progress.deletions_blocked.load(Relaxed) > 0 {
+                    Err(super::prune::Limit.into())
+                } else { Ok(()) }
+            }),
             _ = sigint.recv() => Some("interrupted"),
             _ = terminate.recv() => Some("terminated"),
             _ = outage.stopped() => None,
@@ -403,69 +408,160 @@ impl Engine {
                 .bytes_total
                 .store(plan.iter().map(|s| s.size).sum(), Relaxed);
             self.progress.scan_done.store(true, Relaxed);
-            if self.args.prune_before {
-                self.prune(std::mem::take(&mut prune), Some(&destination))
-                    .await?;
-            }
-            // Directory metadata is applied after descendants, so creating
-            // children cannot change the restored times or require final modes.
             let directories = Arc::new(Mutex::new(Vec::new()));
-            // Authorization leaves job order unchanged, and parallel invokes
-            // this closure in plan order before spawning each future.
-            let mut service_times = service_times.into_iter();
-            parallel(plan, workers, |mut job| {
-                let service_time = service_times.next().flatten();
-                let engine = self.clone();
-                let dst = destination.clone();
-                let dirs = directories.clone();
-                async move {
-                    engine.check_cancelled()?;
-                    let result = engine.download(&mut job, &dst, dirs, service_time).await;
-                    engine.settle(
-                        job.key.as_bytes(),
-                        &job.path,
-                        job.kind,
-                        &result,
-                        job.expected_hash(),
-                    );
-                    Ok(result.ok().flatten())
+            let mut directory_access = directory_permissions::TemporaryAccess::new(
+                self.args.temporarily_widen_dir_permissions
+                    && !self.args.dry_run
+                    && !self.args.only_new_native_entries(),
+            );
+            let mut copies_finished = false;
+            let transferred = async {
+                if self.args.prune_before {
+                    directory_access.prepare(&destination, &plan)?;
+                    self.prune(std::mem::take(&mut prune), Some(&destination))
+                        .await?;
                 }
-            })
+                let mut service_times = service_times.into_iter();
+                parallel(plan, workers, |mut job| {
+                    let service_time = service_times.next().flatten();
+                    let engine = self.clone();
+                    let dst = destination.clone();
+                    let dirs = directories.clone();
+                    // Admission invokes this closure in plan order. Preparing
+                    // here keeps queued downloads' directories untouched and
+                    // needs no lock shared by the running file transfers.
+                    let prepared = directory_access.prepare(&dst, std::slice::from_ref(&job));
+                    async move {
+                        engine.check_cancelled()?;
+                        let result = match prepared {
+                            Ok(()) => engine.download(&mut job, &dst, dirs, service_time).await,
+                            Err(error) => Err(error),
+                        }
+                        .map_err(|error| {
+                            if error.chain().any(|cause| {
+                                cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                                    e.kind() == std::io::ErrorKind::PermissionDenied
+                                })
+                            }) {
+                                if let Ok(path) = RelativePath::new(job.path.as_bytes()) {
+                                    if let Some(hint) = crate::fsops::directory_permission_hint(
+                                        &dst.root, &path, 0o300,
+                                    ) {
+                                        return error.context(hint);
+                                    }
+                                }
+                            }
+                            error
+                        });
+                        engine.settle(
+                            job.key.as_bytes(),
+                            &job.path,
+                            job.kind,
+                            &result,
+                            job.expected_hash(),
+                        );
+                        Ok(result.ok().flatten())
+                    }
+                })
+                .await?;
+                copies_finished = true;
+                self.progress.finish_transfer();
+                if !self.args.prune_before {
+                    self.prune(prune, Some(&destination)).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            self.finish_directories(
+                &destination,
+                &directories,
+                directory_access.into_restorations(),
+                !copies_finished,
+            )
             .await?;
-            self.progress.finish_transfer();
-            // Prune while directories are writable, then restore their modes and times.
-            // Apply metadata even when the deletion budget refuses pruning.
-            let pruned = if self.args.prune_before {
-                Ok(())
-            } else {
-                self.prune(prune, Some(&destination)).await
-            };
-            self.finish_directories(&destination, &directories).await?;
-            pruned?;
+            transferred?;
         }
         Ok(())
     }
+
     async fn finish_directories(
         &self,
         destination: &Destination,
         directories: &DirectoryMetadata,
+        mut widened: BTreeMap<String, crate::proto::DirectoryMode>,
+        aborted: bool,
     ) -> Result<()> {
-        if !self.args.dry_run {
-            let mut directories = directories.lock().await;
-            directories.sort_by_key(|(path, _, _, _)| std::cmp::Reverse(path.len()));
-            for (path, meta, mode, explicit) in directories.iter() {
-                local::apply_metadata(
-                    &destination.root,
-                    &RelativePath::new(path.as_bytes())?,
-                    meta,
-                    &self.args,
-                    *mode,
-                    *explicit,
-                    mode.is_none(),
-                )?;
+        if self.args.dry_run {
+            return Ok(());
+        }
+        let mut entries: BTreeMap<_, _> = if aborted {
+            BTreeMap::new()
+        } else {
+            directories
+                .lock()
+                .await
+                .iter()
+                .map(|(path, meta, mode, explicit)| {
+                    (path.clone(), Some((meta.clone(), *mode, *explicit)))
+                })
+                .collect()
+        };
+        for path in widened.keys() {
+            entries.entry(path.clone()).or_insert(None);
+        }
+        let mut entries: Vec<_> = entries.into_iter().collect();
+        entries.sort_by_key(|(path, _)| {
+            std::cmp::Reverse(
+                path.bytes().filter(|&c| c == b'/').count() + usize::from(!path.is_empty()),
+            )
+        });
+        let mut first_error = None;
+        for (path, metadata) in entries {
+            let relative = RelativePath::new(path.as_bytes())?;
+            let saved = widened.remove(&path);
+            // Require the inode we widened before applying any final metadata.
+            let result = (|| {
+                if let Some(saved) = saved {
+                    let now = destination.root.metadata(&relative)?;
+                    anyhow::ensure!(
+                        (now.dev, now.ino) == (saved.dev, saved.ino),
+                        "directory {path} changed before restoring permissions"
+                    );
+                }
+                if let Some((meta, mode, explicit)) = &metadata {
+                    local::apply_metadata(
+                        &destination.root,
+                        &relative,
+                        meta,
+                        &self.args,
+                        *mode,
+                        *explicit,
+                        mode.is_none(),
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            let explicit_mode_applied = result.is_ok()
+                && metadata
+                    .as_ref()
+                    .is_some_and(|(_, _, explicit)| self.args.perms || explicit.mode.is_some());
+            if !explicit_mode_applied {
+                if let Some(saved) = saved {
+                    if let Err(error) = crate::fsops::restore_directory_mode(
+                        &destination.root,
+                        &relative,
+                        saved,
+                        std::path::Path::new(&path),
+                    ) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
     fn settle(
         &self,

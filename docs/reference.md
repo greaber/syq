@@ -398,8 +398,17 @@ Explicit mapping `metadata.mtime` also sets the requested destination time.
 S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 
-Existing files keep their destination permissions. New files use the
-source read, write, and execute permissions, limited by the destination umask.
+Existing files and directories keep their destination permissions unless you
+request permission or ACL metadata. Native `cp` does not automatically widen
+existing directory permissions to make copying or pruning succeed.
+`--temporarily-widen-dir-permissions` allows adding owner read, write and search
+permission to existing directories being copied into, when the receiving user owns them.
+Syq restores only directories it actually widened, after copying and pruning;
+explicitly requested permissions take precedence. Other processes can see the
+temporary permissions, and a crash or forced termination can leave them in place.
+`syq rsync` enables temporary widening without this option. Root skips widening.
+
+New files use the source read, write, and execute permissions, limited by the destination umask.
 For example, a new script with mode `755` stays executable with umask `022`.
 
 To preserve source permissions and ownership as well:

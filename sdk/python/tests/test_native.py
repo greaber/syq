@@ -612,6 +612,10 @@ class NativeClientTests(unittest.TestCase):
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
 
+    def test_temporary_directory_permissions_option(self) -> None:
+        self.client.cp("source", into="target", temporarily_widen_dir_permissions=True)
+        self.assertIn("--temporarily-widen-dir-permissions", self.argv())
+
     def test_prune_before_implies_pruning(self) -> None:
         events = []
         self.client.cp("source", into="target", prune_before=True, max_delete=5, on_event=events.append)
