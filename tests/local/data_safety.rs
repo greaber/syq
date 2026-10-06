@@ -820,7 +820,7 @@ fn directory_access_does_not_widen_ancestors_of_a_destination_container() {
             if interface == "cp" {
                 args.extend(["--temporarily-widen-dir-permissions", &src, "--into", &dst]);
             } else {
-                args.extend([&src, &dst]);
+                args.extend([src.as_str(), dst.as_str()]);
             }
             if dry_run {
                 args.push("--dry-run");
