@@ -2778,12 +2778,59 @@ impl FsOps {
             .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
-        let gres = parallel_map(&guarded_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
-                .err()
-                .as_ref()
-                .map(wire_error)
-        });
+        // A directory this request creates and then gives a group starts
+        // private when its starting group may differ, so that group cannot
+        // open it, and list what is created in it, before the change. Its
+        // metadata below then gives it the mode it would have been created
+        // with. Otherwise its creation mode is no wider than its final one.
+        let groups: HashMap<&[u8], u32> = meta_idx
+            .iter()
+            .filter_map(|&i| match &ops[i] {
+                Op::SetMeta {
+                    path, meta, flags, ..
+                } if flags & flags::GROUP != 0 => Some((path.as_slice(), meta.gid)),
+                _ => None,
+            })
+            .collect();
+        let parents = apply::CreationParents::default();
+        let private = std::sync::Mutex::new(HashMap::<Vec<u8>, u32>::new());
+        let create = |op: &Op| {
+            let private_op = match op {
+                Op::Mkdir {
+                    path,
+                    mode,
+                    condition,
+                } if groups.get(path.as_slice()).is_some_and(|&group| {
+                    apply::starting_group_may_differ(
+                        path,
+                        group,
+                        &parents,
+                        guard,
+                        destination_root.clone(),
+                        destination_prefix,
+                    )
+                }) =>
+                {
+                    private.lock().unwrap().insert(path.clone(), *mode);
+                    Some(Op::Mkdir {
+                        path: path.clone(),
+                        mode: 0o700,
+                        condition: *condition,
+                    })
+                }
+                _ => None,
+            };
+            apply_one(
+                private_op.as_ref().unwrap_or(op),
+                guard,
+                destination_root.clone(),
+                destination_prefix,
+            )
+            .err()
+            .as_ref()
+            .map(wire_error)
+        };
+        let gres = parallel_map(&guarded_idx, |&i| create(&ops[i]));
         for (i, r) in guarded_idx.iter().zip(gres) {
             out[*i] = r;
         }
@@ -2795,18 +2842,30 @@ impl FsOps {
             return out;
         }
         for wave in creation_waves(ops, &create_idx) {
-            let cres = parallel_by_directory(ops, &wave, |op| {
-                apply_one(op, guard, destination_root.clone(), destination_prefix)
-                    .err()
-                    .as_ref()
-                    .map(wire_error)
-            });
+            let cres = parallel_by_directory(ops, &wave, create);
             for (i, r) in wave.iter().zip(cres) {
                 out[*i] = r;
             }
         }
+        let private = private.into_inner().unwrap();
         let mres = parallel_map(&meta_idx, |&i| {
-            apply_one(&ops[i], guard, destination_root.clone(), destination_prefix)
+            let result = apply_one(&ops[i], guard, destination_root.clone(), destination_prefix);
+            // After its group change, even a refused one, as creating it
+            // directly and then changing its group would have left it.
+            let opened = match &ops[i] {
+                Op::SetMeta { path, .. } => private.get(path).map(|&proposed| {
+                    apply::open_created_directory(
+                        path,
+                        proposed,
+                        guard,
+                        destination_root.clone(),
+                        destination_prefix,
+                    )
+                }),
+                _ => None,
+            };
+            result
+                .and(opened.unwrap_or(Ok(())))
                 .err()
                 .as_ref()
                 .map(wire_error)

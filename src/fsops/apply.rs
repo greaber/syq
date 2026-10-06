@@ -234,6 +234,10 @@ pub(super) fn with_rooted_partial<T>(
 
 pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
     hold_before_guarded_mutation_for_test(path)?;
+    guarded_target_unheld(path, guard)
+}
+
+fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
     let root_path = resolve(&guard.root);
     let target = resolve(path);
     let relative = relative_under(&root_path, &target)?;
@@ -345,7 +349,7 @@ fn apply_one_rooted_with_deletions(
                     .with_context(|| {
                         format!("create confined directory {}", target.label.display())
                     }) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return hold_after_directory_creation_for_test(&target.label),
                     Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                         if *condition == TargetCondition::Absent {
                             bail!(
@@ -622,6 +626,101 @@ pub(super) fn set_meta_rooted(
     require_rooted_identity(after, condition, &target.label)
 }
 
+/// The target an operation on `path` resolves to, as `apply_one` resolves it.
+fn operation_target(
+    path: &[u8],
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<RootedTarget> {
+    if let Some(guard) = guard {
+        return guarded_target_unheld(path, guard).map(|target| target.as_rooted());
+    }
+    let Some(root) = destination_root else {
+        bail!("{UNROOTED_MUTATION}");
+    };
+    Ok(RootedTarget {
+        root,
+        relative: RelativePath::new(path)?,
+        label: PathBuf::from(OsStr::from_bytes(
+            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+        )),
+        create_missing_parents: true,
+        query_partial_name_limit: false,
+    })
+}
+
+/// The group and mode of the directories new ones are created in, observed
+/// once per request.
+pub(super) type CreationParents = std::sync::Mutex<HashMap<Vec<u8>, Option<(u32, u32)>>>;
+
+/// Whether a directory created at `path` might start with a group other
+/// than `group`. On Linux it takes its parent's group when the parent is
+/// setgid, and otherwise this process's group, or its parent's group on a
+/// filesystem mounted with BSD group semantics. Elsewhere it always takes
+/// its parent's group. When unsure, the answer is yes.
+pub(super) fn starting_group_may_differ(
+    path: &[u8],
+    group: u32,
+    parents: &CreationParents,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> bool {
+    let parent_path = path[..path.iter().rposition(|byte| *byte == b'/').unwrap_or(0)].to_vec();
+    let cached = parents.lock().unwrap().get(&parent_path).copied();
+    let parent = cached.unwrap_or_else(|| {
+        let observed = (|| -> Result<(u32, u32)> {
+            let target = operation_target(path, guard, destination_root, destination_prefix)?;
+            let (parents, _) = target.relative.leaf()?;
+            let parent = target
+                .root
+                .metadata(&RelativePath::new(&parents.join(&b'/'))?)?;
+            Ok((parent.gid, parent.mode))
+        })()
+        .ok();
+        parents.lock().unwrap().insert(parent_path, observed);
+        observed
+    });
+    let Some((parent_group, parent_mode)) = parent else {
+        return true;
+    };
+    if cfg!(target_os = "linux") && parent_mode & 0o2000 == 0 {
+        parent_group != group || unsafe { libc::getegid() } != group
+    } else {
+        parent_group != group
+    }
+}
+
+/// Give a directory created private, once it has taken its group, the mode
+/// its creation with `proposed` would have given it. Like such a creation
+/// followed by that group change, it keeps a setgid bit only if the change
+/// left it in place.
+pub(super) fn open_created_directory(
+    path: &[u8],
+    proposed: u32,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<()> {
+    let target = operation_target(path, guard, destination_root, destination_prefix)?;
+    let directory = target.root.open_metadata(&target.relative)?;
+    let current = directory.metadata()?;
+    anyhow::ensure!(
+        current.is_dir(),
+        "created directory {} was replaced",
+        target.label.display()
+    );
+    // A directory someone else created first is not ours to open.
+    if current.mode() & 0o777 != 0o700 || current.uid() != unsafe { libc::geteuid() } {
+        return Ok(());
+    }
+    set_mode_handle(
+        &directory,
+        created_directory_mode(&directory, (proposed & 0o7777) | 0o700, current.mode())?,
+    )
+}
+
 /// The mode creating `directory` with `proposed` would have given it, for a
 /// directory created private instead: permission bits limited by the umask
 /// or by the default ACL it inherited, and the setgid bit of `current`,
@@ -640,7 +739,7 @@ pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u
         .root
         .create_directory(&target.relative, (mode & 0o7777) | 0o700)
     {
-        Ok(()) => Ok(()),
+        Ok(()) => hold_after_directory_creation_for_test(&target.label),
         Err(error)
             if error.chain().any(|cause| {
                 cause
@@ -803,6 +902,28 @@ pub(super) fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
 
 #[cfg(not(debug_assertions))]
 pub(super) fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+/// Pause right after creating a directory whose path ends with
+/// `SYQ_TEST_CREATED_DIRECTORY_SUFFIX`, before anything is created inside it.
+#[cfg(debug_assertions)]
+pub(super) fn hold_after_directory_creation_for_test(path: &Path) -> Result<()> {
+    let Some(suffix) = std::env::var_os("SYQ_TEST_CREATED_DIRECTORY_SUFFIX") else {
+        return Ok(());
+    };
+    if !path.as_os_str().as_bytes().ends_with(suffix.as_bytes()) {
+        return Ok(());
+    }
+    test_race_barrier(
+        "SYQ_TEST_CREATED_DIRECTORY_READY_FILE",
+        "SYQ_TEST_CREATED_DIRECTORY_CONTINUE_FILE",
+        "directory created",
+    )
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn hold_after_directory_creation_for_test(_path: &Path) -> Result<()> {
     Ok(())
 }
 

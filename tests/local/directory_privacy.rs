@@ -1,9 +1,11 @@
 //! A directory receives its copied permissions, group and ACL after it is
-//! filled. Until then it must not let anyone reach the entries published
-//! into it whom the finished directory would keep out. Most tests hold the
-//! copy at finalization, after every entry is published and before any final
-//! directory metadata is applied, and also check that the finished copy keeps
-//! the metadata it had before.
+//! filled. Until then it must not let anyone reach or list the entries
+//! created in it whom the finished directory would keep out. Read permission
+//! is checked only when a directory is opened, so a directory must be closed
+//! to them from the moment it is created or, if it already exists, before
+//! anything is created in it. Tests hold the copy right after a directory is
+//! created, before the first file's data is written, or at finalization, and
+//! also check that the finished copy keeps the metadata it had before.
 use super::*;
 
 /// The umask every copy here runs with.
@@ -71,6 +73,28 @@ fn observe_before_finalization<R>(
     observe: impl FnOnce() -> R,
 ) -> (R, Output) {
     observe_at(t, command, "FINALIZATION", observe)
+}
+
+/// The same right after the receiver creates the directory whose path ends
+/// with `suffix`, before anything is created inside it.
+fn observe_at_creation<R>(
+    t: &Tmp,
+    mut command: Command,
+    suffix: &str,
+    observe: impl FnOnce() -> R,
+) -> (R, Output) {
+    command.env("SYQ_TEST_CREATED_DIRECTORY_SUFFIX", suffix);
+    observe_at(t, command, "CREATED_DIRECTORY", observe)
+}
+
+/// A directory's group, mode and listing.
+fn state(path: &Path) -> (u32, u32, usize) {
+    let metadata = fs::metadata(path).unwrap();
+    (
+        metadata.gid(),
+        metadata.mode() & 0o7777,
+        fs::read_dir(path).unwrap().count(),
+    )
 }
 
 /// Whether `during` grants no group or other access that `after` lacks.
@@ -247,6 +271,152 @@ fn an_existing_directory_has_its_final_group_before_anything_is_published() {
         // The old group, which the copy replaces, must not reach new files.
         assert_eq!(during, [source_gid; 2], "{args:?}: group while filled");
     }
+}
+
+#[test]
+fn a_new_destination_root_is_private_from_its_creation() {
+    // (arguments, private while its metadata is pending)
+    let cases: [(&[&str], bool); 6] = [
+        (&["rsync", "-a", "src/", "dst/"], true),
+        (&["rsync", "-rp", "src/", "dst/"], true),
+        (&["rsync", "-rg", "src/", "dst/"], true),
+        (
+            &[
+                "cp",
+                "--copy-metadata=permissions",
+                "--srcs-in",
+                "src",
+                "--into",
+                "dst",
+            ],
+            true,
+        ),
+        (
+            &[
+                "cp",
+                "--copy-metadata=ownership",
+                "--srcs-in",
+                "src",
+                "--into",
+                "dst",
+            ],
+            true,
+        ),
+        // Nothing is applied later: its creation mode is final.
+        (&["rsync", "-r", "src/", "dst/"], false),
+    ];
+    for (args, private_while_pending) in cases {
+        let t = Tmp::new();
+        source_tree(&t, 0o750, 0o750);
+        let mut command = syq_command(args);
+        command.current_dir(&t.0);
+        let ((_, during, listed), output) =
+            observe_at_creation(&t, command, "/dst", || state(&t.path("dst")));
+        assert_output_ok(&output);
+        assert_eq!(read(&t.path("dst/sub/file")), b"nested file");
+        assert_eq!(listed, 0, "{args:?}");
+        let after = mode(&t.path("dst"));
+        if private_while_pending {
+            assert!(
+                private(during),
+                "{args:?}: root was {during:o} when created"
+            );
+        } else {
+            assert_eq!(during, after, "{args:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_directory_never_opens_to_its_starting_group() {
+    let Some(group) = other_group() else {
+        eprintln!("skipped: this process has no supplementary group");
+        return;
+    };
+    for args in [
+        &["rsync", "-rg", "src/", "shared/dst/"][..],
+        &["rsync", "-a", "src/", "shared/dst/"][..],
+        // An exact target is created with the rest, not before the scan.
+        &["rsync", "-rg", "src/", "shared/dst"][..],
+    ] {
+        // The destination parent is setgid with another group. `sub` has
+        // the root's source group, `other` the parent's group, so each one
+        // starts with a group other than its own at some point.
+        let t = Tmp::new();
+        source_tree(&t, 0o755, 0o751);
+        write(&t.path("src/other/file"), b"other file");
+        std::os::unix::fs::chown(t.path("src/other"), None, Some(group)).unwrap();
+        fs::set_permissions(t.path("src/other"), fs::Permissions::from_mode(0o751)).unwrap();
+        fs::create_dir(t.path("shared")).unwrap();
+        std::os::unix::fs::chown(t.path("shared"), None, Some(group)).unwrap();
+        fs::set_permissions(t.path("shared"), fs::Permissions::from_mode(0o2775)).unwrap();
+        let root_gid = fs::metadata(t.path("src")).unwrap().gid();
+        for (suffix, path, final_gid) in [
+            ("/dst/sub", "shared/dst/sub", root_gid),
+            ("/dst/other", "shared/dst/other", group),
+            ("shared/dst", "shared/dst", root_gid),
+        ] {
+            let _ = fs::remove_dir_all(t.path("shared/dst"));
+            let mut command = syq_command(args);
+            command.current_dir(&t.0);
+            let ((gid, during, listed), output) =
+                observe_at_creation(&t, command, suffix, || state(&t.path(path)));
+            assert_output_ok(&output);
+            assert_eq!(listed, 0, "{args:?}: {path}");
+            let after = mode(&t.path(path));
+            assert_eq!(fs::metadata(t.path(path)).unwrap().gid(), final_gid);
+            assert_eq!(
+                after & 0o777,
+                if path == "shared/dst" { 0o755 } else { 0o751 }
+            );
+            assert!(
+                private(during) || (gid == final_gid && within(during, after)),
+                "{args:?}: {path} was {during:o} with group {gid} when created"
+            );
+        }
+        assert_eq!(read(&t.path("shared/dst/other/file")), b"other file");
+    }
+}
+
+#[test]
+fn an_existing_directory_is_narrowed_before_anything_is_created_in_it() {
+    let t = Tmp::new();
+    write(&t.path("src/wide/inner/file"), b"inner");
+    fs::set_permissions(t.path("src/wide"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir_all(t.path("dst/wide")).unwrap();
+    fs::set_permissions(t.path("dst/wide"), fs::Permissions::from_mode(0o777)).unwrap();
+    let mut command = syq_command(&["rsync", "-rp", "src/", "dst/"]);
+    command.current_dir(&t.0);
+    let (during, output) =
+        observe_at_creation(&t, command, "/wide/inner", || mode(&t.path("dst/wide")));
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/wide/inner/file")), b"inner");
+    assert_eq!(mode(&t.path("dst/wide")), 0o700);
+    assert_eq!(during, 0o700, "{during:o} when its first entry was created");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_existing_directory_takes_its_group_before_anything_is_created_in_it() {
+    let Some(group) = other_group() else {
+        eprintln!("skipped: this process has no supplementary group");
+        return;
+    };
+    let t = Tmp::new();
+    write(&t.path("src/wide/inner/file"), b"inner");
+    fs::create_dir_all(t.path("dst/wide")).unwrap();
+    std::os::unix::fs::chown(t.path("dst/wide"), None, Some(group)).unwrap();
+    fs::set_permissions(t.path("dst/wide"), fs::Permissions::from_mode(0o750)).unwrap();
+    let source_gid = fs::metadata(t.path("src/wide")).unwrap().gid();
+    let mut command = syq_command(&["rsync", "-rg", "src/", "dst/"]);
+    command.current_dir(&t.0);
+    let (during, output) = observe_at_creation(&t, command, "/wide/inner", || {
+        fs::metadata(t.path("dst/wide")).unwrap().gid()
+    });
+    assert_output_ok(&output);
+    assert_eq!(fs::metadata(t.path("dst/wide")).unwrap().gid(), source_gid);
+    assert_eq!(during, source_gid, "group when its first entry was created");
 }
 
 #[cfg(target_os = "linux")]

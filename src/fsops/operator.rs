@@ -79,6 +79,11 @@ impl OperatorDirectorySelection {
                         &component,
                         component_mode,
                     ) {
+                        Ok(()) if final_component => {
+                            apply::hold_after_directory_creation_for_test(Path::new(
+                                OsStr::from_bytes(&self.path),
+                            ))?;
+                        }
                         Ok(()) => {}
                         Err(error)
                             if error.kind() == io::ErrorKind::AlreadyExists
