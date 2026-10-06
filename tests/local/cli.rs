@@ -1101,6 +1101,73 @@ fn managed_descriptor_upload_requires_commit() {
 }
 
 #[test]
+fn stream_directory_permission_mode_respects_placement_and_dry_run() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for mode in [0o500, 0o600] {
+        for dry_run in [false, true] {
+            for widen in [false, true] {
+                for placement in ["--as", "--as-new", "--as-existing"] {
+                    for exists in [false, true] {
+                        let t = Tmp::new();
+                        write(&t.path("payload"), b"stream replacement");
+                        fs::create_dir(t.path("dst")).unwrap();
+                        if exists {
+                            write(&t.path("dst/file"), b"sentinel");
+                        }
+                        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(mode))
+                            .unwrap();
+                        let before = fs::metadata(t.path("dst")).unwrap();
+                        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                        command
+                            .args(["cp", "--src-fd", "0", placement])
+                            .arg(t.path("dst/file"))
+                            .stdin(File::open(t.path("payload")).unwrap())
+                            .arg("-q");
+                        if widen {
+                            command.arg("--temporarily-widen-dir-permissions");
+                        }
+                        if dry_run {
+                            command.arg("--dry-run");
+                        }
+                        let output = command.output().unwrap();
+                        let after = fs::metadata(t.path("dst")).unwrap();
+                        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                        let placement_ok = match placement {
+                            "--as-new" => !exists,
+                            "--as-existing" => exists,
+                            _ => true,
+                        };
+                        let succeeds = placement_ok && (widen || (dry_run && mode == 0o500));
+                        assert_eq!(output.status.success(), succeeds, "{mode:o} dry={dry_run} widen={widen} {placement} exists={exists}: {output:?}");
+                        assert_eq!(after.mode() & 0o7777, mode);
+                        if !widen {
+                            assert_eq!(
+                                (before.ctime(), before.ctime_nsec()),
+                                (after.ctime(), after.ctime_nsec())
+                            );
+                        }
+                        if succeeds && !dry_run {
+                            assert_eq!(read(&t.path("dst/file")), b"stream replacement");
+                        } else if exists {
+                            assert_eq!(read(&t.path("dst/file")), b"sentinel");
+                        } else {
+                            assert!(!t.path("dst/file").exists());
+                        }
+                        assert_eq!(
+                            fs::read_dir(t.path("dst")).unwrap().count(),
+                            usize::from(exists || (succeeds && !dry_run))
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn stream_placement_and_source_roots() {
     let t = Tmp::new();
     write(&t.path("payload"), b"stream");

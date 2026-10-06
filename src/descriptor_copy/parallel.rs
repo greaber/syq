@@ -52,20 +52,23 @@ fn prepare(
     // create a container or a staged destination. Reuse the inspection path.
     let inspect_only = args.dry_run || controls.report.skipped();
     let (size, ticket, source_meta) = match conn::ok(
-        session.call(Request::DescriptorCopy(Operation::Open {
-            entry: entry.id,
-            dry_run: inspect_only,
-            only_new: args.ignore_existing,
-            only_existing: args.existing,
-            path: plan.location.as_ref().unwrap().path.clone(),
-            write: plan.source.is_some(),
-            follow: plan.follow,
-            root: plan.root.clone(),
-            placement: plan.placement.clone(),
-            settings: controls.settings,
-            metadata: controls.metadata,
-            source_meta: input_meta,
-        }))?,
+        session.call(Request::DescriptorCopy(
+            Operation::Open {
+                entry: entry.id,
+                dry_run: inspect_only,
+                only_new: args.ignore_existing,
+                only_existing: args.existing,
+                path: plan.location.as_ref().unwrap().path.clone(),
+                write: plan.source.is_some(),
+                follow: plan.follow,
+                root: plan.root.clone(),
+                placement: plan.placement.clone(),
+                settings: controls.settings,
+                metadata: controls.metadata,
+                source_meta: input_meta,
+            }
+            .with_directory_access(args.temporarily_widen_dir_permissions && plan.source.is_some()),
+        ))?,
         "open stream",
     )? {
         Response::DescriptorOpened {

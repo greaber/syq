@@ -98,6 +98,58 @@ pub(crate) enum Operation {
     Abort {
         entry: u64,
     },
+    // Append: keep the released Open encoding unchanged.
+    OpenWithDirectoryAccess {
+        entry: u64,
+        dry_run: bool,
+        only_new: bool,
+        only_existing: bool,
+        path: Vec<u8>,
+        write: bool,
+        follow: bool,
+        root: Option<Vec<u8>>,
+        placement: StreamPlacement,
+        settings: Settings,
+        metadata: metadata::Policy,
+        source_meta: Option<crate::proto::Meta>,
+    },
+}
+impl Operation {
+    fn with_directory_access(self, enabled: bool) -> Self {
+        if !enabled {
+            return self;
+        }
+        match self {
+            Self::Open {
+                entry,
+                dry_run,
+                only_new,
+                only_existing,
+                path,
+                write,
+                follow,
+                root,
+                placement,
+                settings,
+                metadata,
+                source_meta,
+            } => Self::OpenWithDirectoryAccess {
+                entry,
+                dry_run,
+                only_new,
+                only_existing,
+                path,
+                write,
+                follow,
+                root,
+                placement,
+                settings,
+                metadata,
+                source_meta,
+            },
+            other => other,
+        }
+    }
 }
 pub(crate) use file::{resolve_source, FileWorker, Session};
 
@@ -148,4 +200,29 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     // flags. This CLI entry point exits after endpoint cleanup.
     runtime.shutdown_background();
     result.map(|()| 0)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn existing_descriptor_open_wire_bytes_remain_unchanged() {
+        // Captured with the unchanged Open, Settings, StreamPlacement and
+        // Policy definitions at 75fdc4c8, before OpenWithDirectoryAccess.
+        const BEFORE: &[u8] = &[
+            0, 130, 1, 1, 0, 1, 8, 100, 115, 116, 47, 102, 105, 108, 101, 1, 1, 1, 4, 114, 111,
+            111, 116, 1, 4, 102, 105, 108, 101, 2, 128, 128, 4, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0,
+        ];
+        let operation: Operation = postcard::from_bytes(BEFORE).unwrap();
+        assert!(matches!(&operation, Operation::Open {
+            entry: 130, dry_run: true, only_new: false, only_existing: true,
+            path, write: true, follow: true, root: Some(root),
+            placement: StreamPlacement { name: Some(name), existence: crate::cli::Existence::Existing },
+            settings: Settings { request_size: 65536, algorithm: crate::hashing::HashAlgorithm::Sha256, verify: true },
+            metadata: metadata::Policy { preserve: 3, if_exists: Some(crate::cli::IfExists::Error), restore_named_mtime: true, skip_newer: false, specials: false, overrides: None },
+            source_meta: None,
+        } if path == b"dst/file" && root == b"root" && name == b"file"));
+        assert_eq!(postcard::to_allocvec(&operation).unwrap(), BEFORE);
+    }
 }

@@ -2027,6 +2027,7 @@ fn parse_descriptor_copy(
         if !matches!(
             id.as_str(),
             "src_fd"
+                | "temporarily_widen_dir_permissions"
                 | "if_exists"
                 | "copy_metadata"
                 | "dry_run"

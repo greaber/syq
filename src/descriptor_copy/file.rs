@@ -15,7 +15,89 @@ use std::{
 
 #[derive(Default)]
 pub(crate) struct Session {
+    // Drop staged files before the last directory lease restores permissions.
     entries: std::collections::HashMap<u64, FileSession>,
+    permissions: std::collections::HashMap<(u64, u64), DirectoryLease>,
+}
+struct DirectoryLease {
+    directory: File,
+    original_mode: Option<u32>,
+    users: usize,
+}
+impl DirectoryLease {
+    fn restore(&mut self) -> Result<()> {
+        if let Some(mode) = self.original_mode {
+            crate::fsops::set_mode_handle(&self.directory, mode)?;
+            self.original_mode = None;
+        }
+        Ok(())
+    }
+}
+impl Drop for DirectoryLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            crate::output::diagnostic!("syq: restore stream directory permissions: {error:#}");
+        }
+    }
+}
+struct DirectoryAccess<'a> {
+    enabled: bool,
+    permissions: &'a mut std::collections::HashMap<(u64, u64), DirectoryLease>,
+    held: &'a mut Vec<(u64, u64)>,
+}
+impl DirectoryAccess<'_> {
+    fn acquire(&mut self, directory: &File) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let metadata = directory.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        if self.held.contains(&identity) {
+            return Ok(());
+        }
+        self.held.try_reserve(1)?;
+        // Consult existing leases before examining mode: another entry may
+        // already have added the permissions this entry will rely on.
+        if let Some(lease) = self.permissions.get_mut(&identity) {
+            lease.users += 1;
+        } else {
+            let uid = unsafe { libc::geteuid() };
+            if uid == 0 || metadata.uid() != uid || metadata.mode() & 0o700 == 0o700 {
+                return Ok(());
+            }
+            anyhow::ensure!(metadata.is_dir(), "stream access requires a directory");
+            self.permissions.try_reserve(1)?;
+            let directory = directory.try_clone()?;
+            crate::fsops::set_mode_handle(&directory, metadata.mode() | 0o700)?;
+            self.permissions.insert(
+                identity,
+                DirectoryLease {
+                    directory,
+                    original_mode: Some(metadata.mode() & 0o7777),
+                    users: 1,
+                },
+            );
+        }
+        self.held.push(identity);
+        Ok(())
+    }
+    fn release(&mut self) -> Result<()> {
+        let mut failure = None;
+        for identity in self.held.drain(..).rev() {
+            let lease = self
+                .permissions
+                .get_mut(&identity)
+                .expect("owned directory lease");
+            lease.users -= 1;
+            if lease.users == 0 {
+                let mut lease = self.permissions.remove(&identity).unwrap();
+                if let Err(error) = lease.restore() {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 impl Session {
     pub(crate) fn handle(
@@ -24,7 +106,7 @@ impl Session {
         descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
     ) -> Result<Response> {
         let entry = match operation {
-            Operation::Open { entry, .. } => {
+            Operation::Open { entry, .. } | Operation::OpenWithDirectoryAccess { entry, .. } => {
                 anyhow::ensure!(
                     !slot.entries.contains_key(entry),
                     "descriptor entry already open"
@@ -34,11 +116,30 @@ impl Session {
             Operation::Finish { entry, .. } | Operation::Abort { entry } => *entry,
         };
         let mut file = slot.entries.remove(&entry);
-        let result = FileSession::handle(&mut file, operation, descriptors);
-        if let Some(file) = file {
+        let mut held = file
+            .as_mut()
+            .map(|file| std::mem::take(&mut file.access))
+            .unwrap_or_default();
+        let mut access = DirectoryAccess {
+            enabled: matches!(operation, Operation::OpenWithDirectoryAccess { .. }),
+            permissions: &mut slot.permissions,
+            held: &mut held,
+        };
+        let result = FileSession::handle(&mut file, operation, descriptors, &mut access);
+        if let Some(mut file) = file {
+            file.access = held;
             slot.entries.insert(entry, file);
+            result
+        } else {
+            // Finish/Abort/error already dropped staging and registration.
+            match (result, access.release()) {
+                (Err(error), Err(restore)) => {
+                    Err(error.context(format!("restore stream directory permissions: {restore:#}")))
+                }
+                (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+                (Ok(response), Ok(())) => Ok(response),
+            }
         }
-        result
     }
 }
 
@@ -57,6 +158,7 @@ struct FileSession {
     original: Metadata,
     destination: Option<Destination>,
     registration: Option<Registration>,
+    access: Vec<(u64, u64)>,
 }
 struct Destination {
     root: Root,
@@ -116,6 +218,7 @@ fn resolve_destination(
     follow: bool,
     placement: &StreamPlacement,
     create_container: bool,
+    access: &mut DirectoryAccess<'_>,
 ) -> Result<PinnedPath> {
     let path = crate::fsops::resolve(path);
     let policy = if follow {
@@ -135,7 +238,46 @@ fn resolve_destination(
         },
         true,
         &mut Vec::new(),
-    )?;
+    );
+    let selected = match selected {
+        Err(error)
+            if access.enabled
+                && placement.name.is_none()
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+        {
+            let parent = path
+                .parent()
+                .context("stream destination requires a parent")?;
+            let name = path
+                .file_name()
+                .context("stream destination requires a file name")?;
+            let PinnedPath::Directory(parent) = OperatorResolver::resolve_process(
+                parent.as_os_str().as_bytes(),
+                policy,
+                OperatorFinalComponent::Directory,
+                false,
+                &mut Vec::new(),
+            )?
+            else {
+                bail!("stream destination parent is not a directory")
+            };
+            let parent = parent.into_parts().0;
+            access.acquire(&parent)?;
+            OperatorResolver::beneath(&parent, false, policy)?.resolve(
+                name.as_bytes(),
+                OperatorFinalComponent::Entry {
+                    follow_symlink: false,
+                },
+                true,
+                &mut Vec::new(),
+            )?
+        }
+        result => result?,
+    };
     let exists = !matches!(&selected, PinnedPath::Missing(_));
     use crate::cli::Existence;
     if (placement.existence == Existence::New && exists)
@@ -161,6 +303,7 @@ fn resolve_destination(
                 return Ok(PinnedPath::Missing(missing));
             }
             let (parent, components) = missing.into_parts();
+            access.acquire(&parent)?;
             let root = Root::from_directory(parent)?;
             let path = RelativePath::new(&components.into_iter().collect::<Vec<_>>().join(&b'/'))?;
             root.create_missing_parents(&path, 0o777)?;
@@ -169,6 +312,7 @@ fn resolve_destination(
         }
         _ => bail!("--into destination must be a directory"),
     };
+    access.acquire(&directory)?;
     OperatorResolver::beneath(&directory, true, policy)?.resolve(
         name,
         OperatorFinalComponent::Entry {
@@ -185,6 +329,7 @@ impl FileSession {
         write: bool,
         metadata: super::metadata::Policy,
         source_meta: Option<crate::proto::Meta>,
+        access: &mut DirectoryAccess<'_>,
     ) -> Result<Self> {
         let existed = !matches!(&selected, PinnedPath::Missing(_));
         let new_mode =
@@ -196,6 +341,7 @@ impl FileSession {
                         bail!("stream destination must be a regular file or an absent path");
                     }
                     let (parent, name, meta, _) = leaf.into_parts();
+                    access.acquire(&parent)?;
                     (
                         Root::from_directory(parent)?,
                         RelativePath::new(name.to_bytes())?,
@@ -208,6 +354,7 @@ impl FileSession {
                 }
                 PinnedPath::Missing(missing) => {
                     let (parent, components) = missing.into_parts();
+                    access.acquire(&parent)?;
                     let path = components.into_iter().collect::<Vec<_>>().join(&b'/');
                     (
                         Root::from_directory(parent)?,
@@ -278,6 +425,7 @@ impl FileSession {
             file,
             destination,
             registration: None,
+            access: Vec::new(),
         })
     }
     fn unchanged(&self) -> Result<()> {
@@ -296,6 +444,7 @@ impl FileSession {
         slot: &mut Option<Self>,
         operation: &Operation,
         descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
+        access: &mut DirectoryAccess<'_>,
     ) -> Result<Response> {
         let result = (|| match operation {
             Operation::Open {
@@ -311,7 +460,25 @@ impl FileSession {
                 settings,
                 metadata,
                 source_meta,
+            }
+            | Operation::OpenWithDirectoryAccess {
+                entry: _,
+                dry_run,
+                only_new,
+                only_existing,
+                path,
+                write,
+                follow,
+                root,
+                placement,
+                settings,
+                metadata,
+                source_meta,
             } => {
+                anyhow::ensure!(
+                    !access.enabled || *write,
+                    "directory access applies only to stream destinations"
+                );
                 anyhow::ensure!(slot.is_none(), "descriptor stream already open");
                 anyhow::ensure!(
                     (512..=64 << 20).contains(&settings.request_size),
@@ -326,7 +493,7 @@ impl FileSession {
                         root.is_none(),
                         "source root does not apply to a destination"
                     );
-                    resolve_destination(path, *follow, placement, !check_only)?
+                    resolve_destination(path, *follow, placement, !check_only, access)?
                 } else {
                     resolve_source(path, root.as_deref(), *follow)?
                 };
@@ -386,9 +553,10 @@ impl FileSession {
                     && placement.name.is_some()
                     && matches!(selected, PinnedPath::Missing(_))
                 {
-                    selected = resolve_destination(path, *follow, placement, true)?;
+                    selected = resolve_destination(path, *follow, placement, true, access)?;
                 }
-                let mut stream = Self::open(selected, *write, *metadata, source_meta.clone())?;
+                let mut stream =
+                    Self::open(selected, *write, *metadata, source_meta.clone(), access)?;
                 let size = (!*write).then_some(stream.original.len());
                 let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
                 stream.registration = Some(Registration {
@@ -606,6 +774,157 @@ impl FileWorker {
 mod tests {
     use super::*;
     use crate::{descriptor_broker::DescriptorSessionSlot, proto::Request};
+
+    fn access_open(entry: u64, path: &std::path::Path) -> Operation {
+        Operation::Open {
+            entry,
+            dry_run: false,
+            only_new: false,
+            only_existing: false,
+            path: path.as_os_str().as_bytes().to_vec(),
+            write: true,
+            follow: false,
+            root: None,
+            placement: StreamPlacement::default(),
+            settings: Settings::default(),
+            metadata: Default::default(),
+            source_meta: None,
+        }
+        .with_directory_access(true)
+    }
+
+    #[test]
+    fn shared_directory_access_outlasts_each_stream_and_restores_after_cleanup() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        for mode in [0o500, 0o600] {
+            for last in ["finish", "abort", "error", "drop"] {
+                let temporary = crate::test_support::tempdir().unwrap();
+                let parent = temporary.path().join("dst");
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::set_permissions(&parent, Permissions::from_mode(mode)).unwrap();
+                let descriptors = DescriptorSessionSlot::default();
+                let mut session = Session::default();
+                for entry in [1, 2] {
+                    let Response::DescriptorOpened { ticket, .. } = Session::handle(
+                        &mut session,
+                        &access_open(entry, &parent.join(entry.to_string())),
+                        &descriptors,
+                    )
+                    .unwrap() else {
+                        panic!("stream not opened")
+                    };
+                    descriptors
+                        .acquire(&ticket)
+                        .unwrap()
+                        .write_all_at(b"new", 0)
+                        .unwrap();
+                }
+                assert_eq!(session.permissions.len(), 1);
+                assert_eq!(session.permissions.values().next().unwrap().users, 2);
+                Session::handle(
+                    &mut session,
+                    &Operation::Finish { entry: 1, size: 3 },
+                    &descriptors,
+                )
+                .unwrap();
+                assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o7777, 0o700);
+                match last {
+                    "finish" => {
+                        Session::handle(
+                            &mut session,
+                            &Operation::Finish { entry: 2, size: 3 },
+                            &descriptors,
+                        )
+                        .unwrap();
+                    }
+                    "abort" => {
+                        Session::handle(&mut session, &Operation::Abort { entry: 2 }, &descriptors)
+                            .unwrap();
+                    }
+                    "error" => {
+                        assert!(Session::handle(
+                            &mut session,
+                            &Operation::Finish { entry: 2, size: 9 },
+                            &descriptors
+                        )
+                        .is_err());
+                    }
+                    "drop" => {}
+                    _ => unreachable!(),
+                }
+                drop(session);
+                let after = std::fs::metadata(&parent).unwrap();
+                std::fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
+                assert_eq!(after.mode() & 0o7777, mode, "{last}");
+                assert_eq!(std::fs::read(parent.join("1")).unwrap(), b"new");
+                assert_eq!(parent.join("2").exists(), last == "finish");
+                assert_eq!(
+                    std::fs::read_dir(&parent).unwrap().count(),
+                    if last == "finish" { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_directory_access_restores_after_inspection_and_precondition_errors() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let parent = temporary.path().join("dst");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("file"), b"old").unwrap();
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o600)).unwrap();
+        let descriptors = DescriptorSessionSlot::default();
+        let mut session = Session::default();
+        for (dry_run, only_new, existence) in [
+            (true, false, crate::cli::Existence::Any),
+            (false, true, crate::cli::Existence::Any),
+            (false, false, crate::cli::Existence::New),
+        ] {
+            let mut operation = access_open(1, &parent.join("file"));
+            let Operation::OpenWithDirectoryAccess {
+                dry_run: dry,
+                only_new: new,
+                placement,
+                ..
+            } = &mut operation
+            else {
+                unreachable!()
+            };
+            *dry = dry_run;
+            *new = only_new;
+            placement.existence = existence;
+            let result = Session::handle(&mut session, &operation, &descriptors);
+            assert_eq!(
+                result.is_err(),
+                existence == crate::cli::Existence::New,
+                "{result:?}"
+            );
+            assert!(session.entries.is_empty());
+            assert!(session.permissions.is_empty());
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o7777, 0o600);
+        }
+        // An --into selection must use the same permission leases.
+        let mut operation = access_open(1, &parent);
+        let Operation::OpenWithDirectoryAccess {
+            placement, dry_run, ..
+        } = &mut operation
+        else {
+            unreachable!()
+        };
+        placement.name = Some(b"file".to_vec());
+        *dry_run = true;
+        Session::handle(&mut session, &operation, &descriptors).unwrap();
+        let after = std::fs::metadata(&parent).unwrap();
+        std::fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(after.mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(parent.join("file")).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+    }
 
     #[test]
     fn parallel_workers_are_confined_and_publication_waits_for_finish() {
