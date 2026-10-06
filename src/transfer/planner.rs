@@ -1663,7 +1663,7 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
-            if opts.widen_directory_permissions
+            if opts.may_widen_directory_permissions()
                 && stats
                     .iter()
                     .flatten()
@@ -4136,7 +4136,7 @@ impl Planner<'_> {
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.widen_directory_permissions {
+        if !self.opts.may_widen_directory_permissions() {
             return Ok(());
         }
         self.assert_mutation_root()?;

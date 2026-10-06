@@ -428,7 +428,8 @@ copying permission metadata. The requested final permissions still apply.
 permission to existing directories being copied into, when the receiving user owns them.
 This permission mode also applies during safety checks and dry runs. A dry run
 may temporarily widen directories so it can inspect them, but does not copy or
-remove data or apply requested final metadata. Syq restores permissions after
+remove data or apply requested final metadata. Signed read-only receiver grants
+permit inspection only, so previews using those grants cannot widen directories. Syq restores permissions after
 each safety check and after copying, pruning or a dry run, including when the
 operation fails. During a real copy, explicitly requested final permissions
 take precedence. Other processes can see the

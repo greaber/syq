@@ -1838,8 +1838,16 @@ fn copy_error_message(error: &anyhow::Error, may_widen: bool) -> String {
 }
 
 impl Opts {
+    fn may_widen_directory_permissions(&self) -> bool {
+        // Existing signed dry-run grants authorize observations only. Do not
+        // turn an otherwise valid preview into an unauthorized chmod attempt.
+        self.widen_directory_permissions && !(self.dry_run && self.restricted_receiver)
+    }
+
     fn may_suggest_directory_access(&self) -> bool {
-        !self.widen_directory_permissions && !self.preserve_existing_directory_metadata
+        !self.widen_directory_permissions
+            && !self.preserve_existing_directory_metadata
+            && !(self.dry_run && self.restricted_receiver)
     }
 
     fn wire_error_message(&self, error: &WireError) -> String {
@@ -2930,7 +2938,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 &mut *dst_ctl,
                 &operator_dst_root,
                 opts.operator_symlink_policy,
-                opts.widen_directory_permissions,
+                opts.may_widen_directory_permissions(),
             )?
         };
         // Rsync retains its destination-directory compatibility rule. Native
@@ -3344,7 +3352,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
-                opts.widen_directory_permissions,
+                opts.may_widen_directory_permissions(),
             )?
         };
         if relations.len() != source_checks.len() {
@@ -3467,7 +3475,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Selection already inspected the container. Carry its identity into
     // planning, so file-only copies can request access without another lookup
     // on the ordinary writable-directory path.
-    let container_access = if opts.widen_directory_permissions {
+    let container_access = if opts.may_widen_directory_permissions() {
         if let Some(selection) = &directory_selection {
             selection.needs_owner_access.then(|| {
                 (
