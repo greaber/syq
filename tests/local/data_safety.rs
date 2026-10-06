@@ -1191,3 +1191,38 @@ fn destination_widening_does_not_change_source_permissions() {
         assert!(!t.path("dst/file").exists());
     }
 }
+
+#[test]
+fn dry_run_compares_requested_modes_with_original_directory_permissions() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for source_mode in [0o500, 0o700] {
+        let t = Tmp::new();
+        fs::create_dir(t.path("src")).unwrap();
+        fs::create_dir(t.path("dst")).unwrap();
+        for (path, mode) in [("src", source_mode), ("dst", 0o500)] {
+            timestamp(&t.path(path), 1_700_000_000, 0);
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let out = native_syq(&[
+            "cp",
+            &t.s("src"),
+            "--as",
+            &t.s("dst"),
+            "--dry-run",
+            "-v",
+            "--temporarily-widen-dir-permissions",
+            "--copy-metadata=permissions",
+        ]);
+        assert_output_ok(&out);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).contains("requested directory metadata differs"),
+            source_mode != 0o500,
+            "{out:?}"
+        );
+        assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}

@@ -2843,6 +2843,19 @@ impl Planner<'_> {
     fn trace_dry_run_dirs(&mut self, planned: &[PlannedDir], dst_root: &[u8]) {
         let opts = self.opts;
         for (p, dst_rel, e, destination) in planned {
+            // Permission preparation is temporary, not a requested metadata
+            // change. Compare the requested mode with the original directory.
+            let original;
+            let destination = match (destination, self.directory_restorations.get(p)) {
+                (Some(entry), Some(saved)) if (entry.dev, entry.ino) == (saved.dev, saved.ino) => {
+                    original = Some(Entry {
+                        mode: (entry.mode & !0o7777) | saved.mode,
+                        ..entry.clone()
+                    });
+                    &original
+                }
+                _ => destination,
+            };
             let meta_flags = if destination.is_some() {
                 opts.matching_flags_for(dst_rel)
             } else {
