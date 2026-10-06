@@ -14,12 +14,17 @@
 //! device and inode, when the file it left behind differs only as the change
 //! itself implies: the same identity, mode, ownership and size, the link
 //! count lowered only by the links the change removed, and the modification
-//! time either unchanged or the one the change set. A pin then holds for a
-//! change time reached from it through recorded changes alone. Any other
-//! change, from outside this process or one that changed what a pin protects,
-//! breaks that chain, and the pin no longer holds. A recorded change never
-//! changes the mode, owner or group, so a mode chosen before it still matches
-//! the file after it.
+//! time either unchanged or the one the change set. Changes recorded one
+//! after another, each starting where the last ended, form a chain, kept as
+//! the span of change times from the first one's start to the last one's
+//! end. A pin holds while the change time it holds and the file's current
+//! one both lie in the file's chain. One system call can move the change
+//! time more than once, and a stat in between sees a time inside the span,
+//! which is also only this receiver's doing. Any other change, from outside
+//! this process or one that changed what a pin protects, is not recorded,
+//! so the next recorded change starts a new chain, and pins from before
+//! fail. A recorded change never changes the mode, owner or group, so a
+//! mode chosen before it still matches the file after it.
 //!
 //! A change is observed from a stat taken just before it to one taken just
 //! after it. Checks of the file wait meanwhile, and so do other recorded
@@ -28,34 +33,50 @@
 //! would have (rewriting contents of the same size before the times are set,
 //! or changing the mode and back) is taken for part of this change. It cannot
 //! alter a chosen mode, and reused contents are hashed again before use.
+//! Spans assume change times do not go back: should the clock be set back
+//! during a copy, a change from outside could land inside a recorded span.
 //!
 //! The record is per process: every connection of a restricted copy is
 //! served by the one receiver process that holds its grant, so changes made
-//! for one worker are recorded for checks made for another. It holds two
-//! change times per recorded change for at least `KEPT`, and only for files
-//! that had other names when changed under a pin.
+//! for one worker are recorded for checks made for another. It holds one
+//! span per file that had other names when changed under a pin, for at
+//! least `KEPT` after the span last grew.
 
 use super::RootMetadata;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Recorded change times are kept at least this long. A pin lasts from a
-/// request's authorization to its execution; one that outlives its record
-/// fails as if the file had changed, which is safe.
+/// Recorded spans are kept at least this long after they last grow. A pin
+/// lasts from a request's authorization to its execution; one that outlives
+/// its record fails as if the file had changed, which is safe.
 const KEPT: Duration = Duration::from_secs(10 * 60);
-/// The ledger is pruned of records older than `KEPT` once it holds this many,
+/// The ledger is pruned of spans older than `KEPT` once it holds this many,
 /// and again each time it has doubled since.
 const PRUNE_ABOVE: usize = 4096;
 
+type ChangeTime = (i64, u32);
+
+/// The change times a chain of recorded changes of one file spans, and
+/// when it last grew.
+struct Span {
+    first: ChangeTime,
+    last: ChangeTime,
+    grown: Instant,
+}
+
+impl Span {
+    fn holds(&self, time: ChangeTime) -> bool {
+        self.first <= time && time <= self.last
+    }
+}
+
 #[derive(Default)]
 struct Ledger {
-    /// Each recorded change time of a file, by device, inode and change
-    /// time: the chain of recorded changes it belongs to, and when it was
-    /// recorded.
-    chains: HashMap<(u64, u64, i64, u32), (u64, Instant)>,
-    next_chain: u64,
-    /// How many records the ledger may hold before it is pruned again.
+    /// The latest chain of recorded changes of each file, by device and
+    /// inode.
+    spans: HashMap<(u64, u64), Span>,
+    /// How many spans the ledger may hold before it is pruned again.
     prune_above: usize,
     /// Files with a change in progress.
     busy: HashSet<(u64, u64)>,
@@ -81,19 +102,16 @@ fn idle<'a>(
 /// Whether a pin of the file `dev`/`ino` at change time `pinned` still
 /// holds for the file found at change time `current`: it has not changed, or
 /// only through changes recorded here.
-pub(crate) fn pin_holds(dev: u64, ino: u64, pinned: (i64, u32), current: (i64, u32)) -> bool {
+pub(crate) fn pin_holds(dev: u64, ino: u64, pinned: ChangeTime, current: ChangeTime) -> bool {
     if pinned == current {
         return true;
     }
     let (ledger, changed) = ledger();
     let state = idle(ledger.lock().unwrap(), (dev, ino), changed);
-    let chain = |(ctime, nanoseconds): (i64, u32)| {
-        state
-            .chains
-            .get(&(dev, ino, ctime, nanoseconds))
-            .map(|(chain, _)| *chain)
-    };
-    matches!((chain(pinned), chain(current)), (Some(a), Some(b)) if a == b)
+    state
+        .spans
+        .get(&(dev, ino))
+        .is_some_and(|span| span.holds(pinned) && span.holds(current))
 }
 
 /// A change in progress of a file other names may share. Checks of the file,
@@ -133,26 +151,33 @@ impl OwnChange {
         let (ledger, _) = ledger();
         let mut state = ledger.lock().unwrap();
         let now = Instant::now();
-        if state.chains.len() >= state.prune_above.max(PRUNE_ABOVE) {
+        if state.spans.len() >= state.prune_above.max(PRUNE_ABOVE) {
             state
-                .chains
-                .retain(|_, (_, recorded)| now.duration_since(*recorded) < KEPT);
-            state.prune_above = 2 * state.chains.len();
+                .spans
+                .retain(|_, span| now.duration_since(span.grown) < KEPT);
+            state.prune_above = 2 * state.spans.len();
         }
-        let (dev, ino) = self.file;
-        let from = (dev, ino, before.ctime, before.ctime_nsec);
-        let chain = match state.chains.get(&from) {
-            Some(&(chain, _)) => chain,
-            None => {
-                let chain = state.next_chain;
-                state.next_chain += 1;
-                chain
+        let from = (before.ctime, before.ctime_nsec);
+        let to = (after.ctime, after.ctime_nsec);
+        match state.spans.get_mut(&self.file) {
+            // The change starts within the file's chain: it extends it.
+            Some(span) if span.holds(from) => {
+                span.last = span.last.max(to);
+                span.grown = now;
             }
-        };
-        state.chains.insert(from, (chain, now));
-        state
-            .chains
-            .insert((dev, ino, after.ctime, after.ctime_nsec), (chain, now));
+            // Something not recorded changed the file since: a new chain
+            // starts, and pins from the last no longer hold.
+            _ => {
+                state.spans.insert(
+                    self.file,
+                    Span {
+                        first: from.min(to),
+                        last: from.max(to),
+                        grown: now,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -219,91 +244,53 @@ mod tests {
         assert!(pin_holds(7, ino, (5, 0), (5, 0)));
         assert!(!pin_holds(7, ino, (5, 0), (6, 0)));
         // Keeping one name sets its time; replacing another removes a link.
-        change(
-            seen(ino, 3, 5),
-            RootMetadata {
-                mtime: 50,
-                ..seen(ino, 3, 6)
-            },
-            0,
-            Some(50),
-        );
-        change(
-            RootMetadata {
-                mtime: 50,
-                ..seen(ino, 3, 6)
-            },
-            RootMetadata {
-                mtime: 50,
-                ..seen(ino, 2, 7)
-            },
-            1,
-            None,
-        );
+        let kept = RootMetadata {
+            mtime: 50,
+            ..seen(ino, 3, 6)
+        };
+        change(seen(ino, 3, 5), kept, 0, Some(50));
+        let replaced = RootMetadata {
+            mtime: 50,
+            ..seen(ino, 2, 7)
+        };
+        change(kept, replaced, 1, None);
         assert!(pin_holds(7, ino, (5, 0), (7, 0)));
         assert!(pin_holds(7, ino, (6, 0), (7, 0)));
+        // A stat in the middle of a recorded change saw only its doing.
+        assert!(pin_holds(7, ino, (5, 0), (6, 500)));
+        assert!(pin_holds(7, ino, (6, 500), (7, 0)));
         // A change from outside breaks the chain, and a recorded change after
         // it starts a new one.
         change(seen(ino, 2, 8), seen(ino, 2, 9), 0, None);
         assert!(!pin_holds(7, ino, (5, 0), (9, 0)));
+        assert!(!pin_holds(7, ino, (7, 0), (9, 0)));
         assert!(pin_holds(7, ino, (8, 0), (9, 0)));
         // Other files are not affected.
-        assert!(!pin_holds(7, ino + 1, (5, 0), (7, 0)));
-        assert!(!pin_holds(8, ino, (5, 0), (7, 0)));
+        assert!(!pin_holds(7, ino + 1, (8, 0), (9, 0)));
+        assert!(!pin_holds(8, ino, (8, 0), (9, 0)));
     }
 
     #[test]
     fn a_change_that_did_more_than_itself_is_not_recorded() {
         let ino = 0x5157_0100;
         let before = seen(ino, 2, 10);
+        let after = seen(ino, 2, 11);
         for (case, after, links, mtime) in [
             (
                 "mode",
                 RootMetadata {
                     mode: 0o100600,
-                    ..seen(ino, 2, 11)
+                    ..after
                 },
                 0,
                 None,
             ),
-            (
-                "owner",
-                RootMetadata {
-                    uid: 9,
-                    ..seen(ino, 2, 11)
-                },
-                0,
-                None,
-            ),
-            (
-                "group",
-                RootMetadata {
-                    gid: 9,
-                    ..seen(ino, 2, 11)
-                },
-                0,
-                None,
-            ),
-            (
-                "size",
-                RootMetadata {
-                    len: 11,
-                    ..seen(ino, 2, 11)
-                },
-                0,
-                None,
-            ),
+            ("owner", RootMetadata { uid: 9, ..after }, 0, None),
+            ("group", RootMetadata { gid: 9, ..after }, 0, None),
+            ("size", RootMetadata { len: 11, ..after }, 0, None),
             ("links", seen(ino, 1, 11), 0, None),
             ("last link", seen(ino, 1, 11), 2, None),
-            (
-                "time",
-                RootMetadata {
-                    mtime: 70,
-                    ..seen(ino, 2, 11)
-                },
-                0,
-                Some(60),
-            ),
+            ("time", RootMetadata { mtime: 70, ..after }, 0, Some(60)),
             ("inode", seen(ino + 1, 2, 11), 0, None),
         ] {
             change(before, after, links, mtime);
