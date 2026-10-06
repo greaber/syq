@@ -1898,16 +1898,19 @@ fn files_from_empty_list_leaves_an_existing_destination_untouched() {
 }
 
 #[test]
-fn files_from_restores_unlisted_destination_root_permissions() {
-    // rsync's permission mode also applies to --files-from. The unlisted
-    // container gains temporary access, then recovers its own mode rather
-    // than adopting the source root's metadata.
+fn files_from_unwritable_destination_root_fails_and_is_left_alone() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // The destination container is absent from the file list, so rsync
+    // leaves its permissions alone even though listed directories can widen.
     let t = Tmp::new();
     write(&t.path("src/a"), b"a");
     fs::create_dir_all(t.path("dst")).unwrap();
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
     set_mtime(&t.path("dst"), 1_000);
     write(&t.path("list"), b"a\n");
+    let before = fs::metadata(t.path("dst")).unwrap();
     let preview = syq(&[
         "-a",
         "--dry-run",
@@ -1920,17 +1923,25 @@ fn files_from_restores_unlisted_destination_root_permissions() {
     assert!(preview.status.success(), "{}", stderr_of(&preview));
     assert_eq!(preview_metadata.mode() & 0o777, 0o500);
     assert_eq!(preview_metadata.mtime(), 1_000);
+    assert_eq!(
+        (preview_metadata.ctime(), preview_metadata.ctime_nsec()),
+        (before.ctime(), before.ctime_nsec())
+    );
     assert!(
         !t.path("dst/a").exists(),
         "the preview must not create files"
     );
 
     let out = syq(&["-a", "--files-from", &t.s("list"), &t.s("src"), &t.s("dst")]);
-    let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+    let after = fs::metadata(t.path("dst")).unwrap();
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(mode, 0o500, "the unlisted root keeps its mode");
-    assert_eq!(read(&t.path("dst/a")), b"a");
+    assert_eq!(out.status.code(), Some(23), "{}", stderr_of(&out));
+    assert_eq!(after.mode() & 0o777, 0o500);
+    assert_eq!(
+        (after.ctime(), after.ctime_nsec()),
+        (before.ctime(), before.ctime_nsec())
+    );
+    assert!(!t.path("dst/a").exists());
 }
 
 #[test]

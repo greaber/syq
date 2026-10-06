@@ -209,7 +209,7 @@ def direct():
                                                    "--no-tcp", "--if-exists=update", "--dry-run"]
                     if widen:
                         command.append("--temporarily-widen-dir-permissions")
-                    expected = 0 if mode == 0o500 else (23 if placement == "--into" else 1)
+                    expected = 0 if mode == 0o500 else 1
                     preview = run(command, data=data, expected=expected)
                     if mode == 0o600:
                         assert b"Permission denied" in preview.stderr, preview.stderr

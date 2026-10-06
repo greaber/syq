@@ -38,6 +38,13 @@ files use the source permission bits limited by the destination parent's default
 ACL, or by the receiving process's umask when that parent has no default ACL.
 Use `-p` to preserve source permissions and `-A` to preserve source ACLs.
 
+During a real copy, directories included in the source selection can temporarily
+receive owner access so syq can fill them. This includes implied parents of
+`--files-from` entries, but not an unlisted destination container. Copying a
+single file into an unwritable directory therefore fails. Dry runs leave
+directory permissions unchanged, and the destination root must already be
+searchable.
+
 Syq uses numeric IDs and keeps partial files a later copy can resume from (see
 [Resume an interrupted copy](reference.md#resume-an-interrupted-copy)), so
 `--numeric-ids` and `--partial` are accepted no-ops. `-P` enables progress. Compression is on by

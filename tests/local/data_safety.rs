@@ -1379,3 +1379,160 @@ fn directory_dry_run_adds_search_without_write_until_restoration() {
     assert_eq!(restored, 0o400);
     assert_eq!(read(&t.path("dst/file")), b"old");
 }
+
+// Observed with upstream rsync 3.2.7 and 3.5.1 as a non-root owner.
+#[test]
+fn rsync_single_file_does_not_widen_its_destination_container() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for mode in [0o100, 0o300, 0o500] {
+        for dry_run in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"new contents");
+            write(&t.path("dst/file"), b"old");
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(mode)).unwrap();
+            let before = fs::metadata(t.path("dst")).unwrap();
+            let src = t.s("src/file");
+            let dst = t.s("dst/");
+            let mut args = vec!["-a", &src, &dst];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = syq(&args);
+            let after = fs::metadata(t.path("dst")).unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            let writable = mode & 0o200 != 0;
+            assert_eq!(
+                out.status.code(),
+                Some(if dry_run || writable { 0 } else { 23 }),
+                "{mode:o}, dry={dry_run}: {out:?}"
+            );
+            assert_eq!(after.mode(), before.mode());
+            if dry_run || !writable {
+                assert_eq!(
+                    (after.ctime(), after.ctime_nsec()),
+                    (before.ctime(), before.ctime_nsec())
+                );
+            }
+            assert_eq!(
+                read(&t.path("dst/file")),
+                if dry_run || !writable {
+                    b"old".as_slice()
+                } else {
+                    b"new contents".as_slice()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn rsync_refuses_unsearchable_destination_roots_without_chmod() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for selection in ["single", "contents", "files-from"] {
+        for dry_run in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"new contents");
+            write(&t.path("dst/file"), b"old");
+            write(&t.path("list"), b"file\n");
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::metadata(t.path("dst")).unwrap();
+            let src = t.s(if selection == "single" {
+                "src/file"
+            } else {
+                "src/"
+            });
+            let dst = t.s("dst/");
+            let list = t.s("list");
+            let mut args = vec!["-a", &src, &dst];
+            if selection == "files-from" {
+                args.extend(["--files-from", &list]);
+            }
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = syq(&args);
+            let after = fs::metadata(t.path("dst")).unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!out.status.success(), "{selection}, dry={dry_run}: {out:?}");
+            assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+            assert_eq!(after.mode(), before.mode());
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec())
+            );
+            assert_eq!(read(&t.path("dst/file")), b"old");
+        }
+    }
+}
+
+#[test]
+fn rsync_widens_copied_directories_but_never_during_previews() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Both releases widen implied --files-from parents. With a read-only
+    // copied directory lacking search access, 3.5.1 also completes without
+    // 3.2.7's late cleanup error. Follow the current release for that case.
+    for selection in ["named", "files-from"] {
+        for mode in [0o400, 0o500] {
+            for preserve in [false, true] {
+                for dry_run in [false, true] {
+                    let t = Tmp::new();
+                    write(&t.path("src/sub/file"), b"new contents");
+                    write(&t.path("dst/sub/file"), b"old");
+                    write(&t.path("list"), b"sub/file\n");
+                    fs::set_permissions(t.path("src/sub"), fs::Permissions::from_mode(0o750))
+                        .unwrap();
+                    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(mode))
+                        .unwrap();
+                    let before = fs::metadata(t.path("dst/sub")).unwrap();
+                    let src = t.s(if selection == "named" {
+                        "src/sub"
+                    } else {
+                        "src/"
+                    });
+                    let dst = t.s("dst/");
+                    let list = t.s("list");
+                    let mut args = vec![if preserve { "-a" } else { "-r" }, &src, &dst];
+                    if selection == "files-from" {
+                        args.extend(["--files-from", &list]);
+                    }
+                    if dry_run {
+                        args.push("--dry-run");
+                    }
+                    let out = syq(&args);
+                    let after = fs::metadata(t.path("dst/sub")).unwrap();
+                    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    assert_eq!(
+                        out.status.success(),
+                        !dry_run || mode & 0o100 != 0,
+                        "{selection}, {mode:o}, preserve={preserve}, dry={dry_run}: {out:?}"
+                    );
+                    assert_eq!(
+                        after.mode() & 0o777,
+                        if preserve && !dry_run { 0o750 } else { mode }
+                    );
+                    if dry_run {
+                        assert_eq!(
+                            (after.ctime(), after.ctime_nsec()),
+                            (before.ctime(), before.ctime_nsec())
+                        );
+                    }
+                    assert_eq!(
+                        read(&t.path("dst/sub/file")),
+                        if dry_run {
+                            b"old".as_slice()
+                        } else {
+                            b"new contents".as_slice()
+                        }
+                    );
+                }
+            }
+        }
+    }
+}

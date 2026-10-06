@@ -437,7 +437,10 @@ dry run, including when the
 operation fails. During a real copy, explicitly requested final permissions
 take precedence. Other processes can see the temporary permissions, and an
 interruption, crash or forced termination can leave them in place.
-`syq rsync` enables temporary widening without this option. Root skips widening.
+`syq rsync` temporarily widens directories included in the copy, including
+implied `--files-from` parents. It leaves unlisted destination containers alone
+and does not widen directories during dry runs. See [rsync compatibility](rsync-compat.md).
+Root skips widening.
 
 New files use the source read, write, and execute permissions, limited by the destination umask.
 For example, a new script with mode `755` stays executable with umask `022`.
