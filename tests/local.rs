@@ -1007,6 +1007,9 @@ mod confinement;
 mod copy;
 #[path = "local/data_safety.rs"]
 mod data_safety;
+#[cfg(debug_assertions)]
+#[path = "local/directory_privacy.rs"]
+mod directory_privacy;
 #[path = "local/existing_policy.rs"]
 mod existing_policy;
 #[path = "local/fifo.rs"]

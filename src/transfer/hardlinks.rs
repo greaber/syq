@@ -475,8 +475,9 @@ impl Planner<'_> {
 
     fn hardlink_failure(&self, follower: &Follower, error: WireError) {
         self.progress.error(&format!(
-            "syq: hardlink {}: {error}",
-            display(&follower.rel)
+            "syq: hardlink {}: {}",
+            display(&follower.rel),
+            self.opts.wire_error_message(&error)
         ));
         if !self.opts.dry_run {
             self.emit_entry_failed(

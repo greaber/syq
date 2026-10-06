@@ -241,7 +241,9 @@ syq cp --prune --max-delete 100 --srcs-in build --into-existing deploy
 This makes the contents of `deploy` match `build`: it copies changes, then
 removes extras. Preview with `--dry-run -v` first. If more than 100 removals
 are planned, syq refuses all deletions. Scan or copy errors also prevent deletion.
-Ignored paths are kept.
+Ignored paths are kept. Use `--prune-before` instead of `--prune` to free space
+before copying. Source selection must finish first; a later copy failure does
+not restore removed extras. The same `--max-delete` limit applies.
 
 Placement determines where pruning happens. Compare:
 
@@ -325,10 +327,11 @@ untouched. Changing to `--if-exists=update` authorizes updates to all differing
 selected files; it does not preserve the original policy. Reusing matching parts
 follows the selected transfer strategy.
 
-A copy may temporarily make a newly created directory writable while filling it.
-After interruption, syq cannot distinguish that directory from a pre-existing
-writable directory. A retry treats it as an existing container, so its permissions
-and modification time may differ from an uninterrupted copy. Explicit
+A copy may temporarily make a newly created directory writable while filling it,
+or keep it open only to its owner until its copied ACL is applied. After
+interruption, syq cannot distinguish that directory from a pre-existing
+directory. A retry treats it as an existing container, so its permissions and
+modification time may differ from an uninterrupted copy. Explicit
 `--copy-metadata=permissions,mtime` makes those attributes match the source.
 
 Partial files may remain after a successful retry. To remove them:
@@ -405,8 +408,18 @@ Explicit mapping `metadata.mtime` also sets the requested destination time.
 S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 
-Existing files keep their destination permissions. New files use the
-source read, write, and execute permissions, limited by the destination umask.
+Existing files and directories keep their destination permissions unless you
+request permission or ACL metadata. Native `cp` does not automatically widen
+existing directory permissions to make copying or pruning succeed, even when
+copying permission metadata. The requested final permissions still apply.
+`--temporarily-widen-dir-permissions` allows adding owner read, write and search
+permission to existing directories being copied into, when the receiving user owns them.
+Syq restores only directories it actually widened, after copying and pruning;
+explicitly requested permissions take precedence. Other processes can see the
+temporary permissions, and a crash or forced termination can leave them in place.
+`syq rsync` enables temporary widening without this option. Root skips widening.
+
+New files use the source read, write, and execute permissions, limited by the destination umask.
 For example, a new script with mode `755` stays executable with umask `022`.
 
 To preserve source permissions and ownership as well:
@@ -414,6 +427,40 @@ To preserve source permissions and ownership as well:
 ```sh
 syq cp --copy-metadata=permissions,ownership project --into backup
 ```
+
+A directory receives its copied permissions and ACLs after its contents: a
+read-only directory could not take them, and adding entries changes its
+modification time anyway. Until then, syq limits who can enter or list it:
+
+- A new directory starts with the source's permissions, limited by the umask.
+  With `--copy-metadata=ownership`, it takes its copied owner and group before
+  syq copies files into it. If it could start out with another group, it is
+  open only to its owner until then.
+- A new directory whose ACL is still to be copied is open only to its owner.
+- When permissions or ownership are copied, the destination of `src/` or
+  `--srcs-in` is open only to its owner until it has its copied permissions,
+  owner and group, which it gets before syq copies files into it.
+- With `--copy-metadata=permissions`, an existing directory that allows more
+  than its source is restricted to the source's permissions before syq
+  creates anything in it; its owner keeps access until the copy finishes.
+  With `--copy-metadata=ownership`, it also takes its copied owner and group
+  then.
+- An S3 download creates a directory that has a directory marker open only to
+  its owner until the marker's metadata is applied.
+
+Some directories get their copied metadata only at the end, or are already
+open:
+
+- Anyone who opened an existing directory before syq restricted it can keep
+  listing the names syq creates in it.
+- With `--copy-metadata=acls` on macOS, a new directory keeps the entries it
+  inherits from its parent's ACL until its own ACL is copied.
+- In an S3 download with `--copy-metadata=permissions`, an existing directory
+  is restricted to its marker's permissions only at the end.
+- A receiver restricted by a [signed grant](security.md#destination-permissions)
+  applies a copied group to an existing directory only at the end. If the
+  grant keeps groups but not permissions, the same is true of a new
+  destination root.
 
 | Syq option | Corresponding rsync option |
 |---|---|

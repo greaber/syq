@@ -9,6 +9,8 @@
 //! unlinked as entries; neither is followed. FIFOs on platforms without O_PATH
 //! retain only their parent and observed identity, avoiding a stream reader.
 
+#[cfg(test)]
+use crate::deletion::workers::worker_loop;
 use crate::proto::{
     Kind, NativeRemoveDisposition, NativeRemoveErrorClass, NativeRemoveFailure, NativeRemoveKind,
     NativeRemoveOutcome, NativeRemoveSelection, OperatorSymlinkPolicy, PathBytes,
@@ -29,13 +31,12 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{mpsc, Condvar, Mutex};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
-const EVENT_BATCH: usize = 200;
-const EVENT_POLL: Duration = Duration::from_millis(100);
-const EVENT_FLUSH: Duration = Duration::from_millis(100);
-const ATTACHED_HEARTBEAT: Duration = Duration::from_secs(1);
 const RMDIR_RETRIES: usize = 3;
 // Share short sibling batches as copying does. Large files remain separate
 // jobs: their block reclamation can run outside the directory's inode lock.
@@ -80,11 +81,15 @@ enum PinnedParent {
 }
 
 impl PinnedParent {
-    fn as_raw_fd(&self) -> RawFd {
+    fn file(&self) -> &File {
         match self {
-            Self::File(file) => file.as_raw_fd(),
-            Self::Directory(job) => job.directory.as_raw_fd(),
+            Self::File(file) => file,
+            Self::Directory(job) => &job.directory,
         }
+    }
+    #[cfg(test)]
+    fn as_raw_fd(&self) -> RawFd {
+        self.file().as_raw_fd()
     }
 }
 
@@ -432,162 +437,15 @@ enum Task {
     Finish(Arc<DirectoryJob>),
 }
 
-struct Pool {
-    sender: Mutex<Option<mpsc::SyncSender<Task>>>,
-    pending: Mutex<usize>,
-    events: mpsc::Sender<Option<NativeRemoveOutcome>>,
-    dry_run: bool,
-    cancelled: AtomicBool,
-    limit: AtomicUsize,
-    active: AtomicUsize,
-    parked: Mutex<()>,
-    waiting: AtomicUsize,
-    wake: Condvar,
-}
+type Pool = crate::deletion::workers::Pool<Task>;
 
-impl Pool {
-    fn submit(self: &Arc<Self>, task: Task) {
-        *self.pending.lock().unwrap() += 1;
-        let queued = self
-            .sender
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|sender| sender.try_send(task));
-        match queued {
-            Some(Ok(())) => return,
-            Some(Err(mpsc::TrySendError::Full(task)))
-            | Some(Err(mpsc::TrySendError::Disconnected(task))) => {
-                process_task(self, task);
-            }
-            None => unreachable!("native removal submitted work after shutdown"),
-        }
-        self.task_done();
+impl crate::deletion::workers::Work for Task {
+    type Outcome = NativeRemoveOutcome;
+    fn run(self, pool: &Arc<Pool>) {
+        process_task(pool, self);
     }
-
-    fn task_done(&self) {
-        let finished = {
-            let mut pending = self.pending.lock().unwrap();
-            *pending -= 1;
-            *pending == 0
-        };
-        if finished {
-            // The coordinator can consume the last outcome before this task
-            // finishes. Wake it again so completion cannot wait for EVENT_POLL.
-            let _ = self.events.send(None);
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        *self.pending.lock().unwrap() == 0
-    }
-
-    fn close(&self) {
-        self.sender.lock().unwrap().take();
-        let _parked = self.parked.lock().unwrap();
-        self.wake.notify_all();
-    }
-
-    fn set_limit(&self, limit: usize) {
-        let _parked = self.parked.lock().unwrap();
-        self.limit.store(limit, Ordering::Relaxed);
-        self.wake.notify_all();
-    }
-
-    fn enter(&self) -> ActiveWorker<'_> {
-        if !self.try_enter() {
-            let parked = self.parked.lock().unwrap();
-            let _parked = self.wait_for_capacity(parked);
-        }
-        ActiveWorker(self)
-    }
-
-    fn try_enter(&self) -> bool {
-        let mut active = self.active.load(Ordering::SeqCst);
-        loop {
-            if active >= self.limit.load(Ordering::Relaxed) && !self.is_cancelled() {
-                return false;
-            }
-            match self.active.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(current) => active = current,
-            }
-        }
-    }
-
-    fn wait_for_capacity<'a>(
-        &self,
-        mut parked: std::sync::MutexGuard<'a, ()>,
-    ) -> std::sync::MutexGuard<'a, ()> {
-        // Register before checking capacity. Together with the sequentially
-        // consistent release/check in ActiveWorker::drop, this prevents a
-        // missed wakeup without locking on uncontended admission or release.
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-        while !self.try_enter() {
-            parked = self.wake.wait(parked).unwrap();
-        }
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
-        parked
-    }
-
-    /// A scan may keep executing inline work while the queue is full. Let
-    /// excess workers pause in that scan, retaining its existing state. Any
-    /// worker can resume when another releases capacity; worker IDs cannot
-    /// decide admission because a parked scan still needs to finish.
-    /// Call only while active and without a directory mutation permit.
-    fn retire_excess(&self) {
-        if self.active.load(Ordering::Relaxed) <= self.limit.load(Ordering::Relaxed) {
-            return;
-        }
-        let parked = self.parked.lock().unwrap();
-        if self.active.load(Ordering::Relaxed) > self.limit.load(Ordering::Relaxed)
-            && !self.is_cancelled()
-        {
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            let _parked = self.wait_for_capacity(parked);
-        }
-    }
-
-    fn backlogged(&self) -> bool {
-        let limit = self.limit.load(Ordering::Relaxed);
-        *self.pending.lock().unwrap() >= limit + limit.min(16)
-            && self.active.load(Ordering::Relaxed) <= limit
-    }
-
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        let _parked = self.parked.lock().unwrap();
-        self.wake.notify_all();
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    fn outcome(&self, outcome: NativeRemoveOutcome) {
-        if !self.is_cancelled() {
-            let _ = self.events.send(Some(outcome));
-        }
-    }
-}
-
-/// Capacity belongs to a worker only while it can make progress. In
-/// particular, waiting for an empty task queue must release it so a paused
-/// scan can resume and produce the remaining work.
-struct ActiveWorker<'a>(&'a Pool);
-
-impl Drop for ActiveWorker<'_> {
-    fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::SeqCst);
-        if self.0.waiting.load(Ordering::SeqCst) != 0 {
-            let _parked = self.0.parked.lock().unwrap();
-            self.0.wake.notify_one();
-        }
+    fn completed(outcome: &Self::Outcome) -> u64 {
+        u64::from(outcome.disposition == NativeRemoveDisposition::Removed)
     }
 }
 
@@ -639,19 +497,6 @@ fn removal_outcome(
         attempts,
         failure: None,
     }
-}
-
-fn emit_attached(
-    pool: &Pool,
-    batch: &mut Vec<NativeRemoveOutcome>,
-    sink: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
-) -> Result<()> {
-    let ready = std::mem::replace(batch, Vec::with_capacity(EVENT_BATCH));
-    if let Err(error) = sink(ready) {
-        pool.cancel();
-        return Err(error);
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -721,166 +566,39 @@ pub(crate) fn remove(
     }
     sink(selection_outcomes)?;
 
-    // Queue every resolved root before starting workers. Once workers run,
-    // only they may take the bounded-queue inline fallback; the coordinator
-    // remains available to flush results and detect connection failure.
-    let concurrency = crate::deletion::Concurrency::filesystem(workers);
-    let mut tuning = crate::deletion::Control::new(concurrency);
-    let queue_capacity = concurrency
-        .initial
-        .saturating_mul(4)
-        .max(resolved.len())
-        .max(1);
-    let (task_tx, task_rx) = mpsc::sync_channel(queue_capacity);
-    let (event_tx, event_rx) = mpsc::channel();
-    let pool = Arc::new(Pool {
-        sender: Mutex::new(Some(task_tx)),
-        pending: Mutex::new(0),
-        events: event_tx,
-        dry_run,
-        cancelled: AtomicBool::new(false),
-        limit: AtomicUsize::new(tuning.limit()),
-        active: AtomicUsize::new(0),
-        parked: Mutex::new(()),
-        waiting: AtomicUsize::new(0),
-        wake: Condvar::new(),
+    let tasks = resolved.into_iter().map(|selected| match selected {
+        ResolvedSelection::Missing => unreachable!(),
+        ResolvedSelection::Leaf(leaf) => Task::Leaf {
+            selector: leaf.selector,
+            name: leaf.name,
+            _object: leaf._object,
+            label: leaf.label,
+            parent: None,
+        },
+        ResolvedSelection::Directory(directory) => Task::Scan(Arc::new(DirectoryJob {
+            selector: directory.selector,
+            partials_only: directory.partials_only,
+            directory: directory.directory,
+            removal: directory
+                .remove_selected_directory
+                .then_some(directory.name)
+                .flatten(),
+            label: directory.label,
+            parent: None,
+            #[cfg(target_os = "linux")]
+            leaves: Arc::new(crate::rooted::directory_gate::Gate::new(4)),
+            remaining: AtomicUsize::new(1),
+            retries: AtomicUsize::new(0),
+            descendant_failed: AtomicBool::new(false),
+        })),
     });
-    for selected in resolved {
-        match selected {
-            ResolvedSelection::Missing => unreachable!(),
-            ResolvedSelection::Leaf(leaf) => pool.submit(Task::Leaf {
-                selector: leaf.selector,
-                name: leaf.name,
-                _object: leaf._object,
-                label: leaf.label,
-                parent: None,
-            }),
-            ResolvedSelection::Directory(directory) => {
-                pool.submit(Task::Scan(Arc::new(DirectoryJob {
-                    selector: directory.selector,
-                    partials_only: directory.partials_only,
-                    directory: directory.directory,
-                    removal: directory
-                        .remove_selected_directory
-                        .then_some(directory.name)
-                        .flatten(),
-                    label: directory.label,
-                    parent: None,
-                    #[cfg(target_os = "linux")]
-                    leaves: Arc::new(crate::rooted::directory_gate::Gate::new(4)),
-                    remaining: AtomicUsize::new(1),
-                    retries: AtomicUsize::new(0),
-                    descendant_failed: AtomicBool::new(false),
-                })));
-            }
-        }
-    }
 
-    let task_rx = Arc::new(Mutex::new(task_rx));
-    let mut threads = Vec::new();
-    let mut spawn_to = |limit: usize| {
-        while threads.len() < limit {
-            let pool = pool.clone();
-            let task_rx = task_rx.clone();
-            threads.push(std::thread::spawn(move || worker_loop(pool, task_rx)));
-        }
-    };
-    spawn_to(tuning.limit());
-    let mut sampled = Instant::now();
-    let mut completed = 0;
-
-    let mut batch = Vec::with_capacity(EVENT_BATCH);
-    let mut sink_error = None;
-    let mut last_emit = Instant::now();
-    while !pool.is_done() {
-        match event_rx.recv_timeout(EVENT_POLL) {
-            Ok(Some(event)) => {
-                if event.disposition == NativeRemoveDisposition::Removed {
-                    completed += 1;
-                }
-                if sink_error.is_none() {
-                    batch.push(event);
-                }
-            }
-            Ok(None) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        if !dry_run && !pool.is_cancelled() && sampled.elapsed() >= crate::deletion::SAMPLE {
-            let limit = tuning.observe(completed, sampled.elapsed(), pool.backlogged());
-            if limit != pool.limit.load(Ordering::Relaxed) {
-                pool.set_limit(limit);
-                spawn_to(limit);
-            }
-            sampled = Instant::now();
-            completed = 0;
-        }
-        if sink_error.is_none()
-            && (batch.len() >= EVENT_BATCH
-                || (!batch.is_empty() && last_emit.elapsed() >= EVENT_FLUSH)
-                || last_emit.elapsed() >= ATTACHED_HEARTBEAT)
-        {
-            if let Err(error) = emit_attached(&pool, &mut batch, sink) {
-                sink_error = Some(error);
-            } else {
-                last_emit = Instant::now();
-            }
-        }
-    }
-    for event in event_rx.try_iter().flatten() {
-        if sink_error.is_none() {
-            batch.push(event);
-            if batch.len() >= EVENT_BATCH {
-                if let Err(error) = emit_attached(&pool, &mut batch, sink) {
-                    sink_error = Some(error);
-                }
-            }
-        }
-    }
-    if !batch.is_empty() && sink_error.is_none() {
-        if let Err(error) = emit_attached(&pool, &mut batch, sink) {
-            sink_error = Some(error);
-        }
-    }
-    pool.close();
-    for thread in threads {
-        if thread.join().is_err() && sink_error.is_none() {
-            sink_error = Some(endpoint_failure(anyhow::anyhow!(
-                "native removal worker panicked"
-            )));
-        }
-    }
-    if let Some(error) = sink_error {
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn worker_loop(pool: Arc<Pool>, receiver: Arc<Mutex<mpsc::Receiver<Task>>>) {
-    loop {
-        let mut task = match receiver.lock().unwrap().recv() {
-            Ok(task) => task,
-            Err(_) => return,
-        };
-        let _active = pool.enter();
-        loop {
-            pool.retire_excess();
-            process_task(&pool, task);
-            pool.task_done();
-            // Keep admission across available work, but never while waiting
-            // on the queue: paused scans may be its only remaining producers.
-            let next = match receiver.try_lock() {
-                Ok(receiver) => receiver.try_recv(),
-                Err(std::sync::TryLockError::WouldBlock) => break,
-                Err(error) => panic!("removal receiver lock poisoned: {error}"),
-            };
-            match next {
-                Ok(next) => task = next,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
-    }
+    crate::deletion::workers::Executor::new(
+        crate::deletion::Concurrency::filesystem(workers),
+        dry_run,
+    )
+    .run(tasks, false, sink)
+    .map_err(endpoint_failure)
 }
 
 fn process_task(pool: &Arc<Pool>, task: Task) {
@@ -1282,8 +1000,9 @@ fn remove_pinned(name: &PinnedName, held_directory: Option<&File>) -> Result<Rem
 /// outcomes already arise from an unrelated process removing the entry, so
 /// the race is not serialized.
 fn unlink_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutcome> {
-    let current = match metadata_at_cstring(name.parent.as_raw_fd(), &name.name) {
-        Ok(identity) => identity,
+    let entry = crate::rooted::RemovalEntry::new(name.parent.file(), &name.name);
+    let current = match entry.metadata() {
+        Ok(metadata) => identity_from_root(metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(RemovePinnedOutcome::AlreadyAbsent)
         }
@@ -1292,8 +1011,8 @@ fn unlink_pinned(name: &PinnedName, directory: bool) -> Result<RemovePinnedOutco
     require_same_identity(name.identity, current, "removal target")?;
     #[cfg(test)]
     tests::before_unlink(name.parent.as_raw_fd(), &name.name);
-    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
-    retry_zero(|| unsafe { libc::unlinkat(name.parent.as_raw_fd(), name.name.as_ptr(), flags) })
+    entry
+        .unlink(directory)
         .map(|()| RemovePinnedOutcome::Removed)
         .or_else(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -1387,6 +1106,7 @@ fn metadata_at(parent: RawFd, component: &[u8]) -> io::Result<Identity> {
     metadata_at_cstring(parent, &component)
 }
 
+#[cfg(test)]
 fn metadata_at_cstring(parent: RawFd, component: &CString) -> io::Result<Identity> {
     stat_at_cstring(parent, component).map(|stat| identity_from_stat(&stat))
 }

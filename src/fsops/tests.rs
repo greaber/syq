@@ -3568,8 +3568,12 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
         query_partial_name_limit: false,
     };
 
-    assert!(create_rooted_directory_or_existing(&target(b"winner"), 0o755).is_ok());
-    assert!(create_rooted_directory_or_existing(&target(b"link"), 0o755).is_err());
+    assert!(
+        create_rooted_directory_or_existing(&target(b"winner"), 0o755, true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(create_rooted_directory_or_existing(&target(b"link"), 0o755, true).is_err());
     assert!(fs::read_dir(&outside).unwrap().next().is_none());
 
     fs::remove_dir_all(&dir).unwrap();
@@ -7631,4 +7635,132 @@ fn destination_filesystem_info_reports_whether_the_destination_is_networked() {
     let directory = File::open(tree.path()).unwrap();
     let dev = directory.metadata().unwrap().dev();
     assert_eq!(info.network, on_network_file_system(&directory, dev));
+}
+
+#[test]
+fn temporary_directory_access_is_explicit_and_reports_only_changes() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut operations = destination_ops(temporary.path());
+    assert!(operations
+        .apply(
+            &[Op::Mkdir {
+                path: b"owned".to_vec(),
+                mode: 0o777,
+                condition: TargetCondition::Any
+            }],
+            None
+        )
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    let metadata = fs::metadata(&dir).unwrap();
+    let request = Request::WidenDirectories {
+        directories: vec![(
+            path_bytes(&dir),
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        )],
+        guard: None,
+    };
+    let Response::WidenedDirectories(results) = operations.handle(&request) else {
+        panic!("unexpected response")
+    };
+    let saved = results[0].as_ref().unwrap();
+    if is_superuser() {
+        assert!(saved.is_none());
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    } else {
+        let saved = saved.unwrap();
+        assert_eq!(saved.mode, 0o500);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        let Response::WidenedDirectories(again) = operations.handle(&request) else {
+            panic!("unexpected response")
+        };
+        assert!(matches!(again.as_slice(), [Ok(None)]));
+        restore_directory_mode(
+            &Root::open(temporary.path()).unwrap(),
+            &RelativePath::new(b"owned").unwrap(),
+            saved,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let metadata = fs::metadata(&dir).unwrap();
+    let request = Request::WidenDirectories {
+        directories: vec![(
+            path_bytes(&dir),
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino() + 1,
+            },
+        )],
+        guard: None,
+    };
+    assert!(matches!(FsOps::new().handle(&request), Response::Err(_)));
+    let Response::WidenedDirectories(results) = destination_ops(temporary.path()).handle(&request)
+    else {
+        panic!("unexpected response")
+    };
+    assert!(results[0].is_err());
+    assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn permission_hint_requires_an_owned_directory_missing_needed_bits() {
+    if is_superuser() {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("owned");
+    fs::create_dir(&dir).unwrap();
+    let root = Root::open(temporary.path()).unwrap();
+    let path = RelativePath::new(b"owned/new").unwrap();
+    assert!(directory_permission_hint(&root, &path, 0o300).is_none());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(directory_permission_hint(&root, &path, 0o300).is_some());
+    assert!(directory_permission_hint(&root, &path, 0o100).is_none());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn creations_wait_for_their_parents_created_in_the_same_request() {
+    let mkdir = |path: &[u8]| Op::Mkdir {
+        path: path.to_vec(),
+        mode: 0o700,
+        condition: TargetCondition::Any,
+    };
+    let ops = [
+        mkdir(b"a/b/c"),
+        mkdir(b"a"),
+        Op::Symlink {
+            path: b"a/b/link".to_vec(),
+            target: b"target".to_vec(),
+            condition: TargetCondition::Any,
+        },
+        mkdir(b"x/y"),
+        mkdir(b"a/b"),
+    ];
+    let all: Vec<usize> = (0..ops.len()).collect();
+    assert_eq!(
+        creation_waves(&ops, &all),
+        vec![vec![1, 3], vec![4], vec![0, 2]]
+    );
+    // Without a parent in the request, everything stays in one wave.
+    assert_eq!(creation_waves(&ops, &[0, 2, 3]), vec![vec![0, 2, 3]]);
 }

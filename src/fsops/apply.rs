@@ -20,16 +20,6 @@ pub(super) fn apply_one(
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
 ) -> Result<()> {
-    apply_one_with_deletions(op, guard, destination_root, destination_prefix, None)
-}
-
-pub(super) fn apply_one_with_deletions(
-    op: &Op,
-    guard: Option<&ContainerGuard>,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    deletion: Option<&mut crate::deletion::DirectoryBatch>,
-) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
         let relative = RelativePath::new(path)?;
@@ -81,14 +71,61 @@ pub(super) fn apply_one_with_deletions(
                 dev: *dev,
                 ino: *ino,
             };
-            return apply_one_rooted_with_deletions(&operation, &target.as_rooted(), deletion);
+            return apply_one_rooted(&operation, &target.as_rooted());
         }
-        return apply_one_rooted_with_deletions(op, &target.as_rooted(), deletion);
+        return apply_one_rooted(op, &target.as_rooted());
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted_with_deletions(op, &target, deletion)
+    apply_one_rooted(op, &target)
+}
+
+/// Resolve one authorized request's root, then keep the caller's explicit
+/// names. No Selected operation permits traversal or recursive discovery.
+pub(super) fn selected_removals(
+    ops: &[Op],
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Vec<Result<crate::deletion::Selected>> {
+    let root = if let Some(guard) = guard {
+        ops.first()
+            .map(|op| guarded_target(op_path(op), guard).map(|target| target.root))
+            .unwrap_or_else(|| Err(anyhow::anyhow!("empty deletion request")))
+    } else {
+        destination_root.context(UNROOTED_MUTATION)
+    };
+    ops.iter()
+        .map(|op| {
+            let root = root
+                .as_ref()
+                .map_err(|error| anyhow::Error::new(wire_error(error)))?
+                .clone();
+            let path = op_path(op);
+            let label = if guard.is_some() {
+                resolve(path)
+            } else {
+                PathBuf::from(OsStr::from_bytes(
+                    &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+                ))
+            };
+            #[cfg(debug_assertions)]
+            fail_apply_capacity_for_test(&label)?;
+            let relative = if let Some(guard) = guard {
+                relative_under(&resolve(&guard.root), &resolve(path))?
+            } else {
+                RelativePath::new(path)?
+            };
+            Ok(crate::deletion::Selected {
+                root,
+                path: relative,
+                label,
+                directory: matches!(op, Op::Rmdir { .. }),
+                size: None,
+            })
+        })
+        .collect()
 }
 
 pub(super) fn error_is_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool {
@@ -234,6 +271,10 @@ pub(super) fn with_rooted_partial<T>(
 
 pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
     hold_before_guarded_mutation_for_test(path)?;
+    guarded_target_unheld(path, guard)
+}
+
+fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
     let root_path = resolve(&guard.root);
     let target = resolve(path);
     let relative = relative_under(&root_path, &target)?;
@@ -310,70 +351,13 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted_with_deletions(
-    op: &Op,
-    target: &RootedTarget,
-    deletion: Option<&mut crate::deletion::DirectoryBatch>,
-) -> Result<()> {
+fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
         Op::Mkdir {
             mode, condition, ..
-        } => {
-            if path.is_empty() {
-                if *condition == TargetCondition::Absent {
-                    bail!("destination root {} already exists", target.label.display());
-                }
-                let metadata = root.metadata(path)?;
-                require_rooted_condition(metadata, *condition, &target.label)?;
-                if metadata.mode & 0o700 != 0o700 {
-                    let directory = root.open_metadata(path)?;
-                    require_rooted_metadata(&directory, metadata, &target.label)?;
-                    set_mode_handle(&directory, metadata.mode | 0o700)?;
-                }
-                return Ok(());
-            }
-            let parent = if target.create_missing_parents {
-                root.resolve_parent_creating(path, 0o777)?
-            } else {
-                root.resolve_parent(path)?
-            };
-            if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match parent
-                    .create_directory((*mode & 0o7777) | 0o700)
-                    .with_context(|| {
-                        format!("create confined directory {}", target.label.display())
-                    }) {
-                    Ok(()) => return Ok(()),
-                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
-                        if *condition == TargetCondition::Absent {
-                            bail!(
-                                "destination {} appeared before no-replace creation",
-                                target.label.display()
-                            );
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            drop(parent);
-            match observe_rooted_condition(target, *condition)? {
-                Some(metadata) if metadata.is_dir() => {
-                    if metadata.mode & 0o700 != 0o700 {
-                        let directory = root.open_metadata(path)?;
-                        require_rooted_metadata(&directory, metadata, &target.label)?;
-                        set_mode_handle(&directory, metadata.mode | 0o700)?;
-                    }
-                    Ok(())
-                }
-                Some(_) => bail!(
-                    "cannot replace non-directory {} with a directory",
-                    target.label.display()
-                ),
-                None => create_rooted_directory_or_existing(target, *mode),
-            }
-        }
+        } => mkdir_rooted(target, *mode, *condition, false).map(drop),
         Op::Symlink {
             target: link,
             condition,
@@ -477,25 +461,13 @@ fn apply_one_rooted_with_deletions(
                 *condition,
             )
         }
-        Op::Rmdir { .. } => match root.metadata_optional(path)? {
-            None => Ok(()),
-            Some(_) => root.remove_directory(path),
-        },
-        Op::Unlink { .. } => match root.metadata_optional(path)? {
-            None => Ok(()),
-            Some(metadata) if metadata.is_dir() => {
-                bail!(
-                    "{}: is now a directory; not deleting it",
-                    target.label.display()
-                )
-            }
-            Some(metadata) => {
-                if let Some(deletion) = deletion {
-                    deletion.before_unlink(root, path, metadata.len)?;
-                }
-                root.unlink(path)
-            }
-        },
+        Op::Rmdir { .. } | Op::Unlink { .. } => crate::deletion::DirectoryBatch::default().remove(
+            root,
+            path,
+            &target.label,
+            matches!(op, Op::Rmdir { .. }),
+            None,
+        ),
         Op::Remove { .. } => bail!("recursive remove cannot use a confined destination root"),
     }
 }
@@ -622,16 +594,219 @@ pub(super) fn set_meta_rooted(
     require_rooted_identity(after, condition, &target.label)
 }
 
+/// The target an operation on `path` resolves to, as `apply_one` resolves it.
+fn operation_target(
+    path: &[u8],
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<RootedTarget> {
+    if let Some(guard) = guard {
+        return guarded_target_unheld(path, guard).map(|target| target.as_rooted());
+    }
+    let Some(root) = destination_root else {
+        bail!("{UNROOTED_MUTATION}");
+    };
+    Ok(RootedTarget {
+        root,
+        relative: RelativePath::new(path)?,
+        label: PathBuf::from(OsStr::from_bytes(
+            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+        )),
+        create_missing_parents: true,
+        query_partial_name_limit: false,
+    })
+}
+
+/// The group and mode of the directories new ones are created in, observed
+/// once per request.
+pub(super) type CreationParents = std::sync::Mutex<HashMap<Vec<u8>, Option<(u32, u32)>>>;
+
+/// Whether a directory created at `path` might start with a group other
+/// than `group`. On Linux it takes its parent's group when the parent is
+/// setgid, and otherwise this process's group, or its parent's group on a
+/// filesystem mounted with BSD group semantics. Elsewhere it always takes
+/// its parent's group. When unsure, the answer is yes.
+pub(super) fn starting_group_may_differ(
+    path: &[u8],
+    group: u32,
+    parents: &CreationParents,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> bool {
+    let parent_path = path[..path.iter().rposition(|byte| *byte == b'/').unwrap_or(0)].to_vec();
+    let cached = parents.lock().unwrap().get(&parent_path).copied();
+    let parent = cached.unwrap_or_else(|| {
+        let observed = (|| -> Result<(u32, u32)> {
+            let target = operation_target(path, guard, destination_root, destination_prefix)?;
+            let (parents, _) = target.relative.leaf()?;
+            let parent = target
+                .root
+                .metadata(&RelativePath::new(&parents.join(&b'/'))?)?;
+            Ok((parent.gid, parent.mode))
+        })()
+        .ok();
+        parents.lock().unwrap().insert(parent_path, observed);
+        observed
+    });
+    let Some((parent_group, parent_mode)) = parent else {
+        return true;
+    };
+    if cfg!(target_os = "linux") && parent_mode & 0o2000 == 0 {
+        parent_group != group || unsafe { libc::getegid() } != group
+    } else {
+        parent_group != group
+    }
+}
+
+/// Run a Mkdir with mode 0700, as `apply_one` runs it, and return the
+/// identity of the directory if this call created it rather than finding
+/// one already there.
+pub(super) fn create_private_directory(
+    op: &Op,
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<Option<(u64, u64)>> {
+    let Op::Mkdir {
+        path, condition, ..
+    } = op
+    else {
+        bail!("private creation requires a Mkdir");
+    };
+    let target = match guard {
+        Some(guard) => guarded_target(path, guard)?.as_rooted(),
+        None => operation_target(path, None, destination_root, destination_prefix)?,
+    };
+    #[cfg(debug_assertions)]
+    fail_apply_capacity_for_test(&target.label)?;
+    mkdir_rooted(&target, 0o700, *condition, true)
+}
+
+/// Give a directory this receiver created private, once it has taken its
+/// group, the mode its creation with `proposed` would have given it. Like
+/// such a creation followed by that group change, it keeps a setgid bit
+/// only if the change left it in place. Only the directory with the
+/// `created` identity is changed: another one now at its name is left as
+/// it is, even though the group change already reached it.
+pub(super) fn open_created_directory(
+    path: &[u8],
+    proposed: u32,
+    created: (u64, u64),
+    guard: Option<&ContainerGuard>,
+    destination_root: Option<Arc<Root>>,
+    destination_prefix: Option<&[u8]>,
+) -> Result<()> {
+    let target = operation_target(path, guard, destination_root, destination_prefix)?;
+    let directory = target.root.open_metadata(&target.relative)?;
+    let current = directory.metadata()?;
+    if (current.dev(), current.ino()) != created || !current.is_dir() {
+        return Ok(());
+    }
+    set_mode_handle(
+        &directory,
+        created_directory_mode(&directory, (proposed & 0o7777) | 0o700, current.mode())?,
+    )
+}
+
+/// The mode creating `directory` with `proposed` would have given it, for a
+/// directory created private instead: permission bits limited by the umask
+/// or by the default ACL it inherited, and the setgid bit of `current`,
+/// which it inherited from its parent. Creation never sets other bits.
+pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u32) -> Result<u32> {
+    let permitted = crate::inode_metadata::default_permissions(directory)?;
+    Ok((proposed & permitted & 0o777) | (current & 0o2000))
+}
+
+/// Create the directory `target` names, or accept an existing one as the
+/// condition allows, without changing an existing directory. With `identify`,
+/// return the identity of a directory this call created; `None` means it
+/// found one already there.
+fn mkdir_rooted(
+    target: &RootedTarget,
+    mode: u32,
+    condition: TargetCondition,
+    identify: bool,
+) -> Result<Option<(u64, u64)>> {
+    let root = &target.root;
+    let path = &target.relative;
+    if path.is_empty() {
+        if condition == TargetCondition::Absent {
+            bail!("destination root {} already exists", target.label.display());
+        }
+        let metadata = root.metadata(path)?;
+        require_rooted_condition(metadata, condition, &target.label)?;
+        return Ok(None);
+    }
+    let parent = if target.create_missing_parents {
+        root.resolve_parent_creating(path, 0o777)?
+    } else {
+        root.resolve_parent(path)?
+    };
+    if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
+        match parent
+            .create_directory((mode & 0o7777) | 0o700)
+            .with_context(|| format!("create confined directory {}", target.label.display()))
+        {
+            Ok(()) => {
+                let created = identify
+                    .then(|| {
+                        parent
+                            .metadata()
+                            .map(|metadata| (metadata.dev, metadata.ino))
+                    })
+                    .transpose()?;
+                hold_after_directory_creation_for_test(&target.label)?;
+                return Ok(created);
+            }
+            Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
+                if condition == TargetCondition::Absent {
+                    bail!(
+                        "destination {} appeared before no-replace creation",
+                        target.label.display()
+                    );
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    drop(parent);
+    match observe_rooted_condition(target, condition)? {
+        Some(metadata) if metadata.is_dir() => Ok(None),
+        Some(_) => bail!(
+            "cannot replace non-directory {} with a directory",
+            target.label.display()
+        ),
+        None => create_rooted_directory_or_existing(target, mode, identify),
+    }
+}
+
 /// `TargetCondition::Any` mkdir operations can race each other because apply
 /// batches are parallel and deeper paths create implicit parents. Accept the
 /// winner only when the conflicting name is a real directory beneath the
 /// retained root; a symlink or any other type remains an error.
-pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u32) -> Result<()> {
+pub(super) fn create_rooted_directory_or_existing(
+    target: &RootedTarget,
+    mode: u32,
+    identify: bool,
+) -> Result<Option<(u64, u64)>> {
     match target
         .root
         .create_directory(&target.relative, (mode & 0o7777) | 0o700)
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let created = identify
+                .then(|| {
+                    target
+                        .root
+                        .metadata(&target.relative)
+                        .map(|metadata| (metadata.dev, metadata.ino))
+                })
+                .transpose()?;
+            hold_after_directory_creation_for_test(&target.label)?;
+            Ok(created)
+        }
         Err(error)
             if error.chain().any(|cause| {
                 cause
@@ -643,12 +818,7 @@ pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u
             if !metadata.is_dir() {
                 return Err(error);
             }
-            if metadata.mode & 0o700 != 0o700 {
-                let directory = target.root.open_metadata(&target.relative)?;
-                require_rooted_metadata(&directory, metadata, &target.label)?;
-                set_mode_handle(&directory, metadata.mode | 0o700)?;
-            }
-            Ok(())
+            Ok(None)
         }
         Err(error) => Err(error),
     }
@@ -794,6 +964,28 @@ pub(super) fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
 
 #[cfg(not(debug_assertions))]
 pub(super) fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
+    Ok(())
+}
+
+/// Pause right after creating a directory whose path ends with
+/// `SYQ_TEST_CREATED_DIRECTORY_SUFFIX`, before anything is created inside it.
+#[cfg(debug_assertions)]
+pub(super) fn hold_after_directory_creation_for_test(path: &Path) -> Result<()> {
+    let Some(suffix) = std::env::var_os("SYQ_TEST_CREATED_DIRECTORY_SUFFIX") else {
+        return Ok(());
+    };
+    if !path.as_os_str().as_bytes().ends_with(suffix.as_bytes()) {
+        return Ok(());
+    }
+    test_race_barrier(
+        "SYQ_TEST_CREATED_DIRECTORY_READY_FILE",
+        "SYQ_TEST_CREATED_DIRECTORY_CONTINUE_FILE",
+        "directory created",
+    )
+}
+
+#[cfg(not(debug_assertions))]
+pub(super) fn hold_after_directory_creation_for_test(_path: &Path) -> Result<()> {
     Ok(())
 }
 

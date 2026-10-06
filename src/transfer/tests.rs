@@ -427,6 +427,7 @@ fn pipeline_worker(
         links: false,
         perms: false,
         rsync_creation: false,
+        widen_directory_permissions: false,
         hardlinks: false,
         sparse: false,
         inode_preservation: Default::default(),
@@ -2112,19 +2113,34 @@ fn clean_root_pins_the_edge_cases() {
 
 #[test]
 fn restricted_root_creation_uses_only_the_authorized_mode_policy() {
-    let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false, false);
+    let ordinary = mkdir_root_batches(
+        b"/destination",
+        TargetCondition::Absent,
+        false,
+        false,
+        false,
+    );
     assert_eq!(ordinary.len(), 1);
     assert!(matches!(ordinary[0].as_slice(), [Op::Mkdir { .. }]));
 
-    let preserving = mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true);
+    let preserving =
+        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true, false);
     assert_eq!(preserving.len(), 1);
     assert!(matches!(
         preserving[0].as_slice(),
         [Op::Mkdir { mode: 0o755, .. }]
     ));
 
+    // A root that takes source permissions after it is filled stays private.
+    let private = mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true, true);
+    assert_eq!(private.len(), 1);
+    assert!(matches!(
+        private[0].as_slice(),
+        [Op::Mkdir { mode: 0o700, .. }]
+    ));
+
     let receiver_managed =
-        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, false);
+        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, false, false);
     assert_eq!(receiver_managed.len(), 2);
     assert!(matches!(
         receiver_managed[0].as_slice(),
@@ -5785,4 +5801,19 @@ fn starting_counts_respect_limits_history_and_explicit_settings() {
             assert_eq!(explicit.streaming(600, 600 * 4 * KIB, true), workers);
         }
     }
+}
+
+#[test]
+fn directory_access_advice_needs_evidence_and_an_available_option() {
+    let error = WireError {
+        message: "destination permission denied".into(),
+        io_kind: Some(WireIoKind::OwnedDirectoryPermissions),
+        raw_os_error: Some(libc::EACCES),
+    };
+    assert_eq!(wire_os_kind(&error), Some("permission_denied"));
+    let error = endpoint_error(error).context("prepare file");
+    assert!(copy_error_message(&error, true).contains(DIRECTORY_ACCESS_HINT));
+    assert!(!copy_error_message(&error, false).contains(DIRECTORY_ACCESS_HINT));
+    let plain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
+    assert!(!copy_error_message(&plain, true).contains(DIRECTORY_ACCESS_HINT));
 }

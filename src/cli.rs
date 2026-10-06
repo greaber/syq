@@ -539,6 +539,10 @@ pub struct Args {
         conflicts_with = "files_from"
     )]
     pub delete: bool,
+    #[arg(skip)]
+    pub prune_before: bool,
+    #[arg(skip)]
+    pub temporarily_widen_dir_permissions: bool,
     /// With --delete, also remove destination paths that the --syq-ignore patterns exclude
     #[arg(long, requires = "delete")]
     pub delete_excluded: bool,
@@ -1316,6 +1320,9 @@ struct NativeCopyOperationalArgs {
     /// Match selected source metadata, including on unchanged files (repeatable/comma-separated)
     #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
     copy_metadata: Vec<NativeCopyMetadata>,
+    /// Temporarily add owner read, write and search permission to existing destination directories
+    #[arg(long)]
+    temporarily_widen_dir_permissions: bool,
     /// Request reads without access-time updates; warn and continue if unavailable
     #[arg(long)]
     open_noatime: bool,
@@ -1548,9 +1555,10 @@ struct NativeCopyFields {
     version,
     about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nDirectories are copied recursively and symlinks as symlinks. Creating or updating\ncontents sets the source modification time. Use --copy-metadata to match selected metadata even on unchanged files. Destination-only objects remain unless --prune is selected.\nPlacement chooses where names go: --into DIR gives DIR/name; --as PATH\nuses that exact path. Without placement, --to copies into the remote home;\n--from without --to copies into the local current directory. Local-only copies\nand --prune require placement. Existing files are updated when their contents differ; --if-exists selects another policy.\nSource arguments must precede destination arguments.\nExplicit local pipe sources and --src-fd FD read raw bytes; --as-fd FD writes them.",
     before_help = "Examples:\n  syq cp foo --to j5\n  syq cp foo --from j5\n  syq cp photos --into backup\n  syq cp --copy-metadata=permissions project --into backup\n  syq cp --srcs-in photos --to nas --into /backup/photos\n  syq cp report.txt --as report-backup.txt\n  syq cp data --to s3://bucket --into backup",
-    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Existing files are updated when their contents differ; --if-exists selects another policy.\n\nNative copies recurse and copy symlinks as symlinks. Creating or updating file contents sets the source modification time. Use --copy-metadata to apply selected metadata even when contents already match. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --copy-metadata=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --copy-metadata; pipes have no source metadata. Output descriptors receive source timestamps only with --copy-metadata=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
+    long_about = "Copy files and directories locally, over SSH, or to, from, and between S3 buckets.\n\nPlacement specifies the destination path and how to use it: --into DIR puts selected names inside DIR (foo becomes DIR/foo); --as PATH copies one named object to that exact path. The -new and -existing variants also require the destination to be absent or present.\n\nWith --to and no placement, copy into the remote home directory: syq cp foo --to j5. With --from and no --to or placement, copy into the local current directory: syq cp --from j5 foo. Both default to --into . at the destination. Local-only copies and --prune require a placement option. Existing files are updated when their contents differ; --if-exists selects another policy.\n\nNative copies recurse and copy symlinks as symlinks. Creating or updating file contents sets the source modification time. Use --copy-metadata to apply selected metadata even when contents already match. By default, destination-only objects remain in place. --prune removes them from mapped directory scopes after copying, while protecting ignored paths. --prune-before does this before copying to free space; later copy failures do not restore removed objects. The source endpoint, source base, selectors, and --mapping must precede the first --to or placement option; other options may follow the destination. Attach path and pattern option values beginning with `-` by using `=`, for example --src-dir=-. The spelling --mapping - retains its conventional stdin meaning.\n\nExplicit local FIFOs and process-substitution paths are byte sources with --src, --src-non-dir, or a positional source. --copy-metadata=specials copies the FIFO node instead; recursive copies never consume pipes. A named FIFO can use --into DIR. Anonymous input (including /dev/fd/N) requires --as PATH (or its -new/-existing variant) or --as-fd FD. Placement conditions also apply to stream copies; --root confines pathname sources. --src-fd FD selects an inherited descriptor directly; --as-fd FD replaces destination placement. Each stream copy takes one source. Descriptors belong to this process (0 is stdin, 1 is stdout); stderr is reserved. Regular-file sources preserve modification times at named destinations and support --copy-metadata; pipes have no source metadata. Output descriptors receive source timestamps only with --copy-metadata=mtime. These copies use no restart state; they send progress and requested statistics to stderr. Streams use parallel SSH or TCP data connections, like regular-file copies. EOF ends input; it does not prove producer success. Output descriptors can contain partial bytes after failure.",
     override_usage = "syq cp [OPTIONS] SOURCE... [PLACEMENT]\n       syq cp [OPTIONS] --src-fd FD --as PATH\n       syq cp [OPTIONS] SOURCE --as-fd FD"
 )]
+#[command(group(clap::ArgGroup::new("pruning").args(["prune", "prune_before"]).multiple(true)))]
 struct NativeCopyCommand {
     #[command(flatten)]
     s3: crate::s3::Flags,
@@ -1567,8 +1575,12 @@ struct NativeCopyCommand {
     /// ignored source paths remain protected
     #[arg(long, conflicts_with = "mapping")]
     prune: bool,
-    /// With --prune, refuse all removals if more than N are planned
-    #[arg(long, value_name = "N", requires = "prune")]
+    /// Remove target-only objects before copying to free space. Implies --prune;
+    /// later copy failures do not restore removed objects
+    #[arg(long, conflicts_with = "mapping")]
+    prune_before: bool,
+    /// With --prune or --prune-before, refuse all removals if more than N are planned
+    #[arg(long, value_name = "N", requires = "pruning")]
     max_delete: Option<u64>,
 }
 
@@ -2343,6 +2355,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         remote,
         pscope,
         prune,
+        prune_before,
         max_delete,
     } = parsed;
     if copy.delegated_operands_b64 {
@@ -2414,7 +2427,10 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
-        None if prune => bail!("--prune requires an explicit placement, such as --into DIR"),
+        None if prune || prune_before => bail!(
+            "{} requires an explicit placement, such as --into DIR",
+            if prune_before { "--prune-before" } else { "--prune" }
+        ),
         None if copy.to.is_some() || copy.selection.from.is_some() || s3_options.is_some() => {
             (Some(OsString::from(".")), Placement::Into, Existence::Any)
         }
@@ -2462,7 +2478,8 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
     args.placement = placement;
     args.target_existence = existence;
     args.locations = locations;
-    args.delete = prune;
+    args.delete = prune || prune_before;
+    args.prune_before = prune_before;
     args.max_delete = max_delete;
     args.native_mapping = mapping.map(OsStringExt::into_vec);
     args.stream_mapping_fd = copy.stream_mapping_fd;
@@ -2995,6 +3012,7 @@ fn apply_native_copy_operational(
         ignore,
         ignore_from,
         copy_metadata,
+        temporarily_widen_dir_permissions,
         open_noatime,
         sparse,
         inplace,
@@ -3035,6 +3053,7 @@ fn apply_native_copy_operational(
         "--inplace cannot combine with --if-exists=keep or --if-exists=update-if-older"
     );
     args.inplace = inplace;
+    args.temporarily_widen_dir_permissions = temporarily_widen_dir_permissions;
     args.open_noatime = open_noatime;
     args.sparse = sparse;
     for attribute in copy_metadata {

@@ -1,5 +1,6 @@
 use super::Route;
 mod authorization;
+mod directory_permissions;
 mod fast;
 mod pruning;
 mod server_copy;
@@ -39,7 +40,63 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
-type DirectoryMetadata = Arc<Mutex<Vec<(String, Metadata, Option<u32>, crate::mapping::Metadata)>>>;
+type DirectoryMetadata = Arc<Directories>;
+/// A marker's path, metadata, the mode of a directory it found, and its
+/// mapping overrides.
+type MarkerMetadata = (String, Metadata, Option<u32>, crate::mapping::Metadata);
+
+/// The directories of one download.
+struct Directories {
+    /// Marker metadata, applied once the descendants are written.
+    metadata: Mutex<Vec<MarkerMetadata>>,
+    /// Planned directory markers. A marker's metadata reaches its directory
+    /// only at the end, so whichever job creates that directory creates it
+    /// private until then.
+    markers: HashSet<Vec<u8>>,
+    /// Marker directories this download created, recorded before creating
+    /// them so a marker job never mistakes one for an existing directory.
+    created: std::sync::Mutex<HashSet<Vec<u8>>>,
+}
+
+impl Directories {
+    fn new(plan: &[Download]) -> Result<Self> {
+        let mut markers = HashSet::new();
+        for job in plan.iter().filter(|job| job.kind == ObjectKind::Dir) {
+            if !job.path.is_empty() {
+                markers.insert(directory_key(&RelativePath::new(job.path.as_bytes())?));
+            }
+        }
+        Ok(Self {
+            metadata: Mutex::new(Vec::new()),
+            markers,
+            created: Default::default(),
+        })
+    }
+
+    /// The creation mode for a missing directory at `path`.
+    fn creation_mode(&self, path: &[u8]) -> u32 {
+        if !self.markers.contains(path) {
+            return 0o777;
+        }
+        self.created.lock().unwrap().insert(path.to_vec());
+        0o700
+    }
+
+    fn created(&self, path: &[u8]) -> bool {
+        self.created.lock().unwrap().contains(path)
+    }
+
+    fn create_missing_parents(&self, root: &Root, path: &RelativePath) -> Result<()> {
+        root.create_missing_parents_with(path, &mut |parent| self.creation_mode(parent))
+    }
+}
+
+/// A directory's path beneath the destination root, in the form parent
+/// creation reports it.
+fn directory_key(path: &RelativePath) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.to_path_buf().as_os_str().as_bytes().to_vec()
+}
 
 pub(super) struct Engine {
     args: Arc<Args>,
@@ -51,7 +108,7 @@ pub(super) struct Engine {
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
-    cancelled: std::sync::atomic::AtomicBool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_wake: tokio::sync::Notify,
     uploads: Arc<super::upload_http::Cancellation>,
     authorization: Option<Arc<super::authorization::Authorization>>,
@@ -212,7 +269,7 @@ impl Engine {
         let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Arc::new(Self {
             tuning: super::tuning::Tuning::new(&options, &args, control),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
             authorization,
@@ -235,7 +292,11 @@ impl Engine {
         tokio::pin!(work);
         let outage = self.outage.clone();
         let interrupted = tokio::select! {
-            result = &mut work => return result,
+            result = &mut work => return result.and_then(|()| {
+                if self.progress.deletions_blocked.load(Relaxed) > 0 {
+                    Err(super::prune::Limit.into())
+                } else { Ok(()) }
+            }),
             _ = sigint.recv() => Some("interrupted"),
             _ = terminate.recv() => Some("terminated"),
             _ = outage.stopped() => None,
@@ -274,7 +335,7 @@ impl Engine {
             let args = self.args.clone();
             let local::UploadPlan {
                 sources: plan,
-                prune,
+                mut prune,
                 ignored,
                 excluded,
             } = tokio::task::spawn_blocking(move || local::upload_plan(&args)).await??;
@@ -326,7 +387,11 @@ impl Engine {
                 .await?;
                 let authorized = async {
                     self.prepare_pruning(&prune).await?;
-                    self.finish_authorization().await
+                    self.finish_authorization().await?;
+                    if self.args.prune_before {
+                        self.prune(std::mem::take(&mut prune), None).await?;
+                    }
+                    Ok::<_, anyhow::Error>(())
                 }
                 .await;
                 let prepared = std::mem::take(&mut *prepared.lock().await);
@@ -362,6 +427,9 @@ impl Engine {
                 })
                 .await?;
             } else {
+                if self.args.prune_before {
+                    self.prune(std::mem::take(&mut prune), None).await?;
+                }
                 parallel(plan, workers, |source| {
                     let engine = self.clone();
                     async move {
@@ -378,12 +446,14 @@ impl Engine {
                 .await?;
             }
             self.progress.finish_transfer();
-            self.prune(prune, None).await?;
+            if !self.args.prune_before {
+                self.prune(prune, None).await?;
+            }
         } else {
             let destination = Arc::new(Destination::open(&self.args)?);
             let DownloadPlan {
                 jobs: mut plan,
-                prune,
+                mut prune,
                 service_times,
             } = self.download_plan(&destination.prefix).await?;
             self.authorize_downloads(&mut plan).await?;
@@ -394,61 +464,191 @@ impl Engine {
                 .bytes_total
                 .store(plan.iter().map(|s| s.size).sum(), Relaxed);
             self.progress.scan_done.store(true, Relaxed);
-            // Directory metadata is applied after descendants, so creating
-            // children cannot change the restored times or require final modes.
-            let directories = Arc::new(Mutex::new(Vec::new()));
-            // Authorization leaves job order unchanged, and parallel invokes
-            // this closure in plan order before spawning each future.
-            let mut service_times = service_times.into_iter();
-            parallel(plan, workers, |mut job| {
-                let service_time = service_times.next().flatten();
-                let engine = self.clone();
-                let dst = destination.clone();
-                let dirs = directories.clone();
-                async move {
-                    engine.check_cancelled()?;
-                    let result = engine.download(&mut job, &dst, dirs, service_time).await;
-                    engine.settle(
-                        job.key.as_bytes(),
-                        &job.path,
-                        job.kind,
-                        &result,
-                        job.expected_hash(),
-                    );
-                    Ok(result.ok().flatten())
+            let directories = Arc::new(Directories::new(&plan)?);
+            let mut directory_access = directory_permissions::TemporaryAccess::new(
+                self.args.temporarily_widen_dir_permissions
+                    && !self.args.dry_run
+                    && !self.args.only_new_native_entries(),
+            );
+            let mut copies_finished = false;
+            let transferred = async {
+                if self.args.prune_before {
+                    directory_access.prepare(&destination, &plan)?;
+                    self.prune(std::mem::take(&mut prune), Some(&destination))
+                        .await?;
                 }
-            })
+                let mut service_times = service_times.into_iter();
+                parallel(plan, workers, |mut job| {
+                    let service_time = service_times.next().flatten();
+                    let engine = self.clone();
+                    let dst = destination.clone();
+                    let dirs = directories.clone();
+                    // Admission invokes this closure in plan order. Preparing
+                    // here keeps queued downloads' directories untouched and
+                    // needs no lock shared by the running file transfers.
+                    let prepared = directory_access.prepare(&dst, std::slice::from_ref(&job));
+                    async move {
+                        engine.check_cancelled()?;
+                        let result = match prepared {
+                            Ok(()) => engine.download(&mut job, &dst, dirs, service_time).await,
+                            Err(error) => Err(error),
+                        }
+                        .map_err(|error| {
+                            if !engine.args.temporarily_widen_dir_permissions
+                                && !engine.args.only_new_native_entries()
+                                && error.chain().any(|cause| {
+                                    cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                                        e.kind() == std::io::ErrorKind::PermissionDenied
+                                    })
+                                })
+                            {
+                                if let Ok(path) = RelativePath::new(job.path.as_bytes()) {
+                                    if let Some(hint) = crate::fsops::directory_permission_hint(
+                                        &dst.root, &path, 0o300,
+                                    ) {
+                                        return error.context(format!(
+                                            "{hint}; {}",
+                                            crate::transfer::DIRECTORY_ACCESS_HINT
+                                        ));
+                                    }
+                                }
+                            }
+                            error
+                        });
+                        engine.settle(
+                            job.key.as_bytes(),
+                            &job.path,
+                            job.kind,
+                            &result,
+                            job.expected_hash(),
+                        );
+                        Ok(result.ok().flatten())
+                    }
+                })
+                .await?;
+                copies_finished = true;
+                self.progress.finish_transfer();
+                #[cfg(debug_assertions)]
+                crate::fsops::test_race_barrier(
+                    "SYQ_TEST_FINALIZATION_READY_FILE",
+                    "SYQ_TEST_FINALIZATION_CONTINUE_FILE",
+                    "copy finalization",
+                )?;
+                if !self.args.prune_before {
+                    self.prune(prune, Some(&destination)).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            self.finish_directories(
+                &destination,
+                &directories,
+                directory_access.into_restorations(),
+                !copies_finished,
+            )
             .await?;
-            self.progress.finish_transfer();
-            // Prune while directories are writable, then restore their modes and times.
-            // Apply metadata even when the deletion budget refuses pruning.
-            let pruned = self.prune(prune, Some(&destination)).await;
-            self.finish_directories(&destination, &directories).await?;
-            pruned?;
+            transferred?;
         }
         Ok(())
     }
+
     async fn finish_directories(
         &self,
         destination: &Destination,
         directories: &DirectoryMetadata,
+        mut widened: BTreeMap<String, crate::proto::DirectoryMode>,
+        aborted: bool,
     ) -> Result<()> {
-        if !self.args.dry_run {
-            let mut directories = directories.lock().await;
-            directories.sort_by_key(|(path, _, _, _)| std::cmp::Reverse(path.len()));
-            for (path, meta, mode, explicit) in directories.iter() {
-                local::apply_metadata(
-                    &destination.root,
-                    &RelativePath::new(path.as_bytes())?,
-                    meta,
-                    &self.args,
-                    *mode,
-                    *explicit,
-                    mode.is_none(),
-                )?;
+        if self.args.dry_run {
+            return Ok(());
+        }
+        let mut entries: BTreeMap<_, _> = if aborted {
+            BTreeMap::new()
+        } else {
+            directories
+                .metadata
+                .lock()
+                .await
+                .iter()
+                .map(|(path, meta, mode, explicit)| {
+                    let path = directory_key(&RelativePath::new(path.as_bytes())?);
+                    Ok((
+                        String::from_utf8(path)?,
+                        Some((meta.clone(), *mode, *explicit)),
+                    ))
+                })
+                .collect::<Result<_>>()?
+        };
+        if !aborted {
+            for path in directories.created.lock().unwrap().iter() {
+                entries
+                    .entry(String::from_utf8(path.clone())?)
+                    .or_insert(None);
             }
         }
-        Ok(())
+        for path in widened.keys() {
+            entries.entry(path.clone()).or_insert(None);
+        }
+        let mut entries: Vec<_> = entries.into_iter().collect();
+        entries.sort_by_key(|(path, _)| {
+            std::cmp::Reverse(
+                path.bytes().filter(|&c| c == b'/').count() + usize::from(!path.is_empty()),
+            )
+        });
+        let mut first_error = None;
+        for (path, metadata) in entries {
+            let relative = RelativePath::new(path.as_bytes())?;
+            let saved = widened.remove(&path);
+            // Require the inode we widened before applying any final metadata.
+            let result = (|| {
+                if let Some(saved) = saved {
+                    let now = destination.root.metadata(&relative)?;
+                    anyhow::ensure!(
+                        (now.dev, now.ino) == (saved.dev, saved.ino),
+                        "directory {path} changed before restoring permissions"
+                    );
+                }
+                if let Some((meta, mode, explicit)) = &metadata {
+                    local::apply_metadata(
+                        &destination.root,
+                        &relative,
+                        meta,
+                        &self.args,
+                        *mode,
+                        *explicit,
+                        mode.is_none(),
+                    )?;
+                } else if saved.is_none() {
+                    let directory = destination.root.open_directory(&relative)?;
+                    let current = directory.metadata()?.mode();
+                    crate::fsops::set_mode_handle(
+                        &directory,
+                        crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            let explicit_mode_applied = result.is_ok()
+                && metadata
+                    .as_ref()
+                    .is_some_and(|(_, _, explicit)| self.args.perms || explicit.mode.is_some());
+            if !explicit_mode_applied {
+                if let Some(saved) = saved {
+                    if let Err(error) = crate::fsops::restore_directory_mode(
+                        &destination.root,
+                        &relative,
+                        saved,
+                        std::path::Path::new(&path),
+                    ) {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
     fn settle(
         &self,
@@ -2141,6 +2341,14 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        // A marker directory another job of this download created is still
+        // new to its marker. Its creator recorded it before creating it, so
+        // checking after the lookup cannot miss it.
+        let existing = if job.kind == ObjectKind::Dir {
+            existing.filter(|_| !directories.created(&directory_key(&path)))
+        } else {
+            existing
+        };
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -2302,8 +2510,11 @@ impl Engine {
         if object.kind() == ObjectKind::Dir {
             if !self.args.dry_run {
                 if existing.is_none() {
-                    root.create_missing_parents(&path, 0o777)?;
-                    match root.create_directory(&path, 0o777) {
+                    // Private until finish_directories applies the marker's
+                    // metadata, which it always does for a new directory.
+                    directories.create_missing_parents(root, &path)?;
+                    let mode = directories.creation_mode(&directory_key(&path));
+                    match root.create_directory(&path, mode) {
                         Ok(()) => {
                             self.progress.directories_created.fetch_add(1, Relaxed);
                         }
@@ -2313,7 +2524,7 @@ impl Engine {
                         Err(e) => return Err(e),
                     }
                 }
-                directories.lock().await.push((
+                directories.metadata.lock().await.push((
                     job.path.clone(),
                     metadata,
                     existing.map(|m| m.mode & 0o7777),
@@ -2344,7 +2555,7 @@ impl Engine {
                 job.path
             );
             if !self.args.dry_run {
-                root.create_missing_parents(&path, 0o777)?;
+                directories.create_missing_parents(root, &path)?;
                 if !same {
                     if existing.is_some() {
                         root.replace_symlink(&path, &bytes)?;
@@ -2432,7 +2643,7 @@ impl Engine {
             self.progress.add_bytes(object.size);
             return Ok(Some(object.size));
         }
-        root.create_missing_parents(&path, 0o777)?;
+        directories.create_missing_parents(root, &path)?;
         if object.size <= part_size {
             return self
                 .download_single(

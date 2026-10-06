@@ -840,6 +840,7 @@ fn expressions_keep_unselected_container_attributes() {
     fs::set_permissions(t.path("dst/existing"), fs::Permissions::from_mode(0o555)).unwrap();
     let output = native_syq(&[
         "cp",
+        "--temporarily-widen-dir-permissions",
         "--srcs-in",
         &t.s("src"),
         "--into",

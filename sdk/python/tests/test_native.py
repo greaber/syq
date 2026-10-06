@@ -132,7 +132,7 @@ if command == "rm":
         machine_output.write(json.dumps(record).encode("utf-8") + b"\n")
     raise SystemExit(exit_code)
 
-prune = "--prune" in args
+prune = "--prune" in args or "--prune-before" in args
 records = [{
     "schema": "syq.automation", "schema_version": 4, "seq": 0,
     "type": "run", "run_id": "fake-run", "started_at": 123,
@@ -611,6 +611,18 @@ class NativeClientTests(unittest.TestCase):
         self.client.cp("source", to="backup", auth_from="@laptop", into="out")
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
+
+    def test_temporary_directory_permissions_option(self) -> None:
+        self.client.cp("source", into="target", temporarily_widen_dir_permissions=True)
+        self.assertIn("--temporarily-widen-dir-permissions", self.argv())
+
+    def test_prune_before_implies_pruning(self) -> None:
+        events = []
+        self.client.cp("source", into="target", prune_before=True, max_delete=5, on_event=events.append)
+        run = next(event for event in events if isinstance(event, syq.RunEvent))
+        self.assertTrue(run.prune)
+        self.assertIn("--prune-before", self.argv())
+        self.assertNotIn("--prune", self.argv())
 
     def test_cp_forwards_native_remote_controls(self) -> None:
         self.client.cp(
