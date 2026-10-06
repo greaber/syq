@@ -520,19 +520,15 @@ mod tests {
     #[test]
     fn upload_identity_failure_reports_remote_platform() {
         use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
 
         let root = crate::test_support::tempdir().unwrap();
         let bin = root.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let uname = bin.join("uname");
-        std::fs::write(
-            &uname,
+        crate::test_support::write_executable(
+            &bin.join("uname"),
             b"#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo riscv64;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let mut child = Command::new("sh")
             .args([
                 "-c",

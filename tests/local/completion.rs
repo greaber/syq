@@ -1560,11 +1560,10 @@ fn return_via_completes_only_explicit_names_without_contacting_hosts() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    write(
+    executable(
         &t.path("bin/ssh"),
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 99\n",
     );
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     for option in ["--auth-from"] {
         for (prefix, expected) in [
             ("lap", b"".as_slice()),
@@ -1669,11 +1668,11 @@ fn automatic_authorization_completion_uses_ssh_but_never_prompts_receivers() {
         &["syq", "cp", "source", "--into", "local-f"],
         &["local-folder/"],
     );
-    write(
+    executable_support::write_executable(
         &t.path("bin/ssh"),
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+        0o700,
     );
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     for source in [false, true] {
         for selector in [
             vec![],
@@ -1719,11 +1718,11 @@ fn ssh_completion_offers_auth_modes_without_probing_destinations() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    write(
+    executable_support::write_executable(
         &t.path("bin/ssh"),
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+        0o700,
     );
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_completion_candidates(&t, &["syq", "ss"], &["ssh"]);
     assert_authorization_candidates(
         &t,
@@ -1769,11 +1768,11 @@ fn return_exec_completion_and_offline_selection_never_contact_ssh() {
     assert_completion_candidates(&t, &["syq", "exec", "--on", "@lap"], &["@laptop"]);
     assert_completion_candidates(&t, &["syq", "exec", "--cw"], &["--cwd"]);
     assert_completion_candidates(&t, &["syq", "exec", "--on", "laptop", "--", "--he"], &[]);
-    write(
+    executable_support::write_executable(
         &t.path("bin/ssh"),
         b"#!/bin/sh\n: > \"$HOME/ssh-used\"\nexit 55\n",
+        0o700,
     );
-    fs::set_permissions(t.path("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
     for name in ["absent", "@absent", "user@host", "host:22"] {
         let output = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(["exec", "--on", name, "--", "true"])

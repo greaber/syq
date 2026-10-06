@@ -71,9 +71,8 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
         };
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
-        fs::create_dir(root.join("bin")).unwrap();
-        fs::write(
-            root.join("bin/ssh"),
+        crate::test_support::write_executable(
+            &root.join("bin/ssh"),
             br#"#!/bin/sh
 for argument do command=$argument; done
 case "$command" in
@@ -82,9 +81,8 @@ case "$command" in
     *) exit 91 ;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(root.join("bin/ssh"), fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let mut manifest = serde_json::json!({
             "schema": 1, "repository": "https://github.com/greaber/syq",
             "version": env!("CARGO_PKG_VERSION"), "tag": format!("v{}", env!("CARGO_PKG_VERSION")),

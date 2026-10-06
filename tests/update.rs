@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "support/executable.rs"]
+mod executable_support;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -79,8 +81,11 @@ impl UpdateFixture {
         let temp = TempDir::new();
         let installed = temp.path("bin/syq");
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_syq"), &installed).unwrap();
-        fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+        executable_support::copy_executable(
+            Path::new(env!("CARGO_BIN_EXE_syq")),
+            &installed,
+            0o755,
+        );
         let original = fs::read(&installed).unwrap();
 
         let target = release_target();
@@ -335,8 +340,7 @@ fn receipt_is_bound_to_the_exact_installed_executable() {
     fixture.register();
     let other = fixture.temp.path("other/syq");
     fs::create_dir_all(other.parent().unwrap()).unwrap();
-    fs::copy(&fixture.installed, &other).unwrap();
-    fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+    executable_support::copy_executable(&fixture.installed, &other, 0o755);
     fs::copy(
         fixture.installed.with_file_name(".syq-install.json"),
         other.with_file_name(".syq-install.json"),
