@@ -28,9 +28,9 @@ impl TemporaryAccess {
             return Ok(());
         }
         let mut paths = BTreeSet::new();
-        if destination.prefix.is_empty() {
-            paths.insert(String::new());
-        }
+        // A named file still needs write/search access to its container.
+        // Root is the nearest existing directory selected for this download.
+        paths.insert(String::new());
         for job in jobs {
             for (index, _) in job.path.match_indices('/') {
                 let parent = &job.path[..index];

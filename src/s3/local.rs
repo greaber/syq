@@ -498,13 +498,54 @@ impl Destination {
                 follow_symlink: false,
             }
         };
-        let pinned = OperatorResolver::resolve_process(
+        let pinned = match OperatorResolver::resolve_process(
             path.as_os_str().as_bytes(),
             policy,
             final_component,
             true,
             &mut Vec::new(),
-        )?;
+        ) {
+            Err(error)
+                if args.temporarily_widen_dir_permissions
+                    && args.placement != Placement::Into
+                    && error.chain().any(|cause| {
+                        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::PermissionDenied
+                        })
+                    }) =>
+            {
+                // Inspect the selected entry through its immediate parent. Do
+                // not widen ancestors merely to reach that parent, or resolve
+                // the operator pathname again after changing its permissions.
+                let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                    return Err(error);
+                };
+                let parent = OperatorResolver::resolve_process(
+                    parent.as_os_str().as_bytes(),
+                    policy,
+                    OperatorFinalComponent::Directory,
+                    false,
+                    &mut Vec::new(),
+                )?;
+                let PinnedPath::Directory(parent) = parent else {
+                    return Err(error);
+                };
+                let parent = parent.into_parts().0;
+                let mut access = crate::fsops::TemporaryDirectorySearchAccess::new(true);
+                access.prepare(&parent)?;
+                let result = (|| {
+                    OperatorResolver::beneath(&parent, false, policy)?.resolve(
+                        name.as_bytes(),
+                        final_component,
+                        true,
+                        &mut Vec::new(),
+                    )
+                })();
+                access.restore()?;
+                result?
+            }
+            result => result?,
+        };
         let exists = !matches!(&pinned, PinnedPath::Missing(_));
         if (args.target_existence == Existence::New && exists)
             || (args.target_existence == Existence::Existing && !exists)
