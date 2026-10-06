@@ -88,6 +88,57 @@ fn native_copies_limit_new_entries_by_the_umask_despite_a_permissive_default_acl
 }
 
 #[test]
+fn new_directories_end_with_the_source_mode_limited_by_the_umask() {
+    // Without -p a new directory ends with its source's mode limited by the
+    // umask, read-only ones too, as rsync and cp give it; it is open to its
+    // owner only while it is filled. An existing directory keeps its mode.
+    let t = Tmp::new();
+    let names = [
+        "read-only",
+        "read-only/inner",
+        "owner-only",
+        "owner-only/inner",
+    ];
+    let set_modes = |root: &Path, modes: [u32; 4]| {
+        // Deepest first, so the outer directories are still writable.
+        for (name, mode) in names.iter().zip(modes).rev() {
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+    };
+    for name in names {
+        write(&t.path("src").join(name).join("file"), b"contents");
+    }
+    set_modes(&t.path("src"), [0o555, 0o555, 0o500, 0o500]);
+    let src = format!("{}/", t.s("src"));
+    for interface in ["cp", "rsync"] {
+        let dst = t.path(interface);
+        fs::create_dir_all(dst.join("read-only")).unwrap();
+        fs::set_permissions(dst.join("read-only"), fs::Permissions::from_mode(0o755)).unwrap();
+        let dst_arg = format!("{}/", dst.display());
+        let args = match interface {
+            "cp" => vec!["cp", "--no-progress", "--srcs-in", &src, "--into", &dst_arg],
+            _ => vec!["rsync", "-r", &src, &dst_arg],
+        };
+        let output = native_copy_with_umask(0o022, &args);
+        assert_output_ok(&output);
+        assert_eq!(read(&dst.join("owner-only/inner/file")), b"contents");
+        let modes = names.map(|name| format!("{name} {:o}", permission_bits(&dst.join(name))));
+        assert_eq!(
+            modes,
+            [
+                "read-only 755",
+                "read-only/inner 555",
+                "owner-only 500",
+                "owner-only/inner 500"
+            ],
+            "{interface}"
+        );
+        set_modes(&dst, [0o755; 4]);
+    }
+    set_modes(&t.path("src"), [0o755; 4]);
+}
+
+#[test]
 fn in_place_updates_keep_existing_set_id_bits() {
     // Writing to a file clears its set-ID bits; without -p an existing
     // file keeps its whole mode, so the copy restores them.

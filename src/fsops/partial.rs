@@ -410,6 +410,7 @@ impl FsOps {
             mode,
             attempt,
             create_if_missing,
+            scanned,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
@@ -452,17 +453,19 @@ impl FsOps {
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
             }
-            // Open the name directly, creating it when absent, as a small
-            // in-place put does; finalize checks the target condition as it
-            // always did. A regular file there, new or existing, is the
-            // destination: the open is read-write because a resume hashes an
-            // existing file through this descriptor, and a new file keeps
-            // owner access for the other range workers until publication
-            // sets its mode. The metadata read at the open serves finalize.
-            // Anything else at the name is sorted out by the checks below.
-            // A new file that its own mode would leave without owner access
-            // is created exclusively, so that finalize knows it is new.
-            let opened = if mode & 0o600 == 0o600 {
+            // Where the scan found a file, open the name directly, creating
+            // it when absent, as a small in-place put does; finalize checks
+            // the target condition as it always did. A regular file there,
+            // new or existing, is the destination: the open is read-write
+            // because a resume hashes an existing file through this
+            // descriptor, and a new file keeps owner access for the other
+            // range workers until publication sets its mode. The metadata
+            // read at the open serves finalize. Anything else at the name is
+            // sorted out by the checks below. A new file that its own mode
+            // would leave without owner access is created exclusively, so
+            // that finalize knows it is new.
+            let opened = if mode & 0o600 == 0o600 && matches!(scanned, ScannedDestination::File(_))
+            {
                 target
                     .root
                     .open_or_create_read_write_file(&target.relative, mode | 0o600)
@@ -503,8 +506,36 @@ impl FsOps {
                 Err(error) if existing_leaf_refused(&error) => {}
                 Err(error) => return Err(error),
             }
+            // Where the scan found nothing, the file is created exclusively
+            // at once; with nothing known, an existing file is opened first.
+            // Either way finalize knows whether the copy created it, on
+            // every receiver.
+            let mut expect_new = scanned == ScannedDestination::Absent;
+            if scanned == ScannedDestination::Unknown {
+                match target.root.open_regular_read_write(&target.relative) {
+                    Ok(file) => {
+                        let opened = file.metadata()?;
+                        receiver_mode::note_inplace_open(copy_id, &opened, false);
+                        self.set_copy_length(&file, size).with_context(|| {
+                            format!("resize confined file {}", target.label.display())
+                        })?;
+                        self.cache_opened_file(target.location(), attempt, false, file, opened);
+                        return Ok(Preparation::default());
+                    }
+                    Err(error) if error_is_kind(&error, io::ErrorKind::NotFound) => {
+                        expect_new = true;
+                    }
+                    // Anything else at the name is sorted out below.
+                    Err(_) => {}
+                }
+            }
             for _ in 0..8 {
-                match target.root.metadata_optional(&target.relative)? {
+                let found = if std::mem::take(&mut expect_new) {
+                    None
+                } else {
+                    target.root.metadata_optional(&target.relative)?
+                };
+                match found {
                     Some(metadata) if metadata.is_file() => {
                         // Retain a descriptor that can service the
                         // immediately following destination hash as well
@@ -3180,6 +3211,7 @@ impl FsOps {
                             mode,
                             attempt: *attempt,
                             create_if_missing: *create_if_missing,
+                            scanned: *scanned,
                         },
                     )
                 })

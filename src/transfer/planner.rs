@@ -2401,7 +2401,8 @@ impl Planner<'_> {
     /// instead, since entries inherited from a default ACL could reach its
     /// contents. Containers and implicit parents receive no later metadata,
     /// so their creation mode is final. Without a mode to apply, a directory
-    /// takes the source's permission bits as creating it limits them.
+    /// takes the source's permission bits as creating it limits them, with
+    /// owner access until it is filled (see `defer_directory_metadata`).
     fn new_directory_mode(&self, path: &[u8], dst_rel: &[u8], entry: &Entry) -> u32 {
         let flags = self.opts.flags_for(dst_rel);
         if self.unselected_dirs.contains(path) {
@@ -2848,10 +2849,18 @@ impl Planner<'_> {
             // Existing directories need no mode operation unless metadata was
             // requested. Actual temporary changes are merged later. A new
             // private root receives the mode its creation would have given it.
-            if flags & flags::MODE == 0 && p == &self.dst_root && self.created_dirs.contains(p) {
-                if let Some(proposed) = self.private_root {
-                    // Its final mode keeps the setgid bit it inherited.
-                    meta.mode = proposed | 0o2000;
+            // Another new directory was created with owner access to fill it;
+            // a source without that access gets its own mode back, limited as
+            // its creation limits it, as rsync and cp give it.
+            if flags & flags::MODE == 0 && self.created_dirs.contains(p) {
+                if p == &self.dst_root {
+                    if let Some(proposed) = self.private_root {
+                        // Its final mode keeps the setgid bit it inherited.
+                        meta.mode = proposed | 0o2000;
+                        flags |= flags::RECEIVER_MODE;
+                    }
+                } else if e.mode & 0o700 != 0o700 {
+                    meta.mode = e.mode & 0o777;
                     flags |= flags::RECEIVER_MODE;
                 }
             }

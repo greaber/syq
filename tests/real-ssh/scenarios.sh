@@ -1235,12 +1235,12 @@ assert ordinary == restricted, (ordinary, restricted)
 if variant != 'permissions':
     # Without -p: the destination's umask (022), not the runner's (077);
     # existing entries keep their modes; no special bits from the source;
-    # new directories keep owner access and inherit the setgid bit.
+    # new directories end with the source mode and inherit the setgid bit.
     expected = {
         '.': 0o2775, 'existing': 0o600, 'existing-dir': 0o2750,
         'script': 0o755, 'secret': 0o600, 'read-only': 0o444, 'setuid': 0o755,
         'large': 0o640, 'large-read-only': 0o444,
-        'new-dir': 0o2755, 'read-only-dir': 0o2755, 'private-dir': 0o2700,
+        'new-dir': 0o2755, 'read-only-dir': 0o2555, 'private-dir': 0o2700,
         'sticky-dir': 0o2755,
     }
     for name, mode in expected.items():

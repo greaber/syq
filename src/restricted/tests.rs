@@ -6224,6 +6224,14 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                     flags: mode_flag,
                     condition: proto::TargetCondition::Any,
                 },
+                // A new directory whose source lacks owner access is narrowed
+                // to its mode once it is filled.
+                Op::SetMeta {
+                    path: path("new-read-only-dir"),
+                    meta: meta(0o555),
+                    flags: mode_flag,
+                    condition: proto::TargetCondition::Any,
+                },
             ],
             guard: None,
         });
@@ -6344,10 +6352,10 @@ fn ordinary_and_restricted_receivers_choose_the_same_modes() {
             assert_eq!(mode("new-read-only"), created(0o444), "{case}");
             assert_eq!(mode("fifo"), created(0o644), "{case}");
             assert_eq!(mode("private-dir"), created(0o755), "{case}");
-            // A new directory keeps owner access, as an ordinary receiver
-            // has always created it, and inherits a parent's setgid bit.
+            // A new directory ends with its source's mode, as creating it
+            // limits it, and inherits a parent's setgid bit.
             assert_eq!(mode("new-dir"), created(0o755), "{case}");
-            assert_eq!(mode("new-read-only-dir"), created(0o755), "{case}");
+            assert_eq!(mode("new-read-only-dir"), created(0o555), "{case}");
             let inherited_setgid = if cfg!(target_os = "linux") { 0o2000 } else { 0 };
             assert_eq!(
                 mode("setgid/child"),
@@ -6504,6 +6512,92 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
         assert_eq!(fs::read(target.join("program")).unwrap(), data);
         let mode = fs::metadata(target.join("program")).unwrap().mode() & 0o7777;
         assert_eq!(mode, 0o4755, "restricted={restricted}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn both_receivers_give_a_new_in_place_file_its_umask_mode_under_a_narrower_default_acl() {
+    use std::os::unix::ffi::OsStrExt;
+    // The directory's default ACL grants only the owner, so the kernel creates
+    // the file narrower than the umask allows. A native copy limits a new
+    // file by the umask alone, whether or not the receiver takes its
+    // sender's word that the file is new.
+    let umask = crate::fsops::process_umask();
+    for restricted in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        // version 2; USER_OBJ rwx, GROUP_OBJ and OTHER nothing.
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions) in [(1u16, 7u16), (4, 0), (32, 0)] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        let directory = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        if unsafe {
+            libc::setxattr(
+                directory.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        } != 0
+        {
+            eprintln!(
+                "skipped: this filesystem rejected a default ACL: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, false, PublicationPolicy::InPlace);
+        let path = path_bytes(&target.join("new"));
+        let data = b"new contents".to_vec();
+        let scanned = proto::ScannedDestination::Absent;
+        receiver.send(Request::Prepare {
+            path: path.clone(),
+            size: data.len() as u64,
+            inplace: true,
+            copy_id: [4; 16],
+            mode: 0o644,
+            flags: proto::flags::RECEIVER_MODE,
+            acl: false,
+            scanned,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+        });
+        receiver.send(Request::WriteRange {
+            path: path.clone(),
+            inplace: true,
+            copy_id: [4; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.clone().into(),
+            guard: None,
+        });
+        receiver.send(Request::Finalize {
+            expected_hash: None,
+            path,
+            inplace: true,
+            copy_id: [4; 16],
+            meta: proto::Meta {
+                mode: 0o644,
+                ..plain_meta()
+            },
+            flags: proto::flags::RECEIVER_MODE,
+            scanned,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        });
+        assert_eq!(fs::read(target.join("new")).unwrap(), data);
+        let mode = fs::metadata(target.join("new")).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o644 & !umask, "restricted={restricted}");
     }
 }
 

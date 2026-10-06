@@ -668,21 +668,24 @@ pub(super) fn starting_group_may_differ(
 /// The identity and mode of a directory a call created.
 pub(super) type CreatedDirectory = (u64, u64, u32);
 
-/// Run a Mkdir with mode 0700, as `apply_one` runs it, and return the
-/// identity and mode of the directory if this call created it rather than
-/// finding one already there.
-pub(super) fn create_private_directory(
+/// Run a Mkdir as `apply_one` runs it, with mode 0700 when `private`, and
+/// return the identity and mode of the directory if this call created it
+/// rather than finding one already there.
+pub(super) fn create_identified_directory(
     op: &Op,
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
     umask: u32,
+    private: bool,
 ) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
-        path, condition, ..
+        path,
+        mode,
+        condition,
     } = op
     else {
-        bail!("private creation requires a Mkdir");
+        bail!("identified creation requires a Mkdir");
     };
     let target = match guard {
         Some(guard) => guarded_target(path, guard)?.as_rooted(),
@@ -690,7 +693,8 @@ pub(super) fn create_private_directory(
     };
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
-    mkdir_rooted(&target, 0o700, *condition, true, umask)
+    let mode = if private { 0o700 } else { *mode };
+    mkdir_rooted(&target, mode, *condition, true, umask)
 }
 
 /// Give a directory this receiver created private, once it has taken its

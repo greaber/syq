@@ -781,6 +781,8 @@ struct PrepareOptions {
     mode: u32,
     attempt: u32,
     create_if_missing: bool,
+    /// What the sender's scan found at the path.
+    scanned: ScannedDestination,
 }
 
 struct HashOptions {
@@ -957,7 +959,7 @@ impl FsOps {
                 .directory
                 .metadata()?;
             self.receiver_directories
-                .created_private((anchor.dev, anchor.ino), created.mode());
+                .created((anchor.dev, anchor.ino), created.mode(), false);
         }
         Ok(anchor)
     }
@@ -2987,36 +2989,44 @@ impl FsOps {
                         )
                     }) =>
                 {
-                    apply::create_private_directory(
+                    apply::create_identified_directory(
                         op,
                         guard,
                         destination_root.clone(),
                         destination_prefix,
                         umask,
+                        true,
                     )
                     .map(|created| {
-                        if let Some((dev, ino, _)) = created {
+                        if let Some((dev, ino, created)) = created {
                             private
                                 .lock()
                                 .unwrap()
                                 .insert(path.clone(), (*mode, (dev, ino)));
+                            if mode & 0o700 != 0o700 {
+                                directories.created((dev, ino), created, true);
+                            }
                         }
                     })
                 }
-                // A directory created private is opened by a later
-                // receiver-chosen mode, as the planner opens the destination
-                // root; one created for a group change is opened above.
-                Op::Mkdir { mode, .. } if mode & 0o7777 == 0o700 => {
-                    apply::create_private_directory(
+                // A later receiver-chosen mode opens a directory created
+                // private, as the planner opens the destination root (one
+                // created for a group change is opened above), and narrows
+                // one whose proposal lacks the owner access it is created
+                // with to fill it.
+                Op::Mkdir { mode, .. } if mode & 0o7777 == 0o700 || mode & 0o700 != 0o700 => {
+                    let narrowing = mode & 0o700 != 0o700;
+                    apply::create_identified_directory(
                         op,
                         guard,
                         destination_root.clone(),
                         destination_prefix,
                         umask,
+                        !narrowing,
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
-                            directories.created_private((dev, ino), created);
+                            directories.created((dev, ino), created, narrowing);
                         }
                     })
                 }

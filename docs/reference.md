@@ -443,7 +443,8 @@ A directory receives its copied permissions and ACLs after its contents: a
 read-only directory could not take them, and adding entries changes its
 modification time anyway. Until then, syq limits who can enter or list it:
 
-- A new directory starts with the source's permissions, limited by the umask.
+- A new directory starts with the source's permissions, limited by the umask,
+  and its owner can add entries to it until its contents are in.
   With `--copy-metadata=ownership`, it takes its copied owner and group before
   syq copies files into it. If it could start out with another group, it is
   open only to its owner until then.

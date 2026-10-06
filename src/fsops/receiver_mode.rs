@@ -16,14 +16,15 @@ use crate::proto::ScannedDestination;
 use crate::rooted::HeldParent;
 use std::borrow::Cow;
 
-/// Directories this connection created private, with the modes they were
-/// created with, which a later receiver-chosen mode gives the mode creating
-/// them would have given them, and directories it widened, with the modes
-/// to restore. Directory creation, widening and their final metadata all
-/// travel on the connection that plans them.
+/// Directories this connection created with more access than their mode
+/// (private, or with the owner access to fill them), with the modes they
+/// were created with, which a later receiver-chosen mode gives the mode
+/// creating them would have given them, and directories it widened, with
+/// the modes to restore. Directory creation, widening and their final
+/// metadata all travel on the connection that plans them.
 #[derive(Default)]
 pub(super) struct ReceiverDirectories {
-    created_private: Mutex<HashMap<(u64, u64), u32>>,
+    created: Mutex<HashMap<(u64, u64), u32>>,
     widened: Mutex<HashMap<(u64, u64), u32>>,
 }
 
@@ -31,12 +32,15 @@ pub(super) struct ReceiverDirectories {
 /// for a mode only for the destination root, which it creates before
 /// anything in it, so the first few cover it; one not remembered keeps its
 /// mode, and a tree of private directories costs no memory per directory.
+/// Directories to narrow are all remembered, until they are narrowed.
 const REMEMBERED_PRIVATE_DIRECTORIES: usize = 1024;
 
 impl ReceiverDirectories {
-    pub(super) fn created_private(&self, identity: (u64, u64), mode: u32) {
-        let mut created = self.created_private.lock().unwrap();
-        if created.len() < REMEMBERED_PRIVATE_DIRECTORIES {
+    /// Remember a directory this connection created: one to narrow once it
+    /// is filled, or one created private.
+    pub(super) fn created(&self, identity: (u64, u64), mode: u32, narrowing: bool) {
+        let mut created = self.created.lock().unwrap();
+        if narrowing || created.len() < REMEMBERED_PRIVATE_DIRECTORIES {
             created.insert(identity, mode);
         }
     }
@@ -112,11 +116,12 @@ impl ReceiverDirectories {
     }
 
     /// The mode for the directory at `target` this connection widened (the
-    /// mode it had) or created private (the mode creating it with
-    /// `proposed` would have given it), with its identity. A directory
-    /// created private keeps a setgid bit while it has one, and gets back
-    /// the one it inherited at creation when `proposed` has that bit, as its
-    /// final metadata asks after a group change that cleared it.
+    /// mode it had) or created (the mode creating it with `proposed` would
+    /// have given it), with its identity. A directory it created keeps a
+    /// setgid bit while it has one, and gets back the one it inherited at
+    /// creation when `proposed` has that bit, as its final metadata asks
+    /// after a group change that cleared it. A proposal without owner access
+    /// is a directory's last: it is forgotten then.
     fn directory_mode(
         &self,
         target: &RootedTarget,
@@ -133,7 +138,15 @@ impl ReceiverDirectories {
         if let Some(mode) = self.widened.lock().unwrap().remove(&identity) {
             return Ok(Some((mode, identity)));
         }
-        let Some(created) = self.created_private.lock().unwrap().get(&identity).copied() else {
+        let created = {
+            let mut created = self.created.lock().unwrap();
+            if proposed & 0o700 != 0o700 {
+                created.remove(&identity)
+            } else {
+                created.get(&identity).copied()
+            }
+        };
+        let Some(created) = created else {
             return Ok(None);
         };
         let directory = target.root.open_metadata(&target.relative)?;
@@ -141,12 +154,7 @@ impl ReceiverDirectories {
         if !opened.is_dir() || (opened.dev(), opened.ino()) != identity {
             return Ok(None);
         }
-        let mode = apply::created_directory_mode(
-            &directory,
-            proposed | 0o700,
-            opened.mode(),
-            default_acl,
-        )?;
+        let mode = apply::created_directory_mode(&directory, proposed, opened.mode(), default_acl)?;
         Ok(Some((mode | (proposed & created & 0o2000), identity)))
     }
 }
@@ -283,10 +291,9 @@ impl FsOps {
             return Ok(None);
         }
         let flags = flags & !flags::RECEIVER_MODE;
-        // What this receiver saw comes first; a file that appeared since
-        // the scan found none is treated as new.
+        // What this receiver saw comes first, then what the scan found.
         let mode = match (opened, scanned) {
-            (Some(InplaceOpen::Created), _) | (_, ScannedDestination::Absent) => {
+            (Some(InplaceOpen::Created), _) | (None, ScannedDestination::Absent) => {
                 self.new_file_mode(target, meta.mode)?
             }
             (Some(InplaceOpen::Found(mode)), _) | (None, ScannedDestination::File(mode)) => mode,
