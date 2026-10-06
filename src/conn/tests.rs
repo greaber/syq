@@ -1960,18 +1960,17 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
 
 #[test]
 fn first_ssh_worker_retries_independently_after_mux_rejection() {
-    use std::os::unix::fs::PermissionsExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let script = temporary.path().join("ssh");
     let log = temporary.path().join("attempts");
-    std::fs::write(
+    crate::test_support::write_executable(
             &script,
             format!(
                 "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = -S ]; then\n    echo shared >> {log}\n    exit 255\n  fi\ndone\necho independent >> {log}\nexit 127\n",
                 log = shell_words::quote(log.to_str().unwrap()),
             ),
-        ).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
     let mut spec = RemoteSpec::local_receiver(true);
     spec.local_process = false;
     spec.rsh = vec![script.to_string_lossy().into_owned()];

@@ -596,15 +596,12 @@ mod tests {
 
     #[test]
     fn relative_program_runs_in_selected_directory_with_closed_stdin() {
-        use std::os::unix::fs::PermissionsExt;
         let root = crate::test_support::tempdir().unwrap();
-        let program = root.path().join("probe");
-        fs::write(
-            &program,
+        crate::test_support::write_executable(
+            &root.path().join("probe"),
             b"#!/bin/sh\nif read -r input; then exit 99; fi\nprintf '%s' \"$1\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         let request = ExecRequest {
             argv: vec![b"./probe".to_vec(), b"literal value".to_vec()],
             cwd: b".".to_vec(),

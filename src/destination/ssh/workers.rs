@@ -418,6 +418,18 @@ mod tests {
         master.write_all(b"remaining mux hello").unwrap();
         drop(master);
         drop(listener);
+        // A child that another test forked before these drops keeps the master
+        // open until it execs. Wait for the hangup without reading, so the
+        // bytes above are still unread when closed() runs.
+        #[cfg(target_os = "linux")]
+        {
+            let mut hangup = libc::pollfd {
+                fd: watch.0.as_raw_fd(),
+                events: libc::POLLRDHUP,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut hangup, 1, 10_000) }, 1);
+        }
         assert!(path.exists());
         assert!(watch.closed());
     }

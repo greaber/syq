@@ -159,6 +159,12 @@ class PathScopeTests(Scratch):
         self.assertScope(scope, tooling_checks=ALL_TOOLING)
         self.assertAll(scope, ["macos", "linux_arm64", "full_suite"], "false")
 
+    def test_test_runner_config_selects_native_platform_and_setup_tests(self):
+        scope = self.scope(".config/nextest.toml")
+        self.assertScope(scope, native="true", macos="true", tooling="true",
+                         tooling_checks="setup")
+        self.assertAll(scope, ["python_sdk", "conformance"], "false")
+
     def test_pull_request_190_surface(self):
         # The surface touched by PR #190 should run the Rust baseline, Python SDK, and
         # shell lint without promoting the pull request to unrelated suites.
@@ -192,6 +198,7 @@ class PathScopeTests(Scratch):
                              ("tests/tooling/test-branch-status.py", "branch workflows"),
                              ("scripts/setup.sh", "setup workflows"),
                              ("tests/tooling/test-setup.sh", "setup workflows"),
+                             ("tests/tooling/test-rust-test-timeouts.py", "setup workflows"),
                              ("tests/tooling/test-release-orchestration.py",
                               "orchestration workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),

@@ -530,7 +530,7 @@ own filesystem.
 
 `scripts/setup.sh` is that setup. Run it without arguments to install the
 Rust toolchain from `rust-toolchain.toml` and the tools pinned in
-`scripts/setup.lock` (ShellCheck, jq, mdBook, uv, Python, and Node.js)
+`scripts/setup.lock` (ShellCheck, jq, mdBook, uv, Python, Node.js, and cargo-nextest)
 into a cache shared by all worktrees, then run
 `eval "$(scripts/setup.sh env)"` in the shell that runs the check. CI uses
 the same script.
@@ -543,6 +543,11 @@ Create intentional symlinks inside that root; do not canonicalize product
 arguments or add follow flags merely to make a fixture pass. For fixtures that
 must fit Unix socket path limits, use `test_support::short_tempdir()`; it
 centralizes the canonical short-root exception without changing `TMPDIR`.
+Create any file that a test or the product code under test executes with
+`write_executable` or `copy_executable` from `tests/support/executable.rs`.
+They write it in a child process: tests run in parallel threads, and a file
+the test process writes itself can stay open in a child that another test
+forks at that moment, so running it fails with "Text file busy".
 
 Testing happens in three places, each running more than the one before:
 before merge, after merge (post-merge CI, which selects checks by changed
@@ -654,11 +659,17 @@ want it:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --bin syq
+cargo nextest run --locked --bin syq
 ```
 
+Use `cargo nextest run` for Rust tests. Its repository configuration gives
+each test a two-minute deadline and a five-second termination grace period,
+then continues the remaining tests. Plain `cargo test` has no enforced
+timeout; use it only for builds/listing or investigations requiring its shared
+process. CI uses nextest on Linux and macOS, including selected ignored tests.
+
 For one exact Rust unit test, use
-`cargo test --locked --bin syq 'module::tests::name' -- --exact`; for an
+`cargo nextest run --locked --bin syq -- --exact 'module::tests::name'`; for an
 integration test, replace `--bin syq` with its target, such as `--test local`.
 Confirm the named test ran; a zero-test or ignored result is not validation.
 
@@ -668,17 +679,19 @@ runner from a clean, pushed task branch:
 
 ```bash
 scripts/run-focused-check.py --runner macos --cargo-cache -- \
-  cargo test --locked --bin syq 'module::tests::name' -- --exact
+  cargo nextest run --locked --bin syq -- --exact 'module::tests::name'
 scripts/run-focused-check.py --runner linux --script target/check.sh
 ```
 
 The script file is local and need not be committed; it may contain setup and
 multiple commands. It runs with Bash `-euo pipefail` in the checked-out repository.
-Use pinned setup commands appropriate to the check; the runner does not install
-all SDK toolchains or reproduce another workflow's setup automatically. For a
-workflow setup regression, reproduce the relevant setup as well as the failing
-command. Inputs and logs are public: do not include secrets. Confirm exact Rust
-tests actually ran; Cargo accepts filters that match zero tests.
+With `--cargo-cache`, the runner also installs the pinned cargo-nextest. Use
+pinned setup commands for other tools; the runner does not install all SDK
+toolchains or reproduce another workflow's setup automatically. For a workflow
+setup regression, reproduce the relevant setup as well as the failing command.
+Inputs and logs are public: do not include secrets. Confirm exact Rust tests
+actually ran; nextest rejects filters that match zero tests, while plain
+`cargo test` accepts them.
 
 The helper selects the current remote branch, pins its checkout commit,
 prints the SHA and run URL, and watches that exact run through

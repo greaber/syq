@@ -6,7 +6,6 @@ use crate::proto::{Request, Response};
 #[test]
 fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
     use ssh_agent_lib::ssh_key::{private::Ed25519Keypair, PrivateKey};
-    use std::os::unix::fs::PermissionsExt;
 
     let client = PrivateKey::new(Ed25519Keypair::from_seed(&[41; 32]).into(), "").unwrap();
     let ca = PrivateKey::new(Ed25519Keypair::from_seed(&[42; 32]).into(), "").unwrap();
@@ -47,18 +46,19 @@ fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
             contents.push_str(&format!(" HostKeyAlias {alias}\n"));
         }
         fs::write(&config, contents).unwrap();
-        fs::write(
+        crate::test_support::write_executable(
             &ssh,
             format!(
                 "#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = /dev/null ]; then exec ssh \"$@\"; fi\ndone\nexec ssh -F {} \"$@\"\n",
                 shell_words::quote(config.to_str().unwrap())
             ),
-        )
-        .unwrap();
-        fs::write(&ssh_keygen, "#!/bin/sh\nexec ssh-keygen \"$@\"\n").unwrap();
-        for program in [&ssh, &ssh_keygen] {
-            fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
-        }
+            0o700,
+        );
+        crate::test_support::write_executable(
+            &ssh_keygen,
+            "#!/bin/sh\nexec ssh-keygen \"$@\"\n",
+            0o700,
+        );
         let policy = crate::agent_broker::resolve_host_policy_at_bounded(
             ssh.to_str().unwrap(),
             None,
@@ -93,14 +93,18 @@ fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
         let diagnostics = String::from_utf8_lossy(&output.stderr);
         for (kind, path) in [("identity", &identity), ("certificate", &cert)] {
             let prefix = format!("debug1: {kind} file {} type ", path.display());
-            let loaded = diagnostics
-                .lines()
-                .find_map(|line| line.strip_prefix(&prefix))
-                .unwrap_or_else(|| panic!("configured {kind} was not selected: {diagnostics}"));
-            assert_ne!(
-                loaded, "-1",
-                "configured {kind} was not loaded: {diagnostics}"
+            // OpenSSH 10.3 reports loaded certificates with their key type
+            // and fingerprint instead of the older numeric file-type line.
+            let certificate_prefix = format!(
+                "debug1: loaded identity cert from {}: ED25519-CERT ",
+                path.display()
             );
+            let loaded = diagnostics.lines().any(|line| {
+                line.strip_prefix(&prefix)
+                    .is_some_and(|value| value.parse::<u32>().is_ok())
+                    || (kind == "certificate" && line.starts_with(&certificate_prefix))
+            });
+            assert!(loaded, "configured {kind} was not loaded: {diagnostics}");
         }
         let mut search = Command::new("ssh-keygen");
         search.args(["-F", lookup, "-f"]).arg(&pins);

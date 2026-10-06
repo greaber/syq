@@ -23,8 +23,6 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 #[cfg(test)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(test)]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
