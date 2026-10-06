@@ -434,7 +434,6 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::ValidateDigest { .. }
         | Request::BindStream(_)
         | Request::ConfigurePreservation { .. }
-        | Request::DefaultPermissions { .. }
         | Request::NativeMap(_)
         | Request::PrepareSmallFiles(_)
         | Request::StageBasis { .. }

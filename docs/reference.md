@@ -468,10 +468,6 @@ open:
   inherits from its parent's ACL until its own ACL is copied.
 - In an S3 download with `--copy-metadata=permissions`, an existing directory
   is restricted to its marker's permissions only at the end.
-- A receiver restricted by a [signed grant](security.md#destination-permissions)
-  applies a copied group to an existing directory only at the end. If the
-  grant keeps groups but not permissions, the same is true of a new
-  destination root.
 
 | Syq option | Corresponding rsync option |
 |---|---|

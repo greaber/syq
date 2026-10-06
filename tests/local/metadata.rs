@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn new_remote_entries_use_the_receivers_umask() {
+    // The copy runs with umask 022 and its receiver with 077: without -p,
+    // new entries get the source's permission bits limited by the
+    // receiver's umask, and an existing file keeps its mode.
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"new");
+    write(&t.path("src/existing"), b"new");
+    fs::create_dir(t.path("src/directory")).unwrap();
+    fs::set_permissions(t.path("src/file"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(t.path("src/existing"), fs::Permissions::from_mode(0o644)).unwrap();
+    write(&t.path("dst/existing"), b"older");
+    fs::set_permissions(t.path("dst/existing"), fs::Permissions::from_mode(0o640)).unwrap();
+    let rsh = fake_rsh(&t);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command
+        .env("FAKE_REMOTE_HOME", &t.0)
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("FAKE_REMOTE_UMASK", "077")
+        .args(["cp", "--rsh"])
+        .arg(&rsh)
+        .args(["--syq-path", env!("CARGO_BIN_EXE_syq"), "--no-progress"])
+        .args([
+            "--srcs-in",
+            &t.s("src"),
+            "--to",
+            "fixture",
+            "--into",
+            &t.s("dst"),
+        ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    let output = command.run().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in ["dst/file", "dst/existing"] {
+        assert_eq!(fs::read(t.path(path)).unwrap(), b"new", "{path}");
+    }
+    for (path, mode) in [
+        ("dst/file", 0o700),
+        ("dst/directory", 0o700),
+        ("dst/existing", 0o640),
+    ] {
+        assert_eq!(
+            fs::metadata(t.path(path)).unwrap().mode() & 0o7777,
+            mode,
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn native_preserve_specials_copies_or_visibly_skips_socket_nodes() {
     let t = Tmp::new();
     write(&t.path("src/nested/ordinary"), b"ordinary");

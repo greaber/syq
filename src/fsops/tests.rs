@@ -764,6 +764,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &copy_id,
             &meta,
             0,
+            false,
             TargetMutation {
                 condition: TargetCondition::Any,
                 guard: None
@@ -780,6 +781,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &copy_id,
             &meta,
             0,
+            false,
             TargetMutation {
                 condition: TargetCondition::Any,
                 guard: None,
@@ -1818,14 +1820,18 @@ fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() 
     };
     // Without group preservation the sidecar carries the final bits, so
     // publication needs no chmod.
-    assert_eq!(staged_file_mode(&meta(0o640), flags::RECEIVER_MODE), 0o640);
     assert_eq!(staged_file_mode(&meta(0o644), flags::MODE), 0o644);
+    // A mode the receiver has not chosen yet is no final mode.
+    assert_eq!(
+        staged_file_mode(&meta(0o640), flags::RECEIVER_MODE),
+        PRIVATE_PARTIAL_MODE
+    );
     // Special bits wait until the content is written.
     assert_eq!(staged_file_mode(&meta(0o4755), flags::MODE), 0o755);
     // Group preservation can change the group after creation, so group
     // bits must not be granted to the group the kernel assigns.
     assert_eq!(
-        staged_file_mode(&meta(0o640), flags::RECEIVER_MODE | flags::GROUP),
+        staged_file_mode(&meta(0o640), flags::MODE | flags::GROUP),
         PRIVATE_PARTIAL_MODE
     );
     // Without a requested mode the sidecar stays private.

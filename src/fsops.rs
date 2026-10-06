@@ -38,6 +38,7 @@ mod limits;
 mod operator;
 mod partial;
 mod paths;
+mod receiver_mode;
 mod sidecars;
 mod small_batch;
 
@@ -640,6 +641,12 @@ pub struct FsOps {
     /// Devices this connection has probed for whether a new file can be
     /// narrowed below the mode it came out with (`note_created_mode`).
     fixed_wide_mode_devices: HashMap<u64, bool>,
+    /// Directories this connection created private or widened, for the
+    /// modes it chooses for them later.
+    receiver_directories: receiver_mode::ReceiverDirectories,
+    /// New entries' permissions are limited by a default ACL, as rsync
+    /// limits them, rather than by the umask alone.
+    default_acl_creation: bool,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -847,6 +854,8 @@ impl FsOps {
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
+            receiver_directories: Default::default(),
+            default_acl_creation: false,
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,
@@ -929,10 +938,23 @@ impl FsOps {
         mode: u32,
         require_absent: bool,
     ) -> Result<DirectoryAnchor> {
-        self.operator_selection
+        let anchor = self
+            .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
-            .create_missing(mode, require_absent)
+            .create_missing(mode, require_absent)?;
+        // A destination created private is opened once its metadata is set.
+        if mode & 0o7777 == 0o700 {
+            let created = self
+                .operator_selection
+                .as_ref()
+                .context("no checked destination directory")?
+                .directory
+                .metadata()?;
+            self.receiver_directories
+                .created_private((anchor.dev, anchor.ino), created.mode());
+        }
+        Ok(anchor)
     }
 
     fn anchor_destination(
@@ -1275,30 +1297,16 @@ impl FsOps {
         // Stage everything before publishing any final files. A staging
         // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
-        for (i, ((file, destination), unchanged)) in request
-            .files
-            .iter()
-            .zip(&destinations)
-            .zip(&unchanged)
-            .enumerate()
-        {
+        for (i, (file, unchanged)) in request.files.iter().zip(&unchanged).enumerate() {
             if *unchanged {
                 staged.push(None);
                 continue;
-            }
-            let mut meta = file.meta.clone();
-            // Without source permission preservation, a replacement keeps
-            // the destination's mode, as in the ordinary worker.
-            if request.flags & flags::MODE == 0 {
-                if let Some(stat) = destination {
-                    meta.mode = stat.st_mode as u32 & 0o7777;
-                }
             }
             match self.stage_small_file(
                 &file.path,
                 &copy_id,
                 data[i].unwrap(),
-                &meta,
+                file.meta.clone(),
                 request.flags,
             ) {
                 Ok(item) => staged.push(Some(item)),
@@ -1442,13 +1450,21 @@ impl FsOps {
         path: &[u8],
         copy_id: &CopyId,
         data: &[u8],
-        meta: &Meta,
-        flags: u8,
+        mut meta: Meta,
+        mut flags: u8,
     ) -> Result<StagedSmallFile> {
         let path = self.destination_relative(path)?;
         let rooted = self
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
+        receiver_mode::resolve_file_publication(
+            &rooted,
+            &mut meta,
+            &mut flags,
+            self.default_acl_creation,
+            &mut None,
+        )?;
+        let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         let creation = sidecars::begin()?;
         let staged = staged_file_mode(meta, flags);
@@ -1909,7 +1925,6 @@ impl FsOps {
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
             | Request::PruneLookup { guard, .. }
-            | Request::DefaultPermissions { guard, .. }
             | Request::WidenDirectories { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
@@ -2231,8 +2246,7 @@ impl FsOps {
             }
             Request::StatMany { paths, guard, .. }
             | Request::PartialPaths { paths, guard, .. }
-            | Request::PruneLookup { paths, guard }
-            | Request::DefaultPermissions { paths, guard } => {
+            | Request::PruneLookup { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -2913,6 +2927,9 @@ impl FsOps {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });
         }
+        let resolved = self.resolve_metadata_ops(ops, guard);
+        let ops = resolved.as_deref().unwrap_or(ops);
+        let directories = &self.receiver_directories;
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
@@ -2969,11 +2986,27 @@ impl FsOps {
                         destination_prefix,
                     )
                     .map(|created| {
-                        if let Some(created) = created {
+                        if let Some((dev, ino, created)) = created {
+                            directories.created_private((dev, ino), created);
                             private
                                 .lock()
                                 .unwrap()
-                                .insert(path.clone(), (*mode, created));
+                                .insert(path.clone(), (*mode, (dev, ino)));
+                        }
+                    })
+                }
+                // A directory created private is opened by a later
+                // receiver-chosen mode, as the one above is in this request.
+                Op::Mkdir { mode, .. } if mode & 0o7777 == 0o700 => {
+                    apply::create_private_directory(
+                        op,
+                        guard,
+                        destination_root.clone(),
+                        destination_prefix,
+                    )
+                    .map(|created| {
+                        if let Some((dev, ino, created)) = created {
+                            directories.created_private((dev, ino), created);
                         }
                     })
                 }

@@ -956,7 +956,7 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
     let mut mkdir = Request::Apply {
         ops: vec![Op::Mkdir {
             path: target.clone(),
-            mode: 0o777,
+            mode: 0o7777,
             condition: proto::TargetCondition::Absent,
         }],
         guard: None,
@@ -965,7 +965,8 @@ fn authority_overwrites_client_guards_and_rejects_scope_and_option_escalation() 
     let Request::Apply { ops, .. } = mkdir else {
         unreachable!()
     };
-    assert!(matches!(ops[0], Op::Mkdir { mode: 0o700, .. }));
+    // Without -p the sender proposes no special bits.
+    assert!(matches!(ops[0], Op::Mkdir { mode: 0o777, .. }));
 
     let mut small = Request::PutSmallBatch(vec![proto::SmallPut {
         path: target.clone(),
@@ -1084,6 +1085,8 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         inplace: false,
         copy_id: [1; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1163,6 +1166,8 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         inplace: false,
         copy_id: [2; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1193,6 +1198,8 @@ fn signed_inplace_policy_requires_inplace_file_mutations() {
         inplace,
         copy_id: [1; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1244,6 +1251,8 @@ fn prepare_request(path: &Path) -> Request {
         inplace: false,
         copy_id: [1; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -1258,6 +1267,7 @@ fn finalize_request(path: &Path, condition: proto::TargetCondition) -> Request {
         copy_id: [1; 16],
         meta: plain_meta(),
         flags: 0,
+        created: false,
         condition,
         guard: None,
     }
@@ -1579,9 +1589,11 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
             authority.copy.options.preserve_permissions = preserve;
             authority.copy.options.receiver_managed_modes = !preserve;
             admit_test_mapping(&mut authority, "parent/item");
+            // The connection that widens a directory restores it.
+            let mut ops = crate::fsops::FsOps::new();
             let mut request = apply(mkdir(&parent));
             let settlement = authority.authorize(&mut request, false).unwrap();
-            let response = crate::fsops::FsOps::new().handle(&request);
+            let response = ops.handle(&request);
             authority.settle(settlement, &response);
             if policy == ExistingDestinationPolicy::Skip {
                 assert!(
@@ -1608,7 +1620,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                     guard: None,
                 };
                 let settlement = authority.authorize(&mut access, false).unwrap();
-                let response = crate::fsops::FsOps::new().handle(&access);
+                let response = ops.handle(&access);
                 authority.settle(settlement, &response);
                 assert!(
                     matches!(response, proto::Response::WidenedDirectories(ref outcomes)
@@ -1638,7 +1650,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                     condition: proto::TargetCondition::Any,
                 });
                 let settlement = authority.authorize(&mut restore, false).unwrap();
-                let response = crate::fsops::FsOps::new().handle(&restore);
+                let response = ops.handle(&restore);
                 authority.settle(settlement, &response);
                 assert!(
                     matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
@@ -1722,13 +1734,11 @@ fn mapping_pending_parent_creation_cannot_authorize_foreign_metadata() {
         ],
         guard: None,
     };
-    // Reject during authorization, without relying on the executor to
-    // abort metadata after the guarded mkdir inevitably fails.
-    let error = authority.authorize(&mut request, false).unwrap_err();
-    assert!(
-        error.to_string().contains("existing implicit parent"),
-        "{error:#}"
-    );
+    // The metadata asks only for a mode the receiver chooses, which keeps
+    // the mode of a directory it did not create.
+    let settlement = authority.authorize(&mut request, false).unwrap();
+    let response = crate::fsops::FsOps::new().handle(&request);
+    authority.settle(settlement, &response);
     assert!(!authority.created_by_this_grant(&path_bytes(&parent)));
     assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o550);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1762,7 +1772,9 @@ fn mapping_failed_parent_creation_cannot_authorize_foreign_metadata() {
         flags: proto::flags::RECEIVER_MODE,
         condition: proto::TargetCondition::Any,
     });
-    assert!(authority.authorize(&mut restore, false).is_err());
+    let settlement = authority.authorize(&mut restore, false).unwrap();
+    let response = crate::fsops::FsOps::new().handle(&restore);
+    authority.settle(settlement, &response);
     assert_eq!(fs::metadata(&parent).unwrap().mode() & 0o777, 0o550);
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -1815,7 +1827,15 @@ fn mapping_receiver_confines_entries_and_protects_existing_parents() {
         .authorize(&mut prepare_request(&target.join("existing")), false)
         .is_err());
     assert!(authority
-        .authorize(&mut apply(set_meta(&target.join("existing"))), false)
+        .authorize(
+            &mut apply(Op::SetMeta {
+                path: path_bytes(&target.join("existing")),
+                meta: plain_meta(),
+                flags: proto::flags::TIMES,
+                condition: proto::TargetCondition::Any,
+            }),
+            false
+        )
         .is_err());
     assert!(authority
         .authorize(
@@ -1924,7 +1944,7 @@ fn special_file_creation_checks_kind_and_masks_mode() {
             };
             assert_eq!(
                 mode,
-                kind | if preserve_permissions { 0o6754 } else { 0o600 }
+                kind | if preserve_permissions { 0o6754 } else { 0o754 }
             );
         }
     }
@@ -2979,6 +2999,8 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         inplace: true,
         copy_id: [1; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -3030,6 +3052,8 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         inplace: true,
         copy_id: [2; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -3043,6 +3067,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         copy_id: [2; 16],
         meta: plain_meta(),
         flags: 0,
+        created: false,
         condition: proto::TargetCondition::Any,
         guard: None,
     };
@@ -3101,6 +3126,8 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             inplace: true,
             copy_id,
             mode: 0o644,
+            flags: 0,
+            acl: false,
             attempt: 0,
             create_if_missing: true,
             guard: None,
@@ -3130,6 +3157,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             copy_id,
             meta: plain_meta(),
             flags: proto::flags::RECEIVER_MODE,
+            created: false,
             condition: proto::TargetCondition::Any,
             guard: None,
         });
@@ -3516,8 +3544,35 @@ fn explicit_ownership_flags_require_existing_grant_authority() {
     assert!(authority.check_flags(flags::REQUIRE_GROUP).is_err());
 }
 
+/// The mode the kernel gives a new directory or file in `parent` created
+/// with `mode`, from a sibling made that way.
+fn created_mode(parent: &Path, mode: u32, directory: bool) -> u32 {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let sibling = parent.join(format!("expected-{mode:o}-{directory}"));
+    if directory {
+        std::fs::DirBuilder::new()
+            .mode(mode)
+            .create(&sibling)
+            .unwrap();
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&sibling)
+            .unwrap();
+    }
+    let created = fs::metadata(&sibling).unwrap().mode() & 0o7777;
+    if directory {
+        fs::remove_dir(&sibling).unwrap();
+    } else {
+        fs::remove_file(&sibling).unwrap();
+    }
+    created
+}
+
 #[test]
-fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
+fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -3525,65 +3580,59 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
     let new_directory = target.join("new-dir");
     fs::create_dir_all(&existing_directory).unwrap();
     fs::set_permissions(&existing_directory, fs::Permissions::from_mode(0o500)).unwrap();
-    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.receiver_umask = 0o022;
+    let new_directory_mode = created_mode(&target, 0o777, true);
+    let new_file_mode = created_mode(&target, 0o777, false);
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut ops = crate::fsops::FsOps::new();
     let path = |path: &Path| path.as_os_str().as_bytes().to_vec();
+    let applied = |response: proto::Response| matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none));
 
-    let mut mkdir = Request::Apply {
-        ops: vec![
-            Op::Mkdir {
-                path: path(&existing_directory),
-                mode: 0o7777,
-                condition: proto::TargetCondition::Any,
-            },
-            Op::Mkdir {
-                path: path(&new_directory),
-                mode: 0o7777,
-                condition: proto::TargetCondition::Any,
-            },
-        ],
-        guard: None,
+    // The sender's special bits never reach a directory it creates, and
+    // an existing directory is left alone.
+    let mkdir = |path: &Path| Op::Mkdir {
+        path: path.as_os_str().as_bytes().to_vec(),
+        mode: 0o7777,
+        condition: proto::TargetCondition::Any,
     };
-    authority.authorize(&mut mkdir, false).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &mkdir
-    else {
-        panic!("authority did not guard directory creation")
-    };
-    assert!(ops
-        .iter()
-        .all(|operation| matches!(operation, Op::Mkdir { mode: 0o700, .. })));
-    assert!(crate::fsops::FsOps::new()
-        .apply(ops, Some(guard))
-        .into_iter()
-        .all(|error| error.is_none()));
+    assert!(applied(execute_authorized(
+        &authority,
+        &mut ops,
+        Request::Apply {
+            ops: vec![mkdir(&existing_directory), mkdir(&new_directory)],
+            guard: None,
+        },
+    )));
     assert_eq!(
         fs::metadata(&existing_directory).unwrap().mode() & 0o7777,
         0o500
     );
-    assert_eq!(fs::metadata(&new_directory).unwrap().mode() & 0o7777, 0o700);
+    assert_eq!(
+        fs::metadata(&new_directory).unwrap().mode() & 0o7777,
+        new_directory_mode
+    );
 
+    // A directory the receiver widened gets back the mode it had; one it
+    // did not create private keeps its mode, whatever the proposal.
     let observed = fs::metadata(&existing_directory).unwrap();
-    let mut access = Request::WidenDirectories {
-        directories: vec![(
-            path(&existing_directory),
-            proto::TargetCondition::Matches {
-                dev: observed.dev(),
-                ino: observed.ino(),
-            },
-        )],
-        guard: None,
-    };
-    authority.authorize(&mut access, false).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&access);
+    let response = execute_authorized(
+        &authority,
+        &mut ops,
+        Request::WidenDirectories {
+            directories: vec![(
+                path(&existing_directory),
+                proto::TargetCondition::Matches {
+                    dev: observed.dev(),
+                    ino: observed.ino(),
+                },
+            )],
+            guard: None,
+        },
+    );
     assert!(
         matches!(response, proto::Response::WidenedDirectories(ref outcomes)
         if outcomes.len() == 1 && outcomes[0].is_ok()),
         "{response:?}"
     );
-
     let receiver_meta = |path: &Path| Op::SetMeta {
         path: path.as_os_str().as_bytes().to_vec(),
         meta: proto::Meta {
@@ -3597,108 +3646,44 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
         flags: proto::flags::RECEIVER_MODE,
         condition: proto::TargetCondition::Any,
     };
-    let mut metadata = Request::Apply {
-        ops: vec![
-            receiver_meta(&existing_directory),
-            receiver_meta(&new_directory),
-        ],
-        guard: None,
-    };
-    authority.authorize(&mut metadata, false).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &metadata
-    else {
-        panic!("authority did not guard directory metadata")
-    };
-    assert!(matches!(
-        &ops[0],
-        Op::SetMeta {
-            meta: proto::Meta { mode: 0o500, .. },
-            flags: proto::flags::MODE,
-            ..
-        }
-    ));
-    assert!(matches!(
-        &ops[1],
-        Op::SetMeta {
-            meta: proto::Meta { mode: 0o755, .. },
-            flags: proto::flags::MODE,
-            ..
-        }
-    ));
-    assert!(crate::fsops::FsOps::new()
-        .apply(ops, Some(guard))
-        .into_iter()
-        .all(|error| error.is_none()));
+    assert!(applied(execute_authorized(
+        &authority,
+        &mut ops,
+        Request::Apply {
+            ops: vec![
+                receiver_meta(&existing_directory),
+                receiver_meta(&new_directory),
+            ],
+            guard: None,
+        },
+    )));
     assert_eq!(
         fs::metadata(&existing_directory).unwrap().mode() & 0o7777,
         0o500
     );
-    assert_eq!(fs::metadata(&new_directory).unwrap().mode() & 0o7777, 0o755);
-
-    let raced_directory = target.join("raced-dir");
-    fs::create_dir(&raced_directory).unwrap();
-    fs::set_permissions(&raced_directory, fs::Permissions::from_mode(0o500)).unwrap();
-    let mut raced_mkdir = Request::Apply {
-        ops: vec![Op::Mkdir {
-            path: path(&raced_directory),
-            mode: 0o7777,
-            condition: proto::TargetCondition::Any,
-        }],
-        guard: None,
-    };
-    authority.authorize(&mut raced_mkdir, false).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &raced_mkdir
-    else {
-        unreachable!()
-    };
-    assert!(crate::fsops::FsOps::new()
-        .apply(ops, Some(guard))
-        .into_iter()
-        .all(|error| error.is_none()));
-    let mut raced_metadata = Request::Apply {
-        ops: vec![receiver_meta(&raced_directory)],
-        guard: None,
-    };
-    authority.authorize(&mut raced_metadata, false).unwrap();
-    let displaced_directory = File::open(&raced_directory).unwrap();
-    fs::remove_dir(&raced_directory).unwrap();
-    fs::create_dir(&raced_directory).unwrap();
-    fs::set_permissions(&raced_directory, fs::Permissions::from_mode(0o700)).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &raced_metadata
-    else {
-        unreachable!()
-    };
-    assert!(crate::fsops::FsOps::new()
-        .apply(ops, Some(guard))
-        .into_iter()
-        .all(|error| error.is_some()));
-    drop(displaced_directory);
     assert_eq!(
-        fs::metadata(&raced_directory).unwrap().mode() & 0o7777,
-        0o700
+        fs::metadata(&new_directory).unwrap().mode() & 0o7777,
+        new_directory_mode
     );
 
+    // A file published over a regular file takes its mode, special bits
+    // included; a new one takes the proposal's permission bits as
+    // creating it limits them.
     let existing_file = target.join("existing-file");
+    let setuid_file = target.join("setuid-file");
     let new_file = target.join("new-file");
     fs::write(&existing_file, b"old").unwrap();
     fs::set_permissions(&existing_file, fs::Permissions::from_mode(0o600)).unwrap();
-    let put = |path: &Path, mode| proto::SmallPut {
+    fs::write(&setuid_file, b"old").unwrap();
+    fs::set_permissions(&setuid_file, fs::Permissions::from_mode(0o4750)).unwrap();
+    let put = |path: &Path| proto::SmallPut {
         path: path.as_os_str().as_bytes().to_vec(),
         copy_id: [1; 16],
         data: b"new".to_vec(),
         hash: crate::fsops::content_digest(b"new"),
         meta: proto::Meta {
             inode_metadata: None,
-            mode,
+            mode: 0o7777,
             uid: 0,
             gid: 0,
             mtime: 0,
@@ -3711,152 +3696,98 @@ fn receiver_managed_modes_preserve_existing_objects_and_mask_new_ones() {
         replaces: false,
     };
     let mut files =
-        Request::PutSmallBatch(vec![put(&existing_file, 0o7777), put(&new_file, 0o7777)]);
-    authority.authorize(&mut files, false).unwrap();
+        Request::PutSmallBatch(vec![put(&existing_file), put(&setuid_file), put(&new_file)]);
+    let settlement = authority.authorize(&mut files, false).unwrap();
     let Request::PutSmallBatch(puts) = &files else {
         unreachable!()
     };
-    assert_eq!(
-        (puts[0].meta.mode, puts[0].flags),
-        (0o600, proto::flags::MODE)
-    );
-    assert_eq!(
-        (puts[1].meta.mode, puts[1].flags),
-        (0o755, proto::flags::MODE)
-    );
-    assert!(matches!(
-        puts[0].condition,
-        proto::TargetCondition::MatchesFingerprint { .. }
-    ));
-    assert_eq!(puts[1].condition, proto::TargetCondition::Any);
-    let response = crate::fsops::FsOps::new().handle(&files);
-    let proto::Response::Applied(errors) = response else {
-        panic!("unexpected small-publication response")
-    };
-    assert!(errors.iter().all(Option::is_none), "{errors:?}");
-    assert_eq!(fs::read(&existing_file).unwrap(), b"new");
-    assert_eq!(fs::metadata(&existing_file).unwrap().mode() & 0o7777, 0o600);
-    assert_eq!(fs::read(&new_file).unwrap(), b"new");
-    assert_eq!(fs::metadata(&new_file).unwrap().mode() & 0o7777, 0o755);
-
-    let mut repeated = Request::PutSmallBatch(vec![put(&new_file, 0o600)]);
-    authority.authorize(&mut repeated, false).unwrap();
-    let Request::PutSmallBatch(puts) = repeated else {
-        unreachable!()
-    };
-    assert_eq!(
-        (puts[0].meta.mode, puts[0].flags),
-        (0o755, proto::flags::MODE)
-    );
-
-    // A later type replacement cannot reuse an existing directory's
-    // receiver-owned mode (including any directory-only special bits) for
-    // a newly published regular file.
-    let mut replacement = Request::PutSmallBatch(vec![put(&existing_directory, 0o7777)]);
-    authority.authorize(&mut replacement, false).unwrap();
-    let Request::PutSmallBatch(puts) = replacement else {
-        unreachable!()
-    };
-    assert_eq!(
-        (puts[0].meta.mode, puts[0].flags),
-        (0o755, proto::flags::MODE)
-    );
-
-    let raced_file = target.join("raced-file");
-    fs::write(&raced_file, b"old").unwrap();
-    fs::set_permissions(&raced_file, fs::Permissions::from_mode(0o6777)).unwrap();
-    let mut raced = Request::PutSmallBatch(vec![put(&raced_file, 0o600)]);
-    authority.authorize(&mut raced, false).unwrap();
-    fs::remove_file(&raced_file).unwrap();
-    let response = crate::fsops::FsOps::new().handle(&raced);
-    assert!(matches!(
-        response,
-        proto::Response::Applied(errors) if errors.iter().all(Option::is_some)
-    ));
-    assert!(!raced_file.exists());
+    // The authority leaves the choice to the receiver.
+    assert!(puts.iter().all(|put| {
+        (put.meta.mode, put.flags, put.condition)
+            == (
+                0o7777,
+                proto::flags::RECEIVER_MODE,
+                proto::TargetCondition::Any,
+            )
+    }));
+    let response = ops.handle(&files);
+    authority.settle(settlement, &response);
+    assert!(applied(response));
+    for (file, mode) in [
+        (&existing_file, 0o600),
+        (&setuid_file, 0o4750),
+        (&new_file, new_file_mode),
+    ] {
+        assert_eq!(fs::read(file).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(file).unwrap().mode() & 0o7777,
+            mode,
+            "{file:?}"
+        );
+    }
 }
 
 #[test]
-fn receiver_managed_missing_root_preserves_receiver_umask_and_inherited_setgid() {
+fn receiver_chosen_mode_opens_a_private_directory_with_its_inherited_setgid() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir(&root).unwrap();
     fs::set_permissions(&root, fs::Permissions::from_mode(0o2755)).unwrap();
-    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.receiver_umask = 0o022;
-
-    let mut mkdir = Request::Apply {
-        ops: vec![Op::Mkdir {
-            path: target.as_os_str().as_bytes().to_vec(),
-            mode: 0o7777,
-            condition: proto::TargetCondition::Any,
-        }],
-        guard: None,
-    };
-    authority.authorize(&mut mkdir, false).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &mkdir
-    else {
-        unreachable!()
-    };
-    assert!(matches!(ops[0], Op::Mkdir { mode: 0o700, .. }));
-    assert!(crate::fsops::FsOps::new()
-        .apply(ops, Some(guard))
-        .into_iter()
-        .all(|error| error.is_none()));
     // Linux propagates a parent's setgid bit to new directories; BSD-derived
     // kernels (macOS) inherit the group without the bit.
     let inherited_setgid = if cfg!(target_os = "linux") { 0o2000 } else { 0 };
+    let opened = created_mode(&root, 0o777, true);
+    assert_eq!(opened & 0o2000, inherited_setgid);
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut ops = crate::fsops::FsOps::new();
+    let response = execute_authorized(
+        &authority,
+        &mut ops,
+        apply(Op::Mkdir {
+            path: path_bytes(&target),
+            mode: 0o700,
+            condition: proto::TargetCondition::Any,
+        }),
+    );
+    assert!(
+        matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+        "{response:?}"
+    );
     assert_eq!(
         fs::metadata(&target).unwrap().mode() & 0o7777,
         0o700 | inherited_setgid
     );
-
-    let mut metadata = Request::Apply {
-        ops: vec![Op::SetMeta {
-            path: target.as_os_str().as_bytes().to_vec(),
+    let receiver_meta = || {
+        apply(Op::SetMeta {
+            path: path_bytes(&target),
             meta: proto::Meta {
                 inode_metadata: None,
                 // None of these source-proposed special bits are trusted.
                 mode: 0o7777,
-                uid: 0,
-                gid: 0,
-                mtime: 0,
-                mtime_nsec: 0,
+                ..plain_meta()
             },
             flags: proto::flags::RECEIVER_MODE,
             condition: proto::TargetCondition::Any,
-        }],
-        guard: None,
+        })
     };
-    authority.authorize(&mut metadata, false).unwrap();
-    let Request::Apply {
-        ops,
-        guard: Some(guard),
-    } = &metadata
-    else {
-        unreachable!()
-    };
-    assert!(matches!(
-        ops[0],
-        Op::SetMeta {
-            meta: proto::Meta { mode, .. },
-            flags: proto::flags::MODE,
-            condition: proto::TargetCondition::MatchesFingerprint { .. },
-            ..
-        } if mode == 0o755 | inherited_setgid
-    ));
-    assert!(crate::fsops::FsOps::new()
-        .apply(ops, Some(guard))
-        .into_iter()
-        .all(|error| error.is_none()));
+    // Another connection did not create it, so its mode stays.
+    let response = execute_authorized(&authority, &mut crate::fsops::FsOps::new(), receiver_meta());
+    assert!(
+        matches!(response, proto::Response::Applied(_)),
+        "{response:?}"
+    );
     assert_eq!(
         fs::metadata(&target).unwrap().mode() & 0o7777,
-        0o755 | inherited_setgid
+        0o700 | inherited_setgid
     );
+    // The connection that created it private gives it its creation mode.
+    let response = execute_authorized(&authority, &mut ops, receiver_meta());
+    assert!(
+        matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+        "{response:?}"
+    );
+    assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, opened);
 }
 
 #[test]
@@ -3926,6 +3857,8 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         inplace: false,
         copy_id: [0; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -4292,6 +4225,8 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         inplace: false,
         copy_id: [1; 16],
         mode: 0o600,
+        flags: 0,
+        acl: false,
         attempt: 0,
         create_if_missing: true,
         guard: None,
@@ -4334,6 +4269,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
             mtime_nsec: 0,
         },
         flags: 0,
+        created: false,
         condition: proto::TargetCondition::Any,
         guard: None,
     };
@@ -4353,6 +4289,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
             mtime_nsec: 0,
         },
         flags: 0,
+        created: false,
         condition: proto::TargetCondition::Any,
         guard: None,
     };
@@ -4825,6 +4762,7 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     fs::create_dir(&root).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let mut configuration = Request::ConfigurePreservation {
+        default_acl_creation: false,
         sparse: true,
         selection: crate::inode_metadata::Selection {
             acls: true,
@@ -5017,8 +4955,7 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
         fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
     }
     let same_inode = fs::metadata(&same).unwrap().ino();
-    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.receiver_umask = 0o022;
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let block = authority.copy.limits.hash_block_bytes;
 
     let mut hash = Request::HashExistingBatch {
@@ -5060,14 +4997,16 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
         unreachable!()
     };
     for patch in patches {
+        // The authority leaves the choice of mode to the receiver.
         assert_eq!(
             (patch.meta.mode, patch.flags, patch.unchanged_flags),
-            (0o640, proto::flags::MODE, proto::flags::MODE)
+            (
+                0o7777,
+                proto::flags::RECEIVER_MODE,
+                proto::flags::RECEIVER_MODE
+            )
         );
-        assert!(matches!(
-            patch.condition,
-            proto::TargetCondition::MatchesFingerprint { .. }
-        ));
+        assert_eq!(patch.condition, proto::TargetCondition::Any);
         assert!(patch.guard.is_some());
     }
     {
@@ -5151,7 +5090,7 @@ fn compare_and_keep(
 }
 
 #[test]
-fn keeping_one_name_of_a_file_leaves_its_other_names_stale_until_compared_again() {
+fn keeping_one_name_of_a_file_keeps_its_other_names_in_the_same_request() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -5162,30 +5101,18 @@ fn keeping_one_name_of_a_file_leaves_its_other_names_stale_until_compared_again(
     let inode = fs::metadata(&a).unwrap().ino();
     let authority = time_preserving_test_authority(&root);
     let mut ops = crate::fsops::FsOps::new();
-    let kept = Ok(proto::SmallPatched {
-        kept: true,
-        identity: None,
-    });
-    // Both conditions hold the change time of the one file. Keeping the
-    // first name sets its times, which changes that once the clock has
-    // moved on, so the second is refused as stale with nothing written.
+    let kept = || {
+        Ok(proto::SmallPatched {
+            kept: true,
+            identity: None,
+        })
+    };
+    // Keeping the first name sets the times of the file both names share,
+    // which changes its change time once the clock has moved on. Nothing
+    // binds the second name to that, so it is kept too.
     std::thread::sleep(std::time::Duration::from_millis(50));
     let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
-    assert_eq!(results[0], kept);
-    assert!(
-        matches!(
-            &results[1],
-            Err(proto::SmallPatchError {
-                matched: false,
-                stale_condition: true,
-                ..
-            })
-        ),
-        "{:?}",
-        results[1]
-    );
-    // Compared again, under a fresh condition, it is kept too.
-    assert_eq!(compare_and_keep(&authority, &mut ops, &[&b]), vec![kept]);
+    assert_eq!(results, vec![kept(), kept()]);
     for path in [&a, &b] {
         let metadata = fs::metadata(path).unwrap();
         assert_eq!((metadata.ino(), metadata.mtime()), (inode, 1_600_000_000));
@@ -5261,10 +5188,44 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
         kept: true,
         identity: None,
     });
-    // Keeping the first name changes the change time the second's
-    // condition holds, so the second is refused as stale.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let results = compare_and_keep(&authority, &mut ops, &[&a, &b]);
+    // Both names are hashed, and the second is then replaced by another
+    // file. A patch pinned to the file it hashed, as an exact destination
+    // or an update-only grant pins it, is refused as stale for that name.
+    let block = proto::MIN_HASH_BLOCK_BYTES;
+    let hash = Request::HashExistingBatch {
+        block,
+        files: vec![existing_read(&a, 4), existing_read(&b, 4)],
+    };
+    let proto::Response::ExistingHashes(existing) = execute_authorized(&authority, &mut ops, hash)
+    else {
+        panic!("unexpected hash response")
+    };
+    let replacement = target.join("replacement");
+    fs::write(&replacement, b"same").unwrap();
+    fs::rename(&replacement, &b).unwrap();
+    let patches = [&a, &b]
+        .into_iter()
+        .zip(existing)
+        .map(|(path, hashed)| {
+            let hashed = hashed.unwrap();
+            let fingerprint = hashed.fingerprint.unwrap();
+            let mut patch = small_patch(path, 4, block, vec![Some(hashed.hashes[0])], b"");
+            patch.basis = Some(fingerprint);
+            patch.meta.mtime = 1_600_000_000;
+            patch.flags = proto::flags::RECEIVER_MODE | proto::flags::TIMES;
+            patch.unchanged_flags = patch.flags;
+            patch.condition = proto::TargetCondition::Matches {
+                dev: fingerprint.dev,
+                ino: fingerprint.ino,
+            };
+            patch
+        })
+        .collect();
+    let proto::Response::PatchedBatch(results) =
+        execute_authorized(&authority, &mut ops, Request::PatchSmallBatch(patches))
+    else {
+        panic!("unexpected patch response")
+    };
     assert_eq!(results[0], kept);
     assert!(
         matches!(
@@ -5300,7 +5261,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
         .unwrap();
     operations.sort_by(|left, right| left.0.cmp(&right.0));
     let kept_with = crate::receipt::OperationAction::SetMetadata {
-        flags: proto::flags::MODE | proto::flags::TIMES,
+        flags: proto::flags::RECEIVER_MODE | proto::flags::TIMES,
     };
     let succeeded = crate::receipt::OperationDisposition::Succeeded;
     assert_eq!(
@@ -6081,4 +6042,385 @@ fn a_streamed_patch_is_refused_wherever_a_batch_patch_is() {
     // A refused begin holds none of the grant's bytes; the one admitted
     // above, never settled, still holds its file's.
     assert_eq!(authority.state.lock().unwrap().reserved_bytes, 4 * block);
+}
+
+/// One receiver of a parity check: ordinary, with the destination registered
+/// as its coordinator registers it, or command-restricted, authorizing each
+/// request against a grant before carrying it out.
+struct ParityReceiver {
+    authority: Option<RestrictedAuthority>,
+    ops: crate::fsops::FsOps,
+}
+
+impl ParityReceiver {
+    fn new(root: &Path, restricted: bool, preserve: bool, publication: PublicationPolicy) -> Self {
+        let target = root.join("target");
+        let authority = restricted.then(|| {
+            let mut authority = test_authority_with_policy(
+                root,
+                DeletionPolicy::Forbid,
+                1 << 20,
+                0,
+                FilterPolicy::default(),
+                publication,
+            );
+            authority.copy.options.preserve_permissions = preserve;
+            authority.copy.options.receiver_managed_modes = !preserve;
+            authority.copy.options.preserve_devices = true;
+            authority.copy.limits.max_entries = 1000;
+            authority
+        });
+        let ops = if restricted {
+            crate::fsops::FsOps::new()
+        } else {
+            crate::fsops::FsOps::test_destination(&target)
+        };
+        Self { authority, ops }
+    }
+
+    fn send(&mut self, mut request: Request) -> proto::Response {
+        let response = match &self.authority {
+            Some(authority) => {
+                let settlement = authority.authorize(&mut request, false).unwrap();
+                let response = self.ops.handle(&request);
+                authority.settle(settlement, &response);
+                response
+            }
+            None => self.ops.handle(&request),
+        };
+        assert!(
+            match &response {
+                proto::Response::Applied(errors) => errors.iter().all(Option::is_none),
+                proto::Response::WidenedDirectories(outcomes) => outcomes.iter().all(Result::is_ok),
+                proto::Response::Err(_) | proto::Response::EndpointError(_) => false,
+                _ => true,
+            },
+            "{response:?}"
+        );
+        response
+    }
+}
+
+/// The same requests, as a coordinator sends them without and with -p,
+/// through an ordinary receiver and a command-restricted one, in two copies
+/// of one tree. Returns each entry's mode after each.
+fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
+    let mode_flag = if preserve {
+        proto::flags::MODE
+    } else {
+        proto::flags::RECEIVER_MODE
+    };
+    [false, true].map(|restricted| {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("setgid")).unwrap();
+        fs::set_permissions(target.join("setgid"), fs::Permissions::from_mode(0o2775)).unwrap();
+        fs::create_dir(target.join("existing-dir")).unwrap();
+        fs::set_permissions(
+            target.join("existing-dir"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        fs::create_dir(target.join("read-only-dir")).unwrap();
+        fs::set_permissions(
+            target.join("read-only-dir"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        for (name, mode) in [
+            ("existing-file", 0o600),
+            ("existing-setuid", 0o4750),
+            ("existing-large", 0o604),
+        ] {
+            fs::write(target.join(name), b"old").unwrap();
+            fs::set_permissions(target.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let publication = if inplace {
+            PublicationPolicy::InPlace
+        } else {
+            PublicationPolicy::AtomicStaged
+        };
+        let mut receiver = ParityReceiver::new(&root, restricted, preserve, publication);
+        let path = |name: &str| path_bytes(&target.join(name));
+        let meta = |mode| proto::Meta {
+            mode,
+            ..plain_meta()
+        };
+        // Directories, as the planner creates them: without -p a proposal of
+        // the source's permission bits.
+        let mkdir = |name: &str, mode: u32| Op::Mkdir {
+            path: path(name),
+            mode: if preserve { mode } else { mode & 0o777 },
+            condition: proto::TargetCondition::Any,
+        };
+        #[allow(clippy::unnecessary_cast)] // macOS mode constants are narrower.
+        let fifo = libc::S_IFIFO as u32;
+        receiver.send(Request::Apply {
+            ops: vec![
+                mkdir("new-dir", 0o1755),
+                mkdir("new-read-only-dir", 0o555),
+                mkdir("setgid/child", 0o750),
+                mkdir("existing-dir", 0o777),
+                mkdir("private-dir", 0o700),
+                Op::Mknod {
+                    path: path("fifo"),
+                    mode: fifo | 0o644,
+                    rdev: 0,
+                    condition: proto::TargetCondition::Any,
+                },
+            ],
+            guard: None,
+        });
+        // A directory widened for writing, and one created private, take
+        // their final modes at the end.
+        let observed = fs::metadata(target.join("read-only-dir")).unwrap();
+        let widened = receiver.send(Request::WidenDirectories {
+            directories: vec![(
+                path("read-only-dir"),
+                proto::TargetCondition::Matches {
+                    dev: observed.dev(),
+                    ino: observed.ino(),
+                },
+            )],
+            guard: None,
+        });
+        let proto::Response::WidenedDirectories(outcomes) = widened else {
+            unreachable!()
+        };
+        let saved = outcomes[0].clone().unwrap();
+        let restore_mode = saved.map_or(0o555, |saved| saved.mode);
+        receiver.send(Request::Apply {
+            ops: vec![
+                Op::SetMeta {
+                    path: path("read-only-dir"),
+                    meta: meta(restore_mode),
+                    flags: mode_flag,
+                    condition: proto::TargetCondition::Matches {
+                        dev: observed.dev(),
+                        ino: observed.ino(),
+                    },
+                },
+                Op::SetMeta {
+                    path: path("private-dir"),
+                    meta: meta(0o755),
+                    flags: mode_flag,
+                    condition: proto::TargetCondition::Any,
+                },
+            ],
+            guard: None,
+        });
+        // Files published whole, as small ones are, unless written in place.
+        if !inplace {
+            let put = |name: &str, mode| proto::SmallPut {
+                path: path(name),
+                copy_id: [1; 16],
+                data: b"new".to_vec(),
+                hash: crate::fsops::content_digest(b"new"),
+                meta: meta(mode),
+                flags: mode_flag,
+                inplace: false,
+                condition: proto::TargetCondition::Any,
+                guard: None,
+                replaces: false,
+            };
+            receiver.send(Request::PutSmallBatch(vec![
+                put("new-file", 0o755),
+                put("existing-file", 0o644),
+                put("existing-setuid", 0o755),
+                put("setgid/new-file", 0o4640),
+            ]));
+        }
+        // Files written by ranges into a sidecar, or in place.
+        for (name, proposed) in [
+            ("new-large", 0o640),
+            ("new-read-only", 0o444),
+            ("existing-large", 0o644),
+        ] {
+            let data = b"contents".to_vec();
+            receiver.send(Request::Prepare {
+                path: path(name),
+                size: data.len() as u64,
+                inplace,
+                copy_id: [2; 16],
+                mode: proposed,
+                flags: mode_flag,
+                acl: false,
+                attempt: 0,
+                create_if_missing: true,
+                guard: None,
+            });
+            receiver.send(Request::WriteRange {
+                path: path(name),
+                inplace,
+                copy_id: [2; 16],
+                attempt: 0,
+                off: 0,
+                hash: crate::fsops::content_digest(&data),
+                data: data.into(),
+                guard: None,
+            });
+            receiver.send(Request::Finalize {
+                expected_hash: None,
+                path: path(name),
+                inplace,
+                copy_id: [2; 16],
+                meta: meta(proposed),
+                flags: mode_flag,
+                created: false,
+                condition: proto::TargetCondition::Any,
+                guard: None,
+            });
+        }
+        let mut modes = Vec::new();
+        for entry in walkdir_entries(&target) {
+            let metadata = fs::symlink_metadata(&entry).unwrap();
+            let name = entry.strip_prefix(&target).unwrap().display().to_string();
+            modes.push((name, metadata.mode() & 0o7777));
+        }
+        modes.sort();
+        modes
+    })
+}
+
+/// Every entry beneath `directory`.
+fn walkdir_entries(directory: &Path) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            entries.extend(walkdir_entries(&path));
+        }
+        entries.push(path);
+    }
+    entries
+}
+
+#[test]
+fn ordinary_and_restricted_receivers_choose_the_same_modes() {
+    let umask = crate::fsops::process_umask();
+    for preserve in [false, true] {
+        for inplace in [false, true] {
+            let case = format!("preserve={preserve} inplace={inplace}");
+            let [ordinary, restricted] = parity_modes(preserve, inplace);
+            assert_eq!(ordinary, restricted, "{case}");
+            let mode = |name: &str| {
+                ordinary
+                    .iter()
+                    .find(|(entry, _)| entry == name)
+                    .unwrap_or_else(|| panic!("{case}: {name} missing"))
+                    .1
+            };
+            if preserve {
+                continue;
+            }
+            // Without -p, existing entries keep their modes, special bits
+            // included, and new ones get the proposal's permission bits
+            // through the receiver's umask, never its special bits.
+            let created = |proposed: u32| proposed & 0o777 & !umask;
+            assert_eq!(mode("existing-dir"), 0o750, "{case}");
+            assert_eq!(mode("read-only-dir"), 0o555, "{case}");
+            assert_eq!(mode("existing-large"), 0o604, "{case}");
+            assert_eq!(mode("new-large"), created(0o640), "{case}");
+            assert_eq!(mode("new-read-only"), created(0o444), "{case}");
+            assert_eq!(mode("fifo"), created(0o644), "{case}");
+            assert_eq!(mode("private-dir"), created(0o755), "{case}");
+            // A new directory keeps owner access, as an ordinary receiver
+            // has always created it, and inherits a parent's setgid bit.
+            assert_eq!(mode("new-dir"), created(0o755), "{case}");
+            assert_eq!(mode("new-read-only-dir"), created(0o755), "{case}");
+            let inherited_setgid = if cfg!(target_os = "linux") { 0o2000 } else { 0 };
+            assert_eq!(
+                mode("setgid/child"),
+                created(0o750) | inherited_setgid,
+                "{case}"
+            );
+            if !inplace {
+                assert_eq!(mode("existing-file"), 0o600, "{case}");
+                assert_eq!(mode("existing-setuid"), 0o4750, "{case}");
+                assert_eq!(mode("new-file"), created(0o755), "{case}");
+                assert_eq!(mode("setgid/new-file"), created(0o640), "{case}");
+            }
+        }
+    }
+}
+
+/// A group this process belongs to other than its own, if any.
+fn supplementary_group() -> Option<u32> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0; count.max(0) as usize];
+    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    groups.truncate(count.max(0) as usize);
+    let own = unsafe { libc::getegid() };
+    groups.into_iter().find(|&group| group != own)
+}
+
+#[test]
+fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
+    let Some(group) = supplementary_group() else {
+        eprintln!("skipping: this process has no supplementary group");
+        return;
+    };
+    let umask = crate::fsops::process_umask();
+    let [ordinary, restricted] = [false, true].map(|restricted| {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(target.join("existing-dir")).unwrap();
+        fs::set_permissions(
+            target.join("existing-dir"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let mut receiver =
+            ParityReceiver::new(&root, restricted, false, PublicationPolicy::AtomicStaged);
+        if let Some(authority) = receiver.authority.as_mut() {
+            authority.copy.options.preserve_group = true;
+        }
+        let path = |name: &str| path_bytes(&target.join(name));
+        let grouped = proto::Meta {
+            mode: 0,
+            gid: group,
+            ..plain_meta()
+        };
+        let flags = proto::flags::GROUP | proto::flags::REQUIRE_GROUP;
+        // As the planner sends them before filling either directory: an
+        // existing one changes group first, and a new one takes its group in
+        // the request that creates it.
+        let existing = fs::metadata(target.join("existing-dir")).unwrap();
+        receiver.send(Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: path("existing-dir"),
+                meta: grouped.clone(),
+                flags,
+                condition: proto::TargetCondition::Matches {
+                    dev: existing.dev(),
+                    ino: existing.ino(),
+                },
+            }],
+            guard: None,
+        });
+        receiver.send(Request::Apply {
+            ops: vec![
+                Op::Mkdir {
+                    path: path("new-dir"),
+                    mode: 0o755,
+                    condition: proto::TargetCondition::Any,
+                },
+                Op::SetMeta {
+                    path: path("new-dir"),
+                    meta: grouped.clone(),
+                    flags,
+                    condition: proto::TargetCondition::Any,
+                },
+            ],
+            guard: None,
+        });
+        ["existing-dir", "new-dir"].map(|name| {
+            let metadata = fs::metadata(target.join(name)).unwrap();
+            (metadata.mode() & 0o7777, metadata.gid())
+        })
+    });
+    assert_eq!(ordinary, restricted);
+    assert_eq!(ordinary, [(0o750, group), (0o755 & !umask, group)]);
 }

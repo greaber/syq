@@ -497,6 +497,7 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             selection: Default::default(),
             sparse: false,
             destination: true,
+            default_acl_creation: false,
         })
         .is_err());
     assert!(fixture
@@ -508,6 +509,7 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
             },
             sparse: false,
             destination: false,
+            default_acl_creation: false,
         })
         .is_err());
     fs::write(&file, vec![0; 1025]).unwrap();

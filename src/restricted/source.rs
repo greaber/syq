@@ -284,6 +284,7 @@ impl SourceConnection {
             selection: policy.preservation,
             sparse: policy.sparse,
             destination: false,
+            default_acl_creation: false,
         });
         match response {
             Response::Ok => Ok(()),
@@ -467,6 +468,7 @@ impl SourceConnection {
                 selection,
                 sparse,
                 destination,
+                ..
             } => {
                 ensure!(
                     !destination && *selection == policy.preservation && *sparse == policy.sparse,

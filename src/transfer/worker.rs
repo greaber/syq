@@ -1498,26 +1498,11 @@ impl Worker {
         }
     }
 
-    /// Mode a new destination file is created with (what finalize will want).
-    /// The mode the finished file should have (rsync semantics):
-    /// with -p the source mode; without -p an existing file keeps its own mode
-    /// and a new file gets the source mode minus the umask.
+    /// The mode a file is published with: a mapping's explicit mode, or the
+    /// source's, which without -p only proposes the mode the receiver
+    /// chooses.
     pub(super) fn create_mode(&self, job: &WorkerJob) -> u32 {
-        if let Some(mode) = self
-            .opts
-            .mapping_metadata
-            .get(&job.rel_bytes)
-            .and_then(|m| m.mode)
-        {
-            return mode;
-        }
-        match job.dst_entry.as_ref().filter(|d| d.kind == Kind::File) {
-            Some(d) if !self.opts.perms => d.mode & 0o7777,
-            _ => job
-                .creation_mode
-                .map(u32::from)
-                .unwrap_or_else(|| fresh_file_mode(&self.opts, &job.entry)),
-        }
+        file_mode(&self.opts, &job.rel_bytes, &job.entry)
     }
 
     pub(super) fn copy_id(&self) -> CopyId {
@@ -1603,27 +1588,18 @@ impl Worker {
         job: &WorkerJob,
         create_if_missing: bool,
     ) -> Result<crate::proto::Preparation> {
-        // An in-place file is created in its final mode; a sidecar in its
-        // staged mode: the final bits, unless group preservation or an ACL
-        // keeps it private until publication. The receiver adds owner access
-        // for its other workers, so publication chmods only files whose
-        // final mode lacks that, or that stayed private.
-        let mode = if job.inplace {
-            self.create_mode(job)
-        } else {
-            crate::fsops::staged_mode(
-                self.create_mode(job),
-                self.publication_flags(job),
-                crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
-            )
-        };
+        // The receiver creates an in-place file in its final mode and a
+        // sidecar in its staged mode: the final bits, unless group
+        // preservation or an ACL keeps it private until publication.
         match ok(
             self.dst.call(Request::Prepare {
                 path: job.dst.clone(),
                 size: job.entry.size,
                 inplace: job.inplace,
                 copy_id: self.copy_id(),
-                mode,
+                mode: self.create_mode(job),
+                flags: self.publication_flags(job),
+                acl: crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
                 attempt: job.attempt,
                 create_if_missing,
                 guard: job.container_guard.clone(),
@@ -2584,6 +2560,8 @@ impl Worker {
                 copy_id: self.copy_id(),
                 meta,
                 flags: self.publication_flags(&job),
+                // A file written in place where the plan found none is new.
+                created: job.inplace && job.dst_entry.as_ref().is_none_or(|d| d.kind != Kind::File),
                 condition: job.target_condition,
                 guard: job.container_guard.clone(),
             })?,

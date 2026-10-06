@@ -421,6 +421,9 @@ if [ -n "${FAKE_SSH_CONNECTION:-}" ]; then
 else
     unset SSH_CONNECTION
 fi
+if [ -n "${FAKE_REMOTE_UMASK:-}" ]; then
+    umask "$FAKE_REMOTE_UMASK"
+fi
 printf '%s\n' "$1" >> "$FAKE_RSH_LOG"
 exec /bin/sh -c "$1"
 "#,

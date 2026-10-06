@@ -539,10 +539,10 @@ pub mod flags {
     pub const OWNER: u8 = 2;
     pub const GROUP: u8 = 4;
     pub const TIMES: u8 = 8;
-    /// A mode proposed by ordinary destination creation/restoration semantics,
-    /// rather than source-mode preservation requested with `-p`. Restricted
-    /// receivers replace it with a mode derived from receiver state and umask,
-    /// including any receiver-observed directory setgid inheritance.
+    /// The mode is the receiver's to choose, with `Meta::mode` as the
+    /// source's proposal: without `-p`, an existing object keeps its mode
+    /// and a new one gets the proposal's permission bits as creating it
+    /// limits them (see `fsops::receiver_mode`).
     pub const RECEIVER_MODE: u8 = 16;
     pub const MODE_MASK: u8 = MODE | RECEIVER_MODE;
     /// Explicit mapping ownership must succeed, unlike best-effort preservation.
@@ -1018,14 +1018,18 @@ pub enum WireRequest<Data> {
     /// whether donor discovery deferred creation to SeedBasis. A
     /// false `create_if_missing` lets content-identical final files complete
     /// without ever allocating a sidecar.
-    /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
-    /// private until final metadata is applied immediately before publication.
+    /// `mode` and `flags` are the publication's mode and metadata flags, a
+    /// proposal under `flags::RECEIVER_MODE`. The receiver creates an
+    /// `--inplace` file and a sidecar from them, the sidecar private while
+    /// `acl` says an ACL will follow.
     Prepare {
         path: PathBytes,
         size: u64,
         inplace: bool,
         copy_id: CopyId,
         mode: u32,
+        flags: u8,
+        acl: bool,
         attempt: u32,
         create_if_missing: bool,
         guard: Option<ContainerGuard>,
@@ -1129,6 +1133,9 @@ pub enum WireRequest<Data> {
         copy_id: CopyId,
         meta: Meta,
         flags: u8,
+        /// The copy created this `--inplace` file, which a receiver-chosen
+        /// mode then gives the mode creating it would have.
+        created: bool,
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
@@ -1215,12 +1222,9 @@ pub enum WireRequest<Data> {
         selection: crate::inode_metadata::Selection,
         sparse: bool,
         destination: bool,
-    },
-    /// Creation permissions from each destination directory's default ACL or
-    /// receiver umask. Used only for rsync copies without preserved modes.
-    DefaultPermissions {
-        paths: Vec<PathBytes>,
-        guard: Option<ContainerGuard>,
+        /// A new entry's permissions are limited by its directory's default
+        /// ACL, as rsync limits them, rather than by the umask alone.
+        default_acl_creation: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.
@@ -1597,7 +1601,6 @@ pub enum Response {
     PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
     /// Non-final fragment of a rich-metadata stat response.
     StatsMore(Vec<Option<Entry>>),
-    DefaultPermissions(Vec<u32>),
     NativeMapData(Vec<u8>),
     NativeMapDone,
     /// One bit per offered file; true requests its payload (including empty files).
@@ -1825,9 +1828,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. }
-            | Request::PruneLookup { paths, .. }
-            | Request::DefaultPermissions { paths, .. } => {
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {

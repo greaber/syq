@@ -62,16 +62,22 @@ impl FsOps {
         root.open_or_create_write_only_file(relative, mode)
     }
 
-    fn create_inplace_file(root: &Root, relative: &RelativePath, mode: u32) -> Result<File> {
+    fn create_inplace_file(
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+        copy_id: &CopyId,
+    ) -> Result<File> {
         // Other range workers, or Prepare after a CopyLocal fallback, must
         // reopen this new inode for writing. Finalize applies the requested
         // mode after every writer is done. Never chmod an existing destination
         // here: its write permissions still decide whether an update is allowed.
         let file = root.create_file(relative, mode | 0o200)?;
-        let permissions = file.metadata()?.permissions();
-        if permissions.mode() & 0o200 == 0 {
+        let created = file.metadata()?;
+        receiver_mode::note_inplace_creation(copy_id, &created);
+        if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
-            file.set_permissions(fs::Permissions::from_mode(permissions.mode() | 0o200))?;
+            file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
         }
         Ok(file)
     }
@@ -452,13 +458,21 @@ impl FsOps {
             // owner access for the other range workers until publication
             // sets its mode. The metadata read at the open serves finalize.
             // Anything else at the name is sorted out by the checks below.
-            match target
-                .root
-                .open_or_create_read_write_file(&target.relative, mode | 0o600)
-            {
-                Ok((file, mut opened)) if opened.is_file() => {
+            // A new file that its own mode would leave without owner access
+            // is created exclusively, so that finalize knows it is new.
+            let opened = if mode & 0o600 == 0o600 {
+                target
+                    .root
+                    .open_or_create_read_write_file(&target.relative, mode | 0o600)
+                    .map(Some)
+            } else {
+                Ok(None)
+            };
+            match opened {
+                Ok(Some((file, mut opened))) if opened.is_file() => {
                     let euid = unsafe { libc::geteuid() };
                     if euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600 {
+                        receiver_mode::note_inplace_creation(copy_id, &opened);
                         // A umask or inherited default ACL can remove even
                         // owner access from a new file; a file of ours that
                         // opened read-write with less can only be new, since
@@ -503,7 +517,12 @@ impl FsOps {
                         bail!("destination {} is a directory", target.label.display())
                     }
                     Some(_) => target.root.unlink(&target.relative)?,
-                    None => match Self::create_inplace_file(&target.root, &target.relative, mode) {
+                    None => match Self::create_inplace_file(
+                        &target.root,
+                        &target.relative,
+                        mode,
+                        copy_id,
+                    ) {
                         Ok(file) => {
                             let opened = file.metadata()?;
                             self.set_copy_length(&file, size).with_context(|| {
@@ -1303,7 +1322,12 @@ impl FsOps {
                     }
                     Some(_) => destination_root.unlink(&target_relative)?,
                     None => {
-                        match Self::create_inplace_file(&destination_root, &target_relative, mode) {
+                        match Self::create_inplace_file(
+                            &destination_root,
+                            &target_relative,
+                            mode,
+                            copy_id,
+                        ) {
                             Ok(file) => {
                                 opened = Some(file);
                                 break;
@@ -2535,7 +2559,7 @@ impl FsOps {
         flags: u8,
         mutation: TargetMutation<'_>,
     ) -> Result<Option<(u64, u64)>> {
-        self.finalize_expected(None, path, inplace, copy_id, meta, flags, mutation)
+        self.finalize_expected(None, path, inplace, copy_id, meta, flags, false, mutation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2547,10 +2571,13 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
+        created: bool,
         mutation: TargetMutation<'_>,
     ) -> Result<Option<(u64, u64)>> {
         let target = self.destination_mutation_target(path, mutation.guard)?;
-        self.finalize_rooted(&target, inplace, copy_id, meta, flags, mutation, expected)
+        self.finalize_rooted(
+            &target, inplace, copy_id, meta, flags, created, mutation, expected,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2561,6 +2588,7 @@ impl FsOps {
         copy_id: &CopyId,
         meta: &Meta,
         flags: u8,
+        created: bool,
         mutation: TargetMutation<'_>,
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
@@ -2579,10 +2607,10 @@ impl FsOps {
                     None,
                 ),
             };
-            // The file is read at most once here. A restricted receiver
-            // binds its approval of this step to the file's ctime as it is
-            // now, after the writes, so that condition needs fresh metadata;
-            // every other condition, the final identity check and the
+            // The file is read at most once here. A fingerprint condition
+            // holds the file's ctime as it is now, after the writes, so that
+            // condition needs fresh metadata; every other condition, the
+            // final identity check and the
             // reported identity are satisfied by the metadata read at the
             // open, since writes change neither device nor inode. The
             // metadata step uses the open-time read when there is one.
@@ -2597,6 +2625,11 @@ impl FsOps {
                 let reader = target.root.open_regular_read(&target.relative)?;
                 Self::verify_expected_inode(&file, &reader, expected)?;
             }
+            let resolved =
+                self.inplace_final_mode(target, copy_id, &current, meta, flags, created)?;
+            let (meta, flags) = resolved
+                .as_ref()
+                .map_or((meta, flags), |(meta, flags)| (meta, *flags));
             match &opened {
                 Some(opened) => set_meta_written_file(&file, meta, flags, opened),
                 None => set_meta_file_known(&file, meta, flags, &current),
@@ -2639,6 +2672,22 @@ impl FsOps {
         if checked_early {
             require_safe_rooted_named_partial(&target.root, &src_relative, &src, &file)?;
         }
+        let resolved = (flags & flags::RECEIVER_MODE != 0)
+            .then(|| {
+                let (mut meta, mut flags) = (meta.clone(), flags);
+                receiver_mode::resolve_file_publication(
+                    target,
+                    &mut meta,
+                    &mut flags,
+                    self.default_acl_creation,
+                    &mut None,
+                )
+                .map(|()| (meta, flags))
+            })
+            .transpose()?;
+        let (meta, flags) = resolved
+            .as_ref()
+            .map_or((meta, flags), |(meta, flags)| (meta, *flags));
         check_destination_writes(&file, &src)?;
         if let Some(expected) = expected {
             if !checked_early {
@@ -2813,6 +2862,12 @@ impl FsOps {
         // HashAndHold's next request must consume the retained descriptor.
         // Any other request means the controller abandoned that comparison
         // (for example because the source hash failed), so release it here.
+        // A small-file batch is carried out with the receiver choosing its
+        // modes, which it records in the batch's puts.
+        let put_results = match req {
+            Request::PutSmallBatch(puts) => Some(self.put_small_batch(puts)),
+            _ => None,
+        };
         let r: Result<Response> = match &req {
             Request::DescriptorCopy(operation) => {
                 if !self.source_roots.is_empty() || self.destination_root.is_some() {
@@ -2831,6 +2886,7 @@ impl FsOps {
                 selection,
                 sparse,
                 destination,
+                default_acl_creation,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -2840,6 +2896,7 @@ impl FsOps {
                 validation.map(|()| {
                     self.inode_preservation = *selection;
                     self.sparse = *sparse;
+                    self.default_acl_creation = *default_acl_creation;
                     Response::Ok
                 })
             }
@@ -2957,19 +3014,6 @@ impl FsOps {
             } => self
                 .destination_filesystem_info(*check_empty, target.as_ref())
                 .map(Response::DestinationFilesystemInfo),
-            Request::DefaultPermissions { paths, guard } => paths
-                .iter()
-                .map(|path| {
-                    let target = self.destination_mutation_target(path, guard.as_ref())?;
-                    let directory = target.root.open_metadata(&target.relative)?;
-                    anyhow::ensure!(
-                        directory.metadata()?.is_dir(),
-                        "creation parent is not a directory"
-                    );
-                    crate::inode_metadata::default_permissions(&directory)
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Response::DefaultPermissions),
             Request::PruneLookup { paths, guard } => (|| {
                 #[cfg(debug_assertions)]
                 record_test_event(
@@ -3036,7 +3080,17 @@ impl FsOps {
                 parallel_map(directories, |(path, condition)| {
                     (|| {
                         let target = self.destination_mutation_target(path, guard.as_ref())?;
-                        widen_directory(&target.root, &target.relative, *condition, &target.label)
+                        let widened = widen_directory(
+                            &target.root,
+                            &target.relative,
+                            *condition,
+                            &target.label,
+                        )?;
+                        if let Some(widened) = &widened {
+                            self.receiver_directories
+                                .widened((widened.dev, widened.ino), widened.mode);
+                        }
+                        Ok(widened)
                     })()
                     .map_err(|error| wire_error(&error))
                 }),
@@ -3053,24 +3107,29 @@ impl FsOps {
                 inplace,
                 copy_id,
                 mode,
+                flags,
+                acl,
                 attempt,
                 create_if_missing,
                 guard,
             } => self
-                .prepare(
-                    PartialTarget {
-                        path,
-                        id: copy_id,
-                        guard: guard.as_ref(),
-                    },
-                    PrepareOptions {
-                        size: *size,
-                        inplace: *inplace,
-                        mode: *mode,
-                        attempt: *attempt,
-                        create_if_missing: *create_if_missing,
-                    },
-                )
+                .creation_mode(path, guard.as_ref(), *inplace, *mode, *flags, *acl)
+                .and_then(|mode| {
+                    self.prepare(
+                        PartialTarget {
+                            path,
+                            id: copy_id,
+                            guard: guard.as_ref(),
+                        },
+                        PrepareOptions {
+                            size: *size,
+                            inplace: *inplace,
+                            mode,
+                            attempt: *attempt,
+                            create_if_missing: *create_if_missing,
+                        },
+                    )
+                })
                 .map(Response::Prepared),
             Request::HashAndHold {
                 off,
@@ -3269,7 +3328,7 @@ impl FsOps {
             Request::PatchData { data, hash } => self.patch_stream_data(data, *hash),
             Request::PatchEnd { commit } => self.end_patch_stream(*commit),
             Request::PutSmallBatch(puts) => {
-                let results = self.put_small_batch(puts);
+                let results = put_results.expect("a small-file batch was carried out");
                 if puts.iter().any(|p| p.flags & flags::REPORT_IDENTITY != 0) {
                     Ok(Response::PublishedBatch(results))
                 } else {
@@ -3348,6 +3407,7 @@ impl FsOps {
                 copy_id,
                 meta,
                 flags,
+                created,
                 condition,
                 guard,
             } => self
@@ -3358,6 +3418,7 @@ impl FsOps {
                     copy_id,
                     meta,
                     *flags,
+                    *created,
                     TargetMutation {
                         condition: *condition,
                         guard: guard.as_ref(),
@@ -3599,7 +3660,7 @@ pub(crate) fn staged_file_mode(meta: &Meta, flags: u8) -> u32 {
 /// The same from the parts a sender has at hand, without cloning the
 /// file's metadata.
 pub(crate) fn staged_mode(mode: u32, flags: u8, acl: bool) -> u32 {
-    if flags & flags::MODE_MASK != 0 && flags & flags::GROUP == 0 && !acl {
+    if flags & flags::MODE != 0 && flags & flags::GROUP == 0 && !acl {
         mode & 0o777
     } else {
         PRIVATE_PARTIAL_MODE
@@ -4015,7 +4076,7 @@ fn fail_writer_close_for_test(label: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn set_meta_file(f: &File, meta: &Meta, flags: u8) -> Result<()> {
-    if flags & (flags::MODE_MASK | flags::OWNER | flags::GROUP | flags::TIMES) == 0
+    if flags & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES) == 0
         && meta.inode_metadata.is_none()
     {
         return Ok(());
@@ -4120,9 +4181,9 @@ fn set_meta_file_inner(
         f,
         meta.inode_metadata.as_deref(),
         meta.mode,
-        flags & flags::MODE_MASK != 0,
+        flags & flags::MODE != 0,
     )?;
-    if flags & flags::MODE_MASK != 0 && !atomic_acl_mode {
+    if flags & flags::MODE != 0 && !atomic_acl_mode {
         // On network filesystems every setattr is a round trip; skip it when
         // the mode is already right. Always run it for set-id bits after a
         // chown, which clears them, and when the metadata predates a write,

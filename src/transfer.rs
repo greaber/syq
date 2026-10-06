@@ -231,7 +231,6 @@ pub struct Opts {
     dry_run_metadata_files: AtomicU64,
     pub quiet: bool,
     pub verbose: u8,
-    pub umask: u32,
     pub copy_id: CopyId,
     /// gitignore-style patterns applied to every source (see scan.rs).
     pub ignore: Vec<String>,
@@ -629,6 +628,7 @@ pub fn connect_ctl(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> {
         },
         args.sparse,
         false,
+        args.interface == Interface::Rsync,
     )?;
     Ok(connection)
 }
@@ -638,13 +638,15 @@ fn configure_preservation(
     selection: crate::inode_metadata::Selection,
     sparse: bool,
     destination: bool,
+    default_acl_creation: bool,
 ) -> Result<()> {
-    if selection.any() || selection.open_noatime || sparse {
+    if selection.any() || selection.open_noatime || sparse || default_acl_creation {
         connection.send_expecting_ok(
             Request::ConfigurePreservation {
                 selection,
                 sparse,
                 destination,
+                default_acl_creation,
             },
             "configure inode metadata preservation",
         )?;
@@ -703,14 +705,15 @@ pub(crate) fn validate_native_source_type(
     }
 }
 
-/// Mode a fresh destination file is created with: the source mode under -p,
-/// otherwise the source mode minus the umask (rsync semantics).
-fn fresh_file_mode(opts: &Opts, entry: &Entry) -> u32 {
-    if opts.perms {
-        entry.mode & 0o7777
-    } else {
-        entry.mode & 0o777 & !opts.umask
-    }
+/// The mode a file at `rel` is published with: a mapping's explicit mode, or
+/// the source's. Without -p the source's only proposes the mode the
+/// receiver chooses (see `flags::RECEIVER_MODE`).
+fn file_mode(opts: &Opts, rel: &[u8], entry: &Entry) -> u32 {
+    opts.mapping_metadata
+        .get(rel)
+        .and_then(|metadata| metadata.mode)
+        .unwrap_or(entry.mode)
+        & 0o7777
 }
 
 /// Outcome of the bounded small push attempted before the ordinary engine
@@ -1098,7 +1101,7 @@ fn attempt_small_copy(
         .zip(&targets)
         .map(|((entry, source), (dst_path, _, _))| {
             let mut meta = entry.meta();
-            meta.mode = fresh_file_mode(opts, entry);
+            meta.mode = entry.mode & 0o7777;
             SmallCopyFile {
                 path: dst_path.clone(),
                 size: entry.size,
@@ -2170,7 +2173,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: args.quiet,
         verbose: if args.quiet { 0 } else { args.verbose },
-        umask: crate::fsops::process_umask(),
         copy_id: crate::resume::fresh_copy_id()?,
         ignore: args.ignore_lines.clone(),
         delete: args.delete,
@@ -2335,7 +2337,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         )?;
     }
     if opts.inode_preservation.crtimes {
-        configure_preservation(&mut *dst_ctl, opts.inode_preservation, opts.sparse, true)?;
+        configure_preservation(
+            &mut *dst_ctl,
+            opts.inode_preservation,
+            opts.sparse,
+            true,
+            opts.rsync_creation,
+        )?;
     }
     if debug() {
         crate::output::diagnostic!(
@@ -2592,8 +2600,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
-                    configure_preservation(&mut *src, opts.inode_preservation, opts.sparse, false)?;
-                    configure_preservation(&mut *dst, opts.inode_preservation, opts.sparse, true)?;
+                    configure_preservation(
+                        &mut *src,
+                        opts.inode_preservation,
+                        opts.sparse,
+                        false,
+                        false,
+                    )?;
+                    configure_preservation(
+                        &mut *dst,
+                        opts.inode_preservation,
+                        opts.sparse,
+                        true,
+                        opts.rsync_creation,
+                    )?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)
                         && (!opts.src_remote || src.transport_paced())
@@ -3430,23 +3450,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // A directory target takes a contents source's metadata, which the
     // planner sends only once it has scanned the source root. Create the
     // root private until its group and mode have landed. The value is the
-    // mode it would otherwise have been created with. A restricted receiver
-    // chooses its default modes itself, so there only a source mode counts.
+    // mode it would otherwise have been created with.
     let private_root = (create_root
         && dst_is_dir
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && srcs.iter().any(Location::copies_contents)
-        && if opts.restricted_receiver {
-            opts.perms
+        && opts.flags & (flags::MODE | flags::GROUP) != 0)
+        .then_some(if use_operator_anchor && opts.rsync_creation {
+            0o777
         } else {
-            opts.flags & (flags::MODE | flags::GROUP) != 0
-        })
-    .then_some(if use_operator_anchor && opts.rsync_creation {
-        0o777
-    } else {
-        0o755
-    });
+            0o755
+        });
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories
@@ -3528,8 +3543,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             &dst_root,
             root_create_condition,
-            opts.restricted_receiver,
-            opts.perms,
             private_root.is_some(),
         )?;
         mutation_root_condition = target_identity(&created);
@@ -3857,7 +3870,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
 
     let mut st = Planner {
-        default_permissions: Default::default(),
         dst: &mut *dst_ctl,
         sched: &sched,
         progress: &progress,
@@ -3906,7 +3918,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             std::collections::HashSet::new()
         },
         private_root,
-        root_default_mode: None,
         mapping_mode: false,
         create_root: if defer_operator_directory_creation {
             Some((
@@ -4652,28 +4663,6 @@ fn stat_many_registered(
     }
 }
 
-fn default_permissions(
-    conn: &mut dyn Conn,
-    mut paths: Vec<PathBytes>,
-    guard: Option<ContainerGuard>,
-) -> Result<Vec<u32>> {
-    if paths.len() > 1 && paths.iter().map(|p| p.len() + 8).sum::<usize>() > SOURCE_BATCH_PATH_BYTES
-    {
-        let tail = paths.split_off(paths.len() / 2);
-        let mut modes = default_permissions(conn, paths, guard.clone())?;
-        modes.extend(default_permissions(conn, tail, guard)?);
-        return Ok(modes);
-    }
-    let count = paths.len();
-    match ok(
-        conn.call(Request::DefaultPermissions { paths, guard })?,
-        "read destination creation permissions",
-    )? {
-        Response::DefaultPermissions(modes) if modes.len() == count => Ok(modes),
-        other => bail!("unexpected creation permissions response {other:?}"),
-    }
-}
-
 fn target_identity(entry: &Entry) -> TargetCondition {
     TargetCondition::Matches {
         dev: entry.dev,
@@ -4710,21 +4699,16 @@ fn mkdir_root(
     conn: &mut dyn Conn,
     dst_root: &[u8],
     condition: TargetCondition,
-    restricted_receiver: bool,
-    preserve_permissions: bool,
     private: bool,
 ) -> Result<Entry> {
-    for ops in mkdir_root_batches(
-        dst_root,
+    let ops = vec![Op::Mkdir {
+        path: dst_root.to_vec(),
+        mode: if private { 0o700 } else { 0o755 },
         condition,
-        restricted_receiver,
-        preserve_permissions,
-        private,
-    ) {
-        match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
-            Response::Applied(errs) => mkdir_apply_result(errs)?,
-            other => bail!("unexpected response {other:?}"),
-        }
+    }];
+    match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
+        Response::Applied(errs) => mkdir_apply_result(errs)?,
+        other => bail!("unexpected response {other:?}"),
     }
     stat_one(conn, dst_root, false)?
         .filter(|entry| entry.kind == Kind::Dir)
@@ -4736,63 +4720,6 @@ fn mkdir_apply_result(errors: Vec<Option<WireError>>) -> Result<()> {
         return Err(endpoint_error(error)).context("mkdir");
     }
     Ok(())
-}
-
-fn mkdir_root_batches(
-    dst_root: &[u8],
-    condition: TargetCondition,
-    restricted_receiver: bool,
-    preserve_permissions: bool,
-    private: bool,
-) -> Vec<Vec<Op>> {
-    let mut batches = vec![vec![Op::Mkdir {
-        path: dst_root.to_vec(),
-        mode: if private { 0o700 } else { 0o755 },
-        condition,
-    }]];
-    if restricted_receiver && !preserve_permissions {
-        // Keep this in a later receiver call. The restricted authority must
-        // observe the directory after Mkdir so it can distinguish HostB's
-        // kernel-inherited setgid bit from HostA's untrusted mode proposal.
-        batches.push(vec![Op::SetMeta {
-            path: dst_root.to_vec(),
-            meta: Meta {
-                inode_metadata: None,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
-                mtime: 0,
-                mtime_nsec: 0,
-            },
-            flags: flags::RECEIVER_MODE,
-            condition: TargetCondition::Any,
-        }]);
-    }
-    batches
-}
-
-fn directory_creation_batches(ops: Vec<Op>, restricted_receiver: bool) -> Vec<Vec<Op>> {
-    if ops.is_empty() {
-        return Vec::new();
-    }
-    if !restricted_receiver {
-        return vec![ops];
-    }
-
-    // A restricted receiver authorizes the whole request before executing any
-    // operation in it. Send parents first so receiver-side mode policy can
-    // inspect every child path without depending on an unexecuted Mkdir from
-    // the same request. Siblings retain the existing parallel batch behavior.
-    let mut by_depth: std::collections::BTreeMap<usize, Vec<Op>> =
-        std::collections::BTreeMap::new();
-    for op in ops {
-        let Op::Mkdir { path, .. } = &op else {
-            unreachable!("directory creation batch contains a non-Mkdir operation")
-        };
-        let depth = path.iter().filter(|&&byte| byte == b'/').count();
-        by_depth.entry(depth).or_default().push(op);
-    }
-    by_depth.into_values().collect()
 }
 
 /// Lexically canonical spelling of a root path: `.` components and duplicate

@@ -471,6 +471,13 @@ impl FsOps {
             stage.file.set_len(stream.patch.len)?;
         }
         check_destination_writes(&stage.file, &stage.label)?;
+        crate::fsops::receiver_mode::resolve_file_publication(
+            &stage.target,
+            &mut stream.put.meta,
+            &mut stream.put.flags,
+            self.default_acl_creation,
+            &mut None,
+        )?;
         set_meta_written_file_for_publication(
             &stage.file,
             &stream.put.meta,
@@ -480,9 +487,9 @@ impl FsOps {
         .with_context(|| format!("set metadata {}", stage.label.display()))?;
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&stage.target.label)?;
-        // The file the patch reused may have changed its condition while
-        // the data arrived, as keeping another name of it does: the file is
-        // then compared again, as a batch patch's would be.
+        // The file the patch reused may no longer meet its condition after
+        // the data arrived: the file is then compared again, as a batch
+        // patch's would be.
         if stream.patch.condition != TargetCondition::Any {
             if let Err(error) = observe_rooted_condition(&stage.target, stream.patch.condition) {
                 stream.stale = true;

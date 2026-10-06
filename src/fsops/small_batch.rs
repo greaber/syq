@@ -601,7 +601,7 @@ impl FsOps {
         }
         for (position, result) in positions
             .into_iter()
-            .zip(self.put_small_sources(&puts, &sources, true))
+            .zip(self.put_small_sources(&mut puts, &sources, true))
         {
             results[position] = result
                 .map(|identity| SmallPatched {
@@ -621,9 +621,7 @@ impl FsOps {
     /// A file found to match whose keeping fails is reported as matched, so
     /// the copy does not rewrite the same contents. A file whose blocks the
     /// patch reuses but that no longer meets its target condition is
-    /// reported as stale, before anything is kept or written: keeping
-    /// another name of the same file, say, changes the change time a
-    /// restricted receiver's condition holds.
+    /// reported as stale, before anything is kept or written.
     fn prepare_patch<'a>(
         &mut self,
         patch: &'a SmallPatch,
@@ -873,7 +871,7 @@ impl FsOps {
         Ok(())
     }
 
-    pub(super) fn put_small_batch(&mut self, puts: &[SmallPut]) -> Vec<SmallOutcome> {
+    pub(super) fn put_small_batch(&mut self, puts: &mut [SmallPut]) -> Vec<SmallOutcome> {
         self.put_small_sources(puts, &[], false)
     }
 
@@ -882,15 +880,20 @@ impl FsOps {
     /// whose data was checked as it arrived, carry no payload hash to check.
     fn put_small_sources(
         &mut self,
-        puts: &[SmallPut],
+        puts: &mut [SmallPut],
         sources: &[Option<PatchSource<'_>>],
         built: bool,
     ) -> Vec<SmallOutcome> {
         let mut results: Vec<SmallOutcome> = vec![Ok(None); puts.len()];
         let mut carried = None;
         let mut next = 0;
+        // The directory of the last name whose mode this receiver chose.
+        let mut held = None;
         while next < puts.len() || carried.is_some() {
             if carried.is_none() && puts[next].inplace {
+                // Written in place, a new file is created from the proposal,
+                // which its creation limits, and an existing one keeps its mode.
+                puts[next].flags &= !flags::RECEIVER_MODE;
                 results[next] = self
                     .put_small(&puts[next])
                     .map_err(|error| wire_error(&error));
@@ -915,6 +918,18 @@ impl FsOps {
                 } else {
                     self.small_target(&puts[index])
                 };
+                let put = &mut puts[index];
+                let default_acl = self.default_acl_creation;
+                let target = target.and_then(|target| {
+                    receiver_mode::resolve_file_publication(
+                        &target,
+                        &mut put.meta,
+                        &mut put.flags,
+                        default_acl,
+                        &mut held,
+                    )
+                    .map(|()| target)
+                });
                 let target = match target {
                     Ok(target) => target,
                     Err(error) => {
@@ -937,7 +952,7 @@ impl FsOps {
                 }
                 run.push((index, target));
             }
-            self.put_small_run(puts, sources, built, run, &mut results);
+            self.put_small_run(&*puts, sources, built, run, &mut results);
         }
         results
     }
@@ -2000,7 +2015,7 @@ mod tests {
             whole.meta = patch.meta.clone();
             whole.flags = patch.flags;
             whole.replaces = true;
-            let failed = without_space(|| ops.put_small_batch(&[whole]));
+            let failed = without_space(|| ops.put_small_batch(&mut [whole]));
             assert!(failed[0].is_err(), "{case}: {:?}", failed[0]);
             let target = ops.destination_mutation_target(b"file", None).unwrap();
             let (relative, _) = rooted_partial_target(&target, &patch.copy_id).unwrap();
@@ -2135,11 +2150,11 @@ mod tests {
         let large = vec![7; PREALLOCATE_MIN_STAGE as usize];
         let small = &large[1..];
         let results =
-            without_space(|| ops.put_small_batch(&[put("large", &large), put("small", small)]));
+            without_space(|| ops.put_small_batch(&mut [put("large", &large), put("small", small)]));
         assert!(results[0].as_ref().is_err_and(full), "{:?}", results[0]);
         assert_eq!(results[1], Ok(None));
         ops.sparse = true;
-        let results = without_space(|| ops.put_small_batch(&[put("sparse", &large)]));
+        let results = without_space(|| ops.put_small_batch(&mut [put("sparse", &large)]));
         assert_eq!(results[0], Ok(None));
         ops.sparse = false;
         // A failed file leaves its sidecar for the next attempt to reuse.
@@ -2485,7 +2500,7 @@ mod tests {
                 .collect();
             puts[61].data[0] ^= 1;
             puts[130].path = b"missing/f130".to_vec();
-            let results = receiver(temporary.path()).put_small_batch(&puts);
+            let results = receiver(temporary.path()).put_small_batch(&mut puts);
             assert_eq!(results.len(), puts.len());
             for (i, (put, result)) in puts.iter().zip(results).enumerate() {
                 let path = temporary.path().join(OsStr::from_bytes(&put.path));
@@ -2510,7 +2525,7 @@ mod tests {
     fn a_repeated_target_is_published_before_it_is_staged_again() {
         // The third case repeats a target immediately after a run break, so
         // the carried target is the one that must not be joined.
-        for (puts, files) in [
+        for (mut puts, files) in [
             (
                 vec![
                     put("file", b"a long first version"),
@@ -2540,7 +2555,7 @@ mod tests {
             for name in ["a", "b"] {
                 fs::create_dir(temporary.path().join(name)).unwrap();
             }
-            let results = receiver(temporary.path()).put_small_batch(&puts);
+            let results = receiver(temporary.path()).put_small_batch(&mut puts);
             assert_eq!(results, vec![Ok(None); puts.len()]);
             let last = puts.last().unwrap();
             assert_eq!(
@@ -2565,13 +2580,13 @@ mod tests {
             .ino();
         let mut inplace = put("inplace", b"written through the old inode");
         inplace.inplace = true;
-        let puts = [
+        let mut puts = [
             put("new", b"new"),
             put("existing", b"replacement"),
             inplace,
             put("after", b"after"),
         ];
-        let results = receiver(temporary.path()).put_small_batch(&puts);
+        let results = receiver(temporary.path()).put_small_batch(&mut puts);
         assert_eq!(results, vec![Ok(None); 4]);
         for (name, contents) in [
             ("new", &b"new"[..]),
@@ -2618,7 +2633,7 @@ mod tests {
                     };
                     let mut ops = receiver(temporary.path());
                     let result = if batched {
-                        ops.put_small_batch(&[put]).pop().unwrap()
+                        ops.put_small_batch(&mut [put]).pop().unwrap()
                     } else {
                         ops.put_small(&put).map_err(|error| wire_error(&error))
                     };
@@ -2683,7 +2698,7 @@ mod tests {
         // planted at the name receives the copy's data.
         let temporary = crate::test_support::tempdir().unwrap();
         let mut ops = receiver(temporary.path());
-        let wanted = put("file", b"contents");
+        let mut wanted = put("file", b"contents");
         let target = ops.small_target(&wanted).unwrap();
         let (relative, _) = rooted_partial_target(&target, &wanted.copy_id).unwrap();
         let sidecar = temporary.path().join(relative.to_path_buf());
@@ -2719,7 +2734,7 @@ mod tests {
                 "data" => fs::write(&sidecar, b"an earlier attempt").unwrap(),
                 _ => unreachable!(),
             }
-            let outcomes = ops.put_small_batch(std::slice::from_ref(&wanted));
+            let outcomes = ops.put_small_batch(std::slice::from_mut(&mut wanted));
             outcomes[0]
                 .as_ref()
                 .unwrap_or_else(|error| panic!("{planted}: {error}"));
@@ -2865,7 +2880,7 @@ mod tests {
                 drop(stage);
                 fs::remove_file(temporary.path().join("file")).unwrap();
             }
-            let outcomes = ops.put_small_batch(std::slice::from_ref(&wanted));
+            let outcomes = ops.put_small_batch(std::slice::from_mut(&mut wanted));
             let published = fs::metadata(temporary.path().join("file")).unwrap();
             assert_eq!(
                 outcomes[0].as_ref().unwrap(),
@@ -2936,10 +2951,10 @@ mod tests {
     fn a_batch_completes_when_bursts_may_hold_no_further_descriptors() {
         let temporary = crate::test_support::tempdir().unwrap();
         let exhausted = ReservedDescriptors::up_to(usize::MAX);
-        let puts: Vec<_> = (0..10)
+        let mut puts: Vec<_> = (0..10)
             .map(|i| put(&format!("f{i}"), format!("data{i}").as_bytes()))
             .collect();
-        let results = receiver(temporary.path()).put_small_batch(&puts);
+        let results = receiver(temporary.path()).put_small_batch(&mut puts);
         assert_eq!(results, vec![Ok(None); 10]);
         assert_eq!(entries(temporary.path()), 10);
         let held = exhausted.0;

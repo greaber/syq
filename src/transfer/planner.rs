@@ -2,7 +2,6 @@ use super::*;
 
 pub(super) struct Planner<'a> {
     /// Bounded parent cache, only for newly created rsync leaves without -p.
-    pub(super) default_permissions: std::collections::HashMap<PathBytes, u32>,
     pub(super) directory_expression_sources: std::collections::HashMap<PathBytes, PathBytes>,
     pub(super) unselected_dirs: std::collections::HashSet<PathBytes>,
     pub(super) dst: &'a mut dyn Conn,
@@ -76,9 +75,6 @@ pub(super) struct Planner<'a> {
     /// metadata reaches it: the mode it would otherwise have been created
     /// with, for when that metadata sets no mode.
     pub(super) private_root: Option<u32>,
-    /// What that creation mode would have given the private root on its
-    /// ordinary receiver, once asked.
-    pub(super) root_default_mode: Option<u32>,
     /// This run consumes a --mapping manifest (identity entries included).
     pub(super) mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
@@ -329,9 +325,8 @@ struct EarlyMetadata {
     existing: Vec<Op>,
     /// For new directories and a private root, sent with the creations.
     created: Vec<Op>,
-    /// A private destination root whose final metadata sets no mode, as
-    /// observed after creation, and whether its group changes.
-    root_default: Option<(Entry, bool)>,
+    /// A private destination root whose final metadata sets no mode.
+    root_default: bool,
 }
 
 /// One scanned batch after the mapping loop: every destination claimed,
@@ -1562,14 +1557,7 @@ impl Planner<'_> {
                     .expect("destination anchor set once");
             } else {
                 debug_assert!(is_destination_root);
-                let created = mkdir_root(
-                    self.dst,
-                    &root,
-                    condition,
-                    self.opts.restricted_receiver,
-                    self.opts.perms,
-                    self.private_root.is_some(),
-                )?;
+                let created = mkdir_root(self.dst, &root, condition, self.private_root.is_some())?;
                 self.mutation_root_condition = target_identity(&created);
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));
@@ -1701,41 +1689,6 @@ impl Planner<'_> {
                 dst_root,
             )?
         };
-        if opts.rsync_creation && !opts.perms && !opts.dry_run {
-            // Jobs retain the resolved mode, so old parents need not accumulate
-            // with the full directory tree. A wide batch adds at most BATCH more.
-            if self.default_permissions.len() >= crate::scan::BATCH {
-                self.default_permissions.clear();
-            }
-            let parents: std::collections::BTreeSet<_> = others
-                .iter()
-                .zip(&stats)
-                .filter(|(p, existing)| {
-                    p.e.kind != Kind::Symlink
-                        && !self.skip_existing(existing)
-                        && !((opts.existing || opts.ignore_existing)
-                            && self.under_missing_dir(&p.dst, dst_root))
-                        && !(p.e.kind == Kind::File
-                            && (opts.max_size.is_some_and(|m| p.e.size > m)
-                                || opts.min_size.is_some_and(|m| p.e.size < m)))
-                        && existing.as_ref().is_none_or(|d| {
-                            d.kind != p.e.kind || (p.e.kind != Kind::File && d.rdev != p.e.rdev)
-                        })
-                })
-                .map(|(p, _)| parent_path(&p.dst))
-                .filter(|parent| !self.default_permissions.contains_key(parent))
-                .collect();
-            for paths in parents
-                .into_iter()
-                .collect::<Vec<_>>()
-                .chunks(crate::scan::BATCH)
-            {
-                let modes =
-                    default_permissions(self.dst, paths.to_vec(), self.container_guard.clone())?;
-                self.default_permissions
-                    .extend(paths.iter().cloned().zip(modes));
-            }
-        }
         let mut leaf_ops = LeafOps::default();
         for (p, dst_entry) in others.into_iter().zip(stats) {
             let target_condition = self.exact_condition_for(&p.dst);
@@ -2324,21 +2277,20 @@ impl Planner<'_> {
             kind: "special",
             name: rel,
         });
+        let meta = opts.metadata_for(&dst_rel, &e);
+        let flags = opts.flags_for(&dst_rel);
+        // Without a mode to apply, the node takes the source's permission
+        // bits as creating it limits them, and none of its special bits.
         leaf_ops.ops.push(Op::Mknod {
             path: dst_path.clone(),
-            mode: e.mode,
+            mode: if flags & flags::MODE == 0 {
+                e.mode & !0o7000
+            } else {
+                e.mode
+            },
             rdev: e.rdev,
             condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
         });
-        let mut meta = opts.metadata_for(&dst_rel, &e);
-        let mut flags = opts.flags_for(&dst_rel);
-        if flags & flags::MODE == 0 {
-            meta.mode = self
-                .creation_mode(&dst_path, &e)
-                .map(u32::from)
-                .unwrap_or(e.mode & 0o777 & !opts.umask);
-            flags |= flags::RECEIVER_MODE;
-        }
         leaf_ops.ops.push(Op::SetMeta {
             condition: TargetCondition::Any,
             path: dst_path,
@@ -2447,23 +2399,21 @@ impl Planner<'_> {
     /// its owner and group follow before anything is published into it (see
     /// `early_directory_metadata`). While an ACL is pending it is private
     /// instead, since entries inherited from a default ACL could reach its
-    /// contents. A restricted receiver takes no early metadata, so there a
-    /// pending group keeps it private too. Containers and implicit parents
-    /// receive no later metadata, so their creation mode is final.
+    /// contents. Containers and implicit parents receive no later metadata,
+    /// so their creation mode is final. Without a mode to apply, a directory
+    /// takes the source's permission bits as creating it limits them.
     fn new_directory_mode(&self, path: &[u8], dst_rel: &[u8], entry: &Entry) -> u32 {
         let flags = self.opts.flags_for(dst_rel);
         if self.unselected_dirs.contains(path) {
             0o777
         } else if self.implicit_dirs.contains(path) {
             entry.mode
-        } else if crate::fsops::has_acl(entry.inode_metadata.as_deref())
-            || (self.opts.restricted_receiver && flags & flags::GROUP != 0)
-        {
+        } else if crate::fsops::has_acl(entry.inode_metadata.as_deref()) {
             0o700
         } else if flags & flags::MODE != 0 {
             self.final_directory_mode(dst_rel, entry)
         } else {
-            entry.mode
+            entry.mode & 0o777
         }
     }
 
@@ -2479,9 +2429,7 @@ impl Planner<'_> {
     /// wider than final. A private destination root takes its final group,
     /// owner and mode, with owner access, unless its ACL is still pending.
     /// The rest of the final metadata follows at the end, which also reports
-    /// any failure here. A restricted receiver authorizes a request before
-    /// running it and keeps its own directories private, so it takes only
-    /// the narrowing.
+    /// any failure here.
     fn early_directory_metadata(&mut self, planned: &[PlannedDir]) -> Result<EarlyMetadata> {
         let opts = self.opts;
         let mut early = EarlyMetadata::default();
@@ -2492,11 +2440,8 @@ impl Planner<'_> {
                 && path == &self.dst_root
                 && self.private_root.is_some()
                 && self.created_dirs.contains(path)
-                && !opts.restricted_receiver
             {
-                if let Some(d) = destination.as_ref().filter(|d| d.kind == Kind::Dir) {
-                    early.root_default = Some((d.clone(), false));
-                }
+                early.root_default = destination.as_ref().is_some_and(|d| d.kind == Kind::Dir);
                 continue;
             }
             if self.implicit_dirs.contains(path) || self.unselected_dirs.contains(path) {
@@ -2522,17 +2467,14 @@ impl Planner<'_> {
             // one needs a change only if its group differs.
             let group_changes =
                 flags & flags::GROUP != 0 && existing.is_none_or(|d| d.gid != meta.gid);
-            if group_changes && !opts.restricted_receiver {
+            if group_changes {
                 early_flags |= flags & (flags::GROUP | flags::REQUIRE_GROUP);
                 // Ownership changes in one call, so move the owner along.
                 if existing.is_none_or(|d| d.uid != meta.uid) {
                     early_flags |= flags & (flags::OWNER | flags::REQUIRE_OWNER);
                 }
             }
-            let private_root = created
-                && path == &self.dst_root
-                && self.private_root.is_some()
-                && !opts.restricted_receiver;
+            let private_root = created && path == &self.dst_root && self.private_root.is_some();
             let acl = crate::fsops::has_acl(entry.inode_metadata.as_deref());
             let mut mode = 0;
             if let Some(d) = existing {
@@ -2548,7 +2490,7 @@ impl Planner<'_> {
                             | (current & 0o2000);
                         early_flags |= flags::MODE;
                     } else {
-                        early.root_default = Some((d.clone(), group_changes));
+                        early.root_default = true;
                     }
                 } else if flags & flags::MODE != 0 {
                     let wanted = if created && acl {
@@ -2598,57 +2540,28 @@ impl Planner<'_> {
         Ok(early)
     }
 
-    /// The mode the private destination root would have been created with:
-    /// its proposed mode limited by the receiver's umask or by the default
-    /// ACL it inherited (its own default ACL is its parent's), and the
-    /// setgid bit it inherited when it was created.
-    fn root_default_mode(&mut self, created: &Entry) -> Result<u32> {
-        if let Some(mode) = self.root_default_mode {
-            return Ok(mode);
-        }
+    /// Give a private destination root whose final metadata sets no mode the
+    /// mode it would have been created with, after its group change. The
+    /// receiver chooses it, as for a directory created that way, keeping the
+    /// setgid bit only if that change left it, so its subdirectories inherit
+    /// what they would have.
+    fn open_private_root(&mut self) -> Result<()> {
         let proposed = self
             .private_root
             .context("the destination root was not created private")?;
-        let permitted = default_permissions(
-            self.dst,
-            vec![self.dst_root.clone()],
-            self.container_guard.clone(),
-        )?
-        .pop()
-        .context("no creation permissions reported for the destination root")?;
-        let mode = (proposed & permitted & 0o777) | (created.mode & 0o2000);
-        self.root_default_mode = Some(mode);
-        Ok(mode)
-    }
-
-    /// Give a private destination root whose final metadata sets no mode the
-    /// mode it would have been created with, after its group change. Like a
-    /// directory created that way, it keeps the setgid bit only if that
-    /// change left it, so its subdirectories inherit what they would have.
-    fn open_private_root(&mut self, created: &Entry, group_changed: bool) -> Result<()> {
-        let default = self.root_default_mode(created)?;
-        let current = if group_changed {
-            stat_many(self.dst, vec![self.dst_root.clone()], false)?
-                .pop()
-                .flatten()
-                .filter(|entry| entry.kind == Kind::Dir)
-                .context("destination root was not a directory after its group change")?
-        } else {
-            created.clone()
-        };
         let root = self.dst_root.clone();
         let condition = self.metadata_condition_for(&root);
         self.apply(vec![Op::SetMeta {
             path: root,
             meta: Meta {
-                mode: (default & 0o777) | (current.mode & 0o2000),
+                mode: proposed,
                 uid: 0,
                 gid: 0,
                 mtime: 0,
                 mtime_nsec: 0,
                 inode_metadata: None,
             },
-            flags: flags::MODE,
+            flags: flags::RECEIVER_MODE,
             condition,
         }])?;
         Ok(())
@@ -2739,7 +2652,11 @@ impl Planner<'_> {
         }
         // A receiver applies a request's metadata after all of its
         // creations, so new directories take their group with the last ones.
-        let mut batches = directory_creation_batches(new_dirs, opts.restricted_receiver);
+        let mut batches = if new_dirs.is_empty() {
+            Vec::new()
+        } else {
+            vec![new_dirs]
+        };
         match batches.last_mut() {
             Some(last) => last.append(&mut early.created),
             None if !early.created.is_empty() => {
@@ -2821,8 +2738,8 @@ impl Planner<'_> {
                 return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
-        if let Some((root, group_changed)) = early.root_default.take() {
-            self.open_private_root(&root, group_changed)?;
+        if std::mem::take(&mut early.root_default) {
+            self.open_private_root()?;
         }
         Ok(true)
     }
@@ -2896,43 +2813,23 @@ impl Planner<'_> {
             if self.unselected_dirs.contains(p) {
                 // Existing containers keep their metadata. A new private root
                 // receives the mode it would normally have been created with.
-                let private_root = self.private_root.filter(|_| p == &self.dst_root);
-                let mut meta = if (s.is_none() && opts.restricted_receiver && !opts.perms)
-                    || private_root.is_some()
-                {
-                    Meta {
-                        mode: private_root.unwrap_or(0o777),
-                        uid: 0,
-                        gid: 0,
-                        mtime: 0,
-                        mtime_nsec: 0,
-                        inode_metadata: None,
-                    }
-                } else {
-                    continue;
-                };
-                // A root created private gets the mode it would have been
-                // created with. Keeping source permissions, a restricted
-                // receiver accepts only a source-style mode.
-                let flags = if opts.restricted_receiver && !opts.perms {
-                    flags::RECEIVER_MODE
-                } else if private_root.is_some() && opts.restricted_receiver {
-                    meta.mode &= !opts.umask;
-                    flags::MODE
-                } else if private_root.is_some() {
-                    let created = s.as_ref().expect("the private root was observed");
-                    meta.mode = self.root_default_mode(created)?;
-                    flags::MODE
-                } else {
-                    flags::MODE
-                };
-                self.deferred.push((
-                    p.clone(),
-                    meta,
-                    flags,
-                    p.iter().filter(|&&c| c == b'/').count(),
-                    self.metadata_condition_for(p),
-                ));
+                if let Some(proposed) = self.private_root.filter(|_| p == &self.dst_root) {
+                    self.deferred.push((
+                        p.clone(),
+                        Meta {
+                            // Its final mode keeps the setgid bit it inherited.
+                            mode: proposed | 0o2000,
+                            uid: 0,
+                            gid: 0,
+                            mtime: 0,
+                            mtime_nsec: 0,
+                            inode_metadata: None,
+                        },
+                        flags::RECEIVER_MODE,
+                        p.iter().filter(|&&c| c == b'/').count(),
+                        self.metadata_condition_for(p),
+                    ));
+                }
                 continue;
             }
             if self.implicit_dirs.contains(p) {
@@ -2949,19 +2846,13 @@ impl Planner<'_> {
                 opts.flags_for(dst_rel)
             };
             // Existing directories need no mode operation unless metadata was
-            // requested. Actual temporary changes are merged later. New private
-            // roots receive the mode their ordinary creation would have given.
-            if flags & flags::MODE == 0 {
-                let private_root = self.private_root.is_some()
-                    && p == &self.dst_root
-                    && self.created_dirs.contains(p)
-                    && !opts.restricted_receiver;
-                if opts.restricted_receiver && (s.is_none() || self.created_dirs.contains(p)) {
-                    meta.mode = e.mode & 0o777 & !opts.umask;
+            // requested. Actual temporary changes are merged later. A new
+            // private root receives the mode its creation would have given it.
+            if flags & flags::MODE == 0 && p == &self.dst_root && self.created_dirs.contains(p) {
+                if let Some(proposed) = self.private_root {
+                    // Its final mode keeps the setgid bit it inherited.
+                    meta.mode = proposed | 0o2000;
                     flags |= flags::RECEIVER_MODE;
-                } else if let Some(created) = s.as_ref().filter(|_| private_root) {
-                    meta.mode = self.root_default_mode(created)?;
-                    flags |= flags::MODE;
                 }
             }
             self.deferred.push((
@@ -3435,15 +3326,6 @@ impl Planner<'_> {
         false
     }
 
-    fn creation_mode(&self, destination: &[u8], entry: &Entry) -> Option<u16> {
-        if !self.opts.rsync_creation || self.opts.perms {
-            return None;
-        }
-        self.default_permissions
-            .get(&parent_path(destination))
-            .map(|permissions| (entry.mode & permissions & 0o777) as u16)
-    }
-
     pub(super) fn enqueue(
         &mut self,
         source_path: (PathBytes, RegisteredPath),
@@ -3456,7 +3338,6 @@ impl Planner<'_> {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
         let src_rel = self.mapping_source_rel(&rel_bytes);
-        let creation_mode = self.creation_mode(&dst, &entry);
         self.progress.files_total.fetch_add(1, Relaxed);
         self.progress.bytes_total.fetch_add(entry.size, Relaxed);
         self.sched.push_file(FileJob {
@@ -3476,7 +3357,6 @@ impl Planner<'_> {
                 target_condition,
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
-                creation_mode,
                 done: Arc::new(AtomicU64::new(0)),
                 inplace: self.opts.inplace
                     && target_condition == TargetCondition::Any
@@ -4206,12 +4086,12 @@ impl Planner<'_> {
         } else {
             std::mem::take(&mut self.deferred)
         };
-        // The signed grant authorizes either source modes or receiver-managed
-        // modes. Restoration uses the same mode authority as the copy.
-        let restoration_flags = if self.opts.restricted_receiver && !self.opts.perms {
-            flags::RECEIVER_MODE
-        } else {
+        // Without -p the receiver restores the modes of the directories it
+        // widened itself.
+        let restoration_flags = if self.opts.perms {
             flags::MODE
+        } else {
+            flags::RECEIVER_MODE
         };
         let mut remaining = std::mem::take(&mut self.directory_restorations);
         for (path, meta, flags, _, condition) in &mut d {

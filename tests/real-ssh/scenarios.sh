@@ -1087,54 +1087,70 @@ for i in range(8):
     mtime = 1_600_000_000 + (i if i % 2 else 0)
     os.utime(path, (mtime, mtime))
 PY_LINKED_SOURCE
-ssh destination python3 - <<'PY_LINKED_DESTINATION'
-import os
+# One worker, and then four at once, whose requests reach the receiver
+# interleaved. Each name is compared once, and each changed name is sent
+# only its second block. Last, the names are copied whole, several to a
+# request, into a destination of another size.
+for linked_run in 1 4 whole; do
+    linked_size=2
+    linked_workers=$linked_run
+    if [ "$linked_run" = whole ]; then
+        linked_size=3
+        linked_workers=4
+    fi
+    # The fixture path is fixed; only the size comes from this loop.
+    # shellcheck disable=SC2029
+    ssh destination "python3 - $linked_size" <<'PY_LINKED_DESTINATION'
+import os, shutil, sys
 root = '/tmp/syq-real-ssh/linked-destination'
+shutil.rmtree(root, ignore_errors=True)
 os.makedirs(root)
 block = 64 * 1024
 first = f'{root}/name0'
 with open(first, 'wb') as f:
-    f.write(bytes(i % 251 for i in range(2 * block)))
+    f.write(bytes(i % 251 for i in range(int(sys.argv[1]) * block)))
 os.utime(first, (1_500_000_000, 1_500_000_000))
 for i in range(1, 8):
     os.link(first, f'{root}/name{i}')
 with open('/tmp/syq-real-ssh/linked-inode', 'w') as f:
     f.write(str(os.stat(first).st_ino))
 PY_LINKED_DESTINATION
-# One worker, whose requests the receiver carries out in turn: each name is
-# compared once, and each changed name is sent only its second block.
-linked_results=/tmp/syq-real-ssh-linked.ndjson
-linked_debug=/tmp/syq-real-ssh-linked.debug
-if ! SYQ_DEBUG=1 syq cp --copy-metadata=mtime --no-progress \
-    --performance-tuning workers=1 --results "$linked_results" \
-    --from source --srcs-in /tmp/syq-real-ssh/linked-source \
-    --to destination --into /tmp/syq-real-ssh/linked-destination \
-    2>"$linked_debug"; then
-    cat "$linked_debug" >&2
-    exit 1
-fi
-python3 - "$linked_results" "$linked_debug" <<'PY_LINKED_RESULTS'
+    linked_results=/tmp/syq-real-ssh-linked.ndjson
+    linked_debug=/tmp/syq-real-ssh-linked.debug
+    rm -f "$linked_results"
+    if ! SYQ_DEBUG=1 syq cp --copy-metadata=mtime --no-progress \
+        --performance-tuning "workers=$linked_workers" --results "$linked_results" \
+        --from source --srcs-in /tmp/syq-real-ssh/linked-source \
+        --to destination --into /tmp/syq-real-ssh/linked-destination \
+        2>"$linked_debug"; then
+        cat "$linked_debug" >&2
+        exit 1
+    fi
+    python3 - "$linked_results" "$linked_debug" "$linked_run" <<'PY_LINKED_RESULTS'
 import json, sys
 from pathlib import Path
 records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
 assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
 assert records[-1]['errors'] == 0, records[-1]
-assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
-marker = 'syq: tuning observed: '
-observed = [
-    json.loads(line.split(marker, 1)[1])
-    for line in Path(sys.argv[2]).read_text().splitlines()
-    if marker in line
-]
-assert any(
-    (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
-    for counts in observed
-), observed
+if sys.argv[3] != 'whole':
+    assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
+    marker = 'syq: tuning observed: '
+    observed = [
+        json.loads(line.split(marker, 1)[1])
+        for line in Path(sys.argv[2]).read_text().splitlines()
+        if marker in line
+    ]
+    assert any(
+        (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
+        for counts in observed
+    ), observed
 PY_LINKED_RESULTS
-ssh destination python3 - <<'PY_LINKED_CHECK'
-import os
+    # shellcheck disable=SC2029
+    ssh destination "python3 - $linked_run" <<'PY_LINKED_CHECK'
+import os, sys
 root = '/tmp/syq-real-ssh/linked-destination'
 inode = int(open('/tmp/syq-real-ssh/linked-inode').read())
+whole = sys.argv[1] == 'whole'
 block = 64 * 1024
 old = bytes(i % 251 for i in range(2 * block))
 new = old[:block] + bytes([7]) * block
@@ -1144,17 +1160,93 @@ for i in range(8):
     status = os.stat(path)
     with open(path, 'rb') as f:
         contents = f.read()
-    if i % 2:
+    if i % 2 or whole:
         # A replaced name names a new file of its own.
-        assert contents == new and status.st_ino != inode, (i, status)
+        assert contents == (new if i % 2 else old) and status.st_ino != inode, (i, status)
         assert status.st_ino not in replaced, (i, status)
         replaced.add(status.st_ino)
-        assert int(status.st_mtime) == 1_600_000_000 + i, (i, status)
+        assert int(status.st_mtime) == 1_600_000_000 + (i if i % 2 else 0), (i, status)
     else:
         # A kept name still names the file the other kept names share.
         assert contents == old and status.st_ino == inode, (i, status)
         assert int(status.st_mtime) == 1_600_000_000, (i, status)
 PY_LINKED_CHECK
+done
+
+printf 'case: ordinary and restricted receivers choose the same modes\n'
+# The same tree on the runner and on the source: the runner copies it through
+# an ordinary SSH helper, with its own umask narrower than the destination's,
+# and the source through the destination's restricted receiver.
+mode_tree=$(cat <<'PY_MODE_TREE'
+import os, sys
+root = sys.argv[1]
+os.makedirs(root)
+for name, mode in [('new-dir', 0o755), ('read-only-dir', 0o555), ('private-dir', 0o700),
+                   ('sticky-dir', 0o1777), ('existing-dir', 0o777)]:
+    os.mkdir(f'{root}/{name}')
+    with open(f'{root}/{name}/file', 'wb') as f:
+        f.write(name.encode())
+    os.chmod(f'{root}/{name}', mode)
+for name, mode, size in [('script', 0o755, 7), ('secret', 0o600, 7), ('read-only', 0o444, 7),
+                         ('setuid', 0o4755, 7), ('existing', 0o644, 9),
+                         ('large', 0o640, 5 << 20), ('large-read-only', 0o444, 5 << 20)]:
+    with open(f'{root}/{name}', 'wb') as f:
+        f.write(bytes([len(name)]) * size)
+    os.chmod(f'{root}/{name}', mode)
+PY_MODE_TREE
+)
+printf '%s\n' "$mode_tree" | python3 - /tmp/syq-real-ssh-mode-tree
+printf '%s\n' "$mode_tree" | ssh source python3 - /tmp/syq-real-ssh/mode-tree
+for mode_variant in default permissions inplace; do
+    set --
+    case "$mode_variant" in
+        permissions) set -- --copy-metadata=permissions ;;
+        inplace) set -- --inplace ;;
+    esac
+    for mode_receiver in ordinary restricted; do
+        mode_destination=/tmp/syq-real-ssh/modes-$mode_variant-$mode_receiver
+        # The fixture path is set by this loop.
+        # shellcheck disable=SC2029
+        ssh destination "mkdir -m 2775 $mode_destination && mkdir -m 0750 $mode_destination/existing-dir && printf old > $mode_destination/existing && chmod 0600 $mode_destination/existing"
+        if [ "$mode_receiver" = ordinary ]; then
+            (umask 077; syq cp "$@" --no-progress --performance-tuning workers=4 \
+                --srcs-in /tmp/syq-real-ssh-mode-tree --to destination --into "$mode_destination")
+        else
+            syq cp "$@" --no-progress --performance-tuning workers=4 \
+                --from source --srcs-in /tmp/syq-real-ssh/mode-tree \
+                --to destination --into "$mode_destination"
+        fi
+    done
+    # shellcheck disable=SC2029
+    ssh destination "python3 - $mode_variant" <<'PY_MODE_CHECK'
+import os, sys
+variant = sys.argv[1]
+def modes(root):
+    found = {}
+    for directory, names, files in os.walk(root):
+        for name in names + files:
+            path = os.path.join(directory, name)
+            found[os.path.relpath(path, root)] = os.lstat(path).st_mode & 0o7777
+    found['.'] = os.lstat(root).st_mode & 0o7777
+    return found
+base = f'/tmp/syq-real-ssh/modes-{variant}'
+ordinary, restricted = modes(f'{base}-ordinary'), modes(f'{base}-restricted')
+assert ordinary == restricted, (ordinary, restricted)
+if variant != 'permissions':
+    # Without -p: the destination's umask (022), not the runner's (077);
+    # existing entries keep their modes; no special bits from the source;
+    # new directories keep owner access and inherit the setgid bit.
+    expected = {
+        '.': 0o2775, 'existing': 0o600, 'existing-dir': 0o2750,
+        'script': 0o755, 'secret': 0o600, 'read-only': 0o444, 'setuid': 0o755,
+        'large': 0o640, 'large-read-only': 0o444,
+        'new-dir': 0o2755, 'read-only-dir': 0o2755, 'private-dir': 0o2700,
+        'sticky-dir': 0o2755,
+    }
+    for name, mode in expected.items():
+        assert ordinary[name] == mode, (name, oct(ordinary[name]), oct(mode))
+PY_MODE_CHECK
+done
 
 printf 'case: expression selection on source, destination, and local coordinators\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'

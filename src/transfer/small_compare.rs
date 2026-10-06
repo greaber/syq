@@ -143,67 +143,6 @@ fn differing_ranges(patch: &SmallPatch, piece: u64) -> Vec<(u64, u32)> {
     ranges
 }
 
-/// Split a batch's files, by their sizes, into comparison groups of at most
-/// `COMPARE_GROUP_FILES` files and `group_bytes` bytes, as positions in the
-/// batch, in the order their requests go out.
-///
-/// `bound` names the destination file whose change time a restricted
-/// receiver binds each file's patch to, when other names of that file may
-/// be in the copy. The receiver authorizes all of a request's patches
-/// before it carries out any, and keeping one name of a hard-linked file
-/// with new metadata, or replacing it, changes the change time the file's
-/// other names share: another of them in the same request would find its
-/// condition stale, and be compared again, or copied whole if it was to be
-/// replaced. So no group holds two names of one such file. A connection's
-/// requests are carried out in turn, so a later group's patch is authorized
-/// against the file as the earlier one left it. Names are taken in order of
-/// how many names of the same file came before them in the batch, all the
-/// first names, then all the second, and so on, so that names of different
-/// files still share groups; files without such a bound keep the batch's
-/// order.
-pub(super) fn compare_groups(
-    sizes: &[u64],
-    bound: &[Option<(u64, u64)>],
-    group_bytes: u64,
-) -> std::collections::VecDeque<Vec<usize>> {
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
-    if bound.iter().any(Option::is_some) {
-        let mut earlier = std::collections::HashMap::new();
-        let rank: Vec<u32> = bound
-            .iter()
-            .map(|file| {
-                file.map_or(0, |file| {
-                    let names = earlier.entry(file).or_insert(0);
-                    *names += 1;
-                    *names - 1
-                })
-            })
-            .collect();
-        order.sort_by_key(|&i| rank[i]);
-    }
-    let mut groups = std::collections::VecDeque::new();
-    let (mut group, mut bytes) = (Vec::new(), 0u64);
-    let mut files = std::collections::HashSet::new();
-    for i in order {
-        if !group.is_empty()
-            && (group.len() >= COMPARE_GROUP_FILES
-                || bytes.saturating_add(sizes[i]) > group_bytes
-                || bound[i].is_some_and(|file| files.contains(&file)))
-        {
-            groups.push_back(std::mem::take(&mut group));
-            bytes = 0;
-            files.clear();
-        }
-        group.push(i);
-        bytes += sizes[i];
-        files.extend(bound[i]);
-    }
-    if !group.is_empty() {
-        groups.push_back(group);
-    }
-    groups
-}
-
 /// Where a streamed patch's request stands on its connection.
 enum StreamStep {
     /// A piece read from the source, at its offset and length.
@@ -254,21 +193,6 @@ impl Worker {
         } else {
             self.opts.block.min(PATCH_BLOCK)
         }
-    }
-
-    /// The destination file a restricted receiver binds `job`'s patch to by
-    /// its change time, if other names of that file may be in this copy:
-    /// the receiver does so when it chooses the mode of the file it
-    /// replaces, as it does unless permissions are preserved.
-    fn change_time_bound_destination(&self, job: &WorkerJob) -> Option<(u64, u64)> {
-        if !self.opts.restricted_receiver
-            || self.publication_flags(job) & crate::proto::flags::RECEIVER_MODE == 0
-        {
-            return None;
-        }
-        job.dst_entry
-            .as_deref()
-            .and_then(crate::sched::linked_identity)
     }
 
     /// The largest file, and the most source bytes of one group, to compare
@@ -324,17 +248,12 @@ impl Worker {
                     self.sched.requeue(i);
                 }
                 Some(Compared::StaleCondition) => {
-                    // Keeping or replacing each other name of the
-                    // destination in this copy changes the change time its
-                    // condition holds, once. This batch's names of the file
-                    // are authorized in turn (see `compare_groups`), but
-                    // another worker's can still leave this name's
-                    // condition stale, once each. Comparing it again as many
-                    // times as this copy has names of the file lets every
-                    // name be kept, and leaves one comparison for a change
-                    // from outside. A file that goes stale more often, as
-                    // one that keeps changing does, is replaced whole. Names
-                    // of it outside this copy do not count.
+                    // The file no longer meets the patch's condition.
+                    // Comparing it again as many times as this copy has
+                    // names of the file, and once more for a change from
+                    // outside, bounds the work for a file that keeps
+                    // changing, which is then replaced whole. Names of it
+                    // outside this copy do not count.
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let names = jobs.destination_names(i);
                     let job = &mut jobs[i];
@@ -372,13 +291,22 @@ impl Worker {
             batch.iter().map(|&i| all.snapshot(i)).collect()
         };
         let mut outcomes: Vec<Option<Compared>> = (0..jobs.len()).map(|_| None).collect();
+        let mut unissued = std::collections::VecDeque::new();
         let (_, group_bytes) = self.compare_group_limits();
-        let sizes: Vec<u64> = jobs.iter().map(|job| job.entry.size).collect();
-        let bound: Vec<Option<(u64, u64)>> = jobs
-            .iter()
-            .map(|job| self.change_time_bound_destination(job))
-            .collect();
-        let mut unissued = compare_groups(&sizes, &bound, group_bytes);
+        let (mut start, mut bytes) = (0, 0u64);
+        for (i, job) in jobs.iter().enumerate() {
+            if i > start
+                && (i - start >= COMPARE_GROUP_FILES
+                    || bytes.saturating_add(job.entry.size) > group_bytes)
+            {
+                unissued.push_back((start..i).collect::<Vec<_>>());
+                (start, bytes) = (i, 0);
+            }
+            bytes += job.entry.size;
+        }
+        if start < jobs.len() {
+            unissued.push_back((start..jobs.len()).collect());
+        }
         // Each group has at most one request outstanding, so the groups in
         // flight bound the replies the destination owes, and waiting reads
         // those the source owes, to what each connection queues. An
