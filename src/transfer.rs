@@ -50,6 +50,16 @@ const FAST_BATCH_FILES: usize = 2048;
 // Keep the startup worker budget independent of the larger batch ceiling.
 // Larger batches must not leave small trees with fewer transfer workers.
 const STARTUP_BATCH_FILES: usize = 128;
+/// Files per starting worker for batched files on a network filesystem. There
+/// every file costs several round trips that batching does not save, so a
+/// worker has about one file in flight: 128 new 4 KiB files in 16 directories
+/// on a 50 ms SSHFS mount took 60 s with one worker and 12 s with sixteen.
+const NETWORK_STARTUP_BATCH_FILES: usize = 8;
+/// Starting workers on a network filesystem when some files are too large to
+/// batch. On SSHFS at 20 and 50 ms, trees of 1 MiB files copied 4-9% faster
+/// with 16 workers than with 32, using about half the memory; SSHFS serves at
+/// most ten requests at once. The tuner can still add workers to a long copy.
+const NETWORK_START_WORKERS: usize = 16;
 // Let small scans finish before choosing their bounded worker count.
 const STREAMING_START_FILES: usize = 4 * STARTUP_BATCH_FILES;
 // Source requests carry both display paths and registered references. Leave
@@ -86,6 +96,72 @@ fn initial_range_workers(
         total.saturating_add((size / min_split).max(1))
     });
     limit.min((capacity.min(usize::MAX as u64) as usize).max(1))
+}
+
+/// How many workers a copy starts with, from what is known when they start.
+#[derive(Clone, Copy, Debug)]
+struct StartRule {
+    /// The explicit, remembered or default count, within resource limits.
+    workers: usize,
+    /// The count is the tuner's starting point, not an explicit `workers=N`.
+    automatic: bool,
+    /// The count was remembered for these filesystems; keep it as measured.
+    remembered: bool,
+    /// The destination lies on a network filesystem.
+    network_destination: bool,
+    /// An explicit `batch-files`, which also sets files per starting worker.
+    batch_files: Option<usize>,
+    batch_bytes: u64,
+}
+
+impl StartRule {
+    /// The most workers to start. An explicit count starts exactly that many.
+    /// On a network destination, an automatic copy with files too large for
+    /// small-file batches starts with at most `NETWORK_START_WORKERS`.
+    fn limit(&self, all_small: bool) -> usize {
+        if self.automatic && self.network_destination && !all_small && !self.remembered {
+            self.workers.min(NETWORK_START_WORKERS)
+        } else {
+            self.workers
+        }
+    }
+
+    fn files_per_worker(&self) -> usize {
+        self.batch_files.unwrap_or(if self.network_destination {
+            NETWORK_STARTUP_BATCH_FILES
+        } else {
+            STARTUP_BATCH_FILES
+        })
+    }
+
+    /// Workers for `files` totalling `bytes`, every one sent in small-file
+    /// batches: a worker per startup batch of files or bytes.
+    fn batched(&self, files: usize, bytes: u64) -> usize {
+        if !self.automatic {
+            return self.workers;
+        }
+        initial_fast_workers(
+            self.limit(true),
+            files,
+            bytes,
+            self.files_per_worker(),
+            self.batch_bytes,
+        )
+    }
+
+    /// Workers while planning a large tree, from the files queued so far.
+    fn streaming(&self, files: usize, bytes: u64, all_small: bool) -> usize {
+        if !self.automatic {
+            return self.workers;
+        }
+        initial_fast_workers(
+            self.limit(all_small),
+            files,
+            bytes,
+            self.files_per_worker(),
+            self.batch_bytes,
+        )
+    }
 }
 
 fn reuse_startup_ssh(id: usize, autotune: bool) -> bool {
@@ -3119,6 +3195,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let destination_filesystem = initial_destination_filesystem
         .as_ref()
         .and_then(|info| info.filesystem.clone());
+    let network_destination = initial_destination_filesystem
+        .as_ref()
+        .is_some_and(|info| info.network);
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
         (fresh_destination && args.dry_run).then_some(FreshCapacityPlan {
             device: info.device,
@@ -3395,6 +3474,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && !pending_tcp_setups.is_empty();
     drop(planning);
     let history_context = std::cell::RefCell::new(None);
+    // Whether the starting count came from remembered tuning history.
+    let remembered_start = std::cell::Cell::new(false);
     let mut finish_transport_setup = |args: &mut Args| -> Result<_> {
         let _setup = progress.clock.setup.begin();
         for (spec, pending) in std::mem::take(&mut pending_tcp_setups) {
@@ -3552,7 +3633,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = gate.active();
             history.event("starting_count", serde_json::json!({"workers":args.connections,
                 "reason":if hint.is_some() {"history"} else if autotune {"default"} else {"explicit"},
-                "hint":hint}));
+                "hint":hint, "network_destination":network_destination}));
+            remembered_start.set(hint.is_some());
             selected_history = hint;
             *history_context.borrow_mut() = Some(key);
         }
@@ -3644,6 +3726,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let streaming_connections = args.connections;
     let streaming_refine = transport_setup.as_ref().and_then(|(_, _, refine)| *refine);
     let streaming_worker_hint = std::cell::Cell::new(0);
+    let start_rule = |workers: usize| StartRule {
+        workers,
+        automatic: autotune,
+        remembered: remembered_start.get(),
+        network_destination,
+        batch_files: opts.tuning.batch_files,
+        batch_bytes: opts.tuning.batch_bytes(),
+    };
+    // Whether every file queued so far fits a small-file batch, checking each
+    // queued job once as planning proceeds.
+    let streaming_batch_limit = fast_file_size_limit(&opts, bwlimit.as_deref());
+    let streaming_checked_jobs = std::cell::Cell::new(0);
+    let streaming_all_batched = std::cell::Cell::new(true);
     let start_streaming = || {
         if !streaming_ready
             || sched.is_aborted()
@@ -3657,13 +3752,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             return;
         }
         let initial = if autotune {
-            initial_fast_workers(
-                streaming_connections,
-                files,
-                bytes,
-                opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                opts.tuning.batch_bytes(),
-            )
+            if streaming_all_batched.get() {
+                let jobs = sched.jobs.lock().unwrap();
+                let checked = streaming_checked_jobs.get();
+                streaming_all_batched.set(
+                    jobs.iter()
+                        .skip(checked)
+                        .all(|job| job.entry.size <= streaming_batch_limit),
+                );
+                streaming_checked_jobs.set(jobs.len());
+            }
+            start_rule(streaming_connections).streaming(files, bytes, streaming_all_batched.get())
         } else {
             streaming_connections
         };
@@ -3879,16 +3978,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             let (files, bytes, all_small) =
                 st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
             (files > 1).then(|| {
+                let rule = start_rule(args.connections);
                 if all_small && !opts.tuning.force_ranges() && bwlimit.is_none() {
-                    initial_fast_workers(
-                        args.connections,
-                        files,
-                        bytes,
-                        opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                        opts.tuning.batch_bytes(),
-                    )
+                    rule.batched(files, bytes)
                 } else {
-                    args.connections
+                    rule.limit(all_small)
                 }
             })
         } else {
@@ -3982,9 +4076,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 progress.error("syq: destination root is missing and cannot be anchored");
                 sched.abort();
             } else {
-                let (multiplex_small_files, file_jobs, file_bytes) = {
+                let (multiplex_small_files, file_jobs, file_bytes, all_small) = {
                     let jobs = sched.jobs.lock().unwrap();
-                    (
+                    let small_limit = fast_file_size_limit(&opts, bwlimit.as_deref());
+                    let population = (
                         !opts.dry_run
                             && !opts.tuning.force_ranges()
                             && (bwlimit.is_none() || transport_budget.is_some())
@@ -3998,7 +4093,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         jobs.len(),
                         jobs.iter()
                             .fold(0u64, |total, job| total.saturating_add(job.entry.size)),
-                    )
+                        jobs.iter().all(|job| job.entry.size <= small_limit),
+                    );
+                    population
                 };
                 if multiplex_small_files {
                     for spec in [&src_ep, &dst_ep]
@@ -4022,16 +4119,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             let jobs = sched.jobs.lock().unwrap();
                             jobs.len() == 1 && jobs[0].container_guard.is_none()
                         };
+                    let rule = start_rule(args.connections);
+                    let start_limit = rule.limit(all_small);
                     let mut initial = if multiplex_small_files {
-                        initial_fast_workers(
-                            args.connections,
-                            file_jobs,
-                            file_bytes,
-                            opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                            opts.tuning.batch_bytes(),
-                        )
+                        rule.batched(file_jobs, file_bytes)
                     } else {
-                        args.connections
+                        start_limit
                     };
                     if autotune
                         && fresh_destination
@@ -4048,20 +4141,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             jobs.iter().map(|job| job.entry.size),
                             sched.min_split,
                         );
-                        if initial < args.connections {
-                            sched.arm_direct_fallback(args.connections);
+                        if initial < start_limit {
+                            sched.arm_direct_fallback(start_limit);
                         }
                         if jobs.len() == 1 {
                             sched.reserve_initial_ranges(initial);
                         }
-                        if args.verbose >= 2 && initial < args.connections {
+                        if args.verbose >= 2 && initial < start_limit {
                             crate::output::diagnostic!(
                                 "syq: SSH startup limited to {initial} workers by available files and ranges"
                             );
                         }
                     }
                     if single_direct_candidate {
-                        sched.arm_direct_fallback(args.connections);
+                        sched.arm_direct_fallback(start_limit);
                         initial = 1;
                     }
                     spawn_workers(initial, refine_start);

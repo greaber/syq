@@ -5707,3 +5707,99 @@ fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_th
     assert_eq!(executed.compared, [3, 3]);
     assert_ne!(executed.whole, 0);
 }
+
+fn start_rule(workers: usize, network_destination: bool) -> StartRule {
+    StartRule {
+        workers,
+        automatic: true,
+        remembered: false,
+        network_destination,
+        batch_files: None,
+        batch_bytes: crate::transfer_tuning::DEFAULT_BATCH_BYTES,
+    }
+}
+
+#[test]
+fn fast_destinations_keep_their_starting_counts() {
+    const KIB: u64 = 1024;
+    let rule = start_rule(32, false);
+    // A worker per 128 batched files or per batch of bytes, as before.
+    assert_eq!(rule.batched(1, 4 * KIB), 1);
+    assert_eq!(rule.batched(128, 128 * 4 * KIB), 1);
+    assert_eq!(rule.batched(129, 129 * 4 * KIB), 2);
+    assert_eq!(rule.batched(512, 512 * 4 * KIB), 4);
+    assert_eq!(rule.batched(100_000, 100_000 * 4 * KIB), 32);
+    assert_eq!(rule.batched(10, 10 * 64 * KIB), 1);
+    // Trees with larger files start at the full count.
+    assert_eq!(rule.limit(false), 32);
+    assert_eq!(rule.limit(true), 32);
+    assert_eq!(rule.streaming(600, 600 * 4 * KIB, true), 5);
+    assert_eq!(rule.streaming(600, 600 * 1024 * KIB, false), 32);
+    assert_eq!(rule.streaming(600, 600 * 70 * KIB, false), 5);
+}
+
+#[test]
+fn network_destinations_start_a_worker_per_eight_small_files() {
+    const KIB: u64 = 1024;
+    let rule = start_rule(32, true);
+    assert_eq!(rule.batched(1, 4 * KIB), 1);
+    assert_eq!(rule.batched(8, 8 * 4 * KIB), 1);
+    assert_eq!(rule.batched(9, 9 * 4 * KIB), 2);
+    assert_eq!(rule.batched(128, 128 * 4 * KIB), 16);
+    assert_eq!(rule.batched(256, 256 * 4 * KIB), 32);
+    assert_eq!(rule.batched(100_000, 100_000 * 4 * KIB), 32);
+    assert_eq!(rule.streaming(600, 600 * 4 * KIB, true), 32);
+    // Larger files start with at most 16 workers.
+    assert_eq!(rule.limit(false), 16);
+    assert_eq!(rule.limit(true), 32);
+    assert_eq!(rule.streaming(600, 600 * 1024 * KIB, false), 16);
+    assert_eq!(rule.streaming(600, 600 * 70 * KIB, false), 16);
+    // Route caps below 16 stay in force: 8 over SSH, 16 over TCP.
+    for cap in [8, 16] {
+        let rule = start_rule(cap, true);
+        assert_eq!(rule.batched(128, 128 * 4 * KIB), cap);
+        assert_eq!(rule.limit(false), cap);
+        assert_eq!(rule.batched(16, 16 * 4 * KIB), 2);
+    }
+}
+
+#[test]
+fn starting_counts_respect_limits_history_and_explicit_settings() {
+    const KIB: u64 = 1024;
+    // Resource limits have already lowered the count.
+    let limited = start_rule(4, true);
+    assert_eq!(limited.batched(128, 128 * 4 * KIB), 4);
+    assert_eq!(limited.limit(false), 4);
+    // A remembered count stands as measured for these filesystems: it can
+    // lower a small tree's start, and it is not capped for larger files.
+    let remembered = StartRule {
+        remembered: true,
+        ..start_rule(2, true)
+    };
+    assert_eq!(remembered.batched(128, 128 * 4 * KIB), 2);
+    let remembered = StartRule {
+        remembered: true,
+        ..start_rule(24, true)
+    };
+    assert_eq!(remembered.limit(false), 24);
+    // An explicit batch size also sets the files per starting worker.
+    let batch = StartRule {
+        batch_files: Some(32),
+        ..start_rule(32, true)
+    };
+    assert_eq!(batch.batched(128, 128 * 4 * KIB), 4);
+    // An explicit worker count starts exactly that many, whatever the tree.
+    for network_destination in [false, true] {
+        for workers in [1, 8, 64] {
+            let explicit = StartRule {
+                automatic: false,
+                ..start_rule(workers, network_destination)
+            };
+            assert_eq!(explicit.batched(1, 4 * KIB), workers);
+            assert_eq!(explicit.batched(128, 128 * 4 * KIB), workers);
+            assert_eq!(explicit.limit(false), workers);
+            assert_eq!(explicit.limit(true), workers);
+            assert_eq!(explicit.streaming(600, 600 * 1024 * KIB, false), workers);
+        }
+    }
+}

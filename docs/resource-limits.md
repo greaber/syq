@@ -39,8 +39,9 @@ syq cp data --to server --into backup --resource-limits workers=4,bandwidth=10M
 ```
 
 Syq can adjust the filesystem copy-worker count up to four. By contrast,
-`--performance-tuning workers=4` fixes four worker slots. Unused slots can
-remain idle in either case. Worker counts do not include directory scanning,
+`--performance-tuning workers=4` starts four workers and keeps that count,
+unless open-file or receiver limits allow fewer. Workers can remain idle in
+either case when there is less work. Worker counts do not include directory scanning,
 metadata processing, or control connections, and do not cap total threads,
 sockets, CPU use, or memory.
 

@@ -295,6 +295,21 @@ fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
     })
 }
 
+/// Filesystems where each operation can cost a network round trip. Local
+/// disk and memory filesystems (ext4, XFS, Btrfs, ZFS, tmpfs) are not.
+#[cfg(target_os = "linux")]
+fn network_file_system_type(file_system_type: u32) -> bool {
+    [
+        libc::NFS_SUPER_MAGIC as u32,
+        libc::FUSE_SUPER_MAGIC as u32,
+        libc::SMB_SUPER_MAGIC as u32,
+        0xfe53_4d42, // SMB2
+        0xff53_4d42, // CIFS
+        0x00c3_6400, // Ceph
+    ]
+    .contains(&file_system_type)
+}
+
 #[cfg(target_os = "linux")]
 fn inspect_file_system(file: &File) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -314,15 +329,7 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
-            network: [
-                libc::NFS_SUPER_MAGIC as u32,
-                libc::FUSE_SUPER_MAGIC as u32,
-                libc::SMB_SUPER_MAGIC as u32,
-                0xfe53_4d42, // SMB2
-                0xff53_4d42, // CIFS
-                0x00c3_6400, // Ceph
-            ]
-            .contains(&file_system_type),
+            network: network_file_system_type(file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
             // tmpfs also provides a real cross-filesystem control for this path.
@@ -1985,6 +1992,7 @@ impl FsOps {
             available_bytes,
             available_inodes,
             empty,
+            network: on_network_file_system(&directory, metadata.dev()),
         })
     }
 
