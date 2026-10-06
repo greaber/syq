@@ -39,7 +39,63 @@ use std::{
 };
 use tokio::{io::AsyncReadExt, sync::Mutex};
 
-type DirectoryMetadata = Arc<Mutex<Vec<(String, Metadata, Option<u32>, crate::mapping::Metadata)>>>;
+type DirectoryMetadata = Arc<Directories>;
+/// A marker's path, metadata, the mode of a directory it found, and its
+/// mapping overrides.
+type MarkerMetadata = (String, Metadata, Option<u32>, crate::mapping::Metadata);
+
+/// The directories of one download.
+struct Directories {
+    /// Marker metadata, applied once the descendants are written.
+    metadata: Mutex<Vec<MarkerMetadata>>,
+    /// Planned directory markers. A marker's metadata reaches its directory
+    /// only at the end, so whichever job creates that directory creates it
+    /// private until then.
+    markers: HashSet<Vec<u8>>,
+    /// Marker directories this download created, recorded before creating
+    /// them so a marker job never mistakes one for an existing directory.
+    created: std::sync::Mutex<HashSet<Vec<u8>>>,
+}
+
+impl Directories {
+    fn new(plan: &[Download]) -> Result<Self> {
+        let mut markers = HashSet::new();
+        for job in plan.iter().filter(|job| job.kind == ObjectKind::Dir) {
+            if !job.path.is_empty() {
+                markers.insert(directory_key(&RelativePath::new(job.path.as_bytes())?));
+            }
+        }
+        Ok(Self {
+            metadata: Mutex::new(Vec::new()),
+            markers,
+            created: Default::default(),
+        })
+    }
+
+    /// The creation mode for a missing directory at `path`.
+    fn creation_mode(&self, path: &[u8]) -> u32 {
+        if !self.markers.contains(path) {
+            return 0o777;
+        }
+        self.created.lock().unwrap().insert(path.to_vec());
+        0o700
+    }
+
+    fn created(&self, path: &[u8]) -> bool {
+        self.created.lock().unwrap().contains(path)
+    }
+
+    fn create_missing_parents(&self, root: &Root, path: &RelativePath) -> Result<()> {
+        root.create_missing_parents_with(path, &mut |parent| self.creation_mode(parent))
+    }
+}
+
+/// A directory's path beneath the destination root, in the form parent
+/// creation reports it.
+fn directory_key(path: &RelativePath) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.to_path_buf().as_os_str().as_bytes().to_vec()
+}
 
 pub(super) struct Engine {
     args: Arc<Args>,
@@ -396,7 +452,7 @@ impl Engine {
             self.progress.scan_done.store(true, Relaxed);
             // Directory metadata is applied after descendants, so creating
             // children cannot change the restored times or require final modes.
-            let directories = Arc::new(Mutex::new(Vec::new()));
+            let directories = Arc::new(Directories::new(&plan)?);
             // Authorization leaves job order unchanged, and parallel invokes
             // this closure in plan order before spawning each future.
             let mut service_times = service_times.into_iter();
@@ -420,6 +476,12 @@ impl Engine {
             })
             .await?;
             self.progress.finish_transfer();
+            #[cfg(debug_assertions)]
+            crate::fsops::test_race_barrier(
+                "SYQ_TEST_FINALIZATION_READY_FILE",
+                "SYQ_TEST_FINALIZATION_CONTINUE_FILE",
+                "copy finalization",
+            )?;
             // Prune while directories are writable, then restore their modes and times.
             // Apply metadata even when the deletion budget refuses pruning.
             let pruned = self.prune(prune, Some(&destination)).await;
@@ -434,18 +496,52 @@ impl Engine {
         directories: &DirectoryMetadata,
     ) -> Result<()> {
         if !self.args.dry_run {
-            let mut directories = directories.lock().await;
-            directories.sort_by_key(|(path, _, _, _)| std::cmp::Reverse(path.len()));
-            for (path, meta, mode, explicit) in directories.iter() {
-                local::apply_metadata(
-                    &destination.root,
-                    &RelativePath::new(path.as_bytes())?,
-                    meta,
-                    &self.args,
-                    *mode,
-                    *explicit,
-                    mode.is_none(),
-                )?;
+            let metadata = directories.metadata.lock().await;
+            // Marker metadata, and a default mode for a marker directory
+            // created by a descendant whose own marker was skipped or failed:
+            // what creating it would otherwise have given it. Children go
+            // before parents, whose final mode may no longer let us in.
+            let mut work: Vec<(Vec<u8>, Option<&MarkerMetadata>)> = metadata
+                .iter()
+                .map(|entry| {
+                    Ok((
+                        directory_key(&RelativePath::new(entry.0.as_bytes())?),
+                        Some(entry),
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let finished: HashSet<Vec<u8>> = work.iter().map(|(path, _)| path.clone()).collect();
+            work.extend(
+                directories
+                    .created
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|path| !finished.contains(*path))
+                    .map(|path| (path.clone(), None)),
+            );
+            work.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+            for (path, marker) in work {
+                let path = RelativePath::new(&path)?;
+                match marker {
+                    Some((_, meta, mode, explicit)) => local::apply_metadata(
+                        &destination.root,
+                        &path,
+                        meta,
+                        &self.args,
+                        *mode,
+                        *explicit,
+                        mode.is_none(),
+                    )?,
+                    None => {
+                        let directory = destination.root.open_directory(&path)?;
+                        let current = directory.metadata()?.mode();
+                        crate::fsops::set_mode_handle(
+                            &directory,
+                            crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
@@ -2141,6 +2237,14 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        // A marker directory another job of this download created is still
+        // new to its marker. Its creator recorded it before creating it, so
+        // checking after the lookup cannot miss it.
+        let existing = if job.kind == ObjectKind::Dir {
+            existing.filter(|_| !directories.created(&directory_key(&path)))
+        } else {
+            existing
+        };
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -2302,8 +2406,11 @@ impl Engine {
         if object.kind() == ObjectKind::Dir {
             if !self.args.dry_run {
                 if existing.is_none() {
-                    root.create_missing_parents(&path, 0o777)?;
-                    match root.create_directory(&path, 0o777) {
+                    // Private until finish_directories applies the marker's
+                    // metadata, which it always does for a new directory.
+                    directories.create_missing_parents(root, &path)?;
+                    let mode = directories.creation_mode(&directory_key(&path));
+                    match root.create_directory(&path, mode) {
                         Ok(()) => {
                             self.progress.directories_created.fetch_add(1, Relaxed);
                         }
@@ -2313,7 +2420,7 @@ impl Engine {
                         Err(e) => return Err(e),
                     }
                 }
-                directories.lock().await.push((
+                directories.metadata.lock().await.push((
                     job.path.clone(),
                     metadata,
                     existing.map(|m| m.mode & 0o7777),
@@ -2344,7 +2451,7 @@ impl Engine {
                 job.path
             );
             if !self.args.dry_run {
-                root.create_missing_parents(&path, 0o777)?;
+                directories.create_missing_parents(root, &path)?;
                 if !same {
                     if existing.is_some() {
                         root.replace_symlink(&path, &bytes)?;
@@ -2432,7 +2539,7 @@ impl Engine {
             self.progress.add_bytes(object.size);
             return Ok(Some(object.size));
         }
-        root.create_missing_parents(&path, 0o777)?;
+        directories.create_missing_parents(root, &path)?;
         if object.size <= part_size {
             return self
                 .download_single(

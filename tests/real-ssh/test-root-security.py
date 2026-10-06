@@ -38,6 +38,36 @@ def stop_group(process):
     raise AssertionError(f"copy process group {process.pid} survived cancellation deadline")
 
 
+def ownership_only_directories(root):
+    """Directories a root copy creates private take their mode back after
+    their owner changes to the source's: they end with the source's modes."""
+    previous = os.umask(0o022)
+    try:
+        for uid, gid in [(1001, 1002), (1234, 1234)]:
+            source = root / f"owned-{uid}"
+            (source / "sub" / "deep").mkdir(parents=True)
+            (source / "sub" / "deep" / "file").write_bytes(b"owned")
+            for path in [source / "sub" / "deep" / "file", source / "sub" / "deep", source / "sub", source]:
+                os.chown(path, uid, gid)
+                path.chmod(0o644 if path.is_file() else 0o755)
+            for name, args in [
+                ("as", ["cp", "--copy-metadata=ownership", str(source), "--as"]),
+                ("into", ["cp", "--copy-metadata=ownership", "--srcs-in", str(source), "--into"]),
+                ("rsync-rog", ["rsync", "-rog", str(source) + "/"]),
+                ("rsync-a", ["rsync", "-a", str(source) + "/"]),
+            ]:
+                destination = root / f"owned-{uid}-{name}"
+                run(["syq", *args, str(destination) + ("/" if name.startswith("rsync") else ""), "--no-progress"])
+                for path in [destination, destination / "sub", destination / "sub" / "deep"]:
+                    status = path.stat()
+                    assert (status.st_mode & 0o7777, status.st_uid, status.st_gid) == (0o755, uid, gid), (
+                        name, str(path), oct(status.st_mode), status.st_uid, status.st_gid)
+                assert (destination / "sub" / "deep" / "file").read_bytes() == b"owned"
+    finally:
+        os.umask(previous)
+    print("Ownership-only root copies end with the source's directory modes", flush=True)
+
+
 def main():
     assert os.geteuid() == 0, "run this check as root only inside the disposable lab"
     libc = ctypes.CDLL(None, use_errno=True)
@@ -46,6 +76,7 @@ def main():
         raise OSError(error, os.strerror(error))
     with tempfile.TemporaryDirectory(prefix="syq-root-security-") as temporary:
         root = Path(temporary)
+        ownership_only_directories(root)
         for interface in ["native", "native-owner", "rsync"]:
             source = root / f"source-{interface}"
             destination = root / f"destination-{interface}"

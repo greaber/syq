@@ -2112,19 +2112,34 @@ fn clean_root_pins_the_edge_cases() {
 
 #[test]
 fn restricted_root_creation_uses_only_the_authorized_mode_policy() {
-    let ordinary = mkdir_root_batches(b"/destination", TargetCondition::Absent, false, false);
+    let ordinary = mkdir_root_batches(
+        b"/destination",
+        TargetCondition::Absent,
+        false,
+        false,
+        false,
+    );
     assert_eq!(ordinary.len(), 1);
     assert!(matches!(ordinary[0].as_slice(), [Op::Mkdir { .. }]));
 
-    let preserving = mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true);
+    let preserving =
+        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true, false);
     assert_eq!(preserving.len(), 1);
     assert!(matches!(
         preserving[0].as_slice(),
         [Op::Mkdir { mode: 0o755, .. }]
     ));
 
+    // A root that takes source permissions after it is filled stays private.
+    let private = mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true, true);
+    assert_eq!(private.len(), 1);
+    assert!(matches!(
+        private[0].as_slice(),
+        [Op::Mkdir { mode: 0o700, .. }]
+    ));
+
     let receiver_managed =
-        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, false);
+        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, false, false);
     assert_eq!(receiver_managed.len(), 2);
     assert!(matches!(
         receiver_managed[0].as_slice(),
