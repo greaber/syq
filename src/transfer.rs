@@ -1851,9 +1851,10 @@ impl Opts {
     }
 
     fn may_widen_directory_permissions(&self) -> bool {
-        // Existing signed dry-run grants authorize observations only. Do not
-        // turn an otherwise valid preview into an unauthorized chmod attempt.
-        self.widen_directory_permissions && !(self.dry_run && self.restricted_receiver)
+        // rsync previews do not chmod. Existing signed dry-run grants likewise
+        // authorize observations only, independently of the native option.
+        self.widen_directory_permissions
+            && !(self.dry_run && (self.rsync_creation || self.restricted_receiver))
     }
 
     fn may_suggest_directory_access(&self) -> bool {
@@ -3366,7 +3367,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
-                opts.may_widen_directory_permissions(),
+                // rsync opens its destination before processing copied
+                // directories; it does not repair access during preflight.
+                !opts.rsync_creation && opts.may_widen_directory_permissions(),
             )?
         };
         if relations.len() != source_checks.len() {
@@ -3489,7 +3492,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Selection already inspected the container. Carry its identity into
     // planning, so file-only copies can request access without another lookup
     // on the ordinary writable-directory path.
-    let container_access = if opts.may_widen_directory_permissions() {
+    // rsync widens only directories represented in the source file list.
+    // Its unlisted destination container is not permission-preparation work.
+    let container_access = if !opts.rsync_creation && opts.may_widen_directory_permissions() {
         if let Some(selection) = &directory_selection {
             selection.needs_owner_access.then(|| {
                 (

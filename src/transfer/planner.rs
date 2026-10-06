@@ -3963,12 +3963,13 @@ impl Planner<'_> {
     }
 
     pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        let strict_preview = self.opts.dry_run && self.opts.restricted_receiver;
+        let strict_preview =
+            self.opts.dry_run && (self.opts.restricted_receiver || self.opts.rsync_creation);
         let entries = if self.opts.expressions.update.is_some() || strict_preview {
             // This existing endpoint operation distinguishes absence from an
-            // unreadable path, unlike ordinary planning stats. A read-only
-            // grant cannot repair access before a later mutation discovers
-            // that error, so its preview must preserve the error here.
+            // unreadable path, unlike ordinary planning stats. Neither an
+            // rsync preview nor a signed read-only grant can repair access,
+            // so the preview must preserve the error here.
             let mut inspected = Vec::with_capacity(paths.len());
             for chunk in paths.chunks(512) {
                 match ok(
