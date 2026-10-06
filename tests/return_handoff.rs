@@ -3,6 +3,8 @@
 #[path = "../src/process.rs"]
 mod process;
 use crate::process::CommandExt as _;
+#[path = "support/executable.rs"]
+mod executable_support;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -64,8 +66,7 @@ impl Fixture {
         fs::create_dir(&bin).unwrap();
         fs::create_dir(self.temp.path().join("runtime")).unwrap();
         let ssh = bin.join("ssh");
-        fs::write(&ssh, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nprintf 'connect\\n' >> \"$HOME/ssh-used\"\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n").unwrap();
-        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        executable_support::write_executable(&ssh, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nprintf 'connect\\n' >> \"$HOME/ssh-used\"\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n", 0o700);
         let listener = UnixListener::bind(self.temp.path().join("absent.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let marker = self.temp.path().join("ssh-used");
@@ -133,8 +134,7 @@ impl Fixture {
 
     fn script(&self, body: &str) -> String {
         let path = self.temp.path().join("helper");
-        fs::write(&path, format!("#!/usr/bin/python3\n{body}")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        executable_support::write_executable(&path, format!("#!/usr/bin/python3\n{body}"), 0o700);
         path.to_str().unwrap().into()
     }
 }

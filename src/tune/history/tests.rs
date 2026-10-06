@@ -353,12 +353,35 @@ fn concurrent_initialization_shares_one_identity_key() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let barrier = std::sync::Barrier::new(2);
+    // Each opening waits only 100 ms for the other's lock, then skips history
+    // for its run. A loaded host can stall the lock holder for longer, so
+    // retry only that outcome: the openings still race on a new database.
+    let open_recorder = || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let details = json!({"policy_version":1});
+            match Recorder::at(&path, Instant::now(), details, DEFAULT_BUDGET) {
+                Ok(writer) => return writer,
+                Err(error)
+                    if Instant::now() < deadline
+                        && error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<rusqlite::Error>()
+                                .is_some_and(|error| {
+                                    error.sqlite_error_code()
+                                        == Some(rusqlite::ErrorCode::DatabaseBusy)
+                                })
+                        }) => {}
+                Err(error) => panic!("{error:#}"),
+            }
+        }
+    };
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 scope.spawn(|| {
                     barrier.wait();
-                    let writer = recorder(&path);
+                    let writer = open_recorder();
                     writer.token("endpoint", "same-endpoint")
                 })
             })

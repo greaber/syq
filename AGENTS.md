@@ -543,6 +543,11 @@ Create intentional symlinks inside that root; do not canonicalize product
 arguments or add follow flags merely to make a fixture pass. For fixtures that
 must fit Unix socket path limits, use `test_support::short_tempdir()`; it
 centralizes the canonical short-root exception without changing `TMPDIR`.
+Create any file that a test or the product code under test executes with
+`write_executable` or `copy_executable` from `tests/support/executable.rs`.
+They write it in a child process: tests run in parallel threads, and a file
+the test process writes itself can stay open in a child that another test
+forks at that moment, so running it fails with "Text file busy".
 
 Testing happens in three places, each running more than the one before:
 before merge, after merge (post-merge CI, which selects checks by changed

@@ -4,6 +4,9 @@ use crate::process::CommandExt as _;
 #[path = "../tests/support/temp.rs"]
 mod temporary;
 pub(crate) use temporary::{short_tempdir, temp_dir, tempdir};
+#[path = "../tests/support/executable.rs"]
+mod executable;
+pub(crate) use executable::write_executable;
 
 /// Run a unit test in a separate process whose stderr reader has gone away.
 /// Keep stdout available for the test harness and assertion diagnostics.
@@ -155,6 +158,75 @@ fn closed_socket_wait_preserves_buffered_bytes_and_socket_settings() {
         unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) },
         flags
     );
+}
+
+/// Executable fixtures must never be open for writing in this process: a
+/// child that another test forks meanwhile keeps that descriptor until it
+/// execs, and running the fixture then fails with "Text file busy". Writing
+/// to a FIFO keeps the writer open mid-write, so any writer this process
+/// holds shows up among its descriptors.
+#[cfg(target_os = "linux")]
+#[test]
+fn executable_fixtures_are_never_open_for_writing_in_this_process() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let root = tempdir().unwrap();
+    // More than a FIFO buffers, so the writer stays blocked until drained.
+    let contents = vec![b'#'; 1 << 20];
+    let source = root.path().join("source");
+    std::fs::write(&source, &contents).unwrap();
+    let inode = |metadata: std::fs::Metadata| (metadata.dev(), metadata.ino());
+    for copy in [false, true] {
+        let fifo = root.path().join(if copy { "copied" } else { "written" });
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let fifo_inode = inode(std::fs::metadata(&fifo).unwrap());
+        // Open the reader first so the writer's open does not wait for it.
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                if copy {
+                    executable::copy_executable(&source, &fifo, 0o700);
+                } else {
+                    write_executable(&fifo, &contents, 0o700);
+                }
+            });
+            let mut ready = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let started = unsafe { libc::poll(&mut ready, 1, 10_000) } == 1;
+            let held: Vec<i32> = std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                .filter(|&fd| {
+                    fd != reader.as_raw_fd()
+                        && std::fs::metadata(format!("/proc/self/fd/{fd}"))
+                            .is_ok_and(|metadata| inode(metadata) == fifo_inode)
+                })
+                .collect();
+            // Drain in blocking mode until the writer closes, so it finishes
+            // even when this test fails. Without a writer, this reads EOF.
+            assert_eq!(
+                unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, 0) },
+                0
+            );
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).unwrap();
+            writer.join().unwrap();
+            assert!(started, "the fixture writer did not start");
+            assert!(held.is_empty(), "this process held the fixture as {held:?}");
+            assert_eq!(received.len(), contents.len());
+        });
+    }
 }
 
 #[test]
