@@ -544,6 +544,9 @@ pub struct FsOps {
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
+    /// Devices this connection has probed for whether a new file can be
+    /// narrowed below the mode it came out with (`note_created_mode`).
+    fixed_wide_mode_devices: HashMap<u64, bool>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -750,6 +753,7 @@ impl FsOps {
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
+            fixed_wide_mode_devices: HashMap::new(),
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,

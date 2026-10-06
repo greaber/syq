@@ -111,7 +111,7 @@ impl FsOps {
                 Ok(file) => {
                     let created = file.metadata()?;
                     note_created_owner(&created);
-                    note_created_mode(&file, &created, create_mode);
+                    self.note_created_mode(&file, &created, create_mode);
                     return Ok(Some((file, None)));
                 }
                 Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {}
@@ -133,7 +133,7 @@ impl FsOps {
                                 continue;
                             }
                             if !self.reusable_partial_permissions(&file)?
-                                || wider_than(opened.mode(), opened.dev(), widest)
+                                || self.wider_than(opened.mode(), opened.dev(), widest)
                             {
                                 drop(file);
                                 discard_safe_rooted_partial_if_same(
@@ -219,7 +219,7 @@ impl FsOps {
                             }
                             require_rooted_metadata(&handle, metadata, label)?;
                             if !self.reusable_partial_permissions(&handle)?
-                                || wider_than(metadata.mode, metadata.dev, widest)
+                                || self.wider_than(metadata.mode, metadata.dev, widest)
                             {
                                 drop(handle);
                                 discard_safe_rooted_partial_if_same(
@@ -266,7 +266,7 @@ impl FsOps {
                     Ok(file) => {
                         let created = file.metadata()?;
                         note_created_owner(&created);
-                        note_created_mode(&file, &created, create_mode);
+                        self.note_created_mode(&file, &created, create_mode);
                         return Ok(Some((file, None)));
                     }
                     Err(error)
@@ -299,7 +299,7 @@ impl FsOps {
             match target.root.metadata_optional(relative)? {
                 Some(metadata)
                     if is_owned_rooted_partial(metadata)
-                        && wider_than(metadata.mode, metadata.dev, Some(widest)) =>
+                        && self.wider_than(metadata.mode, metadata.dev, Some(widest)) =>
                 {
                     discard_safe_rooted_partial_if_same(
                         &target.root,
@@ -3466,78 +3466,79 @@ pub(super) fn is_fresh_partial(metadata: &fs::Metadata, mode: u32) -> bool {
         && reported & 0o777 & !(mode & 0o777) == 0
 }
 
-/// Whether a sidecar's mode lets its group or others in beyond `widest`,
-/// so that someone may hold it open who could not open a new one. On Linux
-/// an ACL's mask is the group bits, so the mode also bounds what the ACL's
-/// named entries grant. Never on a device whose files cannot be narrowed
-/// (`fixed_wide_modes`): a new file there would be no less readable.
-pub(super) fn wider_than(mode: u32, dev: u64, widest: Option<u32>) -> bool {
-    widest.is_some_and(|widest| reported_mode(mode) & 0o077 & !widest != 0)
-        && fixed_wide_modes(dev) != Some(true)
-}
+impl FsOps {
+    /// Whether a sidecar's mode lets its group or others in beyond `widest`,
+    /// so that someone may hold it open who could not open a new one. On
+    /// Linux an ACL's mask is the group bits, so the mode also bounds what
+    /// the ACL's named entries grant. Never on a device where this connection
+    /// found that a new file cannot be narrowed: one there would be no less
+    /// readable.
+    pub(super) fn wider_than(&self, mode: u32, dev: u64, widest: Option<u32>) -> bool {
+        widest.is_some_and(|widest| reported_mode(mode) & 0o077 & !widest != 0)
+            && self.fixed_wide_modes(dev) != Some(true)
+    }
 
-/// Devices probed for whether a file can be narrowed below the mode it came
-/// out with: `true` for one that cannot, such as a Linux CIFS mount without
-/// POSIX extensions, vfat or exfat, which report one fixed mode for every
-/// file. Mode bits restrict nobody there. Every file, new or reused, admits
-/// whoever that mode admits, so replacing a reused sidecar that looks wider
-/// than its attempt's mode could not make it any less readable; it would
-/// only cost the sidecar's resumable bytes and several requests.
-///
-/// Only a file syq has just created exclusively marks a device, and the
-/// entry is for that device number alone and lasts for this process. A
-/// sidecar on any other filesystem has another device number and keeps the
-/// check; so does one beside a directory whose inherited NFSv4 ACL widened
-/// a new file, since that file can be narrowed. `false` records such a
-/// device, so each device is probed once.
-#[cfg(not(test))]
-fn fixed_wide_mode_devices() -> &'static Mutex<HashMap<u64, bool>> {
-    static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
-    DEVICES.get_or_init(Default::default)
+    /// Whether a device this connection probed cannot narrow a new file:
+    /// `Some(true)` for one that ignores a chmod, such as a Linux CIFS mount
+    /// without POSIX extensions, which reports one fixed mode for every file.
+    /// Mode bits restrict nobody there. Every file, new or reused, admits
+    /// whoever that mode admits, so replacing a reused sidecar that looks
+    /// wider than its attempt's mode could not make it any less readable; it
+    /// would only cost the sidecar's resumable bytes and several requests.
+    ///
+    /// The answer is kept per connection, never per process: a persistent
+    /// receiving service handles copies for days, and the number of an
+    /// unmounted device is given to the next network, FUSE or tmpfs mount.
+    /// A sidecar on another device keeps the check, and so does one on a
+    /// device whose new file could be narrowed, or whose chmod was refused.
+    pub(super) fn fixed_wide_modes(&self, dev: u64) -> Option<bool> {
+        self.fixed_wide_mode_devices.get(&dev).copied()
+    }
+
+    /// Probe the device of a sidecar just created exclusively with
+    /// `requested` when it came out wider: narrow it to `requested`, which
+    /// only takes an empty file of ours to the mode it was created with. The
+    /// device counts as unable to narrow a new file only when that succeeds
+    /// and the mode stays wider, as a filesystem that ignores chmod leaves
+    /// it. A refusal proves nothing about the device, since whether a file's
+    /// mode may change can depend on that file's own ACL (NFSv4
+    /// ACE4_WRITE_ACL), so the device keeps the check. Either way the device
+    /// is probed once per connection.
+    pub(super) fn note_created_mode(
+        &mut self,
+        file: &File,
+        created: &fs::Metadata,
+        requested: u32,
+    ) {
+        let requested = requested & 0o777;
+        let wider = |mode: u32| reported_mode(mode) & 0o777 & !requested != 0;
+        if !wider(created.mode()) || self.fixed_wide_modes(created.dev()).is_some() {
+            return;
+        }
+        let fixed = probe_mode_change(file, requested).is_ok()
+            && file.metadata().is_ok_and(|now| wider(now.mode()));
+        self.fixed_wide_mode_devices.insert(created.dev(), fixed);
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The probed devices of this thread, which other tests do not share.
-    pub(super) static FIXED_WIDE_MODE_DEVICES: std::cell::RefCell<HashMap<u64, bool>> =
-        std::cell::RefCell::new(HashMap::new());
     /// A mode this thread's sidecars report, as a device that reports one
     /// fixed mode does, like `SYQ_TEST_FORCED_MODE` for a whole process.
     pub(super) static FORCED_MODE: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
+    /// Refuses the mode change that probes a device, as a file's own ACL can.
+    pub(super) static REFUSE_MODE_PROBE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
-pub(super) fn fixed_wide_modes(dev: u64) -> Option<bool> {
+/// Change the mode of a probed file, or refuse as a test asks.
+fn probe_mode_change(file: &File, mode: u32) -> io::Result<()> {
     #[cfg(test)]
-    return FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow().get(&dev).copied());
-    #[cfg(not(test))]
-    fixed_wide_mode_devices().lock().unwrap().get(&dev).copied()
-}
-
-pub(super) fn record_fixed_wide_modes(dev: u64, fixed: bool) {
-    #[cfg(test)]
-    FIXED_WIDE_MODE_DEVICES.with(|devices| devices.borrow_mut().insert(dev, fixed));
-    #[cfg(not(test))]
-    fixed_wide_mode_devices().lock().unwrap().insert(dev, fixed);
-}
-
-/// Probe the device of a sidecar just created exclusively with `requested`
-/// when it came out wider: try to narrow it to `requested`, which only takes
-/// an empty file of ours to the mode it was created with. The device is
-/// marked when the mode stays wider or the change is refused, as vfat and
-/// exfat refuse modes they cannot store. Another error leaves it unprobed.
-pub(super) fn note_created_mode(file: &File, created: &fs::Metadata, requested: u32) {
-    let requested = requested & 0o777;
-    let wider = |mode: u32| reported_mode(mode) & 0o777 & !requested != 0;
-    if !wider(created.mode()) || fixed_wide_modes(created.dev()).is_some() {
-        return;
+    if REFUSE_MODE_PROBE.get() {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
-    let fixed = match file.set_permissions(fs::Permissions::from_mode(requested)) {
-        Ok(()) => file.metadata().is_ok_and(|now| wider(now.mode())),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => true,
-        Err(_) => return,
-    };
-    record_fixed_wide_modes(created.dev(), fixed);
+    file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
 /// A sidecar's mode as reported. Debug builds simulate a device that
