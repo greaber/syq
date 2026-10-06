@@ -5449,3 +5449,18 @@ fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_th
     assert_eq!(hashed, 3);
     assert_ne!(whole, 0);
 }
+
+#[test]
+fn directory_access_advice_needs_evidence_and_an_available_option() {
+    let error = WireError {
+        message: "destination permission denied".into(),
+        io_kind: Some(WireIoKind::OwnedDirectoryPermissions),
+        raw_os_error: Some(libc::EACCES),
+    };
+    assert_eq!(wire_os_kind(&error), Some("permission_denied"));
+    let error = endpoint_error(error).context("prepare file");
+    assert!(copy_error_message(&error, true).contains(DIRECTORY_ACCESS_HINT));
+    assert!(!copy_error_message(&error, false).contains(DIRECTORY_ACCESS_HINT));
+    let plain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
+    assert!(!copy_error_message(&plain, true).contains(DIRECTORY_ACCESS_HINT));
+}

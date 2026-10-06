@@ -182,7 +182,7 @@ def direct():
         for extra in [[], ["--only-existing"], ["--copy-metadata=permissions"]]:
             readonly = root + "/readonly-" + str(len(extra)) + ("-p" if "--copy-metadata=permissions" in extra else "")
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r}); (p/'parent').mkdir(parents=True); (p/'parent'/'item').write_bytes(b'old'); (p/'parent').chmod(0o2550)")
-            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update"] + extra,
+            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update", "--temporarily-widen-dir-permissions"] + extra,
                 data=manifest([("file", "parent/item", "file")]))
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
         # An untouched writable parent needs no chmod (ctime must stay intact).

@@ -535,7 +535,7 @@ fn last_task_wakes_coordinator_after_its_outcome_was_consumed() {
             NativeRemoveDisposition::Removed,
             Some(1),
         ));
-        assert!(matches!(event_rx.try_recv(), Ok(Some(_))));
+        assert!(matches!(event_rx.try_recv(), Ok(Ok(Some(_)))));
         assert!(!pool.is_done());
         // Force the problematic ordering: the coordinator already consumed
         // the last outcome while its worker still counted as pending.
@@ -749,7 +749,7 @@ fn retirement_pauses_inline_scanning_before_the_directory_finishes() {
     assert_eq!(
         outcomes
             .try_iter()
-            .flatten()
+            .filter_map(Result::unwrap)
             .filter(|o| o.disposition == NativeRemoveDisposition::Removed)
             .count(),
         512,
@@ -828,7 +828,7 @@ fn reduced_scans_finish_with_idle_workers_waiting_on_the_queue() {
     assert_eq!(
         outcomes
             .try_iter()
-            .flatten()
+            .filter_map(Result::unwrap)
             .filter(|o| o.disposition == NativeRemoveDisposition::Removed)
             .count(),
         1024,

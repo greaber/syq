@@ -761,3 +761,74 @@ fn temporary_directory_permissions_restore_after_copy_failure() {
     );
     assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
 }
+
+#[test]
+fn explicit_directory_access_covers_file_destination_containers() {
+    for placement in ["--into", "--as"] {
+        for size in [3, 128 << 10] {
+            let t = Tmp::new();
+            let data = vec![b'n'; size];
+            write(&t.path("src/file"), &data);
+            fs::create_dir(t.path("dst")).unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+            let destination = if placement == "--into" {
+                "dst"
+            } else {
+                "dst/file"
+            };
+            let out = native_syq(&[
+                "cp",
+                "--temporarily-widen-dir-permissions",
+                &t.s("src/file"),
+                placement,
+                &t.s(destination),
+            ]);
+            let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(mode, 0o500);
+            assert_eq!(read(&t.path("dst/file")), data);
+        }
+    }
+}
+
+#[test]
+fn readonly_container_allows_inplace_updates_without_widening() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"updated contents");
+    write(&t.path("dst/file"), b"old");
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o100)).unwrap();
+    let out = native_syq(&[
+        "cp",
+        "--inplace",
+        &t.s("src/file"),
+        "--as",
+        &t.s("dst/file"),
+    ]);
+    let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mode, 0o100);
+    assert_eq!(read(&t.path("dst/file")), b"updated contents");
+}
+
+#[test]
+fn rsync_permission_failures_do_not_suggest_a_native_only_option() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/file"), &vec![b'n'; 128 << 10]);
+    fs::create_dir(t.path("dst")).unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rsync", &t.s("src/file"), &t.s("dst/")])
+        .run()
+        .unwrap();
+    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        !stderr_of(&out).contains("--temporarily-widen-dir-permissions"),
+        "{out:?}"
+    );
+}

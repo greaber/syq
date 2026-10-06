@@ -362,7 +362,7 @@ fn kind_name(kind: Kind) -> &'static str {
 fn wire_os_kind(kind: WireIoKind) -> &'static str {
     match kind {
         WireIoKind::NotFound => "not_found",
-        WireIoKind::PermissionDenied => "permission_denied",
+        WireIoKind::PermissionDenied | WireIoKind::OwnedDirectoryPermissions => "permission_denied",
         WireIoKind::AlreadyExists => "already_exists",
         WireIoKind::InvalidInput => "invalid_input",
         WireIoKind::NoSpace => "no_space",

@@ -438,16 +438,22 @@ impl Engine {
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
-                            if error.chain().any(|cause| {
-                                cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                                    e.kind() == std::io::ErrorKind::PermissionDenied
+                            if !engine.args.temporarily_widen_dir_permissions
+                                && !engine.args.only_new_native_entries()
+                                && error.chain().any(|cause| {
+                                    cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                                        e.kind() == std::io::ErrorKind::PermissionDenied
+                                    })
                                 })
-                            }) {
+                            {
                                 if let Ok(path) = RelativePath::new(job.path.as_bytes()) {
                                     if let Some(hint) = crate::fsops::directory_permission_hint(
                                         &dst.root, &path, 0o300,
                                     ) {
-                                        return error.context(hint);
+                                        return error.context(format!(
+                                            "{hint}; {}",
+                                            crate::transfer::DIRECTORY_ACCESS_HINT
+                                        ));
                                     }
                                 }
                             }

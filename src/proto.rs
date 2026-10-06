@@ -990,12 +990,6 @@ pub enum WireRequest<Data> {
         copy_id: CopyId,
         guard: Option<ContainerGuard>,
     },
-    /// Temporarily add owner access to existing destination directories.
-    /// Returns original modes only for directories actually changed.
-    WidenDirectories {
-        directories: Vec<(PathBytes, TargetCondition)>,
-        guard: Option<ContainerGuard>,
-    },
     Apply {
         ops: Vec<Op>,
         guard: Option<ContainerGuard>,
@@ -1314,6 +1308,12 @@ pub enum WireRequest<Data> {
     PatchEnd {
         commit: bool,
     },
+    /// Temporarily add owner access to existing destination directories.
+    /// Returns original modes only for directories actually changed.
+    WidenDirectories {
+        directories: Vec<(PathBytes, TargetCondition)>,
+        guard: Option<ContainerGuard>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1532,7 +1532,6 @@ pub enum Response {
         others: Option<Vec<Option<Entry>>>,
     },
     Applied(Vec<Option<WireError>>),
-    WidenedDirectories(Vec<std::result::Result<Option<DirectoryMode>, WireError>>),
     PartialSize(Option<u64>),
     Hashes(Vec<ContentDigest>),
     HeldHashes {
@@ -1616,6 +1615,7 @@ pub enum Response {
     ExistingHashes(Vec<std::result::Result<ExistingHashes, WireError>>),
     DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
     PatchedBatch(Vec<std::result::Result<SmallPatched, SmallPatchError>>),
+    WidenedDirectories(Vec<std::result::Result<Option<DirectoryMode>, WireError>>),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
@@ -1674,6 +1674,8 @@ pub enum WireIoKind {
     QuotaExceeded,
     ReadOnly,
     Other,
+    /// Permission denied, with receiver evidence that owner directory access is missing.
+    OwnedDirectoryPermissions,
 }
 
 impl WireError {
@@ -1711,6 +1713,8 @@ pub struct DirectoryAnchor {
     pub path: PathBytes,
     pub dev: u64,
     pub ino: u64,
+    /// Receiver-observed owner access; avoids another lookup for ordinary copies.
+    pub needs_owner_access: bool,
 }
 
 /// Rough serialized size, so big blocks are encoded without reallocation.

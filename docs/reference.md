@@ -400,7 +400,8 @@ class](object-storage.md#copies-between-s3-buckets).
 
 Existing files and directories keep their destination permissions unless you
 request permission or ACL metadata. Native `cp` does not automatically widen
-existing directory permissions to make copying or pruning succeed.
+existing directory permissions to make copying or pruning succeed, even when
+copying permission metadata. The requested final permissions still apply.
 `--temporarily-widen-dir-permissions` allows adding owner read, write and search
 permission to existing directories being copied into, when the receiving user owns them.
 Syq restores only directories it actually widened, after copying and pruning;

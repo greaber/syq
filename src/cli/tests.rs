@@ -813,19 +813,22 @@ fn native_remote_copy_default_placement_and_prune_guard() {
         assert_eq!(args.placement, Placement::Into);
         assert_eq!(args.target_existence, Existence::Any);
         assert_eq!(args.locations.last().unwrap().path, b".");
-        let mut pruning = argv;
+        let pruning = argv;
         // Mapping has a separate clap-level conflict with --prune.
         if pruning.iter().any(|arg| arg == "--mapping") {
             continue;
         }
-        pruning.push(OsString::from("--prune"));
-        let error = parse_native_copy(&pruning).unwrap_err().to_string();
-        assert!(
-            error.contains("--prune requires an explicit placement"),
-            "{error}"
-        );
-        pruning.extend(["--into", "."].map(OsString::from));
-        assert!(parse_native_copy(&pruning).unwrap().delete);
+        for flag in ["--prune", "--prune-before"] {
+            let mut pruning = pruning.clone();
+            pruning.push(OsString::from(flag));
+            let error = parse_native_copy(&pruning).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{flag} requires an explicit placement")),
+                "{error}"
+            );
+            pruning.extend(["--into", "."].map(OsString::from));
+            assert!(parse_native_copy(&pruning).unwrap().delete);
+        }
     }
     assert!(parse_native_copy(&[OsString::from("foo")]).is_err());
 }

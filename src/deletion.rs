@@ -274,6 +274,7 @@ struct SelectedTask(
     Option<Arc<std::sync::atomic::AtomicBool>>,
 );
 impl workers::Work for SelectedTask {
+    const THREAD_NAME: Option<&'static str> = Some("syq-delete");
     type Outcome = Vec<(usize, anyhow::Result<()>)>;
     fn run(self, pool: &Arc<workers::Pool<Self>>) {
         let mut parent = DirectoryBatch::default();

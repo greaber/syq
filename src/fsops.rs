@@ -558,7 +558,9 @@ pub(crate) fn directory_permission_hint(
             0o100
         };
         if metadata.is_dir() && metadata.uid == uid && metadata.mode & required != required {
-            return Some("--temporarily-widen-dir-permissions may help: an owned destination directory lacks the required owner permissions".into());
+            return Some(
+                "an owned destination directory lacks the required owner permissions".into(),
+            );
         }
     }
     None
@@ -2832,6 +2834,7 @@ impl FsOps {
             return;
         };
         if let Some(hint) = directory_permission_hint(&target.root, &target.relative, access) {
+            error.io_kind = Some(WireIoKind::OwnedDirectoryPermissions);
             error.message.push_str("; ");
             error.message.push_str(&hint);
         }

@@ -1314,7 +1314,16 @@ fn attempt_small_copy(
         let failure = match result.error {
             Some(error) => {
                 let error = endpoint_error(error).context("put");
-                Some(("unknown", os_kind_of(&error), format!("{error:#}")))
+                Some((
+                    "unknown",
+                    os_kind_of(&error),
+                    copy_error_message(
+                        &error,
+                        args.interface == Interface::NativeCp
+                            && !args.temporarily_widen_dir_permissions
+                            && !args.only_new_native_entries(),
+                    ),
+                ))
             }
             None => None,
         };
@@ -1740,7 +1749,7 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
 fn wire_os_kind(error: &WireError) -> Option<&'static str> {
     Some(match error.io_kind? {
         WireIoKind::NotFound => "not_found",
-        WireIoKind::PermissionDenied => "permission_denied",
+        WireIoKind::PermissionDenied | WireIoKind::OwnedDirectoryPermissions => "permission_denied",
         WireIoKind::AlreadyExists => "already_exists",
         WireIoKind::InvalidInput => "invalid_input",
         WireIoKind::NoSpace => "no_space",
@@ -1748,6 +1757,38 @@ fn wire_os_kind(error: &WireError) -> Option<&'static str> {
         WireIoKind::ReadOnly => "read_only",
         WireIoKind::Other => "other",
     })
+}
+
+pub(crate) const DIRECTORY_ACCESS_HINT: &str = "--temporarily-widen-dir-permissions may help";
+
+fn permission_error_message(message: String, kind: Option<WireIoKind>, may_widen: bool) -> String {
+    if may_widen && kind == Some(WireIoKind::OwnedDirectoryPermissions) {
+        format!("{message}; {DIRECTORY_ACCESS_HINT}")
+    } else {
+        message
+    }
+}
+
+fn copy_error_message(error: &anyhow::Error, may_widen: bool) -> String {
+    let kind = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WireError>())
+        .and_then(|error| error.io_kind);
+    permission_error_message(format!("{error:#}"), kind, may_widen)
+}
+
+impl Opts {
+    fn may_suggest_directory_access(&self) -> bool {
+        !self.widen_directory_permissions && !self.preserve_existing_directory_metadata
+    }
+
+    fn wire_error_message(&self, error: &WireError) -> String {
+        permission_error_message(
+            error.to_string(),
+            error.io_kind,
+            self.may_suggest_directory_access(),
+        )
+    }
 }
 
 fn capacity_os_kind(kind: Option<&str>) -> bool {
@@ -3327,6 +3368,36 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && directory_selection.is_none()
         && may_create_directories
         && defer_destination_mutations;
+    // Selection already inspected the container. Carry its identity into
+    // planning, so file-only copies can request access without another lookup
+    // on the ordinary writable-directory path.
+    let container_access = if args.temporarily_widen_dir_permissions
+        && !opts.dry_run
+        && !opts.preserve_existing_directory_metadata
+    {
+        if let Some(selection) = &directory_selection {
+            selection.needs_owner_access.then(|| {
+                (
+                    request_prefix.clone(),
+                    TargetCondition::Matches {
+                        dev: selection.dev,
+                        ino: selection.ino,
+                    },
+                )
+            })
+        } else if dst_is_dir {
+            dst_root_entry
+                .as_ref()
+                .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+                .map(|entry| (dst_root.clone(), target_identity(entry)))
+        } else if opts.restricted_receiver {
+            Some((parent_path(&dst_root), TargetCondition::Any))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if use_operator_anchor {
         let create_operator_directory_now = directory_selection.is_none()
             && may_create_directories
@@ -3723,6 +3794,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         mapping_explicit_parents: std::collections::HashSet::new(),
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
+        container_access,
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root {
             std::collections::HashSet::from([dst_root.clone()])
@@ -3990,7 +4062,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     progress.scan_done.store(true, Relaxed);
     if let Some(e) = &scan_err {
         let os_kind = os_kind_of(e);
-        progress.error_classified(&format!("syq: {e:#}"), os_kind.map(|_| "io"), os_kind);
+        progress.error_classified(
+            &format!(
+                "syq: {}",
+                copy_error_message(e, opts.may_suggest_directory_access())
+            ),
+            os_kind.map(|_| "io"),
+            os_kind,
+        );
         sched.abort();
     } else if collision {
         sched.abort();
@@ -4159,7 +4238,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         (deleted, delete_plan) = st.prune(prune_overlap_unsearchable, false)?;
     }
     if !opts.dry_run {
-        st.apply_deferred(aborted)?;
+        if let Err(error) = st.apply_deferred(aborted) {
+            if !aborted {
+                return Err(error);
+            }
+            // Cleanup must not replace the interrupted/aborted terminal result.
+            progress.error(&format!("syq: restore directory permissions: {error:#}"));
+        }
     }
     if debug() {
         crate::output::diagnostic!(

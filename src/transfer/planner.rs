@@ -65,6 +65,8 @@ pub(super) struct Planner<'a> {
     pub(super) mapping_explicit_parents: std::collections::HashSet<PathBytes>,
     /// Observed obstructions at implicit parents fail only mapped descendants.
     pub(super) blocked_mapping_parents: std::collections::HashSet<PathBytes>,
+    /// One pending destination container, including a file-only copy's parent.
+    pub(super) container_access: Option<(PathBytes, TargetCondition)>,
     /// Original receiver modes, only for directories actually widened.
     pub(super) directory_restorations:
         std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
@@ -1505,6 +1507,7 @@ impl Planner<'_> {
         // buffered copies prepare each batch in apply_mapped, so directories
         // for later batches are not widened merely because they were planned.
         if prepare_for_pruning {
+            self.prepare_container_access()?;
             self.prepare_existing_directories(
                 buffered
                     .iter()
@@ -1593,6 +1596,9 @@ impl Planner<'_> {
             return Ok(());
         }
         let root_entry = self.assert_mutation_root()?;
+        if !mapped.dirs.is_empty() || !mapped.others.is_empty() {
+            self.prepare_container_access()?;
+        }
         let opts = self.opts;
         let Mapped {
             directory_expression_sources,
@@ -2447,8 +2453,11 @@ impl Planner<'_> {
             let error = self.apply(vec![root_op])?.into_iter().next().flatten();
             if let Some(error) = error {
                 let os_kind = wire_os_kind(&error);
-                self.progress
-                    .error_classified(&format!("syq: {error}"), Some("io"), os_kind);
+                self.progress.error_classified(
+                    &format!("syq: {}", self.opts.wire_error_message(&error)),
+                    Some("io"),
+                    os_kind,
+                );
                 if capacity_os_kind(os_kind) {
                     return Err(endpoint_error(error)).context("apply destination changes");
                 }
@@ -2495,8 +2504,11 @@ impl Planner<'_> {
                 let os_kind = err.as_ref().and_then(wire_os_kind);
                 if let Some(err) = &err {
                     failed += 1;
-                    self.progress
-                        .error_classified(&format!("syq: {err}"), Some("io"), os_kind);
+                    self.progress.error_classified(
+                        &format!("syq: {}", self.opts.wire_error_message(err)),
+                        Some("io"),
+                        os_kind,
+                    );
                     if name == &self.dst_root && *condition != TargetCondition::Any {
                         self.collision = true;
                     }
@@ -2692,8 +2704,11 @@ impl Planner<'_> {
 
     fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
         let os_kind = wire_os_kind(error);
-        self.progress
-            .error_classified(&format!("syq: {error}"), Some("io"), os_kind);
+        self.progress.error_classified(
+            &format!("syq: {}", self.opts.wire_error_message(&error)),
+            Some("io"),
+            os_kind,
+        );
         if let Some(dst) = dst {
             self.emit_entry_failed(
                 FailedEntry {
@@ -2725,8 +2740,11 @@ impl Planner<'_> {
             let error = e1.or(e2);
             let os_kind = error.as_ref().and_then(wire_os_kind);
             if let Some(e) = &error {
-                self.progress
-                    .error_classified(&format!("syq: {e}"), Some("io"), os_kind);
+                self.progress.error_classified(
+                    &format!("syq: {}", self.opts.wire_error_message(e)),
+                    Some("io"),
+                    os_kind,
+                );
             } else {
                 // Counted only once the operation settles: a fatal
                 // unwind between queueing and applying must not leave
@@ -3786,11 +3804,21 @@ impl Planner<'_> {
         }
     }
 
+    fn prepare_container_access(&mut self) -> Result<()> {
+        if let Some((path, condition)) = self.container_access.take() {
+            if condition == TargetCondition::Any {
+                self.prepare_existing_directories(vec![path])?;
+            } else {
+                self.widen_directories(vec![(path, condition)])?;
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
         if !self.opts.widen_directory_permissions
             || self.opts.dry_run
             || self.opts.preserve_existing_directory_metadata
-            || self.destination_root_known_missing
         {
             return Ok(());
         }
@@ -3831,40 +3859,52 @@ impl Planner<'_> {
                 if directories.is_empty() {
                     continue;
                 }
-                let names: Vec<_> = directories.iter().map(|(path, _)| path.clone()).collect();
-                let response = ok(
-                    self.dst.call(Request::WidenDirectories {
-                        directories,
-                        guard: self.container_guard.clone(),
-                    })?,
-                    "prepare directory permissions",
-                )?;
-                let Response::WidenedDirectories(results) = response else {
-                    bail!("unexpected directory access response {response:?}");
-                };
-                anyhow::ensure!(
-                    results.len() == names.len(),
-                    "directory access response count mismatch"
-                );
-                for (path, result) in names.into_iter().zip(results) {
-                    match result {
-                        Ok(Some(mode)) => {
-                            self.directory_restorations.insert(path, mode);
-                        }
-                        Ok(None) => {}
-                        Err(error) => self.progress.error_classified(
-                            &format!("syq: {}: {error}", display(&path)),
-                            Some("io"),
-                            wire_os_kind(&error),
-                        ),
-                    }
+                self.widen_directories(directories)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn widen_directories(&mut self, directories: Vec<(PathBytes, TargetCondition)>) -> Result<()> {
+        let names: Vec<_> = directories.iter().map(|(path, _)| path.clone()).collect();
+        let response = ok(
+            self.dst.call(Request::WidenDirectories {
+                directories,
+                guard: self.container_guard.clone(),
+            })?,
+            "prepare directory permissions",
+        )?;
+        let Response::WidenedDirectories(results) = response else {
+            bail!("unexpected directory access response {response:?}");
+        };
+        anyhow::ensure!(
+            results.len() == names.len(),
+            "directory access response count mismatch"
+        );
+        for (path, result) in names.into_iter().zip(results) {
+            match result {
+                Ok(Some(mode)) => {
+                    self.directory_restorations.insert(path, mode);
                 }
+                Ok(None) => {}
+                Err(error) => self.progress.error_classified(
+                    &format!(
+                        "syq: {}: {}",
+                        display(&path),
+                        self.opts.wire_error_message(&error)
+                    ),
+                    Some("io"),
+                    wire_os_kind(&error),
+                ),
             }
         }
         Ok(())
     }
 
     pub(super) fn apply_deferred(&mut self, aborted: bool) -> Result<()> {
+        if self.directory_restorations.is_empty() && (aborted || self.deferred.is_empty()) {
+            return Ok(());
+        }
         self.assert_mutation_root()?;
         let mut d = if aborted {
             Vec::new()
@@ -3914,10 +3954,10 @@ impl Planner<'_> {
         }
         d.retain(|(_, _, flags, _, _)| *flags != 0);
         d.sort_by(|a, b| b.3.cmp(&a.3));
-        for chunk in d
-            .chunk_by(|a, b| a.3 == b.3)
-            .flat_map(|depth| depth.chunks(1000))
-        {
+        let mut pending = d.as_slice();
+        while !pending.is_empty() {
+            let (chunk, rest) = pending.split_at(directory_metadata_batch_len(pending));
+            pending = rest;
             let ops: Vec<Op> = chunk
                 .iter()
                 .map(|(p, m, f, _, condition)| Op::SetMeta {
@@ -3943,6 +3983,23 @@ impl Planner<'_> {
         }
         Ok(())
     }
+}
+
+/// Keep ordinary metadata in full batches, even across directory depths. Only
+/// a mode that removes search access needs to wait for deeper operations.
+fn directory_metadata_batch_len(
+    entries: &[(PathBytes, Meta, u8, usize, TargetCondition)],
+) -> usize {
+    let maximum = entries.len().min(1000);
+    let deepest = entries[0].3;
+    entries[..maximum]
+        .iter()
+        .position(|(_, meta, flags, depth, _)| {
+            *depth < deepest
+                && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
+                && meta.mode & 0o100 == 0
+        })
+        .unwrap_or(maximum)
 }
 
 /// A destination ancestor directory without selected source metadata: created
@@ -3998,4 +4055,41 @@ pub(super) fn strip_dst_root<'p>(path: &'p [u8], dst_root: &[u8]) -> Option<&'p 
     }
     let rest = path.strip_prefix(dst_root)?;
     Some(rest.strip_prefix(b"/").unwrap_or(rest))
+}
+
+#[cfg(test)]
+mod directory_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn final_metadata_batches_cross_depths_until_search_access_is_removed() {
+        let mut entries: Vec<_> = (0..12)
+            .rev()
+            .map(|depth| {
+                (
+                    vec![b'd'; depth + 1],
+                    Meta {
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                        mtime_nsec: 0,
+                        inode_metadata: None,
+                    },
+                    flags::MODE | flags::TIMES,
+                    depth,
+                    TargetCondition::Any,
+                )
+            })
+            .collect();
+        assert_eq!(directory_metadata_batch_len(&entries), 12);
+        entries[7].1.mode = 0o600;
+        assert_eq!(directory_metadata_batch_len(&entries), 7);
+        assert_eq!(directory_metadata_batch_len(&entries[7..]), 5);
+        // A time-only update does not change access, regardless of its mode field.
+        entries[7].2 = flags::TIMES;
+        assert_eq!(directory_metadata_batch_len(&entries), 12);
+        entries[7].2 = flags::RECEIVER_MODE;
+        assert_eq!(directory_metadata_batch_len(&entries), 7);
+    }
 }

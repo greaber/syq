@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) trait Work: Send + Sized + 'static {
     type Outcome: Send;
+    const THREAD_NAME: Option<&'static str> = None;
     fn run(self, pool: &Arc<Pool<Self>>);
     fn completed(outcome: &Self::Outcome) -> u64;
 }
@@ -15,7 +16,7 @@ pub(crate) trait Work: Send + Sized + 'static {
 pub(crate) struct Pool<T: Work> {
     pub(crate) sender: Mutex<Option<mpsc::SyncSender<T>>>,
     pub(crate) pending: Mutex<usize>,
-    pub(crate) events: mpsc::Sender<Option<T::Outcome>>,
+    pub(crate) events: mpsc::Sender<Result<Option<T::Outcome>, ()>>,
     pub(crate) dry_run: bool,
     pub(crate) cancelled: AtomicBool,
     pub(crate) limit: AtomicUsize,
@@ -54,7 +55,7 @@ impl<T: Work> Pool<T> {
         if finished {
             // The coordinator can consume the last outcome before this task
             // finishes. Wake it again so completion cannot wait for EVENT_POLL.
-            let _ = self.events.send(None);
+            let _ = self.events.send(Ok(None));
         }
     }
 
@@ -151,7 +152,7 @@ impl<T: Work> Pool<T> {
 
     pub(crate) fn outcome(&self, outcome: T::Outcome) {
         if !self.is_cancelled() {
-            let _ = self.events.send(Some(outcome));
+            let _ = self.events.send(Ok(Some(outcome)));
         }
     }
 }
@@ -216,9 +217,10 @@ pub(crate) fn emit<T: Work>(
 pub(crate) struct Executor<T: Work> {
     pub(crate) pool: Arc<Pool<T>>,
     receiver: Arc<Mutex<mpsc::Receiver<T>>>,
-    events: Mutex<mpsc::Receiver<Option<T::Outcome>>>,
+    events: Mutex<mpsc::Receiver<Result<Option<T::Outcome>, ()>>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     control: Control,
+    failed: bool,
 }
 
 impl<T: Work> Executor<T> {
@@ -242,6 +244,7 @@ impl<T: Work> Executor<T> {
             events: Mutex::new(outcomes),
             threads: Vec::new(),
             control: Control::new(concurrency),
+            failed: false,
         }
     }
 
@@ -249,8 +252,24 @@ impl<T: Work> Executor<T> {
         while self.threads.len() < limit {
             let pool = self.pool.clone();
             let receiver = self.receiver.clone();
-            self.threads
-                .push(std::thread::spawn(move || worker_loop(pool, receiver)));
+            let mut builder = std::thread::Builder::new();
+            if let Some(name) = T::THREAD_NAME {
+                builder = builder.name(format!("{name}-{}", self.threads.len()));
+            }
+            self.threads.push(
+                builder
+                    .spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            worker_loop(pool.clone(), receiver)
+                        }));
+                        if result.is_err() {
+                            // A panicking task cannot decrement its outstanding count.
+                            // Tell the coordinator instead of leaving it waiting forever.
+                            let _ = pool.events.send(Err(()));
+                        }
+                    })
+                    .expect("start removal worker"),
+            );
         }
     }
 
@@ -260,12 +279,13 @@ impl<T: Work> Executor<T> {
         batch_backlogged: bool,
         sink: &mut dyn FnMut(Vec<T::Outcome>) -> Result<()>,
     ) -> Result<()> {
+        anyhow::ensure!(!self.failed, "removal worker previously panicked");
         let mut tasks = tasks.into_iter().peekable();
         if tasks.peek().is_none() {
             return Ok(());
         }
         self.pool.set_limit(self.control.limit());
-        self.spawn_to(self.control.limit());
+        let mut start_workers = true;
         let mut next = tasks.next();
         let mut batch = Vec::with_capacity(200);
         let mut error = None;
@@ -295,6 +315,12 @@ impl<T: Work> Executor<T> {
                     Err(mpsc::TrySendError::Disconnected(_)) => unreachable!(),
                 }
             }
+            if start_workers {
+                // Seed the bounded queue first, as recursive removal did before
+                // sharing this executor. New threads need not park before work.
+                self.spawn_to(self.control.limit());
+                start_workers = false;
+            }
             if next.is_none() && self.pool.is_done() {
                 break;
             }
@@ -304,13 +330,18 @@ impl<T: Work> Executor<T> {
                 .unwrap()
                 .recv_timeout(Duration::from_millis(100))
             {
-                Ok(Some(event)) => {
+                Ok(Ok(Some(event))) => {
                     completed += T::completed(&event);
                     if error.is_none() {
                         batch.push(event);
                     }
                 }
-                Ok(None) | Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Ok(Err(())) => {
+                    self.failed = true;
+                    self.pool.cancel();
+                    anyhow::bail!("removal worker panicked");
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             if !self.pool.dry_run && !self.pool.is_cancelled() && sampled.elapsed() >= SAMPLE {
@@ -337,7 +368,11 @@ impl<T: Work> Executor<T> {
                 last_emit = Instant::now();
             }
         }
-        for event in self.events.get_mut().unwrap().try_iter().flatten() {
+        for event in self.events.get_mut().unwrap().try_iter() {
+            let event = event.expect("a panicking task leaves pending work for the receive loop");
+            let Some(event) = event else {
+                continue;
+            };
             completed += T::completed(&event);
             if error.is_none() {
                 batch.push(event);
@@ -369,5 +404,38 @@ impl<T: Work> Drop for Executor<T> {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Panics;
+    impl Work for Panics {
+        type Outcome = ();
+        fn run(self, _: &Arc<Pool<Self>>) {
+            panic!("test removal panic");
+        }
+        fn completed(_: &()) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn worker_panic_fails_the_batch_and_later_calls_instead_of_hanging() {
+        let (done, result) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut executor = Executor::new(Concurrency::filesystem(2), false);
+            let first = executor.run([Panics], false, &mut |_| Ok(())).unwrap_err();
+            let next = executor.run([Panics], false, &mut |_| Ok(())).unwrap_err();
+            drop(executor);
+            done.send((first.to_string(), next.to_string())).unwrap();
+        });
+        let (first, next) = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("executor hung after a worker panic");
+        assert!(first.contains("worker panicked"));
+        assert!(next.contains("previously panicked"));
     }
 }

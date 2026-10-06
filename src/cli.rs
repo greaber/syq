@@ -2427,7 +2427,10 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
     {
         Some((path, placement, existence)) => (Some(path), placement, existence),
-        None if prune || prune_before => bail!("--prune and --prune-before require an explicit placement, such as --into DIR"),
+        None if prune || prune_before => bail!(
+            "{} requires an explicit placement, such as --into DIR",
+            if prune_before { "--prune-before" } else { "--prune" }
+        ),
         None if copy.to.is_some() || copy.selection.from.is_some() || s3_options.is_some() => {
             (Some(OsString::from(".")), Placement::Into, Existence::Any)
         }
