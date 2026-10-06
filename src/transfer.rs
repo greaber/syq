@@ -50,6 +50,12 @@ const FAST_BATCH_FILES: usize = 2048;
 // Keep the startup worker budget independent of the larger batch ceiling.
 // Larger batches must not leave small trees with fewer transfer workers.
 const STARTUP_BATCH_FILES: usize = 128;
+/// Files per starting worker for batched files on a network filesystem. There
+/// every file costs several round trips that batching does not save, so a
+/// worker has about one file in flight: 128 new 4 KiB files in 16 directories
+/// on a 50 ms SSHFS mount took 34 s from an automatic start at one worker and
+/// 12 s from sixteen.
+const NETWORK_STARTUP_BATCH_FILES: usize = 8;
 // Let small scans finish before choosing their bounded worker count.
 const STREAMING_START_FILES: usize = 4 * STARTUP_BATCH_FILES;
 // Source requests carry both display paths and registered references. Leave
@@ -86,6 +92,60 @@ fn initial_range_workers(
         total.saturating_add((size / min_split).max(1))
     });
     limit.min((capacity.min(usize::MAX as u64) as usize).max(1))
+}
+
+/// How many workers a copy starts with, from what is known when they start.
+#[derive(Clone, Copy, Debug)]
+struct StartRule {
+    /// The explicit, remembered or default count, within resource limits.
+    workers: usize,
+    /// The count is the tuner's starting point, not an explicit `workers=N`.
+    automatic: bool,
+    /// The destination lies on a network filesystem.
+    network_destination: bool,
+    /// An explicit `batch-files`, which also sets files per starting worker.
+    batch_files: Option<usize>,
+    batch_bytes: u64,
+}
+
+impl StartRule {
+    /// Files per starting worker: fewer when every file is batched on a
+    /// network filesystem, where each file costs its own round trips.
+    fn files_per_worker(&self, all_small: bool) -> usize {
+        self.batch_files
+            .unwrap_or(if self.network_destination && all_small {
+                NETWORK_STARTUP_BATCH_FILES
+            } else {
+                STARTUP_BATCH_FILES
+            })
+    }
+
+    /// Workers for `files` new files totalling `bytes`, every one sent in
+    /// small-file batches: a worker per startup batch of files or bytes. A
+    /// batched file is never split, so even an explicit count starts at most
+    /// one worker per file; a worker with nothing to do still costs a
+    /// connection.
+    fn batched(&self, files: usize, bytes: u64) -> usize {
+        if !self.automatic {
+            return self.workers.min(files.max(1));
+        }
+        self.streaming(files, bytes, true)
+    }
+
+    /// Workers while planning a large tree, from the files queued so far. An
+    /// explicit count starts exactly that many workers.
+    fn streaming(&self, files: usize, bytes: u64, all_small: bool) -> usize {
+        if !self.automatic {
+            return self.workers;
+        }
+        initial_fast_workers(
+            self.workers,
+            files,
+            bytes,
+            self.files_per_worker(all_small),
+            self.batch_bytes,
+        )
+    }
 }
 
 fn reuse_startup_ssh(id: usize, autotune: bool) -> bool {
@@ -3163,6 +3223,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let destination_filesystem = initial_destination_filesystem
         .as_ref()
         .and_then(|info| info.filesystem.clone());
+    let network_destination = initial_destination_filesystem
+        .as_ref()
+        .is_some_and(|info| info.network);
     let fresh_capacity = initial_destination_filesystem.and_then(|info| {
         (fresh_destination && args.dry_run).then_some(FreshCapacityPlan {
             device: info.device,
@@ -3650,7 +3713,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             args.connections = gate.active();
             history.event("starting_count", serde_json::json!({"workers":args.connections,
                 "reason":if hint.is_some() {"history"} else if autotune {"default"} else {"explicit"},
-                "hint":hint}));
+                "hint":hint, "network_destination":network_destination}));
             selected_history = hint;
             *history_context.borrow_mut() = Some(key);
         }
@@ -3742,6 +3805,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let streaming_connections = args.connections;
     let streaming_refine = transport_setup.as_ref().and_then(|(_, _, refine)| *refine);
     let streaming_worker_hint = std::cell::Cell::new(0);
+    let start_rule = |workers: usize| StartRule {
+        workers,
+        automatic: autotune,
+        network_destination,
+        batch_files: opts.tuning.batch_files,
+        batch_bytes: opts.tuning.batch_bytes(),
+    };
+    // Whether every file queued so far fits a small-file batch, checking each
+    // queued job once as planning proceeds. Only network destinations ask.
+    let streaming_batch_limit = fast_file_size_limit(&opts, bwlimit.as_deref());
+    let streaming_checked_jobs = std::cell::Cell::new(0);
+    let streaming_all_batched = std::cell::Cell::new(true);
     let start_streaming = || {
         if !streaming_ready
             || sched.is_aborted()
@@ -3751,17 +3826,23 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         let files = progress.files_total.load(Relaxed) as usize;
         let bytes = progress.bytes_total.load(Relaxed);
-        if files < STREAMING_START_FILES {
+        // An explicit count above the files queued so far waits for the
+        // complete count, which can limit a small-file tree to a worker per file.
+        if files < STREAMING_START_FILES || (!autotune && streaming_connections > files) {
             return;
         }
         let initial = if autotune {
-            initial_fast_workers(
-                streaming_connections,
-                files,
-                bytes,
-                opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                opts.tuning.batch_bytes(),
-            )
+            if network_destination && streaming_all_batched.get() {
+                let jobs = sched.jobs.lock().unwrap();
+                let checked = streaming_checked_jobs.get();
+                streaming_all_batched.set(
+                    jobs.iter()
+                        .skip(checked)
+                        .all(|job| job.entry.size <= streaming_batch_limit),
+                );
+                streaming_checked_jobs.set(jobs.len());
+            }
+            start_rule(streaming_connections).streaming(files, bytes, streaming_all_batched.get())
         } else {
             streaming_connections
         };
@@ -3987,13 +4068,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 st.buffered_file_population(fast_file_size_limit(&opts, bwlimit.as_deref()));
             (files > 1).then(|| {
                 if all_small && !opts.tuning.force_ranges() && bwlimit.is_none() {
-                    initial_fast_workers(
-                        args.connections,
-                        files,
-                        bytes,
-                        opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                        opts.tuning.batch_bytes(),
-                    )
+                    start_rule(args.connections).batched(files, bytes)
                 } else {
                     args.connections
                 }
@@ -4146,13 +4221,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             jobs.len() == 1 && jobs[0].container_guard.is_none()
                         };
                     let mut initial = if multiplex_small_files {
-                        initial_fast_workers(
-                            args.connections,
-                            file_jobs,
-                            file_bytes,
-                            opts.tuning.batch_files.unwrap_or(STARTUP_BATCH_FILES),
-                            opts.tuning.batch_bytes(),
-                        )
+                        start_rule(args.connections).batched(file_jobs, file_bytes)
                     } else {
                         args.connections
                     };

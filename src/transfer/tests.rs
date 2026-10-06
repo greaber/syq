@@ -5724,6 +5724,85 @@ fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_th
     assert_ne!(executed.whole, 0);
 }
 
+fn start_rule(workers: usize, network_destination: bool) -> StartRule {
+    StartRule {
+        workers,
+        automatic: true,
+        network_destination,
+        batch_files: None,
+        batch_bytes: crate::transfer_tuning::DEFAULT_BATCH_BYTES,
+    }
+}
+
+#[test]
+fn fast_destinations_keep_their_starting_counts() {
+    const KIB: u64 = 1024;
+    let rule = start_rule(32, false);
+    // A worker per 128 batched files or per batch of bytes, as before.
+    assert_eq!(rule.batched(1, 4 * KIB), 1);
+    assert_eq!(rule.batched(128, 128 * 4 * KIB), 1);
+    assert_eq!(rule.batched(129, 129 * 4 * KIB), 2);
+    assert_eq!(rule.batched(512, 512 * 4 * KIB), 4);
+    assert_eq!(rule.batched(100_000, 100_000 * 4 * KIB), 32);
+    assert_eq!(rule.batched(10, 10 * 64 * KIB), 1);
+    assert_eq!(rule.streaming(600, 600 * 4 * KIB, true), 5);
+    assert_eq!(rule.streaming(600, 600 * 1024 * KIB, false), 32);
+    assert_eq!(rule.streaming(600, 600 * 70 * KIB, false), 5);
+}
+
+#[test]
+fn network_destinations_start_a_worker_per_eight_small_files() {
+    const KIB: u64 = 1024;
+    let rule = start_rule(32, true);
+    assert_eq!(rule.batched(1, 4 * KIB), 1);
+    assert_eq!(rule.batched(8, 8 * 4 * KIB), 1);
+    assert_eq!(rule.batched(9, 9 * 4 * KIB), 2);
+    assert_eq!(rule.batched(128, 128 * 4 * KIB), 16);
+    assert_eq!(rule.batched(256, 256 * 4 * KIB), 32);
+    assert_eq!(rule.batched(100_000, 100_000 * 4 * KIB), 32);
+    assert_eq!(rule.streaming(600, 600 * 4 * KIB, true), 32);
+    // Trees with files too large to batch start as on a fast destination.
+    assert_eq!(rule.streaming(600, 600 * 1024 * KIB, false), 32);
+    assert_eq!(rule.streaming(600, 600 * 70 * KIB, false), 5);
+    // Route caps stay in force: 8 over SSH, 16 over TCP.
+    for cap in [8, 16] {
+        let rule = start_rule(cap, true);
+        assert_eq!(rule.batched(128, 128 * 4 * KIB), cap);
+        assert_eq!(rule.batched(16, 16 * 4 * KIB), 2);
+    }
+}
+
+#[test]
+fn starting_counts_respect_limits_history_and_explicit_settings() {
+    const KIB: u64 = 1024;
+    // Resource limits or a remembered count have already set `workers`; the
+    // rule starts no more than that.
+    let limited = start_rule(4, true);
+    assert_eq!(limited.batched(128, 128 * 4 * KIB), 4);
+    assert_eq!(start_rule(2, true).batched(128, 128 * 4 * KIB), 2);
+    // An explicit batch size also sets the files per starting worker.
+    let batch = StartRule {
+        batch_files: Some(32),
+        ..start_rule(32, true)
+    };
+    assert_eq!(batch.batched(128, 128 * 4 * KIB), 4);
+    // An explicit worker count starts that many, except that small batched
+    // files are never split: at most one worker per file.
+    for network_destination in [false, true] {
+        for workers in [1, 8, 64] {
+            let explicit = StartRule {
+                automatic: false,
+                ..start_rule(workers, network_destination)
+            };
+            assert_eq!(explicit.batched(1, 4 * KIB), 1);
+            assert_eq!(explicit.batched(3, 3 * 4 * KIB), workers.min(3));
+            assert_eq!(explicit.batched(128, 128 * 4 * KIB), workers);
+            assert_eq!(explicit.streaming(600, 600 * 1024 * KIB, false), workers);
+            assert_eq!(explicit.streaming(600, 600 * 4 * KIB, true), workers);
+        }
+    }
+}
+
 #[test]
 fn directory_access_advice_needs_evidence_and_an_available_option() {
     let error = WireError {
