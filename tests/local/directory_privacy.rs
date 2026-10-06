@@ -302,8 +302,8 @@ fn a_new_destination_root_is_private_from_its_creation() {
             ],
             true,
         ),
-        // Its source's mode is applied at the end.
-        (&["rsync", "-r", "src/", "dst/"], true),
+        // Nothing is applied later: its creation mode is final.
+        (&["rsync", "-r", "src/", "dst/"], false),
     ];
     for (args, private_while_pending) in cases {
         let t = Tmp::new();
@@ -685,6 +685,41 @@ fn a_remote_receiver_grants_no_more_than_the_source_while_filling() {
             "{args:?}: {} while filled",
             octal(&during)
         );
+    }
+}
+
+#[test]
+fn a_root_interrupted_right_after_its_creation_has_its_final_mode() {
+    // Without -p a new destination root is created with its source's mode
+    // and owner access, as any new directory is, so a copy interrupted right
+    // after creating it, and its retry, leave it as a whole copy does.
+    let cases: [&[&str]; 3] = [
+        &["rsync", "-r", "src/", "dst/"],
+        &["cp", "--srcs-in", "src", "--into", "dst"],
+        &["cp", "src", "--as", "dst"],
+    ];
+    for args in cases {
+        let t = Tmp::new();
+        source_tree(&t, 0o755, 0o755);
+        let mut command = syq_command(args);
+        command
+            .current_dir(&t.0)
+            .env("SYQ_TEST_CREATED_DIRECTORY_SUFFIX", "/dst");
+        let (mut child, _) = start_held(&t, command, "CREATED_DIRECTORY");
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        child.wait().unwrap();
+        assert_eq!(mode(&t.path("dst")), 0o755, "{args:?}: interrupted");
+        let mut retry = syq_command(args);
+        retry.current_dir(&t.0);
+        unsafe {
+            retry.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+        assert_output_ok(&retry.run().unwrap());
+        assert_eq!(read(&t.path("dst/sub/file")), b"nested file");
+        assert_eq!(mode(&t.path("dst")), 0o755, "{args:?}: after the retry");
     }
 }
 

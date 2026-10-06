@@ -945,13 +945,16 @@ impl FsOps {
         require_absent: bool,
     ) -> Result<DirectoryAnchor> {
         let umask = self.creation_umask();
+        // It has owner access while it is filled, as any new directory has.
         let anchor = self
             .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
-            .create_missing(mode, require_absent, umask)?;
-        // A destination created private is opened once its metadata is set.
-        if mode & 0o7777 == 0o700 {
+            .create_missing(mode | 0o700, require_absent, umask)?;
+        // A destination created private is opened once its metadata is set,
+        // and one whose mode lacks owner access is narrowed once it is filled.
+        let narrowing = mode & 0o700 != 0o700;
+        if mode & 0o7777 == 0o700 || narrowing {
             let created = self
                 .operator_selection
                 .as_ref()
@@ -959,7 +962,7 @@ impl FsOps {
                 .directory
                 .metadata()?;
             self.receiver_directories
-                .created((anchor.dev, anchor.ino), created.mode(), false);
+                .created((anchor.dev, anchor.ino), created.mode(), narrowing);
         }
         Ok(anchor)
     }

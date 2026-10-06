@@ -1558,7 +1558,12 @@ impl Planner<'_> {
                     .expect("destination anchor set once");
             } else {
                 debug_assert!(is_destination_root);
-                let created = mkdir_root(self.dst, &root, condition, self.private_root.is_some())?;
+                let mode = if self.private_root.is_some() {
+                    0o700
+                } else {
+                    0o755
+                };
+                let created = mkdir_root(self.dst, &root, condition, mode)?;
                 self.mutation_root_condition = target_identity(&created);
                 if self.guard_containers {
                     self.container_guard = Some(target_container(&root, &created));

@@ -3056,6 +3056,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             );
         }
     }
+    // Source roots already inspected, which a new destination root's mode
+    // can come from.
+    let mut source_root_entries: Vec<Option<Entry>> = vec![None; srcs.len()];
     if args.interface != Interface::Rsync {
         // Native selectors are structural: validate every selected root before
         // a missing --into target can be created. The registered selection is
@@ -3068,7 +3071,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 source.follows_root(args.follows_native_source_paths()),
             )? {
                 Some(entry) => {
-                    validate_native_source_type(&source.path, source.selection, entry.kind)?
+                    validate_native_source_type(&source.path, source.selection, entry.kind)?;
+                    source_root_entries[source_index] = Some(entry);
                 }
                 None => bail!("source {} does not exist", display(&source.path)),
             }
@@ -3448,20 +3452,39 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let dry_run_creates_root = root_creatable && args.dry_run;
     let root_create_condition = TargetCondition::Any;
     // A directory target takes a contents source's metadata, which the
-    // planner sends only once it has scanned the source root: its mode, as
-    // any new directory takes it, and its group and permissions when they
-    // are copied. Create the root private until they have landed. The value
-    // is the mode it would otherwise have been created with.
-    let private_root = (create_root
-        && dst_is_dir
-        && args.files_from.is_none()
-        && args.native_mapping.is_none()
-        && srcs.iter().any(Location::copies_contents))
-    .then_some(if use_operator_anchor && opts.rsync_creation {
-        0o777
-    } else {
-        0o755
+    // planner sends only once it has scanned the source root. When its
+    // permissions or group are copied, create the root private until they
+    // have landed; the value is the mode it would otherwise have been
+    // created with. Otherwise it is created as any new directory is: with
+    // its source's mode and owner access, which it loses at the end if its
+    // source has none, so an interrupted copy leaves it as it ends.
+    let contents_source = srcs.iter().position(Location::copies_contents).filter(|_| {
+        create_root && dst_is_dir && args.files_from.is_none() && args.native_mapping.is_none()
     });
+    let private_root = (contents_source.is_some()
+        && opts.flags & (flags::MODE | flags::GROUP) != 0)
+        .then_some(if use_operator_anchor && opts.rsync_creation {
+            0o777
+        } else {
+            0o755
+        });
+    let root_source_mode = match contents_source.filter(|_| private_root.is_none()) {
+        Some(index) => {
+            let entry = match source_root_entries[index].take() {
+                Some(entry) => Some(entry),
+                None => stat_one_registered(
+                    &mut *src_ctl,
+                    &srcs[index].path,
+                    &source_roots.get().expect("source roots registered")[index].selection,
+                    srcs[index].follows_root(args.follows_native_source_paths()),
+                )?,
+            };
+            entry
+                .filter(|entry| entry.kind == Kind::Dir)
+                .map(|entry| entry.mode & 0o777)
+        }
+        None => None,
+    };
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories
@@ -3509,9 +3532,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             directory_selection = Some(create_operator_directory(
                 &mut *dst_ctl,
                 condition,
-                private_root
-                    .filter(|_| dst_is_dir)
-                    .map_or_else(|| operator_directory_mode(&opts), |_| 0o700),
+                private_root.filter(|_| dst_is_dir).map_or_else(
+                    || root_source_mode.unwrap_or_else(|| operator_directory_mode(&opts)),
+                    |_| 0o700,
+                ),
             )?);
         }
         if let Some(selection) = directory_selection.take() {
@@ -3543,7 +3567,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             &dst_root,
             root_create_condition,
-            private_root.is_some(),
+            if private_root.is_some() {
+                0o700
+            } else {
+                root_source_mode.unwrap_or(0o755)
+            },
         )?;
         mutation_root_condition = target_identity(&created);
         if guard_containers {
@@ -4699,11 +4727,11 @@ fn mkdir_root(
     conn: &mut dyn Conn,
     dst_root: &[u8],
     condition: TargetCondition,
-    private: bool,
+    mode: u32,
 ) -> Result<Entry> {
     let ops = vec![Op::Mkdir {
         path: dst_root.to_vec(),
-        mode: if private { 0o700 } else { 0o755 },
+        mode,
         condition,
     }];
     match ok(conn.call(Request::Apply { ops, guard: None })?, "mkdir")? {
