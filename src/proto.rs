@@ -1332,6 +1332,7 @@ pub enum WireRequest<Data> {
     WidenDirectoriesForInspection {
         directories: Vec<(PathBytes, TargetCondition)>,
         guard: Option<ContainerGuard>,
+        enumerate: bool,
     },
 }
 

@@ -249,3 +249,40 @@ fn readable_download_preview_preserves_directory_ctime() {
     assert_eq!(fs::read(directory.join("extra")).unwrap(), b"keep");
     assert!(!directory.join("file").exists());
 }
+
+#[test]
+fn search_only_download_preview_does_not_widen_a_named_container() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let server = Server::start("existing-policy");
+    let temp = crate::test_support::tempdir().unwrap();
+    let directory = temp.path().join("dst");
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("file"), b"keep").unwrap();
+    let restricted = RestrictedDirectory::new(directory.clone(), 0o100);
+    let before = fs::metadata(&directory).unwrap();
+    for widen in [false, true] {
+        let mut args = vec![
+            "--from",
+            "s3://bucket",
+            "data",
+            "--as",
+            "dst/file",
+            "--dry-run",
+        ];
+        if widen {
+            args.push("--temporarily-widen-dir-permissions");
+        }
+        let output = server.cp(temp.path(), &args);
+        assert!(output.status.success(), "{}", output_text(&output));
+        let after = fs::metadata(&directory).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+    }
+    drop(restricted);
+    assert_eq!(fs::read(directory.join("file")).unwrap(), b"keep");
+}

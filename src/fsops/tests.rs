@@ -7758,6 +7758,7 @@ fn directory_inspection_access_adds_no_write_permission() {
                 },
             )],
             guard: None,
+            enumerate: true,
         };
         assert!(matches!(FsOps::new().handle(&request), Response::Err(_)));
         let Response::WidenedDirectories(results) =

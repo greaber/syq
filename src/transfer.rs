@@ -1840,7 +1840,11 @@ fn copy_error_message(error: &anyhow::Error, may_widen: bool) -> String {
 impl Opts {
     fn directory_access_mode(&self) -> u32 {
         if self.dry_run {
-            0o500
+            if self.delete {
+                0o500
+            } else {
+                0o100
+            }
         } else {
             0o700
         }

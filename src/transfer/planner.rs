@@ -4197,7 +4197,11 @@ impl Planner<'_> {
         let names: Vec<_> = directories.iter().map(|(path, _)| path.clone()).collect();
         let guard = self.container_guard.clone();
         let request = if self.opts.dry_run {
-            Request::WidenDirectoriesForInspection { directories, guard }
+            Request::WidenDirectoriesForInspection {
+                directories,
+                guard,
+                enumerate: self.opts.delete,
+            }
         } else {
             Request::WidenDirectories { directories, guard }
         };

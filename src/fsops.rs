@@ -535,8 +535,15 @@ pub(crate) fn widen_directory_for_inspection(
     path: &RelativePath,
     condition: TargetCondition,
     label: &Path,
+    enumerate: bool,
 ) -> Result<Option<crate::proto::DirectoryMode>> {
-    widen_directory_access(root, path, condition, label, 0o500)
+    widen_directory_access(
+        root,
+        path,
+        condition,
+        label,
+        if enumerate { 0o500 } else { 0o100 },
+    )
 }
 
 fn widen_directory_access(
@@ -2300,7 +2307,9 @@ impl FsOps {
                 }
             }
             Request::WidenDirectories { directories, guard }
-            | Request::WidenDirectoriesForInspection { directories, guard } => {
+            | Request::WidenDirectoriesForInspection {
+                directories, guard, ..
+            } => {
                 if guard.is_none() {
                     for (path, _) in directories {
                         map(path)?;

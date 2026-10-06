@@ -468,6 +468,7 @@ impl Engine {
             let mut directory_access = directory_permissions::TemporaryAccess::new(
                 self.args.temporarily_widen_dir_permissions,
                 self.args.dry_run,
+                self.args.delete,
             );
             let mut copies_finished = false;
             let transferred = async {

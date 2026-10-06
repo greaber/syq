@@ -3049,18 +3049,30 @@ impl FsOps {
                 })
             })(),
             Request::WidenDirectories { directories, guard }
-            | Request::WidenDirectoriesForInspection { directories, guard } => {
-                let widen = if matches!(req, Request::WidenDirectoriesForInspection { .. }) {
-                    widen_directory_for_inspection
-                } else {
-                    widen_directory
+            | Request::WidenDirectoriesForInspection {
+                directories, guard, ..
+            } => {
+                let access = match req {
+                    Request::WidenDirectoriesForInspection {
+                        enumerate: true, ..
+                    } => 0o500,
+                    Request::WidenDirectoriesForInspection {
+                        enumerate: false, ..
+                    } => 0o100,
+                    _ => 0o700,
                 };
                 Ok(Response::WidenedDirectories(parallel_map(
                     directories,
                     |(path, condition)| {
                         (|| {
                             let target = self.destination_mutation_target(path, guard.as_ref())?;
-                            widen(&target.root, &target.relative, *condition, &target.label)
+                            widen_directory_access(
+                                &target.root,
+                                &target.relative,
+                                *condition,
+                                &target.label,
+                                access,
+                            )
                         })()
                         .map_err(|error| wire_error(&error))
                     },

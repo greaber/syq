@@ -1275,7 +1275,17 @@ fn readable_directory_dry_runs_preserve_permissions_and_ctime() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    for selection in ["single", "tree", "contents", "files-from"] {
+    for (selection, mode, widen) in [
+        ("single", 0o100, false),
+        ("single", 0o100, true),
+        ("tree", 0o100, true),
+        ("contents", 0o100, true),
+        ("files-from", 0o100, true),
+        ("single", 0o500, true),
+        ("tree", 0o500, true),
+        ("prune", 0o500, true),
+        ("files-from", 0o500, true),
+    ] {
         let t = Tmp::new();
         write(&t.path("src/sub/file"), b"new");
         write(&t.path("dst/sub/file"), b"old");
@@ -1284,7 +1294,7 @@ fn readable_directory_dry_runs_preserve_permissions_and_ctime() {
         let before: Vec<_> = paths
             .iter()
             .map(|path| {
-                fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
                 fs::metadata(path).unwrap()
             })
             .collect();
@@ -1293,11 +1303,15 @@ fn readable_directory_dry_runs_preserve_permissions_and_ctime() {
         let manifest = t.s("manifest");
         let source_file = t.s("src/sub/file");
         let destination_file = t.s("dst/sub/file");
-        let mut args = vec!["cp", "--dry-run", "--temporarily-widen-dir-permissions"];
+        let mut args = vec!["cp", "--dry-run"];
+        if widen {
+            args.push("--temporarily-widen-dir-permissions");
+        }
         match selection {
             "single" => args.extend([&source_file, "--as", &destination_file]),
             "tree" => args.extend([&src, "--as", &dst]),
-            "contents" => args.extend(["--srcs-in", &src, "--into", &dst, "--prune"]),
+            "contents" => args.extend(["--srcs-in", &src, "--into", &dst]),
+            "prune" => args.extend(["--srcs-in", &src, "--into", &dst, "--prune"]),
             _ => args = vec!["rsync", "-rn", "--files-from", &manifest, &src, &dst],
         }
         let output = native_syq(&args);

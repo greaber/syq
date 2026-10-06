@@ -4155,6 +4155,7 @@ fn placement_access_uses_signed_directory_mutation_authority_and_restores_search
             },
         )],
         guard: None,
+        enumerate: true,
     };
     let error = authority.authorize(&mut preview_access, false).unwrap_err();
     assert!(format!("{error:#}").contains("read-only"), "{error:#}");

@@ -11,15 +11,17 @@ use std::path::Path;
 pub(super) struct TemporaryAccess {
     enabled: bool,
     dry_run: bool,
+    enumerate: bool,
     prepared: HashSet<String>,
     widened: BTreeMap<String, DirectoryMode>,
 }
 
 impl TemporaryAccess {
-    pub(super) fn new(enabled: bool, dry_run: bool) -> Self {
+    pub(super) fn new(enabled: bool, dry_run: bool, enumerate: bool) -> Self {
         Self {
             enabled,
             dry_run,
+            enumerate,
             prepared: HashSet::new(),
             widened: BTreeMap::new(),
         }
@@ -61,14 +63,23 @@ impl TemporaryAccess {
                         ctime: metadata.ctime,
                         ctime_nsec: metadata.ctime_nsec,
                     };
-                    let widen = if self.dry_run {
-                        crate::fsops::widen_directory_for_inspection
+                    let saved = if self.dry_run {
+                        crate::fsops::widen_directory_for_inspection(
+                            &destination.root,
+                            &relative,
+                            condition,
+                            Path::new(&path),
+                            self.enumerate,
+                        )?
                     } else {
-                        crate::fsops::widen_directory
+                        crate::fsops::widen_directory(
+                            &destination.root,
+                            &relative,
+                            condition,
+                            Path::new(&path),
+                        )?
                     };
-                    if let Some(saved) =
-                        widen(&destination.root, &relative, condition, Path::new(&path))?
-                    {
+                    if let Some(saved) = saved {
                         self.widened.insert(path.clone(), saved);
                     }
                 }
@@ -120,7 +131,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(true, false);
+        let mut access = TemporaryAccess::new(true, false, false);
         access.prepare(&destination, &[job("first/one")]).unwrap();
         assert_eq!(
             fs::metadata(temporary.path().join("later")).unwrap().mode() & 0o777,
@@ -170,7 +181,7 @@ mod tests {
         for mode in [0o500, 0o400, 0o600] {
             fs::set_permissions(&selected, fs::Permissions::from_mode(mode)).unwrap();
             let before = fs::metadata(&selected).unwrap();
-            let mut access = TemporaryAccess::new(true, true);
+            let mut access = TemporaryAccess::new(true, true, true);
             access.prepare(&destination, &[job("file")]).unwrap();
             let during = fs::metadata(&selected).unwrap();
             assert_eq!(during.mode() & 0o777, mode | 0o500);
@@ -202,7 +213,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(false, false);
+        let mut access = TemporaryAccess::new(false, false, false);
         access
             .prepare(&destination, &[job("missing/file")])
             .unwrap();
