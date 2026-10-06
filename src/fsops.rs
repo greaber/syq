@@ -38,6 +38,7 @@ mod limits;
 mod operator;
 mod partial;
 mod paths;
+mod sidecars;
 mod small_batch;
 
 pub(crate) use apply::*;
@@ -46,6 +47,8 @@ pub(crate) use limits::*;
 pub(crate) use operator::*;
 pub(crate) use partial::*;
 pub(crate) use paths::*;
+use sidecars::Sidecar;
+pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
 
 /// Compare at the decimal precision suggested by the destination timestamp.
 /// Trailing zeros may reflect either filesystem truncation or a round timestamp;
@@ -223,6 +226,7 @@ fn discard_rooted_copy_partial(
         {
             root.unlink(relative)
                 .with_context(|| format!("remove {}", label.display()))?;
+            sidecars::forget((expected_dev, expected_ino));
         }
         Some(_) | None => {}
     }
@@ -1330,6 +1334,7 @@ impl FsOps {
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
         self.uncache_rooted(&rooted.root, &rooted.relative);
+        let creation = sidecars::begin()?;
         let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
             self.open_private_partial_rooted(
                 &rooted.root,
@@ -1340,6 +1345,13 @@ impl FsOps {
             )
         })?;
         let (file, basis_size) = opened.context("sidecar creation was requested")?;
+        let staged = file.metadata()?;
+        creation.register(
+            &rooted.root,
+            &partial,
+            (staged.dev(), staged.ino()),
+            Sidecar::Stage,
+        );
         if basis_size.is_some() {
             file.set_len(0)?;
         }

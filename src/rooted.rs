@@ -27,7 +27,7 @@
 //! descriptor-based traversal, an already-open descendant remains the selected
 //! object if another process subsequently renames it.
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 use crate::fsops::CopyLocalOutcome;
 use crate::proto::OperatorSymlinkPolicy;
 use crate::sys::{
@@ -166,6 +166,12 @@ impl RelativePath {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.components.is_empty()
+    }
+
+    /// The path as one byte string, its components joined by `/`, which
+    /// `new` accepts again.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        self.components.join(&b'/')
     }
 
     pub(crate) fn to_path_buf(&self) -> PathBuf {
@@ -643,7 +649,7 @@ impl Root {
     /// Clone data into a new private sidecar, removing copied xattrs and user
     /// flags to match byte-copy metadata behavior.
     /// The private directory hides the source mode until it has been normalized.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     pub(crate) fn clone_file(
         &self,
         source: &File,
@@ -1844,6 +1850,12 @@ impl ResolvedParent<'_> {
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         })
+    }
+
+    /// Remove the leaf, which the caller has just inspected through
+    /// `metadata`. Directories are refused by the kernel.
+    pub(crate) fn unlink(&self) -> io::Result<()> {
+        retry_zero(|| unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.leaf.as_ptr(), 0) })
     }
 }
 

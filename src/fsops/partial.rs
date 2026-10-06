@@ -476,6 +476,9 @@ impl FsOps {
                 target.label.display()
             );
         }
+        // A partial this creates is registered, so that an interrupted
+        // receiver removes it when it is too short to be worth resuming.
+        let creation = create_if_missing.then(sidecars::begin).transpose()?;
         let (relative, _label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
                 if create_if_missing {
@@ -522,6 +525,13 @@ impl FsOps {
                 has_candidates: !self.candidate_partials(&target).is_empty(),
             });
         };
+        if let (Some(creation), None) = (creation, basis_size) {
+            let identity = match &created {
+                Some(created) => identity_of(created),
+                None => identity_of(&file.metadata()?),
+            };
+            creation.register(&target.root, &relative, identity, Sidecar::Partial);
+        }
         if let Some(old_size) = basis_size {
             if old_size > size {
                 self.set_copy_length(&file, size)?;
@@ -764,6 +774,7 @@ impl FsOps {
                 final_ranges.is_none_or(|ranges| !ranges.is_empty()),
             )?;
         }
+        let creation = sidecars::begin()?;
         let (relative, label, opened) =
             with_rooted_partial(&target, copy_id, |relative, label| {
                 self.open_private_partial_rooted(
@@ -830,11 +841,26 @@ impl FsOps {
         let (output, basis_size) = if input.is_some() && basis_size.is_some() {
             drop(output);
             self.uncache_rooted(&target.root, &relative);
-            let (output, _) = create_fresh_rooted_partial(&target.root, &relative, &label, || {
-                self.create_partial_rooted(&target.root, &relative, PRIVATE_PARTIAL_MODE)
-            })?;
+            let (output, created) =
+                create_fresh_rooted_partial(&target.root, &relative, &label, || {
+                    self.create_partial_rooted(&target.root, &relative, PRIVATE_PARTIAL_MODE)
+                })?;
+            creation.register(
+                &target.root,
+                &relative,
+                identity_of(&created),
+                Sidecar::Partial,
+            );
             (output, None)
         } else {
+            if basis_size.is_none() {
+                creation.register(
+                    &target.root,
+                    &relative,
+                    identity_of(&output.metadata()?),
+                    Sidecar::Partial,
+                );
+            }
             (output, basis_size)
         };
         if stage_only {
@@ -961,9 +987,10 @@ impl FsOps {
         }
         // APFS cloning creates a new name. Try it before opening a new sidecar,
         // and never unlink or replace an existing resumable output to clone.
-        with_rooted_partial(target, copy_id, |relative, _| {
+        let creation = sidecars::begin()?;
+        let (relative, _, cloned) = with_rooted_partial(target, copy_id, |relative, _| {
             if target.root.metadata_optional(relative)?.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             let mut donor = None;
             for candidate in self.candidate_partials(target) {
@@ -982,16 +1009,22 @@ impl FsOps {
             if donor.is_none() && allow_final {
                 donor = target.root.open_regular_read(&target.relative).ok();
             }
-            if let Some(file) = donor {
-                let metadata = file.metadata()?;
-                // Clone the donor's actual size; preparation resizes it to the
-                // planned output length, including growth and shrinkage.
-                let _ = target
-                    .root
-                    .clone_file(&file, &metadata, relative, metadata.len())?;
-            }
-            Ok(())
+            let Some(file) = donor else {
+                return Ok(None);
+            };
+            let metadata = file.metadata()?;
+            // Clone the donor's actual size; preparation resizes it to the
+            // planned output length, including growth and shrinkage.
+            target
+                .root
+                .clone_file_open(&file, &metadata, relative, metadata.len())?
+                .map(|clone| clone.metadata().map(|metadata| identity_of(&metadata)))
+                .transpose()
+                .map_err(Into::into)
         })?;
+        if let Some(identity) = cloned {
+            creation.register(&target.root, &relative, identity, Sidecar::Partial);
+        }
         Ok(())
     }
 
@@ -1238,6 +1271,7 @@ impl FsOps {
                 )
             })?
         } else {
+            let creation = sidecars::begin()?;
             let (relative, label, opened) =
                 with_rooted_partial(&target, copy_id, |relative, label| {
                     self.open_private_partial_rooted(
@@ -1251,6 +1285,14 @@ impl FsOps {
             target_relative = relative;
             target_label = label;
             let (d, basis_size) = opened.context("sidecar creation was requested")?;
+            if basis_size.is_none() {
+                creation.register(
+                    &destination_root,
+                    &target_relative,
+                    identity_of(&d.metadata()?),
+                    Sidecar::Partial,
+                );
+            }
             if basis_size.is_some() {
                 if !replace_partial {
                     // Preserve resumable data unless the coordinator chose
@@ -1507,10 +1549,20 @@ impl FsOps {
                 }
             }
         }
-        let outcome = root.clone_file(&source, &source_metadata, &partial, size)?;
-        if outcome == CopyLocalOutcome::Copied {
-            _copy.bytes(size);
-        }
+        let creation = sidecars::begin()?;
+        let outcome = match root.clone_file_open(&source, &source_metadata, &partial, size)? {
+            Some(clone) => {
+                creation.register(
+                    &root,
+                    &partial,
+                    identity_of(&clone.metadata()?),
+                    Sidecar::Partial,
+                );
+                _copy.bytes(size);
+                CopyLocalOutcome::Copied
+            }
+            None => CopyLocalOutcome::Unsupported,
+        };
         // Like staged Linux offload, leave no writer-cache entry. CopyLocal has no
         // attempt field; finalize opens and checks the named partial normally.
         Ok(outcome)
@@ -3312,7 +3364,9 @@ pub(super) fn publish_partial_rooted(
             ino,
             Some((ctime, ctime_nsec)),
         ),
-    }
+    }?;
+    sidecars::forget(staged_identity);
+    Ok(())
 }
 
 /// Open an existing leaf without following a last-component symlink. Parent
@@ -3506,6 +3560,7 @@ pub(super) fn discard_safe_rooted_partial_if_same(
         {
             root.unlink(relative)
                 .with_context(|| format!("replace {}", label.display()))?;
+            sidecars::forget((expected_dev, expected_ino));
         }
         Some(_) | None => {}
     }

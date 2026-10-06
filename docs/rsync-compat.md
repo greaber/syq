@@ -14,7 +14,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
 | Type changes | Refuses replacement between a directory and any non-directory, even when the directory is empty |
 | `--update` | Checks mtimes only for regular files; replacements between non-directory types still occur |
-| Resume | Always keeps syq partial files; cannot reuse rsync partials |
+| Resume | Keeps syq partial files of 1 MiB or more; cannot reuse rsync partials |
 | Delta transfer | Reuses matching blocks at the same offsets in the corresponding destination file; shifted blocks are not matched. Local copies default to whole-file and remote copies to block reuse. `-W` / `--whole-file` disables reuse; `--no-W` / `--no-whole-file` enables it |
 | `--rsync-path PATH` | Exact syq executable path, not a shell fragment |
 | Remote-to-remote | Refused; use native `syq cp` |
@@ -38,8 +38,8 @@ files use the source permission bits limited by the destination parent's default
 ACL, or by the receiving process's umask when that parent has no default ACL.
 Use `-p` to preserve source permissions and `-A` to preserve source ACLs.
 
-Syq uses numeric IDs and always keeps partial files, so `--numeric-ids` and
-`--partial` are accepted no-ops. `-P` enables progress. Compression is on by
+Syq uses numeric IDs and keeps partial files of 1 MiB or more, so
+`--numeric-ids` and `--partial` are accepted no-ops. `-P` enables progress. Compression is on by
 default; `-z` does not enable anything extra. `-B` / `--block-size` changes
 syq's comparison and reuse block size; see the [tuning table](tuning.md#transfer-controls)
 for its default and allowed range. Values outside that range are rejected.

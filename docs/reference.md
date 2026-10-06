@@ -331,7 +331,14 @@ writable directory. A retry treats it as an existing container, so its permissio
 and modification time may differ from an uninterrupted copy. Explicit
 `--copy-metadata=permissions,mtime` makes those attributes match the source.
 
-Partial files may remain after a successful retry. To remove them:
+If you interrupt a copy with Ctrl-C or stop it with SIGTERM, or its
+connection to a remote syq is lost, the receiving side removes the temporary
+files it created before it exits, taking at most half a second. It keeps
+partial files of 1 MiB or more, so that rerunning the copy can reuse their
+contents. A second Ctrl-C stops syq immediately, without this cleanup.
+
+Partial files may remain after a successful retry, as can temporary files
+left by a copy that was stopped immediately or killed. To remove them:
 
 ```sh
 syq clean-partials --dry-run -v backup
