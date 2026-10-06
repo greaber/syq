@@ -35,10 +35,16 @@ impl RequestReader {
         named_socket: Option<std::os::unix::net::UnixStream>,
         disconnected: Arc<std::sync::atomic::AtomicBool>,
         source_control: Option<Arc<crate::restricted::source::SourceAuthority>>,
+        sweep: Option<SweepOnLoss>,
     ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(4);
         let thread = std::thread::Builder::new().spawn(move || loop {
             let msg = reader.read_budgeted::<Request>();
+            if let (Ok(request), Some(sweep)) = (&msg, &sweep) {
+                if matches!(request.value, Request::Shutdown) {
+                    sweep.ended();
+                }
+            }
             let failed = msg.is_err();
             if failed {
                 // The control operation may still be busy, including blocked
@@ -48,6 +54,12 @@ impl RequestReader {
                     source.close();
                 }
                 disconnected.store(true, std::sync::atomic::Ordering::Release);
+                // Unless the coordinator asked this process to shut down, the
+                // copy has lost it. Remove what it staged now, rather than
+                // once the operation under way finishes.
+                if let Some(sweep) = &sweep {
+                    sweep.run();
+                }
             }
             if tx.send(msg).is_err() || failed {
                 break;
@@ -129,7 +141,76 @@ impl Drop for RequestReader {
     }
 }
 
+/// Removes the sidecars of the one copy this process serves when the copy's
+/// connection is lost: closed or broken before the coordinator asked this
+/// process to shut down, as when the coordinator was interrupted or killed.
+/// A copy that ends normally keeps them as before, a failed file's included.
+/// Partials too short to resume are removed only when the connection was
+/// the copy's control: a data worker's own process leaves them, since other
+/// workers may still be writing them.
+#[derive(Clone)]
+struct SweepOnLoss {
+    partials: bool,
+    ended: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SweepOnLoss {
+    fn new(partials: bool) -> Self {
+        Self {
+            partials,
+            ended: Default::default(),
+        }
+    }
+
+    /// The coordinator asked this process to shut down.
+    fn ended(&self) {
+        self.ended.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Within the cap: a removal that stalls, as on a filesystem that stops
+    /// answering, ends the process rather than leaving it running.
+    fn run(&self) {
+        if self.ended.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        crate::process::termination::bounded(|deadline| {
+            let swept = crate::fsops::sweep_sidecars(self.partials, deadline);
+            if crate::output::debug() && swept != crate::fsops::Swept::default() {
+                crate::output::diagnostic!("syq server: copy lost: temporary files {swept:?}");
+            }
+        });
+    }
+}
+
+impl Drop for SweepOnLoss {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
+/// Remove this process's unpublished sidecars, partials too short to resume
+/// included, before SIGINT or SIGTERM ends it. A local receiver shares the
+/// terminal's process group, so Ctrl-C reaches it directly; a remote one
+/// learns of an interrupted copy when its connection closes. This is best
+/// effort: a receiver that cannot listen for signals still copies.
+fn clean_up_on_termination() -> Option<crate::process::termination::Cleanup> {
+    crate::process::termination::add(|deadline| {
+        let started = std::time::Instant::now();
+        let swept = crate::fsops::sweep_sidecars(true, deadline);
+        if crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq server: interrupted: temporary files {swept:?} in {:?}",
+                started.elapsed()
+            );
+        }
+    })
+    .ok()
+}
+
 struct ServeSession {
+    /// This process serves only this session's copy and ends with it, so
+    /// the copy's sidecars are removed if the connection is lost.
+    owns_process: bool,
     handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     ssh_worker_ticket: Option<std::result::Result<String, String>>,
     allow_tcp: bool,
@@ -192,6 +273,7 @@ impl Drop for ConnectionPermit {
 
 /// `local_receiver` marks the child process that receives a local copy.
 pub fn run(local_receiver: bool) -> Result<()> {
+    let _termination = clean_up_on_termination();
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
         io::stdin(),
@@ -201,6 +283,7 @@ pub fn run(local_receiver: bool) -> Result<()> {
         None,
         None,
         ServeSession {
+            owns_process: true,
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: true,
@@ -213,10 +296,12 @@ pub fn run(local_receiver: bool) -> Result<()> {
         },
     );
     descriptor_session.close();
+    crate::process::termination::wait_if_terminating();
     result
 }
 
 pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
+    let _termination = clean_up_on_termination();
     let (_workers, ticket) = match crate::restricted::start_ssh_workers(authority.clone()) {
         Ok((workers, ticket)) => (Some(workers), Ok(ticket)),
         Err(error) => (
@@ -233,6 +318,7 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
         None,
         None,
         ServeSession {
+            owns_process: true,
             handshake_pending: None,
             ssh_worker_ticket: Some(ticket),
             allow_tcp: true,
@@ -246,16 +332,21 @@ pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthori
     );
     descriptor_session.close();
     authority.close_control();
+    crate::process::termination::wait_if_terminating();
     result
 }
 
 /// A relayed one-copy control. File payload uses direct TCP or SSH workers.
+/// `owns_process` marks a process that serves only this copy: it removes the
+/// copy's sidecars when interrupted or when the control is lost.
 pub(crate) fn run_forwarded<R: Read + Send + 'static, W: Write>(
     authority: Arc<crate::restricted::RestrictedAuthority>,
     input: R,
     output: W,
     pending: Arc<std::sync::atomic::AtomicBool>,
+    owns_process: bool,
 ) -> Result<()> {
+    let _termination = owns_process.then(clean_up_on_termination).flatten();
     let descriptor_session = DescriptorSessionSlot::default();
     let result = serve(
         input,
@@ -265,6 +356,7 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static, W: Write>(
         None,
         None,
         ServeSession {
+            owns_process,
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
@@ -278,6 +370,9 @@ pub(crate) fn run_forwarded<R: Read + Send + 'static, W: Write>(
     );
     descriptor_session.close();
     authority.close_control();
+    if owns_process {
+        crate::process::termination::wait_if_terminating();
+    }
     result
 }
 
@@ -375,6 +470,7 @@ pub(crate) fn run_named(
         None,
         None,
         ServeSession {
+            owns_process: false,
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
@@ -411,6 +507,7 @@ pub(crate) fn run_authorized_source<R: Read + Send + 'static, W: Write>(
         None,
         None,
         ServeSession {
+            owns_process: false,
             handshake_pending: pending,
             ssh_worker_ticket: None,
             allow_tcp: true,
@@ -454,6 +551,7 @@ pub(crate) fn run_authorized_source_worker(
         None,
         None,
         ServeSession {
+            owns_process: false,
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
@@ -489,6 +587,7 @@ pub(crate) fn run_named_tcp(
         None,
         Some(stream),
         ServeSession {
+            owns_process: false,
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
@@ -527,6 +626,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     session: ServeSession,
 ) -> Result<()> {
     let ServeSession {
+        owns_process,
         handshake_pending,
         ssh_worker_ticket,
         allow_tcp,
@@ -641,6 +741,13 @@ fn serve<R: Read + Send + 'static, W: Write>(
     }
     let is_control = matches!(&role, ConnectionRole::Control);
     let is_source_worker = matches!(&role, ConnectionRole::SourceWorker { .. });
+    // The copy's sidecars are registered from here so that they can be
+    // removed; the guard is dropped on every return, after the reader.
+    if owns_process {
+        crate::fsops::track_sidecars();
+    }
+    let sweep_on_loss = owns_process.then(|| SweepOnLoss::new(is_control));
+    let _sweep = sweep_on_loss.clone();
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
@@ -786,8 +893,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
         .as_ref()
         .filter(|_| matches!(role, ConnectionRole::Control))
         .cloned();
-    let reader = RequestReader::spawn(r, tcp_socket, named_socket, disconnected, source_control)
-        .context("start request reader")?;
+    let reader = RequestReader::spawn(
+        r,
+        tcp_socket,
+        named_socket,
+        disconnected,
+        source_control,
+        sweep_on_loss,
+    )
+    .context("start request reader")?;
     let server_actor = ops.observations.actor("server");
     let mut w = ObservedWriter {
         compress: w.compress,
@@ -1765,6 +1879,7 @@ fn serve_tcp(
         Some(&authed),
         Some(stream.try_clone()?),
         ServeSession {
+            owns_process: false,
             handshake_pending: Some(handshake_pending),
             ssh_worker_ticket: None,
             allow_tcp: true,

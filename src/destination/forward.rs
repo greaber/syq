@@ -867,6 +867,7 @@ fn receive() -> Result<i32> {
         ),
         std::io::stdout().lock(),
         pending,
+        true,
     );
     authority.close_control();
     drop(workers);

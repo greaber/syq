@@ -4444,7 +4444,7 @@ fn one_connections_probe_does_not_decide_for_another() {
             )
             .unwrap()
             .unwrap();
-        (file.metadata().unwrap().ino(), basis.is_some())
+        (file.metadata().unwrap().ino(), basis.basis_size().is_some())
     };
     let leftover = |name: &str| {
         let path = temporary.path().join(name);
@@ -6712,7 +6712,7 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
             .open_private_partial_rooted(&root, &relative, &path, true, 0o644, None)
             .unwrap()
             .unwrap();
-        assert!(basis.is_none());
+        assert!(basis.basis_size().is_none());
         assert_ne!(file.metadata().unwrap().ino(), old_inode);
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
         assert!(crate::inode_metadata::staging_acl_is_empty(&file).unwrap());

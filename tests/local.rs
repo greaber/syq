@@ -1033,6 +1033,10 @@ mod tuning;
 #[path = "local/inode_metadata.rs"]
 mod inode_metadata;
 
+#[cfg(debug_assertions)]
+#[path = "local/interruption.rs"]
+mod interruption;
+
 #[cfg(target_os = "macos")]
 #[path = "local/macos_metadata.rs"]
 mod macos_metadata;
