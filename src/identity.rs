@@ -45,7 +45,7 @@ pub(crate) fn uses_release_helpers() -> bool {
     if env!("SYQ_RELEASE_HELPERS") == "1" || is_release_build() {
         return true;
     }
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     if std::env::var_os("SYQ_TEST_RELEASE_HELPERS").is_some_and(|value| value == "1") {
         return true;
     }
@@ -56,7 +56,7 @@ pub(crate) fn is_release_build() -> bool {
     if env!("SYQ_IS_RELEASE_BUILD") == "1" {
         return true;
     }
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     if std::env::var_os("SYQ_TEST_RELEASE_BUILD").is_some_and(|value| value == "1") {
         return true;
     }
