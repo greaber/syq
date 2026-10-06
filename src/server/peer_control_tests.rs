@@ -32,6 +32,7 @@ impl Session {
                     server.try_clone().unwrap(),
                     server,
                     Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    false,
                 );
             }
             serve(
@@ -42,6 +43,7 @@ impl Session {
                 None,
                 None,
                 ServeSession {
+                    owns_process: false,
                     handshake_pending: None,
                     ssh_worker_ticket: None,
                     allow_tcp: true,

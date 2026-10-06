@@ -116,6 +116,17 @@ pub(super) struct SmallStage {
     created: fs::Metadata,
 }
 
+impl SmallStage {
+    fn register(&self, creation: sidecars::Creation<'_>) {
+        creation.register(
+            &self.target.root,
+            &self.partial,
+            (self.created.dev(), self.created.ino()),
+            Sidecar::Stage,
+        );
+    }
+}
+
 /// Apply `each` to `items` on up to `PARALLEL_WRITES` threads, in order.
 /// This thread runs the first part, as it would otherwise only wait, and
 /// any part whose thread the system refuses to start.
@@ -1128,8 +1139,23 @@ impl FsOps {
     /// private until publication. On Linux a patch's stage takes a clone or
     /// copy of that file once created, so it is created as a new file
     /// (`create_seeded_stage`); so is any stage that is to be `fresh`, as a
-    /// streamed patch's, which may place that file's blocks itself.
+    /// streamed patch's, which may place that file's blocks itself. The
+    /// stage is registered, so that an interrupted receiver removes it.
     fn create_stage(
+        &mut self,
+        put: &SmallPut,
+        source: Option<&PatchSource<'_>>,
+        target: RootedTarget,
+        mode: u32,
+        fresh: bool,
+    ) -> Result<SmallStage> {
+        let creation = sidecars::begin()?;
+        let stage = self.create_unregistered_stage(put, source, target, mode, fresh)?;
+        stage.register(creation);
+        Ok(stage)
+    }
+
+    fn create_unregistered_stage(
         &mut self,
         put: &SmallPut,
         source: Option<&PatchSource<'_>>,
@@ -1233,7 +1259,10 @@ impl FsOps {
         target: RootedTarget,
     ) -> Result<SmallStage> {
         let mode = staged_file_mode(&put.meta, put.flags);
-        self.create_small_stage_with_mode(put, target, mode)
+        let creation = sidecars::begin()?;
+        let stage = self.create_small_stage_with_mode(put, target, mode)?;
+        stage.register(creation);
+        Ok(stage)
     }
 
     fn create_small_stage_with_mode(
@@ -1287,13 +1316,13 @@ impl FsOps {
         label: &Path,
         mode: u32,
     ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
-        let Some((file, basis_size)) =
+        let Some((file, opened)) =
             self.open_private_partial_rooted(root, relative, label, true, mode, Some(mode))?
         else {
             return Ok(None);
         };
         let metadata = file.metadata()?;
-        Ok(Some((file, metadata, basis_size)))
+        Ok(Some((file, metadata, opened.basis_size())))
     }
 
     /// Write a staged file's data and metadata, from a patch source when

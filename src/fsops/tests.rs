@@ -4444,7 +4444,7 @@ fn one_connections_probe_does_not_decide_for_another() {
             )
             .unwrap()
             .unwrap();
-        (file.metadata().unwrap().ino(), basis.is_some())
+        (file.metadata().unwrap().ino(), basis.basis_size().is_some())
     };
     let leftover = |name: &str| {
         let path = temporary.path().join(name);
@@ -6712,7 +6712,7 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
             .open_private_partial_rooted(&root, &relative, &path, true, 0o644, None)
             .unwrap()
             .unwrap();
-        assert!(basis.is_none());
+        assert!(basis.basis_size().is_none());
         assert_ne!(file.metadata().unwrap().ino(), old_inode);
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
         assert!(crate::inode_metadata::staging_acl_is_empty(&file).unwrap());
@@ -7599,6 +7599,42 @@ fn native_copy_reports_original_writer_close_error() {
     );
     assert_eq!(fs::read(&target).unwrap(), b"previous good copy");
     assert_eq!(fs::metadata(&target).unwrap().ino(), before.ino());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn only_network_filesystem_types_count_as_network_destinations() {
+    for local in [
+        libc::EXT4_SUPER_MAGIC as u32,
+        libc::XFS_SUPER_MAGIC as u32,
+        libc::BTRFS_SUPER_MAGIC as u32,
+        libc::TMPFS_MAGIC as u32,
+        libc::OVERLAYFS_SUPER_MAGIC as u32,
+        0x2fc1_2fc1, // ZFS
+    ] {
+        assert!(!network_file_system_type(local), "{local:#x}");
+    }
+    for network in [
+        libc::NFS_SUPER_MAGIC as u32,
+        libc::FUSE_SUPER_MAGIC as u32,
+        libc::SMB_SUPER_MAGIC as u32,
+        0xfe53_4d42,
+        0xff53_4d42,
+        0x00c3_6400,
+    ] {
+        assert!(network_file_system_type(network), "{network:#x}");
+    }
+}
+
+#[test]
+fn destination_filesystem_info_reports_whether_the_destination_is_networked() {
+    let tree = crate::test_support::tempdir().unwrap();
+    let mut ops = FsOps::new();
+    ops.destination_root = Some(Arc::new(Root::open(tree.path()).unwrap()));
+    let info = ops.destination_filesystem_info(false, None).unwrap();
+    let directory = File::open(tree.path()).unwrap();
+    let dev = directory.metadata().unwrap().dev();
+    assert_eq!(info.network, on_network_file_system(&directory, dev));
 }
 
 #[test]

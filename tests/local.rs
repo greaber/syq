@@ -820,6 +820,27 @@ fn make_tree(root: &Path) {
     set_mtime(root, t + 7);
 }
 
+/// The workers the latest copy recorded in `history` started with, and
+/// whether its destination counted as a network filesystem.
+fn started_workers(history: &Path) -> (i64, bool) {
+    let db = rusqlite::Connection::open(history).unwrap();
+    let workers = db
+        .query_row(
+            "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='workers_start' ORDER BY run DESC, sequence LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let network = db
+        .query_row(
+            "SELECT json_extract(data,'$.data.network_destination') FROM events WHERE json_extract(data,'$.kind')='starting_count' ORDER BY run DESC, sequence LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (workers, network)
+}
+
 fn tuning_observed(out: &Output) -> serde_json::Value {
     let diagnostic = stderr_of(out);
     let line = diagnostic
@@ -1032,6 +1053,10 @@ mod tuning;
 #[cfg(target_os = "linux")]
 #[path = "local/inode_metadata.rs"]
 mod inode_metadata;
+
+#[cfg(debug_assertions)]
+#[path = "local/interruption.rs"]
+mod interruption;
 
 #[cfg(target_os = "macos")]
 #[path = "local/macos_metadata.rs"]

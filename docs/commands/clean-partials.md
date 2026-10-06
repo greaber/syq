@@ -1,7 +1,10 @@
 # syq clean-partials
 
-Remove syq partial files below local or SSH directories. Wait for active copies
-into those directories to finish before running cleanup:
+Remove syq partial files below local or SSH directories. An interrupted copy
+removes most of its own temporary files, but keeps partial files worth resuming
+(see [Resume an interrupted copy](../reference.md#resume-an-interrupted-copy));
+this command removes what remains. Wait for active copies into those
+directories to finish before running cleanup:
 
 ```sh
 syq clean-partials --dry-run -v backup

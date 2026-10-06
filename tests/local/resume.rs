@@ -408,37 +408,57 @@ fn small_files_atomic_no_partials() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn small_inplace_files_use_one_batched_worker() {
-    let t = Tmp::new();
-    for i in 0..3 {
-        write(
-            &t.path(&format!("src/f{i}")),
-            format!("contents-{i}").as_bytes(),
-        );
+fn small_inplace_files_use_batched_workers() {
+    for workers in [None, Some(32)] {
+        let t = Tmp::new();
+        for i in 0..3 {
+            write(
+                &t.path(&format!("src/f{i}")),
+                format!("contents-{i}").as_bytes(),
+            );
+        }
+        let events = t.path("worker-events");
+        let mut command = compat_command();
+        command.args(["-a", "--inplace", "--no-progress"]);
+        if let Some(workers) = workers {
+            command.args(["--performance-tuning", &format!("workers={workers}")]);
+        }
+        let output = command
+            .args([&t.s("src/"), &t.s("dst/")])
+            .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
+            .run()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        // Worker events are separate from inherited helper stderr, where debug
+        // messages from TCP probes can interleave with coordinator diagnostics.
+        let events = fs::read_to_string(events).unwrap();
+        let lines: Vec<&str> = events.lines().collect();
+        // Three small files start one automatic worker, and at most one per
+        // file even when more are requested. A started worker that finds every
+        // file already done exits without connecting.
+        let (started, _) = started_workers(&t.path("history.sqlite"));
+        assert_eq!(started, if workers.is_some() { 3 } else { 1 });
+        if workers.is_none() {
+            assert_eq!(lines, ["connected 0 0", "batch 0 3"]);
+        }
+        let connected = lines.iter().filter(|l| l.starts_with("connected ")).count();
+        assert!((1..=started as usize).contains(&connected), "{events}");
+        let batched: usize = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("batch "))
+            .map(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(batched, 3, "{events}");
+        assert_eq!(read(&t.path("dst/f2")), b"contents-2");
+        assert!(partial_files(&t.path("dst")).is_empty());
     }
-    let events = t.path("worker-events");
-    let output = compat_command()
-        .args([
-            "-a",
-            "--inplace",
-            "--performance-tuning",
-            "workers=32",
-            "--no-progress",
-            &t.s("src/"),
-            &t.s("dst/"),
-        ])
-        .env("SYQ_TEST_WORKER_EVENTS", &events)
-        .run()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr_of(&output));
-    // Worker events are separate from inherited helper stderr, where debug
-    // messages from TCP probes can interleave with coordinator diagnostics.
-    assert_eq!(
-        fs::read_to_string(events).unwrap(),
-        "connected 0 0\nbatch 0 3\n"
-    );
-    assert_eq!(read(&t.path("dst/f2")), b"contents-2");
-    assert!(partial_files(&t.path("dst")).is_empty());
 }
 
 #[cfg(debug_assertions)]

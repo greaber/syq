@@ -1645,6 +1645,10 @@ pub struct DestinationFilesystemInfo {
     /// None rather than a misleading zero.
     pub available_inodes: Option<u64>,
     pub empty: Option<bool>,
+    /// The directory lies on a network filesystem (Linux NFS, SMB, Ceph or
+    /// FUSE), where each file operation can cost a round trip. Senders and
+    /// receivers share an exact build, so the field needs no fallback.
+    pub network: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
