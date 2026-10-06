@@ -1331,7 +1331,7 @@ impl FsOps {
         check_destination_writes(&stage.file, &stage.label)?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         fail_put_small_before_rename_for_test(&stage.target.label)?;
         Ok(())
     }

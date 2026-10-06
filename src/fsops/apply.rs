@@ -947,7 +947,7 @@ pub(super) fn file_type_bits(mode: u32) -> u32 {
     mode & libc::S_IFMT as u32
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 pub(super) fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
     let Some(suffix) = std::env::var_os("SYQ_TEST_GUARDED_MUTATION_SUFFIX") else {
         return Ok(());
@@ -962,7 +962,7 @@ pub(super) fn hold_before_guarded_mutation_for_test(path: &[u8]) -> Result<()> {
     )
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(any(test, debug_assertions)))]
 pub(super) fn hold_before_guarded_mutation_for_test(_path: &[u8]) -> Result<()> {
     Ok(())
 }
@@ -1183,7 +1183,7 @@ pub(super) fn fail_apply_capacity_for_test(p: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 pub(super) fn fail_put_small_before_rename_for_test(p: &Path) -> Result<()> {
     if let Some(pat) = std::env::var_os("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME") {
         // Model interruption after the sidecar is complete but before it

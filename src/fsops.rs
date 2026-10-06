@@ -114,7 +114,7 @@ fn test_corrupt_payload_once() -> bool {
     })
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn test_race_barrier(ready_env: &str, continue_env: &str, label: &str) -> Result<()> {
     let ready = std::env::var_os(ready_env);
     let continuation = std::env::var_os(continue_env);
@@ -1461,7 +1461,7 @@ impl FsOps {
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the open
         // descriptor immediately before the rename.
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         fail_put_small_before_rename_for_test(&rooted.label)?;
         Ok(StagedSmallFile {
             root: rooted.root,
