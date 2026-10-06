@@ -53,6 +53,7 @@ fn b_runs_after_timeout() {
                 cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 start_new_session=True)
             started = time.monotonic()
+            cleanup_needed = True
             try:
                 output, _ = process.communicate(timeout=30)
                 self.assertEqual(process.returncode, 100, output)
@@ -61,15 +62,19 @@ fn b_runs_after_timeout() {
                 pid = int((root / "test-pid").read_text())
                 with self.assertRaises(ProcessLookupError):
                     os.kill(pid, 0)
+                cleanup_needed = False
                 self.assertLess(time.monotonic() - started, 30, output)
             finally:
                 # Also clean up if a broken runner fails this regression check.
-                for pid in [process.pid] + ([int((root / "test-pid").read_text())]
-                                           if (root / "test-pid").exists() else []):
-                    try:
-                        os.killpg(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                if cleanup_needed:
+                    groups = [process.pid] if process.poll() is None else []
+                    if (root / "test-pid").exists():
+                        groups.append(int((root / "test-pid").read_text()))
+                    for pid in groups:
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                 process.wait()
 
 

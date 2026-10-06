@@ -463,7 +463,7 @@ class BranchStatusTests(unittest.TestCase):
 
     def test_check_that_moves_head_reports_nothing(self):
         # A check that moves HEAD cannot report its results against the new commit.
-        self.write_fake("cargo", "#!/bin/sh\nif [ \"$1\" = test ]; then "
+        self.write_fake("cargo", "#!/bin/sh\nif [ \"$1\" = nextest ]; then "
                                  "git commit -q --allow-empty -m 'moved during check'; fi\n")
         output = self.status("--check", expected=2)
         self.assertIn("HEAD changed during baseline checks", output)
