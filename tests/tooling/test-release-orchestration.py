@@ -197,6 +197,7 @@ class PathScopeTests(Scratch):
                              ("tests/tooling/test-branch-status.py", "branch workflows"),
                              ("scripts/setup.sh", "setup workflows"),
                              ("tests/tooling/test-setup.sh", "setup workflows"),
+                             ("tests/tooling/test-rust-test-timeouts.py", "setup workflows"),
                              ("tests/tooling/test-release-orchestration.py",
                               "orchestration workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),

@@ -8,6 +8,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import tomllib
 import unittest
 
 
@@ -44,6 +45,10 @@ fn b_runs_after_timeout() {
 }
 ''')
             env = dict(os.environ)
+            # The fixture is outside the checkout, where rustup cannot discover
+            # our toolchain file. Do not depend on a global default being set.
+            env["RUSTUP_TOOLCHAIN"] = tomllib.loads(
+                (ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
             env.pop("CARGO_TARGET_DIR", None)
             env.pop("NEXTEST_PROFILE", None)
             subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root,

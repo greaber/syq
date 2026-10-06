@@ -303,7 +303,9 @@ jobs:
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
-        run: tests/tooling/test-setup.sh
+        run: |
+          tests/tooling/test-setup.sh
+          python3 tests/tooling/test-rust-test-timeouts.py
       - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')

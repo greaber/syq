@@ -681,10 +681,12 @@ scripts/run-focused-check.py --runner linux --script target/check.sh
 The script file is local and need not be committed; it may contain setup and
 multiple commands. It runs with Bash `-euo pipefail` in the checked-out repository.
 With `--cargo-cache`, the runner also installs the pinned cargo-nextest. Use
-pinned setup commands for other tools; the runner does not install all SDK toolchains or reproduce another workflow's setup automatically. For a
-workflow setup regression, reproduce the relevant setup as well as the failing
-command. Inputs and logs are public: do not include secrets. Confirm exact Rust
-tests actually ran; Cargo accepts filters that match zero tests.
+pinned setup commands for other tools; the runner does not install all SDK
+toolchains or reproduce another workflow's setup automatically. For a workflow
+setup regression, reproduce the relevant setup as well as the failing command.
+Inputs and logs are public: do not include secrets. Confirm exact Rust tests
+actually ran; nextest rejects filters that match zero tests, while plain
+`cargo test` accepts them.
 
 The helper selects the current remote branch, pins its checkout commit,
 prints the SHA and run URL, and watches that exact run through
