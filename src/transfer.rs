@@ -1845,9 +1845,9 @@ impl Opts {
     }
 
     fn may_suggest_directory_access(&self) -> bool {
-        !self.widen_directory_permissions
-            && !self.preserve_existing_directory_metadata
-            && !(self.dry_run && self.restricted_receiver)
+        !(self.widen_directory_permissions
+            || self.preserve_existing_directory_metadata
+            || self.dry_run && self.restricted_receiver)
     }
 
     fn wire_error_message(&self, error: &WireError) -> String {
