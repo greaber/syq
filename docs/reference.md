@@ -429,11 +429,12 @@ permission to existing directories being copied into, when the receiving user ow
 This permission mode also applies during safety checks and dry runs. A dry run
 may temporarily widen directories so it can inspect them, but does not copy or
 remove data or apply requested final metadata. Signed read-only receiver grants
-permit inspection only, so previews using those grants cannot widen directories. Syq restores permissions after
-each safety check and after copying, pruning or a dry run, including when the
+permit inspection only, so previews using those grants cannot widen directories.
+Syq restores permissions after each safety check and after copying, pruning or a
+dry run, including when the
 operation fails. During a real copy, explicitly requested final permissions
-take precedence. Other processes can see the
-temporary permissions, and an interruption, crash or forced termination can leave them in place.
+take precedence. Other processes can see the temporary permissions, and an
+interruption, crash or forced termination can leave them in place.
 `syq rsync` enables temporary widening without this option. Root skips widening.
 
 New files use the source read, write, and execute permissions, limited by the destination umask.

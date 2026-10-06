@@ -98,7 +98,7 @@ pub(crate) enum Operation {
     Abort {
         entry: u64,
     },
-    // Append: keep the released Open encoding unchanged.
+    // Append: keep the existing Open encoding unchanged.
     OpenWithDirectoryAccess {
         entry: u64,
         dry_run: bool,
