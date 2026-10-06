@@ -120,8 +120,8 @@ fn source_tree(t: &Tmp, root_mode: u32, sub_mode: u32) {
 
 #[test]
 fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
-    let default_rsync = 0o777 & !UMASK;
-    // (arguments, destination root's mode after the copy)
+    // (arguments, destination root's mode after the copy): its source's,
+    // with permissions copied or not.
     let cases: [(&[&str], u32); 6] = [
         (&["rsync", "-a", "src/", "dst/"], 0o750),
         (&["rsync", "-rp", "src/", "dst/"], 0o750),
@@ -136,7 +136,7 @@ fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
             ],
             0o750,
         ),
-        (&["rsync", "-rg", "src/", "dst/"], default_rsync),
+        (&["rsync", "-rg", "src/", "dst/"], 0o750),
         (
             &[
                 "cp",
@@ -146,9 +146,9 @@ fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
                 "--into",
                 "dst",
             ],
-            0o755,
+            0o750,
         ),
-        (&["rsync", "-r", "src/", "dst/"], default_rsync),
+        (&["rsync", "-r", "src/", "dst/"], 0o750),
     ];
     for (args, final_mode) in cases {
         let t = Tmp::new();
@@ -302,8 +302,8 @@ fn a_new_destination_root_is_private_from_its_creation() {
             ],
             true,
         ),
-        // Nothing is applied later: its creation mode is final.
-        (&["rsync", "-r", "src/", "dst/"], false),
+        // Its source's mode is applied at the end.
+        (&["rsync", "-r", "src/", "dst/"], true),
     ];
     for (args, private_while_pending) in cases {
         let t = Tmp::new();
@@ -665,7 +665,7 @@ fn a_remote_receiver_grants_no_more_than_the_source_while_filling() {
     source_tree(&t, 0o750, 0o751);
     for (args, root, sub) in [
         (&["-a"][..], 0o750, 0o751),
-        (&["-rg"][..], 0o777 & !UMASK, 0o751 | 0o700),
+        (&["-rg"][..], 0o750, 0o751 | 0o700),
     ] {
         let destination = t.path("dst");
         let _ = fs::remove_dir_all(&destination);
@@ -706,10 +706,7 @@ fn an_interrupted_copy_ends_with_the_same_directory_metadata_after_a_retry() {
             ],
             [0o755, 0o777 & !UMASK],
         ),
-        (
-            &["rsync", "-rg", "src/", "dst/"],
-            [0o777 & !UMASK, 0o775 & !UMASK],
-        ),
+        (&["rsync", "-rg", "src/", "dst/"], [0o750, 0o775 & !UMASK]),
         (
             &[
                 "cp",
@@ -719,7 +716,7 @@ fn an_interrupted_copy_ends_with_the_same_directory_metadata_after_a_retry() {
                 "--into",
                 "dst",
             ],
-            [0o755, 0o775 & !UMASK],
+            [0o750, 0o775 & !UMASK],
         ),
         (&["rsync", "-a", "src/", "dst/"], [0o750, 0o775]),
     ];

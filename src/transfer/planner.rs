@@ -325,8 +325,9 @@ struct EarlyMetadata {
     existing: Vec<Op>,
     /// For new directories and a private root, sent with the creations.
     created: Vec<Op>,
-    /// A private destination root whose final metadata sets no mode.
-    root_default: bool,
+    /// A private destination root to open, with owner access, to the mode
+    /// creating it from this proposal would have given it.
+    root_default: Option<u32>,
 }
 
 /// One scanned batch after the mapping loop: every destination claimed,
@@ -2442,7 +2443,9 @@ impl Planner<'_> {
                 && self.private_root.is_some()
                 && self.created_dirs.contains(path)
             {
-                early.root_default = destination.as_ref().is_some_and(|d| d.kind == Kind::Dir);
+                early.root_default = self
+                    .private_root
+                    .filter(|_| destination.as_ref().is_some_and(|d| d.kind == Kind::Dir));
                 continue;
             }
             if self.implicit_dirs.contains(path) || self.unselected_dirs.contains(path) {
@@ -2490,8 +2493,11 @@ impl Planner<'_> {
                             | 0o700
                             | (current & 0o2000);
                         early_flags |= flags::MODE;
-                    } else {
-                        early.root_default = true;
+                    } else if flags & flags::GROUP != 0 {
+                        // After its group change it is open, with owner
+                        // access, as creating it from its source would have
+                        // left it; it is narrowed at the end.
+                        early.root_default = Some((entry.mode & 0o777) | 0o700);
                     }
                 } else if flags & flags::MODE != 0 {
                     let wanted = if created && acl {
@@ -2542,14 +2548,11 @@ impl Planner<'_> {
     }
 
     /// Give a private destination root whose final metadata sets no mode the
-    /// mode it would have been created with, after its group change. The
-    /// receiver chooses it, as for a directory created that way, keeping the
-    /// setgid bit only if that change left it, so its subdirectories inherit
-    /// what they would have.
-    fn open_private_root(&mut self) -> Result<()> {
-        let proposed = self
-            .private_root
-            .context("the destination root was not created private")?;
+    /// mode creating it from `proposed` would have given it, after its group
+    /// change. The receiver chooses it, as for a directory created that way,
+    /// keeping the setgid bit only if that change left it, so its
+    /// subdirectories inherit what they would have.
+    fn open_private_root(&mut self, proposed: u32) -> Result<()> {
         let root = self.dst_root.clone();
         let condition = self.metadata_condition_for(&root);
         self.apply(vec![Op::SetMeta {
@@ -2739,8 +2742,8 @@ impl Planner<'_> {
                 return Err(endpoint_error(error)).context("apply destination changes");
             }
         }
-        if std::mem::take(&mut early.root_default) {
-            self.open_private_root()?;
+        if let Some(proposed) = early.root_default.take() {
+            self.open_private_root(proposed)?;
         }
         Ok(true)
     }
@@ -2853,12 +2856,12 @@ impl Planner<'_> {
             // a source without that access gets its own mode back, limited as
             // its creation limits it, as rsync and cp give it.
             if flags & flags::MODE == 0 && self.created_dirs.contains(p) {
-                if p == &self.dst_root {
-                    if let Some(proposed) = self.private_root {
-                        // Its final mode keeps the setgid bit it inherited.
-                        meta.mode = proposed | 0o2000;
-                        flags |= flags::RECEIVER_MODE;
-                    }
+                if p == &self.dst_root && self.private_root.is_some() {
+                    // A private root takes its source's mode as a new
+                    // directory does. Its final mode keeps the setgid bit it
+                    // inherited.
+                    meta.mode = (e.mode & 0o777) | 0o2000;
+                    flags |= flags::RECEIVER_MODE;
                 } else if e.mode & 0o700 != 0o700 {
                     meta.mode = e.mode & 0o777;
                     flags |= flags::RECEIVER_MODE;

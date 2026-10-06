@@ -3448,20 +3448,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let dry_run_creates_root = root_creatable && args.dry_run;
     let root_create_condition = TargetCondition::Any;
     // A directory target takes a contents source's metadata, which the
-    // planner sends only once it has scanned the source root. Create the
-    // root private until its group and mode have landed. The value is the
-    // mode it would otherwise have been created with.
+    // planner sends only once it has scanned the source root: its mode, as
+    // any new directory takes it, and its group and permissions when they
+    // are copied. Create the root private until they have landed. The value
+    // is the mode it would otherwise have been created with.
     let private_root = (create_root
         && dst_is_dir
         && args.files_from.is_none()
         && args.native_mapping.is_none()
-        && srcs.iter().any(Location::copies_contents)
-        && opts.flags & (flags::MODE | flags::GROUP) != 0)
-        .then_some(if use_operator_anchor && opts.rsync_creation {
-            0o777
-        } else {
-            0o755
-        });
+        && srcs.iter().any(Location::copies_contents))
+    .then_some(if use_operator_anchor && opts.rsync_creation {
+        0o777
+    } else {
+        0o755
+    });
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories

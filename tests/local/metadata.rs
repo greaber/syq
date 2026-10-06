@@ -135,6 +135,48 @@ fn new_directories_end_with_the_source_mode_limited_by_the_umask() {
         );
         set_modes(&dst, [0o755; 4]);
     }
+    // A destination root this copy creates for a source directory follows
+    // the same rule; one that only contains named sources keeps the default.
+    let read_only = t.s("src/read-only");
+    let owner_only = format!("{}/", t.s("src/owner-only"));
+    let roots = [
+        (
+            "cp-as",
+            vec!["cp", "--no-progress", &read_only, "--as"],
+            "555",
+        ),
+        ("rsync-contents", vec!["rsync", "-r", &owner_only], "500"),
+        (
+            "cp-srcs-in",
+            vec!["cp", "--no-progress", "--srcs-in", &owner_only, "--into"],
+            "500",
+        ),
+        (
+            "cp-into",
+            vec!["cp", "--no-progress", &read_only, "--into"],
+            "755",
+        ),
+    ];
+    for (name, mut args, expected) in roots {
+        let root = t.path(name);
+        let root_arg = format!("{}/", root.display());
+        args.push(&root_arg);
+        let output = native_copy_with_umask(0o022, &args);
+        assert_output_ok(&output);
+        assert_eq!(format!("{:o}", permission_bits(&root)), expected, "{name}");
+        if name == "cp-into" {
+            assert_eq!(permission_bits(&root.join("read-only")), 0o555, "{name}");
+            fs::set_permissions(
+                root.join("read-only/inner"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            fs::set_permissions(root.join("read-only"), fs::Permissions::from_mode(0o755)).unwrap();
+        } else {
+            fs::set_permissions(root.join("inner"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
     set_modes(&t.path("src"), [0o755; 4]);
 }
 
