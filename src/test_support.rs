@@ -6,7 +6,7 @@ mod temporary;
 pub(crate) use temporary::{short_tempdir, temp_dir, tempdir};
 #[path = "../tests/support/executable.rs"]
 mod executable;
-pub(crate) use executable::{copy_executable, write_executable};
+pub(crate) use executable::write_executable;
 
 /// Run a unit test in a separate process whose stderr reader has gone away.
 /// Keep stdout available for the test harness and assertion diagnostics.
@@ -193,7 +193,7 @@ fn executable_fixtures_are_never_open_for_writing_in_this_process() {
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| {
                 if copy {
-                    copy_executable(&source, &fifo, 0o700);
+                    executable::copy_executable(&source, &fifo, 0o700);
                 } else {
                     write_executable(&fifo, &contents, 0o700);
                 }
