@@ -2311,3 +2311,47 @@ fn local_read_ahead_preserves_staged_and_inplace_contents() {
         }
     }
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn copies_to_a_device_that_reports_one_fixed_mode_end_in_the_requested_modes() {
+    // SYQ_TEST_FORCED_MODE makes syq see every sidecar as 0755, as on a Linux
+    // CIFS mount without POSIX extensions. The first new sidecar shows that
+    // the device cannot narrow a new file; the rest are reused as opened.
+    // Small files and ranged copies must still publish their contents in
+    // the requested modes and leave no sidecar behind.
+    for tuning in ["batch-bytes=64K", "copy-path=ranges"] {
+        let t = Tmp::new();
+        for (index, mode) in [0o600, 0o640, 0o644, 0o700].into_iter().enumerate() {
+            let file = t.path(&format!("src/small-{index}"));
+            write(&file, format!("small {index}").as_bytes());
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        write(&t.path("src/large"), &prng(3 << 20, 61));
+        fs::set_permissions(t.path("src/large"), fs::Permissions::from_mode(0o600)).unwrap();
+        let out = compat_command()
+            .args([
+                "-a",
+                "--no-progress",
+                "--performance-tuning",
+                tuning,
+                &t.s("src/"),
+                &t.s("dst/"),
+            ])
+            .env("SYQ_TEST_FORCED_MODE", "755")
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        for name in ["small-0", "small-1", "small-2", "small-3", "large"] {
+            let source = t.path(&format!("src/{name}"));
+            let destination = t.path(&format!("dst/{name}"));
+            assert_eq!(read(&destination), read(&source), "{tuning}: {name}");
+            assert_eq!(
+                fs::metadata(&destination).unwrap().mode() & 0o7777,
+                fs::metadata(&source).unwrap().mode() & 0o7777,
+                "{tuning}: {name}"
+            );
+        }
+        assert!(partial_files(&t.path("dst")).is_empty(), "{tuning}");
+    }
+}

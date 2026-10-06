@@ -77,6 +77,11 @@ jobs:
           key: ${{ inputs.runner == 'macos-intel' && format('cargo-ci-macos_intel-fast-v1-{0}-{1}-{2}-{3}-{4}', runner.os, runner.arch, hashFiles('rust-toolchain.toml'), hashFiles('Cargo.lock'), inputs.revision || github.sha) || format('focused-{0}-{1}-{2}', runner.os, runner.arch, hashFiles('rust-toolchain.toml', 'Cargo.lock')) }}
           restore-keys: |
             cargo-${{ inputs.runner == 'macos-intel' && 'ci-macos_intel-fast-v1' || inputs.runner == 'macos' && 'macos-suite' || 'ci-rust' }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Install the pinned Rust test runner
+        if: inputs.cargo_cache
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github cargo-nextest
       - name: Run the selected check
         shell: bash
         env:

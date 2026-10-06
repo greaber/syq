@@ -137,7 +137,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python${{ (needs.scope.outputs.all_tooling == 'true' || needs.scope.outputs.quick_tooling == 'true') && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-nextest${{ (needs.scope.outputs.all_tooling == 'true' || needs.scope.outputs.quick_tooling == 'true') && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
@@ -147,7 +147,7 @@ jobs:
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: |
-          scripts/setup.sh github shellcheck jq python
+          scripts/setup.sh github shellcheck jq python cargo-nextest
           if [[ "${{ needs.scope.outputs.all_tooling }}" == true || "${{ needs.scope.outputs.quick_tooling }}" == true ]]; then
             scripts/setup.sh github node
           fi
@@ -224,20 +224,20 @@ jobs:
           fi
           read -r -a integration_targets <<< "$INTEGRATION_TARGETS"
           if [[ "$FULL_SUITE" == true || " ${integration_targets[*]} " == *" all "* ]]; then
-            cargo test --locked --all-targets
+            cargo nextest run --locked --all-targets
           else
             targets=(--bin syq)
             for target in "${integration_targets[@]}"; do
               targets+=(--test "$target")
             done
-            cargo test --locked "${targets[@]}"
+            cargo nextest run --locked "${targets[@]}"
           fi
       - name: Test executable mapping documentation
         if: >-
           needs.scope.outputs.mapping_docs == 'true' &&
           (needs.scope.outputs.native != 'true' ||
            needs.scope.outputs.full_suite != 'true')
-        run: cargo test --locked --test local _md_
+        run: cargo nextest run --locked --test local _md_
       - name: Run cheap tooling checks
         if: >-
           needs.scope.outputs.quick_tooling == 'true' &&
@@ -303,7 +303,9 @@ jobs:
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
-        run: tests/tooling/test-setup.sh
+        run: |
+          tests/tooling/test-setup.sh
+          python3 tests/tooling/test-rust-test-timeouts.py
       - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
@@ -543,8 +545,12 @@ jobs:
             cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
             cargo-ci-macos_intel-fast-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - run: cargo check --locked --all-targets
+      - name: Install the pinned test runner
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github cargo-nextest
       - name: Exercise the Intel standalone-update artifact selection
-        run: cargo test --locked --test update
+        run: cargo nextest run --locked --test update
 
   # Preserve the `macos` check for Intel. Apple Silicon is certified once by
   # the full macos.yml workflow, required separately by verify-release-ci.py.
@@ -751,7 +757,7 @@ jobs:
       - name: Install pinned development tools
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/setup.sh github python node mdbook
+        run: scripts/setup.sh github python node mdbook cargo-nextest
       - name: Cache Cargo dependencies and build output
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -772,7 +778,7 @@ jobs:
       # The ignored Linux tests are timing and simulation reports.
       - name: Run ignored Linux tests
         if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
-        run: cargo test --locked --all-targets -- --ignored
+        run: cargo nextest run --locked --all-targets --run-ignored only
       - name: Check that automation fixtures match real output
         if: ${{ !cancelled() && steps.build-tests.outcome == 'success' }}
         run: python3 scripts/regen-automation-fixtures.py --check --no-build

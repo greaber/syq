@@ -314,6 +314,8 @@ def classify(paths, preparation_only):
                 native = True
         elif matches(path, "src/*macos*", "tests/macos*"):
             native = macos = True
+        elif path == ".config/nextest.toml":
+            native = macos = True
         elif matches(path, "rust-toolchain.toml", "build.rs", "src/*", "tests/*.rs", "schemas/*"):
             native = True
         elif matches(path, ".github/workflows/*"):
@@ -364,7 +366,8 @@ def classify(paths, preparation_only):
                      "scripts/dispatched_checks.py", "scripts/dispatched-checks-status.py",
                      "scripts/pr-checks.py", "tests/tooling/test-dispatched-checks-status.py"):
             path_tooling_checks.append("branch")
-        elif matches(path, "scripts/setup.sh", "tests/tooling/test-setup.sh"):
+        elif matches(path, "scripts/setup.sh", "tests/tooling/test-setup.sh",
+                     "tests/tooling/test-rust-test-timeouts.py", ".config/nextest.toml"):
             path_tooling_checks.append("setup")
         elif path == "scripts/setup.lock":
             path_tooling_checks += ALL_TOOLING.split()

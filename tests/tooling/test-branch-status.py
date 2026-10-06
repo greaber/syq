@@ -448,7 +448,7 @@ class BranchStatusTests(unittest.TestCase):
             {"name": "fmt", "command": "cargo fmt --all -- --check", "result": "pass"},
             {"name": "clippy", "command": "cargo clippy --locked --all-targets --all-features -- -D warnings",
              "result": "fail"},
-            {"name": "unit-tests", "command": "cargo test --locked --bin syq", "result": "pass"}])
+            {"name": "unit-tests", "command": "cargo nextest run --locked --bin syq", "result": "pass"}])
         self.assertEqual(report["warnings"], ["clippy failed"])
         self.assertEqual(report["exit_status"], 1)
 
@@ -463,7 +463,7 @@ class BranchStatusTests(unittest.TestCase):
 
     def test_check_that_moves_head_reports_nothing(self):
         # A check that moves HEAD cannot report its results against the new commit.
-        self.write_fake("cargo", "#!/bin/sh\nif [ \"$1\" = test ]; then "
+        self.write_fake("cargo", "#!/bin/sh\nif [ \"$1\" = nextest ]; then "
                                  "git commit -q --allow-empty -m 'moved during check'; fi\n")
         output = self.status("--check", expected=2)
         self.assertIn("HEAD changed during baseline checks", output)

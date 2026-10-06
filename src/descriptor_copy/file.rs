@@ -420,47 +420,48 @@ impl FileSession {
                             same_contents(&stream.file, &existing)?,
                             "destination contents differ (--if-exists=error-if-different)"
                         );
-                        if let Some(meta) = destination.source_meta.clone() {
-                            crate::fsops::set_meta_file(
-                                &existing,
-                                &meta,
-                                destination.metadata.preserve,
-                            )?;
-                        }
-                        if let Some(attributes) = destination.metadata.overrides {
-                            let mut meta = super::metadata::from_file(&existing.metadata()?);
-                            attributes.apply(&mut meta);
-                            crate::fsops::set_meta_file(
-                                &existing,
-                                &meta,
-                                attributes.apply_flags(),
-                            )?;
+                        let base = destination
+                            .source_meta
+                            .clone()
+                            .map(|meta| (meta, destination.metadata.preserve));
+                        if let Some((meta, flags)) =
+                            with_overrides(&existing, base, destination.metadata.overrides)?
+                        {
+                            crate::fsops::set_meta_file(&existing, &meta, flags)?;
                         }
                         slot.take();
                         return Ok(Response::Ok);
                     }
-                    if let Some(mut meta) = destination.source_meta.clone() {
-                        meta.mode = destination.mode;
-                        crate::fsops::set_meta_file(
-                            &stream.file,
-                            &meta,
-                            crate::proto::flags::MODE
-                                | if destination.metadata.restore_named_mtime {
-                                    crate::proto::flags::TIMES
-                                } else {
-                                    0
-                                }
-                                | destination.metadata.preserve,
-                        )?;
-                    } else {
-                        stream
-                            .file
-                            .set_permissions(Permissions::from_mode(destination.mode))?;
-                    }
-                    if let Some(attributes) = destination.metadata.overrides {
-                        let mut meta = super::metadata::from_file(&stream.file.metadata()?);
-                        attributes.apply(&mut meta);
-                        crate::fsops::set_meta_file(&stream.file, &meta, attributes.apply_flags())?;
+                    let base = match destination.source_meta.clone() {
+                        Some(mut meta) => {
+                            meta.mode = destination.mode;
+                            let times = if destination.metadata.restore_named_mtime {
+                                crate::proto::flags::TIMES
+                            } else {
+                                0
+                            };
+                            Some((
+                                meta,
+                                crate::proto::flags::MODE | times | destination.metadata.preserve,
+                            ))
+                        }
+                        None if destination.metadata.overrides.is_some() => {
+                            let mut meta = super::metadata::from_file(&stream.file.metadata()?);
+                            meta.mode = destination.mode;
+                            Some((meta, crate::proto::flags::MODE))
+                        }
+                        None => None,
+                    };
+                    match with_overrides(&stream.file, base, destination.metadata.overrides)? {
+                        Some((meta, flags)) => {
+                            crate::fsops::set_meta_file(&stream.file, &meta, flags)?
+                        }
+                        None => {
+                            stream
+                                .file
+                                .set_permissions(Permissions::from_mode(destination.mode))?;
+                            crate::fsops::access_changed(&stream.file);
+                        }
                     }
                     stream.file.sync_all()?;
                     if protected {
@@ -492,6 +493,26 @@ impl FileSession {
         }
         result
     }
+}
+
+/// A destination's final metadata and the flags selecting it: `base`, with
+/// what a mapping entry's metadata overrides replaced. Applying it in one
+/// step means no other mode comes first, which would let anyone it admits
+/// open the finished file and keep reading it once the override narrows it.
+fn with_overrides(
+    file: &File,
+    base: Option<(crate::proto::Meta, u8)>,
+    overrides: Option<crate::mapping::Metadata>,
+) -> Result<Option<(crate::proto::Meta, u8)>> {
+    let Some(attributes) = overrides else {
+        return Ok(base);
+    };
+    let (mut meta, flags) = match base {
+        Some(base) => base,
+        None => (super::metadata::from_file(&file.metadata()?), 0),
+    };
+    attributes.apply(&mut meta);
+    Ok(Some((meta, flags | attributes.apply_flags())))
 }
 
 fn same_contents(left: &File, right: &File) -> Result<bool> {
@@ -683,6 +704,116 @@ mod tests {
         drop(slot);
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read(&target).unwrap(), b"onetwo");
+    }
+
+    #[test]
+    fn a_metadata_override_is_the_first_mode_the_finished_file_gets() {
+        // A mapping entry's metadata replaces the mode the destination would
+        // otherwise get. The finished file must take it at once: a default
+        // or source mode on the way lets anyone it admits open the file and
+        // keep reading it after the override narrows it.
+        let mut exposed = Vec::new();
+        for case in ["callback source", "file source", "existing destination"] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let target = temporary.path().join("target");
+            let existing = case == "existing destination";
+            if existing {
+                std::fs::write(&target, b"private").unwrap();
+                std::fs::set_permissions(&target, Permissions::from_mode(0o600)).unwrap();
+            }
+            let source_meta = (case != "callback source").then_some(crate::proto::Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            });
+            let metadata = super::super::metadata::Policy {
+                preserve: if existing {
+                    crate::proto::flags::MODE
+                } else {
+                    0
+                },
+                if_exists: existing.then_some(crate::cli::IfExists::ErrorIfDifferent),
+                overrides: Some(crate::mapping::Metadata {
+                    mode: Some(0o640),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let descriptors = DescriptorSessionSlot::default();
+            let mut slot = Session::default();
+            let Response::DescriptorOpened { ticket, .. } = Session::handle(
+                &mut slot,
+                &Operation::Open {
+                    entry: 1,
+                    dry_run: false,
+                    only_new: false,
+                    only_existing: false,
+                    path: target.as_os_str().as_bytes().to_vec(),
+                    write: true,
+                    follow: false,
+                    root: None,
+                    placement: StreamPlacement::default(),
+                    settings: Settings::default(),
+                    metadata,
+                    source_meta,
+                },
+                &descriptors,
+            )
+            .unwrap() else {
+                panic!()
+            };
+            let worker = FileWorker::new(
+                descriptors.acquire(&ticket).unwrap(),
+                ticket.stream_write().unwrap(),
+                Settings::default(),
+            )
+            .unwrap();
+            worker
+                .handle(&Request::WriteRange {
+                    path: Vec::new(),
+                    inplace: true,
+                    copy_id: [0; 16],
+                    attempt: 0,
+                    off: 0,
+                    hash: [0; 32],
+                    data: b"private".to_vec().into(),
+                    guard: None,
+                })
+                .unwrap();
+            let modes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = modes.clone();
+            crate::fsops::ACCESS_CHANGED.set(Some(Box::new(move |file: &File| {
+                observed
+                    .borrow_mut()
+                    .push(file.metadata().unwrap().mode() & 0o7777);
+            })));
+            let finished = Session::handle(
+                &mut slot,
+                &Operation::Finish { entry: 1, size: 7 },
+                &descriptors,
+            );
+            crate::fsops::ACCESS_CHANGED.set(None);
+            finished.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"private", "{case}");
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().mode() & 0o7777,
+                0o640,
+                "{case}"
+            );
+            let modes = modes.borrow();
+            assert!(!modes.is_empty(), "{case}");
+            if modes.iter().any(|&mode| mode != 0o640) {
+                let modes = modes.iter().map(|mode| format!("{mode:o}"));
+                exposed.push(format!("{case}: {:?}", modes.collect::<Vec<_>>()));
+            }
+        }
+        assert!(
+            exposed.is_empty(),
+            "the file took other modes on the way: {exposed:?}"
+        );
     }
 
     #[test]

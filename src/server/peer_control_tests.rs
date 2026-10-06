@@ -78,7 +78,11 @@ impl Session {
     }
 
     fn finish(&mut self) -> Result<()> {
-        self.socket.shutdown(std::net::Shutdown::Both).unwrap();
+        // macOS reports ENOTCONN if the server already rejected the role
+        // and closed its socket; that is the expected end of this session.
+        if let Err(error) = self.socket.shutdown(std::net::Shutdown::Both) {
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        }
         self.server.take().unwrap().join().unwrap()
     }
 }
@@ -253,6 +257,10 @@ fn control_hangup_revokes_with_unread_pipe_data() {
     writer.write_all(b"queued metadata").unwrap();
     let lifetime = ControlLifetime::watch(&input, authority.clone()).unwrap();
     assert!(authority.control_is_open());
+    // Let the watcher observe queued data before EOF. A one-shot Darwin
+    // poll subscription can otherwise pass by noticing an already-closed pipe.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(authority.control_is_open(), "queued data is not a hangup");
     // Keep all queued bytes unread, as when the protocol reader is blocked
     // sending into its full request queue during a long metadata operation.
     drop(writer);
