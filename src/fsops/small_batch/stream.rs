@@ -394,14 +394,7 @@ impl FsOps {
             }
             let bytes = &mut stream.buffer[..len];
             let old = stream.old.as_ref().context("no file to reuse blocks of")?;
-            let complete = read_exact_or_short(old, off, bytes)?;
-            let algorithm = self.hash_policy.algorithm;
-            if !complete
-                || bytes
-                    .chunks(patch.block as usize)
-                    .zip(&patch.reuse[first..end])
-                    .any(|(block, expected)| Some(algorithm.hash(block)) != *expected)
-            {
+            if !self.holds_blocks(old, off, bytes, patch.block, &patch.reuse[first..end])? {
                 bail!("the destination changed after it was compared");
             }
             let stage = stream

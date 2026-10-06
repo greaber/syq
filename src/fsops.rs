@@ -3172,6 +3172,39 @@ fn observed_write(
     Ok(())
 }
 
+/// Write a file's whole new contents from its start over `old_len` bytes of
+/// old contents that may lie there, as an in-place update does. Sparse zero
+/// runs over old bytes clear them rather than being skipped. The caller sets
+/// the final length afterwards, so the old contents are never cut first.
+fn observed_overwrite(
+    actor: &Arc<crate::transfer_observations::Actor>,
+    file: &File,
+    data: &[u8],
+    old_len: u64,
+    sparse: bool,
+) -> std::io::Result<()> {
+    let writing = actor.span(crate::transfer_observations::Stage::DestinationWrite);
+    #[cfg(debug_assertions)]
+    fail_inplace_write_for_test()?;
+    if sparse {
+        crate::sparse::write_at(file, data, 0, old_len > 0)?;
+    } else {
+        file.write_all_at(data, 0)?;
+    }
+    writing.bytes(data.len() as u64);
+    Ok(())
+}
+
+/// Tests make in-place small-file writes fail, as a destination that
+/// refuses writes to existing files does.
+#[cfg(debug_assertions)]
+fn fail_inplace_write_for_test() -> std::io::Result<()> {
+    if std::env::var_os("SYQ_TEST_FAIL_INPLACE_PUT").is_some() {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
+}
+
 /// `observed_write` for a caller that records the write itself.
 fn write_data(file: &File, data: &[u8], off: u64, sparse: bool) -> std::io::Result<()> {
     if sparse {

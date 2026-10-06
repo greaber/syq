@@ -248,41 +248,13 @@ pub(super) struct PatchSource<'a> {
     patch: &'a SmallPatch,
 }
 
-/// The whole contents a patch describes: its new blocks, and the reused
-/// blocks of `old`, each of which must still hash as compared.
-fn assemble(
-    old: Option<&File>,
-    algorithm: crate::hashing::HashAlgorithm,
-    patch: &SmallPatch,
-) -> Result<Vec<u8>> {
-    let mut data = Vec::with_capacity(patch.len as usize);
-    let mut taken = 0;
-    for (index, reuse) in patch.reuse.iter().enumerate() {
-        let off = index as u64 * patch.block;
-        let len = patch.block.min(patch.len - off) as usize;
-        match (reuse, old) {
-            (Some(expected), Some(old)) => {
-                data.resize(off as usize + len, 0);
-                let block = &mut data[off as usize..];
-                let complete = read_exact_or_short(old, off, block)?;
-                if !complete || algorithm.hash(block) != *expected {
-                    bail!("the destination changed after it was compared");
-                }
-            }
-            _ => {
-                let new = patch
-                    .data
-                    .get(taken..taken + len)
-                    .context("patch contents end early")?;
-                data.extend_from_slice(new);
-                taken += len;
-            }
-        }
-    }
-    if taken != patch.data.len() {
-        bail!("patch contents run past the file");
-    }
-    Ok(data)
+/// Bytes of a file's comparison blocks read, and then hashed, at once, as
+/// the source compares its files: whole blocks, at least one.
+const HASH_CHUNK_BYTES: u64 = 1 << 20;
+
+/// How many `block`-byte blocks one chunk holds.
+fn chunk_blocks(block: u64) -> usize {
+    (HASH_CHUNK_BYTES / block).max(1) as usize
 }
 
 fn fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
@@ -345,38 +317,6 @@ fn reproduces_basis(patch: &SmallPatch) -> bool {
         && patch.reuse.iter().all(Option::is_some)
 }
 
-/// Whether `file` is exactly as long as a patch's file and every block
-/// still hashes as the patch reuses it.
-fn holds_reused_blocks(
-    file: &File,
-    algorithm: crate::hashing::HashAlgorithm,
-    patch: &SmallPatch,
-) -> Result<bool> {
-    if file.metadata()?.len() != patch.len {
-        return Ok(false);
-    }
-    let mut buffer = Vec::new();
-    for (index, reuse) in patch.reuse.iter().enumerate() {
-        let off = index as u64 * patch.block;
-        let len = patch.block.min(patch.len - off) as usize;
-        if !read_block(file, off, len, &mut buffer)?
-            || Some(algorithm.hash(&buffer[..len])) != *reuse
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Read `len` bytes at `off` into the start of `buffer`. Returns false when
-/// the file ends first.
-fn read_block(file: &File, off: u64, len: usize, buffer: &mut Vec<u8>) -> Result<bool> {
-    if buffer.len() < len {
-        buffer.resize(len, 0);
-    }
-    read_exact_or_short(file, off, &mut buffer[..len])
-}
-
 /// Fill `buffer` from `file` at `off`. Returns false when the file ends first.
 fn read_exact_or_short(file: &File, off: u64, buffer: &mut [u8]) -> Result<bool> {
     match file.read_exact_at(buffer, off) {
@@ -387,6 +327,108 @@ fn read_exact_or_short(file: &File, off: u64, buffer: &mut [u8]) -> Result<bool>
 }
 
 impl FsOps {
+    /// Fill `buffer` from `file` at `off` in one read, observed as the
+    /// per-file path observes reading the file it compares with. Returns
+    /// false when the file ends first.
+    fn observed_basis_read(&self, file: &File, off: u64, buffer: &mut [u8]) -> Result<bool> {
+        let reading = self
+            .operation
+            .span(crate::transfer_observations::Stage::SourceRead);
+        let complete = read_exact_or_short(file, off, buffer)?;
+        if complete {
+            reading.bytes(buffer.len() as u64);
+        }
+        Ok(complete)
+    }
+
+    /// Whether `file` still holds a run of a patch's reused blocks from
+    /// `off`: read into `bytes` at once, each `block` bytes of it must hash
+    /// as `expected` lists it.
+    pub(super) fn holds_blocks(
+        &self,
+        file: &File,
+        off: u64,
+        bytes: &mut [u8],
+        block: u64,
+        expected: &[Option<ContentDigest>],
+    ) -> Result<bool> {
+        debug_assert_eq!(bytes.len().div_ceil(block as usize), expected.len());
+        if !self.observed_basis_read(file, off, bytes)? {
+            return Ok(false);
+        }
+        let _hash = self
+            .operation
+            .span(crate::transfer_observations::Stage::Hashing);
+        let algorithm = self.hash_policy.algorithm;
+        Ok(bytes
+            .chunks(block as usize)
+            .zip(expected)
+            .all(|(bytes, expected)| Some(algorithm.hash(bytes)) == *expected))
+    }
+
+    /// The whole contents a patch describes: its new blocks, and the reused
+    /// blocks of `old`, each of which must still hash as compared. Each run
+    /// of reused blocks, up to a chunk, is read and checked at once.
+    fn assemble(&self, old: Option<&File>, patch: &SmallPatch) -> Result<Vec<u8>> {
+        let mut data = Vec::with_capacity(patch.len as usize);
+        let run = chunk_blocks(patch.block);
+        let mut taken = 0;
+        let mut index = 0;
+        while index < patch.reuse.len() {
+            let off = index as u64 * patch.block;
+            match (&patch.reuse[index], old) {
+                (Some(_), Some(old)) => {
+                    let mut end = index + 1;
+                    while end < patch.reuse.len() && end - index < run && patch.reuse[end].is_some()
+                    {
+                        end += 1;
+                    }
+                    let len = ((end as u64 * patch.block).min(patch.len) - off) as usize;
+                    data.resize(off as usize + len, 0);
+                    let (blocks, expected) = (&mut data[off as usize..], &patch.reuse[index..end]);
+                    if !self.holds_blocks(old, off, blocks, patch.block, expected)? {
+                        bail!("the destination changed after it was compared");
+                    }
+                    index = end;
+                }
+                _ => {
+                    let len = patch.block.min(patch.len - off) as usize;
+                    let new = patch
+                        .data
+                        .get(taken..taken + len)
+                        .context("patch contents end early")?;
+                    data.extend_from_slice(new);
+                    taken += len;
+                    index += 1;
+                }
+            }
+        }
+        if taken != patch.data.len() {
+            bail!("patch contents run past the file");
+        }
+        Ok(data)
+    }
+
+    /// Whether `file` is exactly as long as a patch's file and every block
+    /// still hashes as the patch reuses it, read and checked a chunk at a
+    /// time.
+    fn holds_reused_blocks(&self, file: &File, patch: &SmallPatch) -> Result<bool> {
+        if file.metadata()?.len() != patch.len {
+            return Ok(false);
+        }
+        let run = chunk_blocks(patch.block);
+        let mut buffer = Vec::new();
+        for (chunk, expected) in patch.reuse.chunks(run).enumerate() {
+            let off = (chunk * run) as u64 * patch.block;
+            let end = (off + expected.len() as u64 * patch.block).min(patch.len);
+            buffer.resize((end - off) as usize, 0);
+            if !self.holds_blocks(file, off, &mut buffer, patch.block, expected)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Hash the blocks each existing destination holds whole, up to the
     /// length of the source that would replace it. A target that is not an
     /// existing regular file under the root and condition has no hashes.
@@ -428,14 +470,34 @@ impl FsOps {
         };
         let fingerprint = fingerprint(&file.metadata()?);
         let algorithm = self.hash_policy.algorithm;
+        // Only blocks the file holds whole are hashed: every block up to the
+        // source's length, or those before the file ends. They are read, and
+        // then hashed, a chunk at a time.
+        let end = if fingerprint.len >= read.len {
+            read.len
+        } else {
+            fingerprint.len / block * block
+        };
+        let chunk = chunk_blocks(block) as u64 * block;
         let mut hashes = Vec::with_capacity(blocks);
-        for index in 0..blocks as u64 {
-            let off = index * block;
-            let len = block.min(read.len - off) as usize;
-            if off + len as u64 > fingerprint.len || !read_block(&file, off, len, buffer)? {
+        let mut off = 0;
+        while off < end {
+            let len = chunk.min(end - off) as usize;
+            if buffer.len() < len {
+                buffer.resize(len, 0);
+            }
+            if !self.observed_basis_read(&file, off, &mut buffer[..len])? {
                 break;
             }
-            hashes.push(algorithm.hash(&buffer[..len]));
+            let _hash = self
+                .operation
+                .span(crate::transfer_observations::Stage::Hashing);
+            hashes.extend(
+                buffer[..len]
+                    .chunks(block as usize)
+                    .map(|bytes| algorithm.hash(bytes)),
+            );
+            off += len as u64;
         }
         Ok(ExistingHashes {
             fingerprint: Some(fingerprint),
@@ -618,7 +680,7 @@ impl FsOps {
             return Ok(false);
         }
         Ok(patch.basis == Some(fingerprint(&file.metadata()?))
-            || holds_reused_blocks(file, self.hash_policy.algorithm, patch)?)
+            || self.holds_reused_blocks(file, patch)?)
     }
 
     /// The put that publishes a patch, and the file whose blocks it reuses.
@@ -666,7 +728,7 @@ impl FsOps {
                 return Ok((put(Vec::new()), Some(source)));
             }
         }
-        let data = assemble(old.as_ref(), self.hash_policy.algorithm, patch)?;
+        let data = self.assemble(old.as_ref(), patch)?;
         Ok((put(data), None))
     }
 
@@ -695,7 +757,7 @@ impl FsOps {
         if !copied {
             file.set_len(0)?;
             self.preallocate_stage(stage, patch.len)?;
-            let data = assemble(Some(&source.old), self.hash_policy.algorithm, patch)?;
+            let data = self.assemble(Some(&source.old), patch)?;
             return match unobserved {
                 None => observed_write(&self.operation, file, &data, 0, self.sparse),
                 Some(bytes) => write_data(file, &data, 0, self.sparse).inspect(|()| {

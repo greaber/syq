@@ -150,6 +150,13 @@ Syq refuses to replace a directory with a file, or a file with a directory.
 See [filename and type conflicts](commands/cp.md#filename-and-type-conflicts)
 when copying between filesystems with different naming rules.
 
+An rclone mount works as a source in any mode, but to be a destination it
+needs rclone's `--vfs-cache-mode writes` or `full`. In rclone's default mode a
+file can only be written once, from start to end, and
+[rclone's documentation](https://rclone.org/commands/rclone_mount/#vfs-file-caching)
+says most applications need write caching; most syq copies and updates fail
+there.
+
 ## Choose which existing files to update
 
 By default, syq copies missing files and updates existing files whose contents
@@ -372,7 +379,9 @@ syq cp --inplace large-file --to server --into /backup
 
 This avoids the disk space for a second full copy and can reduce disk I/O.
 However, readers can see a mixture of old and new contents during the copy or
-after an interruption. Writes through a hard link also affect its other names.
+after an interruption: the parts already written hold new data, and the rest
+keeps whatever old data was there, up to the file's new length. Writes through
+a hard link also affect its other names.
 Changing an existing file’s contents requires write permission; an unchanged
 read-only file can still be checked with `--hash`. New files keep owner-write
 permission until the copy succeeds and applies their final permissions; an

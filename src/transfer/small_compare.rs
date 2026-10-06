@@ -28,6 +28,12 @@
 //! Pieces are pipelined: up to `STREAM_BUFFER_BYTES` of them are read ahead
 //! from a remote source, and those sent await their acknowledgments within
 //! the destination's reply queue.
+//!
+//! Each file is complete, and counts as progress, as soon as the reply that
+//! keeps or publishes it arrives, not when its batch ends; a streamed patch's
+//! pieces count as they are acknowledged, and no longer count if the patch is
+//! not published. Once the copy is aborted, nothing further is sent for the
+//! groups in flight, as the per-file path publishes nothing after an abort.
 
 use super::*;
 use crate::proto::PATCH_PIECE_BYTES;
@@ -78,6 +84,8 @@ pub(super) enum Compared {
     /// The destination already held the source's contents, but keeping it
     /// failed: a file error, as for a content-identical per-file finish.
     KeepFailed(WireError),
+    /// Kept or published, and completed when the reply that did so arrived.
+    Completed,
 }
 
 #[derive(Clone, Copy)]
@@ -135,13 +143,74 @@ fn differing_ranges(patch: &SmallPatch, piece: u64) -> Vec<(u64, u32)> {
     ranges
 }
 
+/// Split a batch's files, by their sizes, into comparison groups of at most
+/// `COMPARE_GROUP_FILES` files and `group_bytes` bytes, as positions in the
+/// batch, in the order their requests go out.
+///
+/// `bound` names the destination file whose change time a restricted
+/// receiver binds each file's patch to, when other names of that file may
+/// be in the copy. The receiver authorizes all of a request's patches
+/// before it carries out any, and keeping one name of a hard-linked file
+/// with new metadata, or replacing it, changes the change time the file's
+/// other names share: another of them in the same request would find its
+/// condition stale, and be compared again, or copied whole if it was to be
+/// replaced. So no group holds two names of one such file. A connection's
+/// requests are carried out in turn, so a later group's patch is authorized
+/// against the file as the earlier one left it. Names are taken in order of
+/// how many names of the same file came before them in the batch, all the
+/// first names, then all the second, and so on, so that names of different
+/// files still share groups; files without such a bound keep the batch's
+/// order.
+pub(super) fn compare_groups(
+    sizes: &[u64],
+    bound: &[Option<(u64, u64)>],
+    group_bytes: u64,
+) -> std::collections::VecDeque<Vec<usize>> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    if bound.iter().any(Option::is_some) {
+        let mut earlier = std::collections::HashMap::new();
+        let rank: Vec<u32> = bound
+            .iter()
+            .map(|file| {
+                file.map_or(0, |file| {
+                    let names = earlier.entry(file).or_insert(0);
+                    *names += 1;
+                    *names - 1
+                })
+            })
+            .collect();
+        order.sort_by_key(|&i| rank[i]);
+    }
+    let mut groups = std::collections::VecDeque::new();
+    let (mut group, mut bytes) = (Vec::new(), 0u64);
+    let mut files = std::collections::HashSet::new();
+    for i in order {
+        if !group.is_empty()
+            && (group.len() >= COMPARE_GROUP_FILES
+                || bytes.saturating_add(sizes[i]) > group_bytes
+                || bound[i].is_some_and(|file| files.contains(&file)))
+        {
+            groups.push_back(std::mem::take(&mut group));
+            bytes = 0;
+            files.clear();
+        }
+        group.push(i);
+        bytes += sizes[i];
+        files.extend(bound[i]);
+    }
+    if !group.is_empty() {
+        groups.push_back(group);
+    }
+    groups
+}
+
 /// Where a streamed patch's request stands on its connection.
 enum StreamStep {
     /// A piece read from the source, at its offset and length.
     Piece(usize, u64, u32),
-    /// The patch's begin, or a piece, sent to the destination.
+    /// The patch's begin, or a piece of this length, sent to the destination.
     Begin(usize),
-    Ack(usize),
+    Ack(usize, u32),
     /// The source's metadata read after the patch's last piece.
     Recheck(usize),
     End(usize),
@@ -161,6 +230,9 @@ struct StreamState {
     refused: bool,
     /// The source changed while it was read, to this or nothing.
     changed: Option<Option<Entry>>,
+    /// Bytes of its pieces the receiver acknowledged, counted as progress
+    /// until the patch is published or fails.
+    counted: u64,
 }
 
 /// One group's files, as positions in the batch, and what each stage
@@ -184,6 +256,21 @@ impl Worker {
         }
     }
 
+    /// The destination file a restricted receiver binds `job`'s patch to by
+    /// its change time, if other names of that file may be in this copy:
+    /// the receiver does so when it chooses the mode of the file it
+    /// replaces, as it does unless permissions are preserved.
+    fn change_time_bound_destination(&self, job: &WorkerJob) -> Option<(u64, u64)> {
+        if !self.opts.restricted_receiver
+            || self.publication_flags(job) & crate::proto::flags::RECEIVER_MODE == 0
+        {
+            return None;
+        }
+        job.dst_entry
+            .as_deref()
+            .and_then(crate::sched::linked_identity)
+    }
+
     /// The largest file, and the most source bytes of one group, to compare
     /// in groups. A restricted receiver with a rate limit refuses a request
     /// carrying more file data than one burst, so a group's files, and with
@@ -199,8 +286,9 @@ impl Worker {
     }
 
     /// Claim files near `idx` whose destinations can be compared, and
-    /// compare them. Kept and published files are complete; the others
-    /// return to the queue, those that failed marked to be replaced whole.
+    /// compare them. Kept and published files are complete, most as soon as
+    /// their replies arrive; the others return to the queue, those that
+    /// failed marked to be replaced whole.
     pub(super) fn compare_small_batch(&mut self, idx: usize) -> Result<()> {
         let first_bytes = self.job(idx).entry.size;
         let target = self
@@ -238,13 +326,15 @@ impl Worker {
                 Some(Compared::StaleCondition) => {
                     // Keeping or replacing each other name of the
                     // destination in this copy changes the change time its
-                    // condition holds, once, and so can leave this name's
-                    // condition stale once. Comparing it again as many times
-                    // as this copy has names of the file lets every name be
-                    // kept, and leaves one comparison for a change from
-                    // outside. A file that goes stale more often, as one
-                    // that keeps changing does, is replaced whole. Names of
-                    // it outside this copy do not count.
+                    // condition holds, once. This batch's names of the file
+                    // are authorized in turn (see `compare_groups`), but
+                    // another worker's can still leave this name's
+                    // condition stale, once each. Comparing it again as many
+                    // times as this copy has names of the file lets every
+                    // name be kept, and leaves one comparison for a change
+                    // from outside. A file that goes stale more often, as
+                    // one that keeps changing does, is replaced whole. Names
+                    // of it outside this copy do not count.
                     let mut jobs = self.sched.jobs.lock().unwrap();
                     let names = jobs.destination_names(i);
                     let job = &mut jobs[i];
@@ -261,6 +351,7 @@ impl Worker {
                     let job = self.job(i);
                     self.retry_changed_small(i, &job, now);
                 }
+                Some(Compared::Completed) => {}
                 Some(outcome) => finished.push((i, outcome)),
                 None => self.sched.requeue(i),
             }
@@ -281,30 +372,23 @@ impl Worker {
             batch.iter().map(|&i| all.snapshot(i)).collect()
         };
         let mut outcomes: Vec<Option<Compared>> = (0..jobs.len()).map(|_| None).collect();
-        let mut unissued = std::collections::VecDeque::new();
         let (_, group_bytes) = self.compare_group_limits();
-        let (mut start, mut bytes) = (0, 0u64);
-        for (i, job) in jobs.iter().enumerate() {
-            if i > start
-                && (i - start >= COMPARE_GROUP_FILES
-                    || bytes.saturating_add(job.entry.size) > group_bytes)
-            {
-                unissued.push_back((start..i).collect::<Vec<_>>());
-                (start, bytes) = (i, 0);
-            }
-            bytes += job.entry.size;
-        }
-        if start < jobs.len() {
-            unissued.push_back((start..jobs.len()).collect());
-        }
+        let sizes: Vec<u64> = jobs.iter().map(|job| job.entry.size).collect();
+        let bound: Vec<Option<(u64, u64)>> = jobs
+            .iter()
+            .map(|job| self.change_time_bound_destination(job))
+            .collect();
+        let mut unissued = compare_groups(&sizes, &bound, group_bytes);
         // Each group has at most one request outstanding, so the groups in
         // flight bound the replies the destination owes, and waiting reads
-        // those the source owes, to what each connection queues.
+        // those the source owes, to what each connection queues. An
+        // in-process source answers each read as it is sent: it is sent one
+        // at a time, so that its data moves on before the next is read.
         let window = self
             .dst
             .reply_queue()
             .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
-        let source_queue = self.src.reply_queue().unwrap_or(usize::MAX);
+        let source_queue = self.src.reply_queue().unwrap_or(1);
         let mut groups: Vec<Group> = Vec::new();
         // Patches to stream once the groups are done.
         let mut streams = Vec::new();
@@ -315,6 +399,11 @@ impl Worker {
         let mut destination = std::collections::VecDeque::new();
         let result = (|| -> Result<()> {
             loop {
+                // Once the copy is aborted, the groups in flight send nothing
+                // further: what they have outstanding is drained below.
+                if self.sched.is_aborted() {
+                    return Ok(());
+                }
                 while source.len() < source_queue {
                     let Some((group, request)) = waiting.pop_front() else {
                         break;
@@ -349,31 +438,44 @@ impl Worker {
                     });
                     in_flight += 1;
                 }
-                // Replies arrive in order on each connection. Take one that
-                // has arrived, as an in-process endpoint's has, so that the
-                // data it holds moves on at once; otherwise wait for the one
-                // whose request went out first.
-                let from_source = match (source.front(), destination.front()) {
-                    (Some(_), Some(_)) if self.src.reply_ready() => true,
-                    (Some(_), Some(_)) if self.dst.reply_ready() => false,
-                    (Some((_, _, a)), Some((_, _, b))) => a <= b,
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (None, None) => {
-                        debug_assert!(waiting.is_empty());
-                        return Ok(());
-                    }
+                // Replies arrive in order on each connection, and each is
+                // acted on as soon as it is taken, so that what a patch reply
+                // published is recorded before anything else can fail. A
+                // destination reply that has already arrived goes first:
+                // acting on it sends nothing, and a patch reply, which waits
+                // behind the hash replies of the groups issued before it,
+                // then counts its files at once rather than after a source
+                // reply whose patch may first wait for the bandwidth limit.
+                // Next comes a source reply that has arrived, as an
+                // in-process source's has, so that the data it holds moves
+                // on at once; otherwise wait for the reply whose request went
+                // out first.
+                let arrived = if destination.is_empty() {
+                    None
+                } else {
+                    self.arrived_reply()?
                 };
-                let (group, stage, _) = if from_source {
-                    source.pop_front()
+                let (group, stage, response) = if let Some(response) = arrived {
+                    let (group, stage, _) = destination.pop_front().expect("pending reply");
+                    (group, stage, response)
                 } else {
-                    destination.pop_front()
-                }
-                .expect("pending reply");
-                let response = if from_source {
-                    self.src.recv()?
-                } else {
-                    self.dst.recv()?
+                    let from_source = match (source.front(), destination.front()) {
+                        (Some(_), Some(_)) if self.src.reply_ready() => true,
+                        (Some((_, _, a)), Some((_, _, b))) => a <= b,
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => {
+                            debug_assert!(waiting.is_empty());
+                            return Ok(());
+                        }
+                    };
+                    if from_source {
+                        let (group, stage, _) = source.pop_front().expect("pending reply");
+                        (group, stage, self.src.recv()?)
+                    } else {
+                        let (group, stage, _) = destination.pop_front().expect("pending reply");
+                        (group, stage, self.dst.recv()?)
+                    }
                 };
                 let next = self.compare_stage(
                     &jobs,
@@ -383,6 +485,10 @@ impl Worker {
                     &mut outcomes,
                     &mut streams,
                 )?;
+                if let Stage::Patch = stage {
+                    let files = groups[group].files.iter().copied();
+                    self.complete_settled(batch, files, &mut outcomes)?;
+                }
                 match next {
                     Some((Stage::Read, request)) => waiting.push_back((group, request)),
                     Some((stage, request)) => {
@@ -415,16 +521,38 @@ impl Worker {
         };
         let source_end = drain(&mut self.src, source, &mut groups, &mut outcomes);
         let destination_end = drain(&mut self.dst, destination, &mut groups, &mut outcomes);
-        let result = result.and(source_end).and(destination_end);
+        // The files the drained replies kept or published are complete too.
+        let settled = self.complete_settled(batch, 0..batch.len(), &mut outcomes);
+        let result = result.and(source_end).and(destination_end).and(settled);
         // A patch that is not streamed to its end is compared again.
         for stream in &streams {
             outcomes[stream.file] = None;
         }
         let result = match result {
-            Ok(()) if !streams.is_empty() => self.stream_patches(&jobs, streams, &mut outcomes),
+            Ok(()) if !streams.is_empty() && !self.sched.is_aborted() => {
+                self.stream_patches(batch, &jobs, streams, &mut outcomes)
+            }
             result => result,
         };
         (outcomes, result)
+    }
+
+    /// Complete each of `files` that a reply has kept or published, as soon
+    /// as the reply arrives, so that progress counts it while the rest of
+    /// its batch is still compared.
+    fn complete_settled(
+        &mut self,
+        batch: &[usize],
+        files: impl IntoIterator<Item = usize>,
+        outcomes: &mut [Option<Compared>],
+    ) -> Result<()> {
+        for i in files {
+            if let Some(Compared::Kept(_) | Compared::Published { .. }) = outcomes[i] {
+                let outcome = outcomes[i].replace(Compared::Completed);
+                self.complete_compared(batch[i], outcome.expect("a settled outcome"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Bytes of new data each piece of a streamed patch carries: whole
@@ -440,15 +568,16 @@ impl Worker {
     }
 
     /// Stream each of `streams`' patches, one after another, and record
-    /// their outcomes. The next patch begins as soon as the last has ended,
-    /// and its pieces are read ahead while the last's are still sent.
+    /// their outcomes, completing each file published. The next patch begins
+    /// as soon as the last has ended, and its pieces are read ahead while the
+    /// last's are still sent.
     fn stream_patches(
         &mut self,
+        batch: &[usize],
         jobs: &[WorkerJob],
         mut streams: Vec<Streamed>,
         outcomes: &mut [Option<Compared>],
     ) -> Result<()> {
-        use std::collections::VecDeque;
         let piece = self.patch_piece(self.patch_block());
         let mut states: Vec<StreamState> = streams
             .iter()
@@ -460,6 +589,31 @@ impl Worker {
                 ..Default::default()
             })
             .collect();
+        let result = self.stream_each(batch, jobs, &mut streams, &mut states, outcomes);
+        // A patch that did not reach its end, as when its connection failed,
+        // is compared again: its pieces no longer count.
+        for state in &mut states {
+            self.uncount_pieces(state);
+        }
+        result
+    }
+
+    /// Take back the progress a streamed patch's acknowledged pieces counted.
+    fn uncount_pieces(&self, state: &mut StreamState) {
+        let counted = std::mem::take(&mut state.counted);
+        self.progress.bytes_done.fetch_sub(counted, Relaxed);
+    }
+
+    /// Stream the patches whose states `stream_patches` prepared.
+    fn stream_each(
+        &mut self,
+        batch: &[usize],
+        jobs: &[WorkerJob],
+        streams: &mut [Streamed],
+        states: &mut [StreamState],
+        outcomes: &mut [Option<Compared>],
+    ) -> Result<()> {
+        use std::collections::VecDeque;
         // An in-process source answers each read as it is sent, and its
         // piece moves on before the next is read. A remote one's reads queue
         // within its reply queue and the read-ahead buffer.
@@ -482,7 +636,7 @@ impl Worker {
             "SYQ_TEST_PATCH_STREAM_CONTINUE_FILE",
             "streamed patches before their pieces are read",
         )?;
-        self.begin_stream(&mut streams, &mut states, 0, &mut destination)?;
+        self.begin_stream(streams, states, 0, &mut destination)?;
         loop {
             while source.len() < reads && reading < streams.len() {
                 // The next patch's pieces are read ahead, before it begins.
@@ -544,7 +698,7 @@ impl Worker {
             if !from_source {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let response = self.dst.recv()?;
-                self.streamed_reply(&streams, &mut states, step, response, outcomes);
+                self.streamed_reply(batch, streams, states, step, response, outcomes)?;
                 continue;
             }
             let (step, _) = source.pop_front().expect("pending reply");
@@ -553,11 +707,11 @@ impl Worker {
             // that have arrived, so that a patch the receiver has failed
             // sends no more pieces, and owe no more acknowledgments than the
             // destination's connection queues.
-            self.arrived_replies(&streams, &mut states, &mut destination, outcomes)?;
+            self.arrived_replies(batch, streams, states, &mut destination, outcomes)?;
             while destination.len() >= acknowledgments {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let reply = self.dst.recv()?;
-                self.streamed_reply(&streams, &mut states, step, reply, outcomes);
+                self.streamed_reply(batch, streams, states, step, reply, outcomes)?;
             }
             match step {
                 StreamStep::Piece(index, off, len) => {
@@ -579,8 +733,10 @@ impl Worker {
                                 data: data.into(),
                                 hash,
                             })?;
-                            destination
-                                .push_back((StreamStep::Ack(index), std::time::Instant::now()));
+                            destination.push_back((
+                                StreamStep::Ack(index, len),
+                                std::time::Instant::now(),
+                            ));
                         }
                         Some(_) => {}
                         // The source may have changed: its recheck tells.
@@ -628,38 +784,45 @@ impl Worker {
                         while destination.len() >= acknowledgments {
                             let (step, _) = destination.pop_front().expect("pending reply");
                             let reply = self.dst.recv()?;
-                            self.streamed_reply(&streams, &mut states, step, reply, outcomes);
+                            self.streamed_reply(batch, streams, states, step, reply, outcomes)?;
                         }
-                        self.begin_stream(&mut streams, &mut states, index + 1, &mut destination)?;
+                        self.begin_stream(streams, states, index + 1, &mut destination)?;
                     }
                 }
-                StreamStep::Begin(_) | StreamStep::Ack(_) | StreamStep::End(_) => {
+                StreamStep::Begin(_) | StreamStep::Ack(..) | StreamStep::End(_) => {
                     unreachable!("destination steps")
                 }
             }
         }
     }
 
+    /// The destination's next reply, if it has already arrived.
+    fn arrived_reply(&mut self) -> Result<Option<Response>> {
+        if self.dst.reply_ready() {
+            return self.dst.recv().map(Some);
+        }
+        self.dst
+            .try_recv_with_arrival()
+            .transpose()
+            .map(|reply| reply.map(|(response, _)| response))
+    }
+
     /// Act on the destination's replies that have already arrived, without
     /// waiting for more.
     fn arrived_replies(
         &mut self,
+        batch: &[usize],
         streams: &[Streamed],
         states: &mut [StreamState],
         destination: &mut std::collections::VecDeque<(StreamStep, std::time::Instant)>,
         outcomes: &mut [Option<Compared>],
     ) -> Result<()> {
         while !destination.is_empty() {
-            let response = if self.dst.reply_ready() {
-                self.dst.recv()?
-            } else {
-                match self.dst.try_recv_with_arrival() {
-                    Some(reply) => reply?.0,
-                    None => return Ok(()),
-                }
+            let Some(response) = self.arrived_reply()? else {
+                return Ok(());
             };
             let (step, _) = destination.pop_front().expect("pending reply");
-            self.streamed_reply(streams, states, step, response, outcomes);
+            self.streamed_reply(batch, streams, states, step, response, outcomes)?;
         }
         Ok(())
     }
@@ -689,26 +852,34 @@ impl Worker {
     }
 
     /// Act on the destination's reply to a streamed patch's begin, piece or
-    /// end.
+    /// end. A piece the receiver acknowledges counts as progress at once; a
+    /// published patch completes its file, and one that is not takes back
+    /// what its pieces counted.
     fn streamed_reply(
         &mut self,
+        batch: &[usize],
         streams: &[Streamed],
         states: &mut [StreamState],
         step: StreamStep,
         response: Response,
         outcomes: &mut [Option<Compared>],
-    ) {
+    ) -> Result<()> {
         match step {
             // A begin or piece replies Ok until the patch fails; its end
             // reports why. A refused begin opened nothing.
-            StreamStep::Begin(index) | StreamStep::Ack(index) => {
-                if !matches!(response, Response::Ok) {
-                    states[index].failed = true;
-                }
-                if let (StreamStep::Begin(_), Response::Err(_) | Response::EndpointError(_)) =
-                    (&step, &response)
-                {
-                    states[index].refused = true;
+            StreamStep::Begin(index) | StreamStep::Ack(index, _) => {
+                let state = &mut states[index];
+                match (&step, &response) {
+                    (StreamStep::Ack(_, len), Response::Ok) => {
+                        state.counted += u64::from(*len);
+                        self.progress.add_bytes(u64::from(*len));
+                    }
+                    (_, Response::Ok) => {}
+                    (StreamStep::Begin(_), Response::Err(_) | Response::EndpointError(_)) => {
+                        state.failed = true;
+                        state.refused = true;
+                    }
+                    _ => state.failed = true,
                 }
             }
             StreamStep::End(index) => {
@@ -719,7 +890,7 @@ impl Worker {
                     Ok(Response::PatchedBatch(mut patched)) if patched.len() == 1 => patched.pop(),
                     _ => None,
                 };
-                outcomes[file] = Some(match (states[index].changed.take(), reply) {
+                let outcome = match (states[index].changed.take(), reply) {
                     (Some(now), _) => Compared::SourceChanged(now),
                     (
                         None,
@@ -741,10 +912,20 @@ impl Worker {
                         })),
                     ) => Compared::StaleCondition,
                     _ => Compared::Differs,
-                });
+                };
+                if let Compared::Published { .. } = outcome {
+                    // Every piece was acknowledged, and its bytes counted.
+                    let counted = std::mem::take(&mut states[index].counted);
+                    debug_assert_eq!(counted, sent);
+                    outcomes[file] = Some(Compared::Completed);
+                    return self.complete_compared(batch[file], outcome);
+                }
+                self.uncount_pieces(&mut states[index]);
+                outcomes[file] = Some(outcome);
             }
             StreamStep::Piece(..) | StreamStep::Recheck(_) => unreachable!("source steps"),
         }
+        Ok(())
     }
 
     /// Act on one group's reply: record the outcomes it decides, and return
@@ -979,11 +1160,18 @@ impl Worker {
             } => {
                 self.benchmark.patched_files += 1;
                 self.benchmark.streamed_patches += u64::from(streamed);
+                // A streamed patch's bytes counted as its pieces were
+                // acknowledged; a file that fails counts none.
                 if let Err(error) = self.record_hardlink_identity(idx, &job, identity) {
+                    if streamed {
+                        self.progress.bytes_done.fetch_sub(sent, Relaxed);
+                    }
                     return self.file_error(idx, error);
                 }
                 job.done.store(job.entry.size, Relaxed);
-                self.progress.add_bytes(sent);
+                if !streamed {
+                    self.progress.add_bytes(sent);
+                }
                 self.progress.bytes_unchanged.fetch_add(reused, Relaxed);
                 self.progress.bytes_total.fetch_sub(reused, Relaxed);
                 self.complete_file(job, false)
@@ -996,6 +1184,7 @@ impl Worker {
             | Compared::ResumePartial
             | Compared::Differs
             | Compared::StaleCondition => unreachable!("these files are requeued"),
+            Compared::Completed => unreachable!("this file is complete"),
         }
     }
 
