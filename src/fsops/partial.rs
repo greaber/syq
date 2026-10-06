@@ -852,6 +852,7 @@ impl FsOps {
         // Retry bytes already belong to this invocation. Hash them in place;
         // copying them onto themselves adds writes without improving safety.
         let mut input = None;
+        let access = SeedAccess::new(&output);
         if basis_size.unwrap_or(0) == 0 && len > 0 {
             for candidate in self.candidate_partials(&target) {
                 let Ok(relative) = RelativePath::new(&candidate) else {
@@ -873,7 +874,7 @@ impl FsOps {
                     if file
                         .metadata()
                         .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
-                        && seeding_keeps_donor_private(&output, &file)
+                        && access.admits(&file)
                     {
                         input = Some(file);
                         break;
@@ -902,9 +903,7 @@ impl FsOps {
         let seeds_other_bytes = !final_donor || (!stage_only && selected_final.is_none());
         if final_donor
             && seeds_other_bytes
-            && !input
-                .as_ref()
-                .is_some_and(|donor| seeding_keeps_donor_private(&output, donor))
+            && !input.as_ref().is_some_and(|donor| access.admits(donor))
         {
             input = None;
             final_donor = false;
@@ -926,11 +925,8 @@ impl FsOps {
                 Sidecar::Partial,
             );
             // The new sidecar takes the directory's entries as they are now.
-            if seeds_other_bytes
-                && !input
-                    .as_ref()
-                    .is_some_and(|donor| seeding_keeps_donor_private(&output, donor))
-            {
+            let access = SeedAccess::new(&output);
+            if seeds_other_bytes && !input.as_ref().is_some_and(|donor| access.admits(donor)) {
                 input = None;
                 selected_final = None;
                 final_donor = false;
@@ -3866,25 +3862,47 @@ pub(super) fn create_fresh_rooted_partial(
     )
 }
 
-/// Whether `donor`'s bytes may be seeded into the sidecar `output`, which
-/// is created owner-only so that they stay as private as the donor kept
-/// them. On macOS a new file also takes its directory's inheritable ACL
-/// entries whatever its mode, and those can let someone read the sidecar
-/// whom the donor never let read it: a partial an earlier copy left with
-/// `-A`, or from before the directory gained that policy. There the donor
-/// is used only when the sidecar has no entries or exactly the donor's;
-/// otherwise the copy does without it, as with any unsuitable donor.
-/// Elsewhere the owner-only mode suffices: it masks the named entries of a
-/// POSIX default ACL.
-pub(super) fn seeding_keeps_donor_private(output: &File, donor: &File) -> bool {
+/// Which donors' bytes may be seeded into the sidecar `output`, which is
+/// created owner-only so that they stay as private as each donor kept them.
+/// On macOS a new file also takes its directory's inheritable ACL entries
+/// whatever its mode, and those can let someone read the sidecar whom a
+/// donor never let read it: a partial an earlier copy left with `-A`, or
+/// from before the directory gained that policy. There a donor is used only
+/// when the sidecar has no entries or exactly the donor's; otherwise the
+/// copy does without it, as with any unsuitable donor. The sidecar's ACL is
+/// read once, however many donors are weighed; each donor's is read only
+/// when the sidecar has entries. Elsewhere the owner-only mode suffices: it
+/// masks the named entries of a POSIX default ACL.
+pub(super) struct SeedAccess<'a> {
+    output: &'a File,
     #[cfg(target_os = "macos")]
-    {
-        crate::inode_metadata::staging_acl_within(output, donor).unwrap_or(false)
+    acl: std::cell::OnceCell<Option<crate::inode_metadata::MacAcl>>,
+}
+
+impl<'a> SeedAccess<'a> {
+    pub(super) fn new(output: &'a File) -> Self {
+        Self {
+            output,
+            #[cfg(target_os = "macos")]
+            acl: std::cell::OnceCell::new(),
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (output, donor);
-        true
+
+    pub(super) fn admits(&self, donor: &File) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::inode_metadata::read_macos_acl;
+            match self.acl.get_or_init(|| read_macos_acl(self.output).ok()) {
+                Some(stage) if stage.entries.is_empty() => true,
+                Some(stage) => read_macos_acl(donor).is_ok_and(|donor| donor == *stage),
+                None => false,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (self.output, donor);
+            true
+        }
     }
 }
 
