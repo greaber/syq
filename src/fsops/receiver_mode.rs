@@ -22,9 +22,18 @@ pub(super) struct ReceiverDirectories {
     widened: Mutex<HashMap<(u64, u64), u32>>,
 }
 
+/// Directories created private that a connection remembers. A planner asks
+/// for a mode only for the destination root, which it creates before
+/// anything in it, so the first few cover it; one not remembered keeps its
+/// mode, and a tree of private directories costs no memory per directory.
+const REMEMBERED_PRIVATE_DIRECTORIES: usize = 1024;
+
 impl ReceiverDirectories {
     pub(super) fn created_private(&self, identity: (u64, u64), mode: u32) {
-        self.created_private.lock().unwrap().insert(identity, mode);
+        let mut created = self.created_private.lock().unwrap();
+        if created.len() < REMEMBERED_PRIVATE_DIRECTORIES {
+            created.insert(identity, mode);
+        }
     }
 
     pub(super) fn widened(&self, identity: (u64, u64), mode: u32) {

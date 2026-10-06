@@ -2986,8 +2986,7 @@ impl FsOps {
                         destination_prefix,
                     )
                     .map(|created| {
-                        if let Some((dev, ino, created)) = created {
-                            directories.created_private((dev, ino), created);
+                        if let Some((dev, ino, _)) = created {
                             private
                                 .lock()
                                 .unwrap()
@@ -2996,7 +2995,8 @@ impl FsOps {
                     })
                 }
                 // A directory created private is opened by a later
-                // receiver-chosen mode, as the one above is in this request.
+                // receiver-chosen mode, as the planner opens the destination
+                // root; one created for a group change is opened above.
                 Op::Mkdir { mode, .. } if mode & 0o7777 == 0o700 => {
                     apply::create_private_directory(
                         op,
