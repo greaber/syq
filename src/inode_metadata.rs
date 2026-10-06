@@ -586,6 +586,12 @@ pub(crate) fn staging_acl_is_empty(file: &File) -> Result<bool> {
     Ok(macos_acl::read(file)?.entries.is_empty())
 }
 
+/// The ACL `file` has now.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_macos_acl(file: &File) -> Result<MacAcl> {
+    macos_acl::read(file)
+}
+
 pub(crate) fn finish_publication(
     file: &File,
     metadata: Option<&InodeMetadata>,
