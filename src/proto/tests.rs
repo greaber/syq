@@ -767,9 +767,12 @@ fn frames_mix_lz4_zstd_and_raw_without_losing_boundaries() {
             .observe_write(4 << 20, std::time::Duration::from_secs(1));
         writer.write_msg(&block_message(inputs[1].clone())).unwrap();
         writer.write_msg(&block_message(inputs[2].clone())).unwrap();
+        // The writer adds the real time of its large writes to this sample.
+        // A stall of about 20 ms would bring 4 MiB below the LZ4 threshold;
+        // 1 GiB keeps the sample fast unless a write stalls for seconds.
         writer
             .compression
-            .observe_write(4 << 20, std::time::Duration::from_millis(1));
+            .observe_write(1 << 30, std::time::Duration::from_millis(1));
         writer.write_msg(&block_message(inputs[3].clone())).unwrap();
     }
     let mut reader = FrameReader::new(bytes.as_slice());
