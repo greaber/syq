@@ -1009,6 +1009,93 @@ syq cp --if-exists=update-if-older --no-progress --performance-tuning workers=2 
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
+# Eight names of one destination file. The odd names' sources changed in
+# their second block; the even names' did not. Keeping an even name sets the
+# times they share, and replacing an odd name takes a link from the file.
+ssh source python3 - <<'PY_LINKED_SOURCE'
+import os
+root = '/tmp/syq-real-ssh/linked-source'
+os.makedirs(root)
+block = 64 * 1024
+old = bytes(i % 251 for i in range(2 * block))
+new = old[:block] + bytes([7]) * block
+for i in range(8):
+    path = f'{root}/name{i}'
+    with open(path, 'wb') as f:
+        f.write(new if i % 2 else old)
+    mtime = 1_600_000_000 + (i if i % 2 else 0)
+    os.utime(path, (mtime, mtime))
+PY_LINKED_SOURCE
+ssh destination python3 - <<'PY_LINKED_DESTINATION'
+import os
+root = '/tmp/syq-real-ssh/linked-destination'
+os.makedirs(root)
+block = 64 * 1024
+first = f'{root}/name0'
+with open(first, 'wb') as f:
+    f.write(bytes(i % 251 for i in range(2 * block)))
+os.utime(first, (1_500_000_000, 1_500_000_000))
+for i in range(1, 8):
+    os.link(first, f'{root}/name{i}')
+with open('/tmp/syq-real-ssh/linked-inode', 'w') as f:
+    f.write(str(os.stat(first).st_ino))
+PY_LINKED_DESTINATION
+# One worker, whose requests the receiver carries out in turn: each name is
+# compared once, and each changed name is sent only its second block.
+linked_results=/tmp/syq-real-ssh-linked.ndjson
+linked_debug=/tmp/syq-real-ssh-linked.debug
+if ! SYQ_DEBUG=1 syq cp --copy-metadata=mtime --no-progress \
+    --performance-tuning workers=1 --results "$linked_results" \
+    --from source --srcs-in /tmp/syq-real-ssh/linked-source \
+    --to destination --into /tmp/syq-real-ssh/linked-destination \
+    2>"$linked_debug"; then
+    cat "$linked_debug" >&2
+    exit 1
+fi
+python3 - "$linked_results" "$linked_debug" <<'PY_LINKED_RESULTS'
+import json, sys
+from pathlib import Path
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+assert records[-1]['errors'] == 0, records[-1]
+assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
+marker = 'syq: tuning observed: '
+observed = [
+    json.loads(line.split(marker, 1)[1])
+    for line in Path(sys.argv[2]).read_text().splitlines()
+    if marker in line
+]
+assert any(
+    (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
+    for counts in observed
+), observed
+PY_LINKED_RESULTS
+ssh destination python3 - <<'PY_LINKED_CHECK'
+import os
+root = '/tmp/syq-real-ssh/linked-destination'
+inode = int(open('/tmp/syq-real-ssh/linked-inode').read())
+block = 64 * 1024
+old = bytes(i % 251 for i in range(2 * block))
+new = old[:block] + bytes([7]) * block
+replaced = set()
+for i in range(8):
+    path = f'{root}/name{i}'
+    status = os.stat(path)
+    with open(path, 'rb') as f:
+        contents = f.read()
+    if i % 2:
+        # A replaced name names a new file of its own.
+        assert contents == new and status.st_ino != inode, (i, status)
+        assert status.st_ino not in replaced, (i, status)
+        replaced.add(status.st_ino)
+        assert int(status.st_mtime) == 1_600_000_000 + i, (i, status)
+    else:
+        # A kept name still names the file the other kept names share.
+        assert contents == old and status.st_ino == inode, (i, status)
+        assert int(status.st_mtime) == 1_600_000_000, (i, status)
+PY_LINKED_CHECK
+
 printf 'case: expression selection on source, destination, and local coordinators\n'
 ssh source 'mkdir -p /tmp/syq-real-ssh/expressions/sub; printf selected > /tmp/syq-real-ssh/expressions/sub/keep; printf x > /tmp/syq-real-ssh/expressions/sub/tiny'
 for coordinator in src dst local; do

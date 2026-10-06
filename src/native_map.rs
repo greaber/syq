@@ -500,19 +500,19 @@ fn push_directory_children(
     let directory = root.open_directory_verified(&directory_relative, expected)?;
     let mut names = root.read_open_directory(&directory)?;
     names.sort();
-    let mut children = Vec::with_capacity(names.len());
+    let start = pending.len();
+    pending.reserve(names.len());
     for name in names {
         let metadata = root.metadata_in_directory(&directory, &name)?;
         let output_relative = join_rel(output_relative, &name);
         let entry = rooted_entry_in_directory(root, &directory, &name, output_relative, metadata)?;
-        children.push(PendingMapEntry {
+        pending.push(PendingMapEntry {
             root_relative: join_rel(root_relative, &name),
             entry,
             metadata,
         });
     }
-    children.reverse();
-    pending.extend(children);
+    pending[start..].reverse();
     Ok(())
 }
 
@@ -575,7 +575,8 @@ fn join_rel(prefix: &[u8], name: &[u8]) -> Vec<u8> {
     if prefix.is_empty() {
         return name.to_vec();
     }
-    let mut joined = prefix.to_vec();
+    let mut joined = Vec::with_capacity(prefix.len() + 1 + name.len());
+    joined.extend_from_slice(prefix);
     joined.push(b'/');
     joined.extend_from_slice(name);
     joined
