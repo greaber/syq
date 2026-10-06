@@ -151,12 +151,12 @@ impl Hangup {
             let events = &events[..count as usize];
             if events
                 .iter()
-                .any(|event| event.ident == stopped.as_raw_fd() as _)
+                .any(|event| event.ident == stopped.as_raw_fd() as libc::uintptr_t)
             {
                 return Ok(false);
             }
             if events.iter().any(|event| {
-                event.ident == input.as_raw_fd() as _
+                event.ident == input.as_raw_fd() as libc::uintptr_t
                     && event.flags & (libc::EV_EOF | libc::EV_ERROR) != 0
             }) {
                 return Ok(true);
