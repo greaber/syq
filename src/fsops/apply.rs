@@ -473,9 +473,13 @@ fn apply_one_rooted_with_deletions(
                 );
             }
             require_open_target_known(&opened, &target.label, *condition)?;
-            own_metadata_change(&file, *condition, set_mtime(meta, *flags), || {
-                set_meta_handle_known_portable(&file, meta, *flags, &opened)
-            })?;
+            own_metadata_change(
+                &file,
+                Some(&opened),
+                *condition,
+                set_mtime(meta, *flags),
+                || set_meta_handle_known_portable(&file, meta, *flags, &opened),
+            )?;
             require_rooted_named_identity_known(
                 &target.root,
                 &target.relative,
@@ -598,24 +602,30 @@ pub(super) fn set_meta_rooted(
             );
         }
         require_open_target_known(&opened, &target.label, condition)?;
-        own_metadata_change(&handle, condition, set_mtime(meta, flags), || {
-            // Timestamp mutation is performed separately with no-follow
-            // descriptor-relative semantics. All other metadata is applied
-            // to the stable opened inode, so a raced leaf symlink cannot
-            // redirect it.
-            if time_differs {
-                let times = [
-                    timespec(0, libc::UTIME_OMIT as u32),
-                    timespec(meta.mtime, meta.mtime_nsec),
-                ];
-                parent.set_times(&times).with_context(|| {
-                    format!("set times on confined path {}", target.label.display())
-                })?;
-            }
-            // Birth time follows mtime: macOS may lower birth time when
-            // setting an older modification time.
-            set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)
-        })?;
+        own_metadata_change(
+            &handle,
+            Some(&opened),
+            condition,
+            set_mtime(meta, flags),
+            || {
+                // Timestamp mutation is performed separately with no-follow
+                // descriptor-relative semantics. All other metadata is applied
+                // to the stable opened inode, so a raced leaf symlink cannot
+                // redirect it.
+                if time_differs {
+                    let times = [
+                        timespec(0, libc::UTIME_OMIT as u32),
+                        timespec(meta.mtime, meta.mtime_nsec),
+                    ];
+                    parent.set_times(&times).with_context(|| {
+                        format!("set times on confined path {}", target.label.display())
+                    })?;
+                }
+                // Birth time follows mtime: macOS may lower birth time when
+                // setting an older modification time.
+                set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)
+            },
+        )?;
         // The final lookup resolves from Root again. Release the reused
         // parent first so that check does not raise peak descriptor usage.
         drop(parent);
@@ -664,12 +674,14 @@ pub(super) fn create_rooted_directory_or_existing(target: &RootedTarget, mode: u
     }
 }
 
-/// Change the metadata of the existing `file` with `change`, which sets its
-/// modification time to `mtime` if any. When `condition` pins the file to its
-/// change time, other names of it may be pinned too: the change is then
-/// recorded as this process's own (see `crate::rooted::own_changes`).
+/// Change the metadata of the existing `file`, last seen as `seen` if it was
+/// looked at, with `change`, which sets its modification time to `mtime` if
+/// any. When `condition` pins the file to its change time and it has other
+/// names, those may be pinned too: the change is then recorded as this
+/// process's own (see `crate::rooted::own_changes`).
 pub(super) fn own_metadata_change<T>(
     file: &File,
+    seen: Option<&fs::Metadata>,
     condition: TargetCondition,
     mtime: Option<i64>,
     change: impl FnOnce() -> Result<T>,
@@ -679,9 +691,15 @@ pub(super) fn own_metadata_change<T>(
             .ok()
             .and_then(|metadata| crate::rooted::root_metadata_from_std(&metadata).ok())
     };
-    let own = match (condition, observe()) {
+    let own = match (condition, seen) {
+        (TargetCondition::MatchesFingerprint { .. }, Some(seen)) if seen.nlink() <= 1 => None,
         (TargetCondition::MatchesFingerprint { .. }, Some(seen)) => {
-            crate::rooted::own_changes::begin(&seen)
+            crate::rooted::root_metadata_from_std(seen)
+                .ok()
+                .and_then(|seen| crate::rooted::own_changes::begin(&seen))
+        }
+        (TargetCondition::MatchesFingerprint { .. }, None) => {
+            observe().and_then(|seen| crate::rooted::own_changes::begin(&seen))
         }
         _ => None,
     };
