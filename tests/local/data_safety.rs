@@ -1205,16 +1205,19 @@ fn dry_run_compares_requested_modes_with_original_directory_permissions() {
             timestamp(&t.path(path), 1_700_000_000, 0);
             fs::set_permissions(t.path(path), fs::Permissions::from_mode(mode)).unwrap();
         }
-        let out = native_syq(&[
-            "cp",
-            &t.s("src"),
-            "--as",
-            &t.s("dst"),
-            "--dry-run",
-            "-v",
-            "--temporarily-widen-dir-permissions",
-            "--copy-metadata=permissions",
-        ]);
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("src"),
+                "--as",
+                &t.s("dst"),
+                "--dry-run",
+                "-v",
+                "--temporarily-widen-dir-permissions",
+                "--copy-metadata=permissions",
+            ])
+            .run()
+            .unwrap();
         assert_output_ok(&out);
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).contains("requested directory metadata differs"),
