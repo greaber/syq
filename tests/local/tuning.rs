@@ -2835,10 +2835,9 @@ fn network_destinations_choose_their_own_starting_counts() {
         let (workers, flagged) = copy("small", "small-auto", &[]);
         assert_eq!(flagged, network);
         assert_eq!(workers, if network { 16 } else { 1 });
-        // Larger files start with at most 16 workers on a network filesystem.
+        // Trees with files too large to batch start as on a fast destination.
         let (workers, _) = copy("large", "large-auto", &[]);
-        let local = expected_local_start() as i64;
-        assert_eq!(workers, if network { local.min(16) } else { local });
+        assert_eq!(workers, expected_local_start() as i64);
         // Resource ceilings still bound the start.
         let (workers, _) = copy(
             "small",
@@ -2891,7 +2890,10 @@ fn network_destinations_keep_remembered_starting_counts() {
         assert_same_tree(&t.path(source), &t.path(destination));
         started_workers(&t.path("history.sqlite"))
     };
-    assert_eq!(copy("large", "first"), (16, true));
+    assert_eq!(
+        copy("large", "first"),
+        (expected_local_start() as i64, true)
+    );
     let db = rusqlite::Connection::open(t.path("history.sqlite")).unwrap();
     // Measurements in which `best` workers beat six.
     let remember = |best: i64| {
@@ -2915,7 +2917,7 @@ fn network_destinations_keep_remembered_starting_counts() {
     // A remembered count can lower a small tree's start...
     remember(2);
     assert_eq!(copy("small", "small-remembered"), (2, true));
-    // ...and is not capped for larger files.
+    // ...and sets the start for larger files.
     remember(24);
     assert_eq!(
         copy("large", "large-remembered").0,
@@ -2961,5 +2963,45 @@ fn remote_network_destinations_start_within_the_ssh_limit() {
         let (workers, flagged) = started_workers(&t.path("history.sqlite"));
         assert_eq!(flagged, network);
         assert_eq!(workers, if network { 8 } else { 1 });
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn network_destinations_start_larger_small_file_trees_while_planning() {
+    for network in [false, true] {
+        let t = Tmp::new();
+        // Enough files that workers start while planning continues.
+        for file in 0..600 {
+            write(
+                &t.path(&format!("source/d{}/f{file}", file % 8)),
+                &prng(4096, file),
+            );
+        }
+        let mut command = history_command(&t);
+        if network {
+            command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+        }
+        let output = command
+            .args([
+                "cp",
+                "--srcs-in",
+                &t.s("source"),
+                "--into",
+                &t.s("destination"),
+                "--no-progress",
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        assert_same_tree(&t.path("source"), &t.path("destination"));
+        let (workers, flagged) = started_workers(&t.path("history.sqlite"));
+        assert_eq!(flagged, network);
+        if network {
+            assert_eq!(workers, expected_local_start() as i64);
+        } else {
+            // A worker per 128 files queued when planning started workers.
+            assert!((4..=5).contains(&workers), "{workers}");
+        }
     }
 }

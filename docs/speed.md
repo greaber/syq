@@ -119,8 +119,8 @@ its local path.
 On Linux, syq recognizes destinations on network filesystems (NFS, SMB, Ceph,
 and FUSE mounts such as SSHFS), where each file costs several round trips to
 the server. Copies of many small files there start with more workers, up to
-one for every eight files, and copies that include larger files start with at
-most 16 workers. During a longer copy, syq can still adjust the count.
+one for every eight files. During a longer copy, syq can still adjust the
+count.
 
 Reported bytes count the file's size even when cloning avoids physical I/O,
 so the displayed rate can exceed disk throughput.
