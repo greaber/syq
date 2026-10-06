@@ -860,6 +860,7 @@ impl FsOps {
                     if file
                         .metadata()
                         .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                        && seeding_keeps_donor_private(&output, &file)
                     {
                         input = Some(file);
                         break;
@@ -881,6 +882,20 @@ impl FsOps {
             selected_final = input.as_ref().and(final_ranges);
             final_donor = input.is_some();
         }
+        // A partial's bytes, and the final file's when no matching ranges
+        // were selected, are not just the new contents. A staged basis on
+        // macOS copies nothing from the final: it compares it instead, and
+        // clones it only where no ACL entries are inherited.
+        let seeds_other_bytes = !final_donor || (!stage_only && selected_final.is_none());
+        if final_donor
+            && seeds_other_bytes
+            && !input
+                .as_ref()
+                .is_some_and(|donor| seeding_keeps_donor_private(&output, donor))
+        {
+            input = None;
+            final_donor = false;
+        }
         // A donor's bytes go only into a sidecar created for them: an empty
         // one found at the name may have been opened while its mode was
         // wider, as when an earlier attempt created it in the final mode.
@@ -890,6 +905,16 @@ impl FsOps {
             let (output, _) = create_fresh_rooted_partial(&target.root, &relative, &label, || {
                 self.create_partial_rooted(&target.root, &relative, PRIVATE_PARTIAL_MODE)
             })?;
+            // The new sidecar takes the directory's entries as they are now.
+            if seeds_other_bytes
+                && !input
+                    .as_ref()
+                    .is_some_and(|donor| seeding_keeps_donor_private(&output, donor))
+            {
+                input = None;
+                selected_final = None;
+                final_donor = false;
+            }
             (output, None)
         } else {
             (output, basis_size)
@@ -3778,6 +3803,28 @@ pub(super) fn create_fresh_rooted_partial(
         "partial {} changed repeatedly while creating it",
         label.display()
     )
+}
+
+/// Whether `donor`'s bytes may be seeded into the sidecar `output`, which
+/// is created owner-only so that they stay as private as the donor kept
+/// them. On macOS a new file also takes its directory's inheritable ACL
+/// entries whatever its mode, and those can let someone read the sidecar
+/// whom the donor never let read it: a partial an earlier copy left with
+/// `-A`, or from before the directory gained that policy. There the donor
+/// is used only when the sidecar has no entries or exactly the donor's;
+/// otherwise the copy does without it, as with any unsuitable donor.
+/// Elsewhere the owner-only mode suffices: it masks the named entries of a
+/// POSIX default ACL.
+pub(super) fn seeding_keeps_donor_private(output: &File, donor: &File) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::inode_metadata::staging_acl_within(output, donor).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (output, donor);
+        true
+    }
 }
 
 #[cfg(debug_assertions)]

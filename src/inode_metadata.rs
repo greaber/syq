@@ -586,6 +586,15 @@ pub(crate) fn staging_acl_is_empty(file: &File) -> Result<bool> {
     Ok(macos_acl::read(file)?.entries.is_empty())
 }
 
+/// Whether a stage's ACL lets no one read it who cannot read `donor`: it
+/// has no entries, or exactly the donor's, as a file created in the same
+/// directory under the same inherited policy has.
+#[cfg(target_os = "macos")]
+pub(crate) fn staging_acl_within(stage: &File, donor: &File) -> Result<bool> {
+    let stage = macos_acl::read(stage)?;
+    Ok(stage.entries.is_empty() || stage == macos_acl::read(donor)?)
+}
+
 pub(crate) fn finish_publication(
     file: &File,
     metadata: Option<&InodeMetadata>,
