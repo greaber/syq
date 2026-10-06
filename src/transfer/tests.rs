@@ -5770,14 +5770,16 @@ fn starting_counts_respect_limits_history_and_explicit_settings() {
         ..start_rule(32, true)
     };
     assert_eq!(batch.batched(128, 128 * 4 * KIB), 4);
-    // An explicit worker count starts exactly that many, whatever the tree.
+    // An explicit worker count starts that many, except that small batched
+    // files are never split: at most one worker per file.
     for network_destination in [false, true] {
         for workers in [1, 8, 64] {
             let explicit = StartRule {
                 automatic: false,
                 ..start_rule(workers, network_destination)
             };
-            assert_eq!(explicit.batched(1, 4 * KIB), workers);
+            assert_eq!(explicit.batched(1, 4 * KIB), 1);
+            assert_eq!(explicit.batched(3, 3 * 4 * KIB), workers.min(3));
             assert_eq!(explicit.batched(128, 128 * 4 * KIB), workers);
             assert_eq!(explicit.streaming(600, 600 * 1024 * KIB, false), workers);
             assert_eq!(explicit.streaming(600, 600 * 4 * KIB, true), workers);

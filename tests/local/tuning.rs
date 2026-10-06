@@ -2763,27 +2763,6 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
     }
 }
 
-/// The workers the latest copy recorded in `history` started with, and
-/// whether its destination counted as a network filesystem.
-fn started_workers(history: &Path) -> (i64, bool) {
-    let db = rusqlite::Connection::open(history).unwrap();
-    let workers = db
-        .query_row(
-            "SELECT json_extract(data,'$.data.workers') FROM events WHERE json_extract(data,'$.kind')='workers_start' ORDER BY run DESC, sequence LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let network = db
-        .query_row(
-            "SELECT json_extract(data,'$.data.network_destination') FROM events WHERE json_extract(data,'$.kind')='starting_count' ORDER BY run DESC, sequence LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    (workers, network)
-}
-
 /// 128 small files in four directories, and four files too large to batch
 /// on Linux (64 KiB) or macOS (4 MiB).
 fn small_and_large_sources(t: &Tmp) {
@@ -2851,14 +2830,20 @@ fn network_destinations_choose_their_own_starting_counts() {
             &["--resource-limits", "workers=8"],
         );
         assert_eq!(workers, 8);
-        // An explicit count starts exactly that many workers, even for a few
-        // small files and above the automatic network limit.
+        // An explicit count starts that many workers, even for small files,
+        // but at most one per small file: batched files are never split.
         let (workers, _) = copy(
             "small",
             "small-fixed",
             &["--performance-tuning", "workers=8"],
         );
         assert_eq!(workers, 8);
+        let (workers, _) = copy(
+            "small",
+            "small-more-than-files",
+            &["--performance-tuning", "workers=200"],
+        );
+        assert_eq!(workers, 128);
         let (workers, _) = copy(
             "large",
             "large-fixed",

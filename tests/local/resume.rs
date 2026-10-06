@@ -426,6 +426,7 @@ fn small_inplace_files_use_batched_workers() {
         let output = command
             .args([&t.s("src/"), &t.s("dst/")])
             .env("SYQ_TEST_WORKER_EVENTS", &events)
+            .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
             .run()
             .unwrap();
         assert!(output.status.success(), "{}", stderr_of(&output));
@@ -433,27 +434,28 @@ fn small_inplace_files_use_batched_workers() {
         // messages from TCP probes can interleave with coordinator diagnostics.
         let events = fs::read_to_string(events).unwrap();
         let lines: Vec<&str> = events.lines().collect();
-        match workers {
-            // Three small files need one automatic worker and one batch.
-            None => assert_eq!(lines, ["connected 0 0", "batch 0 3"]),
-            // An explicit count starts every worker; the files stay batched.
-            Some(workers) => {
-                let connected = lines.iter().filter(|l| l.starts_with("connected ")).count();
-                assert_eq!(connected, workers, "{events}");
-                let batched: usize = lines
-                    .iter()
-                    .filter_map(|l| l.strip_prefix("batch "))
-                    .map(|l| {
-                        l.split_whitespace()
-                            .nth(1)
-                            .unwrap()
-                            .parse::<usize>()
-                            .unwrap()
-                    })
-                    .sum();
-                assert_eq!(batched, 3, "{events}");
-            }
+        // Three small files start one automatic worker, and at most one per
+        // file even when more are requested. A started worker that finds every
+        // file already done exits without connecting.
+        let (started, _) = started_workers(&t.path("history.sqlite"));
+        assert_eq!(started, if workers.is_some() { 3 } else { 1 });
+        if workers.is_none() {
+            assert_eq!(lines, ["connected 0 0", "batch 0 3"]);
         }
+        let connected = lines.iter().filter(|l| l.starts_with("connected ")).count();
+        assert!((1..=started as usize).contains(&connected), "{events}");
+        let batched: usize = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("batch "))
+            .map(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(batched, 3, "{events}");
         assert_eq!(read(&t.path("dst/f2")), b"contents-2");
         assert!(partial_files(&t.path("dst")).is_empty());
     }

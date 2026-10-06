@@ -53,7 +53,8 @@ const STARTUP_BATCH_FILES: usize = 128;
 /// Files per starting worker for batched files on a network filesystem. There
 /// every file costs several round trips that batching does not save, so a
 /// worker has about one file in flight: 128 new 4 KiB files in 16 directories
-/// on a 50 ms SSHFS mount took 60 s with one worker and 12 s with sixteen.
+/// on a 50 ms SSHFS mount took 34 s from an automatic start at one worker and
+/// 12 s from sixteen.
 const NETWORK_STARTUP_BATCH_FILES: usize = 8;
 // Let small scans finish before choosing their bounded worker count.
 const STREAMING_START_FILES: usize = 4 * STARTUP_BATCH_FILES;
@@ -98,8 +99,7 @@ fn initial_range_workers(
 struct StartRule {
     /// The explicit, remembered or default count, within resource limits.
     workers: usize,
-    /// The count is the tuner's starting point, not an explicit `workers=N`,
-    /// which starts exactly that many workers.
+    /// The count is the tuner's starting point, not an explicit `workers=N`.
     automatic: bool,
     /// The destination lies on a network filesystem.
     network_destination: bool,
@@ -121,12 +121,18 @@ impl StartRule {
     }
 
     /// Workers for `files` totalling `bytes`, every one sent in small-file
-    /// batches: a worker per startup batch of files or bytes.
+    /// batches: a worker per startup batch of files or bytes. A batched file
+    /// is never split, so even an explicit count starts at most one worker
+    /// per file; a worker with nothing to do still costs a connection.
     fn batched(&self, files: usize, bytes: u64) -> usize {
+        if !self.automatic {
+            return self.workers.min(files.max(1));
+        }
         self.streaming(files, bytes, true)
     }
 
-    /// Workers while planning a large tree, from the files queued so far.
+    /// Workers while planning a large tree, from the files queued so far. An
+    /// explicit count starts exactly that many workers.
     fn streaming(&self, files: usize, bytes: u64, all_small: bool) -> usize {
         if !self.automatic {
             return self.workers;
@@ -3721,7 +3727,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         let files = progress.files_total.load(Relaxed) as usize;
         let bytes = progress.bytes_total.load(Relaxed);
-        if files < STREAMING_START_FILES {
+        // An explicit count above the files queued so far waits for the
+        // complete count, which can limit a small-file tree to a worker per file.
+        if files < STREAMING_START_FILES || (!autotune && streaming_connections > files) {
             return;
         }
         let initial = if autotune {

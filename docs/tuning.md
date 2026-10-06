@@ -24,7 +24,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy \
 
 | Key | Default | Accepted values |
 |---|---|---|
-| `workers` | Automatic | 1 through 65536 filesystem workers; syq starts that many unless open-file or route-specific receiver limits allow fewer |
+| `workers` | Automatic | 1 through 65536 filesystem workers, all started, but at most one per file when every file is small enough to batch; the copy fails if an endpoint cannot provide the open files or threads they need, and route-specific receiver limits also apply |
 | `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB | 64 KiB through 64 MiB; filesystem copies only |
 | `request-size` | Automatic remote requests up to the hash block size (normally 4 MiB); at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4 | 1 through 64 outstanding range requests per endpoint per worker |
