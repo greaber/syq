@@ -436,6 +436,16 @@ pub(crate) fn on_network_file_system(file: &File, dev: u64) -> bool {
     if std::env::var_os("SYQ_TEST_NETWORK_FILESYSTEM").is_some() {
         return true;
     }
+    // Tests mount nothing: they name the one directory that counts as a
+    // network filesystem mounted where it is.
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if let Some(directory) = std::env::var_os("SYQ_TEST_NETWORK_DIRECTORY") {
+        if fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .is_ok_and(|path| path.as_os_str() == directory)
+        {
+            return true;
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         file_system_traits(file, file_system_key(file, dev)).network
@@ -445,6 +455,13 @@ pub(crate) fn on_network_file_system(file: &File, dev: u64) -> bool {
         let _ = (file, dev);
         false
     }
+}
+
+/// Whether a test names a directory to treat as a network filesystem mounted
+/// on the same device (`SYQ_TEST_NETWORK_DIRECTORY`).
+pub(crate) fn network_directory_named_for_test() -> bool {
+    cfg!(all(debug_assertions, target_os = "linux"))
+        && std::env::var_os("SYQ_TEST_NETWORK_DIRECTORY").is_some()
 }
 
 /// One file of a small copy, staged but not yet published.
@@ -646,9 +663,9 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
-    /// Whether each guarded destination root seen so far lies on a network
-    /// filesystem.
-    guarded_network: HashMap<RootIdentity, bool>,
+    /// Whether each destination root, and each directory directly beneath
+    /// one, lies on a network filesystem; the root itself has an empty name.
+    network_entries: HashMap<(RootIdentity, Vec<u8>), bool>,
     /// Names asked about so far in each directory of the destination, to
     /// decide when one is worth listing before its stats; `None` once it has
     /// been listed or turned out not to be on NFS.
@@ -858,7 +875,7 @@ impl FsOps {
             allow_unconfined_source_paths: false,
             destination_root: None,
             destination_prefix: None,
-            guarded_network: HashMap::new(),
+            network_entries: HashMap::new(),
             #[cfg(target_os = "linux")]
             listing_requests: HashMap::new(),
         }
@@ -2690,7 +2707,12 @@ impl FsOps {
             if follow {
                 return vec![None; paths.len()];
             }
-            return parallel_map(paths, |path| {
+            let minimum = self.destination_parallel_minimum(
+                Some(guard),
+                paths.len(),
+                paths.iter().map(Vec::as_slice),
+            );
+            return parallel_map_from(minimum, paths, |path| {
                 let target = guarded_target(path, guard).ok()?;
                 let metadata = target.root.metadata(&target.relative).ok()?;
                 rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
@@ -2702,7 +2724,13 @@ impl FsOps {
             }
             #[cfg(target_os = "linux")]
             list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
-            return parallel_map_init(
+            let minimum = self.destination_parallel_minimum(
+                None,
+                paths.len(),
+                paths.iter().map(Vec::as_slice),
+            );
+            return parallel_map_init_from(
+                minimum,
                 paths,
                 || None,
                 |parent, path| stat_with_parent(&root, parent, path),
@@ -2720,11 +2748,13 @@ impl FsOps {
     }
 
     fn prune_lookup(
-        &self,
+        &mut self,
         paths: &[PathBytes],
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
-        parallel_map(paths, |path| {
+        let minimum =
+            self.destination_parallel_minimum(guard, paths.len(), paths.iter().map(Vec::as_slice));
+        parallel_map_from(minimum, paths, |path| {
             // Resolve authority before classifying missing paths. An invalid
             // root/guard must never be mistaken for a missing child.
             let target = self.rooted_destination_target(path, guard)?;
@@ -2891,42 +2921,103 @@ impl FsOps {
         }
     }
 
-    /// Whether the destination that `guard`, or else the registered root,
-    /// names lies on a network filesystem.
-    fn destination_on_network_file_system(&mut self, guard: Option<&ContainerGuard>) -> bool {
-        let Some(guard) = guard else {
-            return self
-                .destination_root
-                .as_ref()
-                .is_some_and(|root| root.on_network_file_system());
+    /// Whether operations on `paths` reach a network filesystem: the one the
+    /// destination root that `guard`, or else the registered root, lies on,
+    /// or one mounted on a directory directly beneath it, such as the target
+    /// of an exact placement. Mounts deeper in the tree are not looked for.
+    fn destination_on_network_file_system(
+        &mut self,
+        guard: Option<&ContainerGuard>,
+        paths: &[&[u8]],
+    ) -> bool {
+        let (identity, guard_root) = match guard {
+            Some(guard) => (
+                RootIdentity {
+                    dev: guard.dev,
+                    ino: guard.ino,
+                },
+                Some(resolve(&guard.root)),
+            ),
+            None => match &self.destination_root {
+                Some(root) => (root.identity(), None),
+                None => return false,
+            },
         };
-        let identity = RootIdentity {
-            dev: guard.dev,
-            ino: guard.ino,
-        };
-        *self.guarded_network.entry(identity).or_insert_with(|| {
-            Root::open_verified(&resolve(&guard.root), identity)
-                .is_ok_and(|root| root.on_network_file_system())
-        })
+        let mut entries: Vec<Vec<u8>> = paths
+            .iter()
+            .filter_map(|path| match &guard_root {
+                Some(root) => relative_under(root, &resolve(path)).ok(),
+                None => RelativePath::new(path).ok(),
+            })
+            .map(|relative| relative.first().unwrap_or_default().to_vec())
+            .collect();
+        entries.sort_unstable();
+        entries.dedup();
+        if self.network_entries.len() > NETWORK_ENTRIES_MAX {
+            self.network_entries.clear();
+        }
+        let mut opened: Option<Option<Arc<Root>>> = None;
+        for entry in std::iter::once(Vec::new()).chain(entries) {
+            let key = (identity, entry);
+            let network = match self.network_entries.get(&key) {
+                Some(&network) => network,
+                None => {
+                    let root = match &guard_root {
+                        None => self.destination_root.clone(),
+                        Some(path) => opened
+                            .get_or_insert_with(|| {
+                                Root::open_verified(path, identity).ok().map(Arc::new)
+                            })
+                            .clone(),
+                    };
+                    let Some(root) = root else {
+                        return false;
+                    };
+                    let network = if key.1.is_empty() {
+                        root.on_network_file_system()
+                    } else {
+                        root.entry_on_network_file_system(&key.1)
+                    };
+                    self.network_entries.insert(key, network);
+                    network
+                }
+            };
+            if network {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The fewest of `count` destination lookups or changes, on `paths`, that
+    /// run in parallel (see `parallel_minimum`).
+    fn destination_parallel_minimum<'a>(
+        &mut self,
+        guard: Option<&ContainerGuard>,
+        count: usize,
+        paths: impl Iterator<Item = &'a [u8]>,
+    ) -> usize {
+        let short = (2..PAR_MIN).contains(&count);
+        parallel_minimum(
+            short && self.destination_on_network_file_system(guard, &paths.collect::<Vec<_>>()),
+        )
     }
 
     /// Ops within a batch run in parallel, except that a creation waits for
-    /// its parent's Mkdir in the same batch. Those that change directory
-    /// entries share their directory between at most two threads. A short
-    /// batch runs on this thread unless the destination is on a network
-    /// filesystem.
+    /// its parent's Mkdir in the same batch. Creations in a wave share each
+    /// directory between at most two threads. A short phase runs on this
+    /// thread unless its operations reach a network filesystem.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
-        let removals = ops
+        if ops
             .iter()
-            .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }));
-        let minimum = parallel_minimum(
-            !removals && ops.len() > 1 && self.destination_on_network_file_system(guard),
-        );
-        let destination_root = self.destination_root.clone();
-        let destination_prefix = self.destination_prefix.as_deref();
-        if removals {
-            let selected =
-                apply::selected_removals(ops, guard, destination_root, destination_prefix);
+            .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
+        {
+            let selected = apply::selected_removals(
+                ops,
+                guard,
+                self.destination_root.clone(),
+                self.destination_prefix.as_deref(),
+            );
             return self
                 .deletions
                 .get_or_insert_with(Default::default)
@@ -2958,6 +3049,19 @@ impl FsOps {
             .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
             .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
+        let waves = creation_waves(ops, &create_idx);
+        let short: Vec<&[u8]> = [&guarded_idx, &meta_idx]
+            .into_iter()
+            .chain(&waves)
+            .filter(|phase| (2..PAR_MIN).contains(&phase.len()))
+            .flatten()
+            .map(|&index| op_path(&ops[index]))
+            .collect();
+        let minimum = parallel_minimum(
+            !short.is_empty() && self.destination_on_network_file_system(guard, &short),
+        );
+        let destination_root = self.destination_root.clone();
+        let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         // A directory this request creates and then gives a group starts
         // private when its starting group may differ, so that group cannot
@@ -3020,7 +3124,7 @@ impl FsOps {
             }
             return out;
         }
-        for wave in creation_waves(ops, &create_idx) {
+        for wave in waves {
             let cres = parallel_by_directory(minimum, ops, &wave, create);
             for (i, r) in wave.iter().zip(cres) {
                 out[*i] = r;
@@ -3243,6 +3347,9 @@ fn stat_with_parent(
 
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
+/// Destination entries remembered as on or off a network filesystem before
+/// the record starts over.
+const NETWORK_ENTRIES_MAX: usize = 4096;
 
 fn metadata_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();

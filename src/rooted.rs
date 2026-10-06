@@ -168,6 +168,12 @@ impl RelativePath {
         self.components.is_empty()
     }
 
+    /// The first component: the entry directly beneath the root that holds
+    /// the path, or is the path itself.
+    pub(crate) fn first(&self) -> Option<&[u8]> {
+        self.components.first().map(Vec::as_slice)
+    }
+
     /// The path as one byte string, its components joined by `/`, which
     /// `new` accepts again.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
@@ -314,6 +320,35 @@ impl Root {
         *self.network.get_or_init(|| {
             crate::fsops::on_network_file_system(&self.directory, self.identity.dev)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_network_file_system_for_test(&self) {
+        let _ = self.network.set(true);
+    }
+
+    /// Whether the directory `name` directly beneath this root lies on a
+    /// network filesystem: this root's own, or another one mounted there, as
+    /// on the target of an exact placement. A missing entry would be created
+    /// on this root's filesystem.
+    pub(crate) fn entry_on_network_file_system(&self, name: &[u8]) -> bool {
+        if self.on_network_file_system() {
+            return true;
+        }
+        let Ok(relative) = RelativePath::new(name) else {
+            return false;
+        };
+        let Ok(metadata) = self.metadata(&relative) else {
+            return false;
+        };
+        if !metadata.is_dir()
+            || (metadata.dev == self.identity.dev
+                && !crate::fsops::network_directory_named_for_test())
+        {
+            return false;
+        }
+        self.open_directory(&relative)
+            .is_ok_and(|directory| crate::fsops::on_network_file_system(&directory, metadata.dev))
     }
 
     /// Wait to replace files beneath this root, where its filesystem needs

@@ -1375,6 +1375,42 @@ fn a_network_destination_gives_a_few_directories_their_metadata_at_once() {
     }
 }
 
+/// `--as` registers the target's parent, here on a local filesystem, while
+/// the target itself is a network mount: the receiver goes by the target.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn an_exact_placement_onto_a_network_mount_gives_a_few_directories_their_metadata_at_once() {
+    let t = Tmp::new();
+    for index in 0..4 {
+        write(&t.path(&format!("src/together{index}/file")), b"x");
+        set_mtime(&t.path(&format!("src/together{index}")), 1_000_000_000);
+    }
+    fs::create_dir(t.path("mount")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--copy-metadata=times",
+            &t.s("src"),
+            "--as",
+            &t.s("mount"),
+            "--no-progress",
+        ])
+        .env(
+            "SYQ_TEST_NETWORK_DIRECTORY",
+            fs::canonicalize(t.path("mount")).unwrap(),
+        )
+        .env("SYQ_TEST_CONCURRENT_SET_META_PREFIX", "together")
+        .env("SYQ_TEST_CONCURRENT_SET_META_COUNT", "4")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    for index in 0..4 {
+        let path = t.path(&format!("mount/together{index}"));
+        assert_eq!(fs::metadata(&path).unwrap().mtime(), 1_000_000_000);
+        assert_eq!(read(&path.join("file")), b"x");
+    }
+}
+
 #[test]
 fn later_sources_stamp_every_shared_directory() {
     // Enough shared directories that the receiver applies their final

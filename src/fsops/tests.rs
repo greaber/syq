@@ -5636,6 +5636,30 @@ fn short_batches_run_in_parallel_on_a_network_filesystem() {
 }
 
 #[test]
+fn short_destination_batches_run_in_parallel_only_on_a_network_filesystem() {
+    let dir = test_dir();
+    fs::create_dir_all(dir.join("a")).unwrap();
+    let paths: Vec<PathBytes> = (0..40).map(|i| format!("a/f{i}").into_bytes()).collect();
+    let mut ops = FsOps::test_destination(&dir);
+    let minimum = |ops: &mut FsOps, count: usize| {
+        ops.destination_parallel_minimum(None, count, paths[..count].iter().map(Vec::as_slice))
+    };
+    // A local destination keeps short lookups and changes on one thread.
+    assert_eq!(minimum(&mut ops, 3), PAR_MIN);
+    let mut network = FsOps::test_destination(&dir);
+    network
+        .destination_root
+        .as_ref()
+        .unwrap()
+        .assume_network_file_system_for_test();
+    assert_eq!(minimum(&mut network, 3), 2);
+    // A long batch runs in parallel anyway.
+    assert_eq!(minimum(&mut ops, 40), PAR_MIN);
+    assert_eq!(minimum(&mut network, 40), PAR_MIN);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn parallel_metadata_batches_share_a_bounded_pool() {
     let mut threads = std::collections::HashSet::new();
     let items: Vec<_> = (0..PAR_MIN).collect();

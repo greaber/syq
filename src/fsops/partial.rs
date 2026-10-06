@@ -3032,15 +3032,29 @@ impl FsOps {
                     others,
                 })
             })(),
-            Request::WidenDirectories { directories, guard } => Ok(Response::WidenedDirectories(
-                parallel_map(directories, |(path, condition)| {
-                    (|| {
-                        let target = self.destination_mutation_target(path, guard.as_ref())?;
-                        widen_directory(&target.root, &target.relative, *condition, &target.label)
-                    })()
-                    .map_err(|error| wire_error(&error))
-                }),
-            )),
+            Request::WidenDirectories { directories, guard } => {
+                let minimum = self.destination_parallel_minimum(
+                    guard.as_ref(),
+                    directories.len(),
+                    directories.iter().map(|(path, _)| path.as_slice()),
+                );
+                Ok(Response::WidenedDirectories(parallel_map_from(
+                    minimum,
+                    directories,
+                    |(path, condition)| {
+                        (|| {
+                            let target = self.destination_mutation_target(path, guard.as_ref())?;
+                            widen_directory(
+                                &target.root,
+                                &target.relative,
+                                *condition,
+                                &target.label,
+                            )
+                        })()
+                        .map_err(|error| wire_error(&error))
+                    },
+                )))
+            }
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
             Request::ProbePartial {
                 path,
