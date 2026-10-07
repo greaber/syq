@@ -22,6 +22,7 @@ pub(super) fn apply_one(
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
     umask: u32,
+    names: Option<&scope_names::ScopeNames>,
 ) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
@@ -76,14 +77,14 @@ pub(super) fn apply_one(
                 ino: *ino,
                 condition: *condition,
             };
-            return apply_one_rooted(&operation, &target.as_rooted(), umask);
+            return apply_one_rooted(&operation, &target.as_rooted(), umask, names);
         }
-        return apply_one_rooted(op, &target.as_rooted(), umask);
+        return apply_one_rooted(op, &target.as_rooted(), umask, names);
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target, umask)
+    apply_one_rooted(op, &target, umask, names)
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -356,7 +357,12 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
+fn apply_one_rooted(
+    op: &Op,
+    target: &RootedTarget,
+    umask: u32,
+    names: Option<&scope_names::ScopeNames>,
+) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
@@ -447,7 +453,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
             flags,
             condition,
             ..
-        } => set_meta_rooted(target, meta, *flags, *condition),
+        } => set_meta_confined(target, meta, *flags, *condition, names),
         Op::SetFileMetaIfSame {
             condition,
             meta,
@@ -463,6 +469,9 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
                 );
             }
             require_open_target_known(&opened, &target.label, *condition)?;
+            if scope_names::changes_metadata(&opened, meta, *flags) {
+                scope_names::require_names_inside(names, target, &opened)?;
+            }
             set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
             require_rooted_named_identity_known(
                 &target.root,
@@ -483,11 +492,24 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn set_meta_rooted(
     target: &RootedTarget,
     meta: &Meta,
     flags: u8,
     condition: TargetCondition,
+) -> Result<()> {
+    set_meta_confined(target, meta, flags, condition, None)
+}
+
+/// As `set_meta_rooted`, changing no file in place that has names outside
+/// the approved directories `names` knows.
+fn set_meta_confined(
+    target: &RootedTarget,
+    meta: &Meta,
+    flags: u8,
+    condition: TargetCondition,
+    names: Option<&scope_names::ScopeNames>,
 ) -> Result<()> {
     if target.relative.is_empty() {
         let metadata = target.root.metadata(&target.relative)?;
@@ -532,6 +554,13 @@ pub(super) fn set_meta_rooted(
         && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec);
     if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
         return Ok(());
+    }
+    if let Some(names) = names.filter(|_| !metadata.is_dir()) {
+        names.require_inside(
+            &target.root,
+            target.label.as_os_str().as_bytes(),
+            (metadata.dev, metadata.ino, metadata.nlink),
+        )?;
     }
     if is_link {
         let handle = meta

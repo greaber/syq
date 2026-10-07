@@ -1600,11 +1600,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     }
 
     // Unsupported options and explicit SSH never ask a receiving machine.
-    for extra in [
-        vec!["--auth-from", "ssh"],
-        vec!["--inplace"],
-        vec!["--into", "~//archive"],
-    ] {
+    for extra in [vec!["--auth-from", "ssh"], vec!["--into", "~//archive"]] {
         let mut args = vec!["cp", "source", "--to", "backup"];
         args.extend(extra);
         let output = run(&args);

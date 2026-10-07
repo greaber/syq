@@ -492,7 +492,10 @@ including updates, reruns, and `--inplace`. Only names eligible under the
 overwrite policy join the group; links outside the selected sources are not
 reconstructed. Existing extra destination links are not necessarily split.
 With `--inplace`, writes still affect every existing name for that destination
-inode, including names outside the copy.
+inode, including names outside the copy. A restricted receiver or receiving
+machine instead leaves a file with names outside the copy's directory
+unchanged, for in-place writes and metadata updates alike, and reports an
+error for it.
 
 Hardlink preservation scans all selected sources before changing the destination.
 Large trees therefore take longer to start copying and require memory for the

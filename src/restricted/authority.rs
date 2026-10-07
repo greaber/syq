@@ -130,9 +130,17 @@ pub(crate) struct RestrictedAuthority {
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
+    /// The names this receiver knows files have inside the signed scopes,
+    /// shared with every connection's operations, which change no file in
+    /// place that has others.
+    pub(super) scope_names: std::sync::Arc<crate::fsops::scope_names::ScopeNames>,
 }
 
 impl RestrictedAuthority {
+    pub(crate) fn scope_names(&self) -> std::sync::Arc<crate::fsops::scope_names::ScopeNames> {
+        self.scope_names.clone()
+    }
+
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
         self.hashing.as_ref().map_or(
             crate::hashing::HashPolicy {
@@ -235,9 +243,16 @@ impl RestrictedAuthority {
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
+        let scope_names = std::sync::Arc::new(crate::fsops::scope_names::ScopeNames::new(
+            config.root.as_bytes().to_vec(),
+            copy.mutation_scopes
+                .iter()
+                .map(|scope| (scope.path.clone(), scope.descendants)),
+        ));
         let authority = Self {
             hashing,
             extra_options,
+            scope_names,
             tcp_congestion,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
