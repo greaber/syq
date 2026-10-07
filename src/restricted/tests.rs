@@ -4474,6 +4474,17 @@ fn receivers_refuse_root_and_effective_capabilities() {
         privilege::parse_effective_capabilities("Name:\tsyq\n"),
         None
     );
+    // The refusal points to the alternatives, and to removing a root
+    // enrollment only when there is one.
+    let fresh = privilege::privileged_receiver_message(None);
+    assert!(fresh.contains("--coordinate-at local"), "{fresh}");
+    assert!(fresh.contains("--peer-auth broker"), "{fresh}");
+    assert!(!fresh.contains("revoke"), "{fresh}");
+    let existing = privilege::privileged_receiver_message(Some("0123abcd"));
+    assert!(
+        existing.ends_with("`syq receiver revoke 0123abcd` removes this root enrollment"),
+        "{existing}"
+    );
 }
 
 #[test]

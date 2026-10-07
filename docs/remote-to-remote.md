@@ -34,6 +34,7 @@ for what this protects against.
   the copy uses SSH workers on the same hostA-to-hostB route. `--no-tcp` selects
   SSH directly.
 - An existing parent directory for the destination.
+- A hostB login other than root.
 
 The copy stops if your laptop command ends, so keep it running until the copy finishes.
 

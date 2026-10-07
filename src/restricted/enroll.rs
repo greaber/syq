@@ -337,11 +337,6 @@ pub(super) fn enroll(
     jump: Option<&SshEndpoint>,
     refresh_existing: bool,
 ) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
-    // The receiver refuses to run as root; say so before creating anything.
-    // An account with another name and user ID 0 is refused when installing.
-    if login == "root" {
-        bail!(PRIVILEGED_RECEIVER);
-    }
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;
@@ -356,6 +351,15 @@ pub(super) fn enroll(
                 break;
             }
         }
+    }
+    // The receiver refuses to run as root; say so before creating anything,
+    // with how to remove a root enrollment made before. An account with
+    // another name and user ID 0 is refused when installing.
+    if login == "root" {
+        let existing = active
+            .as_ref()
+            .map(|(metadata, _, _)| metadata.id.to_string());
+        bail!(privileged_receiver_message(existing.as_deref()));
     }
     if !refresh_existing {
         if let Some(existing) = active.take() {

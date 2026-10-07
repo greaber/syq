@@ -53,7 +53,7 @@ pub(crate) use grant::*;
 pub(crate) use install::*;
 use keys::*;
 pub(crate) use privilege::{
-    refuse_privileged_approved_receiver, refuse_privileged_receiver, PRIVILEGED_RECEIVER,
+    privileged_receiver_message, refuse_privileged_approved_receiver, refuse_privileged_receiver,
 };
 pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;

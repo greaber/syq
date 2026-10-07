@@ -4,13 +4,26 @@
 
 use super::*;
 
-/// Why an enrolled receiver for a root account refuses to run.
-pub(crate) const PRIVILEGED_RECEIVER: &str = "command-restricted receivers do not run as root or with root's capabilities; enroll an ordinary account instead (`syq receiver revoke` removes a root enrollment)";
+/// Why a command-restricted receiver does not run for a root account, with
+/// how to remove `enrollment` when one exists for it.
+pub(crate) fn privileged_receiver_message(enrollment: Option<&str>) -> String {
+    let mut message = "command-restricted receivers do not run as root or with root's capabilities; copy through this machine with --coordinate-at local, or enroll an ordinary account on the destination (--peer-auth broker would give the source host root's authority on the destination)".to_owned();
+    if let Some(enrollment) = enrollment {
+        message.push_str(&format!(
+            "; `syq receiver revoke {enrollment}` removes this root enrollment"
+        ));
+    }
+    message
+}
 
 /// Refuse to act as a command-restricted receiver as root or, on Linux, with
-/// any effective capability.
-pub(crate) fn refuse_privileged_receiver() -> Result<()> {
-    refuse_privileged(PRIVILEGED_RECEIVER)
+/// any effective capability. `enrollment` names the enrollment this
+/// receiver serves, when one exists.
+pub(crate) fn refuse_privileged_receiver(enrollment: Option<&str>) -> Result<()> {
+    if privileged(unsafe { libc::geteuid() }, effective_capabilities()?) {
+        bail!(privileged_receiver_message(enrollment));
+    }
+    Ok(())
 }
 
 /// As [`refuse_privileged_receiver`], for a receiver that copies on another
@@ -44,6 +57,7 @@ fn effective_capabilities() -> Result<u64> {
 }
 
 /// The effective capability set from a Linux `/proc/self/status`.
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn parse_effective_capabilities(status: &str) -> Option<u64> {
     status
         .lines()
