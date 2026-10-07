@@ -4946,22 +4946,41 @@ fn hard_links_never_make_an_existing_file_the_grants_own() {
         "{error:#}"
     );
 
-    // A name this grant created may not be replaced with a link, in a
-    // later request or in the same one.
+    // A link never replaces a name this grant created: it is published to
+    // the final name, which the kernel refuses while that name exists.
     let mut symlink = apply(vec![Op::Symlink {
         path: path_bytes(&root.join("target/mine")),
         target: b"kept".to_vec(),
         condition: proto::TargetCondition::Any,
     }]);
     let settlement = authority.authorize(&mut symlink, false).unwrap();
-    authority.settle(settlement, &proto::Response::Applied(vec![None]));
-    let error = authority
-        .authorize(&mut apply(vec![link("mine")]), false)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("a hard link may not replace it"),
-        "{error:#}"
-    );
+    let Request::Apply { ops, guard } = &symlink else {
+        unreachable!()
+    };
+    let response = proto::Response::Applied(crate::fsops::FsOps::new().apply(ops, guard.as_ref()));
+    authority.settle(settlement, &response);
+    let mut relink = apply(vec![link("mine")]);
+    let settlement = authority.authorize(&mut relink, false).unwrap();
+    let Request::Apply { ops, guard } = &relink else {
+        unreachable!()
+    };
+    assert!(matches!(
+        ops[0],
+        Op::Hardlink {
+            condition: proto::TargetCondition::Absent,
+            ..
+        }
+    ));
+    let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+    let error = results[0].as_ref().expect("the link replaced a name");
+    assert!(error.as_str().contains("already exists"), "{error:?}");
+    authority.settle(settlement, &proto::Response::Applied(results));
+    assert!(fs::symlink_metadata(root.join("target/mine"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    // The same in one request: the name the link was to replace no longer
+    // makes its file the grant's own.
     let error = authority
         .authorize(
             &mut apply(vec![
@@ -4977,14 +4996,15 @@ fn hard_links_never_make_an_existing_file_the_grants_own() {
         )
         .unwrap_err();
     assert!(
-        error.to_string().contains("a hard link may not replace it"),
+        error.to_string().contains("may not be modified"),
         "{error:#}"
     );
 }
 
 /// Keeping existing files, a request on one connection that changes a name
 /// this grant created cannot be turned onto an existing file by a link a
-/// request on another connection makes at that name before it runs.
+/// request on another connection makes at that name before it runs: the
+/// link may not replace the name.
 #[test]
 fn a_link_cannot_redirect_another_connections_change_to_a_kept_file() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -5041,18 +5061,13 @@ fn a_link_cannot_redirect_another_connections_change_to_a_kept_file() {
         ino: kept.ino(),
         condition: proto::TargetCondition::Any,
     }]);
-    let refused = match authority.authorize(&mut link, false) {
-        Ok(settlement) => {
-            let Request::Apply { ops, guard } = &link else {
-                unreachable!()
-            };
-            let response =
-                proto::Response::Applied(crate::fsops::FsOps::new().apply(ops, guard.as_ref()));
-            authority.settle(settlement, &response);
-            None
-        }
-        Err(error) => Some(error),
+    let settlement = authority.authorize(&mut link, false).unwrap();
+    let Request::Apply { ops, guard } = &link else {
+        unreachable!()
     };
+    let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+    let refused = results[0].clone();
+    authority.settle(settlement, &proto::Response::Applied(results));
     // Connection 2's change then runs, and must not reach the kept file.
     let Request::Apply { ops, guard } = &change else {
         unreachable!()
@@ -5063,18 +5078,16 @@ fn a_link_cannot_redirect_another_connections_change_to_a_kept_file() {
         fs::metadata(root.join("target/kept")).unwrap().mode() & 0o7777,
         0o600
     );
-    let error = refused.expect("the link was authorized");
-    assert!(
-        error.to_string().contains("a hard link may not replace it"),
-        "{error:#}"
-    );
+    let error = refused.expect("the link replaced the name");
+    assert!(error.as_str().contains("already exists"), "{error:?}");
 }
 
 /// A name already linked to its file changes nothing, so the receipt
-/// records no operation for it, as an ordinary copy reports it unchanged,
-/// unless linking it fails after all: its file may change before it runs.
+/// records no operation for it, as an ordinary copy reports it unchanged.
+/// The link is held to that file: if the name changes before it runs, it
+/// fails, and the receipt records that, rather than linking it again.
 #[test]
-fn a_name_already_linked_records_no_operation_unless_it_fails() {
+fn a_name_already_linked_records_no_operation_unless_it_changes() {
     use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
@@ -5085,7 +5098,7 @@ fn a_name_already_linked_records_no_operation_unless_it_fails() {
     let file = fs::metadata(root.join("target/a")).unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     authority.extra_options.hardlinks = true;
-    let link = |name: &str, error: Option<&str>| {
+    let link = |name: &str, before: &dyn Fn()| {
         let mut request = Request::Apply {
             ops: vec![Op::Hardlink {
                 path: path_bytes(&root.join("target").join(name)),
@@ -5097,17 +5110,29 @@ fn a_name_already_linked_records_no_operation_unless_it_fails() {
             guard: None,
         };
         let settlement = authority.authorize(&mut request, false).unwrap();
-        authority.settle(
-            settlement,
-            &proto::Response::Applied(vec![error.map(|error| error.to_owned().into())]),
-        );
+        before();
+        let Request::Apply { ops, guard } = &request else {
+            unreachable!()
+        };
+        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+        authority.settle(settlement, &proto::Response::Applied(results));
         let state = authority.state.lock().unwrap();
         let summary = state.receipt_stream.as_ref().unwrap().summary();
         (summary.operations, summary.failed)
     };
-    assert_eq!(link("b", None), (0, 0));
-    assert_eq!(link("b", Some("the linked file changed")), (1, 1));
-    assert_eq!(link("c", None), (2, 1));
+    assert_eq!(link("b", &|| ()), (0, 0));
+    // The name is replaced by another file between the check and the link.
+    let replace_b = || {
+        fs::remove_file(root.join("target/b")).unwrap();
+        fs::write(root.join("target/b"), b"someone else's").unwrap();
+    };
+    assert_eq!(link("b", &replace_b), (1, 1));
+    assert_eq!(fs::read(root.join("target/b")).unwrap(), b"someone else's");
+    assert_eq!(link("c", &|| ()), (2, 1));
+    assert_eq!(
+        fs::metadata(root.join("target/c")).unwrap().ino(),
+        file.ino()
+    );
 }
 
 #[test]

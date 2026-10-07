@@ -1739,20 +1739,16 @@ impl RestrictedAuthority {
         if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
             bail!("hardlink publication accepts no fingerprint condition");
         }
-        // Keeping existing files, a link never replaces a name this grant
-        // created, even one it has since removed: another request may hold
-        // that name as the grant's own, and would then change the existing
-        // file the link gives it. Ordinary copies link only new names.
-        if self.copy.policy.existing == ExistingDestinationPolicy::Skip
-            && (self.created_by_this_grant(path)
-                || pending.iter().any(|creation| creation.path == path))
-        {
-            bail!(
-                "{} was created by this copy; a hard link may not replace it while existing files are kept",
-                String::from_utf8_lossy(path)
-            );
-        }
         self.constrain_creation(path, condition, false, index, pending)?;
+        // Keeping existing files, a link replaces nothing, not even a name
+        // this grant created: another request may still hold that name as
+        // the grant's own, and would change the existing file the link gave
+        // it. The receiver links to the final name, which the kernel refuses
+        // when it exists. Ordinary copies link only new names there.
+        let keep = self.copy.policy.existing == ExistingDestinationPolicy::Skip;
+        if keep {
+            *condition = proto::TargetCondition::Absent;
+        }
         // The link replaces whatever this grant made at that name, in this
         // request or before, so that name no longer makes a file its own.
         for creation in pending.iter_mut().filter(|creation| creation.path == path) {
@@ -1761,11 +1757,19 @@ impl RestrictedAuthority {
         }
         self.state.lock().unwrap().created.remove(path);
         // A name already linked to the file changes nothing; the copy
-        // reports it unchanged, as an ordinary copy does, unless linking it
-        // fails after all.
+        // reports it unchanged, as an ordinary copy does. The link is then
+        // held to that file, so that it succeeds only by finding the name
+        // still linked, and fails rather than link it again if the name
+        // changes first; a failure is recorded.
         let linked = self
             .rooted_metadata(path)?
             .is_some_and(|metadata| (metadata.dev, metadata.ino) == identity);
+        if linked && !keep {
+            *condition = proto::TargetCondition::Matches {
+                dev: identity.0,
+                ino: identity.1,
+            };
+        }
         touched.push(path.to_vec());
         let path = path.to_vec();
         let action = crate::receipt::OperationAction::LinkFile;
