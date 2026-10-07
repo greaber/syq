@@ -310,6 +310,13 @@ authorized = remote("sha256sum ~/.ssh/authorized_keys")
 copy(".ssh/authorized_keys", success=False)
 assert remote("sha256sum ~/.ssh/authorized_keys") == authorized
 
+print("case: approved copies keep ownership and special files as an ordinary account", flush=True)
+# Outside the shared return-source tree, which later cases copy whole.
+run("ssh", "source", "mkdir -p /tmp/syq-real-ssh/forward-specials && mkfifo /tmp/syq-real-ssh/forward-specials/pipe")
+copy("/tmp/syq-real-ssh/forward/pipe", source="/tmp/syq-real-ssh/forward-specials/pipe",
+     extra=("--copy-metadata=mtime,ownership,specials",))
+remote("test -p /tmp/syq-real-ssh/forward/pipe")
+
 print("case: unreachable TCP falls back to direct restricted SSH data", flush=True)
 port = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
 started = time.monotonic()

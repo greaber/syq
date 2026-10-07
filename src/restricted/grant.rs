@@ -549,6 +549,7 @@ pub(crate) fn named_authority(
         request: request_id,
         digest,
         receipt_key: key.public_key().to_openssh()?,
+        max_delete: u64::MAX,
     };
     let authority = RestrictedAuthority::new(
         &config,

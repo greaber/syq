@@ -150,6 +150,23 @@ finally:
                 assert (destination / name).read_bytes() == b'protected destination contents', (target, name)
             for name in ["skip.log", "drop.cache", "stale.txt"]:
                 assert not (destination / name).exists(), (target, name)
+    print("case: pruning without --max-delete keeps to the laptop's limit", flush=True)
+    destination = root / "laptop-limit"
+    destination.mkdir()
+    for name in ["extra-1", "extra-2"]:
+        (destination / name).write_bytes(b"extra")
+    run("ssh", "source", "mkdir -p /tmp/syq-real-ssh/handoff-source/limit-source && "
+        "printf kept > /tmp/syq-real-ssh/handoff-source/limit-source/kept")
+    prune = shlex.join(["syq", "cp", "--srcs-in", "/tmp/syq-real-ssh/handoff-source/limit-source",
+                        "--to", "@laptop", "--into", "laptop-limit", "--prune", "--no-progress"])
+    # Two planned deletions exceed the laptop's limit of one: none happen.
+    exceeded = subprocess.run(["ssh", "source", prune], capture_output=True, timeout=40)
+    assert exceeded.returncode == 25, exceeded
+    assert (destination / "extra-1").exists() and (destination / "extra-2").exists()
+    (destination / "extra-2").unlink()
+    run("ssh", "source", prune)
+    assert not (destination / "extra-1").exists()
+    assert (destination / "kept").read_bytes() == b"kept"
 finally:
     run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")

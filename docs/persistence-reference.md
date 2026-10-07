@@ -368,8 +368,9 @@ Lower limits requested by the sender also apply. Limits are per copy; repeated
 copies can fill the disk. Copies support at most 128 workers each.
 
 Pruning is disabled unless the laptop sets a positive `--max-delete`.
-A sending `--prune` command must also supply its own `--max-delete` ceiling,
-no higher than the laptop's. Validation failures leave the copy unstarted.
+A pruning copy that plans more deletions than the laptop's limit, or than its
+own `--max-delete` if lower, deletes nothing and exits 25. Validation failures
+leave the copy unstarted.
 Errors during copying fail visibly and may leave partial files for retry.
 The sender verifies a signed receipt before reporting success.
 
