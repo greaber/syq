@@ -931,3 +931,57 @@ fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
     }
     assert_eq!(fs::read_dir(&destination).unwrap().count(), 5000);
 }
+
+/// A file an `--inplace` copy creates is never wider than its final mode,
+/// even while its contents are written: the umask limits it as it is
+/// created, though the directory's default ACL would let everyone in.
+#[cfg(debug_assertions)]
+#[test]
+fn inplace_files_are_created_within_the_umask_under_a_permissive_default_acl() {
+    use std::os::unix::process::CommandExt;
+    let mut everyone = 2u32.to_le_bytes().to_vec();
+    for tag in [1u16, 4, 32] {
+        everyone.extend(tag.to_le_bytes());
+        everyone.extend(7u16.to_le_bytes());
+        everyone.extend(u32::MAX.to_le_bytes());
+    }
+    for fail in [true, false] {
+        let t = Tmp::new();
+        // A second file keeps the receiver's sequential local copy in use.
+        write(&t.path("src/small"), b"parallel file work");
+        write(&t.path("src/file"), &vec![7; 2 << 20]);
+        for name in ["small", "file"] {
+            fs::set_permissions(t.path("src").join(name), fs::Permissions::from_mode(0o666))
+                .unwrap();
+        }
+        fs::create_dir(t.path("dst")).unwrap();
+        set_attr(&t.path("dst"), "system.posix_acl_default", &everyone);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--inplace", "--no-progress", "--srcs-in"])
+            .args([t.s("src"), "--into".into(), t.s("dst")])
+            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+            .env("SYQ_TEST_COPY_LOCAL_FS", "local");
+        if fail {
+            command.env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1");
+        }
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        let out = command.run().unwrap();
+        let mode = fs::metadata(t.path("dst/file")).unwrap().mode() & 0o7777;
+        if fail {
+            // Stopped after its first write, before finalization.
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            assert!(stderr_of(&out).contains("test local-copy write failure"));
+            assert_eq!(fs::metadata(t.path("dst/file")).unwrap().len(), 1 << 20);
+        } else {
+            assert_output_ok(&out);
+            assert_eq!(read(&t.path("dst/file")), vec![7; 2 << 20]);
+        }
+        assert_eq!(mode, 0o600, "fail={fail}: {mode:o}");
+    }
+}

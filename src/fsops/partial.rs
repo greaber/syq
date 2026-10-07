@@ -64,6 +64,7 @@ impl FsOps {
     }
 
     fn create_inplace_file(
+        &self,
         root: &Root,
         relative: &RelativePath,
         mode: u32,
@@ -73,6 +74,11 @@ impl FsOps {
         // reopen this new inode for writing. Finalize applies the requested
         // mode after every writer is done. Never chmod an existing destination
         // here: its write permissions still decide whether an update is allowed.
+        // The data arrives before finalization, so the file is created no
+        // wider than creating it allows a native copy: a directory's default
+        // ACL replaces the kernel's umask, so it is applied here, as for
+        // every other new object (`creation_umask`).
+        let mode = mode & 0o777 & !self.creation_umask();
         let file = root.create_file(relative, mode | 0o200)?;
         let created = file.metadata()?;
         receiver_mode::note_inplace_open(copy_id, &created, true);
@@ -555,7 +561,7 @@ impl FsOps {
                         bail!("destination {} is a directory", target.label.display())
                     }
                     Some(_) => target.root.unlink(&target.relative)?,
-                    None => match Self::create_inplace_file(
+                    None => match self.create_inplace_file(
                         &target.root,
                         &target.relative,
                         mode,
@@ -1360,7 +1366,7 @@ impl FsOps {
                     }
                     Some(_) => destination_root.unlink(&target_relative)?,
                     None => {
-                        match Self::create_inplace_file(
+                        match self.create_inplace_file(
                             &destination_root,
                             &target_relative,
                             mode,
