@@ -3796,13 +3796,13 @@ pub(crate) fn staged_mode(mode: u32, flags: u8, acl: bool) -> u32 {
     }
 }
 
-/// The mode a file the copy writes in place is created in, before the
-/// receiver's umask. Like a sidecar, it stays private while its group or
-/// ACL is still to be set: the group the kernel gives it at creation, or
-/// the ACL mask its group bits set, would let others read what is written
-/// before finalize sets them. Otherwise it has the permission bits it will
-/// end with, so that finalize needs no chmod; a proposal's special bits are
-/// never created.
+/// The mode a file the copy writes in place is created with, which its
+/// directory's default ACL, or else the umask, then limits. Like a sidecar,
+/// it stays private while its group or ACL is still to be set: the group
+/// the kernel gives it at creation, or the ACL mask its group bits set,
+/// would let others read what is written before finalize sets them.
+/// Otherwise it has the permission bits it will end with, so that finalize
+/// needs no chmod; a proposal's special bits are never created.
 pub(crate) fn inplace_creation_mode(mode: u32, flags: u8, acl: bool) -> u32 {
     if flags & flags::GROUP != 0 || acl {
         PRIVATE_PARTIAL_MODE
