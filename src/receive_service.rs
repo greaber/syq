@@ -682,6 +682,23 @@ fn try_lock(control: &Path, create: bool) -> Result<Option<File>> {
 pub(crate) fn is_running(control: &Path) -> bool {
     matches!(try_lock(control, false), Ok(None))
 }
+/// is_running and the provider's check probe a lock by taking it for a
+/// moment. A service or provider that starts during such a probe would take
+/// the probe for another owner, so it retries for longer than a probe holds
+/// the lock before concluding that another copy is running.
+const PROBE_GRACE: Duration = Duration::from_millis(100);
+fn lock_for_start<T>(mut attempt: impl FnMut() -> Result<Option<T>>) -> Result<Option<T>> {
+    let deadline = Instant::now() + PROBE_GRACE;
+    loop {
+        if let Some(lock) = attempt()? {
+            return Ok(Some(lock));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 fn read_spec(control: &Path) -> Result<ServiceSpec> {
     let bytes = crate::delegation::read_private_regular(
         &suffixed(control, RECORD),
@@ -1131,7 +1148,7 @@ fn run(domain: &Domain, control: &Path) -> Result<()> {
     if scope.join(CLOSING).exists() || !domain.enabled()? {
         return Ok(());
     }
-    let Some(_lock) = try_lock(control, true)? else {
+    let Some(_lock) = lock_for_start(|| try_lock(control, true))? else {
         return Ok(());
     };
     if scope.join(CLOSING).exists() || !preferences(domain)?.enabled() {
@@ -1361,6 +1378,9 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     }
     drop(_lock);
     domain.enable()?;
+    // A provider from another build may reject these settings when refreshed.
+    // Stop it first; configure then starts one from this build.
+    provider::stop_other_build(domain)?;
     apply_preferences(domain, &preferences)?;
     Ok(config)
 }
@@ -2352,5 +2372,39 @@ mod tests {
             .unwrap()
             .is_none());
         stopped.join().unwrap();
+    }
+
+    #[test]
+    fn a_starting_service_waits_out_a_status_probe() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let control = root.path().join("cm-test");
+        // A status check holds the lock during the first attempt, then ends.
+        let mut probe = Some(try_lock(&control, true).unwrap().unwrap());
+        let mut attempts = 0;
+        let lock = lock_for_start(|| {
+            attempts += 1;
+            let attempt = try_lock(&control, true);
+            probe.take();
+            attempt
+        })
+        .unwrap();
+        assert!(lock.is_some());
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn a_service_started_beside_a_running_one_gives_up_after_the_grace() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let control = root.path().join("cm-test");
+        let _owner = try_lock(&control, true).unwrap().unwrap();
+        let started = Instant::now();
+        assert!(lock_for_start(|| try_lock(&control, true))
+            .unwrap()
+            .is_none());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= PROBE_GRACE && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
     }
 }
