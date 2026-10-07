@@ -3074,7 +3074,7 @@ impl FsOps {
                 require_absent,
             } => self
                 .create_operator_directory(*mode, *require_absent)
-                .map(|anchor| Response::DirectorySelection(Some(anchor))),
+                .map(|(anchor, created)| Response::OperatorDirectoryCreated { anchor, created }),
             Request::AnchorDestination {
                 expected_dev,
                 expected_ino,

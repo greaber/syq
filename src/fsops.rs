@@ -944,29 +944,36 @@ impl FsOps {
         &mut self,
         mode: u32,
         require_absent: bool,
-    ) -> Result<DirectoryAnchor> {
+    ) -> Result<(DirectoryAnchor, bool)> {
         let umask = self.creation_umask();
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_OPERATOR_DIRECTORY_READY_FILE",
+            "SYQ_TEST_OPERATOR_DIRECTORY_CONTINUE_FILE",
+            "destination directory creation",
+        )?;
         // It has owner access while it is filled, as any new directory has.
-        let anchor = self
+        let (anchor, created) = self
             .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
             .create_missing(mode | 0o700, require_absent, umask)?;
         // A destination created private is opened once its metadata is set,
         // and under `syq rsync` one whose mode lacks owner access is narrowed
-        // once it is filled.
+        // once it is filled. A directory found at its name, which another
+        // process created after it was found missing, keeps its mode.
         let narrowing = self.default_acl_creation && mode & 0o700 != 0o700;
-        if mode & 0o7777 == 0o700 || narrowing {
-            let created = self
+        if created && (mode & 0o7777 == 0o700 || narrowing) {
+            let metadata = self
                 .operator_selection
                 .as_ref()
                 .context("no checked destination directory")?
                 .directory
                 .metadata()?;
             self.receiver_directories
-                .created((anchor.dev, anchor.ino), created.mode(), narrowing);
+                .created((anchor.dev, anchor.ino), metadata.mode(), narrowing);
         }
-        Ok(anchor)
+        Ok((anchor, created))
     }
 
     fn anchor_destination(

@@ -1377,12 +1377,15 @@ fn concurrent_operator_directory_creation_reuses_the_real_directory() {
     assert!(first_anchor.is_none());
     assert!(second_anchor.is_none());
 
-    let first_anchor = first.create_missing(0o755, false, 0).unwrap();
-    let second_anchor = second.create_missing(0o755, false, 0).unwrap();
+    let (first_anchor, first_created) = first.create_missing(0o755, false, 0).unwrap();
+    let (second_anchor, second_created) = second.create_missing(0o755, false, 0).unwrap();
     assert_eq!(
         (first_anchor.dev, first_anchor.ino),
         (second_anchor.dev, second_anchor.ino)
     );
+    // Only the first created it; the second found it there.
+    assert!(first_created);
+    assert!(!second_created);
 
     fs::remove_dir_all(&dir).unwrap();
 }

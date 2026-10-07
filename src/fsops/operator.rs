@@ -48,13 +48,15 @@ impl OperatorDirectorySelection {
     }
 
     /// Create the missing components, the last with `mode`, each without
-    /// the `umask` permission bits.
+    /// the `umask` permission bits. Also returns whether this call created
+    /// the last component, rather than finding a directory there.
     pub(super) fn create_missing(
         &mut self,
         mode: u32,
         require_absent: bool,
         umask: u32,
-    ) -> Result<DirectoryAnchor> {
+    ) -> Result<(DirectoryAnchor, bool)> {
+        let mut created = false;
         while let Some(component) = self.missing.pop_front() {
             if component == b"." {
                 continue;
@@ -87,6 +89,7 @@ impl OperatorDirectorySelection {
                         component_mode,
                     ) {
                         Ok(()) if final_component => {
+                            created = true;
                             apply::hold_after_directory_creation_for_test(Path::new(
                                 OsStr::from_bytes(&self.path),
                             ))?;
@@ -117,7 +120,7 @@ impl OperatorDirectorySelection {
             }
             self.directory = open_operator_directory_at(&self.directory, &component)?;
         }
-        self.anchor()
+        Ok((self.anchor()?, created))
     }
 
     /// Compare an effective directory beneath this retained operator
