@@ -52,6 +52,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a registering server waits for the receiving laptop's handshake.
 const REGISTRATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PREFIX: &str = "named-v2:";
+/// The restricted grant marker of a copy through a receiving machine's
+/// access to another server.
+pub(crate) const RETURN_GRANT: &str = "return-control-v1";
 const REQUEST_ROOT: &[u8] = b"/SYQ-RECEIVE";
 const RECONNECT_PENDING: i32 = 75;
 
@@ -825,14 +828,10 @@ fn constrain(
     for filter_root in &mut request.constraints.filters.destination_roots {
         *filter_root = rebase(filter_root, destination)?;
     }
-    if request.copy.options.preserve_owner
-        || request.copy.options.preserve_group
-        || request.copy.options.preserve_devices
-        || request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace
-    {
-        bail!(
-            "named destinations do not accept ownership, special-file preservation, or --inplace"
-        );
+    // Ownership and special files act as for any copy by an ordinary
+    // account: the receiver never runs as root.
+    if request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace {
+        bail!("named destinations do not accept --inplace");
     }
     if request.copy.limits.max_deletions > max_delete {
         bail!("requested deletion limit exceeds laptop --max-delete={max_delete}");
@@ -851,6 +850,16 @@ fn constrain(
 /// The SSH destination a copy through the receiving machine's access would use.
 pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
+}
+
+/// A receiving machine's own --max-delete bounds pruning it approves, and the
+/// sender cannot see that limit. The sending command states a ceiling within
+/// it, so that the sender refuses all deletions above it, as any --max-delete.
+pub(crate) fn require_deletion_ceiling(args: &crate::cli::Args) -> Result<()> {
+    if !args.dry_run && args.delete && args.max_delete.is_none() {
+        bail!("pruning through a receiving machine needs an explicit --max-delete, no higher than that machine's own");
+    }
+    Ok(())
 }
 
 pub(crate) fn is_named(grant: &Option<String>) -> bool {
@@ -1019,6 +1028,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             recipient_public_key: public,
         },
     };
+    require_deletion_ceiling(args)?;
     let request = crate::restricted::named_request(args, policy.clone())?;
     crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
     let (_, reply) = exchange(
@@ -1287,6 +1297,7 @@ impl Receiver {
                 cwd,
                 request,
             } => {
+                crate::restricted::refuse_privileged_approved_receiver()?;
                 let _request = self.request_lock.try_lock().map_err(|_| {
                     anyhow::anyhow!(
                         "another transfer is awaiting approval; retry after it is decided"

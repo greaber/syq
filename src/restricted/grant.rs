@@ -67,14 +67,6 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
-    if !args.dry_run && args.delete && args.max_delete.is_none() {
-        // The signed deletion count is the only bound on what a compromised
-        // hostA can remove inside the scope, so make it an explicit choice
-        // instead of a silent hundred-million default.
-        bail!(
-            "deletion through the command-restricted receiver needs an explicit --max-delete ceiling"
-        );
-    }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
     if args
@@ -97,19 +89,9 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             bail!("--max-size must be at least 1 byte on the command-restricted path");
         }
     }
-    if !args.files_from_lines.is_empty() || args.files_from.is_some() || args.min_size.is_some() {
-        bail!(
-            "--files-from and --min-size are not yet independently enforceable by the command-restricted receiver"
-        );
-    }
     if args.pscope_explicit {
         bail!(
             "--pscope is not available with the command-restricted receiver: its host-bound authentication is verified per fresh connection"
-        );
-    }
-    if !args.dry_run && args.delete && args.max_size.is_some() {
-        bail!(
-            "--max-size with deletion is not yet independently enforceable by the command-restricted receiver"
         );
     }
     if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
@@ -152,12 +134,13 @@ pub(super) fn grant_for(
         .transpose()?
         .unwrap_or(DEFAULT_MAX_BYTES)
         .min(max_total_bytes);
+    // Without --max-delete, pruning may remove as many entries as the copy
+    // may touch, as an ordinary copy's pruning is unlimited.
     let max_deletions = match deletion {
         DeletionPolicy::Forbid => 0,
-        DeletionPolicy::DeleteDestinationOnly => args
-            .max_delete
-            .context("deletion through the command-restricted receiver needs --max-delete")?
-            .min(max_entries),
+        DeletionPolicy::DeleteDestinationOnly => {
+            args.max_delete.unwrap_or(max_entries).min(max_entries)
+        }
     };
     let start_by = issued_at
         .checked_add(GRANT_VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
@@ -404,7 +387,9 @@ pub(crate) fn prepare_transfer(
             tcp_congestion: args.tcp_congestion.clone(),
             mapping: mapping_authorization(args)?,
             hashing: Some(crate::hashing::CopyHashing::from_args(args)),
-            max_file_data_bytes_per_second: args.bwlimit_bytes,
+            // The sender paces network bytes, as for an ordinary copy: a
+            // bandwidth limit is a preference, not part of the authorization.
+            max_file_data_bytes_per_second: 0,
             filters: FilterPolicy {
                 ignore: args.ignore_lines.clone(),
                 destination_roots: filter_destination_roots(args, sources, &canonical_destination)?,
@@ -427,6 +412,16 @@ pub(crate) fn prepare_transfer(
         grant: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(grant),
         enrollment_id: metadata.id,
     })
+}
+
+/// Whether `grant` was signed for an enrolled receiver, whose sender paces
+/// network bytes as for an ordinary copy. Connections that a receiving
+/// machine approves are not paced at the transport, so those requests carry
+/// the bandwidth limit and the receiver enforces it on file data.
+pub(crate) fn enrolled_grant(grant: &str) -> bool {
+    !(crate::destination::is_named(&Some(grant.to_owned()))
+        || grant == crate::destination::RETURN_GRANT
+        || grant == crate::destination::peer_bridge::GRANT)
 }
 
 /// Build a request without trusting the source's eventual filesystem claims.

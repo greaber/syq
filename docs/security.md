@@ -188,7 +188,8 @@ The protection has several parts:
    SSH access to install a receiver and a dedicated public key. That key's
    `authorized_keys` entry permits only the receiver command, with SSH
    forwarding disabled. The key stays on your laptop or hardware token,
-   matching the setup login's protection. Later copies reuse this setup.
+   matching the setup login's protection. Later copies reuse this setup. The
+   receiver refuses to run as root.
 2. **Authenticate hostA's connection without handing it the key.** A small
    signing service on your laptop answers hostA's SSH authentication requests.
    Before signing, it checks OpenSSH's cryptographic proof of which server

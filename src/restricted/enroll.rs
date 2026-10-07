@@ -352,6 +352,15 @@ pub(super) fn enroll(
             }
         }
     }
+    // The receiver refuses to run as root; say so before creating anything,
+    // with how to remove a root enrollment made before. An account with
+    // another name and user ID 0 is refused when installing.
+    if login == "root" {
+        let existing = active
+            .as_ref()
+            .map(|(metadata, _, _)| metadata.id.to_string());
+        bail!(privileged_receiver_message(existing.as_deref()));
+    }
     if !refresh_existing {
         if let Some(existing) = active.take() {
             return Ok(existing);

@@ -904,6 +904,77 @@ fn named_copy_with_transport(tcp: bool) {
     );
 }
 
+/// The receiving machine never runs as root, so a laptop download accepts
+/// ownership and special files as any copy by an ordinary account does.
+#[test]
+fn named_copy_accepts_ownership_and_special_files() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("hello"), b"hello laptop").unwrap();
+    let fifo = std::ffi::CString::new(source.join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    let (command, request, secret) = requested(
+        &source,
+        &["--copy-metadata", "mtime,permissions,ownership,specials"],
+    );
+    let options = &request.copy.options;
+    assert!(options.preserve_owner && options.preserve_group && options.preserve_devices);
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    let policy = request.constraints.receipt_policy.clone();
+    let approved = approve(&registration, command, request);
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration, approved.token.clone()));
+    args.named_receipt = Some(Arc::new(NamedReceipt {
+        connection: None,
+        secret,
+        approved,
+        policy,
+    }));
+    assert_eq!(crate::transfer::run(args).unwrap(), 0);
+    assert_eq!(
+        fs::read(root.join("source/hello")).unwrap(),
+        b"hello laptop"
+    );
+    let pipe = fs::symlink_metadata(root.join("source/pipe")).unwrap();
+    assert!(pipe.file_type().is_fifo());
+    assert_eq!(pipe.gid(), fs::metadata(&source).unwrap().gid());
+}
+
+#[test]
+fn named_requests_keep_inplace_refused_and_need_a_stated_deletion_ceiling() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut inplace = args(&temporary.path().join("source"), "output");
+    inplace.inplace = true;
+    let (request, _) = request(&inplace);
+    let error = constrain(request, temporary.path(), 1000, 1000, 0).unwrap_err();
+    assert!(error.to_string().contains("--inplace"), "{error:#}");
+
+    let mut pruning = args(&temporary.path().join("source"), "output");
+    pruning.delete = true;
+    let error = require_deletion_ceiling(&pruning).unwrap_err();
+    assert!(error.to_string().contains("--max-delete"), "{error:#}");
+    pruning.max_delete = Some(3);
+    require_deletion_ceiling(&pruning).unwrap();
+    pruning.max_delete = None;
+    pruning.dry_run = true;
+    require_deletion_ceiling(&pruning).unwrap();
+}
+
+#[test]
+fn named_requests_sign_the_senders_bandwidth_limit() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut args = args(&temporary.path().join("source"), "output");
+    args.bwlimit_bytes = 1 << 20;
+    let (request, _) = request(&args);
+    assert_eq!(request.constraints.max_file_data_bytes_per_second, 1 << 20);
+}
+
 #[test]
 fn named_authorization_expires_before_control_opens() {
     let temp = crate::test_support::tempdir().unwrap();

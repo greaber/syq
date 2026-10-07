@@ -29,8 +29,8 @@ remain possible because the operating system buffers network writes.
 
 Remote-to-remote relays apply the rate to each network leg separately: a
 10 MiB/s cap permits up to 10 MiB/s inbound and 10 MiB/s outbound at the relay. Local,
-S3, named receiving, descriptor, and signed-receiver copies count logical
-file-data bytes before compression.
+S3 and descriptor copies, and copies a receiving machine approves, count
+logical file-data bytes before compression.
 
 ## Concurrency ceilings
 

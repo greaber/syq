@@ -18,6 +18,7 @@ pub(crate) fn receiver_config(id: EnrollmentId) -> Result<(ReceiverEnrollment, P
 }
 
 pub(crate) fn run_receiver(enrollment: &str) -> Result<()> {
+    refuse_privileged_receiver(Some(enrollment))?;
     let enrollment = EnrollmentId::parse(enrollment)?;
     let original = std::env::var("SSH_ORIGINAL_COMMAND")
         .context("restricted receiver requires SSH_ORIGINAL_COMMAND from sshd")?;

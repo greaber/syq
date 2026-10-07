@@ -4430,8 +4430,16 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     args.receiver_max_bytes = Some(0);
     assert!(validate_restricted_args(&args).is_err());
     assert!(validate_restricted_args(&parse(&["--max-size", "0"])).is_err());
-    assert!(validate_restricted_args(&parse(&["--delete"])).is_err());
+    validate_restricted_args(&parse(&["--delete"])).unwrap();
     validate_restricted_args(&parse(&["--delete", "--max-delete", "0"])).unwrap();
+    // Selection options and size limits act as for an ordinary copy.
+    for options in [
+        &["--min-size", "1"][..],
+        &["--delete", "--max-size", "3M"],
+        &["--files-from", "list"],
+    ] {
+        validate_restricted_args(&parse(options)).unwrap();
+    }
 
     // A zero deletion budget signs a grant that forbids deletion outright.
     let id = EnrollmentId::random();
@@ -4447,6 +4455,44 @@ fn ceiling_ranges_are_checked_before_any_enrollment_side_effect() {
     let GrantOperation::Copy(copy) = &grant.operation;
     assert_eq!(copy.policy.deletion, DeletionPolicy::Forbid);
     assert_eq!(copy.limits.max_deletions, 0);
+}
+
+#[test]
+fn receivers_refuse_root_and_effective_capabilities() {
+    assert!(privilege::privileged(0, 0));
+    // CAP_DAC_OVERRIDE alone lets a process write any file.
+    assert!(privilege::privileged(1000, 1 << 1));
+    assert!(!privilege::privileged(1000, 0));
+    let status = "Name:\tsyq\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\n";
+    assert_eq!(
+        privilege::parse_effective_capabilities(status),
+        Some(0x1ff_ffff_ffff)
+    );
+    let ordinary = "Name:\tsyq\nCapEff:\t0000000000000000\n";
+    assert_eq!(privilege::parse_effective_capabilities(ordinary), Some(0));
+    assert_eq!(
+        privilege::parse_effective_capabilities("Name:\tsyq\n"),
+        None
+    );
+    // The refusal points to the alternatives, and to removing a root
+    // enrollment only when there is one.
+    let fresh = privilege::privileged_receiver_message(None);
+    assert!(fresh.contains("--coordinate-at local"), "{fresh}");
+    assert!(fresh.contains("--peer-auth broker"), "{fresh}");
+    assert!(!fresh.contains("revoke"), "{fresh}");
+    let existing = privilege::privileged_receiver_message(Some("0123abcd"));
+    assert!(
+        existing.ends_with("`syq receiver revoke 0123abcd` removes this root enrollment"),
+        "{existing}"
+    );
+}
+
+#[test]
+fn only_enrolled_grants_leave_bandwidth_to_the_sender() {
+    assert!(enrolled_grant("c2lnbmVkLWdyYW50"));
+    assert!(!enrolled_grant("named-v2:route"));
+    assert!(!enrolled_grant(crate::destination::RETURN_GRANT));
+    assert!(!enrolled_grant(crate::destination::peer_bridge::GRANT));
 }
 
 #[test]
@@ -4480,7 +4526,7 @@ fn native_comparison_block_size_sets_the_signed_receiver_limit() {
 }
 
 #[test]
-fn explicit_ceilings_are_signed_and_deletion_needs_a_stated_budget() {
+fn explicit_ceilings_are_signed_and_deletion_defaults_to_the_entry_ceiling() {
     let id = EnrollmentId::random();
     let source = Location::parse("host-a:source").unwrap();
     let parse = |options: &[&str]| {
@@ -4534,17 +4580,22 @@ fn explicit_ceilings_are_signed_and_deletion_needs_a_stated_budget() {
     assert_eq!(copy.limits.max_file_bytes, 2 << 20);
     assert_eq!(grant.issued_at - grant.not_before, CLOCK_SKEW_SECONDS);
 
-    // Deletion authority must be stated; it is then capped by the entry
-    // ceiling so the grant stays self-consistent.
-    let unbounded = parse(&["--delete"]);
-    assert!(grant_for(
+    // Without --max-delete, pruning may remove as many entries as the copy
+    // may touch; a stated budget is capped by the entry ceiling so the
+    // grant stays self-consistent.
+    let mut unbounded = parse(&["--delete"]);
+    unbounded.receiver_max_entries = Some(30);
+    let grant = grant_for(
         &unbounded,
         std::slice::from_ref(&source),
         id,
         "backup",
-        b"/backup"
+        b"/backup",
     )
-    .is_err());
+    .unwrap();
+    let GrantOperation::Copy(copy) = &grant.operation;
+    assert_eq!(copy.policy.deletion, DeletionPolicy::DeleteDestinationOnly);
+    assert_eq!(copy.limits.max_deletions, 30);
     let mut bounded = parse(&["--delete", "--max-delete", "40"]);
     bounded.receiver_max_entries = Some(30);
     let grant = grant_for(
@@ -4612,11 +4663,6 @@ fn signed_scopes_distinguish_named_children_from_directory_contents() {
         .mutation_scopes
         .iter()
         .all(|scope| !scope.descendants));
-
-    let mut unsupported = nonrecursive_args;
-    unsupported.min_size = Some("1".into());
-    let file = Location::parse("host-a:file").unwrap();
-    assert!(grant_for(&unsupported, &[file], id, "backup", b"/backup").is_err());
 }
 
 #[test]

@@ -19,6 +19,8 @@ host keys. HostA's SSH configuration does not override those choices.
 ## Enrollment
 
 Enrollment needs normal command authority on the destination during setup.
+The receiver does not run as root or with root's capabilities, so enroll an
+ordinary account.
 Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
@@ -194,7 +196,8 @@ copy between this machine and one SSH server.
 These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
-Per-copy SSH authorization through a receiving machine does not support `--detach`, custom
+Per-copy SSH authorization through a receiving machine does not support a root
+login on the destination, `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
 or `--coordinate-at`, or `--no-tcp-encryption`. Uploads send file data directly from
 source to destination over encrypted TCP, falling back to SSH between those same
@@ -252,7 +255,8 @@ the source and destination. The invoking machine's `ProxyJump` route can
 reach the control endpoints, but does not provide a data route between the
 servers. Data workers still need to reach the peer directly. Disabled forwarding is an error and never selects a
 payload relay. Syq creates a receiver for this copy over the destination's
-approved account connection; durable receiver enrollment is unnecessary.
+approved account connection, which must not log in as root; durable receiver
+enrollment is unnecessary.
 The destination's [restricted-copy limits](#limits-and-unsupported-options)
 and [signed results](#signed-results) still apply. Helpers must match the
 invoking build; normal bootstrap installs them unless disabled.
