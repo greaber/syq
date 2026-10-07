@@ -223,6 +223,8 @@ enum FileSystemKey {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy<'a> {
     inplace: bool,
+    /// The group publication gives an in-place file, when it sets one.
+    group: Option<u32>,
     replace_partial: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
@@ -681,6 +683,9 @@ pub struct FsOps {
     /// Directories this connection created private or widened, for the
     /// modes it chooses for them later.
     receiver_directories: receiver_mode::ReceiverDirectories,
+    /// The parents of the in-place files the current small-file batch
+    /// creates, looked up once per directory.
+    inplace_parents: Mutex<apply::InplaceParents>,
     /// A new directory whose mode lacks owner access, as `syq rsync` creates
     /// one, gets that mode only after its contents.
     narrow_new_directories: bool,
@@ -900,6 +905,7 @@ impl FsOps {
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
             receiver_directories: Default::default(),
+            inplace_parents: Default::default(),
             narrow_new_directories: false,
             creation_permissions: Default::default(),
             prepared_small_copy: None,

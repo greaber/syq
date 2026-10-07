@@ -1060,6 +1060,10 @@ pub enum WireRequest<Data> {
         attempt: u32,
         create_if_missing: bool,
         guard: Option<ContainerGuard>,
+        /// The group publication gives the file, when it sets one. A new
+        /// in-place file that would start with another group is created
+        /// owner-only.
+        group: Option<u32>,
     },
     /// Hash an existing final file and retain that open inode as the repair
     /// basis until FinishBasis or SeedBasis consumes it. Offset zero opens a
@@ -1119,6 +1123,9 @@ pub enum WireRequest<Data> {
         /// The mode an in-place file this creates starts with
         /// (`fsops::inplace_creation_mode`).
         mode: u32,
+        /// The group publication gives the file, when it sets one, as in
+        /// `Prepare`.
+        group: Option<u32>,
     },
     HashBlocks {
         off: u64,

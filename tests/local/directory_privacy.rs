@@ -173,7 +173,7 @@ fn a_new_destination_root_grants_no_more_than_its_source_while_filled() {
 
 /// A supplementary group of this process other than its effective group.
 #[cfg(target_os = "linux")]
-fn other_group() -> Option<libc::gid_t> {
+pub(crate) fn other_group() -> Option<libc::gid_t> {
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     let mut groups = vec![0; count.max(0) as usize];
     let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };

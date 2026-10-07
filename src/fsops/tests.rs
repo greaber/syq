@@ -874,6 +874,7 @@ fn macos_receiver_refuses_inplace_copy_without_touching_files() {
             copy_id: [38; 16],
             size: 9,
             mode: 0o600,
+            group: None,
         });
         assert!(
             matches!(response, Response::CopyLocalUnsupported),
@@ -906,6 +907,7 @@ fn direct_copy_rejects_eof_before_the_planned_size() {
             allow_sequential_nfs_fallback: false,
             allow_sequential_local_fallback: true,
             progress: &mut |_| Ok(()),
+            group: None,
         },
         &[37; 16],
         100,
@@ -7753,6 +7755,7 @@ fn native_copy_reports_original_writer_close_error() {
                 allow_sequential_nfs_fallback: false,
                 allow_sequential_local_fallback: true,
                 progress: &mut |_| Ok(()),
+                group: None,
             },
             &[84; 16],
             1 << 20,

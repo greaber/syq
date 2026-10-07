@@ -112,6 +112,35 @@ impl FsOps {
         }
     }
 
+    /// The mode for a new in-place file at `target`, created with `mode`
+    /// unless it would start with a group other than `group`, the one
+    /// publication gives it: then it is created owner-only, so the group the
+    /// kernel gives it cannot read what is written before finalize changes
+    /// it. Deciding looks up its directory, so it is done only when a file
+    /// is to be created and its group is set; within a small-file batch
+    /// (`in_batch`) once per directory.
+    pub(super) fn inplace_group_mode(
+        &self,
+        target: &RootedTarget,
+        mode: u32,
+        group: Option<u32>,
+        in_batch: bool,
+    ) -> u32 {
+        let differs = |group| {
+            if in_batch {
+                let mut parents = self.inplace_parents.lock().unwrap();
+                apply::new_file_group_may_differ(target, group, Some(&mut parents))
+            } else {
+                apply::new_file_group_may_differ(target, group, None)
+            }
+        };
+        if group.is_some_and(differs) {
+            PRIVATE_PARTIAL_MODE
+        } else {
+            mode
+        }
+    }
+
     /// Whether every new in-place file is created through a private
     /// directory (`create_new_inplace_file`), and so only exclusively.
     fn creates_inplace_files_privately(&self) -> bool {
@@ -1237,6 +1266,7 @@ impl FsOps {
         self.held_basis.take();
         let CopyLocalPolicy {
             inplace,
+            group,
             replace_partial,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
@@ -1367,6 +1397,7 @@ impl FsOps {
                     None => {
                         // The coordinator sends the in-place creation mode
                         // (`inplace_creation_mode`).
+                        let mode = self.inplace_group_mode(&target, mode, group, false);
                         match self.create_inplace_file(
                             &destination_root,
                             &target_relative,
@@ -1973,9 +2004,13 @@ impl FsOps {
             // that clear its set-ID bits, or `None` for a new file.
             let mut found = None;
             let acl = has_acl(meta.inode_metadata.as_deref());
-            // Created owner-only, as `inplace_creation_mode` says.
-            let private = flags & flags::GROUP != 0 || acl;
+            // The group publication sets, which a new file created with
+            // another one waits for owner-only (`inplace_group_mode`).
+            let group = (flags & flags::GROUP != 0).then_some(meta.gid);
+            // Whether a new file may be created owner-only.
+            let private = group.is_some() || acl;
             let create_mode = inplace_creation_mode(meta.mode, flags, acl);
+            let creation_mode = || self.inplace_group_mode(&rooted, create_mode, group, true);
             // How far the file's old contents may extend. They are written
             // over and only then cut to the new length, so a write that
             // fails leaves old data rather than an emptied file.
@@ -1984,7 +2019,12 @@ impl FsOps {
                 // The whole file is written here and never read back.
                 TargetCondition::Absent => {
                     let file = self
-                        .create_new_inplace_file(&rooted.root, &rooted.relative, create_mode, true)
+                        .create_new_inplace_file(
+                            &rooted.root,
+                            &rooted.relative,
+                            creation_mode(),
+                            true,
+                        )
                         .with_context(|| format!("create {}", rooted.label.display()))?;
                     created = Some(file.metadata()?);
                     file
@@ -2031,7 +2071,7 @@ impl FsOps {
                     } else {
                         match rooted
                             .root
-                            .open_or_create_write_only_file(&rooted.relative, create_mode)
+                            .open_or_create_write_only_file(&rooted.relative, creation_mode())
                         {
                             Ok((file, metadata)) if metadata.is_file() => {
                                 old_len = metadata.len();
@@ -2074,7 +2114,7 @@ impl FsOps {
                             None => match self.create_new_inplace_file(
                                 &rooted.root,
                                 &rooted.relative,
-                                create_mode,
+                                creation_mode(),
                                 true,
                             ) {
                                 Ok(file) => {
@@ -3232,6 +3272,7 @@ impl FsOps {
                 attempt,
                 create_if_missing,
                 guard,
+                group,
             } => self
                 .creation_mode(
                     path,
@@ -3241,6 +3282,7 @@ impl FsOps {
                     *flags,
                     *acl,
                     *scanned,
+                    *group,
                 )
                 .and_then(|mode| {
                     self.prepare(
@@ -3426,12 +3468,14 @@ impl FsOps {
                 copy_id,
                 size,
                 mode,
+                group,
             } => self
                 .copy_local(
                     source,
                     dst,
                     CopyLocalPolicy {
                         inplace: *inplace,
+                        group: *group,
                         replace_partial: *replace_partial,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,
@@ -3798,13 +3842,14 @@ pub(crate) fn staged_mode(mode: u32, flags: u8, acl: bool) -> u32 {
 
 /// The mode a file the copy writes in place is created with, which its
 /// directory's default ACL, or else the umask, then limits. Like a sidecar,
-/// it stays private while its group or ACL is still to be set: the group
-/// the kernel gives it at creation, or the ACL mask its group bits set,
-/// would let others read what is written before finalize sets them.
-/// Otherwise it has the permission bits it will end with, so that finalize
-/// needs no chmod; a proposal's special bits are never created.
+/// it stays private while an ACL is still to be set: the ACL mask its group
+/// bits set would let others read what is written before finalize sets the
+/// ACL. Otherwise it has the permission bits it will end with, so that
+/// finalize needs no chmod; a proposal's special bits are never created.
+/// The receiver also keeps it private when its group will change
+/// (`FsOps::inplace_group_mode`).
 pub(crate) fn inplace_creation_mode(mode: u32, flags: u8, acl: bool) -> u32 {
-    if flags & flags::GROUP != 0 || acl {
+    if acl {
         PRIVATE_PARTIAL_MODE
     } else if flags & flags::RECEIVER_MODE != 0 {
         mode & 0o777

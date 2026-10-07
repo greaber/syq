@@ -123,6 +123,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
             attempt: 0,
             create_if_missing: true,
             guard: None,
+            group: None,
         })
         .unwrap();
     assert!(matches!(

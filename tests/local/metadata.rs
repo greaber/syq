@@ -242,136 +242,224 @@ fn in_place_updates_keep_existing_set_id_bits() {
     }
 }
 
+/// The default ACL of `directory`, as the kernel stores one: (tag,
+/// permissions, id) entries.
+#[cfg(target_os = "linux")]
+fn set_default_acl(directory: &Path, entries: &[(u16, u16, u32)]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in entries {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    let path = std::ffi::CString::new(directory.as_os_str().as_bytes()).unwrap();
+    let set = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            c"system.posix_acl_default".as_ptr(),
+            acl.as_ptr().cast(),
+            acl.len(),
+            0,
+        )
+    };
+    if set != 0 {
+        eprintln!(
+            "skipped: this filesystem rejected a default ACL: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    set == 0
+}
+
+/// How an in-place copy of one file is run: batched, in ranges, or as a
+/// local whole-file copy, and stopped after the file is created and
+/// written to, or run to the end.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+struct InplaceRun<'a> {
+    args: &'a [&'a str],
+    path: &'a str,
+    stopped: bool,
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+impl InplaceRun<'_> {
+    /// The source file's name and size for the path.
+    fn source(&self) -> (&'static str, usize) {
+        if self.path == "batched" {
+            ("small", 100)
+        } else {
+            ("large", 3 << 20)
+        }
+    }
+
+    /// Run the copy into `dst` and return the destination file's mode,
+    /// observed while a stopped run holds or after it fails.
+    fn run(&self, t: &Tmp, dst: &Path) -> u32 {
+        let (name, _) = self.source();
+        let context = format!("{:?}, {}, stopped={}", self.args, self.path, self.stopped);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args(self.args).arg("--no-progress");
+        if self.args[0] == "cp" {
+            command.args(["--srcs-in", &t.s("src"), "--into", dst.to_str().unwrap()]);
+        } else {
+            command.args([format!("{}/", t.s("src")), format!("{}/", dst.display())]);
+        }
+        if self.path == "ranges" {
+            command.args(["--performance-tuning", "copy-path=ranges"]);
+        }
+        let (ready, resume) = (t.path("written"), t.path("continue"));
+        let _ = fs::remove_file(&ready);
+        let _ = fs::remove_file(&resume);
+        if self.stopped {
+            match self.path {
+                "batched" => command.env("SYQ_TEST_FAIL_INPLACE_PUT", "1"),
+                "ranges" => command.env("SYQ_TEST_FAIL_WRITE_RANGE_NAME", name),
+                _ => command
+                    .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+                    .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+                    .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", &ready)
+                    .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &resume),
+            };
+        }
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+        let file = dst.join(name);
+        if self.stopped && self.path == "local" {
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .start()
+                .unwrap();
+            wait_for(
+                "the local copy's first write",
+                std::time::Duration::from_secs(30),
+                || ready.exists() || child.try_wait().unwrap().is_some(),
+            );
+            assert!(ready.exists(), "{context}: no local copy was held");
+            let observed = permission_bits(&file);
+            write(&resume, b"continue");
+            assert_output_ok(&child.wait_with_output().unwrap());
+            return observed;
+        }
+        let output = command.run().unwrap();
+        assert_eq!(
+            output.status.success(),
+            !self.stopped,
+            "{context}: {}",
+            stderr_of(&output)
+        );
+        if !self.stopped {
+            assert_eq!(read(&file), read(&t.path("src").join(name)), "{context}");
+        }
+        permission_bits(&file)
+    }
+}
+
+/// A source tree of one `0644` file for `run`, and a second file that lets a
+/// local copy write its file sequentially.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn inplace_source(t: &Tmp, run: &InplaceRun<'_>) {
+    let (name, size) = run.source();
+    write(&t.path("src").join(name), &prng(size, 5));
+    fs::set_permissions(t.path("src").join(name), fs::Permissions::from_mode(0o644)).unwrap();
+    write(&t.path("src/other"), b"other");
+}
+
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn new_in_place_files_are_written_private_until_their_group_or_acl_is_set() {
-    use std::os::unix::ffi::OsStrExt;
     // A file --inplace creates gets its copied group or ACL only when it is
     // finalized. Until then its group bits would let the group it was
-    // created with read it, or, as the mask of an ACL it inherited, the
-    // named user of its directory's default ACL. Each run stops after the
-    // file is created and written to: a batched or range write fails and
-    // leaves it, and a local copy is held after its first write.
-    let default_acl = |entries: &[(u16, u16, u32)]| {
-        let mut acl = 2u32.to_le_bytes().to_vec();
-        for (tag, permissions, id) in entries {
-            acl.extend(tag.to_le_bytes());
-            acl.extend(permissions.to_le_bytes());
-            acl.extend(id.to_le_bytes());
-        }
-        acl
-    };
+    // created with read it, when that group is not its final one, or, as
+    // the mask of an ACL it inherited, the named user of its directory's
+    // default ACL. Each stopped run is held, or fails its writes, after the
+    // file is created and written to.
     // USER_OBJ rwx, USER 12345 rwx, GROUP_OBJ r-x, MASK rwx, OTHER r-x.
-    let named = default_acl(&[
+    let named = [
         (1, 7, u32::MAX),
         (2, 7, 12345),
         (4, 5, u32::MAX),
         (16, 7, u32::MAX),
         (32, 5, u32::MAX),
-    ]);
-    for (metadata, acl) in [("ownership", None), ("acls", Some(&named))] {
+    ];
+    let group = crate::directory_privacy::other_group();
+    if group.is_none() {
+        eprintln!("skipped the group change: this process has no other group");
+    }
+    for metadata in ["ownership", "acls"] {
+        if metadata == "ownership" && group.is_none() {
+            continue;
+        }
         for path in ["batched", "ranges", "local"] {
-            let context = format!("--copy-metadata={metadata}, {path}");
             let t = Tmp::new();
-            let (name, size) = if path == "batched" {
-                ("small", 100)
-            } else {
-                ("large", 3 << 20)
-            };
-            write(&t.path("src").join(name), &prng(size, 5));
-            fs::set_permissions(t.path("src").join(name), fs::Permissions::from_mode(0o644))
-                .unwrap();
-            // A second file lets the local copy write its file sequentially.
-            write(&t.path("src/other"), b"other");
-            let src = t.s("src");
-            for (destination, stopped) in [("stopped", true), ("finished", false)] {
-                let dst = t.path(destination);
-                fs::create_dir(&dst).unwrap();
-                if let Some(acl) = acl {
-                    let c_path = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
-                    if unsafe {
-                        libc::setxattr(
-                            c_path.as_ptr(),
-                            c"system.posix_acl_default".as_ptr(),
-                            acl.as_ptr().cast(),
-                            acl.len(),
-                            0,
-                        )
-                    } != 0
-                    {
-                        eprintln!(
-                            "skipped: this filesystem rejected a default ACL: {}",
-                            std::io::Error::last_os_error()
-                        );
-                        return;
-                    }
-                }
-                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
-                command.args([
-                    "cp",
-                    "--no-progress",
-                    "--inplace",
-                    &format!("--copy-metadata={metadata}"),
-                    "--srcs-in",
-                    &src,
-                    "--into",
-                    dst.to_str().unwrap(),
-                ]);
-                if path == "ranges" {
-                    command.args(["--performance-tuning", "copy-path=ranges"]);
-                }
-                let (ready, resume) = (t.path("written"), t.path("continue"));
-                if stopped {
-                    match path {
-                        "batched" => command.env("SYQ_TEST_FAIL_INPLACE_PUT", "1"),
-                        "ranges" => command.env("SYQ_TEST_FAIL_WRITE_RANGE_NAME", name),
-                        _ => command
-                            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
-                            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
-                            .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", &ready)
-                            .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &resume),
-                    };
-                }
-                unsafe {
-                    command.pre_exec(|| {
-                        libc::umask(0o022);
-                        Ok(())
-                    });
-                }
-                let file = dst.join(name);
-                let observed = if stopped && path == "local" {
-                    let mut child = command
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .start()
-                        .unwrap();
-                    wait_for(
-                        "the local copy's first write",
-                        std::time::Duration::from_secs(30),
-                        || ready.exists() || child.try_wait().unwrap().is_some(),
-                    );
-                    assert!(ready.exists(), "{context}: no local copy was held");
-                    let observed = permission_bits(&file);
-                    write(&resume, b"continue");
-                    assert_output_ok(&child.wait_with_output().unwrap());
-                    observed
-                } else {
-                    let output = command.run().unwrap();
-                    assert_eq!(
-                        output.status.success(),
-                        !stopped,
-                        "{context}: {}",
-                        stderr_of(&output)
-                    );
-                    permission_bits(&file)
+            let copy_metadata = format!("--copy-metadata={metadata}");
+            let args = ["cp", "--inplace", copy_metadata.as_str()];
+            for stopped in [true, false] {
+                let run = InplaceRun {
+                    args: &args,
+                    path,
+                    stopped,
                 };
+                inplace_source(&t, &run);
+                if let Some(group) = group.filter(|_| metadata == "ownership") {
+                    let (name, _) = run.source();
+                    std::os::unix::fs::chown(t.path("src").join(name), None, Some(group)).unwrap();
+                }
+                let dst = t.path(if stopped { "stopped" } else { "finished" });
+                fs::create_dir(&dst).unwrap();
+                if metadata == "acls" && !set_default_acl(&dst, &named) {
+                    return;
+                }
+                let context = format!("{metadata}, {path}, stopped={stopped}");
+                let observed = run.run(&t, &dst);
                 if stopped {
                     assert_eq!(observed & 0o077, 0, "{context}: {observed:o}");
                 } else {
-                    assert_eq!(read(&file), read(&t.path("src").join(name)), "{context}");
                     assert_eq!(observed, 0o644, "{context}: {observed:o}");
+                    if let Some(group) = group.filter(|_| metadata == "ownership") {
+                        let (name, _) = run.source();
+                        assert_eq!(fs::metadata(dst.join(name)).unwrap().gid(), group);
+                    }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn an_interrupted_in_place_copy_that_keeps_the_group_ends_with_the_normal_mode() {
+    // A new in-place file whose copied group is the one it is created with
+    // has its final mode from the start, so a copy stopped part way, and the
+    // copy that then finishes it, leave it as an uninterrupted copy does.
+    let commands: [&[&str]; 2] = [
+        &["cp", "--inplace", "--copy-metadata=ownership"],
+        &["rsync", "-rg", "--inplace"],
+    ];
+    for args in commands {
+        for path in ["batched", "ranges"] {
+            let t = Tmp::new();
+            let context = format!("{args:?}, {path}");
+            let stopped = InplaceRun {
+                args,
+                path,
+                stopped: true,
+            };
+            inplace_source(&t, &stopped);
+            let dst = t.path("dst");
+            fs::create_dir(&dst).unwrap();
+            assert_eq!(stopped.run(&t, &dst), 0o644, "{context}: stopped");
+            let rerun = InplaceRun {
+                args,
+                path,
+                stopped: false,
+            };
+            assert_eq!(rerun.run(&t, &dst), 0o644, "{context}: rerun");
         }
     }
 }

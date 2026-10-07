@@ -651,6 +651,46 @@ pub(super) fn starting_group_may_differ(
         parents.lock().unwrap().insert(parent_path, observed);
         observed
     });
+    group_may_differ(parent, group)
+}
+
+/// The group and mode of the directories in-place files are created in,
+/// by root identity and path, observed once per small-file batch.
+pub(super) type InplaceParents = HashMap<(u64, u64, Vec<u8>), Option<(u32, u32)>>;
+
+/// Whether a file created at `target` might start with a group other than
+/// `group`, decided as for a directory (`starting_group_may_differ`) from
+/// its parent, which this looks up unless `parents` already holds it.
+pub(super) fn new_file_group_may_differ(
+    target: &RootedTarget,
+    group: u32,
+    parents: Option<&mut InplaceParents>,
+) -> bool {
+    let Ok((directories, _)) = target.relative.leaf() else {
+        return true;
+    };
+    let directory = directories.join(&b'/');
+    let observe = || -> Option<(u32, u32)> {
+        let parent = target
+            .root
+            .metadata(&RelativePath::new(&directory).ok()?)
+            .ok()?;
+        Some((parent.gid, parent.mode))
+    };
+    let parent = match parents {
+        Some(parents) => {
+            let identity = target.root.identity();
+            let key = (identity.dev, identity.ino, directory.clone());
+            *parents.entry(key).or_insert_with(observe)
+        }
+        None => observe(),
+    };
+    group_may_differ(parent, group)
+}
+
+/// Whether an object created in a directory with `parent`'s group and mode
+/// might start with a group other than `group`.
+fn group_may_differ(parent: Option<(u32, u32)>, group: u32) -> bool {
     let Some((parent_group, parent_mode)) = parent else {
         return true;
     };

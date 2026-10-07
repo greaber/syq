@@ -890,6 +890,19 @@ impl FsOps {
         sources: &[Option<PatchSource<'_>>],
         built: bool,
     ) -> Vec<SmallOutcome> {
+        // In-place files look their directories up once per batch.
+        self.inplace_parents.lock().unwrap().clear();
+        let results = self.put_small_sources_in_batch(puts, sources, built);
+        self.inplace_parents.lock().unwrap().clear();
+        results
+    }
+
+    fn put_small_sources_in_batch(
+        &mut self,
+        puts: &mut [SmallPut],
+        sources: &[Option<PatchSource<'_>>],
+        built: bool,
+    ) -> Vec<SmallOutcome> {
         let mut results: Vec<SmallOutcome> = vec![Ok(None); puts.len()];
         let mut carried = None;
         let mut next = 0;
