@@ -257,6 +257,13 @@ pub(crate) fn snapshot(domain: &Domain) -> Result<Option<Snapshot>> {
         Err(error) => Err(error),
     }
 }
+/// Stop a provider from another build, which `ensure` would replace anyway.
+pub(super) fn stop_other_build(domain: &Domain) -> Result<()> {
+    if snapshot(domain)?.is_some_and(|state| state.build != crate::identity::build()) {
+        stop(domain)?;
+    }
+    Ok(())
+}
 pub(super) fn refresh(domain: &Domain) -> Result<()> {
     if is_running(domain)? {
         query(domain, Control::Refresh)?;
@@ -831,7 +838,7 @@ impl Runtime {
             domain.enabled()? && preferences(&domain)?.enabled(),
             "receiving is off in this domain"
         );
-        let lock = acquire_lock(&domain, true)?
+        let lock = lock_for_start(|| acquire_lock(&domain, true))?
             .context("local SSH authorization provider is already running")?;
         let path = scope.join(SOCKET_FILE);
         match fs::symlink_metadata(&path) {
@@ -1534,5 +1541,91 @@ mod tests {
         assert!(!is_running(&first_domain).unwrap());
         assert!(is_running(&second_domain).unwrap());
         drop(second);
+    }
+
+    #[test]
+    fn a_starting_provider_waits_out_a_status_probe_before_giving_up() {
+        let (_directory, domain, _) = fixture();
+        let _owner = acquire_lock(&domain, true).unwrap().unwrap();
+        let started = Instant::now();
+        let error = Runtime::new(domain.clone()).err().unwrap();
+        assert!(started.elapsed() >= PROBE_GRACE, "{:?}", started.elapsed());
+        assert!(error.to_string().contains("already running"), "{error:#}");
+    }
+
+    /// A provider from an older build: it answers status and stop, and rejects
+    /// a refresh by closing the connection, as one that cannot parse newer
+    /// settings does. Returns the requests it received.
+    fn other_build_provider(domain: &Domain) -> std::thread::JoinHandle<Vec<&'static str>> {
+        const OTHER: &str = "v0.0.1+other";
+        let lock = acquire_lock(domain, true).unwrap().unwrap();
+        let path = domain.runtime_path().join(SOCKET_FILE);
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut lock = Some(lock);
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while lock.is_some() {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "provider was not stopped: {seen:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let _: Hello = crate::destination::read_message(&mut stream).unwrap();
+                crate::destination::write_message(
+                    &mut stream,
+                    &HelloReply {
+                        version: PROTOCOL,
+                        build: OTHER.into(),
+                    },
+                )
+                .unwrap();
+                let reply = Snapshot {
+                    build: OTHER.into(),
+                    pid: 1,
+                    profiles: Vec::new(),
+                    decision_error: None,
+                };
+                match crate::destination::read_message(&mut stream).unwrap() {
+                    Control::Status => seen.push("status"),
+                    Control::Refresh => {
+                        seen.push("refresh");
+                        continue;
+                    }
+                    Control::Stop => {
+                        seen.push("stop");
+                        lock = None;
+                    }
+                    Control::Decide(_) => panic!("unexpected decision"),
+                }
+                crate::destination::write_framed(
+                    &mut stream,
+                    &reply,
+                    MAX_STATUS,
+                    "provider status",
+                )
+                .unwrap();
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn receive_on_stops_a_provider_from_another_build_instead_of_refreshing_it() {
+        let (_directory, domain, _) = fixture();
+        let old = other_build_provider(&domain);
+        configure_profile(&domain, Configure::default()).unwrap();
+        assert_eq!(old.join().unwrap(), ["status", "stop"]);
+        assert!(!is_running(&domain).unwrap());
     }
 }
