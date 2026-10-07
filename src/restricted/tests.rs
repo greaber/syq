@@ -7258,3 +7258,71 @@ fn a_deleted_and_relinked_name_does_not_redirect_an_approved_change() {
         0o600
     );
 }
+
+/// A restricted receiver counts the names its own lookups returned, whether
+/// a stat or a planning batch asked. A file whose eight names were looked
+/// up together, all inside the signed scope, takes a time change through
+/// any of them.
+#[test]
+fn names_a_lookup_returned_count_inside() {
+    use std::os::unix::fs::MetadataExt;
+    for planning in [true, false] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let names: Vec<PathBuf> = (0..8).map(|i| target.join(format!("name{i}"))).collect();
+        fs::write(&names[0], b"shared").unwrap();
+        for name in &names[1..] {
+            fs::hard_link(&names[0], name).unwrap();
+        }
+        let authority = time_preserving_test_authority_for(&root, 1 << 20, 64, false);
+        let mut ops = crate::fsops::FsOps::new();
+        ops.set_scope_names(authority.scope_names());
+        let mut send = |mut request: Request| {
+            let settlement = authority.authorize(&mut request, false).unwrap();
+            let response = ops.handle(&request);
+            authority.settle(settlement, &response);
+            response
+        };
+        let paths: Vec<_> = names.iter().map(|name| path_bytes(name)).collect();
+        send(if planning {
+            Request::PlanBatch {
+                partial_paths: Vec::new(),
+                copy_id: [3; 16],
+                directories: vec![path_bytes(&target)],
+                others: paths,
+                guard: None,
+                strict_metadata: false,
+            }
+        } else {
+            Request::StatMany {
+                paths,
+                sources: None,
+                follow: false,
+                guard: None,
+            }
+        });
+        let before = fs::metadata(&names[0]).unwrap();
+        let response = send(Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: path_bytes(&names[0]),
+                meta: proto::Meta {
+                    mtime: 1_600_000_000,
+                    ..plain_meta()
+                },
+                flags: proto::flags::TIMES,
+                condition: proto::TargetCondition::Matches {
+                    dev: before.dev(),
+                    ino: before.ino(),
+                },
+            }],
+            guard: None,
+        });
+        assert!(
+            matches!(&response, proto::Response::Applied(errors) if errors.iter().all(Option::is_none)),
+            "planning={planning}: {response:?}"
+        );
+        assert_eq!(fs::metadata(&names[7]).unwrap().mtime(), 1_600_000_000);
+    }
+}

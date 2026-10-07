@@ -136,6 +136,27 @@ impl FsOps {
         }
     }
 
+    /// Remember the names a guarded destination lookup of `paths` found,
+    /// whichever request asked: a stat, a planning batch or a pruning lookup.
+    pub(crate) fn record_looked_up_names(
+        &self,
+        paths: &[PathBytes],
+        entries: &[Option<Entry>],
+        guard: Option<&ContainerGuard>,
+    ) {
+        let Some(names) = self.scope_names.as_ref().filter(|_| guard.is_some()) else {
+            return;
+        };
+        for (path, entry) in paths.iter().zip(entries) {
+            if let Some(entry) = entry
+                .as_ref()
+                .filter(|entry| entry.nlink > 1 && entry.kind != Kind::Dir)
+            {
+                names.record(path, entry.dev, entry.ino);
+            }
+        }
+    }
+
     /// Refuse to change `target`'s file in place, described by `metadata`,
     /// when it has names outside the approved directories.
     pub(super) fn require_names_inside(

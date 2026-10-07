@@ -306,18 +306,8 @@ impl FsOps {
             )?;
         }
         let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
-        if let Some(names) = self
-            .scope_names
-            .as_ref()
-            .filter(|_| guard.is_some() && !follow)
-        {
-            for (path, entry) in paths.iter().zip(&entries) {
-                if let Some(entry) = entry.as_ref().filter(|entry| entry.nlink > 1) {
-                    if entry.kind != Kind::Dir {
-                        names.record(path, entry.dev, entry.ino);
-                    }
-                }
-            }
+        if !follow {
+            self.record_looked_up_names(paths, &entries, guard);
         }
         if self.inode_preservation.any() {
             for (index, entry) in entries.iter_mut().enumerate() {
