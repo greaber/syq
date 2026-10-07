@@ -269,20 +269,46 @@ mod bounded_tests {
 
     #[test]
     fn deadline_kills_descendant_holding_output_after_parent_exits() {
-        let directory = crate::test_support::tempdir().unwrap();
-        let pidfile = directory.path().join("descendant");
-        let script = format!(
-            "sleep 30 & echo $! > {}; exit 0",
-            shell_words::quote(pidfile.to_str().unwrap())
-        );
-        let error = capture(&script, Duration::from_millis(150), &|| false, 1024).unwrap_err();
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt as _;
+        // The shell and everything it starts inherit this pipe as descriptor
+        // 3, so its read end reaches EOF only once all of them have exited.
+        // A PID file would need the shell to write it before the deadline,
+        // which a slow host does not guarantee.
+        let (mut alive, holder) = with_inheritance_guard(std::io::pipe).unwrap();
+        let fd = holder.as_raw_fd();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & exit 0"]);
+        unsafe {
+            command.pre_exec(move || {
+                // dup2 clears close-on-exec on its copy; dup2(3, 3) does not.
+                let result = if fd == 3 {
+                    libc::fcntl(fd, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if result < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let error = capture_output_bounded(
+            &mut command,
+            Instant::now() + Duration::from_millis(150),
+            &|| false,
+            1024,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        let pid: libc::pid_t = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_descendant_stopped(pid);
+        drop(holder);
+        let (closed, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || closed.send(alive.read_to_end(&mut Vec::new()).unwrap()));
+        let unread = wait
+            .recv_timeout(Duration::from_secs(3))
+            .expect("inspection descendant survived process-group cleanup");
+        assert_eq!(unread, 0);
     }
 
     #[test]
