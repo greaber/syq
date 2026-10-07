@@ -3707,9 +3707,15 @@ impl Planner<'_> {
         self.progress.deletions_planned.store(planned, Relaxed);
         if let Some(max) = opts.max_delete {
             if planned > max {
-                self.progress.eprintln(&format!(
-                    "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
-                ));
+                self.progress.eprintln(&if opts.max_delete_from_approver {
+                    format!(
+                        "syq: {planned} deletions planned, more than the {max} the approving machine allows; deleting nothing (raise its limit there with `syq persist receive on --max-delete N`)"
+                    )
+                } else {
+                    format!(
+                        "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
+                    )
+                });
                 if let Some(results) = self.progress.results_writer().filter(|_| !opts.dry_run) {
                     let blocked = leaves
                         .iter()

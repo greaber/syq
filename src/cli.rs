@@ -560,6 +560,10 @@ pub struct Args {
         allow_hyphen_values = true
     )]
     pub max_delete: Option<u64>,
+    /// The approving machine's own --max-delete set `max_delete`, lower
+    /// than any the command gave.
+    #[arg(skip)]
+    pub max_delete_from_approver: bool,
     /// Native-only command-restricted receiver ceilings, signed into the grant.
     #[arg(skip)]
     pub receiver_max_entries: Option<u64>,

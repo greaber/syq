@@ -240,6 +240,8 @@ pub struct Opts {
     pub delete_excluded: bool,
     /// --max-delete: delete nothing if more than this many deletions are planned.
     pub max_delete: Option<u64>,
+    /// The approving machine's --max-delete is the one in effect.
+    pub max_delete_from_approver: bool,
     /// -u: skip files that are newer on the destination.
     pub update: bool,
     /// --ignore-existing: never touch a destination path that already exists.
@@ -2181,6 +2183,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         delete: args.delete,
         delete_excluded: args.delete_excluded,
         max_delete: args.max_delete,
+        max_delete_from_approver: args.max_delete_from_approver,
         expressions: args.expressions.clone(),
         update: args.update,
         ignore_existing: args.ignore_existing,

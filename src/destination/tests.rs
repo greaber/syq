@@ -975,7 +975,9 @@ fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
     let (prune, _) = request(&pruning);
     let error = constrain(prune.clone(), temporary.path(), 1000, 1000, 0).unwrap_err();
     assert!(
-        error.to_string().contains("pruning is turned off"),
+        error
+            .to_string()
+            .contains("pruning needs a positive --max-delete"),
         "{error:#}"
     );
     let constrained = constrain(prune.clone(), temporary.path(), 1000, 1000, 5).unwrap();
@@ -991,20 +993,25 @@ fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
         request: crate::delegation::RequestId::fresh(1).unwrap(),
         digest: [0; 32],
         receipt_key: String::new(),
-        max_delete: 0,
+        max_delete: None,
     };
-    for (stated, laptop, planned) in [
-        (None, 5, Some(5)),
-        (Some(3), 5, Some(3)),
-        (Some(9), 5, Some(5)),
-        (None, u64::MAX, None),
-        (Some(9), u64::MAX, Some(9)),
+    for (stated, machine, planned, from_machine) in [
+        (None, Some(5), Some(5), true),
+        (Some(3), Some(5), Some(3), false),
+        (Some(9), Some(5), Some(5), true),
+        (None, None, None, false),
+        (Some(9), None, Some(9), false),
     ] {
         let mut approved = approved.clone();
-        approved.max_delete = laptop;
+        approved.max_delete = machine;
         pruning.max_delete = stated;
+        pruning.max_delete_from_approver = false;
         apply_deletion_limit(&mut pruning, &approved);
-        assert_eq!(pruning.max_delete, planned, "{stated:?} {laptop}");
+        assert_eq!(
+            (pruning.max_delete, pruning.max_delete_from_approver),
+            (planned, from_machine),
+            "{stated:?} {machine:?}"
+        );
     }
 }
 

@@ -65,7 +65,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
             || (args.target_existence == Existence::New && args.placement == Placement::As))
     {
         bail!(
-            "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
+            "--inplace cannot be combined with --if-exists=keep, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     // Range-check every ceiling here, before automatic enrollment can touch
@@ -549,7 +549,7 @@ pub(crate) fn named_authority(
         request: request_id,
         digest,
         receipt_key: key.public_key().to_openssh()?,
-        max_delete: u64::MAX,
+        max_delete: None,
     };
     let authority = RestrictedAuthority::new(
         &config,

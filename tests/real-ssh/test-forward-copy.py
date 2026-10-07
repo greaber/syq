@@ -317,6 +317,25 @@ copy("/tmp/syq-real-ssh/forward/pipe", source="/tmp/syq-real-ssh/forward-special
      extra=("--copy-metadata=mtime,ownership,specials",))
 remote("test -p /tmp/syq-real-ssh/forward/pipe")
 
+print("case: approved copies prune within the laptop's own limit", flush=True)
+run("ssh", "source", "mkdir -p /tmp/syq-real-ssh/forward-prune-source && printf kept > /tmp/syq-real-ssh/forward-prune-source/kept")
+remote("mkdir -p /tmp/syq-real-ssh/forward/pruned && cd /tmp/syq-real-ssh/forward/pruned && "
+       "printf kept > kept && printf extra > extra-1 && printf extra > extra-2")
+run("syq", "persist", "receive", "on", "--max-delete", "1", "--notify", "off")
+run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+try:
+    # Two planned deletions exceed the laptop's limit of one: none happen.
+    copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+         extra=("--prune",), success=False)
+    remote("test -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/extra-2")
+    remote("rm /tmp/syq-real-ssh/forward/pruned/extra-2")
+    copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
+         extra=("--prune",))
+    remote("test ! -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/kept")
+finally:
+    run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+
 print("case: unreachable TCP falls back to direct restricted SSH data", flush=True)
 port = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
 started = time.monotonic()
