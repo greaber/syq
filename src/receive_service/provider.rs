@@ -294,14 +294,15 @@ fn running(
     }
     Ok(None)
 }
-/// Stop a provider from another build, which `ensure` would replace anyway.
-pub(super) fn stop_other_build(domain: &Domain) -> Result<()> {
+/// Stop a provider from another build, and report whether there was one.
+pub(super) fn stop_other_build(domain: &Domain) -> Result<bool> {
     if running(domain, ANSWER_TIMEOUT, || Control::Status)?
         .is_some_and(|state| state.build != crate::identity::build())
     {
         stop(domain)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 pub(super) fn refresh(domain: &Domain) -> Result<()> {
     running(domain, ANSWER_TIMEOUT, || Control::Refresh)?;
@@ -785,7 +786,8 @@ fn is_running(domain: &Domain) -> Result<bool> {
     }
 }
 
-/// Called only by explicit local receive-on, never by an inbound SSH helper.
+/// Called only by explicit local receiving commands, never by an inbound SSH
+/// helper.
 pub(super) fn ensure(domain: &Domain) -> Result<()> {
     domain.ensure_runtime()?;
     if let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? {
@@ -1755,37 +1757,12 @@ mod tests {
     }
 
     #[test]
-    fn receive_on_stops_a_provider_from_another_build_instead_of_refreshing_it() {
+    fn a_provider_from_another_build_is_stopped_instead_of_refreshed() {
         let (_directory, domain, _) = fixture();
         let old = other_build_provider(&domain);
-        configure_profile(&domain, Configure::default()).unwrap();
+        assert!(stop_other_build(&domain).unwrap());
         assert_eq!(old.join().unwrap(), ["status", "stop"]);
         assert!(!is_running(&domain).unwrap());
-    }
-
-    #[test]
-    fn receive_off_and_remove_stop_a_provider_from_another_build() {
-        for action in [
-            Action::Off {
-                name: Some("first".into()),
-            },
-            Action::Remove {
-                name: "first".into(),
-            },
-        ] {
-            let (_directory, domain, _) = fixture();
-            let old = other_build_provider(&domain);
-            run_command(&domain, ReceiveCommand { action }).unwrap();
-            // The old provider can no longer serve the profile that was turned
-            // off or removed; no provider runs until persist receive on.
-            assert_eq!(old.join().unwrap(), ["status", "stop"]);
-            assert!(!is_running(&domain).unwrap());
-            let remaining = preferences(&domain).unwrap();
-            assert!(remaining
-                .profiles
-                .iter()
-                .all(|profile| profile.name != "first" || !profile.enabled));
-            assert!(remaining.enabled());
-        }
+        assert!(!stop_other_build(&domain).unwrap());
     }
 }

@@ -1065,10 +1065,13 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
 fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
     if config.enabled() {
         // A provider from another build may not read these settings, and a
-        // profile turned off must still lose access. Stop it; persist receive
-        // on then starts one from this build, and off and remove leave none.
-        provider::stop_other_build(domain)?;
-        provider::refresh(domain)?;
+        // profile turned off must still lose access. Replace it with one from
+        // this build for the profiles that remain enabled.
+        if provider::stop_other_build(domain)? {
+            provider::ensure(domain)?;
+        } else {
+            provider::refresh(domain)?;
+        }
     } else {
         provider::stop(domain)?;
     }

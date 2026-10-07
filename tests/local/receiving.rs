@@ -2033,6 +2033,27 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
     assert!(!socket_path.exists());
 }
 
+/// Run `syq persist receive ...` in this fixture's isolated persistence domain.
+fn receive_command(t: &Tmp, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["persist", "receive"])
+        .args(args)
+        .env("HOME", t.path(""))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
+        .env("SYQ_NO_UPDATE_CHECK", "1")
+        .current_dir(t.path(""))
+        .capture_output()
+        .unwrap()
+}
+
+/// The local SSH authorization provider reported by `persist receive status`.
+fn local_provider(t: &Tmp) -> serde_json::Value {
+    let output = receive_command(t, &["status", "--json"]);
+    assert_output_ok(&output);
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["provider"].clone()
+}
+
 /// On Linux, syq starts its background services from the running image
 /// through /proc/self/exe. They still show syq's name and path to ps, pgrep
 /// and pkill, as when started from the file.
@@ -2043,30 +2064,188 @@ fn background_provider_keeps_the_syq_process_name_and_path() {
     fs::create_dir(t.runtime()).unwrap();
     let _persistence = PersistenceOff(&t);
     fs::create_dir_all(t.path("root")).unwrap();
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args(["persist", "receive"])
-            .args(args)
-            .env("HOME", t.path(""))
-            .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.runtime())
-            .env("SYQ_NO_UPDATE_CHECK", "1")
-            .current_dir(t.path(""))
-            .capture_output()
-            .unwrap()
-    };
-    assert_output_ok(&run(&["on", "--root", "root", "--notify", "off"]));
-    let output = run(&["status", "--json"]);
-    assert_output_ok(&output);
-    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let pid = status["provider"]["pid"].as_u64().unwrap();
+    assert_output_ok(&receive_command(
+        &t,
+        &["on", "--root", "root", "--notify", "off"],
+    ));
+    let pid = local_provider(&t)["pid"].as_u64().unwrap();
     assert_eq!(
         fs::read_to_string(format!("/proc/{pid}/comm")).unwrap(),
         "syq\n"
     );
+    // syq names itself by its symlink-resolved path, as the kernel reports it.
+    let expected = fs::canonicalize(env!("CARGO_BIN_EXE_syq")).unwrap();
     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
     assert_eq!(
         cmdline.split(|byte| *byte == 0).next().unwrap(),
-        env!("CARGO_BIN_EXE_syq").as_bytes()
+        std::os::unix::ffi::OsStrExt::as_bytes(expected.as_os_str())
     );
+}
+
+const OTHER_BUILD: &str = "v0.0.1+other-build";
+
+/// Read one length-prefixed JSON message of the local provider protocol.
+fn read_provider_frame(stream: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).unwrap();
+    let mut message = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut message).unwrap();
+    serde_json::from_slice(&message).unwrap()
+}
+
+fn write_provider_frame(stream: &mut std::os::unix::net::UnixStream, message: serde_json::Value) {
+    let message = serde_json::to_vec(&message).unwrap();
+    stream
+        .write_all(&(message.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&message).unwrap();
+}
+
+/// Replace this fixture's provider with one from an older build, as after an
+/// upgrade. It answers status and stop requests and closes the connection on
+/// a reload, as a provider that cannot read newer settings does. It returns
+/// the requests it received once it has been stopped.
+fn replace_with_other_build_provider(t: &Tmp) -> std::thread::JoinHandle<Vec<String>> {
+    let pid = local_provider(t)["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let domain = t
+        .runtime()
+        .join(format!("syq-persist-{}/global", unsafe { libc::geteuid() }));
+    let socket = domain.join("provider-v1.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let lock = loop {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(domain.join("provider-v1.lock"))
+            .unwrap();
+        if unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } == 0
+            && !socket.exists()
+        {
+            break lock;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the provider from this build did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the old provider was not stopped: {requests:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            read_provider_frame(&mut stream);
+            write_provider_frame(
+                &mut stream,
+                serde_json::json!({"version": 1, "build": OTHER_BUILD}),
+            );
+            let request = read_provider_frame(&mut stream);
+            let request = request.as_str().unwrap_or("other").to_owned();
+            requests.push(request.clone());
+            if request != "Status" && request != "Stop" {
+                continue;
+            }
+            write_provider_frame(
+                &mut stream,
+                serde_json::json!({
+                    "build": OTHER_BUILD,
+                    "pid": 0,
+                    "profiles": [],
+                    "decision_error": null,
+                }),
+            );
+            if request == "Stop" {
+                // Like a provider, remove the socket before releasing the lock.
+                fs::remove_file(&socket).unwrap();
+                drop(lock);
+                return requests;
+            }
+        }
+    })
+}
+
+/// After an upgrade, a provider from the old build cannot read the new
+/// settings. Every settings command replaces it with one from this build for
+/// the profiles that stay enabled, instead of failing or leaving it running.
+#[test]
+fn settings_commands_replace_a_provider_from_another_build() {
+    let build = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--build-identity")
+        .capture_output()
+        .unwrap();
+    assert_output_ok(&build);
+    let build = String::from_utf8(build.stdout).unwrap();
+    for command in [
+        &["on", "--name", "first"][..],
+        &["off", "--name", "first"],
+        &["remove", "first"],
+    ] {
+        let t = Tmp::new();
+        fs::create_dir(t.runtime()).unwrap();
+        let _persistence = PersistenceOff(&t);
+        fs::create_dir_all(t.path("root")).unwrap();
+        for name in ["first", "second"] {
+            assert_output_ok(&receive_command(
+                &t,
+                &["on", "--name", name, "--root", "root", "--notify", "off"],
+            ));
+        }
+        let old = replace_with_other_build_provider(&t);
+        assert_output_ok(&receive_command(&t, command));
+        assert_eq!(old.join().unwrap(), ["Status", "Stop"], "{command:?}");
+        let provider = local_provider(&t);
+        assert_eq!(provider["build"], build.trim(), "{command:?}");
+        let names: Vec<_> = provider["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|profile| profile["settings"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"second"), "{command:?}: {provider}");
+    }
+}
+
+/// Turning off the last enabled profile stops a provider from another build
+/// and starts none.
+#[test]
+fn turning_off_the_last_profile_leaves_no_provider_after_another_build() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let _persistence = PersistenceOff(&t);
+    fs::create_dir_all(t.path("root")).unwrap();
+    for name in ["first", "second"] {
+        assert_output_ok(&receive_command(
+            &t,
+            &["on", "--name", name, "--root", "root", "--notify", "off"],
+        ));
+    }
+    assert_output_ok(&receive_command(&t, &["off", "--name", "second"]));
+    let old = replace_with_other_build_provider(&t);
+    assert_output_ok(&receive_command(&t, &["off", "--name", "first"]));
+    assert_eq!(old.join().unwrap(), ["Stop"]);
+    assert!(local_provider(&t).is_null());
 }
