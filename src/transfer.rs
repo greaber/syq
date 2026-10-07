@@ -2800,18 +2800,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     }
     // Configure each ordinary network leg before selecting TCP or SSH. Source
     // helpers share one mapped budget; coordinator sends share one local budget.
-    // Signed/named routes keep their separately authorized resource policy.
+    // Routes a receiving machine approves keep their separately authorized
+    // resource policy; an enrolled restricted receiver is paced like any other.
+    let ordinary_grant = |grant: &Option<String>| {
+        grant
+            .as_deref()
+            .is_none_or(crate::restricted::enrolled_grant)
+    };
     let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
         Endpoint::Remote(spec) => {
             spec.local_process
-                || (spec.restricted_grant.is_none()
+                || (ordinary_grant(&spec.restricted_grant)
                     && (spec.forwarded.is_none() || args.return_source.is_some()))
         }
         _ => true,
     });
     let transport_budget = (args.bwlimit_bytes > 0
         && ordinary
-        && args.restricted_grant.is_none()
+        && ordinary_grant(&args.restricted_grant)
         && (opts.src_remote || opts.dst_remote))
         .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
     if let Some(budget) = &transport_budget {

@@ -38,6 +38,7 @@ mod enroll;
 mod grant;
 mod install;
 mod keys;
+mod privilege;
 mod receiver;
 pub(crate) mod source;
 mod ssh;
@@ -51,6 +52,9 @@ use enroll::*;
 pub(crate) use grant::*;
 pub(crate) use install::*;
 use keys::*;
+pub(crate) use privilege::{
+    refuse_privileged_approved_receiver, refuse_privileged_receiver, PRIVILEGED_RECEIVER,
+};
 pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;

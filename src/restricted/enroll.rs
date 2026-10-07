@@ -337,6 +337,11 @@ pub(super) fn enroll(
     jump: Option<&SshEndpoint>,
     refresh_existing: bool,
 ) -> Result<(LocalEnrollment, PathBuf, Vec<u8>)> {
+    // The receiver refuses to run as root; say so before creating anything.
+    // An account with another name and user ID 0 is refused when installing.
+    if login == "root" {
+        bail!(PRIVILEGED_RECEIVER);
+    }
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;

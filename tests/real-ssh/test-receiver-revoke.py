@@ -72,6 +72,9 @@ def main():
             process = subprocess.Popen([
                 "syq", "cp", "--from", "source", source, "--to", "destination",
                 "--as", f"{root}/{name}", "--performance-tuning", "workers=1", "--resource-limits", "bandwidth=1M", "--no-progress", *transport,
+                # The cap counts transport bytes; compression would let this
+                # repetitive payload finish before revocation.
+                "--no-compress",
             ], stdout=output, stderr=output, start_new_session=True)
             processes.append(process)
         probe = "python3 -c " + shlex.quote(f"""

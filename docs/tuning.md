@@ -404,8 +404,9 @@ controls logical-byte pacing:
 - `average`: wait for each request's byte budget before sending it. A 2 MiB
   request at 1 MiB/s waits about two seconds, then can arrive in a burst.
 
-Streaming and transport buffering can also produce bursts. Restricted receivers
-apply their authorized rate and request-size limits.
+Streaming and transport buffering can also produce bursts. Copies that a
+receiving machine approves apply its authorized rate and request-size limits;
+other direct copies between servers are paced as ordinary SSH and TCP copies.
 
 ### Recording a comparison
 

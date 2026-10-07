@@ -237,6 +237,7 @@ pub(crate) fn remote_install() -> Result<()> {
         bail!("unsupported restricted enrollment request version");
     }
     request.id.validate()?;
+    refuse_privileged_receiver()?;
     let (account, home) = current_account()?;
     if account != request.target_login {
         bail!("enrollment target login does not match the remote account");
