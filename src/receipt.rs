@@ -497,6 +497,13 @@ fn summarize(record: &ReceiptRecord, summary: &mut ReceiptSummary) {
                     summary.published_files += 1;
                     summary.published_bytes = summary.published_bytes.saturating_add(size);
                 }
+                // Another name for a file counts as a file transferred, with
+                // no bytes, as an ordinary copy counts it.
+                OperationAction::LinkFile
+                    if record.disposition == OperationDisposition::Succeeded =>
+                {
+                    summary.published_files += 1;
+                }
                 OperationAction::DeleteFile | OperationAction::DeleteDirectory
                     if record.disposition == OperationDisposition::Succeeded =>
                 {

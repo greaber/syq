@@ -1964,6 +1964,64 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
     assert!(tree.path().join("directory").is_dir());
 }
 
+/// A temporary link that turns out not to name the representative is
+/// removed, whatever the condition: no exchange ran, so nothing it holds was
+/// displaced from the destination.
+#[test]
+fn hardlink_publication_removes_a_temporary_that_names_another_file() {
+    use crate::proto::TargetCondition::{Absent, Any, Matches};
+    for condition in ["any", "absent", "matches"] {
+        let tree = TestDir::new("hardlink-temporary");
+        let root = Root::open(tree.path()).unwrap();
+        fs::write(tree.path().join("source"), b"payload").unwrap();
+        fs::write(tree.path().join("existing"), b"existing").unwrap();
+        let source = relative(b"source");
+        let target = relative(if condition == "absent" {
+            b"new"
+        } else {
+            b"existing"
+        });
+        let original = root.metadata(&source).unwrap();
+        let observed = root.metadata(&relative(b"existing")).unwrap();
+        let directory = tree.path().to_path_buf();
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::AfterHardlinkTemporary,
+            move || {
+                for entry in fs::read_dir(&directory).unwrap() {
+                    let name = entry.unwrap().file_name();
+                    if !["source", "existing"].contains(&name.to_str().unwrap()) {
+                        fs::remove_file(directory.join(&name)).unwrap();
+                        fs::write(directory.join(&name), b"impostor").unwrap();
+                    }
+                }
+            },
+        );
+        let condition = match condition {
+            "any" => Any,
+            "absent" => Absent,
+            _ => Matches {
+                dev: observed.dev,
+                ino: observed.ino,
+            },
+        };
+        let error = root
+            .publish_hardlink(&source, &target, (original.dev, original.ino), condition)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed while linking"),
+            "{error:#}"
+        );
+        let mut names = fs::read_dir(tree.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["existing", "source"], "{condition:?}");
+    }
+}
+
 /// A restricted receiver binds a new name to its existing-object policy:
 /// no replacement, or replacement of exactly the object it observed.
 #[test]

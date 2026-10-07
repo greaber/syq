@@ -1283,6 +1283,7 @@ impl RestrictedAuthority {
                         index,
                         path: path.to_vec(),
                         persist: false,
+                        link: false,
                     });
                 }
                 Ok(())
@@ -1307,6 +1308,7 @@ impl RestrictedAuthority {
                     index,
                     path: path.to_vec(),
                     persist: true,
+                    link: false,
                 });
                 Ok(())
             }
@@ -1331,7 +1333,9 @@ impl RestrictedAuthority {
         // metadata, say) counts: the batch executes in order, so the
         // metadata only ever lands on this request's own creation.
         let own = self.created_by_this_grant(path)
-            || pending.iter().any(|creation| creation.path == path);
+            || pending
+                .iter()
+                .any(|creation| creation.path == path && !creation.link);
         match self.copy.policy.existing {
             ExistingDestinationPolicy::Skip if own => Ok(()),
             ExistingDestinationPolicy::Skip => {
@@ -1698,7 +1702,12 @@ impl RestrictedAuthority {
     /// through that name under a policy that keeps existing objects.
     fn authorize_hardlink(
         &self,
-        (path, source, condition): (&[u8], &[u8], &mut proto::TargetCondition),
+        (path, source, identity, condition): (
+            &[u8],
+            &[u8],
+            (u64, u64),
+            &mut proto::TargetCondition,
+        ),
         index: usize,
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
@@ -1715,16 +1724,26 @@ impl RestrictedAuthority {
         if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
             bail!("hardlink publication accepts no fingerprint condition");
         }
-        let created = pending.len();
         self.constrain_creation(path, condition, false, index, pending)?;
-        for creation in &mut pending[created..] {
+        // The link replaces whatever this grant made at that name, in this
+        // request or before, so that name no longer makes a file its own.
+        for creation in pending.iter_mut().filter(|creation| creation.path == path) {
             creation.persist = false;
+            creation.link = true;
         }
-        outcomes.push(PendingOutcome::Logical {
-            index,
-            path: path.to_vec(),
-            action: crate::receipt::OperationAction::LinkFile,
-        });
+        self.state.lock().unwrap().created.remove(path);
+        // A name already linked to the file changes nothing; the copy
+        // reports it unchanged, as an ordinary copy does.
+        let linked = self
+            .rooted_metadata(path)?
+            .is_some_and(|metadata| (metadata.dev, metadata.ino) == identity);
+        if !linked {
+            outcomes.push(PendingOutcome::Logical {
+                index,
+                path: path.to_vec(),
+                action: crate::receipt::OperationAction::LinkFile,
+            });
+        }
         touched.push(path.to_vec());
         Ok(())
     }
@@ -1740,12 +1759,13 @@ impl RestrictedAuthority {
         if let Op::Hardlink {
             path,
             source,
+            dev,
+            ino,
             condition,
-            ..
         } = operation
         {
             return self.authorize_hardlink(
-                (&*path, &*source, condition),
+                (&*path, &*source, (*dev, *ino), condition),
                 index,
                 pending,
                 outcomes,
@@ -2873,4 +2893,7 @@ pub(crate) struct PendingCreation {
     pub(super) index: usize,
     pub(super) path: Vec<u8>,
     pub(super) persist: bool,
+    /// The name a hard link made, for a file that may already have been
+    /// there: never the grant's own, even later in its own request.
+    pub(super) link: bool,
 }

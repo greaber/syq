@@ -1115,7 +1115,12 @@ fn named_extended_attributes_ask_and_reconcile_the_user_namespace() {
         named_copy(&registration, &source, &["--copy-metadata", "mtime,xattrs"]),
         0
     );
-    shown.join().unwrap();
+    // The prompt says why it asks.
+    let shown = shown.join().unwrap();
+    assert!(
+        shown.contains("The server can set extended attributes, which some programs act on."),
+        "{shown}"
+    );
     // As `tests/local/inode_metadata.rs` checks for ordinary copies: the
     // source's user attributes, and none the source lacks.
     assert_eq!(

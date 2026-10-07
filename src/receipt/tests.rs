@@ -508,3 +508,44 @@ fn diagnostics_are_bounded_on_utf8_boundaries() {
     assert!(bounded.len() <= MAX_DIAGNOSTIC_BYTES + '…'.len_utf8());
     assert!(bounded.ends_with('…'));
 }
+
+/// Another name made for a file counts as a file transferred, without
+/// bytes, as an ordinary copy counts it; one that failed does not.
+#[test]
+fn successful_links_count_as_transferred_files() {
+    let record = |action, disposition, code| {
+        ReceiptRecord::Operation(ReceiptOperationRecord {
+            sequence: 0,
+            scope: 0,
+            path: b"name".to_vec(),
+            action,
+            disposition,
+            code,
+            diagnostic: None,
+        })
+    };
+    let mut summary = ReceiptSummary::default();
+    for record in [
+        record(
+            OperationAction::PublishFile {
+                size: 7,
+                inplace: false,
+            },
+            OperationDisposition::Succeeded,
+            OutcomeCode::None,
+        ),
+        record(
+            OperationAction::LinkFile,
+            OperationDisposition::Succeeded,
+            OutcomeCode::None,
+        ),
+        record(
+            OperationAction::LinkFile,
+            OperationDisposition::Failed,
+            OutcomeCode::ExecutionFailed,
+        ),
+    ] {
+        summarize(&record, &mut summary);
+    }
+    assert_eq!((summary.published_files, summary.published_bytes), (2, 7));
+}

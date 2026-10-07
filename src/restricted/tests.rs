@@ -4892,6 +4892,131 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
     );
 }
 
+/// A link names a file that may already have been there. Neither the new
+/// name nor a name this grant created and the link replaced makes that file
+/// the grant's own, so a policy that keeps existing files keeps it.
+#[test]
+fn hard_links_never_make_an_existing_file_the_grants_own() {
+    use std::os::unix::fs::MetadataExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/kept"), b"kept").unwrap();
+    let kept = fs::metadata(root.join("target/kept")).unwrap();
+    let mut authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.extra_options.hardlinks = true;
+    authority.copy.options.preserve_permissions = true;
+    authority.copy.options.receiver_managed_modes = false;
+    let link = |name: &str| Op::Hardlink {
+        path: path_bytes(&root.join("target").join(name)),
+        source: path_bytes(&root.join("target/kept")),
+        dev: kept.dev(),
+        ino: kept.ino(),
+        condition: proto::TargetCondition::Any,
+    };
+    let set_mode = |name: &str| {
+        let mut meta = plain_meta();
+        meta.mode = 0o100666;
+        Op::SetMeta {
+            path: path_bytes(&root.join("target").join(name)),
+            meta,
+            flags: proto::flags::MODE,
+            condition: proto::TargetCondition::Any,
+        }
+    };
+    let apply = |ops: Vec<Op>| Request::Apply { ops, guard: None };
+
+    // In one request: link a new name, then change the file through it.
+    let error = authority
+        .authorize(&mut apply(vec![link("new"), set_mode("new")]), false)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("may not be modified"),
+        "{error:#}"
+    );
+
+    // A name this grant created, then replaced with a link.
+    let mut symlink = apply(vec![Op::Symlink {
+        path: path_bytes(&root.join("target/mine")),
+        target: b"kept".to_vec(),
+        condition: proto::TargetCondition::Any,
+    }]);
+    let settlement = authority.authorize(&mut symlink, false).unwrap();
+    authority.settle(settlement, &proto::Response::Applied(vec![None]));
+    let settlement = authority
+        .authorize(&mut apply(vec![link("mine")]), false)
+        .unwrap();
+    authority.settle(settlement, &proto::Response::Applied(vec![None]));
+    let error = authority
+        .authorize(&mut apply(vec![set_mode("mine")]), false)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("may not be modified"),
+        "{error:#}"
+    );
+    // The same in one request.
+    let error = authority
+        .authorize(
+            &mut apply(vec![
+                Op::Symlink {
+                    path: path_bytes(&root.join("target/again")),
+                    target: b"kept".to_vec(),
+                    condition: proto::TargetCondition::Any,
+                },
+                link("again"),
+                set_mode("again"),
+            ]),
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("may not be modified"),
+        "{error:#}"
+    );
+}
+
+/// A name already linked to its file changes nothing, so the receipt
+/// records no operation for it, as an ordinary copy reports it unchanged.
+#[test]
+fn a_name_already_linked_records_no_operation() {
+    use std::os::unix::fs::MetadataExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/a"), b"shared").unwrap();
+    fs::hard_link(root.join("target/a"), root.join("target/b")).unwrap();
+    fs::write(root.join("target/c"), b"other").unwrap();
+    let file = fs::metadata(root.join("target/a")).unwrap();
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.extra_options.hardlinks = true;
+    let request = |name: &str| {
+        let mut request = Request::Apply {
+            ops: vec![Op::Hardlink {
+                path: path_bytes(&root.join("target").join(name)),
+                source: path_bytes(&root.join("target/a")),
+                dev: file.dev(),
+                ino: file.ino(),
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        };
+        authority.authorize(&mut request, false).unwrap()
+    };
+    assert!(request("b").outcomes.is_empty());
+    assert_eq!(request("c").outcomes.len(), 1);
+}
+
 #[test]
 fn signed_grants_authorize_only_their_inode_metadata() {
     let temporary = crate::test_support::tempdir().unwrap();

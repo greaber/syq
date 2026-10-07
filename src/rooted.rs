@@ -1660,6 +1660,15 @@ impl Root {
             result
         })?;
         let directory = parent.directory.as_raw_fd();
+        // Set once a matched exchange has displaced the old destination
+        // into the temporary name.
+        let exchanged = std::cell::Cell::new(false);
+        #[cfg(test)]
+        run_publication_test_hook(
+            self.identity,
+            target,
+            PublicationTestPoint::AfterHardlinkTemporary,
+        );
         let result = (|| {
             // On platforms without fd-relative link creation, a raced source
             // name can create a different temporary inode. Never publish it.
@@ -1686,6 +1695,7 @@ impl Root {
                 Matches { dev, ino } => {
                     rename_exchange(directory, &temporary, directory, &parent.leaf)
                         .with_context(|| format!("publish hardlink {}", target.label()))?;
+                    exchanged.set(true);
                     let swapped = metadata_at(directory, &temporary)?;
                     if (swapped.dev, swapped.ino) != (dev, ino) {
                         // As for other matched replacements, never touch the
@@ -1711,9 +1721,11 @@ impl Root {
         match (&result, condition) {
             // A rename consumed the temporary name; anything else leaves it.
             (Ok(()), Any) => {}
-            (Err(_), Matches { .. })
-                if metadata_at(directory, &temporary)
-                    .is_ok_and(|entry| (entry.dev, entry.ino) != identity) => {}
+            // What an exchange displaced is not ours to remove.
+            (Err(_), Matches { dev, ino })
+                if exchanged.get()
+                    && metadata_at(directory, &temporary)
+                        .is_ok_and(|entry| (entry.dev, entry.ino) != (dev, ino)) => {}
             _ => {
                 let _ = unlink_at(directory, &temporary, 0);
             }
@@ -2856,6 +2868,7 @@ pub(crate) enum PublicationTestPoint {
     AfterAbsentLink,
     BeforeMatchedExchange,
     AfterMatchedExchange,
+    AfterHardlinkTemporary,
 }
 
 #[cfg(test)]

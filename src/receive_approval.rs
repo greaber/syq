@@ -582,6 +582,9 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .acls
             .then(|| "can give other users access to files".to_owned()),
         extra
+            .xattrs
+            .then(|| "can set extended attributes, which some programs act on".to_owned()),
+        extra
             .hardlinks
             .then(|| "can link new names to files already in the destination".to_owned()),
         (request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace)
@@ -1670,6 +1673,7 @@ mod tests {
             "can make files readable by others or create programs that run as you",
             "can give files to any group you belong to",
             "can give other users access to files",
+            "can set extended attributes, which some programs act on",
             "can link new names to files already in the destination",
         ];
         let summary = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
