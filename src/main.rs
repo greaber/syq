@@ -157,6 +157,8 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    process::restore_self_started_name();
     let argv = match use_version::enter(std::env::args_os().collect()) {
         Ok(argv) => argv,
         Err(error) => {

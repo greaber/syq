@@ -2235,7 +2235,7 @@ impl RemoteSpec {
         } else if let Some(approved) = &self.forwarded {
             approved.ssh_command()?
         } else if self.local_process {
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = crate::process::self_command()?;
             // The same executable receives, so this internal flag is always
             // understood; it keeps the data listener on loopback.
             command.args(&server_args).arg("--local-receiver");
