@@ -144,6 +144,12 @@ fn new_read_only_directories_follow_cp_and_rsync() {
             "755",
         ),
         ("rsync-contents", vec!["rsync", "-r", &owner_only], "500"),
+        // Hard links make the copy create the root after its scan.
+        (
+            "rsync-contents-hardlinks",
+            vec!["rsync", "-r", "-H", &owner_only],
+            "500",
+        ),
         (
             "cp-srcs-in",
             vec!["cp", "--no-progress", "--srcs-in", &owner_only, "--into"],

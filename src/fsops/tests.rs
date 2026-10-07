@@ -7805,3 +7805,83 @@ fn creations_wait_for_their_parents_created_in_the_same_request() {
     // Without a parent in the request, everything stays in one wave.
     assert_eq!(creation_waves(&ops, &[0, 2, 3]), vec![vec![0, 2, 3]]);
 }
+
+/// A retry in another receiver process finds the file an interrupted
+/// attempt created. The sender's scan found nothing there before the copy,
+/// so the file still gets a new file's mode, not the owner write it was
+/// created with to be filled.
+#[test]
+fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let target = dir.path().join("file");
+    fs::write(&target, b"par").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let target_bytes = target.as_os_str().as_bytes();
+    let identity = Root::open(dir.path()).unwrap().identity();
+    let guard = ContainerGuard {
+        root: dir.path().as_os_str().as_bytes().to_vec(),
+        dev: identity.dev,
+        ino: identity.ino,
+    };
+    let copy_id = [9; 16];
+    let mut operations = FsOps::new();
+    let source_mode = 0o100444;
+    operations
+        .prepare(
+            PartialTarget {
+                path: target_bytes,
+                id: &copy_id,
+                guard: Some(&guard),
+            },
+            PrepareOptions {
+                size: 3,
+                inplace: true,
+                mode: source_mode & 0o777,
+                attempt: 1,
+                create_if_missing: true,
+                scanned: ScannedDestination::Absent,
+            },
+        )
+        .unwrap();
+    operations
+        .write_range(
+            PartialTarget {
+                path: target_bytes,
+                id: &copy_id,
+                guard: Some(&guard),
+            },
+            true,
+            1,
+            0,
+            content_digest(b"new"),
+            b"new",
+        )
+        .unwrap();
+    operations
+        .finalize_expected(
+            None,
+            target_bytes,
+            true,
+            &copy_id,
+            &Meta {
+                inode_metadata: None,
+                mode: source_mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags::RECEIVER_MODE,
+            ScannedDestination::Absent,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: Some(&guard),
+            },
+        )
+        .unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert_eq!(
+        fs::metadata(&target).unwrap().mode() & 0o7777,
+        0o444 & !crate::fsops::limits::process_umask()
+    );
+}

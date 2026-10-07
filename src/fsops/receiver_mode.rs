@@ -291,9 +291,13 @@ impl FsOps {
             return Ok(None);
         }
         let flags = flags & !flags::RECEIVER_MODE;
-        // What this receiver saw comes first, then what the scan found.
+        // A file this receiver created, or one the scan found absent before
+        // the copy, is new: one this process merely found may be an earlier
+        // attempt's, made by another process with the owner access its
+        // writers needed, as the small-file in-place path decides too. Then
+        // what this receiver found, then what the scan found.
         let mode = match (opened, scanned) {
-            (Some(InplaceOpen::Created), _) | (None, ScannedDestination::Absent) => {
+            (Some(InplaceOpen::Created), _) | (_, ScannedDestination::Absent) => {
                 self.new_file_mode(target, meta.mode)?
             }
             (Some(InplaceOpen::Found(mode)), _) | (None, ScannedDestination::File(mode)) => mode,

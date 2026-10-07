@@ -75,6 +75,9 @@ pub(super) struct Planner<'a> {
     /// metadata reaches it: the mode it would otherwise have been created
     /// with, for when that metadata sets no mode.
     pub(super) private_root: Option<u32>,
+    /// The mode `syq rsync` creates a new destination root with, from its
+    /// contents source, when the planner creates it after scanning.
+    pub(super) root_source_mode: Option<u32>,
     /// This run consumes a --mapping manifest (identity entries included).
     pub(super) mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
@@ -1536,7 +1539,10 @@ impl Planner<'_> {
             if self.use_operator_anchor {
                 let mode = match self.private_root {
                     Some(_) if is_destination_root => 0o700,
-                    _ => operator_directory_mode(self.opts),
+                    _ => self
+                        .root_source_mode
+                        .filter(|_| is_destination_root)
+                        .unwrap_or_else(|| operator_directory_mode(self.opts)),
                 };
                 let selection = create_operator_directory(self.dst, condition, mode)?;
                 let anchor = activate_control_destination(self.dst, selection, root.clone())?;
@@ -1561,7 +1567,7 @@ impl Planner<'_> {
                 let mode = if self.private_root.is_some() {
                     0o700
                 } else {
-                    0o755
+                    self.root_source_mode.unwrap_or(0o755)
                 };
                 let created = mkdir_root(self.dst, &root, condition, mode)?;
                 self.mutation_root_condition = target_identity(&created);

@@ -3938,6 +3938,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             std::collections::HashSet::new()
         },
         private_root,
+        root_source_mode,
         mapping_mode: false,
         create_root: if defer_operator_directory_creation {
             Some((
