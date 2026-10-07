@@ -1342,65 +1342,83 @@ impl RestrictedAuthority {
         condition: Option<&mut proto::TargetCondition>,
         pending: &[PendingCreation],
     ) -> Result<()> {
-        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
         // metadata, say) counts: the batch executes in order, so the
         // metadata only ever lands on this request's own creation.
-        let own = self.created_by_this_grant(path)
-            || pending
-                .iter()
-                .any(|creation| creation.path == path && !creation.link);
+        let created_before = self.created_by_this_grant(path);
+        let created_here = pending
+            .iter()
+            .any(|creation| creation.path == path && !creation.link);
         match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if own => Ok(()),
+            ExistingDestinationPolicy::Skip if created_here => Ok(()),
+            // A name an earlier request created may have been removed and
+            // given to an existing file since, on another connection, before
+            // this change runs: the change is held to the file there now.
+            ExistingDestinationPolicy::Skip if created_before => {
+                self.pin_update(path, &label, condition)
+            }
             ExistingDestinationPolicy::Skip => {
                 bail!("signed grant retains existing objects: {label} may not be modified")
             }
-            ExistingDestinationPolicy::MustExist if own => Ok(()),
-            ExistingDestinationPolicy::MustExist => {
-                // Updates are pinned to the observed object, like
-                // publications: nothing hostA supplies names an inode on its
-                // own authority.
-                let Some(metadata) = self.rooted_metadata(path)? else {
-                    bail!("signed grant creates nothing: {label} does not exist")
-                };
-                let Some(condition) = condition else {
-                    return Ok(());
-                };
-                match *condition {
-                    Any => {
-                        *condition = Matches {
-                            dev: metadata.dev,
-                            ino: metadata.ino,
-                        }
-                    }
-                    Absent => bail!(
-                        "no-replace update of {label} contradicts the signed existing-object policy"
-                    ),
-                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
-                    MatchesFingerprint {
-                        dev,
-                        ino,
-                        ctime,
-                        ctime_nsec,
-                    } if (dev, ino, ctime, ctime_nsec)
-                        == (
-                            metadata.dev,
-                            metadata.ino,
-                            metadata.ctime,
-                            metadata.ctime_nsec,
-                        ) => {}
-                    Matches { .. } | MatchesFingerprint { .. } => bail!(
-                        "requested identity for {label} does not match the object the receiver observed"
-                    ),
-                }
-                Ok(())
-            }
+            ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
+            // Updates are pinned to the observed object, like publications:
+            // nothing hostA supplies names an inode on its own authority.
+            ExistingDestinationPolicy::MustExist => self.pin_update(path, &label, condition),
             ExistingDestinationPolicy::Replace => Ok(()),
             ExistingDestinationPolicy::UpdateIfOlder => {
                 bail!("update-if-older existing-object policy is not enforceable by the receiver")
             }
         }
+    }
+
+    /// Hold an update of `path` to the object the receiver observes there
+    /// now: its device and inode, or the identity the sender named if it is
+    /// that object's. Execution then refuses a name that has come to lead
+    /// to another object. A change time would also tell an inode number
+    /// reused by a new file, but this copy's own links and publications
+    /// change it too, so it would refuse legitimate updates.
+    fn pin_update(
+        &self,
+        path: &[u8],
+        label: &str,
+        condition: Option<&mut proto::TargetCondition>,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let Some(metadata) = self.rooted_metadata(path)? else {
+            bail!("signed grant creates nothing: {label} does not exist")
+        };
+        let Some(condition) = condition else {
+            return Ok(());
+        };
+        match *condition {
+            Any => {
+                *condition = Matches {
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                }
+            }
+            Absent => {
+                bail!("no-replace update of {label} contradicts the signed existing-object policy")
+            }
+            Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+            MatchesFingerprint {
+                dev,
+                ino,
+                ctime,
+                ctime_nsec,
+            } if (dev, ino, ctime, ctime_nsec)
+                == (
+                    metadata.dev,
+                    metadata.ino,
+                    metadata.ctime,
+                    metadata.ctime_nsec,
+                ) => {}
+            Matches { .. } | MatchesFingerprint { .. } => bail!(
+                "requested identity for {label} does not match the object the receiver observed"
+            ),
+        }
+        Ok(())
     }
 
     /// Refuse staging work whose eventual publication the existing-object

@@ -1359,6 +1359,7 @@ fn set_meta(path: &Path) -> Op {
 
 #[test]
 fn signed_only_new_rejects_existing_directory_mutation() {
+    use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let dir = root.join("target/dir");
@@ -1380,10 +1381,20 @@ fn signed_only_new_rejects_existing_directory_mutation() {
     let mut create = apply(mkdir(&new_dir));
     let settlement = authority.authorize(&mut create, false).unwrap();
     assert_eq!(op_condition(&create), proto::TargetCondition::Absent);
+    // As executing the creation leaves it.
+    fs::create_dir(&new_dir).unwrap();
     authority.settle(settlement, &proto::Response::Applied(vec![None]));
-    authority
-        .authorize(&mut apply(set_meta(&new_dir)), false)
-        .unwrap();
+    // Its metadata is held to the directory there now.
+    let mut meta = apply(set_meta(&new_dir));
+    authority.authorize(&mut meta, false).unwrap();
+    let created = fs::metadata(&new_dir).unwrap();
+    assert_eq!(
+        op_condition(&meta),
+        proto::TargetCondition::Matches {
+            dev: created.dev(),
+            ino: created.ino(),
+        }
+    );
 }
 
 #[test]
@@ -2075,6 +2086,8 @@ fn signed_skip_policy_retains_preexisting_objects() {
     let mut create_link = apply(symlink_op(&link));
     let settlement = authority.authorize(&mut create_link, false).unwrap();
     assert_eq!(op_condition(&create_link), Absent);
+    // As executing the creation leaves it.
+    symlink("target", &link).unwrap();
     authority.settle(settlement, &proto::Response::Applied(vec![None]));
     let mut meta_link = apply(set_meta(&link));
     authority.authorize(&mut meta_link, false).unwrap();
@@ -7050,4 +7063,108 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
     });
     assert_eq!(ordinary, restricted);
     assert_eq!(ordinary, [(0o750, group), (0o755 & !umask, group)]);
+}
+
+/// Keeping existing files and allowing deletion, a request on one
+/// connection that changes a name this grant created cannot be turned onto
+/// an existing file by deleting the name on another connection and linking
+/// it to that file before the change runs: the change is held to the file
+/// the name led to when it was approved.
+#[test]
+fn a_deleted_and_relinked_name_does_not_redirect_an_approved_change() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/kept"), b"kept").unwrap();
+    fs::set_permissions(root.join("target/kept"), fs::Permissions::from_mode(0o600)).unwrap();
+    let kept = fs::metadata(root.join("target/kept")).unwrap();
+    let mut authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::DeleteDestinationOnly,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.extra_options.hardlinks = true;
+    authority.copy.options.preserve_permissions = true;
+    authority.copy.options.receiver_managed_modes = false;
+    authority.copy.limits.max_deletions = 10;
+    let mine = root.join("target/mine");
+    let execute = |authority: &RestrictedAuthority, request: &mut Request| {
+        let settlement = authority.authorize(request, false).unwrap();
+        let Request::Apply { ops, guard } = &*request else {
+            unreachable!()
+        };
+        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+        authority.settle(settlement, &proto::Response::Applied(results.clone()));
+        results
+    };
+    // The grant creates `mine`.
+    let created = execute(
+        &authority,
+        &mut Request::Apply {
+            ops: vec![Op::Symlink {
+                path: path_bytes(&mine),
+                target: b"kept".to_vec(),
+                condition: proto::TargetCondition::Absent,
+            }],
+            guard: None,
+        },
+    );
+    assert_eq!(created, [None]);
+    // Connection 2 is approved to change `mine`, its own, and has not run.
+    let mut meta = plain_meta();
+    meta.mode = 0o100666;
+    let mut change = Request::Apply {
+        ops: vec![Op::SetMeta {
+            path: path_bytes(&mine),
+            meta,
+            flags: proto::flags::MODE,
+            condition: proto::TargetCondition::Any,
+        }],
+        guard: None,
+    };
+    let pending_change = authority.authorize(&mut change, false).unwrap();
+    // Connection 1 deletes `mine` and links it to the kept file.
+    let removed = execute(
+        &authority,
+        &mut Request::Apply {
+            ops: vec![Op::Unlink {
+                path: path_bytes(&mine),
+            }],
+            guard: None,
+        },
+    );
+    assert_eq!(removed, [None]);
+    let linked = execute(
+        &authority,
+        &mut Request::Apply {
+            ops: vec![Op::Hardlink {
+                path: path_bytes(&mine),
+                source: path_bytes(&root.join("target/kept")),
+                dev: kept.dev(),
+                ino: kept.ino(),
+                condition: proto::TargetCondition::Any,
+            }],
+            guard: None,
+        },
+    );
+    assert_eq!(linked, [None]);
+    // Connection 2's change then runs, and refuses the file now there.
+    let Request::Apply { ops, guard } = &change else {
+        unreachable!()
+    };
+    let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
+    assert!(results[0].is_some(), "the change ran on another file");
+    authority.settle(pending_change, &proto::Response::Applied(results));
+    assert_eq!(
+        fs::metadata(root.join("target/kept")).unwrap().mode() & 0o7777,
+        0o600
+    );
 }
