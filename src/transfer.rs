@@ -3487,23 +3487,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Selection already inspected the container. Carry its identity into
     // planning, so file-only copies can request access without another lookup
     // on the ordinary writable-directory path.
-    let may_widen_container = args.temporarily_widen_dir_permissions
-        && !opts.dry_run
-        && !opts.preserve_existing_directory_metadata;
-    let selected_container_access = |selection: &DirectoryAnchor| {
-        selection.needs_owner_access.then(|| {
-            (
-                request_prefix.clone(),
-                TargetCondition::Matches {
-                    dev: selection.dev,
-                    ino: selection.ino,
-                },
-            )
-        })
-    };
-    let mut container_access = if may_widen_container {
+    let widen_container = widens_destination_container(&args, &opts);
+    let mut container_access = if widen_container {
         if let Some(selection) = &directory_selection {
-            selected_container_access(selection)
+            selected_container_access(widen_container, &request_prefix, selection)
         } else if dst_is_dir {
             dst_root_entry
                 .as_ref()
@@ -3545,9 +3532,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 private_root = None;
                 dst_initially_missing = false;
                 fresh_destination = false;
-                if may_widen_container {
-                    container_access = selected_container_access(&selection);
-                }
+                container_access =
+                    selected_container_access(widen_container, &request_prefix, &selection);
             }
             directory_selection = Some(selection);
         }
@@ -3952,6 +3938,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         container_access,
+        widen_container,
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root {
             std::collections::HashSet::from([dst_root.clone()])
@@ -4927,6 +4914,35 @@ fn operator_directory_mode(opts: &Opts) -> u32 {
     } else {
         0o755
     }
+}
+
+/// Whether a destination container that lacks owner access is widened for
+/// its owner, the one rule for a root found existing, one another process
+/// created before syq's mkdir, and one found when the planner creates it
+/// after the scan.
+fn widens_destination_container(args: &Args, opts: &Opts) -> bool {
+    args.temporarily_widen_dir_permissions
+        && !opts.dry_run
+        && !opts.preserve_existing_directory_metadata
+}
+
+/// The access to request for the operator directory `selection`, known by
+/// `request_prefix`: widening for its owner, when `widen` allows it and the
+/// directory lacks owner access.
+fn selected_container_access(
+    widen: bool,
+    request_prefix: &[u8],
+    selection: &DirectoryAnchor,
+) -> Option<(PathBytes, TargetCondition)> {
+    (widen && selection.needs_owner_access).then(|| {
+        (
+            request_prefix.to_vec(),
+            TargetCondition::Matches {
+                dev: selection.dev,
+                ino: selection.ino,
+            },
+        )
+    })
 }
 
 /// Create the checked operator directory, returning it and whether the

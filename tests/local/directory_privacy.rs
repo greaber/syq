@@ -728,6 +728,73 @@ fn a_root_another_process_creates_first_is_treated_as_an_existing_directory() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_raced_root_without_owner_access_is_widened_as_an_existing_one_is() {
+    // A root another process creates without owner access just before
+    // syq's mkdir is an existing directory, widened for its owner exactly
+    // when one found there before the copy would be: before planning (one
+    // source) and after the scan (two sources, or -H).
+    let cases: [&[&str]; 3] = [
+        &[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "src",
+            "--into",
+            "dst",
+        ],
+        &[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "src",
+            "other",
+            "--into",
+            "dst",
+        ],
+        &["rsync", "-rH", "src", "dst/"],
+    ];
+    for args in cases {
+        let mut results = Vec::new();
+        for raced in [true, false] {
+            let t = Tmp::new();
+            source_tree(&t, 0o755, 0o755);
+            write(&t.path("other"), b"other file");
+            let mut command = syq_command(args);
+            command.current_dir(&t.0);
+            let output = if raced {
+                observe_at(&t, command, "OPERATOR_DIRECTORY", || {
+                    fs::create_dir(t.path("dst")).unwrap();
+                    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+                })
+                .1
+            } else {
+                fs::create_dir(t.path("dst")).unwrap();
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o500)).unwrap();
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::umask(0o022);
+                        Ok(())
+                    });
+                }
+                command.run().unwrap()
+            };
+            let copied = output.status.success();
+            if copied {
+                assert_eq!(
+                    read(&t.path("dst/src/sub/file")),
+                    b"nested file",
+                    "{args:?}"
+                );
+            }
+            results.push((output.status.code(), copied, mode(&t.path("dst"))));
+        }
+        assert_eq!(results[0], results[1], "{args:?}: raced, then existing");
+        if args[0] == "cp" {
+            assert_eq!(results[0], (Some(0), true, 0o500), "{args:?}");
+        }
+    }
+}
+
 #[test]
 fn a_root_interrupted_right_after_its_creation_has_its_final_mode() {
     // Without -p a new destination root is created with its source's mode
