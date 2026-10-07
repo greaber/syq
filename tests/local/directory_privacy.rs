@@ -692,26 +692,56 @@ fn a_remote_receiver_grants_no_more_than_the_source_while_filling() {
 #[test]
 fn a_root_interrupted_right_after_its_creation_has_its_final_mode() {
     // Without -p a new destination root is created with its source's mode
-    // and owner access, as any new directory is, so a copy interrupted right
-    // after creating it, and its retry, leave it as a whole copy does.
-    let cases: [&[&str]; 3] = [
-        &["rsync", "-r", "src/", "dst/"],
-        &["cp", "--srcs-in", "src", "--into", "dst"],
-        &["cp", "src", "--as", "dst"],
+    // and owner access, as any new directory is (native cp gives the
+    // destination of --srcs-in the default mode), so a copy interrupted
+    // right after creating it, and its retry, leave it as a whole copy does.
+    // A remote source reports its root's mode when it is registered.
+    let cases = [
+        ("rsync", 0o750),
+        ("rsync from a remote source", 0o750),
+        ("cp --srcs-in", 0o755),
+        ("cp --as", 0o750),
     ];
-    for args in cases {
+    for (case, expected) in cases {
         let t = Tmp::new();
-        source_tree(&t, 0o755, 0o755);
-        let mut command = syq_command(args);
-        command
-            .current_dir(&t.0)
-            .env("SYQ_TEST_CREATED_DIRECTORY_SUFFIX", "/dst");
-        let (mut child, _) = start_held(&t, command, "CREATED_DIRECTORY");
+        source_tree(&t, 0o750, 0o755);
+        let rsh = fake_rsh(&t);
+        t.expose_remote_syq();
+        fs::create_dir(t.path("remote-home")).unwrap();
+        let remote_source = format!("host:{}/", t.s("src"));
+        let rsh = rsh.display().to_string();
+        let args: Vec<&str> = match case {
+            "rsync" => vec!["rsync", "-r", "src/", "dst/"],
+            "rsync from a remote source" => vec![
+                "rsync",
+                "-r",
+                "-e",
+                &rsh,
+                "--syq-no-bootstrap",
+                &remote_source,
+                "dst/",
+            ],
+            "cp --srcs-in" => vec!["cp", "--srcs-in", "src", "--into", "dst"],
+            _ => vec!["cp", "src", "--as", "dst"],
+        };
+        let command = || {
+            let mut command = syq_command(&args);
+            command
+                .current_dir(&t.0)
+                .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                .env("XDG_CONFIG_HOME", t.path("config"))
+                .env("XDG_CACHE_HOME", t.path("cache"));
+            command
+        };
+        let mut held = command();
+        held.env("SYQ_TEST_CREATED_DIRECTORY_SUFFIX", "/dst");
+        let (mut child, _) = start_held(&t, held, "CREATED_DIRECTORY");
         unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
         child.wait().unwrap();
-        assert_eq!(mode(&t.path("dst")), 0o755, "{args:?}: interrupted");
-        let mut retry = syq_command(args);
-        retry.current_dir(&t.0);
+        assert_eq!(mode(&t.path("dst")), expected, "{case}: interrupted");
+        let mut retry = command();
         unsafe {
             retry.pre_exec(|| {
                 libc::umask(0o022);
@@ -720,7 +750,7 @@ fn a_root_interrupted_right_after_its_creation_has_its_final_mode() {
         }
         assert_output_ok(&retry.run().unwrap());
         assert_eq!(read(&t.path("dst/sub/file")), b"nested file");
-        assert_eq!(mode(&t.path("dst")), 0o755, "{args:?}: after the retry");
+        assert_eq!(mode(&t.path("dst")), expected, "{case}: after the retry");
     }
 }
 

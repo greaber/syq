@@ -724,6 +724,10 @@ pub struct RegisteredSourceRoot {
     /// Permit this explicitly opted-in rsync session to use legacy unconfined
     /// source pathnames for `--insecure-links` compatibility.
     pub allow_unconfined_paths: bool,
+    /// A selected directory's permission bits when it was registered, so a
+    /// coordinator that creates a destination for its contents needs no
+    /// lookup of its own. None for an exact leaf.
+    pub directory_mode: Option<u32>,
 }
 
 impl RegisteredSourceRoot {

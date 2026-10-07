@@ -1734,13 +1734,19 @@ impl FsOps {
         let registrations: Vec<_> = resolved
             .iter()
             .map(|(directory, relative, expected_leaf, object)| {
-                (
+                let directory_mode = if relative.is_empty() {
+                    Some(directory.metadata()?.mode() & 0o777)
+                } else {
+                    None
+                };
+                Ok((
                     relative.clone(),
                     expected_leaf.clone(),
                     filesystem_hint(object.as_ref().unwrap_or(directory)),
-                )
+                    directory_mode,
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let tickets = self.descriptor_session.register_source_handles(
             resolved
                 .into_iter()
@@ -1751,7 +1757,7 @@ impl FsOps {
             .into_iter()
             .zip(registrations)
             .map(
-                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem))| {
+                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem, directory_mode))| {
                     let selection = RegisteredPath::new(ticket.root_id(), relative)?;
                     Ok(RegisteredSourceRoot {
                         filesystem,
@@ -1760,6 +1766,7 @@ impl FsOps {
                         selection,
                         expected_leaf,
                         allow_unconfined_paths,
+                        directory_mode,
                     })
                 },
             )

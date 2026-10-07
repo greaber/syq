@@ -3468,18 +3468,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             0o755
         });
-    let root_source_mode =
-        match contents_source.filter(|_| private_root.is_none() && opts.rsync_creation) {
-            Some(index) => stat_one_registered(
-                &mut *src_ctl,
-                &srcs[index].path,
-                &source_roots.get().expect("source roots registered")[index].selection,
-                srcs[index].follows_root(args.follows_native_source_paths()),
-            )?
-            .filter(|entry| entry.kind == Kind::Dir)
-            .map(|entry| entry.mode & 0o777),
-            None => None,
-        };
+    // Registering the source root read its mode, so this takes no lookup.
+    let root_source_mode = contents_source
+        .filter(|_| private_root.is_none() && opts.rsync_creation)
+        .and_then(|index| {
+            source_roots.get().expect("source roots registered")[index].directory_mode
+        });
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories

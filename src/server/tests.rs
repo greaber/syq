@@ -468,6 +468,7 @@ fn tcp_server_joins_request_reader_on_shutdown() {
         leaf_ticket: None,
         expected_leaf: None,
         allow_unconfined_paths: false,
+        directory_mode: None,
     };
     let server_session = descriptor_session.clone();
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -804,6 +805,7 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
         leaf_ticket: None,
         expected_leaf: None,
         allow_unconfined_paths: false,
+        directory_mode: None,
     };
     owner.close();
 
