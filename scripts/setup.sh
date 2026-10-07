@@ -20,7 +20,10 @@ rust-toolchain.toml, and install every pinned tool.
 install  Download, verify, and unpack pinned tools (default: all).
 env      Print shell commands that put installed tools first on PATH:
            eval "$(scripts/setup.sh env)"
-github   Install, then add the tools to a GitHub Actions job's PATH.
+         They also set NEXTEST_DOUBLE_SPAWN=0, which saves CPU; suspending
+         a nextest run with Ctrl-Z can then occasionally hang it.
+github   Install, then add the tools to a GitHub Actions job's PATH, and
+         set NEXTEST_DOUBLE_SPAWN=0 when installing cargo-nextest.
 
 Tools are cached in ${SYQ_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/syq/tools}.
 EOF

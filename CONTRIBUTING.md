@@ -25,7 +25,10 @@ are kept in
 only what is missing.
 
 The `eval` line puts the pinned tools first on `PATH` in the current shell;
-repeat it in each new shell. It also sets `UV_PYTHON` to the pinned Python. Pass tool
+repeat it in each new shell. It also sets `UV_PYTHON` to the pinned Python, and
+`NEXTEST_DOUBLE_SPAWN=0`, which stops nextest from starting a second copy of
+itself before every test and saves a large share of its CPU; suspending a
+nextest run with Ctrl-Z can then occasionally hang it. Pass tool
 names to select only some of them, for example `scripts/setup.sh env python jq`.
 CI runs the same script.
 
