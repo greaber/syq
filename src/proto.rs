@@ -1059,6 +1059,11 @@ pub enum WireRequest<Data> {
         scanned: ScannedDestination,
         attempt: u32,
         create_if_missing: bool,
+        /// What an in-place file's name must hold when it is opened: nothing,
+        /// for an exclusive create, or exactly the scanned file, opened
+        /// without creating one. Staged files meet their condition when
+        /// they are published instead.
+        condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
     /// Hash an existing final file and retain that open inode as the repair

@@ -827,6 +827,8 @@ struct PrepareOptions {
     create_if_missing: bool,
     /// What the sender's scan found at the path.
     scanned: ScannedDestination,
+    /// What an in-place file's name must hold when it is opened.
+    condition: TargetCondition,
 }
 
 struct HashOptions {

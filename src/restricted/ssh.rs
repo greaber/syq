@@ -287,6 +287,7 @@ mod tests {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
         };
         first_writer.write_msg(&prepare("target/a", 1024)).unwrap();

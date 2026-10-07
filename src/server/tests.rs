@@ -122,6 +122,7 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
         })
         .unwrap();
@@ -260,7 +261,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         },
         flags: flags::RECEIVER_MODE | flags::TIMES,
         unchanged_flags: flags::RECEIVER_MODE | flags::TIMES,
-        condition: TargetCondition::Any,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     let new_data = new[..3 * block as usize].to_vec();
@@ -294,7 +295,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
                 files: vec![ExistingRead {
                     path: target.join(name).as_os_str().as_bytes().to_vec(),
                     len,
-                    condition: TargetCondition::Any,
+                    condition: crate::proto::TargetCondition::Any,
                     guard: None,
                 }],
             };

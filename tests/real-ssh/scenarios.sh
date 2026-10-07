@@ -1098,6 +1098,13 @@ case "$outside_output" in
 esac
 ssh destination 'cd /tmp/syq-real-ssh/outside-links && test "$(cat outside/a)" = old && test "$(cat scope/a)" = old && test "$(cat scope/b)" = new'
 
+printf 'case: restricted receiver writes in place only where the existing-file policy allows\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-policy-source && printf new > /tmp/syq-real-ssh/inplace-policy-source/a && printf new > /tmp/syq-real-ssh/inplace-policy-source/b'
+ssh destination 'mkdir -p /tmp/syq-real-ssh/inplace-policy && printf old > /tmp/syq-real-ssh/inplace-policy/a'
+syq cp --inplace --only-existing --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-policy-source \
+    --to destination --into /tmp/syq-real-ssh/inplace-policy
+ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/a)" = new && test ! -e /tmp/syq-real-ssh/inplace-policy/b'
+
 printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in
 # their second block; the even names' did not. Keeping an even name sets the

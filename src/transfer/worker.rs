@@ -1586,6 +1586,32 @@ impl Worker {
         ))
     }
 
+    /// What an in-place file's name must hold when Prepare opens it, as the
+    /// copy's existing-file policy requires: nothing for a file the copy
+    /// creates under --if-exists=keep or at a new root, exactly the scanned
+    /// file under --only-existing. A retry reopens the file its first
+    /// attempt created.
+    fn inplace_condition(&self, job: &WorkerJob) -> TargetCondition {
+        if !job.inplace {
+            return TargetCondition::Any;
+        }
+        match job.target_condition {
+            TargetCondition::Any => {}
+            TargetCondition::Absent if job.attempt > 0 => return TargetCondition::Any,
+            condition => return condition,
+        }
+        match job.dst_entry.as_ref() {
+            None if self.opts.ignore_existing && job.attempt == 0 => TargetCondition::Absent,
+            Some(destination) if self.opts.existing && destination.kind == Kind::File => {
+                TargetCondition::Matches {
+                    dev: destination.dev,
+                    ino: destination.ino,
+                }
+            }
+            _ => TargetCondition::Any,
+        }
+    }
+
     fn prepare_file(
         &mut self,
         job: &WorkerJob,
@@ -1606,6 +1632,7 @@ impl Worker {
                 scanned: job.scanned,
                 attempt: job.attempt,
                 create_if_missing,
+                condition: self.inplace_condition(job),
                 guard: job.container_guard.clone(),
             })?,
             "prepare",
@@ -2565,7 +2592,12 @@ impl Worker {
                 meta,
                 flags: self.publication_flags(&job),
                 scanned: job.scanned,
-                condition: job.target_condition,
+                // An in-place file met its condition when it was opened.
+                condition: if job.inplace {
+                    TargetCondition::Any
+                } else {
+                    job.target_condition
+                },
                 guard: job.container_guard.clone(),
             })?,
             "finalize destination",

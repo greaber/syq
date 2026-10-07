@@ -183,10 +183,9 @@ does not change that directory's permissions to make it writable.
 interrupted write could leave a file that a retry skips. With
 `--if-exists=error-if-different`, a retry rejects differing final contents,
 including incomplete output from an interrupted in-place copy. The default
-`update` policy can repair that incomplete file. Restricted receivers also
-reject `--as-new --inplace`, because direct writes do not enforce that destination
-condition. S3 and named receiving destinations do not support `--inplace`; see
-[Copy limits](../persistence-reference.md#copy-limits).
+`update` policy can repair that incomplete file. With `--inplace`,
+`--only-existing` opens only the file the scan found, and `--as-new` creates
+its file without replacing one. S3 destinations do not support `--inplace`.
 
 These policies do not disable requested pruning. Descriptor-specific
 restrictions are listed under [file descriptors](#file-descriptors).

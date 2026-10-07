@@ -208,16 +208,6 @@ impl RestrictedAuthority {
             // coordinator reports, so the receiver cannot enforce it.
             bail!("update-if-older existing-object policy is not enforceable by the receiver");
         }
-        if copy.policy.publication == PublicationPolicy::InPlace
-            && (copy.policy.existing != ExistingDestinationPolicy::Replace
-                || (root_existence == RootExistence::New
-                    && copy.policy.placement == DestinationPlacement::ExactPath))
-        {
-            // In-place preparation opens, creates, or replaces the final
-            // pathname with no condition to attach, so it can neither retain
-            // a pre-existing object nor be pinned to one.
-            bail!("in-place publication cannot honor a signed existing-object policy");
-        }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(&config.root);
@@ -1436,6 +1426,63 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// Bind an in-place file's opening to the signed existing-object policy.
+    /// In place, the name is written as it is opened, so the request must
+    /// carry the condition the policy needs: no file there when the policy
+    /// keeps existing files or the root must be new, and exactly the file
+    /// the receiver observes when it changes existing files only. A file
+    /// this grant created, in an earlier attempt, may be opened again.
+    pub(super) fn constrain_inplace(
+        &self,
+        path: &[u8],
+        condition: &proto::TargetCondition,
+        pending: &mut Vec<PendingCreation>,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        if self.created_by_this_grant(path) {
+            return Ok(());
+        }
+        let label = String::from_utf8_lossy(path);
+        let root_must_be_new =
+            self.root_existence == RootExistence::New && path == self.destination;
+        match self.copy.policy.existing {
+            ExistingDestinationPolicy::Replace if !root_must_be_new => {}
+            ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip => {
+                if *condition != Absent {
+                    bail!(
+                        "in-place preparation of {label} must create it without replacing anything, as the signed existing-object policy requires"
+                    );
+                }
+                // Once created, the file is this grant's own: its retries
+                // and metadata may follow.
+                pending.push(PendingCreation {
+                    index: 0,
+                    path: path.to_vec(),
+                    persist: true,
+                    link: false,
+                });
+            }
+            ExistingDestinationPolicy::MustExist => {
+                let Some(metadata) = self.rooted_metadata(path)? else {
+                    bail!("signed grant creates nothing: {label} does not exist")
+                };
+                match *condition {
+                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+                    Matches { .. } => bail!(
+                        "requested identity for {label} does not match the object the receiver observed"
+                    ),
+                    Any | Absent | MatchesFingerprint { .. } => bail!(
+                        "in-place preparation of {label} must name the existing file it changes, as the signed existing-object policy requires"
+                    ),
+                }
+            }
+            ExistingDestinationPolicy::UpdateIfOlder => {
+                bail!("update-if-older existing-object policy is not enforceable by the receiver")
+            }
+        }
+        Ok(())
+    }
+
     /// Refuse staging work whose eventual publication the existing-object
     /// policy would reject, so the transfer fails before moving bytes.
     pub(super) fn constrain_prepare(&self, path: &[u8]) -> Result<()> {
@@ -2495,6 +2542,7 @@ impl RestrictedAuthority {
                 flags,
                 scanned,
                 create_if_missing,
+                condition,
                 guard,
                 ..
             } => {
@@ -2509,7 +2557,11 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
-                self.constrain_prepare(path)?;
+                if *inplace {
+                    self.constrain_inplace(path, condition, pending)?;
+                } else {
+                    self.constrain_prepare(path)?;
+                }
                 let observation_hold =
                     self.reserve_bytes(path, *copy_id, *size, !*create_if_missing)?;
                 outcomes.push(PendingOutcome::FileStage {

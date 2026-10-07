@@ -3402,8 +3402,15 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
+                // A conditioned in-place file meets its condition when it
+                // is opened (`Request::Prepare`).
                 inplace: self.opts.inplace
-                    && target_condition == TargetCondition::Any
+                    && matches!(
+                        target_condition,
+                        TargetCondition::Any
+                            | TargetCondition::Absent
+                            | TargetCondition::Matches { .. }
+                    )
                     && self.container_guard.is_none(),
                 src_rel,
                 scanned,

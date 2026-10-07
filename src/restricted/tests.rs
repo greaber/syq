@@ -1092,6 +1092,7 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     let mut included_prepare = prepare(included);
@@ -1174,6 +1175,7 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     let mut cache_root = prepare(cache.clone());
@@ -1207,6 +1209,7 @@ fn signed_inplace_policy_requires_inplace_file_mutations() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     let mut inplace = prepare(true);
@@ -1261,6 +1264,7 @@ fn prepare_request(path: &Path) -> Request {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     }
 }
@@ -3026,6 +3030,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     let settlement = authority.authorize(&mut prepare, false).unwrap();
@@ -3080,6 +3085,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     let settlement = finished.authorize(&mut prepare, false).unwrap();
@@ -3155,6 +3161,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
         });
         assert!(
@@ -3334,12 +3341,20 @@ fn new_directory_placement_root_must_be_created_as_a_directory() {
     assert_eq!(op_condition(&as_directory), Absent);
 }
 
+/// In place, a name is written as it is opened, so each in-place request
+/// carries the condition the signed existing-file policy needs, and the
+/// receiver opens the name only on that condition. A compromised sender
+/// cannot drop the condition, and its condition cannot name another file.
 #[test]
-fn inplace_publication_cannot_honor_no_replace_policies() {
+fn inplace_requests_carry_the_condition_their_existing_file_policy_needs() {
+    use proto::TargetCondition::{Absent, Any, Matches};
+    use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
-    let inplace = |existing, placement, root_existence| {
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/existing"), b"kept").unwrap();
+    let existing = fs::metadata(root.join("target/existing")).unwrap();
+    let inplace = |policy, placement, root_existence| {
         test_authority_with_existence(
             &root,
             DeletionPolicy::Forbid,
@@ -3347,42 +3362,112 @@ fn inplace_publication_cannot_honor_no_replace_policies() {
             0,
             FilterPolicy::default(),
             PublicationPolicy::InPlace,
-            existing,
+            policy,
             placement,
             root_existence,
         )
+        .unwrap()
     };
-    assert!(inplace(
+    let prepare = |name: &str, condition| Request::Prepare {
+        path: path_bytes(&root.join("target").join(name)),
+        size: 4,
+        inplace: true,
+        copy_id: [1; 16],
+        mode: 0o600,
+        flags: 0,
+        acl: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+        attempt: 0,
+        create_if_missing: true,
+        condition,
+        guard: None,
+    };
+    let refused = |authority: &RestrictedAuthority, name: &str, condition| {
+        authority
+            .authorize(&mut prepare(name, condition), false)
+            .unwrap_err()
+            .to_string()
+    };
+
+    // Keeping existing files: only an exclusive create, and the receiver's
+    // exclusive create then refuses a file that is already there.
+    let keep = inplace(
         ExistingDestinationPolicy::Skip,
-        DestinationPlacement::ExactPath,
+        DestinationPlacement::DirectoryContents,
         RootExistence::Any,
-    )
-    .is_err());
-    assert!(inplace(
+    );
+    let error = refused(&keep, "existing", Any);
+    assert!(
+        error.contains("must create it without replacing"),
+        "{error}"
+    );
+    let mut create_over = prepare("existing", Absent);
+    keep.authorize(&mut create_over, false).unwrap();
+    let response = crate::fsops::FsOps::new().handle_in_place(&mut create_over);
+    assert!(
+        matches!(
+            &response,
+            crate::proto::Response::EndpointError(_) | crate::proto::Response::Err(_)
+        ),
+        "{response:?}"
+    );
+    assert_eq!(fs::read(root.join("target/existing")).unwrap(), b"kept");
+    keep.authorize(&mut prepare("new", Absent), false).unwrap();
+
+    // Changing existing files only: exactly the file the receiver observes.
+    let update = inplace(
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    );
+    let observed = Matches {
+        dev: existing.dev(),
+        ino: existing.ino(),
+    };
+    let error = refused(&update, "missing", observed);
+    assert!(error.contains("creates nothing"), "{error}");
+    assert!(!root.join("target/missing").exists());
+    let error = refused(&update, "existing", Any);
+    assert!(error.contains("must name the existing file"), "{error}");
+    let error = refused(
+        &update,
+        "existing",
+        Matches {
+            dev: existing.dev(),
+            ino: existing.ino() + 1,
+        },
+    );
+    assert!(error.contains("does not match"), "{error}");
+    update
+        .authorize(&mut prepare("existing", observed), false)
+        .unwrap();
+
+    // A new root exactly at the destination is created, never replaced.
+    let as_new = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::ExactPath,
         RootExistence::New,
-    )
-    .is_err());
-    // In-place preparation cannot be pinned to an observed object either,
-    // so MustExist is refused as well; only Replace remains, and a new
-    // directory root is fine because mkdir creates it.
-    assert!(inplace(
-        ExistingDestinationPolicy::MustExist,
-        DestinationPlacement::ExactPath,
-        RootExistence::Any,
-    )
-    .is_err());
-    inplace(
+    );
+    // The test destination already exists, so redemption refuses it.
+    assert!(as_new.is_err());
+
+    // Replacing: any condition, as before.
+    let replace = inplace(
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::DirectoryContents,
-        RootExistence::New,
-    )
-    .unwrap();
+        RootExistence::Any,
+    );
+    replace
+        .authorize(&mut prepare("existing", Any), false)
+        .unwrap();
 
-    // The coordinator refuses the same combination before signing. The
-    // rsync-shaped parser already makes --inplace and --ignore-existing
-    // conflict, so the reachable case is the native --as-new placement.
+    // The coordinator signs these combinations now.
     let mut args = Args::try_parse_from([
         "syq rsync",
         "-r",
@@ -3392,11 +3477,10 @@ fn inplace_publication_cannot_honor_no_replace_policies() {
     ])
     .unwrap();
     args.normalize();
-    validate_restricted_args(&args).unwrap();
     args.placement = Placement::As;
     args.target_existence = Existence::New;
-    assert!(validate_restricted_args(&args).is_err());
-    args.placement = Placement::Into;
+    validate_restricted_args(&args).unwrap();
+    args.existing = true;
     validate_restricted_args(&args).unwrap();
 }
 
@@ -3889,6 +3973,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     authority.authorize(&mut prepare, false).unwrap();
@@ -4259,6 +4344,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
     };
     authority.authorize(&mut prepare("a", 10), false).unwrap();
@@ -6661,6 +6747,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 scanned: crate::proto::ScannedDestination::Unknown,
                 attempt: 0,
                 create_if_missing: true,
+                condition: crate::proto::TargetCondition::Any,
                 guard: None,
             });
             receiver.send(Request::WriteRange {
@@ -6811,6 +6898,7 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 scanned,
                 attempt: 0,
                 create_if_missing: true,
+                condition: crate::proto::TargetCondition::Any,
                 guard: None,
             });
             receiver.send(Request::WriteRange {
@@ -6869,6 +6957,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             scanned: proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
         });
         receiver.send(Request::WriteRange {
@@ -6953,6 +7042,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             scanned,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
         });
         receiver.send(Request::WriteRange {

@@ -1313,6 +1313,34 @@ fn named_inplace_copies_update_link_groups_inside_their_directory() {
     }
 }
 
+/// A laptop download with --inplace --only-existing changes the files the
+/// destination has, in place, and creates none.
+#[test]
+fn named_inplace_copies_change_only_existing_files() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(root.join("source")).unwrap();
+    fs::write(source.join("a"), b"new contents").unwrap();
+    fs::write(source.join("b"), b"not wanted").unwrap();
+    fs::write(root.join("source/a"), b"old").unwrap();
+    let inode = fs::metadata(root.join("source/a")).unwrap().ino();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    assert_eq!(
+        named_copy(
+            &registration,
+            &source,
+            &["--inplace", "--only-existing", "--copy-metadata", "mtime"]
+        ),
+        0
+    );
+    assert_eq!(fs::read(root.join("source/a")).unwrap(), b"new contents");
+    assert_eq!(fs::metadata(root.join("source/a")).unwrap().ino(), inode);
+    assert!(!root.join("source/b").exists());
+}
+
 #[test]
 fn named_authorization_expires_before_control_opens() {
     let temp = crate::test_support::tempdir().unwrap();

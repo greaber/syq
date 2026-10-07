@@ -288,3 +288,38 @@ fn prune_does_not_require_permission_to_replace_source_matches() {
     assert_eq!(read(&t.path("dst/new")), b"new");
     assert!(!t.path("dst/extra").exists());
 }
+
+/// In place, the name is written as it is opened, so `--only-existing` opens
+/// only the file the scan found and `--as-new` creates its file exclusively.
+#[test]
+fn inplace_files_open_their_names_as_the_existing_file_policy_requires() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"new a");
+    write(&t.path("src/b"), b"new b");
+    write(&t.path("dst/a"), b"old");
+    let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
+    run_native_ok(&[
+        "cp",
+        "--inplace",
+        "--only-existing",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/a")), b"new a");
+    assert_eq!(fs::metadata(t.path("dst/a")).unwrap().ino(), inode);
+    assert!(!t.path("dst/b").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--inplace",
+        &t.s("src/b"),
+        "--as-new",
+        &t.s("dst/new"),
+    ]);
+    assert_eq!(read(&t.path("dst/new")), b"new b");
+    let refused = native_syq(&["cp", "--inplace", &t.s("src/b"), "--as-new", &t.s("dst/a")]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(read(&t.path("dst/a")), b"new a");
+}

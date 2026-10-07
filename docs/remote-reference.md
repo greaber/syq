@@ -89,7 +89,6 @@ their original limits.
 | `--no-tcp-encryption` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
-| `--inplace` with `--if-exists=keep`, `--only-existing` or `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
 

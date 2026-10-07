@@ -417,6 +417,7 @@ impl FsOps {
             attempt,
             create_if_missing,
             scanned,
+            condition,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
@@ -436,11 +437,53 @@ impl FsOps {
         }
         if inplace {
             self.uncache_rooted(&target.root, &target.relative);
-            if self
+            let held_here = self
                 .held_basis
                 .as_ref()
-                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id)
-            {
+                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id);
+            match condition {
+                // Only a new file: created exclusively, never one already there.
+                TargetCondition::Absent => {
+                    let file = self
+                        .create_inplace_file(&target.root, &target.relative, mode, copy_id)
+                        .map_err(|error| {
+                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                                error.kind() == io::ErrorKind::AlreadyExists
+                            }) {
+                                anyhow!(
+                                    "destination {} appeared after the new-path precondition was checked",
+                                    target.label.display()
+                                )
+                            } else {
+                                error
+                            }
+                        })?;
+                    let opened = file.metadata()?;
+                    self.set_copy_length(&file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    self.cache_opened_file(target.location(), attempt, false, file, opened);
+                    return Ok(Preparation::default());
+                }
+                // Only the file the scan found: opened, never created.
+                TargetCondition::Matches { .. } if !held_here => {
+                    let file = target.root.open_regular_read_write(&target.relative)?;
+                    require_open_target(&file, &target.label, condition)?;
+                    let opened = file.metadata()?;
+                    self.require_names_inside(&target, &opened)?;
+                    receiver_mode::note_inplace_open(copy_id, &opened, false);
+                    self.set_copy_length(&file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    self.cache_opened_file(target.location(), attempt, false, file, opened);
+                    return Ok(Preparation::default());
+                }
+                TargetCondition::MatchesFingerprint { .. } => {
+                    bail!("in-place preparation accepts no fingerprint condition")
+                }
+                _ => {}
+            }
+            if held_here {
                 // The coordinator reuses hashes from this inode. Never resize
                 // or write a replacement name using that earlier comparison.
                 let held = self.held_basis.take().unwrap();
@@ -454,6 +497,7 @@ impl FsOps {
                         ino: metadata.ino(),
                     },
                 )?;
+                require_open_target(&file, &target.label, condition)?;
                 self.require_names_inside(&target, &metadata)?;
                 receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
@@ -3235,6 +3279,7 @@ impl FsOps {
                 scanned,
                 attempt,
                 create_if_missing,
+                condition,
                 guard,
             } => self
                 .creation_mode(
@@ -3254,6 +3299,7 @@ impl FsOps {
                             guard: guard.as_ref(),
                         },
                         PrepareOptions {
+                            condition: *condition,
                             size: *size,
                             inplace: *inplace,
                             mode,
