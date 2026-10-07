@@ -115,6 +115,32 @@ def check():
             after = {path: mode(acl / 'download' / path) for path in directories}
             assert after == {path: value & 0o750 for path, value in expected.items()}, after
 
+        # Without -p, a read-only marker's directory gets owner access, as a
+        # native copy gives every new directory, so a later download can still
+        # update what it holds. With -p it gets the marker's mode.
+        readonly = root / 'readonly-source'
+        (readonly / 'locked').mkdir(parents=True)
+        (readonly / 'locked/file').write_bytes(b'first')
+        (readonly / 'locked').chmod(0o555)
+        upload = [readonly, '--to', remote, '--into', prefix, '--copy-metadata=permissions']
+        c.run(upload)
+        download = {preserve: ['--from', remote, prefix + '/readonly-source', '--into',
+                               root / f'readonly-{preserve}'] for preserve in (False, True)}
+        download[True].append('--copy-metadata=permissions')
+        for preserve, expected_mode in [(False, 0o755), (True, 0o555)]:
+            c.run(download[preserve])
+            locked = root / f'readonly-{preserve}/readonly-source/locked'
+            assert mode(locked) == expected_mode, (preserve, oct(mode(locked)))
+            assert (locked / 'file').read_bytes() == b'first'
+        (readonly / 'locked').chmod(0o755)
+        (readonly / 'locked/file').write_bytes(b'second')
+        (readonly / 'locked').chmod(0o555)
+        c.run(upload)
+        c.run(download[False])
+        assert (root / 'readonly-False/readonly-source/locked/file').read_bytes() == b'second'
+        for path in (readonly, root / 'readonly-True/readonly-source'):
+            (path / 'locked').chmod(0o755)
+
         # A directory a file's download creates before its own marker's job runs
         # still receives the marker's mode. One object at a time, in mapping order.
         mapping = root / 'mapping.jsonl'
