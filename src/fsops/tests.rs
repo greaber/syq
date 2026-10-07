@@ -8091,3 +8091,52 @@ fn an_in_place_open_of_a_scanned_file_refuses_one_with_names_outside() {
     );
     assert_eq!(fs::read(base.join("outside/a")).unwrap(), b"old");
 }
+
+/// An in-place Prepare that may only create its file creates it once: a
+/// retry under the same condition reopens the file this copy created, and
+/// any other file at the name, or a file another copy created, is refused.
+#[test]
+fn an_in_place_retry_that_may_only_create_reopens_only_its_own_file() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let identity = Root::open(dir.path()).unwrap().identity();
+    let guard = ContainerGuard {
+        root: dir.path().as_os_str().as_bytes().to_vec(),
+        dev: identity.dev,
+        ino: identity.ino,
+    };
+    let target = dir.path().join("new");
+    let target_bytes = target.as_os_str().as_bytes().to_vec();
+    let prepare = |operations: &mut FsOps, copy_id: &[u8; 16], attempt| {
+        operations.prepare(
+            PartialTarget {
+                path: &target_bytes,
+                id: copy_id,
+                guard: Some(&guard),
+            },
+            PrepareOptions {
+                condition: crate::proto::TargetCondition::Absent,
+                size: 3,
+                inplace: true,
+                mode: 0o644,
+                attempt,
+                create_if_missing: true,
+                scanned: ScannedDestination::Absent,
+            },
+        )
+    };
+    let copy = [11; 16];
+    prepare(&mut FsOps::new(), &copy, 0).unwrap();
+    let created = fs::metadata(&target).unwrap();
+    // A retry, here on another connection, reopens the same file.
+    prepare(&mut FsOps::new(), &copy, 1).unwrap();
+    assert_eq!(fs::metadata(&target).unwrap().ino(), created.ino());
+    // Another copy may not take it.
+    let error = prepare(&mut FsOps::new(), &[12; 16], 0).unwrap_err();
+    assert!(error.to_string().contains("appeared after"), "{error:#}");
+    // Nor may the retry take a file that replaced it.
+    fs::remove_file(&target).unwrap();
+    fs::write(&target, b"someone else's").unwrap();
+    let error = prepare(&mut FsOps::new(), &copy, 2).unwrap_err();
+    assert!(error.to_string().contains("appeared after"), "{error:#}");
+    assert_eq!(fs::read(&target).unwrap(), b"someone else's");
+}

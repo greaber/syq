@@ -1589,19 +1589,18 @@ impl Worker {
     /// What an in-place file's name must hold when Prepare opens it, as the
     /// copy's existing-file policy requires: nothing for a file the copy
     /// creates under --if-exists=keep or at a new root, exactly the scanned
-    /// file under --only-existing. A retry reopens the file its first
-    /// attempt created.
+    /// file under --only-existing. A retry sends the same condition; the
+    /// receiver also accepts a file this copy created there itself.
     fn inplace_condition(&self, job: &WorkerJob) -> TargetCondition {
         if !job.inplace {
             return TargetCondition::Any;
         }
         match job.target_condition {
             TargetCondition::Any => {}
-            TargetCondition::Absent if job.attempt > 0 => return TargetCondition::Any,
             condition => return condition,
         }
         match job.dst_entry.as_ref() {
-            None if self.opts.ignore_existing && job.attempt == 0 => TargetCondition::Absent,
+            None if self.opts.ignore_existing => TargetCondition::Absent,
             Some(destination) if self.opts.existing && destination.kind == Kind::File => {
                 TargetCondition::Matches {
                     dev: destination.dev,

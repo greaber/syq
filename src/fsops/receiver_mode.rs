@@ -194,6 +194,18 @@ pub(super) fn note_inplace_open(copy_id: &CopyId, opened: &fs::Metadata, created
         .or_insert(open);
 }
 
+/// Whether this process created the file `opened` describes to write
+/// `copy_id`'s data in place.
+pub(super) fn created_inplace(copy_id: &CopyId, opened: &fs::Metadata) -> bool {
+    matches!(
+        inplace_opened()
+            .lock()
+            .unwrap()
+            .get(&(*copy_id, opened.dev(), opened.ino())),
+        Some(InplaceOpen::Created)
+    )
+}
+
 impl FsOps {
     /// The mode creating a file at `target` from `proposed` gives it: the
     /// proposal's permission bits limited by its directory's default ACL if

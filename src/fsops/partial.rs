@@ -442,22 +442,40 @@ impl FsOps {
                 .as_ref()
                 .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id);
             match condition {
-                // Only a new file: created exclusively, never one already there.
+                // Only a new file: created exclusively, never one already
+                // there, except the one this copy created there for an
+                // earlier attempt.
                 TargetCondition::Absent => {
-                    let file = self
-                        .create_inplace_file(&target.root, &target.relative, mode, copy_id)
-                        .map_err(|error| {
+                    let file = match self.create_inplace_file(
+                        &target.root,
+                        &target.relative,
+                        mode,
+                        copy_id,
+                    ) {
+                        Ok(file) => file,
+                        Err(error)
                             if error.downcast_ref::<io::Error>().is_some_and(|error| {
                                 error.kind() == io::ErrorKind::AlreadyExists
-                            }) {
-                                anyhow!(
+                            }) =>
+                        {
+                            let file = target
+                                .root
+                                .open_regular_read_write(&target.relative)
+                                .ok()
+                                .filter(|file| {
+                                    file.metadata().is_ok_and(|opened| {
+                                        receiver_mode::created_inplace(copy_id, &opened)
+                                    })
+                                });
+                            file.with_context(|| {
+                                format!(
                                     "destination {} appeared after the new-path precondition was checked",
                                     target.label.display()
                                 )
-                            } else {
-                                error
-                            }
-                        })?;
+                            })?
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let opened = file.metadata()?;
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
