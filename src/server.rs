@@ -750,6 +750,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
+        ops.set_scope_names(authority.scope_names());
     }
     if let Some(source) = &source_permit {
         source.initialize(&mut ops)?;
@@ -1330,6 +1331,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                             &requested_root,
                             batch.iter().map(|entry| entry.path.as_slice()),
                         )?;
+                        ops.record_scope_names(&requested_root, &batch);
                     }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {

@@ -246,6 +246,7 @@ HostA cannot:
   configuration directory.
 - Overwrite existing files when the grant permits only creating new ones,
   or delete files without permission.
+- Change in place a file that also has names outside the scope.
 - Exceed the signed byte, entry, or deletion limits.
 - Reuse the grant for another copy or use the restricted key to run a shell.
 - Forge hostB's receipt.

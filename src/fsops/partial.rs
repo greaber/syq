@@ -454,6 +454,7 @@ impl FsOps {
                         ino: metadata.ino(),
                     },
                 )?;
+                self.require_names_inside(&target, &metadata)?;
                 receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
                 self.cache_file(target.location(), attempt, false, file);
@@ -521,6 +522,7 @@ impl FsOps {
                 match target.root.open_regular_read_write(&target.relative) {
                     Ok(file) => {
                         let opened = file.metadata()?;
+                        self.require_names_inside(&target, &opened)?;
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -550,6 +552,7 @@ impl FsOps {
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
                         let opened = file.metadata()?;
+                        self.require_names_inside(&target, &opened)?;
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -804,6 +807,12 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
+        if self.scope_names.is_some() {
+            let current = held.file.metadata()?;
+            if scope_names::changes_metadata(&current, meta, flags) {
+                self.require_names_inside(&target, &current)?;
+            }
+        }
         set_meta_file(&held.file, meta, flags)
             .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
         if guard.is_some() {
@@ -2098,6 +2107,9 @@ impl FsOps {
                 flags = (flags & !flags::RECEIVER_MODE) | flags::MODE;
             }
             let meta = &*meta;
+            if self.scope_names.is_some() {
+                self.require_names_inside(&rooted, &file.metadata()?)?;
+            }
             observed_overwrite(&self.operation, &file, data, old_len, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
             let len = data.len() as u64;
@@ -2723,6 +2735,7 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
+            self.require_names_inside(target, &current)?;
             check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;

@@ -961,13 +961,16 @@ fn named_copy_accepts_ownership_and_special_files() {
 }
 
 #[test]
-fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
+fn named_requests_accept_inplace_and_prune_within_the_machines_limit() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut inplace = args(&temporary.path().join("source"), "output");
     inplace.inplace = true;
-    let (refused, _) = request(&inplace);
-    let error = constrain(refused, temporary.path(), 1000, 1000, 0).unwrap_err();
-    assert!(error.to_string().contains("--inplace"), "{error:#}");
+    let (accepted, _) = request(&inplace);
+    let constrained = constrain(accepted, temporary.path(), 1000, 1000, 0).unwrap();
+    assert_eq!(
+        constrained.copy.policy.publication,
+        crate::delegation::PublicationPolicy::InPlace
+    );
 
     // Without --max-delete, the request may delete what this machine allows.
     let mut pruning = args(&temporary.path().join("source"), "output");
@@ -1205,6 +1208,109 @@ fn named_extended_attributes_ask_and_reconcile_the_user_namespace() {
         attributes(&root.join("source/file")),
         [(b"user.kept".to_vec(), b"value".to_vec())]
     );
+}
+
+/// A downloaded file whose destination shares its inode with a name outside
+/// the copy's directory, as snapshot trees do, is not changed in place:
+/// neither its contents with `--inplace` nor its metadata alone. That file
+/// fails; the copy's other files and other names are as an ordinary copy
+/// leaves them.
+#[test]
+fn named_copies_change_no_file_in_place_that_has_names_outside() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for (options, contents) in [
+        (&["--inplace", "--copy-metadata", "mtime"][..], &b"new"[..]),
+        (&["--copy-metadata", "mtime,permissions"], b"old"),
+    ] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        let source = fs::canonicalize(temp.path()).unwrap().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(source.join("a"), contents).unwrap();
+        fs::write(source.join("b"), b"new").unwrap();
+        fs::set_permissions(source.join("a"), fs::Permissions::from_mode(0o600)).unwrap();
+        // Older than the destination, so that no file looks unchanged.
+        for name in ["a", "b"] {
+            fs::File::options()
+                .write(true)
+                .open(source.join(name))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+                .unwrap();
+        }
+        fs::write(root.join("source/a"), b"old").unwrap();
+        fs::set_permissions(root.join("source/a"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(root.join("source/a"), root.join("outside/a")).unwrap();
+        fs::write(root.join("source/b"), b"old").unwrap();
+        let before = fs::metadata(root.join("outside/a")).unwrap();
+        let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+        // A partial transfer: that one file failed.
+        assert_eq!(
+            named_copy(&registration, &source, options),
+            23,
+            "{options:?}"
+        );
+        let after = fs::metadata(root.join("outside/a")).unwrap();
+        assert_eq!(
+            fs::read(root.join("outside/a")).unwrap(),
+            b"old",
+            "{options:?}"
+        );
+        assert_eq!(
+            (after.ino(), after.mode(), after.mtime(), after.mtime_nsec()),
+            (
+                before.ino(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec()
+            ),
+            "{options:?}"
+        );
+        assert_eq!(
+            fs::read(root.join("source/b")).unwrap(),
+            b"new",
+            "{options:?}"
+        );
+    }
+}
+
+/// Names the copy's own scan found inside its directory are not outside:
+/// a linked pair there is updated in place as usual.
+#[test]
+fn named_inplace_copies_update_link_groups_inside_their_directory() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(root.join("source")).unwrap();
+    fs::write(source.join("x"), b"new contents").unwrap();
+    fs::hard_link(source.join("x"), source.join("y")).unwrap();
+    fs::write(root.join("source/x"), b"old").unwrap();
+    fs::hard_link(root.join("source/x"), root.join("source/y")).unwrap();
+    let inode = fs::metadata(root.join("source/x")).unwrap().ino();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let shown = approve_pending(&receiver);
+    assert_eq!(
+        named_copy(
+            &registration,
+            &source,
+            &["--inplace", "--copy-metadata", "mtime,hardlinks"]
+        ),
+        0
+    );
+    let shown = shown.join().unwrap();
+    assert!(
+        shown.contains("The server can rewrite existing files in place."),
+        "{shown}"
+    );
+    for name in ["x", "y"] {
+        let path = root.join("source").join(name);
+        assert_eq!(fs::read(&path).unwrap(), b"new contents");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode, "{name}");
+    }
 }
 
 #[test]

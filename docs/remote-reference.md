@@ -197,7 +197,7 @@ These options choose authorization, not the destination: `--to host` names an
 SSH destination, while `--to @NAME` sends files to a receiving machine.
 
 Per-copy SSH authorization through a receiving machine does not support a root
-login on the destination, `--inplace`, `--detach`, custom
+login on the destination, `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
 or `--coordinate-at`, or `--no-tcp-encryption`. The authorizing machine's copy
 limits apply, including its `--max-delete` for pruning. Uploads send file data directly from

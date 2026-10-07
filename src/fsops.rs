@@ -41,6 +41,7 @@ mod operator;
 mod partial;
 mod paths;
 mod receiver_mode;
+pub(crate) mod scope_names;
 mod sidecars;
 mod small_batch;
 
@@ -701,6 +702,9 @@ pub struct FsOps {
     /// been listed or turned out not to be on NFS.
     #[cfg(target_os = "linux")]
     listing_requests: HashMap<PathBytes, Option<usize>>,
+    /// On a confined receiver, the names it knows files have inside its
+    /// approved directories; it changes no file in place that has others.
+    scope_names: Option<Arc<scope_names::ScopeNames>>,
 }
 
 struct ComparisonWindow {
@@ -913,6 +917,7 @@ impl FsOps {
             network_entries: HashMap::new(),
             #[cfg(target_os = "linux")]
             listing_requests: HashMap::new(),
+            scope_names: None,
         }
     }
 
@@ -2696,6 +2701,17 @@ impl FsOps {
                 self.fds.remove(&victim);
             }
             let file = root.open_regular_write(relative, false)?;
+            // A file written in place by name is the inode there now.
+            if let Some(names) = self.scope_names.as_ref().filter(|_| !private) {
+                let opened = file.metadata()?;
+                if !opened.is_dir() {
+                    names.require_inside(
+                        root,
+                        label.as_os_str().as_bytes(),
+                        (opened.dev(), opened.ino(), opened.nlink()),
+                    )?;
+                }
+            }
             if private {
                 require_safe_partial(&file, label)?;
                 let named = root.metadata(relative)?;
@@ -3109,6 +3125,7 @@ impl FsOps {
             !short.is_empty() && self.destination_on_network_file_system(guard, &short),
         );
         let directories = &self.receiver_directories;
+        let scope_names = self.scope_names.as_deref();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
@@ -3184,7 +3201,13 @@ impl FsOps {
                         }
                     })
                 }
-                _ => apply_one(op, guard, destination_root.clone(), destination_prefix),
+                _ => apply_one(
+                    op,
+                    guard,
+                    destination_root.clone(),
+                    destination_prefix,
+                    scope_names,
+                ),
             };
             result.err().as_ref().map(wire_error)
         };
@@ -3215,7 +3238,13 @@ impl FsOps {
                 destination_root.clone(),
                 destination_prefix,
             );
-            let result = apply_one(&op, guard, destination_root.clone(), destination_prefix);
+            let result = apply_one(
+                &op,
+                guard,
+                destination_root.clone(),
+                destination_prefix,
+                scope_names,
+            );
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {
@@ -3239,6 +3268,25 @@ impl FsOps {
         });
         for (i, r) in meta_idx.iter().zip(mres) {
             out[*i] = r;
+        }
+        // A link this copy made is a name inside the approved directories.
+        if let Some(names) = &self.scope_names {
+            for (op, outcome) in ops.iter().zip(&out) {
+                if let (
+                    Op::Hardlink {
+                        path,
+                        source,
+                        dev,
+                        ino,
+                        ..
+                    },
+                    None,
+                ) = (op, outcome)
+                {
+                    names.record(path, *dev, *ino);
+                    names.record(source, *dev, *ino);
+                }
+            }
         }
         out
     }

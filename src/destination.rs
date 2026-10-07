@@ -832,10 +832,8 @@ fn constrain(
         *filter_root = rebase(filter_root, destination)?;
     }
     // Ownership and special files act as for any copy by an ordinary
-    // account: the receiver never runs as root.
-    if request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace {
-        bail!("named destinations do not accept --inplace");
-    }
+    // account: the receiver never runs as root. In-place writes change no
+    // file with names outside the destination (`ScopeNames`).
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
