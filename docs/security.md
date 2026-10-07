@@ -251,9 +251,9 @@ HostA cannot:
 - Reuse the grant for another copy or use the restricted key to run a shell.
 - Forge hostB's receipt.
 
-The filesystem limitations above still apply, including effects through
-hard links. HostB's account and receiver remain trusted to
-enforce the grant and report accurately. A verified receipt describes their
+The filesystem limitations above still apply to names inside the scope: a
+change in place reaches every name a file has there. HostB's account and
+receiver remain trusted to enforce the grant and report accurately. A verified receipt describes their
 work; it cannot prove that hostA supplied the right files. For example, a
 successful receipt can accurately report that hostB wrote false contents
 provided by hostA.

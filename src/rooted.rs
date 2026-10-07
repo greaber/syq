@@ -1114,6 +1114,15 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
+    /// How many entries of the directory `path` name the inode `ino`.
+    pub(crate) fn count_entries_naming(&self, path: &RelativePath, ino: u64) -> Result<u64> {
+        let directory = self.open_directory(path)?;
+        let readable = open_readable_directory_at(&directory, b".")
+            .context("open readable confined directory")?;
+        crate::sys::directory_entries_naming(readable, ino)
+            .with_context(|| format!("read confined directory {}", path.label()))
+    }
+
     /// Whether a retained directory has no entries, reading only as far as
     /// the first.
     pub(crate) fn open_directory_is_empty(&self, directory: &File) -> Result<bool> {

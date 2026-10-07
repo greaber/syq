@@ -471,7 +471,7 @@ impl FsOps {
                     let file = target.root.open_regular_read_write(&target.relative)?;
                     require_open_target(&file, &target.label, condition)?;
                     let opened = file.metadata()?;
-                    self.require_names_inside(&target, &opened)?;
+                    self.require_names_inside(&target, &file)?;
                     receiver_mode::note_inplace_open(copy_id, &opened, false);
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
@@ -499,7 +499,7 @@ impl FsOps {
                     },
                 )?;
                 require_open_target(&file, &target.label, condition)?;
-                self.require_names_inside(&target, &metadata)?;
+                self.require_names_inside(&target, &file)?;
                 receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
                 self.cache_file(target.location(), attempt, false, file);
@@ -529,7 +529,7 @@ impl FsOps {
                 Ok(Some((file, mut opened))) if opened.is_file() => {
                     // A restricted receiver discards the scan, so it never
                     // opens here; the check keeps it so if that changes.
-                    self.require_names_inside(&target, &opened)?;
+                    self.require_names_inside(&target, &file)?;
                     let euid = unsafe { libc::geteuid() };
                     let created =
                         euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600;
@@ -570,7 +570,7 @@ impl FsOps {
                 match target.root.open_regular_read_write(&target.relative) {
                     Ok(file) => {
                         let opened = file.metadata()?;
-                        self.require_names_inside(&target, &opened)?;
+                        self.require_names_inside(&target, &file)?;
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -600,7 +600,7 @@ impl FsOps {
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
                         let opened = file.metadata()?;
-                        self.require_names_inside(&target, &opened)?;
+                        self.require_names_inside(&target, &file)?;
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -858,7 +858,7 @@ impl FsOps {
         if self.scope_names.is_some() {
             let current = held.file.metadata()?;
             if scope_names::changes_metadata(&current, meta, flags) {
-                self.require_names_inside(&target, &current)?;
+                self.require_names_inside(&target, &held.file)?;
             }
         }
         set_meta_file(&held.file, meta, flags)
@@ -2156,7 +2156,7 @@ impl FsOps {
             }
             let meta = &*meta;
             if self.scope_names.is_some() {
-                self.require_names_inside(&rooted, &file.metadata()?)?;
+                self.require_names_inside(&rooted, &file)?;
             }
             observed_overwrite(&self.operation, &file, data, old_len, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
@@ -2783,7 +2783,7 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
-            self.require_names_inside(target, &current)?;
+            self.require_names_inside(target, &file)?;
             check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;

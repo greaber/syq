@@ -2705,13 +2705,11 @@ impl FsOps {
             let file = root.open_regular_write(relative, false)?;
             // A file written in place by name is the inode there now.
             if let Some(names) = self.scope_names.as_ref().filter(|_| !private) {
-                let opened = file.metadata()?;
-                if !opened.is_dir() {
-                    names.require_inside(
-                        root,
-                        label.as_os_str().as_bytes(),
-                        (opened.dev(), opened.ino(), opened.nlink()),
-                    )?;
+                if !file.metadata()?.is_dir() {
+                    names.require_inside(root, relative, label, &|| {
+                        let opened = file.metadata()?;
+                        Ok((opened.dev(), opened.ino(), opened.nlink()))
+                    })?;
                 }
             }
             if private {

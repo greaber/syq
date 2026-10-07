@@ -156,6 +156,42 @@ pub(crate) fn directory_names(directory: File) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
+/// How many entries of a directory name the inode `ino`, as the directory
+/// lists them. Takes over `directory` like [`directory_names`].
+pub(crate) fn directory_entries_naming(directory: File, ino: u64) -> io::Result<u64> {
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    let descriptor = directory.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        let _ = unsafe { libc::close(descriptor) };
+        return Err(error);
+    }
+    let stream = DirectoryStream(stream);
+    let mut count = 0;
+    loop {
+        set_errno(0);
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let errno = get_errno();
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            return Ok(count);
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." && unsafe { (*entry).d_ino } as u64 == ino {
+            count += 1;
+        }
+    }
+}
+
 /// Whether a directory has no entries but `.` and `..`, reading no further
 /// than the first one. Takes over `directory` like [`directory_names`].
 pub(crate) fn directory_is_empty(directory: File) -> io::Result<bool> {

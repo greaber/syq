@@ -1090,9 +1090,9 @@ if outside_output=$(syq cp --inplace --no-progress --from source --srcs-in /tmp/
     exit 1
 fi
 case "$outside_output" in
-    *"has other names outside"*) ;;
+    *"has names this copy can't confirm are inside"*) ;;
     *)
-        printf 'in-place refusal did not name the outside link:\n%s\n' "$outside_output" >&2
+        printf 'in-place refusal did not explain the unconfirmed names:\n%s\n' "$outside_output" >&2
         exit 1
         ;;
 esac

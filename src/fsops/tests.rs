@@ -8086,7 +8086,7 @@ fn an_in_place_open_of_a_scanned_file_refuses_one_with_names_outside() {
         )
         .unwrap_err();
     assert!(
-        error.to_string().contains("has other names outside"),
+        error.to_string().contains("can't confirm are inside"),
         "{error:#}"
     );
     assert_eq!(fs::read(base.join("outside/a")).unwrap(), b"old");
