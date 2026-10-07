@@ -927,6 +927,9 @@ python3 /usr/local/libexec/syq-test-receiver-keys.py
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
 
+printf 'case: ending the requesting syq stops its server-to-server copy\n'
+python3 /usr/local/libexec/syq-test-requester-loss.py
+
 printf 'case: source coordinator with constrained agent and restricted destination\n'
 make_tree source /tmp/syq-real-ssh/direct-source direct
 # Exercise explicit congestion selection without requiring the CI kernel to

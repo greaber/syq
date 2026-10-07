@@ -92,6 +92,34 @@ pub(crate) struct ExtendedAttributes {
 }
 
 impl InodeMetadata {
+    /// Replace each part `later` carries, as applying this and then `later`
+    /// would: each part present is applied whole, and an absent one is left
+    /// as it was.
+    pub(crate) fn overlay(&mut self, later: InodeMetadata) {
+        let InodeMetadata {
+            acls,
+            macos_acl,
+            xattrs,
+            atime,
+            crtime,
+        } = later;
+        if acls.is_some() {
+            self.acls = acls;
+        }
+        if macos_acl.is_some() {
+            self.macos_acl = macos_acl;
+        }
+        if xattrs.is_some() {
+            self.xattrs = xattrs;
+        }
+        if atime.is_some() {
+            self.atime = atime;
+        }
+        if crtime.is_some() {
+            self.crtime = crtime;
+        }
+    }
+
     /// Resolve chmod-like mapping overrides before comparison and publication.
     /// Invalid wire ACLs are left intact for the application validator to reject.
     pub(crate) fn resolve_mode(&mut self, mode: u32) {
@@ -593,6 +621,12 @@ pub(crate) fn make_staging_private(file: &File, mode: u32) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub(crate) fn staging_acl_is_empty(file: &File) -> Result<bool> {
     Ok(macos_acl::read(file)?.entries.is_empty())
+}
+
+/// The ACL `file` has now.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_macos_acl(file: &File) -> Result<MacAcl> {
+    macos_acl::read(file)
 }
 
 pub(crate) fn finish_publication(

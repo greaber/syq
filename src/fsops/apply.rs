@@ -47,12 +47,11 @@ pub(super) fn apply_one(
     )?;
     #[cfg(debug_assertions)]
     if matches!(op, Op::SetMeta { .. } | Op::SetFileMetaIfSame { .. }) {
-        fail_set_meta_for_test(
-            registered_target
-                .as_ref()
-                .map_or_else(|| resolve(op_path(op)), |target| target.label.clone())
-                .as_path(),
-        )?;
+        let label = registered_target
+            .as_ref()
+            .map_or_else(|| resolve(op_path(op)), |target| target.label.clone());
+        fail_set_meta_for_test(&label)?;
+        meet_concurrent_set_meta_for_test(&label)?;
     }
     if matches!(op, Op::SetFileMetaIfSame { .. }) {
         hold_before_quick_metadata_for_test()?;
@@ -1176,6 +1175,43 @@ pub(super) fn fail_set_meta_for_test(p: &Path) -> Result<()> {
         if !pat.is_empty() && p.as_os_str().as_bytes().ends_with(pat.as_bytes()) {
             return Err(anyhow!("set metadata {}: injected failure", p.display()));
         }
+    }
+    Ok(())
+}
+
+/// Hold the metadata change of each path whose name starts with
+/// `SYQ_TEST_CONCURRENT_SET_META_PREFIX` until
+/// `SYQ_TEST_CONCURRENT_SET_META_COUNT` of them have started, and fail it if
+/// they do not all start within a few seconds, as when they run one at a time.
+#[cfg(debug_assertions)]
+fn meet_concurrent_set_meta_for_test(p: &Path) -> Result<()> {
+    use std::sync::{Condvar, Mutex};
+    static STARTED: Mutex<usize> = Mutex::new(0);
+    static CHANGED: Condvar = Condvar::new();
+    let Some(prefix) = std::env::var_os("SYQ_TEST_CONCURRENT_SET_META_PREFIX") else {
+        return Ok(());
+    };
+    if !p
+        .file_name()
+        .is_some_and(|name| name.as_bytes().starts_with(prefix.as_bytes()))
+    {
+        return Ok(());
+    }
+    let count: usize = std::env::var("SYQ_TEST_CONCURRENT_SET_META_COUNT")?.parse()?;
+    let mut started = STARTED.lock().unwrap();
+    *started += 1;
+    CHANGED.notify_all();
+    let (started, waited) = CHANGED
+        .wait_timeout_while(started, std::time::Duration::from_secs(5), |started| {
+            *started < count
+        })
+        .unwrap();
+    if waited.timed_out() {
+        bail!(
+            "set metadata {}: only {} of {count} changes started together",
+            p.display(),
+            *started
+        );
     }
     Ok(())
 }

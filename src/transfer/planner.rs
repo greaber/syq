@@ -4133,6 +4133,16 @@ impl Planner<'_> {
         } else {
             std::mem::take(&mut self.deferred)
         };
+        // Several sources can give one directory metadata, in source order.
+        // The receiver applies a batch in parallel, so each directory gets one
+        // change that leaves it as applying them in turn would.
+        d.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+        d.dedup_by(|later, earlier| {
+            later.0 == earlier.0 && {
+                merge_directory_metadata(earlier, later);
+                true
+            }
+        });
         // Without -p the receiver restores the modes of the directories it
         // widened itself.
         let restoration_flags = if self.opts.perms {
@@ -4203,6 +4213,43 @@ impl Planner<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Merge a later directory metadata entry into an earlier one for the same
+/// directory, as applying the earlier and then the later would leave it: each
+/// field the later one sets replaces the earlier value, and the rest stay.
+fn merge_directory_metadata(
+    earlier: &mut (PathBytes, Meta, u8, usize, TargetCondition),
+    later: &mut (PathBytes, Meta, u8, usize, TargetCondition),
+) {
+    let (_, meta, flags, _, _) = earlier;
+    let (_, later_meta, later_flags, _, _) = later;
+    let replaced = |field: u8, required: u8, flags: &mut u8| {
+        *flags = *flags & !(field | required) | *later_flags & (field | required);
+    };
+    if *later_flags & flags::MODE_MASK != 0 {
+        meta.mode = later_meta.mode;
+        replaced(flags::MODE_MASK, 0, flags);
+    }
+    if *later_flags & flags::OWNER != 0 {
+        meta.uid = later_meta.uid;
+        replaced(flags::OWNER, flags::REQUIRE_OWNER, flags);
+    }
+    if *later_flags & flags::GROUP != 0 {
+        meta.gid = later_meta.gid;
+        replaced(flags::GROUP, flags::REQUIRE_GROUP, flags);
+    }
+    if *later_flags & flags::TIMES != 0 {
+        meta.mtime = later_meta.mtime;
+        meta.mtime_nsec = later_meta.mtime_nsec;
+        *flags |= flags::TIMES;
+    }
+    if let Some(later_inode) = later_meta.inode_metadata.take() {
+        match &mut meta.inode_metadata {
+            Some(inode) => inode.overlay(*later_inode),
+            None => meta.inode_metadata = Some(later_inode),
+        }
     }
 }
 
@@ -4312,5 +4359,56 @@ mod directory_metadata_tests {
         assert_eq!(directory_metadata_batch_len(&entries), 12);
         entries[7].2 = flags::RECEIVER_MODE;
         assert_eq!(directory_metadata_batch_len(&entries), 7);
+    }
+
+    #[test]
+    fn a_later_source_replaces_only_the_directory_metadata_it_sets() {
+        let meta = |mode, uid, gid, mtime, inode| Meta {
+            mode,
+            uid,
+            gid,
+            mtime,
+            mtime_nsec: 0,
+            inode_metadata: inode,
+        };
+        let inode = |xattrs: Option<&[u8]>, atime: Option<i64>| {
+            Some(Box::new(crate::inode_metadata::InodeMetadata {
+                xattrs: xattrs.map(|name| crate::inode_metadata::ExtendedAttributes {
+                    privileged: false,
+                    values: vec![(name.to_vec(), b"v".to_vec())],
+                }),
+                atime: atime.map(|seconds| crate::inode_metadata::Timestamp {
+                    seconds,
+                    nanoseconds: 0,
+                }),
+                ..Default::default()
+            }))
+        };
+        let entry = |meta, flags| (b"d".to_vec(), meta, flags, 1, TargetCondition::Any);
+        // The earlier source sets times, group (required), xattrs and atime;
+        // the later one sets mode, group (best effort) and xattrs.
+        let mut earlier = entry(
+            meta(0o700, 1, 2, 100, inode(Some(b"user.a"), Some(5))),
+            flags::TIMES | flags::GROUP | flags::REQUIRE_GROUP,
+        );
+        let mut later = entry(
+            meta(0o751, 3, 4, 200, inode(Some(b"user.b"), None)),
+            flags::MODE | flags::GROUP,
+        );
+        merge_directory_metadata(&mut earlier, &mut later);
+        let (_, merged, merged_flags, _, _) = earlier;
+        assert_eq!(
+            merged_flags,
+            flags::TIMES | flags::MODE | flags::GROUP,
+            "the later group change keeps its own best-effort requirement"
+        );
+        assert_eq!(
+            (merged.mode, merged.gid, merged.mtime),
+            (0o751, 4, 100),
+            "mode and group from the later source, times from the earlier"
+        );
+        let inode = merged.inode_metadata.unwrap();
+        assert_eq!(inode.xattrs.unwrap().values[0].0, b"user.b");
+        assert_eq!(inode.atime.unwrap().seconds, 5);
     }
 }

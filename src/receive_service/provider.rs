@@ -198,13 +198,24 @@ fn connect(domain: &Domain, control: bool) -> Result<UnixStream> {
     let metadata = fs::symlink_metadata(&path).with_context(|| format!(
         "SSH authorization provider is unavailable at {}; run syq persist receive on locally on the provider", path.display()))?;
     anyhow::ensure!(
-        metadata.file_type().is_socket()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
+        metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
         "provider control socket must be owned and private"
     );
+    if metadata.mode() & 0o077 != 0 {
+        return Err(NotYetPrivate.into());
+    }
     handshake(UnixStream::connect(&path)?, control)
 }
+/// The provider binds its socket before making it private. Never connect to
+/// it before then; while the provider holds its lock, it is still starting.
+#[derive(Debug)]
+struct NotYetPrivate;
+impl std::fmt::Display for NotYetPrivate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider control socket must be owned and private")
+    }
+}
+impl std::error::Error for NotYetPrivate {}
 fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -257,10 +268,43 @@ pub(crate) fn snapshot(domain: &Domain) -> Result<Option<Snapshot>> {
         Err(error) => Err(error),
     }
 }
-pub(super) fn refresh(domain: &Domain) -> Result<()> {
-    if is_running(domain)? {
-        query(domain, Control::Refresh)?;
+/// Query the provider holding the lock, giving one that is starting up to
+/// `timeout` to answer: it takes the lock before it binds its socket and makes
+/// that private. None once no provider holds the lock.
+fn running(
+    domain: &Domain,
+    timeout: Duration,
+    operation: impl Fn() -> Control,
+) -> Result<Option<Snapshot>> {
+    let deadline = Instant::now() + timeout;
+    while is_running(domain)? {
+        match query(domain, operation()) {
+            Ok(state) => return Ok(Some(state)),
+            Err(error) if unanswered(&error) || error.is::<NotYetPrivate>() => {
+                if Instant::now() >= deadline {
+                    return Err(error.context(format!(
+                        "SSH authorization provider is running but not answering in {}",
+                        domain.runtime_path().display()
+                    )));
+                }
+                std::thread::sleep(ANSWER_POLL);
+            }
+            Err(error) => return Err(error),
+        }
     }
+    Ok(None)
+}
+/// Stop a provider from another build, which `ensure` would replace anyway.
+pub(super) fn stop_other_build(domain: &Domain) -> Result<()> {
+    if running(domain, ANSWER_TIMEOUT, || Control::Status)?
+        .is_some_and(|state| state.build != crate::identity::build())
+    {
+        stop(domain)?;
+    }
+    Ok(())
+}
+pub(super) fn refresh(domain: &Domain) -> Result<()> {
+    running(domain, ANSWER_TIMEOUT, || Control::Refresh)?;
     Ok(())
 }
 pub(super) fn decide(domain: &Domain, decision: Decision) -> Result<()> {
@@ -744,7 +788,7 @@ fn is_running(domain: &Domain) -> Result<bool> {
 /// Called only by explicit local receive-on, never by an inbound SSH helper.
 pub(super) fn ensure(domain: &Domain) -> Result<()> {
     domain.ensure_runtime()?;
-    if let Some(state) = snapshot(domain)? {
+    if let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? {
         if state.build == crate::identity::build() {
             return refresh(domain);
         }
@@ -786,8 +830,11 @@ pub(super) fn ensure(domain: &Domain) -> Result<()> {
                 libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
             }
             let _ = child.wait();
-            // A simultaneous local receive-on may have started the owner.
-            if snapshot(domain)?.is_some_and(|state| state.build == crate::identity::build()) {
+            // A simultaneous local receive-on may have started the owner, which
+            // can hold the lock before it answers.
+            if running(domain, ANSWER_TIMEOUT, || Control::Status)?
+                .is_some_and(|state| state.build == crate::identity::build())
+            {
                 return refresh(domain);
             }
             match result {
@@ -831,7 +878,7 @@ impl Runtime {
             domain.enabled()? && preferences(&domain)?.enabled(),
             "receiving is off in this domain"
         );
-        let lock = acquire_lock(&domain, true)?
+        let lock = lock_for_start(|| acquire_lock(&domain, true))?
             .context("local SSH authorization provider is already running")?;
         let path = scope.join(SOCKET_FILE);
         match fs::symlink_metadata(&path) {
@@ -1534,5 +1581,185 @@ mod tests {
         assert!(!is_running(&first_domain).unwrap());
         assert!(is_running(&second_domain).unwrap());
         drop(second);
+    }
+
+    /// Model a provider another process is starting: it holds the lock, and
+    /// 100 ms after `go` it binds its socket and makes it private. With
+    /// `exposed`, the socket already exists before then but is not private.
+    /// Then it answers `answers` connections.
+    fn starting_provider(
+        domain: &Domain,
+        exposed: bool,
+        answers: usize,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (go, started) = std::sync::mpsc::channel();
+        let lock = acquire_lock(domain, true).unwrap().unwrap();
+        let domain = domain.clone();
+        let path = domain.runtime_path().join(SOCKET_FILE);
+        let early = exposed.then(|| {
+            let listener = UnixListener::bind(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            listener
+        });
+        let provider = std::thread::spawn(move || {
+            let _lock = lock;
+            started.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            let listener = early.unwrap_or_else(|| UnixListener::bind(&path).unwrap());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let service = Service::new(domain).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for _ in 0..answers {
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "no provider query arrived");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                service
+                    .handle(service.streams.track(stream).unwrap())
+                    .unwrap();
+            }
+        });
+        (provider, go)
+    }
+
+    #[test]
+    fn refresh_waits_until_a_starting_provider_socket_is_private() {
+        let (_directory, domain, _) = fixture();
+        let (provider, go) = starting_provider(&domain, true, 1);
+        assert!(matches!(
+            connect(&domain, true).unwrap_err().downcast_ref(),
+            Some(NotYetPrivate)
+        ));
+        go.send(()).unwrap();
+        refresh(&domain).unwrap();
+        provider.join().unwrap();
+    }
+
+    #[test]
+    fn losing_a_start_race_waits_for_the_owner_to_answer() {
+        let (_directory, domain, _) = fixture();
+        // The losing receive-on finds the owner's lock held but no socket yet.
+        let (provider, go) = starting_provider(&domain, false, 2);
+        go.send(()).unwrap();
+        let state = running(&domain, ANSWER_TIMEOUT, || Control::Status)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.build, crate::identity::build());
+        refresh(&domain).unwrap();
+        provider.join().unwrap();
+    }
+
+    #[test]
+    fn a_provider_that_never_answers_fails_within_its_bound() {
+        let (_directory, domain, _) = fixture();
+        let _lock = acquire_lock(&domain, true).unwrap().unwrap();
+        let started = Instant::now();
+        let Err(error) = running(&domain, Duration::from_millis(200), || Control::Status) else {
+            panic!("a provider that never answered was reported");
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(5),
+            "{elapsed:?}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("SSH authorization provider is running but not answering in "),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_starting_provider_waits_out_a_status_probe_before_giving_up() {
+        let (_directory, domain, _) = fixture();
+        let _owner = acquire_lock(&domain, true).unwrap().unwrap();
+        let started = Instant::now();
+        let error = Runtime::new(domain.clone()).err().unwrap();
+        assert!(started.elapsed() >= PROBE_GRACE, "{:?}", started.elapsed());
+        assert!(error.to_string().contains("already running"), "{error:#}");
+    }
+
+    /// A provider from an older build: it answers status and stop, and rejects
+    /// a refresh by closing the connection, as one that cannot parse newer
+    /// settings does. Returns the requests it received.
+    fn other_build_provider(domain: &Domain) -> std::thread::JoinHandle<Vec<&'static str>> {
+        const OTHER: &str = "v0.0.1+other";
+        let lock = acquire_lock(domain, true).unwrap().unwrap();
+        let path = domain.runtime_path().join(SOCKET_FILE);
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut lock = Some(lock);
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while lock.is_some() {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "provider was not stopped: {seen:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let _: Hello = crate::destination::read_message(&mut stream).unwrap();
+                crate::destination::write_message(
+                    &mut stream,
+                    &HelloReply {
+                        version: PROTOCOL,
+                        build: OTHER.into(),
+                    },
+                )
+                .unwrap();
+                let reply = Snapshot {
+                    build: OTHER.into(),
+                    pid: 1,
+                    profiles: Vec::new(),
+                    decision_error: None,
+                };
+                match crate::destination::read_message(&mut stream).unwrap() {
+                    Control::Status => seen.push("status"),
+                    Control::Refresh => {
+                        seen.push("refresh");
+                        continue;
+                    }
+                    Control::Stop => {
+                        seen.push("stop");
+                        lock = None;
+                    }
+                    Control::Decide(_) => panic!("unexpected decision"),
+                }
+                crate::destination::write_framed(
+                    &mut stream,
+                    &reply,
+                    MAX_STATUS,
+                    "provider status",
+                )
+                .unwrap();
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn receive_on_stops_a_provider_from_another_build_instead_of_refreshing_it() {
+        let (_directory, domain, _) = fixture();
+        let old = other_build_provider(&domain);
+        configure_profile(&domain, Configure::default()).unwrap();
+        assert_eq!(old.join().unwrap(), ["status", "stop"]);
+        assert!(!is_running(&domain).unwrap());
     }
 }

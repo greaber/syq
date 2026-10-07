@@ -4747,6 +4747,63 @@ fn fresh_nfs_partial_is_not_allocated_or_sized_before_writes() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn compressed_btrfs_partial_is_sized_without_reserving_space() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let file = File::create(dir.path().join("partial")).unwrap();
+    super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+    super::btrfs::FILE_FLAGS.set(Some(0));
+    let result = preallocate_new_file(
+        &file,
+        1024 * 1024,
+        FileSystemTraits {
+            btrfs_compression: Some(super::btrfs::Compression::On),
+            ..FileSystemTraits::default()
+        },
+    );
+    super::partial::FALLOCATE_ERRNO.set(None);
+    super::btrfs::FILE_FLAGS.set(None);
+    result.unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 1024 * 1024);
+    // Some filesystems charge a metadata block even for an entirely sparse file.
+    let metadata = file.metadata().unwrap();
+    assert!(metadata.blocks() * 512 < metadata.len());
+    file.write_all_at(b"payload", 1024).unwrap();
+    let mut payload = [0; 7];
+    File::open(dir.path().join("partial"))
+        .unwrap()
+        .read_exact_at(&mut payload, 1024)
+        .unwrap();
+    assert_eq!(&payload, b"payload");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_files_still_report_preallocation_failures() {
+    let dir = crate::test_support::tempdir().unwrap();
+    for btrfs_compression in [None, Some(super::btrfs::Compression::Off)] {
+        let file = File::create(dir.path().join("partial")).unwrap();
+        super::partial::FALLOCATE_ERRNO.set(Some(libc::ENOSPC));
+        super::btrfs::FILE_FLAGS.set(Some(0));
+        let result = preallocate_new_file(
+            &file,
+            1024 * 1024,
+            FileSystemTraits {
+                btrfs_compression,
+                ..FileSystemTraits::default()
+            },
+        );
+        super::partial::FALLOCATE_ERRNO.set(None);
+        super::btrfs::FILE_FLAGS.set(None);
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSPC))));
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+}
+
 #[test]
 fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
     let dir = test_dir();
@@ -5621,6 +5678,77 @@ fn small_metadata_batches_run_inline() {
         parallel_map(&[(); PAR_MIN - 1], |_| std::thread::current().id()),
         vec![caller; PAR_MIN - 1]
     );
+}
+
+#[test]
+fn short_batches_run_in_parallel_on_a_network_filesystem() {
+    // Each operation waits until all of them have started, so the batch can
+    // only finish if they run at once.
+    let started = (Mutex::new(0), std::sync::Condvar::new());
+    let together = |count: usize| {
+        let (mutex, changed) = &started;
+        let mut arrived = mutex.lock().unwrap();
+        *arrived += 1;
+        changed.notify_all();
+        let (_arrived, waited) = changed
+            .wait_timeout_while(arrived, std::time::Duration::from_secs(30), |arrived| {
+                *arrived < count
+            })
+            .unwrap();
+        !waited.timed_out()
+    };
+    let network = parallel_minimum(true);
+    assert!(parallel_map_from(network, &[(); 3], |_| together(3))
+        .into_iter()
+        .all(|met| met));
+    // Directories in different parents are created at once as well.
+    let ops: Vec<Op> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|parent| Op::Mkdir {
+            path: format!("{parent}/new").into_bytes(),
+            mode: 0o755,
+            condition: TargetCondition::Any,
+        })
+        .collect();
+    let selected: Vec<usize> = (0..ops.len()).collect();
+    *started.0.lock().unwrap() = 0;
+    assert!(
+        parallel_by_directory(network, &ops, &selected, |_| together(4))
+            .into_iter()
+            .all(|met| met)
+    );
+    // A local filesystem keeps a short batch on the calling thread.
+    let caller = std::thread::current().id();
+    assert_eq!(
+        parallel_map_from(parallel_minimum(false), &[(); 3], |_| std::thread::current(
+        )
+        .id()),
+        vec![caller; 3]
+    );
+}
+
+#[test]
+fn short_destination_batches_run_in_parallel_only_on_a_network_filesystem() {
+    let dir = test_dir();
+    fs::create_dir_all(dir.join("a")).unwrap();
+    let paths: Vec<PathBytes> = (0..40).map(|i| format!("a/f{i}").into_bytes()).collect();
+    let mut ops = FsOps::test_destination(&dir);
+    let minimum = |ops: &mut FsOps, count: usize| {
+        ops.destination_parallel_minimum(None, count, paths[..count].iter().map(Vec::as_slice))
+    };
+    // A local destination keeps short lookups and changes on one thread.
+    assert_eq!(minimum(&mut ops, 3), PAR_MIN);
+    let mut network = FsOps::test_destination(&dir);
+    network
+        .destination_root
+        .as_ref()
+        .unwrap()
+        .assume_network_file_system_for_test();
+    assert_eq!(minimum(&mut network, 3), 2);
+    // A long batch runs in parallel anyway.
+    assert_eq!(minimum(&mut ops, 40), PAR_MIN);
+    assert_eq!(minimum(&mut network, 40), PAR_MIN);
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -7241,7 +7369,7 @@ fn directory_changes_share_each_directory_between_two_threads() {
     let selected: Vec<usize> = (0..ops.len()).filter(|index| index % 5 != 1).collect();
     let active = [AtomicUsize::new(0), AtomicUsize::new(0)];
     let peak = [AtomicUsize::new(0), AtomicUsize::new(0)];
-    let results = parallel_by_directory(&ops, &selected, |op| {
+    let results = parallel_by_directory(PAR_MIN, &ops, &selected, |op| {
         let path = op_path(op);
         let busy = [&b"busy/a"[..], b"other/"]
             .iter()

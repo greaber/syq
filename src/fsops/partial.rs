@@ -915,6 +915,7 @@ impl FsOps {
         // Retry bytes already belong to this invocation. Hash them in place;
         // copying them onto themselves adds writes without improving safety.
         let mut input = None;
+        let access = SeedAccess::new(&output);
         if basis_size.unwrap_or(0) == 0 && len > 0 {
             for candidate in self.candidate_partials(&target) {
                 let Ok(relative) = RelativePath::new(&candidate) else {
@@ -936,6 +937,7 @@ impl FsOps {
                     if file
                         .metadata()
                         .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                        && access.admits(&file)
                     {
                         input = Some(file);
                         break;
@@ -957,6 +959,18 @@ impl FsOps {
             selected_final = input.as_ref().and(final_ranges);
             final_donor = input.is_some();
         }
+        // A partial's bytes, and the final file's when no matching ranges
+        // were selected, are not just the new contents. A staged basis on
+        // macOS copies nothing from the final: it compares it instead, and
+        // clones it only where no ACL entries are inherited.
+        let seeds_other_bytes = !final_donor || (!stage_only && selected_final.is_none());
+        if final_donor
+            && seeds_other_bytes
+            && !input.as_ref().is_some_and(|donor| access.admits(donor))
+        {
+            input = None;
+            final_donor = false;
+        }
         // A donor's bytes go only into a sidecar created for them: an empty
         // one found at the name may have been opened while its mode was
         // wider, as when an earlier attempt created it in the final mode.
@@ -973,6 +987,13 @@ impl FsOps {
                 identity_of(&created),
                 Sidecar::Partial,
             );
+            // The new sidecar takes the directory's entries as they are now.
+            let access = SeedAccess::new(&output);
+            if seeds_other_bytes && !input.as_ref().is_some_and(|donor| access.admits(donor)) {
+                input = None;
+                selected_final = None;
+                final_donor = false;
+            }
             (output, None)
         } else {
             if let Some(identity) = created {
@@ -1247,7 +1268,7 @@ impl FsOps {
         // A new entry lives on its directory's filesystem, so the directory
         // answers every filesystem question before a sidecar exists.
         let (s, source_metadata, target, destination) =
-            self.prepare_local_copy(source, dst, directory_file_system)?;
+            self.prepare_local_copy(source, dst, opened_file_system)?;
         let (destination_key, destination_fs) =
             destination.context("inspect the destination filesystem")?;
         let source_label = PathBuf::from(OsStr::from_bytes(source.relative()));
@@ -3156,26 +3177,34 @@ impl FsOps {
                 directories,
                 remember,
                 guard,
-            } => Ok(Response::WidenedDirectories(parallel_map(
-                directories,
-                |(path, condition)| {
-                    (|| {
-                        let target = self.destination_mutation_target(path, guard.as_ref())?;
-                        let widened = widen_directory(
-                            &target.root,
-                            &target.relative,
-                            *condition,
-                            &target.label,
-                        )?;
-                        if let Some(widened) = widened.as_ref().filter(|_| *remember) {
-                            self.receiver_directories
-                                .widened((widened.dev, widened.ino), widened.mode);
-                        }
-                        Ok(widened)
-                    })()
-                    .map_err(|error| wire_error(&error))
-                },
-            ))),
+            } => {
+                let minimum = self.destination_parallel_minimum(
+                    guard.as_ref(),
+                    directories.len(),
+                    directories.iter().map(|(path, _)| path.as_slice()),
+                );
+                Ok(Response::WidenedDirectories(parallel_map_from(
+                    minimum,
+                    directories,
+                    |(path, condition)| {
+                        (|| {
+                            let target = self.destination_mutation_target(path, guard.as_ref())?;
+                            let widened = widen_directory(
+                                &target.root,
+                                &target.relative,
+                                *condition,
+                                &target.label,
+                            )?;
+                            if let Some(widened) = widened.as_ref().filter(|_| *remember) {
+                                self.receiver_directories
+                                    .widened((widened.dev, widened.ino), widened.mode);
+                            }
+                            Ok(widened)
+                        })()
+                        .map_err(|error| wire_error(&error))
+                    },
+                )))
+            }
             Request::Apply { ops, guard } => Ok(Response::Applied(self.apply(ops, guard.as_ref()))),
             Request::ProbePartial {
                 path,
@@ -3993,6 +4022,50 @@ pub(super) fn create_fresh_rooted_partial(
     )
 }
 
+/// Which donors' bytes may be seeded into the sidecar `output`, which is
+/// created owner-only so that they stay as private as each donor kept them.
+/// On macOS a new file also takes its directory's inheritable ACL entries
+/// whatever its mode, and those can let someone read the sidecar whom a
+/// donor never let read it: a partial an earlier copy left with `-A`, or
+/// from before the directory gained that policy. There a donor is used only
+/// when the sidecar has no entries or exactly the donor's; otherwise the
+/// copy does without it, as with any unsuitable donor. The sidecar's ACL is
+/// read once, however many donors are weighed; each donor's is read only
+/// when the sidecar has entries. Elsewhere the owner-only mode suffices: it
+/// masks the named entries of a POSIX default ACL.
+pub(super) struct SeedAccess<'a> {
+    output: &'a File,
+    #[cfg(target_os = "macos")]
+    acl: std::cell::OnceCell<Option<crate::inode_metadata::MacAcl>>,
+}
+
+impl<'a> SeedAccess<'a> {
+    pub(super) fn new(output: &'a File) -> Self {
+        Self {
+            output,
+            #[cfg(target_os = "macos")]
+            acl: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub(super) fn admits(&self, donor: &File) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::inode_metadata::read_macos_acl;
+            match self.acl.get_or_init(|| read_macos_acl(self.output).ok()) {
+                Some(stage) if stage.entries.is_empty() => true,
+                Some(stage) => read_macos_acl(donor).is_ok_and(|donor| donor == *stage),
+                None => false,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (self.output, donor);
+            true
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 pub(super) fn fail_partial_chmod_for_test() -> Result<()> {
     if std::env::var_os("SYQ_TEST_FAIL_PARTIAL_CHMOD").is_some() {
@@ -4029,6 +4102,13 @@ pub(super) fn preallocate_new_file(f: &File, size: u64, traits: FileSystemTraits
     // sparse-sizing fallback.
     if traits.is_nfs {
         return Ok(());
+    }
+    // Btrfs fallocate disables compression, even when explicitly requested.
+    // Keep the logical sizing without reserving uncompressed physical extents.
+    if traits.uses_btrfs_compression(f) {
+        return f
+            .set_len(size)
+            .context("set compressed destination file length");
     }
     let fallocate_error = if let Some(raw) = test_fallocate_errno() {
         Some(io::Error::from_raw_os_error(raw))

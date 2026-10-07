@@ -35,7 +35,7 @@ for what this protects against.
   SSH directly.
 - An existing parent directory for the destination.
 
-Keep your laptop command running until the copy finishes.
+The copy stops if your laptop command ends, so keep it running until the copy finishes.
 
 ### First copy and access management
 

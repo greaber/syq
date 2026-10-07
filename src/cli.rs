@@ -497,6 +497,11 @@ pub struct Args {
     /// Original source endpoint for a native remote coordinator's dry-run summary
     #[arg(skip)]
     pub plan_source_host: Option<String>,
+    /// A native remote coordinator's standard input comes from the attached
+    /// syq that started it: this many mapping manifest bytes, then a marker,
+    /// then end of input when that syq ends.
+    #[arg(skip)]
+    pub(crate) requester_stdin: Option<u64>,
     /// Syq extension: skip paths matching PATTERN (gitignore syntax: `foo` matches at any depth, `/foo` only
     /// at the source root, `foo/` only directories, `!pat` re-includes). Repeatable.
     /// Named non-directory sources match their basename. Combined
@@ -3153,6 +3158,13 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
     };
     args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
+    args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?
+        .map(|bytes| {
+            bytes
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid internal requester input length"))
+        })
+        .transpose()?;
     if let Some(width) = utf8("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH")? {
         args.width = Some(
             width

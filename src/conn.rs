@@ -1938,6 +1938,12 @@ impl RemoteSpec {
         format!("syq {}", shell_words::join(args))
     }
 
+    /// Whether `program_command` runs exactly this build, so its internal
+    /// interfaces need no allowance for another version.
+    pub(crate) fn runs_this_build(&self) -> bool {
+        self.syq_path.is_none() && self.bootstrap_helper
+    }
+
     /// The command for another session of this run. After a handshake, a
     /// release build launches the helper it identified without asking the
     /// host for its platform again. Anything that outlives the run, such as

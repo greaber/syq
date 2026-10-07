@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
 mod basis_copy;
+#[cfg(target_os = "linux")]
+mod btrfs;
 mod entry;
 mod limits;
 mod operator;
@@ -200,6 +202,8 @@ pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileSystemTraits {
     is_nfs: bool,
+    /// None on other filesystems; btrfs also checks each file's inherited flags.
+    btrfs_compression: Option<btrfs::Compression>,
     /// NFS, SMB, Ceph, or a FUSE mount such as sshfs: each operation waits
     /// for a network round trip.
     network: bool,
@@ -339,7 +343,7 @@ fn network_file_system_type(file_system_type: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_file_system(file: &File) -> FileSystemTraits {
+fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     unsafe {
         if libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) != 0 {
@@ -357,6 +361,8 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
+            btrfs_compression: (file_system_type == libc::BTRFS_SUPER_MAGIC as u32)
+                .then(|| btrfs::Compression::for_mount(file, key)),
             network: network_file_system_type(file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
@@ -402,14 +408,28 @@ fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
     mount_id(file).map_or(FileSystemKey::Device(dev), FileSystemKey::Mount)
 }
 
-/// The filesystem a new entry of `directory` would live on, with its traits.
+/// The filesystem of an opened file or directory, with its cached traits.
 #[cfg(target_os = "linux")]
-fn directory_file_system(directory: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
-    let key = match mount_id(directory) {
+fn opened_file_system(file: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
+    let key = match mount_id(file) {
         Some(mount) => FileSystemKey::Mount(mount),
-        None => FileSystemKey::Device(directory.metadata()?.dev()),
+        None => FileSystemKey::Device(file.metadata()?.dev()),
     };
-    Ok((key, file_system_traits(directory, key)))
+    Ok((key, file_system_traits(file, key)))
+}
+
+/// Physical preallocation would prevent these writes from being compressed.
+#[cfg(target_os = "linux")]
+pub(crate) fn uses_btrfs_compression(file: &File) -> bool {
+    opened_file_system(file).is_ok_and(|(_, traits)| traits.uses_btrfs_compression(file))
+}
+
+#[cfg(target_os = "linux")]
+impl FileSystemTraits {
+    fn uses_btrfs_compression(self, file: &File) -> bool {
+        self.btrfs_compression
+            .is_some_and(|compression| compression.enabled_for(file))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -420,7 +440,7 @@ fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
     if let Some(traits) = file_systems.lock().unwrap().get(&key).copied() {
         return traits;
     }
-    let traits = inspect_file_system(file);
+    let traits = inspect_file_system(file, key);
     file_systems.lock().unwrap().insert(key, traits);
     traits
 }
@@ -432,10 +452,20 @@ fn unsupported_copy_pairs() -> &'static Mutex<HashSet<(FileSystemKey, FileSystem
 }
 
 /// Whether `file`, on device `dev`, lies on a network filesystem.
-fn on_network_file_system(file: &File, dev: u64) -> bool {
+pub(crate) fn on_network_file_system(file: &File, dev: u64) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("SYQ_TEST_NETWORK_FILESYSTEM").is_some() {
         return true;
+    }
+    // Tests mount nothing: they name the one directory that counts as a
+    // network filesystem mounted where it is.
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if let Some(directory) = std::env::var_os("SYQ_TEST_NETWORK_DIRECTORY") {
+        if fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .is_ok_and(|path| path.as_os_str() == directory)
+        {
+            return true;
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -446,6 +476,13 @@ fn on_network_file_system(file: &File, dev: u64) -> bool {
         let _ = (file, dev);
         false
     }
+}
+
+/// Whether a test names a directory to treat as a network filesystem mounted
+/// on the same device (`SYQ_TEST_NETWORK_DIRECTORY`).
+pub(crate) fn network_directory_named_for_test() -> bool {
+    cfg!(all(debug_assertions, target_os = "linux"))
+        && std::env::var_os("SYQ_TEST_NETWORK_DIRECTORY").is_some()
 }
 
 /// One file of a small copy, staged but not yet published.
@@ -656,6 +693,9 @@ pub struct FsOps {
     allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
+    /// Whether each destination root, and each directory directly beneath
+    /// one, lies on a network filesystem; the root itself has an empty name.
+    network_entries: HashMap<(RootIdentity, Vec<u8>), bool>,
     /// Names asked about so far in each directory of the destination, to
     /// decide when one is worth listing before its stats; `None` once it has
     /// been listed or turned out not to be on NFS.
@@ -870,6 +910,7 @@ impl FsOps {
             allow_unconfined_source_paths: false,
             destination_root: None,
             destination_prefix: None,
+            network_entries: HashMap::new(),
             #[cfg(target_os = "linux")]
             listing_requests: HashMap::new(),
         }
@@ -2713,7 +2754,12 @@ impl FsOps {
             if follow {
                 return vec![None; paths.len()];
             }
-            return parallel_map(paths, |path| {
+            let minimum = self.destination_parallel_minimum(
+                Some(guard),
+                paths.len(),
+                paths.iter().map(Vec::as_slice),
+            );
+            return parallel_map_from(minimum, paths, |path| {
                 let target = guarded_target(path, guard).ok()?;
                 let metadata = target.root.metadata(&target.relative).ok()?;
                 rooted_entry(&target.root, &target.relative, Vec::new(), metadata).ok()
@@ -2725,7 +2771,13 @@ impl FsOps {
             }
             #[cfg(target_os = "linux")]
             list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
-            return parallel_map_init(
+            let minimum = self.destination_parallel_minimum(
+                None,
+                paths.len(),
+                paths.iter().map(Vec::as_slice),
+            );
+            return parallel_map_init_from(
+                minimum,
                 paths,
                 || None,
                 |parent, path| stat_with_parent(&root, parent, path),
@@ -2743,11 +2795,13 @@ impl FsOps {
     }
 
     fn prune_lookup(
-        &self,
+        &mut self,
         paths: &[PathBytes],
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
-        parallel_map(paths, |path| {
+        let minimum =
+            self.destination_parallel_minimum(guard, paths.len(), paths.iter().map(Vec::as_slice));
+        parallel_map_from(minimum, paths, |path| {
             // Resolve authority before classifying missing paths. An invalid
             // root/guard must never be mistaken for a missing child.
             let target = self.rooted_destination_target(path, guard)?;
@@ -2914,18 +2968,103 @@ impl FsOps {
         }
     }
 
+    /// Whether operations on `paths` reach a network filesystem: the one the
+    /// destination root that `guard`, or else the registered root, lies on,
+    /// or one mounted on a directory directly beneath it, such as the target
+    /// of an exact placement. Mounts deeper in the tree are not looked for.
+    fn destination_on_network_file_system(
+        &mut self,
+        guard: Option<&ContainerGuard>,
+        paths: &[&[u8]],
+    ) -> bool {
+        let (identity, guard_root) = match guard {
+            Some(guard) => (
+                RootIdentity {
+                    dev: guard.dev,
+                    ino: guard.ino,
+                },
+                Some(resolve(&guard.root)),
+            ),
+            None => match &self.destination_root {
+                Some(root) => (root.identity(), None),
+                None => return false,
+            },
+        };
+        let mut entries: Vec<Vec<u8>> = paths
+            .iter()
+            .filter_map(|path| match &guard_root {
+                Some(root) => relative_under(root, &resolve(path)).ok(),
+                None => RelativePath::new(path).ok(),
+            })
+            .map(|relative| relative.first().unwrap_or_default().to_vec())
+            .collect();
+        entries.sort_unstable();
+        entries.dedup();
+        if self.network_entries.len() > NETWORK_ENTRIES_MAX {
+            self.network_entries.clear();
+        }
+        let mut opened: Option<Option<Arc<Root>>> = None;
+        for entry in std::iter::once(Vec::new()).chain(entries) {
+            let key = (identity, entry);
+            let network = match self.network_entries.get(&key) {
+                Some(&network) => network,
+                None => {
+                    let root = match &guard_root {
+                        None => self.destination_root.clone(),
+                        Some(path) => opened
+                            .get_or_insert_with(|| {
+                                Root::open_verified(path, identity).ok().map(Arc::new)
+                            })
+                            .clone(),
+                    };
+                    let Some(root) = root else {
+                        return false;
+                    };
+                    let network = if key.1.is_empty() {
+                        root.on_network_file_system()
+                    } else {
+                        root.entry_on_network_file_system(&key.1)
+                    };
+                    self.network_entries.insert(key, network);
+                    network
+                }
+            };
+            if network {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The fewest of `count` destination lookups or changes, on `paths`, that
+    /// run in parallel (see `parallel_minimum`).
+    fn destination_parallel_minimum<'a>(
+        &mut self,
+        guard: Option<&ContainerGuard>,
+        count: usize,
+        paths: impl Iterator<Item = &'a [u8]>,
+    ) -> usize {
+        let short = (2..PAR_MIN).contains(&count);
+        parallel_minimum(
+            short && self.destination_on_network_file_system(guard, &paths.collect::<Vec<_>>()),
+        )
+    }
+
     /// Ops within a batch run in parallel, except that a creation waits for
-    /// its parent's Mkdir in the same batch. Those that change directory
-    /// entries share their directory between at most two threads.
+    /// its parent's Mkdir in the same batch. Creations in a wave share each
+    /// directory between at most two threads. A short phase runs on this
+    /// thread unless its operations reach a network filesystem.
     pub fn apply(&mut self, ops: &[Op], guard: Option<&ContainerGuard>) -> Vec<Option<WireError>> {
-        let destination_root = self.destination_root.clone();
-        let destination_prefix = self.destination_prefix.as_deref();
         if ops
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
         {
-            let selected =
-                apply::selected_removals(ops, guard, destination_root, destination_prefix);
+            let selected = apply::selected_removals(
+                ops,
+                guard,
+                self.destination_root.clone(),
+                self.destination_prefix.as_deref(),
+            );
             return self
                 .deletions
                 .get_or_insert_with(Default::default)
@@ -2940,7 +3079,6 @@ impl FsOps {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });
         }
-        let directories = &self.receiver_directories;
         let narrow = self.narrow_new_directories;
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
@@ -2959,6 +3097,20 @@ impl FsOps {
             .filter(|&i| !is_meta(&ops[i]) && !is_guarded_create(&ops[i]))
             .collect();
         let meta_idx: Vec<usize> = (0..ops.len()).filter(|&i| is_meta(&ops[i])).collect();
+        let waves = creation_waves(ops, &create_idx);
+        let short: Vec<&[u8]> = [&guarded_idx, &meta_idx]
+            .into_iter()
+            .chain(&waves)
+            .filter(|phase| (2..PAR_MIN).contains(&phase.len()))
+            .flatten()
+            .map(|&index| op_path(&ops[index]))
+            .collect();
+        let minimum = parallel_minimum(
+            !short.is_empty() && self.destination_on_network_file_system(guard, &short),
+        );
+        let directories = &self.receiver_directories;
+        let destination_root = self.destination_root.clone();
+        let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         // A directory this request creates and then gives a group starts
         // private when its starting group may differ, so that group cannot
@@ -3036,7 +3188,7 @@ impl FsOps {
             };
             result.err().as_ref().map(wire_error)
         };
-        let gres = parallel_map(&guarded_idx, |&i| create(&ops[i]));
+        let gres = parallel_map_from(minimum, &guarded_idx, |&i| create(&ops[i]));
         for (i, r) in guarded_idx.iter().zip(gres) {
             out[*i] = r;
         }
@@ -3047,14 +3199,14 @@ impl FsOps {
             }
             return out;
         }
-        for wave in creation_waves(ops, &create_idx) {
-            let cres = parallel_by_directory(ops, &wave, create);
+        for wave in waves {
+            let cres = parallel_by_directory(minimum, ops, &wave, create);
             for (i, r) in wave.iter().zip(cres) {
                 out[*i] = r;
             }
         }
         let private = private.into_inner().unwrap();
-        let mres = parallel_map(&meta_idx, |&i| {
+        let mres = parallel_map_from(minimum, &meta_idx, |&i| {
             // A receiver-chosen mode is decided here, in parallel, once the
             // request's creations are done.
             let op = directories.resolve_op(
@@ -3202,7 +3354,7 @@ fn list_nfs_directories_before_stats(
         let Ok(directory) = root.open_directory(&relative) else {
             return false;
         };
-        let Ok((_, traits)) = directory_file_system(&directory) else {
+        let Ok((_, traits)) = opened_file_system(&directory) else {
             return false;
         };
         if !traits.is_nfs {
@@ -3278,6 +3430,9 @@ fn stat_with_parent(
 
 const PAR_THREADS: usize = 32;
 const PAR_MIN: usize = 32;
+/// Destination entries remembered as on or off a network filesystem before
+/// the record starts over.
+const NETWORK_ENTRIES_MAX: usize = 4096;
 
 fn metadata_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
@@ -3285,8 +3440,28 @@ fn metadata_pool() -> Option<&'static rayon::ThreadPool> {
         .as_ref()
 }
 
+/// The fewest operations that run in parallel. On a network filesystem each
+/// one waits a round trip, so even two finish sooner together; locally a
+/// short batch is faster on the calling thread.
+fn parallel_minimum(network: bool) -> usize {
+    if network {
+        2
+    } else {
+        PAR_MIN
+    }
+}
+
 fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    parallel_map_init(items, || (), |_, item| f(item))
+    parallel_map_from(PAR_MIN, items, f)
+}
+
+/// `parallel_map` for batches of at least `minimum` items.
+fn parallel_map_from<T: Sync, R: Send>(
+    minimum: usize,
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    parallel_map_init_from(minimum, items, || (), |_, item| f(item))
 }
 
 /// Split creations so that each runs after the Mkdir of its parent in the
@@ -3347,11 +3522,12 @@ fn creation_waves(ops: &[Op], selected: &[usize]) -> Vec<Vec<usize>> {
 /// distribution; the work of freeing a removed file's blocks happens after
 /// the directory is unlocked and does spread over threads.
 fn parallel_by_directory<R: Send>(
+    minimum: usize,
     ops: &[Op],
     selected: &[usize],
     f: impl Fn(&Op) -> R + Sync,
 ) -> Vec<R> {
-    if selected.len() < PAR_MIN {
+    if selected.len() < minimum {
         return selected.iter().map(|&index| f(&ops[index])).collect();
     }
     let Some(pool) = metadata_pool() else {
@@ -3422,7 +3598,16 @@ fn parallel_map_init<T: Sync, R: Send, S>(
     init: impl Fn() -> S + Sync,
     f: impl Fn(&mut S, &T) -> R + Sync,
 ) -> Vec<R> {
-    if items.len() < PAR_MIN {
+    parallel_map_init_from(PAR_MIN, items, init, f)
+}
+
+fn parallel_map_init_from<T: Sync, R: Send, S>(
+    minimum: usize,
+    items: &[T],
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &T) -> R + Sync,
+) -> Vec<R> {
+    if items.len() < minimum {
         let mut state = init();
         return items.iter().map(|item| f(&mut state, item)).collect();
     }

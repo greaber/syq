@@ -1648,3 +1648,159 @@ fn native_mtime_metadata_is_explicit_on_unchanged_files() {
     ]);
     assert_eq!(fs::metadata(t.path("dst/file")).unwrap().mtime(), 123);
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_network_destination_gives_a_few_directories_their_metadata_at_once() {
+    // On a network filesystem each change waits a round trip, so even a few
+    // directories take their final metadata in parallel. The receiver fails
+    // each change to a `together` directory unless all four start at once.
+    let t = Tmp::new();
+    for index in 0..4 {
+        write(&t.path(&format!("src/together{index}/file")), b"x");
+        set_mtime(&t.path(&format!("src/together{index}")), 1_000_000_000);
+    }
+    let output = compat_command()
+        .args(["-rt", "--no-progress", &t.s("src/"), &t.s("dst/")])
+        .env("SYQ_TEST_NETWORK_FILESYSTEM", "1")
+        .env("SYQ_TEST_CONCURRENT_SET_META_PREFIX", "together")
+        .env("SYQ_TEST_CONCURRENT_SET_META_COUNT", "4")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    for index in 0..4 {
+        let path = t.path(&format!("dst/together{index}"));
+        assert_eq!(fs::metadata(&path).unwrap().mtime(), 1_000_000_000);
+        assert_eq!(read(&path.join("file")), b"x");
+    }
+}
+
+/// `--as` registers the target's parent, here on a local filesystem, while
+/// the target itself is a network mount: the receiver goes by the target.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn an_exact_placement_onto_a_network_mount_gives_a_few_directories_their_metadata_at_once() {
+    let t = Tmp::new();
+    for index in 0..4 {
+        write(&t.path(&format!("src/together{index}/file")), b"x");
+        set_mtime(&t.path(&format!("src/together{index}")), 1_000_000_000);
+    }
+    fs::create_dir(t.path("mount")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--copy-metadata=times",
+            &t.s("src"),
+            "--as",
+            &t.s("mount"),
+            "--no-progress",
+        ])
+        .env(
+            "SYQ_TEST_NETWORK_DIRECTORY",
+            fs::canonicalize(t.path("mount")).unwrap(),
+        )
+        .env("SYQ_TEST_CONCURRENT_SET_META_PREFIX", "together")
+        .env("SYQ_TEST_CONCURRENT_SET_META_COUNT", "4")
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    for index in 0..4 {
+        let path = t.path(&format!("mount/together{index}"));
+        assert_eq!(fs::metadata(&path).unwrap().mtime(), 1_000_000_000);
+        assert_eq!(read(&path.join("file")), b"x");
+    }
+}
+
+#[test]
+fn later_sources_stamp_every_shared_directory() {
+    // Enough shared directories that the receiver applies their final
+    // metadata in parallel; each still ends with the later source's.
+    later_sources_stamp_shared_directories(40, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn later_sources_stamp_shared_directories_on_a_network_filesystem() {
+    later_sources_stamp_shared_directories(2, true);
+}
+
+#[test]
+fn a_later_source_changes_only_the_shared_directory_metadata_it_sets() {
+    // `--copy-if` leaves out the later source's root, so for the shared
+    // destination root that source sets only the mode it would have been
+    // created with. The earlier source's time stays.
+    let t = Tmp::new();
+    for (source, mode, time) in [("a", 0o750, 1_000_000_000), ("b", 0o711, 1_600_000_000)] {
+        write(&t.path(&format!("{source}/{source}")), source.as_bytes());
+        set_mtime(&t.path(&format!("{source}/{source}")), 1_000_000_000);
+        fs::set_permissions(t.path(source), fs::Permissions::from_mode(mode)).unwrap();
+        set_mtime(&t.path(source), time);
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args([
+        "cp",
+        "--copy-metadata=permissions",
+        "--copy-if",
+        r#"src.mtime < timestamp("2020-01-01T00:00:00Z")"#,
+        "--srcs-in",
+        &t.s("a"),
+        "--srcs-in",
+        &t.s("b"),
+        "--into",
+        &t.s("dst"),
+        "--no-progress",
+    ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o022);
+            Ok(())
+        });
+    }
+    assert_output_ok(&command.run().unwrap());
+    let meta = fs::metadata(t.path("dst")).unwrap();
+    assert_eq!((meta.mode() & 0o777, meta.mtime()), (0o755, 1_000_000_000));
+    for source in ["a", "b"] {
+        assert_eq!(read(&t.path(&format!("dst/{source}"))), source.as_bytes());
+    }
+}
+
+fn later_sources_stamp_shared_directories(count: usize, network: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Tmp::new();
+    for (source, mode, time) in [("a", 0o750, 1_500_000_000), ("b", 0o711, 1_600_000_000)] {
+        for index in 0..count {
+            let dir = format!("{source}/d{index}");
+            write(&t.path(&format!("{dir}/{source}")), source.as_bytes());
+            fs::set_permissions(t.path(&dir), fs::Permissions::from_mode(mode)).unwrap();
+            set_mtime(&t.path(&dir), time);
+        }
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+    command.args([
+        "cp",
+        "--copy-metadata=permissions",
+        "--srcs-in",
+        &t.s("a"),
+        "--srcs-in",
+        &t.s("b"),
+        "--into",
+        &t.s("dst"),
+        "--no-progress",
+    ]);
+    if network {
+        command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+    }
+    assert_output_ok(&command.run().unwrap());
+    for index in 0..count {
+        let dir = format!("dst/d{index}");
+        let meta = fs::metadata(t.path(&dir)).unwrap();
+        assert_eq!(
+            (meta.mode() & 0o777, meta.mtime()),
+            (0o711, 1_600_000_000),
+            "{dir}"
+        );
+        for source in ["a", "b"] {
+            assert_eq!(read(&t.path(&format!("{dir}/{source}"))), source.as_bytes());
+        }
+    }
+}

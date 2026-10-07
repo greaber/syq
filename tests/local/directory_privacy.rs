@@ -793,14 +793,26 @@ fn an_interrupted_copy_ends_with_the_same_directory_metadata_after_a_retry() {
 
 #[test]
 fn directories_created_together_keep_their_own_modes() {
+    directories_created_together_keep_their_modes(128, false);
+}
+
+/// On a network filesystem, a few directories created together also run in
+/// parallel.
+#[cfg(debug_assertions)]
+#[test]
+fn a_few_directories_created_together_on_a_network_filesystem_keep_their_own_modes() {
+    directories_created_together_keep_their_modes(4, true);
+}
+
+fn directories_created_together_keep_their_modes(count: usize, network: bool) {
     // A batch creates parents and children together. A child must not create
     // its missing parent with default permissions ahead of the parent's own
     // creation, which would leave the parent wider than its source.
     let t = Tmp::new();
-    for index in 0..128 {
+    for index in 0..count {
         write(&t.path(&format!("src/d{index}/e/f/file")), b"x");
     }
-    for index in 0..128 {
+    for index in 0..count {
         for path in [
             format!("src/d{index}/e/f"),
             format!("src/d{index}/e"),
@@ -811,6 +823,9 @@ fn directories_created_together_keep_their_own_modes() {
     }
     let mut command = syq_command(&["rsync", "-r", "src/", "dst/"]);
     command.current_dir(&t.0);
+    if network {
+        command.env("SYQ_TEST_NETWORK_FILESYSTEM", "1");
+    }
     unsafe {
         command.pre_exec(|| {
             libc::umask(0o022);
@@ -820,7 +835,7 @@ fn directories_created_together_keep_their_own_modes() {
     let output = command.run().unwrap();
     assert_output_ok(&output);
     let mut wide = Vec::new();
-    for index in 0..128 {
+    for index in 0..count {
         for path in [
             format!("dst/d{index}"),
             format!("dst/d{index}/e"),

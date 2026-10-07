@@ -168,6 +168,12 @@ impl RelativePath {
         self.components.is_empty()
     }
 
+    /// The first component: the entry directly beneath the root that holds
+    /// the path, or is the path itself.
+    pub(crate) fn first(&self) -> Option<&[u8]> {
+        self.components.first().map(Vec::as_slice)
+    }
+
     /// The path as one byte string, its components joined by `/`, which
     /// `new` accepts again.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
@@ -216,6 +222,7 @@ pub(crate) struct Root {
     partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
     #[cfg(target_os = "linux")]
     bounds_replacement: OnceLock<bool>,
+    network: OnceLock<bool>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, target_os = "linux"))]
@@ -251,6 +258,7 @@ impl Root {
             partial_name_limits: OnceLock::new(),
             #[cfg(target_os = "linux")]
             bounds_replacement: OnceLock::new(),
+            network: OnceLock::new(),
             #[cfg(all(test, target_os = "linux"))]
             test_name_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, target_os = "linux"))]
@@ -304,6 +312,43 @@ impl Root {
         }
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    /// Whether this root lies on a network filesystem, where each operation
+    /// waits a round trip.
+    pub(crate) fn on_network_file_system(&self) -> bool {
+        *self.network.get_or_init(|| {
+            crate::fsops::on_network_file_system(&self.directory, self.identity.dev)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_network_file_system_for_test(&self) {
+        let _ = self.network.set(true);
+    }
+
+    /// Whether the directory `name` directly beneath this root lies on a
+    /// network filesystem: this root's own, or another one mounted there, as
+    /// on the target of an exact placement. A missing entry would be created
+    /// on this root's filesystem.
+    pub(crate) fn entry_on_network_file_system(&self, name: &[u8]) -> bool {
+        if self.on_network_file_system() {
+            return true;
+        }
+        let Ok(relative) = RelativePath::new(name) else {
+            return false;
+        };
+        let Ok(metadata) = self.metadata(&relative) else {
+            return false;
+        };
+        if !metadata.is_dir()
+            || (metadata.dev == self.identity.dev
+                && !crate::fsops::network_directory_named_for_test())
+        {
+            return false;
+        }
+        self.open_directory(&relative)
+            .is_ok_and(|directory| crate::fsops::on_network_file_system(&directory, metadata.dev))
     }
 
     /// Wait to replace files beneath this root, where its filesystem needs
@@ -1488,8 +1533,9 @@ impl Root {
             // writer has already updated the target. Either way, the target
             // name must not be touched again.
             bail!(
-                "confined replacement for {} changed during replacement",
-                path.label()
+                "confined replacement for {} changed during replacement; kept the entry it displaced as {}",
+                path.label(),
+                sibling_label(path, &temporary)
             );
         }
         if swapped.dev != expected_dev
@@ -1499,10 +1545,11 @@ impl Root {
             // Another writer may already have replaced `path` after our
             // exchange. Never mutate that name again: a compensating exchange
             // could remove the later writer's result. Preserve the displaced
-            // entry under the temporary name and report the race.
+            // entry under the temporary recovery name and report the race.
             bail!(
-                "confined destination {} changed during replacement",
-                path.label()
+                "confined destination {} changed during replacement; kept the entry it displaced as {}",
+                path.label(),
+                sibling_label(path, &temporary)
             );
         }
         unlink_at(parent.directory.as_raw_fd(), &temporary, 0)
@@ -1751,30 +1798,90 @@ impl Root {
             target,
             PublicationTestPoint::AfterMatchedExchange,
         );
-        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
-        let displaced = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+        // A check that cannot be made, as when another program removes the
+        // published file first, counts as failed: the staged name must not
+        // keep whatever the exchange put there.
+        let checked = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)
+            .and_then(|published| {
+                let displaced =
+                    metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
+                Ok((published, displaced))
+            });
+        let (published, displaced) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                let race = format!(
+                    "confined destination {} could not be checked after publication: {error}",
+                    target.label()
+                );
+                return Err(self.keep_displaced(source, &source_parent, race));
+            }
+        };
         if !is_safe_staged_identity(published, staged_dev, staged_ino) {
-            bail!(
-                "confined staged path {} changed during publication",
-                source.label()
-            );
+            return Err(self.keep_displaced(
+                source,
+                &source_parent,
+                format!(
+                    "confined staged path {} changed during publication",
+                    source.label()
+                ),
+            ));
         }
         // The exchange itself may update the displaced inode's ctime. Its
         // dev/inode identity cannot be recycled while the link still exists,
         // so the pre-exchange fingerprint plus this identity check is enough.
         if !has_expected_identity(displaced) {
             // The target may already contain a still-later writer's result.
-            // Never exchange it again after publication; retain the displaced
-            // entry under the staged name and report the race.
-            bail!(
-                "confined destination {} changed during publication",
-                target.label()
-            );
+            // Never exchange it again after publication; keep the displaced
+            // entry and report the race.
+            return Err(self.keep_displaced(
+                source,
+                &source_parent,
+                format!(
+                    "confined destination {} changed during publication",
+                    target.label()
+                ),
+            ));
         }
         #[cfg(any(target_os = "linux", test))]
         let _permit = self.mutation_permit(source)?;
         unlink_at(source_parent.directory.as_raw_fd(), &source_parent.leaf, 0)
             .with_context(|| format!("remove displaced confined path {}", target.label()))
+    }
+
+    /// After an exchange whose result failed its checks, the staged name
+    /// holds whatever was at the target, usually another writer's file. Move
+    /// it to a fresh recovery name and return `race` naming where it went.
+    ///
+    /// The staged name is one a later attempt adopts: a retry, a grouped put
+    /// or a resume search reopens a sidecar this account owns and writes the
+    /// copy's contents into it, and replaces one it cannot reuse. Writing
+    /// into another writer's file shows the copy's data to whoever holds
+    /// that file open, and its permissions and ACL would come with it to the
+    /// published file; replacing it loses that writer's data. Recovery names
+    /// are never adopted, cleaned up by `clean-partials` or pruned.
+    fn keep_displaced(
+        &self,
+        staged: &RelativePath,
+        parent: &ResolvedParent<'_>,
+        race: String,
+    ) -> anyhow::Error {
+        #[cfg(any(target_os = "linux", test))]
+        let _permit = match self.mutation_permit(staged) {
+            Ok(permit) => permit,
+            Err(error) => return error.context(race),
+        };
+        match move_to_recovery_name(parent) {
+            Ok(Some(name)) => anyhow::anyhow!(
+                "{race}; kept the entry it displaced as {}",
+                sibling_label(staged, &name)
+            ),
+            Ok(None) => anyhow::anyhow!(race),
+            Err(error) => anyhow::anyhow!(
+                "{race}; the entry it displaced is still at {}: {error:#}",
+                staged.label()
+            ),
+        }
     }
 
     fn resolve_publish_target<'a>(
@@ -2510,6 +2617,86 @@ fn create_temporary(
     bail!("could not allocate a replacement sidecar name")
 }
 
+/// Rename the entry at `parent.leaf` to a new recovery name beside it,
+/// never replacing anything there. `None` when the name is already empty.
+fn move_to_recovery_name(parent: &ResolvedParent<'_>) -> Result<Option<CString>> {
+    for _ in 0..32 {
+        let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
+        let name = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
+            .expect("generated swap name contains no NUL");
+        match rename_noreplace(
+            parent.directory.as_raw_fd(),
+            &parent.leaf,
+            parent.directory.as_raw_fd(),
+            &name,
+        ) {
+            Ok(()) => return Ok(Some(name)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("rename it to a recovery name"),
+        }
+    }
+    bail!("could not allocate a recovery name")
+}
+
+/// The label of `name` in the directory that holds `path`.
+fn sibling_label(path: &RelativePath, name: &CStr) -> String {
+    let mut components = path.components.clone();
+    if let Some(leaf) = components.last_mut() {
+        *leaf = name.to_bytes().to_vec();
+    }
+    RelativePath { components }.label()
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(
+    old_parent: RawFd,
+    old_name: &CString,
+    new_parent: RawFd,
+    new_name: &CString,
+) -> io::Result<()> {
+    retry_zero(|| unsafe {
+        libc::renameat2(
+            old_parent,
+            old_name.as_ptr(),
+            new_parent,
+            new_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(
+    old_parent: RawFd,
+    old_name: &CString,
+    new_parent: RawFd,
+    new_name: &CString,
+) -> io::Result<()> {
+    retry_zero(|| unsafe {
+        libc::renameatx_np(
+            old_parent,
+            old_name.as_ptr(),
+            new_parent,
+            new_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_noreplace(
+    _old_parent: RawFd,
+    _old_name: &CString,
+    _new_parent: RawFd,
+    _new_name: &CString,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "rename without replacement is unavailable",
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn rename_exchange(
     old_parent: RawFd,
@@ -2604,7 +2791,7 @@ fn require_safe_staged_identity(
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PublicationTestPoint {
+pub(crate) enum PublicationTestPoint {
     AfterAnyRename,
     AfterAbsentLink,
     BeforeMatchedExchange,
@@ -2633,7 +2820,7 @@ fn publication_test_hooks() -> &'static std::sync::Mutex<
 }
 
 #[cfg(test)]
-struct PublicationTestHookGuard(PublicationTestHookKey);
+pub(crate) struct PublicationTestHookGuard(PublicationTestHookKey);
 
 #[cfg(test)]
 impl Drop for PublicationTestHookGuard {
@@ -2646,7 +2833,7 @@ impl Drop for PublicationTestHookGuard {
 }
 
 #[cfg(test)]
-fn install_publication_test_hook(
+pub(crate) fn install_publication_test_hook(
     root: RootIdentity,
     target: &RelativePath,
     point: PublicationTestPoint,
