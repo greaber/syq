@@ -2610,6 +2610,8 @@ fn resource_pressure_accounts_for_transport_and_endpoint_roots() {
             );
         }
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        // The expected counts assume a helper that holds only what syq opens.
+        nofile::inherit_only_standard_descriptors(&mut command);
         command.arg("cp");
         if selectors {
             for index in 0..count {
@@ -2702,6 +2704,9 @@ fn resource_pressure_copies_mixed_files_with_source_and_receiver_caches() {
     ] {
         let history_path = t.path(&format!("{label}.sqlite"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        // Two workers fit a 128-descriptor helper only when it holds just
+        // what syq opens.
+        nofile::inherit_only_standard_descriptors(&mut command);
         command.arg("cp");
         if remote == Some("--from") {
             command.args(["--from", "host"]);
