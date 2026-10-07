@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod apply;
 mod basis_copy;
+#[cfg(target_os = "linux")]
+mod btrfs;
 mod entry;
 mod limits;
 mod operator;
@@ -199,6 +201,8 @@ pub(crate) fn content_digest(data: &[u8]) -> ContentDigest {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FileSystemTraits {
     is_nfs: bool,
+    /// None on other filesystems; btrfs also checks each file's inherited flags.
+    btrfs_compression: Option<btrfs::Compression>,
     /// NFS, SMB, Ceph, or a FUSE mount such as sshfs: each operation waits
     /// for a network round trip.
     network: bool,
@@ -338,7 +342,7 @@ fn network_file_system_type(file_system_type: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn inspect_file_system(file: &File) -> FileSystemTraits {
+fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     unsafe {
         if libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) != 0 {
@@ -356,6 +360,8 @@ fn inspect_file_system(file: &File) -> FileSystemTraits {
         };
         FileSystemTraits {
             is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
+            btrfs_compression: (file_system_type == libc::BTRFS_SUPER_MAGIC as u32)
+                .then(|| btrfs::Compression::for_mount(file, key)),
             network: network_file_system_type(file_system_type),
             synchronous,
             // Keep unknown and network-backed filesystems on adaptive ranges.
@@ -401,14 +407,28 @@ fn file_system_key(file: &File, dev: u64) -> FileSystemKey {
     mount_id(file).map_or(FileSystemKey::Device(dev), FileSystemKey::Mount)
 }
 
-/// The filesystem a new entry of `directory` would live on, with its traits.
+/// The filesystem of an opened file or directory, with its cached traits.
 #[cfg(target_os = "linux")]
-fn directory_file_system(directory: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
-    let key = match mount_id(directory) {
+fn opened_file_system(file: &File) -> io::Result<(FileSystemKey, FileSystemTraits)> {
+    let key = match mount_id(file) {
         Some(mount) => FileSystemKey::Mount(mount),
-        None => FileSystemKey::Device(directory.metadata()?.dev()),
+        None => FileSystemKey::Device(file.metadata()?.dev()),
     };
-    Ok((key, file_system_traits(directory, key)))
+    Ok((key, file_system_traits(file, key)))
+}
+
+/// Physical preallocation would prevent these writes from being compressed.
+#[cfg(target_os = "linux")]
+pub(crate) fn uses_btrfs_compression(file: &File) -> bool {
+    opened_file_system(file).is_ok_and(|(_, traits)| traits.uses_btrfs_compression(file))
+}
+
+#[cfg(target_os = "linux")]
+impl FileSystemTraits {
+    fn uses_btrfs_compression(self, file: &File) -> bool {
+        self.btrfs_compression
+            .is_some_and(|compression| compression.enabled_for(file))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -419,7 +439,7 @@ fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
     if let Some(traits) = file_systems.lock().unwrap().get(&key).copied() {
         return traits;
     }
-    let traits = inspect_file_system(file);
+    let traits = inspect_file_system(file, key);
     file_systems.lock().unwrap().insert(key, traits);
     traits
 }
@@ -3139,7 +3159,7 @@ fn list_nfs_directories_before_stats(
         let Ok(directory) = root.open_directory(&relative) else {
             return false;
         };
-        let Ok((_, traits)) = directory_file_system(&directory) else {
+        let Ok((_, traits)) = opened_file_system(&directory) else {
             return false;
         };
         if !traits.is_nfs {
