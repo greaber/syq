@@ -1072,6 +1072,14 @@ syq cp --if-exists=update-if-older --no-progress --performance-tuning workers=2 
     --to destination --into /tmp/syq-real-ssh/direct-destination
 ssh destination 'test "$(cat /tmp/syq-real-ssh/direct-destination/policy-file)" = newer; test -e /tmp/syq-real-ssh/direct-destination/policy-new'
 
+printf 'case: restricted receiver prunes without a stated deletion limit\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/prune-source && printf kept > /tmp/syq-real-ssh/prune-source/kept'
+ssh destination 'mkdir -p /tmp/syq-real-ssh/prune-destination && printf extra > /tmp/syq-real-ssh/prune-destination/extra && printf extra > /tmp/syq-real-ssh/prune-destination/other'
+syq cp --prune --no-progress --performance-tuning workers=2 \
+    --from source --srcs-in /tmp/syq-real-ssh/prune-source \
+    --to destination --into-existing /tmp/syq-real-ssh/prune-destination
+ssh destination 'cd /tmp/syq-real-ssh/prune-destination && test ! -e extra && test ! -e other && test "$(cat kept)" = kept'
+
 printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in
 # their second block; the even names' did not. Keeping an even name sets the

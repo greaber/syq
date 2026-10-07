@@ -96,7 +96,7 @@ for option support.
 
 ## Mirror a directory
 
-From your laptop, include a deletion limit when pruning:
+From your laptop:
 
 ```sh
 syq cp --prune --max-delete 100 --from hostA --srcs-in data --to hostB --into-existing /archive

@@ -90,6 +90,7 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
         bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
     }
     crate::restricted::validate_restricted_args(args)?;
+    super::require_deletion_ceiling(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
     Ok(target)
@@ -210,7 +211,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     // The actual authority never leaves the destination helper. This internal
     // marker selects its restricted executor and per-copy worker admission.
-    args.restricted_grant = Some("return-control-v1".into());
+    args.restricted_grant = Some(super::RETURN_GRANT.into());
     let ssh = ssh::Client::new(registration, approved.token.clone());
     args.named_receipt = Some(Arc::new(NamedReceipt {
         connection: Some(ReturnConnection::new(stream, Some(ssh))),
@@ -825,6 +826,7 @@ fn receive() -> Result<i32> {
     }
     let mut input = unsafe { File::from_raw_fd(fd) };
     let setup = (|| {
+        crate::restricted::refuse_privileged_approved_receiver()?;
         let request: HelperRequest = read_message(&mut DeadlineIo {
             inner: &mut input,
             deadline: Instant::now() + Duration::from_secs(10),

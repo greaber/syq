@@ -356,11 +356,11 @@ falling back to SSH when TCP is unreachable. `--no-tcp` forces SSH;
 The receiving connection must stay open throughout the copy.
 
 Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, `--copy-metadata=permissions`, and the
+resume, mappings, `--copy-metadata=permissions,ownership,specials`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
-Ownership preservation, special-file preservation, and `--inplace` are
-unsupported. Timestamp comparisons trust the source's reported modification
-times.
+`--inplace` is unsupported, and copies are refused while syq runs as root, so
+ownership and special files work as for any copy by an ordinary account.
+Timestamp comparisons trust the source's reported modification times.
 
 Each copy is limited to 100 GiB and one million touched entries by default.
 Change these ceilings with `syq persist receive on --max-bytes 20G --max-entries 100000`.
