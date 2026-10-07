@@ -596,6 +596,7 @@ impl Engine {
             )
         });
         let mut first_error = None;
+        let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
             let relative = RelativePath::new(path.as_bytes())?;
             let saved = widened.remove(&path);
@@ -617,6 +618,7 @@ impl Engine {
                         *mode,
                         *explicit,
                         mode.is_none(),
+                        &mut creation,
                     )?;
                 } else if saved.is_none() {
                     let directory = destination.root.open_directory(&relative)?;
@@ -2564,7 +2566,16 @@ impl Engine {
                     }
                     self.progress.symlinks_created.fetch_add(1, Relaxed);
                 }
-                local::apply_metadata(root, &path, &metadata, &self.args, None, explicit, !same)?;
+                local::apply_metadata(
+                    root,
+                    &path,
+                    &metadata,
+                    &self.args,
+                    None,
+                    explicit,
+                    !same,
+                    &mut Default::default(),
+                )?;
             }
             if same {
                 return Ok(None);
@@ -2632,6 +2643,7 @@ impl Engine {
                     existing.map(|m| m.mode & 0o7777),
                     explicit,
                     false,
+                    &mut Default::default(),
                 )?;
             }
             self.progress

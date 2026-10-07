@@ -8,11 +8,12 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     fs::File,
     io::Read,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -545,6 +546,29 @@ impl Destination {
     }
 }
 
+/// The permission bits creating a directory allows, read once per parent
+/// directory: the default ACL a new directory inherits from its parent, or
+/// else the umask. Siblings inherit the same default ACL, so their
+/// directory's lookup serves them all; on a network filesystem that lookup
+/// is a request.
+#[derive(Default)]
+pub(super) struct CreationPermissions(HashMap<PathBuf, u32>);
+
+impl CreationPermissions {
+    fn permitted(&mut self, path: &RelativePath, directory: &File) -> Result<u32> {
+        let parent = path.to_path_buf().parent().map(Path::to_path_buf);
+        if let Some(permitted) = parent.as_ref().and_then(|parent| self.0.get(parent)) {
+            return Ok(*permitted);
+        }
+        let permitted = crate::inode_metadata::default_permissions(directory)?;
+        if let Some(parent) = parent {
+            self.0.insert(parent, permitted);
+        }
+        Ok(permitted)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_metadata(
     root: &Root,
     path: &RelativePath,
@@ -553,6 +577,7 @@ pub(super) fn apply_metadata(
     existing_mode: Option<u32>,
     explicit: crate::mapping::Metadata,
     copied: bool,
+    creation: &mut CreationPermissions,
 ) -> Result<()> {
     if metadata.kind == super::client::ObjectKind::File && !copied {
         let flags = args.matching_meta_flags() | explicit.apply_flags();
@@ -596,10 +621,18 @@ pub(super) fn apply_metadata(
         } else {
             root.open_regular_read(path)?
         };
+        // Without -p, a directory this download created gets its marker's
+        // permission bits and, as a native copy gives every new directory,
+        // owner access, so that a later download can update it. Creating it
+        // limits them by the default ACL it inherited, or else by the umask,
+        // and it keeps the setgid bit it inherited.
         let mode = if args.perms || explicit.mode.is_some() {
             metadata.mode
+        } else if let Some(existing) = existing_mode {
+            existing
         } else {
-            existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
+            let permitted = creation.permitted(path, &file)?;
+            ((metadata.mode | 0o700) & permitted & 0o777) | (file.metadata()?.mode() & 0o2000)
         };
         crate::fsops::set_mode_handle(&file, mode)?;
     }
