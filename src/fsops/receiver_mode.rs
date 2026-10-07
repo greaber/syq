@@ -295,9 +295,10 @@ impl FsOps {
     }
 
     /// The mode `Prepare` creates its file in: an `--inplace` file in the
-    /// publication's mode, as creating it limits a receiver-chosen one; a
-    /// sidecar in its staged mode, from the mode publication will give it,
-    /// with `scanned` what the sender's scan found at `path`.
+    /// publication's mode, as creating it limits a receiver-chosen one, or
+    /// owner-only while its group or ACL is to come; a sidecar in its staged
+    /// mode, from the mode publication will give it, with `scanned` what the
+    /// sender's scan found at `path`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn creation_mode(
         &mut self,
@@ -310,13 +311,7 @@ impl FsOps {
         scanned: ScannedDestination,
     ) -> Result<u32> {
         if inplace {
-            // A proposal's special bits are never created.
-            let mode = if flags & flags::RECEIVER_MODE != 0 {
-                mode & 0o777
-            } else {
-                mode
-            };
-            return Ok(mode);
+            return Ok(inplace_creation_mode(mode, flags, acl));
         }
         if flags & flags::RECEIVER_MODE == 0 {
             return Ok(staged_mode(mode, flags, acl));

@@ -1115,6 +1115,8 @@ pub enum WireRequest<Data> {
         allow_sequential_local_fallback: bool,
         copy_id: CopyId,
         size: u64,
+        /// The mode an in-place file this creates starts with
+        /// (`fsops::inplace_creation_mode`).
         mode: u32,
     },
     HashBlocks {

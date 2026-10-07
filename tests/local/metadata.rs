@@ -242,6 +242,140 @@ fn in_place_updates_keep_existing_set_id_bits() {
     }
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn new_in_place_files_are_written_private_until_their_group_or_acl_is_set() {
+    use std::os::unix::ffi::OsStrExt;
+    // A file --inplace creates gets its copied group or ACL only when it is
+    // finalized. Until then its group bits would let the group it was
+    // created with read it, or, as the mask of an ACL it inherited, the
+    // named user of its directory's default ACL. Each run stops after the
+    // file is created and written to: a batched or range write fails and
+    // leaves it, and a local copy is held after its first write.
+    let default_acl = |entries: &[(u16, u16, u32)]| {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in entries {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        acl
+    };
+    // USER_OBJ rwx, USER 12345 rwx, GROUP_OBJ r-x, MASK rwx, OTHER r-x.
+    let named = default_acl(&[
+        (1, 7, u32::MAX),
+        (2, 7, 12345),
+        (4, 5, u32::MAX),
+        (16, 7, u32::MAX),
+        (32, 5, u32::MAX),
+    ]);
+    for (metadata, acl) in [("ownership", None), ("acls", Some(&named))] {
+        for path in ["batched", "ranges", "local"] {
+            let context = format!("--copy-metadata={metadata}, {path}");
+            let t = Tmp::new();
+            let (name, size) = if path == "batched" {
+                ("small", 100)
+            } else {
+                ("large", 3 << 20)
+            };
+            write(&t.path("src").join(name), &prng(size, 5));
+            fs::set_permissions(t.path("src").join(name), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            // A second file lets the local copy write its file sequentially.
+            write(&t.path("src/other"), b"other");
+            let src = t.s("src");
+            for (destination, stopped) in [("stopped", true), ("finished", false)] {
+                let dst = t.path(destination);
+                fs::create_dir(&dst).unwrap();
+                if let Some(acl) = acl {
+                    let c_path = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
+                    if unsafe {
+                        libc::setxattr(
+                            c_path.as_ptr(),
+                            c"system.posix_acl_default".as_ptr(),
+                            acl.as_ptr().cast(),
+                            acl.len(),
+                            0,
+                        )
+                    } != 0
+                    {
+                        eprintln!(
+                            "skipped: this filesystem rejected a default ACL: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        return;
+                    }
+                }
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.args([
+                    "cp",
+                    "--no-progress",
+                    "--inplace",
+                    &format!("--copy-metadata={metadata}"),
+                    "--srcs-in",
+                    &src,
+                    "--into",
+                    dst.to_str().unwrap(),
+                ]);
+                if path == "ranges" {
+                    command.args(["--performance-tuning", "copy-path=ranges"]);
+                }
+                let (ready, resume) = (t.path("written"), t.path("continue"));
+                if stopped {
+                    match path {
+                        "batched" => command.env("SYQ_TEST_FAIL_INPLACE_PUT", "1"),
+                        "ranges" => command.env("SYQ_TEST_FAIL_WRITE_RANGE_NAME", name),
+                        _ => command
+                            .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
+                            .env("SYQ_TEST_COPY_LOCAL_FS", "local")
+                            .env("SYQ_TEST_COPY_LOCAL_WRITTEN_FILE", &ready)
+                            .env("SYQ_TEST_COPY_LOCAL_CONTINUE_FILE", &resume),
+                    };
+                }
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::umask(0o022);
+                        Ok(())
+                    });
+                }
+                let file = dst.join(name);
+                let observed = if stopped && path == "local" {
+                    let mut child = command
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .start()
+                        .unwrap();
+                    wait_for(
+                        "the local copy's first write",
+                        std::time::Duration::from_secs(30),
+                        || ready.exists() || child.try_wait().unwrap().is_some(),
+                    );
+                    assert!(ready.exists(), "{context}: no local copy was held");
+                    let observed = permission_bits(&file);
+                    write(&resume, b"continue");
+                    assert_output_ok(&child.wait_with_output().unwrap());
+                    observed
+                } else {
+                    let output = command.run().unwrap();
+                    assert_eq!(
+                        output.status.success(),
+                        !stopped,
+                        "{context}: {}",
+                        stderr_of(&output)
+                    );
+                    permission_bits(&file)
+                };
+                if stopped {
+                    assert_eq!(observed & 0o077, 0, "{context}: {observed:o}");
+                } else {
+                    assert_eq!(read(&file), read(&t.path("src").join(name)), "{context}");
+                    assert_eq!(observed, 0o644, "{context}: {observed:o}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn new_remote_entries_use_the_receivers_umask() {
     // The copy runs with umask 022 and its receiver with 077: without -p,

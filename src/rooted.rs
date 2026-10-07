@@ -450,6 +450,24 @@ impl Root {
         self.open_regular(path, libc::O_RDWR, false)
     }
 
+    /// Open an existing regular file for writing only, with the metadata
+    /// read when it was opened.
+    pub(crate) fn open_regular_write_known(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_regular_known(path, libc::O_WRONLY)
+    }
+
+    /// Open an existing regular file for reading and writing, with the
+    /// metadata read when it was opened.
+    pub(crate) fn open_regular_read_write_known(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(File, std::fs::Metadata)> {
+        self.open_regular_known(path, libc::O_RDWR)
+    }
+
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
         if path.is_empty() {
             // The root is already selected and pinned. Reopening it through
@@ -489,6 +507,19 @@ impl Root {
         access: libc::c_int,
         truncate: bool,
     ) -> Result<File> {
+        let (file, _) = self.open_regular_known(path, access)?;
+        if truncate {
+            file.set_len(0)
+                .with_context(|| format!("truncate confined file {}", path.label()))?;
+        }
+        Ok(file)
+    }
+
+    fn open_regular_known(
+        &self,
+        path: &RelativePath,
+        access: libc::c_int,
+    ) -> Result<(File, std::fs::Metadata)> {
         let file = self
             .open_leaf(
                 path,
@@ -496,14 +527,13 @@ impl Root {
                 0,
             )
             .with_context(|| format!("open confined regular file {}", path.label()))?;
-        require_regular(&file, path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("confined path {} is not a regular file", path.label());
+        }
         clear_nonblocking(&file)
             .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
-        if truncate {
-            file.set_len(0)
-                .with_context(|| format!("truncate confined file {}", path.label()))?;
-        }
-        Ok(file)
+        Ok((file, metadata))
     }
 
     /// Create a new regular leaf. Existing leaves of every type are refused.
@@ -532,21 +562,6 @@ impl Root {
         mode: u32,
     ) -> Result<(File, std::fs::Metadata)> {
         self.open_or_create_file_with_access(path, mode, libc::O_WRONLY)
-    }
-
-    /// Open a leaf for reading and writing, creating it when absent, and read
-    /// its metadata before anything is written to it. Like
-    /// `open_or_create_write_only_file`, an existing leaf is opened rather
-    /// than refused, so the caller decides from the metadata whether the
-    /// file is one it may write to; the open follows no symlink and cannot
-    /// block on a FIFO. For a destination written in place, whose existing
-    /// contents a resume hashes.
-    pub(crate) fn open_or_create_read_write_file(
-        &self,
-        path: &RelativePath,
-        mode: u32,
-    ) -> Result<(File, std::fs::Metadata)> {
-        self.open_or_create_file_with_access(path, mode, libc::O_RDWR)
     }
 
     fn open_or_create_file_with_access(
@@ -2747,13 +2762,6 @@ fn rename_exchange(
         io::ErrorKind::Unsupported,
         "atomic exchange rename is unavailable",
     ))
-}
-
-fn require_regular(file: &File, path: &RelativePath) -> Result<()> {
-    if !file.metadata()?.is_file() {
-        bail!("confined path {} is not a regular file", path.label());
-    }
-    Ok(())
 }
 
 fn is_safe_staged_identity(metadata: RootMetadata, expected_dev: u64, expected_ino: u64) -> bool {

@@ -1449,7 +1449,13 @@ impl Worker {
         // could mistake for complete. Only --inplace writes the final path
         // directly.
         let inplace = job.inplace;
-        let mode = self.create_mode(job);
+        // A file it creates in place waits owner-only for its group or ACL,
+        // as a sidecar does.
+        let mode = crate::fsops::inplace_creation_mode(
+            self.create_mode(job),
+            self.publication_flags(job),
+            crate::fsops::has_acl(job.entry.inode_metadata.as_deref()),
+        );
         // Keep range parallelism for a single-file copy. Read the planned
         // file count before the RPC so no scheduler lock spans the copy.
         let allow_sequential_local_fallback = self.sched.jobs.lock().unwrap().len() > 1;
@@ -1592,8 +1598,8 @@ impl Worker {
         create_if_missing: bool,
     ) -> Result<crate::proto::Preparation> {
         // The receiver creates an in-place file in its final mode and a
-        // sidecar in its staged mode: the final bits, unless group
-        // preservation or an ACL keeps it private until publication.
+        // sidecar in its staged mode, the final bits, unless group
+        // preservation or an ACL keeps either private until finalize.
         match ok(
             self.dst.call(Request::Prepare {
                 path: job.dst.clone(),
