@@ -446,7 +446,6 @@ fn pipeline_worker(
         dry_run_metadata_files: AtomicU64::new(0),
         quiet: true,
         verbose: 0,
-        umask: 0,
         copy_id: [0; 16],
         ignore: Vec::new(),
         delete: false,
@@ -2109,93 +2108,6 @@ fn clean_root_pins_the_edge_cases() {
             "clean_root({given:?})"
         );
     }
-}
-
-#[test]
-fn restricted_root_creation_uses_only_the_authorized_mode_policy() {
-    let ordinary = mkdir_root_batches(
-        b"/destination",
-        TargetCondition::Absent,
-        false,
-        false,
-        false,
-    );
-    assert_eq!(ordinary.len(), 1);
-    assert!(matches!(ordinary[0].as_slice(), [Op::Mkdir { .. }]));
-
-    let preserving =
-        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true, false);
-    assert_eq!(preserving.len(), 1);
-    assert!(matches!(
-        preserving[0].as_slice(),
-        [Op::Mkdir { mode: 0o755, .. }]
-    ));
-
-    // A root that takes source permissions after it is filled stays private.
-    let private = mkdir_root_batches(b"/destination", TargetCondition::Absent, true, true, true);
-    assert_eq!(private.len(), 1);
-    assert!(matches!(
-        private[0].as_slice(),
-        [Op::Mkdir { mode: 0o700, .. }]
-    ));
-
-    let receiver_managed =
-        mkdir_root_batches(b"/destination", TargetCondition::Absent, true, false, false);
-    assert_eq!(receiver_managed.len(), 2);
-    assert!(matches!(
-        receiver_managed[0].as_slice(),
-        [Op::Mkdir { mode: 0o755, .. }]
-    ));
-    assert!(matches!(
-        receiver_managed[1].as_slice(),
-        [Op::SetMeta {
-            meta: Meta { mode: 0o755, .. },
-            flags: flags::RECEIVER_MODE,
-            ..
-        }]
-    ));
-}
-
-#[test]
-fn restricted_directory_creation_batches_put_parents_before_children() {
-    let mkdir = |path: &[u8]| Op::Mkdir {
-        path: path.to_vec(),
-        mode: 0o755,
-        condition: TargetCondition::Any,
-    };
-    let ops = vec![
-        mkdir(b"/destination/a/b"),
-        mkdir(b"/destination/c"),
-        mkdir(b"/destination/a"),
-        mkdir(b"/destination/c/d"),
-    ];
-
-    let ordinary = directory_creation_batches(ops.clone(), false);
-    assert_eq!(ordinary.len(), 1);
-    assert_eq!(ordinary[0].len(), 4);
-
-    let restricted = directory_creation_batches(ops, true);
-    assert_eq!(restricted.len(), 2);
-    fn paths(batch: &[Op]) -> Vec<&[u8]> {
-        batch
-            .iter()
-            .map(|op| match op {
-                Op::Mkdir { path, .. } => path.as_slice(),
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>()
-    }
-    assert_eq!(
-        paths(&restricted[0]),
-        vec![b"/destination/c".as_slice(), b"/destination/a".as_slice()]
-    );
-    assert_eq!(
-        paths(&restricted[1]),
-        vec![
-            b"/destination/a/b".as_slice(),
-            b"/destination/c/d".as_slice()
-        ]
-    );
 }
 
 #[test]
@@ -4605,9 +4517,8 @@ fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
 fn a_streamed_patch_that_fails_at_its_begin_sends_none_of_its_pieces() {
     // An in-process source's pieces are ready as soon as they are read, but
     // the sender still takes the receiver's replies first: a patch whose
-    // begin failed or was refused sends no piece. A stale begin is compared
-    // again and streamed once more; a refused one is copied whole, and the
-    // receiver's grant refuses nothing further for it.
+    // begin was refused sends no piece. A refused one is copied whole, and
+    // the receiver's grant refuses nothing further for it.
     use std::os::unix::fs::PermissionsExt;
     let files = [("file", 32 << 20, 4 << 20..28 << 20)];
     for refused in [false, true] {
@@ -4628,8 +4539,9 @@ fn a_streamed_patch_that_fails_at_its_begin_sends_none_of_its_pieces() {
             64 << 20,
         ));
         let executed = Arc::new(Mutex::new(Vec::new()));
-        // The first begin goes stale: a metadata change, as keeping
-        // another name of the file makes, changes its change time.
+        // The file's mode changes between the first begin's authorization
+        // and its execution, which binds the patch to nothing: the receiver
+        // publishes it with the mode it has then.
         let first = Arc::new(std::sync::atomic::AtomicBool::new(!refused));
         let stale = target.clone();
         let mut receiver = restricted_destination(authority.clone(), executed.clone(), move || {
@@ -4693,10 +4605,13 @@ fn a_streamed_patch_that_fails_at_its_begin_sends_none_of_its_pieces() {
             assert_eq!(counts, (1, 0, 0), "refused");
             assert_eq!(*refusals.lock().unwrap(), 1);
         } else {
-            // The stale patch ended without a piece; the second streamed
-            // its 24 MiB in six.
-            assert_eq!(counts, (2, 6, 2), "stale");
+            // The patch streamed its 24 MiB in six pieces.
+            assert_eq!(counts, (1, 6, 1), "changed mode");
             assert_eq!(*refusals.lock().unwrap(), 0);
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+                0o640
+            );
         }
         assert_eq!(authority.in_flight(), 0, "refused={refused}");
     }
@@ -5317,7 +5232,7 @@ fn a_restricted_receiver_keeps_both_names_of_a_matching_destination() {
 }
 
 #[test]
-fn a_restricted_receiver_compares_a_changed_destination_again_only_once() {
+fn a_restricted_receiver_copies_a_destination_changed_after_comparison_whole() {
     use std::os::unix::fs::{FileExt, MetadataExt};
     let block = MIN_HASH_BLOCK_BYTES as usize;
     let contents: Vec<u8> = (0..2 * block).map(|i| (i % 251) as u8).collect();
@@ -5353,11 +5268,10 @@ fn a_restricted_receiver_compares_a_changed_destination_again_only_once() {
         assert_eq!(std::fs::read(&destination).unwrap(), contents, "{changes}");
         assert_ne!(metadata.ino(), inode, "{changes}");
         assert_eq!(metadata.mtime(), 1_600_000_000, "{changes}");
-        // It is compared again once; a second stale condition copies it
-        // whole.
+        // Its patch cannot reuse the changed block, so it is copied whole.
         assert_eq!(
             (executed.compared, executed.whole),
-            (vec![2], changes - 1),
+            (vec![1], 1),
             "{changes}"
         );
     }
@@ -5492,30 +5406,60 @@ fn a_restricted_receiver_keeps_or_replaces_each_name_of_a_linked_destination() {
 }
 
 #[test]
-fn comparison_groups_hold_one_name_of_each_bound_file() {
-    use super::small_compare::compare_groups;
-    // Three names of one file, two of another, two of a third, and a file
-    // without a bound: the first names go together, then the second, then
-    // the third.
-    let bound = [
-        Some((1, 1)),
-        Some((1, 1)),
-        Some((1, 2)),
-        Some((1, 2)),
-        None,
-        Some((1, 3)),
-        Some((1, 3)),
-        Some((1, 3)),
-    ];
-    assert_eq!(
-        compare_groups(&[1; 8], &bound, 1 << 20),
-        [vec![0, 2, 4, 5], vec![1, 3, 6], vec![7]]
-    );
-    // Without bounds, groups keep the batch's order and limits.
-    assert_eq!(
-        compare_groups(&[3; 5], &[None; 5], 6),
-        [vec![0, 1], vec![2, 3], vec![4]]
-    );
+fn a_restricted_receiver_patches_or_replaces_linked_names_on_four_workers() {
+    use std::os::unix::fs::MetadataExt;
+    // Every name of one destination file changed. Edited names keep their
+    // first block and are patched; names whose size changed are copied
+    // whole, several to a request. Four workers handle them at once, and
+    // each publication takes a link from the file the others share.
+    let block = MIN_HASH_BLOCK_BYTES as usize;
+    let old: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
+    for (count, whole) in [(8, false), (32, false), (8, true)] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let (names, inode) = linked_destination(root, count, &old);
+        let mut sources = Vec::new();
+        let files: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let new = if whole {
+                    vec![i as u8; 100 + i]
+                } else {
+                    let mut new = old.clone();
+                    new[block..].fill(i as u8);
+                    new
+                };
+                std::fs::write(root.join("source").join(name), &new).unwrap();
+                sources.push(new);
+                (name.as_str(), 1_600_000_000 + i as i64)
+            })
+            .collect();
+        // The copy itself fails on any error (`run_workers`).
+        let executed = copy_through_restricted_receiver(root, &files, 4, || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        });
+        let case = format!("{count} names, whole={whole}");
+        let mut inodes = std::collections::HashSet::new();
+        for ((name, mtime), contents) in files.iter().zip(&sources) {
+            let path = root.join("target").join(name);
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(&std::fs::read(&path).unwrap(), contents, "{case}: {name}");
+            assert_eq!(metadata.mtime(), *mtime, "{case}: {name}");
+            assert_ne!(metadata.ino(), inode, "{case}: {name}");
+            assert!(inodes.insert(metadata.ino()), "{case}: {name}");
+        }
+        if whole {
+            assert_ne!(executed.whole, 0, "{case}");
+        } else {
+            // Each name is compared once and patched, never copied whole.
+            assert_eq!(
+                (executed.compared, executed.whole),
+                (vec![1; count], 0),
+                "{case}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -5560,10 +5504,9 @@ fn a_restricted_receiver_compares_many_linked_pairs_in_few_requests() {
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), *inode, "{name}");
         assert_eq!(&std::fs::read(&path).unwrap(), contents, "{name}");
     }
-    // The first names share one request and the second names another, so
-    // each name is compared once.
+    // All the names share one request, and each is compared once.
     assert_eq!(executed.compared, vec![1; 2 * pairs]);
-    assert_eq!((executed.hash_batches, executed.whole), (2, 0));
+    assert_eq!((executed.hash_batches, executed.whole), (1, 0));
 }
 
 #[test]
@@ -5634,11 +5577,8 @@ fn a_restricted_receiver_keeps_a_linked_destination_mode_changed_outside() {
         // chosen before the change.
         assert_eq!(metadata.mode() & 0o7777, 0o600, "{name}");
     }
-    // The first patch found its condition stale, and its name was compared
-    // again; the others, authorized after the change, once.
-    let mut compared = executed.compared;
-    compared.sort_unstable();
-    assert_eq!(compared, [1, 1, 2]);
+    // Each name was compared once.
+    assert_eq!(executed.compared, [1, 1, 1]);
     assert_eq!(executed.whole, 0);
 }
 
@@ -5680,54 +5620,11 @@ fn a_restricted_receiver_replaces_a_linked_destination_that_keeps_changing() {
                 "{count}: {name}"
             );
         }
-        // Compared again once for each name the file has, the names are then
-        // copied whole.
-        assert_eq!(executed.compared, vec![count + 1; count], "{count}");
+        // The names' patches cannot reuse the changed block, so they are
+        // copied whole after one comparison each.
+        assert_eq!(executed.compared, vec![1; count], "{count}");
         assert_ne!(executed.whole, 0, "{count}");
     }
-}
-
-#[test]
-fn a_restricted_receiver_compares_a_changing_file_again_only_for_its_names_in_the_copy() {
-    use std::os::unix::fs::{FileExt, MetadataExt};
-    let block = MIN_HASH_BLOCK_BYTES as usize;
-    let contents: Vec<u8> = (0..block + 16).map(|i| (i % 251) as u8).collect();
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path();
-    // Two of the file's twenty names are in the copy.
-    let (names, _) = linked_destination(root, 2, &contents);
-    link_outside(root, &names[0], 18);
-    let first = root.join("target").join(&names[0]);
-    assert_eq!(std::fs::metadata(&first).unwrap().nlink(), 20);
-    // Every patch finds the file's second block rewritten after the receiver
-    // authorized it.
-    let shared = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&first)
-        .unwrap();
-    let writes = std::sync::atomic::AtomicU8::new(0);
-    let files: Vec<_> = names
-        .iter()
-        .map(|name| (name.as_str(), 1_600_000_000))
-        .collect();
-    let executed = copy_through_restricted_receiver(root, &files, 1, move || {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let write = writes.fetch_add(1, Relaxed).wrapping_add(1);
-        shared.write_all_at(&[write; 16], block as u64).unwrap();
-    });
-    for name in &names {
-        let path = root.join("target").join(name);
-        assert_eq!(std::fs::read(&path).unwrap(), contents, "{name}");
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().mtime(),
-            1_600_000_000,
-            "{name}"
-        );
-    }
-    // Compared again once for each name in the copy, not for each of the
-    // file's names, the names are then copied whole.
-    assert_eq!(executed.compared, [3, 3]);
-    assert_ne!(executed.whole, 0);
 }
 
 fn start_rule(workers: usize, network_destination: bool) -> StartRule {

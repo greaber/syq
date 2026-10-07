@@ -545,6 +545,15 @@ pub(crate) fn capture(
     );
     Ok(Some(Box::new(metadata)))
 }
+/// The permission bits creating an entry in `directory` with `proposed` gives
+/// it: limited by the directory's default ACL if it has one, or else by the
+/// umask, as the kernel computes for any creation. Every new file and
+/// directory of a copy ends with this mode, including one created private
+/// first, without asking its source.
+pub(crate) fn creation_mode(directory: &File, proposed: u32) -> Result<u32> {
+    Ok(proposed & default_permissions(directory)? & 0o777)
+}
+
 /// Permissions available to new entries: a POSIX default ACL takes precedence
 /// over umask, just as it does for ordinary kernel file creation.
 pub(crate) fn default_permissions(directory: &File) -> Result<u32> {

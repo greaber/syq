@@ -73,9 +73,6 @@ pub struct FileJobData {
     /// Opened directory identity that anchors descendant target mutations.
     pub container_guard: Option<ContainerGuard>,
     pub attempt: u32,
-    /// Rsync's fresh-file permissions derived from the destination parent.
-    /// None keeps native creation and explicit preservation behavior unchanged.
-    pub creation_mode: Option<u16>,
     /// Bytes of this file in place on the destination (transferred or matched).
     pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
@@ -85,6 +82,10 @@ pub struct FileJobData {
     /// --mapping: the entry's source path relative to the source base, kept
     /// so `--results` records round-trip as retry mapping entries.
     pub src_rel: Option<PathBytes>,
+    /// What the plan's scan found at `dst`, which the receiver chooses the
+    /// file's mode from without looking. A retry over this copy's own output
+    /// keeps it, so the output gets the mode the first attempt gave it.
+    pub scanned: crate::proto::ScannedDestination,
 }
 
 // Snapshots retain a chunk or a private retry version, preserving worker
@@ -126,7 +127,7 @@ pub struct Jobs {
 }
 
 /// The device and inode of a destination file other names may share.
-pub(crate) fn linked_identity(entry: &Entry) -> Option<(u64, u64)> {
+fn linked_identity(entry: &Entry) -> Option<(u64, u64)> {
     (entry.kind == crate::proto::Kind::File && entry.nlink > 1).then_some((entry.dev, entry.ino))
 }
 

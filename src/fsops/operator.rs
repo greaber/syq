@@ -47,6 +47,7 @@ impl OperatorDirectorySelection {
         })
     }
 
+    /// Create the missing components, the last with `mode`.
     pub(super) fn create_missing(
         &mut self,
         mode: u32,

@@ -222,6 +222,7 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
                     mode,
                     attempt: 0,
                     create_if_missing: true,
+                    scanned: ScannedDestination::Unknown,
                 },
             )
             .unwrap()
@@ -361,6 +362,7 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
                 mode: 0o644,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap_err();
@@ -394,6 +396,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
                     mode,
                     attempt: 0,
                     create_if_missing: true,
+                    scanned: ScannedDestination::Unknown,
                 },
             )
             .unwrap()
@@ -648,6 +651,7 @@ fn payload_integrity_checks_are_explicit() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -730,6 +734,7 @@ fn expected_hash_failure_preserves_existing_destination() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -764,6 +769,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &copy_id,
             &meta,
             0,
+            crate::proto::ScannedDestination::Unknown,
             TargetMutation {
                 condition: TargetCondition::Any,
                 guard: None
@@ -780,6 +786,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             &copy_id,
             &meta,
             0,
+            crate::proto::ScannedDestination::Unknown,
             TargetMutation {
                 condition: TargetCondition::Any,
                 guard: None,
@@ -1012,6 +1019,7 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -1066,6 +1074,7 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .is_err());
@@ -1700,6 +1709,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         condition: TargetCondition::Absent,
         guard: None,
         replaces: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     }]);
 
     let mut unrooted = FsOps::new();
@@ -1787,6 +1797,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         condition: TargetCondition::Any,
         guard: None,
         replaces: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
     };
     let response = rooted.handle(&Request::PutSmallBatch(vec![
         put(b"logical/file", 0o640, flags::RECEIVER_MODE),
@@ -1818,14 +1829,18 @@ fn staged_file_mode_withholds_bits_that_could_widen_access_before_publication() 
     };
     // Without group preservation the sidecar carries the final bits, so
     // publication needs no chmod.
-    assert_eq!(staged_file_mode(&meta(0o640), flags::RECEIVER_MODE), 0o640);
     assert_eq!(staged_file_mode(&meta(0o644), flags::MODE), 0o644);
+    // A mode the receiver has not chosen yet is no final mode.
+    assert_eq!(
+        staged_file_mode(&meta(0o640), flags::RECEIVER_MODE),
+        PRIVATE_PARTIAL_MODE
+    );
     // Special bits wait until the content is written.
     assert_eq!(staged_file_mode(&meta(0o4755), flags::MODE), 0o755);
     // Group preservation can change the group after creation, so group
     // bits must not be granted to the group the kernel assigns.
     assert_eq!(
-        staged_file_mode(&meta(0o640), flags::RECEIVER_MODE | flags::GROUP),
+        staged_file_mode(&meta(0o640), flags::MODE | flags::GROUP),
         PRIVATE_PARTIAL_MODE
     );
     // Without a requested mode the sidecar stays private.
@@ -2890,6 +2905,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -2911,6 +2927,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .is_err());
@@ -2981,6 +2998,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             condition: TargetCondition::Absent,
             guard: None,
             replaces: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("small")).unwrap(), b"small-data");
@@ -3005,6 +3023,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             },
             guard: None,
             replaces: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
         })
         .unwrap();
     assert_eq!(fs::read(moved.join("existing")).unwrap(), b"new");
@@ -3030,6 +3049,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -3076,6 +3096,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -3125,6 +3146,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             condition: TargetCondition::Absent,
             guard: None,
             replaces: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
         })
         .is_err());
     assert!(!outside.join("escaped").exists());
@@ -3159,6 +3181,7 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -3250,6 +3273,7 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -3825,6 +3849,7 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: true,
+                    scanned: ScannedDestination::Unknown,
                 },
             )
             .unwrap();
@@ -3958,6 +3983,7 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
                 mode: 0o644,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         );
         super::partial::FALLOCATE_ERRNO.set(None);
@@ -4075,6 +4101,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         mode: 0o644,
                         attempt: 0,
                         create_if_missing: true,
+                        scanned: ScannedDestination::Unknown,
                     },
                 )
                 .unwrap();
@@ -4111,6 +4138,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         mode: retry_mode,
                         attempt: 1,
                         create_if_missing: true,
+                        scanned: ScannedDestination::Unknown,
                     },
                 )
                 .unwrap();
@@ -4225,6 +4253,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                             mode,
                             attempt,
                             create_if_missing: true,
+                            scanned: ScannedDestination::Unknown,
                         },
                     )
                     .unwrap()
@@ -4265,6 +4294,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                         mode: 0o644,
                         attempt: 0,
                         create_if_missing: true,
+                        scanned: ScannedDestination::Unknown,
                     };
                     ops.prepare(other, options).unwrap();
                 }
@@ -4377,6 +4407,7 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         mode,
         attempt,
         create_if_missing: true,
+        scanned: ScannedDestination::Unknown,
     };
     ops.prepare(target(), options(0o644, 0)).unwrap();
     for (index, chunk) in old.chunks(block).enumerate() {
@@ -4560,6 +4591,7 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: false,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -4579,6 +4611,7 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -4610,6 +4643,7 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: false,
+                    scanned: ScannedDestination::Unknown,
                 },
             )
             .unwrap()
@@ -4677,6 +4711,7 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: false,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -6761,6 +6796,7 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         )
         .unwrap();
@@ -6890,6 +6926,7 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
             },
         );
         assert!(result.is_err(), "accepted {replacement} replacement");
@@ -7603,6 +7640,7 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                 condition,
                 guard: None,
                 replaces: true,
+                scanned: crate::proto::ScannedDestination::Unknown,
             })
             .unwrap_err()
         } else {
@@ -7619,6 +7657,7 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: true,
+                    scanned: ScannedDestination::Unknown,
                 },
             )
             .unwrap();
@@ -7786,6 +7825,7 @@ fn temporary_directory_access_is_explicit_and_reports_only_changes() {
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
     let metadata = fs::metadata(&dir).unwrap();
     let request = Request::WidenDirectories {
+        remember: true,
         directories: vec![(
             path_bytes(&dir),
             TargetCondition::Matches {
@@ -7830,6 +7870,7 @@ fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
     let metadata = fs::metadata(&dir).unwrap();
     let request = Request::WidenDirectories {
+        remember: true,
         directories: vec![(
             path_bytes(&dir),
             TargetCondition::Matches {
@@ -7891,4 +7932,84 @@ fn creations_wait_for_their_parents_created_in_the_same_request() {
     );
     // Without a parent in the request, everything stays in one wave.
     assert_eq!(creation_waves(&ops, &[0, 2, 3]), vec![vec![0, 2, 3]]);
+}
+
+/// A retry in another receiver process finds the file an interrupted
+/// attempt created. The sender's scan found nothing there before the copy,
+/// so the file still gets a new file's mode, not the owner write it was
+/// created with to be filled.
+#[test]
+fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let target = dir.path().join("file");
+    fs::write(&target, b"par").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let target_bytes = target.as_os_str().as_bytes();
+    let identity = Root::open(dir.path()).unwrap().identity();
+    let guard = ContainerGuard {
+        root: dir.path().as_os_str().as_bytes().to_vec(),
+        dev: identity.dev,
+        ino: identity.ino,
+    };
+    let copy_id = [9; 16];
+    let mut operations = FsOps::new();
+    let source_mode = 0o100444;
+    operations
+        .prepare(
+            PartialTarget {
+                path: target_bytes,
+                id: &copy_id,
+                guard: Some(&guard),
+            },
+            PrepareOptions {
+                size: 3,
+                inplace: true,
+                mode: source_mode & 0o777,
+                attempt: 1,
+                create_if_missing: true,
+                scanned: ScannedDestination::Absent,
+            },
+        )
+        .unwrap();
+    operations
+        .write_range(
+            PartialTarget {
+                path: target_bytes,
+                id: &copy_id,
+                guard: Some(&guard),
+            },
+            true,
+            1,
+            0,
+            content_digest(b"new"),
+            b"new",
+        )
+        .unwrap();
+    operations
+        .finalize_expected(
+            None,
+            target_bytes,
+            true,
+            &copy_id,
+            &Meta {
+                inode_metadata: None,
+                mode: source_mode,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags::RECEIVER_MODE,
+            ScannedDestination::Absent,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: Some(&guard),
+            },
+        )
+        .unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert_eq!(
+        fs::metadata(&target).unwrap().mode() & 0o7777,
+        0o444 & !crate::fsops::limits::process_umask()
+    );
 }

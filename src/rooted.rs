@@ -1025,6 +1025,60 @@ impl Root {
         metadata_at(directory.as_raw_fd(), &name).context("stat confined directory entry")
     }
 
+    /// The mode a regular file published at `path` takes when the receiver
+    /// chooses it: a regular file there keeps its mode, and a new one gets
+    /// `proposed` limited as creating it would limit it, by its directory's
+    /// default ACL or else the umask. `held` keeps the last parent open for
+    /// the next name in the same directory.
+    pub(crate) fn receiver_file_mode(
+        &self,
+        path: &RelativePath,
+        proposed: u32,
+        held: &mut Option<HeldParent>,
+    ) -> Result<u32> {
+        let (parent, leaf) = self.hold_parent(path, held)?;
+        match metadata_at(parent.directory.as_raw_fd(), &component_cstring(leaf)) {
+            Ok(metadata) if metadata.is_file() => Ok(metadata.mode & 0o7777),
+            Ok(_) => parent.creation_mode(proposed),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => parent.creation_mode(proposed),
+            Err(error) => {
+                Err(error).with_context(|| format!("stat confined path {}", path.label()))
+            }
+        }
+    }
+
+    /// The permission bits a file created at `path` may have: its
+    /// directory's default ACL's, when it has one, and otherwise those the
+    /// umask leaves.
+    pub(crate) fn creation_permissions(&self, path: &RelativePath) -> Result<u32> {
+        let (parents, _) = path.leaf()?;
+        let directory = open_directory_components(&self.directory, parents)
+            .with_context(|| format!("resolve confined parent for {}", path.label()))?;
+        crate::inode_metadata::default_permissions(&directory)
+    }
+
+    fn hold_parent<'a, 'p>(
+        &self,
+        path: &'p RelativePath,
+        held: &'a mut Option<HeldParent>,
+    ) -> Result<(&'a mut HeldParent, &'p [u8])> {
+        let (parents, leaf) = path.leaf()?;
+        let root = (self.identity.dev, self.identity.ino);
+        if !held
+            .as_ref()
+            .is_some_and(|parent| parent.root == root && parent.components == parents)
+        {
+            *held = Some(HeldParent {
+                root,
+                components: parents.to_vec(),
+                directory: open_directory_components(&self.directory, parents)
+                    .with_context(|| format!("resolve confined parent for {}", path.label()))?,
+                permitted: None,
+            });
+        }
+        Ok((held.as_mut().expect("the parent was just held"), leaf))
+    }
+
     pub(crate) fn metadata_optional(&self, path: &RelativePath) -> Result<Option<RootMetadata>> {
         if path.is_empty() {
             return self.metadata(path).map(Some);
@@ -1918,6 +1972,28 @@ impl std::ops::Deref for DirectoryHandle<'_> {
             Self::Borrowed(file) => file,
             Self::Owned(file) => file,
         }
+    }
+}
+
+/// A directory `Root::receiver_file_mode` keeps open between names, with
+/// the permissions its default ACL lets new entries have, once read.
+pub(crate) struct HeldParent {
+    root: (u64, u64),
+    components: Vec<Vec<u8>>,
+    directory: File,
+    permitted: Option<u32>,
+}
+
+impl HeldParent {
+    fn creation_mode(&mut self, proposed: u32) -> Result<u32> {
+        let permitted = if let Some(permitted) = self.permitted {
+            permitted
+        } else {
+            *self
+                .permitted
+                .insert(crate::inode_metadata::default_permissions(&self.directory)?)
+        };
+        Ok(proposed & permitted & 0o777)
     }
 }
 

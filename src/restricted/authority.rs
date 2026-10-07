@@ -2,7 +2,6 @@ use super::*;
 
 pub(super) struct AuthorityState {
     pub(super) paths: HashSet<Vec<u8>>,
-    pub(super) receiver_modes: HashMap<Vec<u8>, ReceiverModeState>,
     /// Objects this grant created and the executor confirmed. The
     /// existing-object policy is about what existed before the transfer, so
     /// later operations on these are the transfer's own business.
@@ -40,26 +39,6 @@ pub(super) struct AuthorityState {
     pub(super) receipt_issued: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ReceiverModeState {
-    /// Keep the permissions HostB had before syq temporarily opened an
-    /// existing object or prepared to replace its contents.
-    Existing {
-        mode: u32,
-        kind: ReceiverModeKind,
-        dev: u64,
-        ino: u64,
-        ctime: i64,
-        ctime_nsec: u32,
-    },
-    /// The object will be created by this transfer. Its proposed source mode
-    /// has not yet been constrained by HostB's umask.
-    New(ReceiverModeKind),
-    /// A new object's already-constrained mode. Pin it for the remainder of
-    /// the grant so repeated requests cannot act as repeated chmod calls.
-    Selected { mode: u32, kind: ReceiverModeKind },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ReservationHoldId(u64);
 
@@ -80,81 +59,6 @@ impl ByteReservation {
             .chain(self.observations.values().copied())
             .max()
     }
-}
-
-impl ReceiverModeState {
-    pub(super) fn carry_forward(self, observed: Self) -> Option<Self> {
-        match (self, observed) {
-            (
-                Self::Existing {
-                    mode,
-                    kind,
-                    dev,
-                    ino,
-                    ..
-                },
-                Self::Existing {
-                    mode: observed_mode,
-                    kind: observed_kind,
-                    dev: observed_dev,
-                    ino: observed_ino,
-                    ctime: observed_ctime,
-                    ctime_nsec: observed_ctime_nsec,
-                },
-            ) if kind == observed_kind && (dev, ino) == (observed_dev, observed_ino) => {
-                let mode = if kind == ReceiverModeKind::Directory && observed_mode == (mode | 0o700)
-                {
-                    mode
-                } else {
-                    observed_mode
-                };
-                Some(Self::Existing {
-                    mode,
-                    kind,
-                    dev,
-                    ino,
-                    ctime: observed_ctime,
-                    ctime_nsec: observed_ctime_nsec,
-                })
-            }
-            (Self::New(kind), Self::New(observed_kind))
-            | (Self::Selected { kind, .. }, Self::New(observed_kind))
-            | (
-                Self::New(kind),
-                Self::Existing {
-                    kind: observed_kind,
-                    ..
-                },
-            )
-            | (
-                Self::Selected { kind, .. },
-                Self::Existing {
-                    kind: observed_kind,
-                    ..
-                },
-            ) if kind == observed_kind => Some(self),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ReceiverModeKind {
-    Directory,
-    RegularFile,
-    Other,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum ReceiverModeTarget {
-    AnyExisting,
-    RegularFile,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ReceiverModeDecision {
-    pub(super) mode: u32,
-    pub(super) identity: Option<(u64, u64, i64, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,19 +104,6 @@ pub(super) fn reject_control_plane_scopes(
     Ok(())
 }
 
-#[cfg(not(test))]
-pub(super) fn read_process_umask() -> u32 {
-    // main captured the mask before any thread existed.
-    crate::fsops::process_umask()
-}
-
-#[cfg(test)]
-pub(super) fn read_process_umask() -> u32 {
-    // Avoid changing the process-global umask while unit tests run in
-    // parallel. Individual policy tests can override the stored value.
-    0o022
-}
-
 /// Shared capability inherited by the authorized SSH control process and all
 /// of its token-authenticated TCP workers. HostA may choose protocol messages,
 /// but it cannot remove or replace this receiver-side authority.
@@ -230,7 +121,6 @@ pub(crate) struct RestrictedAuthority {
     pub(super) grant_digest: [u8; 32],
     pub(super) receipt_key: PrivateKey,
     pub(super) file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
-    pub(super) receiver_umask: u32,
     pub(super) deadline: Instant,
     pub(super) control_open: AtomicBool,
     pub(super) state: Mutex<AuthorityState>,
@@ -340,7 +230,6 @@ impl RestrictedAuthority {
                 ino: config.root_ino,
             },
         )?;
-        let receiver_umask = read_process_umask();
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
@@ -370,13 +259,11 @@ impl RestrictedAuthority {
             grant_digest,
             receipt_key,
             file_data_limit,
-            receiver_umask,
             deadline,
             control_open: AtomicBool::new(true),
             settled: std::sync::Condvar::new(),
             state: Mutex::new(AuthorityState {
                 paths: HashSet::new(),
-                receiver_modes: HashMap::new(),
                 created: HashSet::new(),
                 provisional: HashSet::new(),
                 reserved: HashMap::new(),
@@ -1569,277 +1456,15 @@ impl RestrictedAuthority {
         root.metadata_optional(&relative)
     }
 
-    pub(super) fn remember_receiver_creation(
-        &self,
-        path: &[u8],
-        existing_directory_kept: bool,
-    ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        let metadata = self.rooted_metadata(path)?;
-        Self::remember_receiver_creation_observed(
-            &mut state.receiver_modes,
-            path,
-            existing_directory_kept,
-            metadata,
-        );
-        Ok(())
-    }
-
-    pub(super) fn remember_receiver_creation_observed(
-        modes: &mut HashMap<Vec<u8>, ReceiverModeState>,
-        path: &[u8],
-        existing_directory_kept: bool,
-        metadata: Option<RootMetadata>,
-    ) {
-        let kind = if existing_directory_kept {
-            ReceiverModeKind::Directory
-        } else {
-            ReceiverModeKind::Other
-        };
-        let initial =
-            if existing_directory_kept && metadata.is_some_and(|metadata| metadata.is_dir()) {
-                ReceiverModeState::Existing {
-                    mode: metadata.unwrap().mode & 0o7777,
-                    kind,
-                    dev: metadata.unwrap().dev,
-                    ino: metadata.unwrap().ino,
-                    ctime: metadata.unwrap().ctime,
-                    ctime_nsec: metadata.unwrap().ctime_nsec,
-                }
-            } else {
-                ReceiverModeState::New(kind)
-            };
-        let mode = modes
-            .get(path)
-            .copied()
-            .and_then(|existing| existing.carry_forward(initial))
-            .unwrap_or(initial);
-        modes.insert(path.to_vec(), mode);
-    }
-
-    pub(super) fn receiver_mode(
-        &self,
-        path: &[u8],
-        proposed: u32,
-        target: ReceiverModeTarget,
-    ) -> Result<ReceiverModeDecision> {
-        let mut state = self.state.lock().unwrap();
-        if matches!(target, ReceiverModeTarget::AnyExisting) {
-            match state.receiver_modes.get(path).copied() {
-                Some(existing @ ReceiverModeState::Selected { .. })
-                | Some(existing @ ReceiverModeState::New(ReceiverModeKind::Other))
-                | Some(existing @ ReceiverModeState::New(ReceiverModeKind::RegularFile)) => {
-                    return Ok(Self::select_receiver_mode(
-                        &mut state.receiver_modes,
-                        path,
-                        proposed,
-                        self.receiver_umask,
-                        existing,
-                    ));
-                }
-                Some(ReceiverModeState::New(ReceiverModeKind::Directory)) => {
-                    let Some(metadata) = self.rooted_metadata(path)? else {
-                        return Ok(Self::select_receiver_mode(
-                            &mut state.receiver_modes,
-                            path,
-                            proposed,
-                            self.receiver_umask,
-                            ReceiverModeState::New(ReceiverModeKind::Directory),
-                        ));
-                    };
-                    if !metadata.is_dir() {
-                        bail!("receiver-managed directory target changed before authorization");
-                    }
-
-                    // Mkdir itself was constrained to 0700, so a setgid bit
-                    // observed now came from HostB's destination-parent
-                    // inheritance rather than HostA's proposed source mode.
-                    // Retain just that receiver-derived special bit and bind
-                    // the metadata operation to the observed directory.
-                    let selected =
-                        (proposed & 0o777 & !self.receiver_umask) | (metadata.mode & 0o2000);
-                    state.receiver_modes.insert(
-                        path.to_vec(),
-                        ReceiverModeState::Selected {
-                            mode: selected,
-                            kind: ReceiverModeKind::Directory,
-                        },
-                    );
-                    return Ok(ReceiverModeDecision {
-                        mode: selected,
-                        identity: Some((
-                            metadata.dev,
-                            metadata.ino,
-                            metadata.ctime,
-                            metadata.ctime_nsec,
-                        )),
-                    });
-                }
-                Some(ReceiverModeState::Existing { .. }) | None => {}
-            }
-        }
-        let observed = self.rooted_metadata(path)?;
-        let initial = match (target, observed) {
-            (ReceiverModeTarget::AnyExisting, Some(metadata)) => {
-                let kind = if metadata.is_dir() {
-                    ReceiverModeKind::Directory
-                } else if metadata.is_file() {
-                    ReceiverModeKind::RegularFile
-                } else {
-                    ReceiverModeKind::Other
-                };
-                ReceiverModeState::Existing {
-                    mode: metadata.mode & 0o7777,
-                    kind,
-                    dev: metadata.dev,
-                    ino: metadata.ino,
-                    ctime: metadata.ctime,
-                    ctime_nsec: metadata.ctime_nsec,
-                }
-            }
-            (ReceiverModeTarget::RegularFile, Some(metadata)) if metadata.is_file() => {
-                ReceiverModeState::Existing {
-                    mode: metadata.mode & 0o7777,
-                    kind: ReceiverModeKind::RegularFile,
-                    dev: metadata.dev,
-                    ino: metadata.ino,
-                    ctime: metadata.ctime,
-                    ctime_nsec: metadata.ctime_nsec,
-                }
-            }
-            (ReceiverModeTarget::RegularFile, _) => {
-                ReceiverModeState::New(ReceiverModeKind::RegularFile)
-            }
-            (ReceiverModeTarget::AnyExisting, None) => {
-                ReceiverModeState::New(ReceiverModeKind::Other)
-            }
-        };
-        let mode = state
-            .receiver_modes
-            .get(path)
-            .copied()
-            .and_then(|existing| existing.carry_forward(initial))
-            .unwrap_or(initial);
-        state.receiver_modes.insert(path.to_vec(), mode);
-        Ok(Self::select_receiver_mode(
-            &mut state.receiver_modes,
-            path,
-            proposed,
-            self.receiver_umask,
-            mode,
-        ))
-    }
-
-    pub(super) fn select_receiver_mode(
-        modes: &mut HashMap<Vec<u8>, ReceiverModeState>,
-        path: &[u8],
-        proposed: u32,
-        receiver_umask: u32,
-        mode: ReceiverModeState,
-    ) -> ReceiverModeDecision {
-        match mode {
-            ReceiverModeState::Existing {
-                mode,
-                dev,
-                ino,
-                ctime,
-                ctime_nsec,
-                ..
-            } => ReceiverModeDecision {
-                mode,
-                identity: Some((dev, ino, ctime, ctime_nsec)),
-            },
-            ReceiverModeState::Selected { mode, .. } => ReceiverModeDecision {
-                mode,
-                identity: None,
-            },
-            ReceiverModeState::New(kind) => {
-                // New objects may inherit ordinary source permission bits, but
-                // never source-proposed special bits, and HostB's own umask is
-                // authoritative. Directory setgid inheritance is added only
-                // from receiver-observed state in receiver_mode().
-                let selected = proposed & 0o777 & !receiver_umask;
-                modes.insert(
-                    path.to_vec(),
-                    ReceiverModeState::Selected {
-                        mode: selected,
-                        kind,
-                    },
-                );
-                ReceiverModeDecision {
-                    mode: selected,
-                    identity: None,
-                }
-            }
-        }
-    }
-
-    pub(super) fn constrain_receiver_mode(
-        &self,
-        path: &[u8],
-        meta: &mut proto::Meta,
-        flags: &mut u8,
-        condition: &mut proto::TargetCondition,
-        target: ReceiverModeTarget,
-    ) -> Result<()> {
-        self.check_flags(*flags)?;
-        self.apply_receiver_mode(path, meta, flags, condition, target)
-    }
-
-    pub(super) fn apply_receiver_mode(
-        &self,
-        path: &[u8],
-        meta: &mut proto::Meta,
-        flags: &mut u8,
-        condition: &mut proto::TargetCondition,
-        target: ReceiverModeTarget,
-    ) -> Result<()> {
+    /// Check metadata a request applies: the grant's flags, and no other
+    /// inode metadata. A receiver-chosen mode is the receiver's own to
+    /// decide, as on every receiver (`fsops::receiver_mode`).
+    pub(super) fn check_metadata(&self, meta: &proto::Meta, flags: u8) -> Result<()> {
+        self.check_flags(flags)?;
         anyhow::ensure!(
             meta.inode_metadata.is_none(),
             "signed grants do not authorize additional inode metadata"
         );
-        if *flags & proto::flags::RECEIVER_MODE != 0 {
-            let decision = self.receiver_mode(path, meta.mode, target)?;
-            meta.mode = decision.mode;
-            if let Some((dev, ino, ctime, ctime_nsec)) = decision.identity {
-                match *condition {
-                    proto::TargetCondition::Any => {
-                        *condition = proto::TargetCondition::MatchesFingerprint {
-                            dev,
-                            ino,
-                            ctime,
-                            ctime_nsec,
-                        };
-                    }
-                    proto::TargetCondition::Matches {
-                        dev: expected_dev,
-                        ino: expected_ino,
-                    } if (expected_dev, expected_ino) == (dev, ino) => {
-                        *condition = proto::TargetCondition::MatchesFingerprint {
-                            dev,
-                            ino,
-                            ctime,
-                            ctime_nsec,
-                        };
-                    }
-                    proto::TargetCondition::MatchesFingerprint {
-                        dev: expected_dev,
-                        ino: expected_ino,
-                        ctime: expected_ctime,
-                        ctime_nsec: expected_ctime_nsec,
-                    } if (
-                        expected_dev,
-                        expected_ino,
-                        expected_ctime,
-                        expected_ctime_nsec,
-                    ) == (dev, ino, ctime, ctime_nsec) => {}
-                    _ => bail!("receiver-managed mode target changed before authorization"),
-                }
-            }
-            // From this point on MODE contains receiver-authored data. FsOps
-            // never interprets the untrusted RECEIVER_MODE proposal directly.
-            *flags = (*flags & !proto::flags::RECEIVER_MODE) | proto::flags::MODE;
-        }
         Ok(())
     }
 
@@ -2030,16 +1655,7 @@ impl RestrictedAuthority {
             self.charge_bytes(&patch.path, 0, patch.data.len())?;
             self.constrain_creation(&patch.path, &mut patch.condition, false, index, pending)?;
             self.constrain_update(&patch.path, Some(&mut patch.condition), pending)?;
-            self.constrain_receiver_mode(
-                &patch.path,
-                &mut patch.meta,
-                &mut patch.flags,
-                &mut patch.condition,
-                ReceiverModeTarget::RegularFile,
-            )?;
-            // The receiver's choice of mode applies to the kept file too.
-            patch.unchanged_flags = (patch.flags & !proto::flags::TIMES)
-                | (patch.unchanged_flags & proto::flags::TIMES);
+            self.check_metadata(&patch.meta, patch.flags)?;
             let hold = self.reserve_bytes(&patch.path, patch.copy_id, patch.len, true)?;
             outcomes.push(PendingOutcome::Patch {
                 index,
@@ -2088,7 +1704,6 @@ impl RestrictedAuthority {
             }
             Op::Rmdir { path } => {
                 self.charge_deletion(path, true)?;
-                self.state.lock().unwrap().receiver_modes.remove(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2099,7 +1714,6 @@ impl RestrictedAuthority {
             }
             Op::Unlink { path } => {
                 self.charge_deletion(path, false)?;
-                self.state.lock().unwrap().receiver_modes.remove(path);
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2133,9 +1747,8 @@ impl RestrictedAuthority {
                 condition,
             } => {
                 if self.mapping_parent(path)? {
-                    // Observe once for both the existing-object constraint and
-                    // receiver-owned mode restoration. An existing implicit
-                    // parent may be reopened, but never replaced or recreated.
+                    // An existing implicit parent may be reopened, but never
+                    // replaced or recreated.
                     // An explicit no-replace mkdir needs no preflight stat:
                     // the filesystem checks absence atomically. This is the
                     // planner's usual request for a missing implicit parent.
@@ -2165,22 +1778,13 @@ impl RestrictedAuthority {
                         pending,
                         (policy, observed),
                     )?;
-                    Self::remember_receiver_creation_observed(
-                        &mut self.state.lock().unwrap().receiver_modes,
-                        path,
-                        true,
-                        observed,
-                    );
-                    // Implicit parents have no source mode. Let mkdir apply
-                    // HostB's umask and setgid inheritance directly, avoiding
-                    // a later stat/chmod for newly created parents.
-                    *mode = 0o755;
                 } else {
                     self.constrain_creation(path, condition, true, index, pending)?;
-                    if !self.copy.options.preserve_permissions {
-                        self.remember_receiver_creation(path, true)?;
-                        *mode = 0o700;
-                    }
+                }
+                // Creation limits the permission bits; without -p the
+                // sender chooses no special bits.
+                if !self.copy.options.preserve_permissions {
+                    *mode &= 0o777;
                 }
                 outcomes.push(PendingOutcome::Logical {
                     index,
@@ -2222,12 +1826,13 @@ impl RestrictedAuthority {
                 let file_type = *mode & libc::S_IFMT;
                 #[cfg(not(target_os = "linux"))]
                 let file_type = *mode & libc::S_IFMT as u32;
-                *mode = file_type | (*mode & 0o7777);
+                let permitted = if self.copy.options.preserve_permissions {
+                    0o7777
+                } else {
+                    0o777
+                };
+                *mode = file_type | (*mode & permitted);
                 self.constrain_creation(path, condition, false, index, pending)?;
-                if !self.copy.options.preserve_permissions {
-                    self.remember_receiver_creation(path, false)?;
-                    *mode = file_type | 0o600;
-                }
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2244,34 +1849,26 @@ impl RestrictedAuthority {
             } => {
                 let implicit = self.mapping_parent(path)?;
                 if implicit {
-                    // A parent has no source metadata. Only receiver-derived
-                    // permissions may be finalized, including restoration after
-                    // reopening a read-only parent. Permission preservation on
+                    // A parent has no source metadata. Only a mode the
+                    // receiver chooses may be finalized, as when it restores
+                    // a parent it widened. Permission preservation on
                     // explicit entries grants no chmod authority over parents.
-                    let remembered = self.state.lock().unwrap().receiver_modes.get(path).copied();
-                    if *flags & !(proto::flags::MODE | proto::flags::RECEIVER_MODE) != 0
-                        || remembered.is_none()
-                        || (!matches!(remembered, Some(ReceiverModeState::Existing { .. }))
-                            && !self.created_by_this_grant(path))
-                    {
+                    if *flags & !(proto::flags::MODE | proto::flags::RECEIVER_MODE) != 0 {
                         bail!("mapping cannot change metadata of an existing implicit parent");
                     }
-                    meta.mode = 0o755;
                     if *flags != 0 {
                         *flags = proto::flags::RECEIVER_MODE;
                     }
                 }
                 self.constrain_update(path, Some(&mut *condition), pending)?;
-                if !implicit {
-                    self.check_flags(*flags)?;
+                if implicit {
+                    anyhow::ensure!(
+                        meta.inode_metadata.is_none(),
+                        "signed grants do not authorize additional inode metadata"
+                    );
+                } else {
+                    self.check_metadata(meta, *flags)?;
                 }
-                self.apply_receiver_mode(
-                    path,
-                    meta,
-                    flags,
-                    condition,
-                    ReceiverModeTarget::AnyExisting,
-                )?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2287,13 +1884,7 @@ impl RestrictedAuthority {
                 condition,
             } => {
                 self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.constrain_receiver_mode(
-                    path,
-                    meta,
-                    flags,
-                    condition,
-                    ReceiverModeTarget::RegularFile,
-                )?;
+                self.check_metadata(meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index,
                     path: path.clone(),
@@ -2558,7 +2149,15 @@ impl RestrictedAuthority {
                 }
                 *guard = Some(self.guard.clone());
             }
-            Request::WidenDirectories { directories, guard } => {
+            Request::WidenDirectories {
+                directories,
+                remember,
+                guard,
+            } => {
+                // The receiver restores what it widened when asked to choose
+                // a mode, as it always is for a mapping parent, whose
+                // restoration this authority turns into a receiver-chosen mode.
+                *remember = true;
                 for (index, (path, condition)) in directories.iter_mut().enumerate() {
                     // Widening is the existing-directory part of EnsureDirectory.
                     // Apply exactly the same signed path/policy/quota checks,
@@ -2715,13 +2314,7 @@ impl RestrictedAuthority {
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 self.check_mutation_path(path, false)?;
                 self.constrain_update(path, Some(&mut *condition), pending)?;
-                self.constrain_receiver_mode(
-                    path,
-                    meta,
-                    flags,
-                    condition,
-                    ReceiverModeTarget::RegularFile,
-                )?;
+                self.check_metadata(meta, *flags)?;
                 outcomes.push(PendingOutcome::Logical {
                     index: 0,
                     path: path.clone(),
@@ -2735,13 +2328,19 @@ impl RestrictedAuthority {
                 size,
                 inplace,
                 copy_id,
+                flags,
+                scanned,
                 create_if_missing,
                 guard,
                 ..
             } => {
+                // The receiver looks for itself at what a file replaces: a
+                // sender's word could give an existing file a new mode.
+                *scanned = proto::ScannedDestination::Unknown;
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file preparation does not match the signed publication policy");
                 }
+                self.check_flags(*flags)?;
                 if *size > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
@@ -2843,10 +2442,15 @@ impl RestrictedAuthority {
                 copy_id,
                 meta,
                 flags,
+                scanned,
                 condition,
                 guard,
                 ..
             } => {
+                // The receiver looks for itself, and knows the in-place
+                // files it opened: all of the copy's connections are in its
+                // process.
+                *scanned = proto::ScannedDestination::Unknown;
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
                 if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
                     bail!("file finalization does not match the signed publication policy");
@@ -2865,13 +2469,7 @@ impl RestrictedAuthority {
                     observation_hold: None,
                 });
                 touched.push(path.clone());
-                self.constrain_receiver_mode(
-                    path,
-                    meta,
-                    flags,
-                    condition,
-                    ReceiverModeTarget::RegularFile,
-                )?;
+                self.check_metadata(meta, *flags)?;
                 *guard = Some(self.guard.clone());
             }
             Request::PutSmallBatch(puts) => {
@@ -2891,6 +2489,8 @@ impl RestrictedAuthority {
                     }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
+                    // As for `Prepare`, the receiver looks for itself.
+                    put.scanned = proto::ScannedDestination::Unknown;
                     if self.expected_hash(&put.path)?.is_some() {
                         bail!("expected-hash files require checked finalization");
                     }
@@ -2905,13 +2505,7 @@ impl RestrictedAuthority {
                         },
                     });
                     touched.push(put.path.clone());
-                    self.constrain_receiver_mode(
-                        &put.path,
-                        &mut put.meta,
-                        &mut put.flags,
-                        &mut put.condition,
-                        ReceiverModeTarget::RegularFile,
-                    )?;
+                    self.check_metadata(&put.meta, put.flags)?;
                     put.guard = Some(self.guard.clone());
                 }
             }
@@ -2979,9 +2573,6 @@ impl RestrictedAuthority {
             }
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
-            }
-            Request::DefaultPermissions { .. } => {
-                bail!("rsync creation policy is not valid on a command-restricted receiver")
             }
             Request::ConfigurePreservation { .. } => {
                 bail!("signed grants do not authorize additional inode metadata or read policies")

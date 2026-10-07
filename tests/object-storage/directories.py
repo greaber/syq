@@ -95,7 +95,8 @@ def check():
 
         # Without -p, a marker directory ends as creating it there would have
         # left it, as in a local copy: it keeps the setgid bit it inherited,
-        # and an inherited default ACL limits its mode instead of the umask.
+        # and an inherited default ACL limits its mode instead of the umask,
+        # as it limits the files' modes.
         setgid = root / 'setgid'
         setgid.mkdir()
         setgid.chmod(0o2755)
@@ -114,6 +115,11 @@ def check():
             c.run(['--from', remote, prefix + '/source', '--into', acl / 'download'])
             after = {path: mode(acl / 'download' / path) for path in directories}
             assert after == {path: value & 0o750 for path, value in expected.items()}, after
+            # New files follow the same default ACL: 644 objects give 640.
+            files = ['source/private/deep/file', 'source/shared/file']
+            assert all(mode(source / path.removeprefix('source/')) == 0o644 for path in files)
+            after = {path: mode(acl / 'download' / path) for path in files}
+            assert after == {path: 0o640 for path in files}, after
 
         # Without -p, a read-only marker's directory gets owner access, as a
         # native copy gives every new directory, so a later download can still

@@ -40,6 +40,7 @@ mod limits;
 mod operator;
 mod partial;
 mod paths;
+mod receiver_mode;
 mod sidecars;
 mod small_batch;
 
@@ -677,6 +678,15 @@ pub struct FsOps {
     /// Devices this connection has probed for whether a new file can be
     /// narrowed below the mode it came out with (`note_created_mode`).
     fixed_wide_mode_devices: HashMap<u64, bool>,
+    /// Directories this connection created private or widened, for the
+    /// modes it chooses for them later.
+    receiver_directories: receiver_mode::ReceiverDirectories,
+    /// A new directory whose mode lacks owner access, as `syq rsync` creates
+    /// one, gets that mode only after its contents.
+    narrow_new_directories: bool,
+    /// The permission bits each directory's default ACL lets new files
+    /// have, by root and directory, read once per connection.
+    creation_permissions: Mutex<receiver_mode::CreationPermissions>,
     operator_selection: Option<OperatorDirectorySelection>,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
@@ -811,6 +821,8 @@ struct PrepareOptions {
     mode: u32,
     attempt: u32,
     create_if_missing: bool,
+    /// What the sender's scan found at the path.
+    scanned: ScannedDestination,
 }
 
 struct HashOptions {
@@ -887,6 +899,9 @@ impl FsOps {
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
+            receiver_directories: Default::default(),
+            narrow_new_directories: false,
+            creation_permissions: Default::default(),
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,
@@ -970,10 +985,27 @@ impl FsOps {
         mode: u32,
         require_absent: bool,
     ) -> Result<DirectoryAnchor> {
-        self.operator_selection
+        // It has owner access while it is filled, as any new directory has.
+        let anchor = self
+            .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
-            .create_missing(mode, require_absent)
+            .create_missing(mode | 0o700, require_absent)?;
+        // A destination created private is opened once its metadata is set,
+        // and under `syq rsync` one whose mode lacks owner access is narrowed
+        // once it is filled.
+        let narrowing = self.narrow_new_directories && mode & 0o700 != 0o700;
+        if mode & 0o7777 == 0o700 || narrowing {
+            let created = self
+                .operator_selection
+                .as_ref()
+                .context("no checked destination directory")?
+                .directory
+                .metadata()?;
+            self.receiver_directories
+                .created((anchor.dev, anchor.ino), created.mode(), narrowing);
+        }
+        Ok(anchor)
     }
 
     fn anchor_destination(
@@ -1316,31 +1348,23 @@ impl FsOps {
         // Stage everything before publishing any final files. A staging
         // failure keeps all sidecars for the fallback engine to resume.
         let mut staged = Vec::with_capacity(request.files.len());
-        for (i, ((file, destination), unchanged)) in request
-            .files
-            .iter()
-            .zip(&destinations)
-            .zip(&unchanged)
-            .enumerate()
-        {
+        for (i, (file, unchanged)) in request.files.iter().zip(&unchanged).enumerate() {
             if *unchanged {
                 staged.push(None);
                 continue;
             }
-            let mut meta = file.meta.clone();
-            // Without source permission preservation, a replacement keeps
-            // the destination's mode, as in the ordinary worker.
-            if request.flags & flags::MODE == 0 {
-                if let Some(stat) = destination {
-                    meta.mode = stat.st_mode as u32 & 0o7777;
-                }
-            }
+            // The file it replaces is the one inspected above.
+            let replaced = match &destinations[i] {
+                Some(stat) => crate::proto::ScannedDestination::File(stat.st_mode as u32 & 0o7777),
+                None => crate::proto::ScannedDestination::Absent,
+            };
             match self.stage_small_file(
                 &file.path,
                 &copy_id,
                 data[i].unwrap(),
-                &meta,
+                file.meta.clone(),
                 request.flags,
+                replaced,
             ) {
                 Ok(item) => staged.push(Some(item)),
                 Err(error) => {
@@ -1483,13 +1507,16 @@ impl FsOps {
         path: &[u8],
         copy_id: &CopyId,
         data: &[u8],
-        meta: &Meta,
-        flags: u8,
+        mut meta: Meta,
+        mut flags: u8,
+        replaced: crate::proto::ScannedDestination,
     ) -> Result<StagedSmallFile> {
         let path = self.destination_relative(path)?;
         let rooted = self
             .rooted_destination_target(&path, None)?
             .context("small copy requires the destination root")?;
+        self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
+        let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);
         let creation = sidecars::begin()?;
         let staged = staged_file_mode(meta, flags);
@@ -1707,13 +1734,19 @@ impl FsOps {
         let registrations: Vec<_> = resolved
             .iter()
             .map(|(directory, relative, expected_leaf, object)| {
-                (
+                let directory_mode = if relative.is_empty() {
+                    Some(directory.metadata()?.mode() & 0o777)
+                } else {
+                    None
+                };
+                Ok((
                     relative.clone(),
                     expected_leaf.clone(),
                     filesystem_hint(object.as_ref().unwrap_or(directory)),
-                )
+                    directory_mode,
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let tickets = self.descriptor_session.register_source_handles(
             resolved
                 .into_iter()
@@ -1724,7 +1757,7 @@ impl FsOps {
             .into_iter()
             .zip(registrations)
             .map(
-                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem))| {
+                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem, directory_mode))| {
                     let selection = RegisteredPath::new(ticket.root_id(), relative)?;
                     Ok(RegisteredSourceRoot {
                         filesystem,
@@ -1733,6 +1766,7 @@ impl FsOps {
                         selection,
                         expected_leaf,
                         allow_unconfined_paths,
+                        directory_mode,
                     })
                 },
             )
@@ -1950,7 +1984,6 @@ impl FsOps {
             | Request::StatMany { guard, .. }
             | Request::PartialPaths { guard, .. }
             | Request::PruneLookup { guard, .. }
-            | Request::DefaultPermissions { guard, .. }
             | Request::WidenDirectories { guard, .. }
             | Request::Apply { guard, .. }
             | Request::PlanBatch { guard, .. }
@@ -2272,8 +2305,7 @@ impl FsOps {
             }
             Request::StatMany { paths, guard, .. }
             | Request::PartialPaths { paths, guard, .. }
-            | Request::PruneLookup { paths, guard }
-            | Request::DefaultPermissions { paths, guard } => {
+            | Request::PruneLookup { paths, guard } => {
                 if guard.is_none() {
                     for path in paths {
                         map(path)?;
@@ -2293,7 +2325,9 @@ impl FsOps {
                     }
                 }
             }
-            Request::WidenDirectories { directories, guard } => {
+            Request::WidenDirectories {
+                directories, guard, ..
+            } => {
                 if guard.is_none() {
                     for (path, _) in directories {
                         map(path)?;
@@ -3052,6 +3086,7 @@ impl FsOps {
                     (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
                 });
         }
+        let narrow = self.narrow_new_directories;
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
@@ -3080,6 +3115,7 @@ impl FsOps {
         let minimum = parallel_minimum(
             !short.is_empty() && self.destination_on_network_file_system(guard, &short),
         );
+        let directories = &self.receiver_directories;
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
@@ -3114,18 +3150,44 @@ impl FsOps {
                         )
                     }) =>
                 {
-                    apply::create_private_directory(
+                    apply::create_identified_directory(
                         op,
                         guard,
                         destination_root.clone(),
                         destination_prefix,
+                        true,
                     )
                     .map(|created| {
-                        if let Some(created) = created {
+                        if let Some((dev, ino, created)) = created {
                             private
                                 .lock()
                                 .unwrap()
-                                .insert(path.clone(), (*mode, created));
+                                .insert(path.clone(), (*mode, (dev, ino)));
+                            if narrow && mode & 0o700 != 0o700 {
+                                directories.created((dev, ino), created, true);
+                            }
+                        }
+                    })
+                }
+                // A later receiver-chosen mode opens a directory created
+                // private, as the planner opens the destination root (one
+                // created for a group change is opened above), and under
+                // `syq rsync` narrows one whose proposal lacks the owner
+                // access it is created with to fill it.
+                Op::Mkdir { mode, .. }
+                    if mode & 0o7777 == 0o700 || (narrow && mode & 0o700 != 0o700) =>
+                {
+                    let narrowing = mode & 0o700 != 0o700;
+                    apply::create_identified_directory(
+                        op,
+                        guard,
+                        destination_root.clone(),
+                        destination_prefix,
+                        !narrowing,
+                    )
+                    .map(|created| {
+                        if let Some((dev, ino, created)) = created {
+                            directories.created((dev, ino), created, narrowing);
                         }
                     })
                 }
@@ -3152,7 +3214,15 @@ impl FsOps {
         }
         let private = private.into_inner().unwrap();
         let mres = parallel_map_from(minimum, &meta_idx, |&i| {
-            let result = apply_one(&ops[i], guard, destination_root.clone(), destination_prefix);
+            // A receiver-chosen mode is decided here, in parallel, once the
+            // request's creations are done.
+            let op = directories.resolve_op(
+                &ops[i],
+                guard,
+                destination_root.clone(),
+                destination_prefix,
+            );
+            let result = apply_one(&op, guard, destination_root.clone(), destination_prefix);
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {

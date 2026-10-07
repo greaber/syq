@@ -52,8 +52,8 @@ Metadata used by the expression is added to records only when requested with
 metadata, without blocking their children. Existing filesystem directories then
 keep their metadata, apart from the effects of adding or removing children;
 their permissions can be temporarily reopened for copying and are restored
-afterward. New directories get the receiver's defaults, including its umask and
-setgid inheritance. On S3, directory-marker objects are never filtered by
+afterward. New directories get the receiver's defaults, including its umask or
+the parent's default ACL, and setgid inheritance. On S3, directory-marker objects are never filtered by
 `--where`; `--copy-if` can skip their copy, while keys beneath them are
 considered independently.
 

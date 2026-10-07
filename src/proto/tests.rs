@@ -191,6 +191,7 @@ fn owned_messages_frame_as_borrowed_ones_do() {
                     condition: TargetCondition::Any,
                     guard: None,
                     replaces: false,
+                    scanned: crate::proto::ScannedDestination::Unknown,
                 }])
             };
             for message in [request(), batch()] {

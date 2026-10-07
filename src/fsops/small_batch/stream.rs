@@ -152,6 +152,7 @@ impl FsOps {
             condition: patch.condition,
             guard: patch.guard.clone(),
             replaces: true,
+            scanned: ScannedDestination::Unknown,
         };
         let mut stream = Box::new(PatchStream {
             patch: patch.clone(),
@@ -471,6 +472,18 @@ impl FsOps {
             stage.file.set_len(stream.patch.len)?;
         }
         check_destination_writes(&stage.file, &stage.label)?;
+        // The file a seeded patch reuses is open, so its mode is known.
+        let scanned = match &stream.old {
+            Some(old) => ScannedDestination::File(old.metadata()?.mode() & 0o7777),
+            None => ScannedDestination::Unknown,
+        };
+        self.resolve_publication(
+            &stage.target,
+            &mut stream.put.meta,
+            &mut stream.put.flags,
+            &mut None,
+            scanned,
+        )?;
         set_meta_written_file_for_publication(
             &stage.file,
             &stream.put.meta,
@@ -480,9 +493,9 @@ impl FsOps {
         .with_context(|| format!("set metadata {}", stage.label.display()))?;
         #[cfg(debug_assertions)]
         fail_put_small_before_rename_for_test(&stage.target.label)?;
-        // The file the patch reused may have changed its condition while
-        // the data arrived, as keeping another name of it does: the file is
-        // then compared again, as a batch patch's would be.
+        // The file the patch reused may no longer meet its condition after
+        // the data arrived: the file is then compared again, as a batch
+        // patch's would be.
         if stream.patch.condition != TargetCondition::Any {
             if let Err(error) = observe_rooted_condition(&stage.target, stream.patch.condition) {
                 stream.stale = true;

@@ -382,6 +382,26 @@ pub struct SmallPut {
     /// The sender saw a file at this path while planning. The receiver only
     /// schedules by it: what publication does is decided by `condition`.
     pub replaces: bool,
+    /// What the sender's scan found at this path (see `ScannedDestination`).
+    pub scanned: ScannedDestination,
+}
+
+/// What a sender's scan found at the path a file is published to. It spares
+/// a receiver choosing the file's mode (`flags::RECEIVER_MODE`) a lookup of
+/// the path, which can be a round trip on a network filesystem: a new file
+/// gets the proposal as creating it limits it, and a replacement keeps the
+/// mode found. A receiver that takes its sender's word treats a file that
+/// appeared or changed since as the scan found it. A command-restricted
+/// receiver does not: its authority sets `Unknown`, and it looks.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScannedDestination {
+    /// Not known: the receiver looks.
+    #[default]
+    Unknown,
+    /// No regular file.
+    Absent,
+    /// A regular file with these permission bits.
+    File(u32),
 }
 
 /// An existing file's identity and change time. Any later write to the
@@ -539,10 +559,10 @@ pub mod flags {
     pub const OWNER: u8 = 2;
     pub const GROUP: u8 = 4;
     pub const TIMES: u8 = 8;
-    /// A mode proposed by ordinary destination creation/restoration semantics,
-    /// rather than source-mode preservation requested with `-p`. Restricted
-    /// receivers replace it with a mode derived from receiver state and umask,
-    /// including any receiver-observed directory setgid inheritance.
+    /// The mode is the receiver's to choose, with `Meta::mode` as the
+    /// source's proposal: without `-p`, an existing object keeps its mode
+    /// and a new one gets the proposal's permission bits as creating it
+    /// limits them (see `fsops::receiver_mode`).
     pub const RECEIVER_MODE: u8 = 16;
     pub const MODE_MASK: u8 = MODE | RECEIVER_MODE;
     /// Explicit mapping ownership must succeed, unlike best-effort preservation.
@@ -704,6 +724,10 @@ pub struct RegisteredSourceRoot {
     /// Permit this explicitly opted-in rsync session to use legacy unconfined
     /// source pathnames for `--insecure-links` compatibility.
     pub allow_unconfined_paths: bool,
+    /// A selected directory's permission bits when it was registered, so a
+    /// coordinator that creates a destination for its contents needs no
+    /// lookup of its own. None for an exact leaf.
+    pub directory_mode: Option<u32>,
 }
 
 impl RegisteredSourceRoot {
@@ -1018,14 +1042,20 @@ pub enum WireRequest<Data> {
     /// whether donor discovery deferred creation to SeedBasis. A
     /// false `create_if_missing` lets content-identical final files complete
     /// without ever allocating a sidecar.
-    /// `mode` is the creation mode for `--inplace`; resumable sidecars remain
-    /// private until final metadata is applied immediately before publication.
+    /// `mode` and `flags` are the publication's mode and metadata flags, a
+    /// proposal under `flags::RECEIVER_MODE`. The receiver creates an
+    /// `--inplace` file and a sidecar from them, the sidecar private while
+    /// `acl` says an ACL will follow.
+    /// `scanned` is what the sender's scan found at `path`.
     Prepare {
         path: PathBytes,
         size: u64,
         inplace: bool,
         copy_id: CopyId,
         mode: u32,
+        flags: u8,
+        acl: bool,
+        scanned: ScannedDestination,
         attempt: u32,
         create_if_missing: bool,
         guard: Option<ContainerGuard>,
@@ -1129,6 +1159,8 @@ pub enum WireRequest<Data> {
         copy_id: CopyId,
         meta: Meta,
         flags: u8,
+        /// What the sender's scan found at `path`.
+        scanned: ScannedDestination,
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
     },
@@ -1215,12 +1247,9 @@ pub enum WireRequest<Data> {
         selection: crate::inode_metadata::Selection,
         sparse: bool,
         destination: bool,
-    },
-    /// Creation permissions from each destination directory's default ACL or
-    /// receiver umask. Used only for rsync copies without preserved modes.
-    DefaultPermissions {
-        paths: Vec<PathBytes>,
-        guard: Option<ContainerGuard>,
+        /// A new directory whose mode lacks owner access, as `syq rsync`
+        /// creates one, gets that mode only after its contents.
+        narrow_new_directories: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.
@@ -1309,9 +1338,13 @@ pub enum WireRequest<Data> {
         commit: bool,
     },
     /// Temporarily add owner access to existing destination directories.
-    /// Returns original modes only for directories actually changed.
+    /// Returns original modes only for directories actually changed. With
+    /// `remember`, the receiver keeps them to restore when it is later asked
+    /// to choose these directories' modes; without, the sender restores them
+    /// with the modes returned.
     WidenDirectories {
         directories: Vec<(PathBytes, TargetCondition)>,
+        remember: bool,
         guard: Option<ContainerGuard>,
     },
 }
@@ -1597,7 +1630,6 @@ pub enum Response {
     PublishedBatch(Vec<std::result::Result<Option<(u64, u64)>, WireError>>),
     /// Non-final fragment of a rich-metadata stat response.
     StatsMore(Vec<Option<Entry>>),
-    DefaultPermissions(Vec<u32>),
     NativeMapData(Vec<u8>),
     NativeMapDone,
     /// One bit per offered file; true requests its payload (including empty files).
@@ -1825,9 +1857,7 @@ impl SizeHint for Request {
                     .sum::<usize>()
                     + 16
             }
-            Request::StatMany { paths, .. }
-            | Request::PruneLookup { paths, .. }
-            | Request::DefaultPermissions { paths, .. } => {
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
             Request::PartialPaths { paths, .. } => {

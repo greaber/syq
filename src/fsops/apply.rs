@@ -14,6 +14,8 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
     }
 }
 
+/// Carry out `op`. What it creates is limited as creating it limits it: by
+/// its directory's default ACL, or else by the umask.
 pub(super) fn apply_one(
     op: &Op,
     guard: Option<&ContainerGuard>,
@@ -515,7 +517,7 @@ pub(super) fn set_meta_rooted(
         && metadata.uid != meta.uid)
         || (flags & flags::GROUP != 0 && metadata.gid != meta.gid);
     let mode_differs =
-        flags & flags::MODE_MASK != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;
+        flags & flags::MODE != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;
     let time_differs = flags & flags::TIMES != 0
         && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec);
     if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
@@ -594,7 +596,7 @@ pub(super) fn set_meta_rooted(
 }
 
 /// The target an operation on `path` resolves to, as `apply_one` resolves it.
-fn operation_target(
+pub(super) fn operation_target(
     path: &[u8],
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
@@ -659,20 +661,26 @@ pub(super) fn starting_group_may_differ(
     }
 }
 
-/// Run a Mkdir with mode 0700, as `apply_one` runs it, and return the
-/// identity of the directory if this call created it rather than finding
-/// one already there.
-pub(super) fn create_private_directory(
+/// The identity and mode of a directory a call created.
+pub(super) type CreatedDirectory = (u64, u64, u32);
+
+/// Run a Mkdir as `apply_one` runs it, with mode 0700 when `private`, and
+/// return the identity and mode of the directory if this call created it
+/// rather than finding one already there.
+pub(super) fn create_identified_directory(
     op: &Op,
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
-) -> Result<Option<(u64, u64)>> {
+    private: bool,
+) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
-        path, condition, ..
+        path,
+        mode,
+        condition,
     } = op
     else {
-        bail!("private creation requires a Mkdir");
+        bail!("identified creation requires a Mkdir");
     };
     let target = match guard {
         Some(guard) => guarded_target(path, guard)?.as_rooted(),
@@ -680,7 +688,8 @@ pub(super) fn create_private_directory(
     };
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
-    mkdir_rooted(&target, 0o700, *condition, true)
+    let mode = if private { 0o700 } else { *mode };
+    mkdir_rooted(&target, mode, *condition, true)
 }
 
 /// Give a directory this receiver created private, once it has taken its
@@ -710,12 +719,11 @@ pub(super) fn open_created_directory(
 }
 
 /// The mode creating `directory` with `proposed` would have given it, for a
-/// directory created private instead: permission bits limited by the umask
-/// or by the default ACL it inherited, and the setgid bit of `current`,
+/// directory created private instead: permission bits limited by the default
+/// ACL it inherited, or else by the umask, and the setgid bit of `current`,
 /// which it inherited from its parent. Creation never sets other bits.
 pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u32) -> Result<u32> {
-    let permitted = crate::inode_metadata::default_permissions(directory)?;
-    Ok((proposed & permitted & 0o777) | (current & 0o2000))
+    Ok(crate::inode_metadata::creation_mode(directory, proposed)? | (current & 0o2000))
 }
 
 /// Create the directory `target` names, or accept an existing one as the
@@ -727,7 +735,7 @@ fn mkdir_rooted(
     mode: u32,
     condition: TargetCondition,
     identify: bool,
-) -> Result<Option<(u64, u64)>> {
+) -> Result<Option<CreatedDirectory>> {
     let root = &target.root;
     let path = &target.relative;
     if path.is_empty() {
@@ -753,7 +761,7 @@ fn mkdir_rooted(
                     .then(|| {
                         parent
                             .metadata()
-                            .map(|metadata| (metadata.dev, metadata.ino))
+                            .map(|metadata| (metadata.dev, metadata.ino, metadata.mode))
                     })
                     .transpose()?;
                 hold_after_directory_creation_for_test(&target.label)?;
@@ -789,7 +797,7 @@ pub(super) fn create_rooted_directory_or_existing(
     target: &RootedTarget,
     mode: u32,
     identify: bool,
-) -> Result<Option<(u64, u64)>> {
+) -> Result<Option<CreatedDirectory>> {
     match target
         .root
         .create_directory(&target.relative, (mode & 0o7777) | 0o700)
@@ -800,7 +808,7 @@ pub(super) fn create_rooted_directory_or_existing(
                     target
                         .root
                         .metadata(&target.relative)
-                        .map(|metadata| (metadata.dev, metadata.ino))
+                        .map(|metadata| (metadata.dev, metadata.ino, metadata.mode))
                 })
                 .transpose()?;
             hold_after_directory_creation_for_test(&target.label)?;
@@ -1095,9 +1103,9 @@ pub(super) fn set_meta_handle_known(
         file,
         meta.inode_metadata.as_deref(),
         meta.mode,
-        flags & flags::MODE_MASK != 0,
+        flags & flags::MODE != 0,
     )?;
-    if flags & flags::MODE_MASK != 0 {
+    if flags & flags::MODE != 0 {
         let current = narrowed.unwrap_or(current.mode() & 0o7777);
         let wanted = meta.mode & 0o7777;
         if current != wanted || (owner_changed && wanted & 0o6000 != 0) {
