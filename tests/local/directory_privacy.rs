@@ -689,6 +689,45 @@ fn a_remote_receiver_grants_no_more_than_the_source_while_filling() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_root_another_process_creates_first_is_treated_as_an_existing_directory() {
+    // Another process creates the missing destination root after syq found
+    // it missing and before syq's mkdir. The copy treats it as an existing
+    // directory: it keeps its mode, where a root the copy created private
+    // for its group would be opened to the default mode, and what it holds
+    // is looked up, so a file already there is kept. -H creates the root
+    // only after the source is scanned.
+    let cases: [&[&str]; 3] = [
+        &["rsync", "-rg", "--ignore-existing", "src/", "dst/"],
+        &["rsync", "-rgH", "--ignore-existing", "src/", "dst/"],
+        &[
+            "cp",
+            "--copy-metadata=ownership",
+            "--if-exists=keep",
+            "--srcs-in",
+            "src",
+            "--into",
+            "dst",
+        ],
+    ];
+    for args in cases {
+        let t = Tmp::new();
+        source_tree(&t, 0o755, 0o755);
+        let mut command = syq_command(args);
+        command.current_dir(&t.0);
+        let ((), output) = observe_at(&t, command, "OPERATOR_DIRECTORY", || {
+            fs::create_dir(t.path("dst")).unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            write(&t.path("dst/file"), b"already there");
+        });
+        assert_output_ok(&output);
+        assert_eq!(mode(&t.path("dst")), 0o700, "{args:?}");
+        assert_eq!(read(&t.path("dst/file")), b"already there", "{args:?}");
+        assert_eq!(read(&t.path("dst/sub/file")), b"nested file", "{args:?}");
+    }
+}
+
 #[test]
 fn a_root_interrupted_right_after_its_creation_has_its_final_mode() {
     // Without -p a new destination root is created with its source's mode

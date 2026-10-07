@@ -984,7 +984,8 @@ pub enum WireRequest<Data> {
         independent_handoff_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
-    /// return the selected directory's stable identity.
+    /// return the selected directory's stable identity and whether this
+    /// request created it (`OperatorDirectoryCreated`).
     CreateOperatorDirectory {
         mode: u32,
         /// Refuse a concurrently-created final directory instead of reusing
@@ -1650,6 +1651,13 @@ pub enum Response {
     DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
     PatchedBatch(Vec<std::result::Result<SmallPatched, SmallPatchError>>),
     WidenedDirectories(Vec<std::result::Result<Option<DirectoryMode>, WireError>>),
+    /// The directory `CreateOperatorDirectory` selected. `created` is false
+    /// when its final component already existed, as when another process
+    /// created it after it was found missing.
+    OperatorDirectoryCreated {
+        anchor: DirectoryAnchor,
+        created: bool,
+    },
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).
