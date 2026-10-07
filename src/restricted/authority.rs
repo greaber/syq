@@ -1427,11 +1427,11 @@ impl RestrictedAuthority {
     }
 
     /// Bind an in-place file's opening to the signed existing-object policy.
-    /// In place, the name is written as it is opened, so the request must
-    /// carry the condition the policy needs: no file there when the policy
-    /// keeps existing files or the root must be new, and exactly the file
-    /// the receiver observes when it changes existing files only. A file
-    /// this grant created, in an earlier attempt, may be opened again.
+    /// In place, the name is written as it is opened: when the policy keeps
+    /// existing files or the root must be new, the file is created only,
+    /// never opened once it exists, even by a retry of this copy; when it
+    /// changes existing files only, the request must name exactly the file
+    /// the receiver observes.
     pub(super) fn constrain_inplace(
         &self,
         path: &[u8],
@@ -1447,8 +1447,8 @@ impl RestrictedAuthority {
             ExistingDestinationPolicy::Replace if !root_must_be_new => {}
             ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip => {
                 // The file may only be created: the receiver creates it
-                // exclusively, or reopens the one this copy created there
-                // for an earlier attempt, whatever the sender asked. A
+                // exclusively, whatever the sender asked, and refuses a
+                // retry once it exists, even one this copy created. A
                 // coordinator does not ask this of a new `--as-new` file.
                 *condition = Absent;
                 // Once created, the file is this grant's own: its metadata

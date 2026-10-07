@@ -81,7 +81,7 @@ impl FsOps {
         let mode = mode & 0o777;
         let file = root.create_file(relative, mode | 0o200)?;
         let created = file.metadata()?;
-        receiver_mode::note_inplace_open(copy_id, &created, Some(&file))?;
+        receiver_mode::note_inplace_open(copy_id, &created, true);
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -443,39 +443,22 @@ impl FsOps {
                 .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id);
             match condition {
                 // Only a new file: created exclusively, never one already
-                // there, except the one this copy created there for an
-                // earlier attempt.
+                // there, even one an earlier attempt of this copy created.
                 TargetCondition::Absent => {
-                    let file = match self.create_inplace_file(
-                        &target.root,
-                        &target.relative,
-                        mode,
-                        copy_id,
-                    ) {
-                        Ok(file) => file,
-                        Err(error)
+                    let file = self
+                        .create_inplace_file(&target.root, &target.relative, mode, copy_id)
+                        .map_err(|error| {
                             if error.downcast_ref::<io::Error>().is_some_and(|error| {
                                 error.kind() == io::ErrorKind::AlreadyExists
-                            }) =>
-                        {
-                            let file = target
-                                .root
-                                .open_regular_read_write(&target.relative)
-                                .ok()
-                                .filter(|file| {
-                                    file.metadata().is_ok_and(|opened| {
-                                        receiver_mode::created_inplace(copy_id, &opened)
-                                    })
-                                });
-                            file.with_context(|| {
-                                format!(
-                                    "destination {} appeared after the new-path precondition was checked",
+                            }) {
+                                anyhow!(
+                                    "{} already exists, and this copy may only create it; if an earlier attempt of this copy created it, finish it with --as instead of --as-new",
                                     target.label.display()
                                 )
-                            })?
-                        }
-                        Err(error) => return Err(error),
-                    };
+                            } else {
+                                error
+                            }
+                        })?;
                     let opened = file.metadata()?;
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
@@ -489,7 +472,7 @@ impl FsOps {
                     require_open_target(&file, &target.label, condition)?;
                     let opened = file.metadata()?;
                     self.require_names_inside(&target, &opened)?;
-                    receiver_mode::note_inplace_open(copy_id, &opened, None)?;
+                    receiver_mode::note_inplace_open(copy_id, &opened, false);
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
                     })?;
@@ -517,7 +500,7 @@ impl FsOps {
                 )?;
                 require_open_target(&file, &target.label, condition)?;
                 self.require_names_inside(&target, &metadata)?;
-                receiver_mode::note_inplace_open(copy_id, &metadata, None)?;
+                receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
@@ -552,7 +535,7 @@ impl FsOps {
                         euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600;
                     // Created or not, the file has the mode it was found or
                     // created with until the writes.
-                    receiver_mode::note_inplace_open(copy_id, &opened, created.then_some(&file))?;
+                    receiver_mode::note_inplace_open(copy_id, &opened, created);
                     if created {
                         // A umask or inherited default ACL can remove even
                         // owner access from a new file; a file of ours that
@@ -588,7 +571,7 @@ impl FsOps {
                     Ok(file) => {
                         let opened = file.metadata()?;
                         self.require_names_inside(&target, &opened)?;
-                        receiver_mode::note_inplace_open(copy_id, &opened, None)?;
+                        receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
@@ -618,7 +601,7 @@ impl FsOps {
                         require_rooted_metadata(&file, metadata, &target.label)?;
                         let opened = file.metadata()?;
                         self.require_names_inside(&target, &opened)?;
-                        receiver_mode::note_inplace_open(copy_id, &opened, None)?;
+                        receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;

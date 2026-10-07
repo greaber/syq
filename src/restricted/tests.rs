@@ -7341,3 +7341,67 @@ fn names_a_lookup_returned_count_inside() {
         assert_eq!(fs::metadata(&names[7]).unwrap().mtime(), 1_600_000_000);
     }
 }
+
+/// A restricted receiver creates an `--as-new` file in place and refuses a
+/// retry once the file exists, even one this copy created, telling how to
+/// finish it; it never writes into the existing file.
+#[test]
+fn a_create_only_in_place_retry_is_refused_with_the_way_to_finish() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::New,
+    )
+    .unwrap();
+    let target = root.join("target");
+    let prepare = |attempt| {
+        let mut request = Request::Prepare {
+            path: path_bytes(&target),
+            size: 5,
+            inplace: true,
+            copy_id: [1; 16],
+            mode: 0o644,
+            flags: 0,
+            acl: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
+            attempt,
+            create_if_missing: true,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut request, false).unwrap();
+        let response = crate::fsops::FsOps::new().handle_in_place(&mut request);
+        authority.settle(settlement, &response);
+        response
+    };
+    // The first attempt creates the file.
+    let response = prepare(0);
+    assert!(
+        matches!(response, proto::Response::Prepared(_)),
+        "{response:?}"
+    );
+    fs::write(&target, b"first").unwrap();
+    // A retry, on any connection, is refused and writes nothing.
+    for attempt in [0, 1] {
+        let response = prepare(attempt);
+        let proto::Response::EndpointError(error) = &response else {
+            panic!("{response:?}")
+        };
+        assert!(
+            error
+                .as_str()
+                .contains("finish it with --as instead of --as-new"),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+    }
+}
