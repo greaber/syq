@@ -1063,6 +1063,21 @@ impl RestrictedAuthority {
                         error,
                     );
                 }
+                PendingOutcome::LogicalIfFailed {
+                    index,
+                    path,
+                    action,
+                } => {
+                    if let Some(error) = outcome_error(index) {
+                        self.append_operation(
+                            &mut state,
+                            &path,
+                            action,
+                            crate::receipt::OperationDisposition::Failed,
+                            Some(error),
+                        );
+                    }
+                }
                 PendingOutcome::Logical {
                     index,
                     path,
@@ -1724,6 +1739,19 @@ impl RestrictedAuthority {
         if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
             bail!("hardlink publication accepts no fingerprint condition");
         }
+        // Keeping existing files, a link never replaces a name this grant
+        // created, even one it has since removed: another request may hold
+        // that name as the grant's own, and would then change the existing
+        // file the link gives it. Ordinary copies link only new names.
+        if self.copy.policy.existing == ExistingDestinationPolicy::Skip
+            && (self.created_by_this_grant(path)
+                || pending.iter().any(|creation| creation.path == path))
+        {
+            bail!(
+                "{} was created by this copy; a hard link may not replace it while existing files are kept",
+                String::from_utf8_lossy(path)
+            );
+        }
         self.constrain_creation(path, condition, false, index, pending)?;
         // The link replaces whatever this grant made at that name, in this
         // request or before, so that name no longer makes a file its own.
@@ -1733,18 +1761,27 @@ impl RestrictedAuthority {
         }
         self.state.lock().unwrap().created.remove(path);
         // A name already linked to the file changes nothing; the copy
-        // reports it unchanged, as an ordinary copy does.
+        // reports it unchanged, as an ordinary copy does, unless linking it
+        // fails after all.
         let linked = self
             .rooted_metadata(path)?
             .is_some_and(|metadata| (metadata.dev, metadata.ino) == identity);
-        if !linked {
-            outcomes.push(PendingOutcome::Logical {
-                index,
-                path: path.to_vec(),
-                action: crate::receipt::OperationAction::LinkFile,
-            });
-        }
         touched.push(path.to_vec());
+        let path = path.to_vec();
+        let action = crate::receipt::OperationAction::LinkFile;
+        outcomes.push(if linked {
+            PendingOutcome::LogicalIfFailed {
+                index,
+                path,
+                action,
+            }
+        } else {
+            PendingOutcome::Logical {
+                index,
+                path,
+                action,
+            }
+        });
         Ok(())
     }
 
@@ -2853,6 +2890,12 @@ pub(super) enum PendingOutcome {
         path: Vec<u8>,
     },
     Logical {
+        index: usize,
+        path: Vec<u8>,
+        action: crate::receipt::OperationAction,
+    },
+    /// An operation expected to change nothing, recorded only if it fails.
+    LogicalIfFailed {
         index: usize,
         path: Vec<u8>,
         action: crate::receipt::OperationAction,

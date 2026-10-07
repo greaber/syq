@@ -343,6 +343,11 @@ impl ReceiptStreamWriter {
         self.record_count
     }
 
+    #[cfg(test)]
+    pub(crate) fn summary(&self) -> &ReceiptSummary {
+        &self.summary
+    }
+
     pub(crate) fn mark_recording_failure(&mut self) {
         self.recording_failure
             .get_or_insert(RecordingFailure::StorageFailed);
