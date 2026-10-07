@@ -488,7 +488,7 @@ Setting ownership requires suitable destination permissions. See the
 and [metadata details](commands/cp.md#metadata-details).
 
 With `--copy-metadata=hardlinks`, selected names for the same source regular file
-share one destination inode. This works for local and ordinary SSH copies,
+share one destination inode. This works for local and SSH filesystem copies,
 including updates, reruns, and `--inplace`. Only names eligible under the
 overwrite policy join the group; links outside the selected sources are not
 reconstructed. Existing extra destination links are not necessarily split.
@@ -506,8 +506,8 @@ hashes impose no requirement, identical hashes are checked once, and different
 algorithms are checked together in one read. Different values for the same
 algorithm are rejected before copying the group. Hardlinks across destination
 filesystems fail visibly. Multiply linked symlinks and special files are currently unsupported,
-as are hardlink requests with descriptors, streams, S3, and command-restricted
-or receiving destinations. `-a` retains its existing meaning; add `-H` explicitly.
+as are hardlink requests with descriptors, streams, and S3. `-a` retains its
+existing meaning; add `-H` explicitly.
 
 Add ACLs and xattrs for filesystem archival copies on Linux or macOS:
 
@@ -560,12 +560,11 @@ Copying special files also requires `--copy-metadata=specials` or `-D` (included
 `-a`), and creating devices requires suitable privileges. Filesystem restrictions
 on particular attribute namespaces still apply.
 
-ACLs and xattrs work for local and ordinary SSH filesystem copies, including
+ACLs and xattrs work for local and SSH filesystem copies, including
 updates, unchanged-content reruns, and `--inplace`. macOS also supports native
 metadata on directories, symlinks and copied special nodes where the filesystem
 permits it.
-Descriptors, stream mappings, S3, and command-restricted or receiving destinations
-reject these options. Existing descriptor-backed regular-file copies support
+Descriptors, stream mappings, and S3 reject these options. Existing descriptor-backed regular-file copies support
 only their original time, permission, and ownership options. Neither `-a` nor
 native copy defaults select ACLs, xattrs, hardlinks, or access times.
 
@@ -574,11 +573,11 @@ restore ctime or inode numbers, or create rsync `--fake-super` backup records.
 
 Use `--copy-metadata=atimes` (rsync `-U`/`--atimes`) to restore access times captured
 before reading the source. It covers regular files, directories, links themselves,
-and copied special nodes on local and ordinary SSH filesystem copies. Linux
+and copied special nodes on local and SSH filesystem copies. Linux
 requires kernel 5.8 or later; macOS support depends on the filesystem. Restoration
 runs after content checks and copying, including metadata-only updates and reruns.
 Reading copied files afterward can change their access times again. Descriptors,
-streams, S3, and command-restricted or receiving destinations reject this option.
+streams, and S3 reject this option.
 
 `--open-noatime` requests file reads without updating access times. Repeating
 `-U` (`-UU`) enables it too. Linux permits this for a file's owner or a process
@@ -595,7 +594,7 @@ entry types as access-time preservation. Neither `-a` nor native defaults select
 it. Inode change time (`ctime`) cannot normally be restored.
 
 Use `--sparse` (rsync `-S`) to turn written zero ranges into holes on local or
-ordinary SSH filesystem copies. It applies to regular files, independently of
+SSH filesystem copies. It applies to regular files, independently of
 metadata options, and is not included in `-a` or native defaults. It preserves
 bytes and length, not an exact source extent layout. Eligible local clones still
 use filesystem cloning; other writes skip zeros or clear old blocks into holes.
@@ -603,8 +602,8 @@ The destination filesystem must support sparse files; ranged, resumed, and
 in-place writes also require hole punching. A failed hole operation makes the
 copy unsuccessful. Filesystem allocation units can limit the space reclaimed by
 in-place hole punches, especially with small comparison blocks. Unchanged files
-and reused blocks are not rewritten just to change their allocation. Descriptors, streams, S3, and command-restricted or
-receiving destinations reject this option.
+and reused blocks are not rewritten just to change their allocation.
+Descriptors, streams, and S3 reject this option.
 
 Sparse mode avoids full-size preallocation. Syq also avoids reserving uncompressed
 space for btrfs files that request compression, either through the mount options

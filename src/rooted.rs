@@ -1582,12 +1582,17 @@ impl Root {
 
     /// Link a representative through a held object, then publish its new name.
     /// This deliberately does not use the single-link staging-file helpers.
+    /// `condition` says what the new name may replace: anything but a
+    /// directory (`Any`), nothing (`Absent`), or exactly one object
+    /// (`Matches`).
     pub(crate) fn publish_hardlink(
         &self,
         source: &RelativePath,
         target: &RelativePath,
         identity: (u64, u64),
+        condition: crate::proto::TargetCondition,
     ) -> Result<()> {
+        use crate::proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
         if !opened.is_file() || (opened.dev, opened.ino) != identity {
@@ -1597,14 +1602,33 @@ impl Root {
             );
         }
         let parent = self.resolve_parent(target)?;
-        match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
-            Ok(existing) if (existing.dev, existing.ino) == identity => return Ok(()),
-            Ok(existing) if existing.is_dir() => {
+        let existing = match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
+            Ok(existing) => Some(existing),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        match (condition, existing) {
+            (Absent, Some(_)) => bail!("hardlink destination {} already exists", target.label()),
+            (Matches { dev, ino }, Some(existing))
+                if (existing.dev, existing.ino) != (dev, ino) =>
+            {
+                bail!(
+                    "hardlink destination {} changed before publication",
+                    target.label()
+                )
+            }
+            (Matches { .. }, None) => bail!(
+                "hardlink destination {} disappeared before publication",
+                target.label()
+            ),
+            (MatchesFingerprint { .. }, _) => {
+                bail!("hardlink publication accepts no fingerprint condition")
+            }
+            (_, Some(existing)) if (existing.dev, existing.ino) == identity => return Ok(()),
+            (_, Some(existing)) if existing.is_dir() => {
                 bail!("hardlink destination {} is a directory", target.label())
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            (Any | Absent | Matches { .. }, _) => {}
         }
         #[cfg(target_os = "linux")]
         let source_name = CString::new(crate::sys::proc_fd_path(&file))?;
@@ -1635,28 +1659,64 @@ impl Root {
             });
             result
         })?;
+        let directory = parent.directory.as_raw_fd();
         let result = (|| {
             // On platforms without fd-relative link creation, a raced source
             // name can create a different temporary inode. Never publish it.
-            let linked = metadata_at(parent.directory.as_raw_fd(), &temporary)?;
+            let linked = metadata_at(directory, &temporary)?;
             if !linked.is_file() || (linked.dev, linked.ino) != identity {
                 bail!(
                     "hardlink representative {} changed while linking",
                     source.label()
                 );
             }
-            retry_zero(|| unsafe {
-                libc::renameat(
-                    parent.directory.as_raw_fd(),
-                    temporary.as_ptr(),
-                    parent.directory.as_raw_fd(),
-                    parent.leaf.as_ptr(),
-                )
-            })
-            .with_context(|| format!("publish hardlink {}", target.label()))
+            match condition {
+                // A second link fails rather than replace a name that
+                // appeared since the check above.
+                Absent => retry_zero(|| unsafe {
+                    libc::linkat(
+                        directory,
+                        temporary.as_ptr(),
+                        directory,
+                        parent.leaf.as_ptr(),
+                        0,
+                    )
+                })
+                .with_context(|| format!("publish hardlink {}", target.label())),
+                Matches { dev, ino } => {
+                    rename_exchange(directory, &temporary, directory, &parent.leaf)
+                        .with_context(|| format!("publish hardlink {}", target.label()))?;
+                    let swapped = metadata_at(directory, &temporary)?;
+                    if (swapped.dev, swapped.ino) != (dev, ino) {
+                        // As for other matched replacements, never touch the
+                        // name again: keep what was displaced and report it.
+                        bail!(
+                            "hardlink destination {} changed during publication",
+                            target.label()
+                        );
+                    }
+                    Ok(())
+                }
+                _ => retry_zero(|| unsafe {
+                    libc::renameat(
+                        directory,
+                        temporary.as_ptr(),
+                        directory,
+                        parent.leaf.as_ptr(),
+                    )
+                })
+                .with_context(|| format!("publish hardlink {}", target.label())),
+            }
         })();
-        if result.is_err() {
-            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
+        match (&result, condition) {
+            // A rename consumed the temporary name; anything else leaves it.
+            (Ok(()), Any) => {}
+            (Err(_), Matches { .. })
+                if metadata_at(directory, &temporary)
+                    .is_ok_and(|entry| (entry.dev, entry.ino) != identity) => {}
+            _ => {
+                let _ = unlink_at(directory, &temporary, 0);
+            }
         }
         result
     }

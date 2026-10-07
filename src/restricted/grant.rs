@@ -39,19 +39,20 @@ pub(super) fn root_existence_for(existence: Existence) -> RootExistence {
     }
 }
 
-pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
-    if args.hardlinks
-        || args.acls
-        || args.xattrs
-        || args.atimes > 0
-        || args.crtimes
-        || args.open_noatime
-        || args.sparse
-    {
-        bail!(
-            "hardlink, ACL, xattr, access-time and birth-time preservation, no-atime reads and sparse allocation are not supported by command-restricted receivers"
-        );
+/// The copy options a grant signs beyond its released `CopyOptions`.
+pub(crate) fn extra_copy_options(args: &Args) -> delegation::ExtraCopyOptions {
+    delegation::ExtraCopyOptions {
+        hardlinks: args.hardlinks,
+        acls: args.acls,
+        xattrs: args.xattrs,
+        atimes: args.atimes > 0,
+        crtimes: args.crtimes,
+        sparse: args.sparse,
+        open_noatime: args.open_noatime || args.atimes > 1,
     }
+}
+
+pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if let Some(input) = &args.mapping_contents {
         input.validate_restricted_bounds()?;
     }
@@ -397,6 +398,7 @@ pub(crate) fn prepare_transfer(
             },
             root_existence: root_existence_for(args.target_existence),
             receipt_policy: receipt_policy.clone(),
+            extra_options: extra_copy_options(args),
         },
         |payload| private_key.sign_grant(payload),
     )?;
@@ -461,6 +463,7 @@ pub(crate) fn named_request(
             },
             root_existence: root_existence_for(args.target_existence),
             receipt_policy,
+            extra_options: extra_copy_options(args),
         },
     })
 }

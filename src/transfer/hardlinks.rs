@@ -394,6 +394,7 @@ impl Planner<'_> {
                 source: group.job.dst.clone(),
                 dev,
                 ino,
+                condition: crate::proto::TargetCondition::Any,
             });
             pending.push((group, follower));
         }

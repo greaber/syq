@@ -1935,6 +1935,7 @@ fn creating_parent_handle_rejects_links_and_keeps_selected_directory() {
 
 #[test]
 fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
+    use crate::proto::TargetCondition::Any;
     let tree = TestDir::new("hardlinks");
     let root = Root::open(tree.path()).unwrap();
     fs::write(tree.path().join("source"), b"payload").unwrap();
@@ -1944,19 +1945,90 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
     let target = relative(b"target");
     let original = root.metadata(&source).unwrap();
     let identity = (original.dev, original.ino);
-    root.publish_hardlink(&source, &target, identity).unwrap();
-    root.publish_hardlink(&source, &target, identity).unwrap();
+    root.publish_hardlink(&source, &target, identity, Any)
+        .unwrap();
+    root.publish_hardlink(&source, &target, identity, Any)
+        .unwrap();
     assert_eq!(root.metadata(&target).unwrap().ino, original.ino);
     assert_eq!(fs::read(tree.path().join("outside")).unwrap(), b"untouched");
     fs::remove_file(tree.path().join("source")).unwrap();
     symlink("outside", tree.path().join("source")).unwrap();
     assert!(root
-        .publish_hardlink(&source, &relative(b"other"), identity)
+        .publish_hardlink(&source, &relative(b"other"), identity, Any)
         .is_err());
     assert!(!tree.path().join("other").exists());
     fs::create_dir(tree.path().join("directory")).unwrap();
     assert!(root
-        .publish_hardlink(&target, &relative(b"directory"), identity)
+        .publish_hardlink(&target, &relative(b"directory"), identity, Any)
         .is_err());
     assert!(tree.path().join("directory").is_dir());
+}
+
+/// A restricted receiver binds a new name to its existing-object policy:
+/// no replacement, or replacement of exactly the object it observed.
+#[test]
+fn hardlink_publication_honors_its_target_condition() {
+    use crate::proto::TargetCondition::{Absent, Matches};
+    let tree = TestDir::new("hardlink-conditions");
+    let root = Root::open(tree.path()).unwrap();
+    fs::write(tree.path().join("source"), b"payload").unwrap();
+    fs::write(tree.path().join("existing"), b"existing").unwrap();
+    let source = relative(b"source");
+    let existing = relative(b"existing");
+    let original = root.metadata(&source).unwrap();
+    let identity = (original.dev, original.ino);
+    let names = || {
+        let mut names = fs::read_dir(tree.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+
+    assert!(root
+        .publish_hardlink(&source, &existing, identity, Absent)
+        .is_err());
+    assert_eq!(fs::read(tree.path().join("existing")).unwrap(), b"existing");
+    root.publish_hardlink(&source, &relative(b"new"), identity, Absent)
+        .unwrap();
+    assert_eq!(root.metadata(&relative(b"new")).unwrap().ino, original.ino);
+
+    let observed = root.metadata(&existing).unwrap();
+    assert!(root
+        .publish_hardlink(
+            &source,
+            &existing,
+            identity,
+            Matches {
+                dev: observed.dev,
+                ino: observed.ino + 1,
+            },
+        )
+        .is_err());
+    assert_eq!(fs::read(tree.path().join("existing")).unwrap(), b"existing");
+    assert!(root
+        .publish_hardlink(
+            &source,
+            &relative(b"missing"),
+            identity,
+            Matches {
+                dev: observed.dev,
+                ino: observed.ino,
+            },
+        )
+        .is_err());
+    root.publish_hardlink(
+        &source,
+        &existing,
+        identity,
+        Matches {
+            dev: observed.dev,
+            ino: observed.ino,
+        },
+    )
+    .unwrap();
+    assert_eq!(root.metadata(&existing).unwrap().ino, original.ino);
+    // No temporary names remain.
+    assert_eq!(names(), ["existing", "new", "source"]);
 }

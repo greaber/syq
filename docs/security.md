@@ -232,6 +232,8 @@ hostA can misuse the access that copy requires, but cannot grant itself more:
 HostA can:
 
 - Supply false contents, names, sizes, or timestamps.
+- Set any metadata the copy preserves, such as permissions, ACLs, or extended
+  attributes, and with hard links give files in the scope new names.
 - Overwrite files where the grant permits overwriting.
 - Omit a source file and, if pruning is authorized, cause its destination copy
   to be deleted.
@@ -323,8 +325,9 @@ within those limits. The default starting directory is your home, without
 containment; `syq persist receive on --root DIRECTORY` confines copies to that
 directory. See [Use your laptop from a server](receive.md) for setup and
 approval controls. Automatic approval trusts those accounts to overwrite files
-inside its root. Choose an inbox whose downloaded contents are not automatically
-executed or loaded as trusted configuration.
+inside its root; copies of ACLs, extended attributes, or hard links still ask.
+Choose an inbox whose downloaded contents are not automatically executed or
+loaded as trusted configuration.
 
 A receiving name is tied to a public key; reconnecting requires proof of the
 matching private key. This prevents another client from claiming your name,

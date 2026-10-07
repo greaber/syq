@@ -129,6 +129,7 @@ pub(crate) struct RestrictedAuthority {
     pub(super) tcp_congestion: Option<String>,
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
+    pub(super) extra_options: crate::delegation::ExtraCopyOptions,
 }
 
 impl RestrictedAuthority {
@@ -188,6 +189,7 @@ impl RestrictedAuthority {
             tcp_congestion,
             mapping,
             hashing,
+            extra_options,
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
@@ -235,6 +237,7 @@ impl RestrictedAuthority {
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
         let authority = Self {
             hashing,
+            extra_options,
             tcp_congestion,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
@@ -1406,6 +1409,13 @@ impl RestrictedAuthority {
             | proto::flags::TIMES
             | proto::flags::REQUIRE_OWNER
             | proto::flags::REQUIRE_GROUP;
+        // A hard-link representative reports the identity its followers
+        // link to; that changes only the reply.
+        let known = if self.extra_options.hardlinks {
+            known | proto::flags::REPORT_IDENTITY
+        } else {
+            known
+        };
         if flags & !known != 0 {
             bail!("request contains unknown metadata flags");
         }
@@ -1456,15 +1466,25 @@ impl RestrictedAuthority {
         root.metadata_optional(&relative)
     }
 
-    /// Check metadata a request applies: the grant's flags, and no other
-    /// inode metadata. A receiver-chosen mode is the receiver's own to
-    /// decide, as on every receiver (`fsops::receiver_mode`).
+    /// Check metadata a request applies: the grant's flags, and only the
+    /// inode metadata the grant selects. A receiver-chosen mode is the
+    /// receiver's own to decide, as on every receiver
+    /// (`fsops::receiver_mode`).
     pub(super) fn check_metadata(&self, meta: &proto::Meta, flags: u8) -> Result<()> {
         self.check_flags(flags)?;
-        anyhow::ensure!(
-            meta.inode_metadata.is_none(),
-            "signed grants do not authorize additional inode metadata"
-        );
+        if let Some(metadata) = &meta.inode_metadata {
+            let requested = crate::inode_metadata::Selection {
+                acls: metadata.acls.is_some() || metadata.macos_acl.is_some(),
+                xattrs: metadata.xattrs.is_some(),
+                atimes: metadata.atime.is_some(),
+                crtimes: metadata.crtime.is_some(),
+                open_noatime: false,
+            };
+            anyhow::ensure!(
+                self.extra_options.allows(requested),
+                "request applies inode metadata not authorized by the signed grant"
+            );
+        }
         Ok(())
     }
 
@@ -1671,6 +1691,44 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// A new name for a file already in the signed scopes: a representative
+    /// this copy published or kept, as for an ordinary copy. The new name
+    /// follows the existing-object policy like any creation; the file it
+    /// names is not this grant's own, so later requests cannot change it
+    /// through that name under a policy that keeps existing objects.
+    fn authorize_hardlink(
+        &self,
+        (path, source, condition): (&[u8], &[u8], &mut proto::TargetCondition),
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+        outcomes: &mut Vec<PendingOutcome>,
+        touched: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        if !self.extra_options.hardlinks {
+            bail!("hardlink creation is not authorized by the signed grant");
+        }
+        if self.expected_hash(path)?.is_some() || self.expected_hash(source)?.is_some() {
+            bail!("expected hashes require their own file publications, not hard links");
+        }
+        self.check_mutation_path(source, false)?;
+        self.check_mutation_path(path, false)?;
+        if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
+            bail!("hardlink publication accepts no fingerprint condition");
+        }
+        let created = pending.len();
+        self.constrain_creation(path, condition, false, index, pending)?;
+        for creation in &mut pending[created..] {
+            creation.persist = false;
+        }
+        outcomes.push(PendingOutcome::Logical {
+            index,
+            path: path.to_vec(),
+            action: crate::receipt::OperationAction::LinkFile,
+        });
+        touched.push(path.to_vec());
+        Ok(())
+    }
+
     pub(super) fn authorize_op(
         &self,
         operation: &mut Op,
@@ -1679,8 +1737,20 @@ impl RestrictedAuthority {
         outcomes: &mut Vec<PendingOutcome>,
         touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
-        if matches!(operation, Op::Hardlink { .. }) {
-            bail!("hardlink creation is not authorized by the signed grant");
+        if let Op::Hardlink {
+            path,
+            source,
+            condition,
+            ..
+        } = operation
+        {
+            return self.authorize_hardlink(
+                (&*path, &*source, condition),
+                index,
+                pending,
+                outcomes,
+                touched,
+            );
         }
         let path = match &*operation {
             Op::Mkdir { path, .. }
@@ -1698,7 +1768,7 @@ impl RestrictedAuthority {
                 }
                 path
             }
-            Op::Hardlink { .. } => unreachable!("hardlinks rejected above"),
+            Op::Hardlink { .. } => unreachable!("hardlinks are authorized above"),
             Op::Remove { .. } => {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
@@ -1740,7 +1810,7 @@ impl RestrictedAuthority {
             bail!("expected hash requires a regular file");
         }
         match operation {
-            Op::Hardlink { .. } => bail!("hardlink creation is not authorized by the signed grant"),
+            Op::Hardlink { .. } => unreachable!("hardlinks are authorized above"),
             Op::Mkdir {
                 path,
                 mode,
@@ -2574,8 +2644,18 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
-            Request::ConfigurePreservation { .. } => {
-                bail!("signed grants do not authorize additional inode metadata or read policies")
+            Request::ConfigurePreservation {
+                selection,
+                sparse,
+                narrow_new_directories,
+                ..
+            } => {
+                if *narrow_new_directories
+                    || (*sparse && !self.extra_options.sparse)
+                    || !self.extra_options.allows(*selection)
+                {
+                    bail!("inode metadata or read policy is not authorized by the signed grant");
+                }
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies are not valid on a command-restricted receiver")
