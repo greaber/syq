@@ -81,7 +81,7 @@ impl FsOps {
         let mode = mode & 0o777;
         let file = root.create_file(relative, mode | 0o200)?;
         let created = file.metadata()?;
-        receiver_mode::note_inplace_open(copy_id, &created, true);
+        receiver_mode::note_inplace_open(copy_id, &created, Some(&file))?;
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -489,7 +489,7 @@ impl FsOps {
                     require_open_target(&file, &target.label, condition)?;
                     let opened = file.metadata()?;
                     self.require_names_inside(&target, &opened)?;
-                    receiver_mode::note_inplace_open(copy_id, &opened, false);
+                    receiver_mode::note_inplace_open(copy_id, &opened, None)?;
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
                     })?;
@@ -517,7 +517,7 @@ impl FsOps {
                 )?;
                 require_open_target(&file, &target.label, condition)?;
                 self.require_names_inside(&target, &metadata)?;
-                receiver_mode::note_inplace_open(copy_id, &metadata, false);
+                receiver_mode::note_inplace_open(copy_id, &metadata, None)?;
                 self.set_copy_length(&file, size)?;
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
@@ -552,7 +552,7 @@ impl FsOps {
                         euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600;
                     // Created or not, the file has the mode it was found or
                     // created with until the writes.
-                    receiver_mode::note_inplace_open(copy_id, &opened, created);
+                    receiver_mode::note_inplace_open(copy_id, &opened, created.then_some(&file))?;
                     if created {
                         // A umask or inherited default ACL can remove even
                         // owner access from a new file; a file of ours that
@@ -588,7 +588,7 @@ impl FsOps {
                     Ok(file) => {
                         let opened = file.metadata()?;
                         self.require_names_inside(&target, &opened)?;
-                        receiver_mode::note_inplace_open(copy_id, &opened, false);
+                        receiver_mode::note_inplace_open(copy_id, &opened, None)?;
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;
@@ -618,7 +618,7 @@ impl FsOps {
                         require_rooted_metadata(&file, metadata, &target.label)?;
                         let opened = file.metadata()?;
                         self.require_names_inside(&target, &opened)?;
-                        receiver_mode::note_inplace_open(copy_id, &opened, false);
+                        receiver_mode::note_inplace_open(copy_id, &opened, None)?;
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
                         })?;

@@ -157,10 +157,12 @@ impl ReceiverDirectories {
 }
 
 /// How a file to be written in place was opened: created by this copy, or
-/// found with this mode before anything was written to it.
-#[derive(Clone, Copy, Debug)]
+/// found with this mode before anything was written to it. A created file's
+/// descriptor is kept with the record, so that its inode cannot be freed and
+/// given to another file while the record stands.
+#[derive(Debug)]
 enum InplaceOpen {
-    Created,
+    Created(#[allow(dead_code)] fs::File),
     Found(u32),
 }
 
@@ -178,31 +180,36 @@ fn inplace_opened() -> &'static Mutex<InplaceOpens> {
 type InplaceOpens = HashMap<(CopyId, u64, u64), InplaceOpen>;
 
 /// Record a file this process just opened to write `copy_id`'s data in
-/// place: one it `created`, or one it found as `opened` says. A retry's
-/// open, after writes that may have cleared set-ID bits, keeps the first
-/// record.
-pub(super) fn note_inplace_open(copy_id: &CopyId, opened: &fs::Metadata, created: bool) {
-    let open = if created {
-        InplaceOpen::Created
-    } else {
-        InplaceOpen::Found(opened.mode() & 0o7777)
+/// place: one it `created`, open as that file, or one it found as `opened`
+/// says. A retry's open, after writes that may have cleared set-ID bits,
+/// keeps the first record.
+pub(super) fn note_inplace_open(
+    copy_id: &CopyId,
+    opened: &fs::Metadata,
+    created: Option<&fs::File>,
+) -> Result<()> {
+    let open = match created {
+        Some(file) => InplaceOpen::Created(file.try_clone()?),
+        None => InplaceOpen::Found(opened.mode() & 0o7777),
     };
     inplace_opened()
         .lock()
         .unwrap()
         .entry((*copy_id, opened.dev(), opened.ino()))
         .or_insert(open);
+    Ok(())
 }
 
 /// Whether this process created the file `opened` describes to write
-/// `copy_id`'s data in place.
+/// `copy_id`'s data in place. The record holds that file open, so no other
+/// file can have its identity meanwhile.
 pub(super) fn created_inplace(copy_id: &CopyId, opened: &fs::Metadata) -> bool {
     matches!(
         inplace_opened()
             .lock()
             .unwrap()
             .get(&(*copy_id, opened.dev(), opened.ino())),
-        Some(InplaceOpen::Created)
+        Some(InplaceOpen::Created(_))
     )
 }
 
@@ -291,7 +298,7 @@ impl FsOps {
         // writers needed, as the small-file in-place path decides too. Then
         // what this receiver found, then what the scan found.
         let mode = match (opened, scanned) {
-            (Some(InplaceOpen::Created), _) | (_, ScannedDestination::Absent) => {
+            (Some(InplaceOpen::Created(_)), _) | (_, ScannedDestination::Absent) => {
                 self.new_file_mode(target, meta.mode)?
             }
             (Some(InplaceOpen::Found(mode)), _) | (None, ScannedDestination::File(mode)) => mode,

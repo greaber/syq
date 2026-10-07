@@ -8133,9 +8133,12 @@ fn an_in_place_retry_that_may_only_create_reopens_only_its_own_file() {
     // Another copy may not take it.
     let error = prepare(&mut FsOps::new(), &[12; 16], 0).unwrap_err();
     assert!(error.to_string().contains("appeared after"), "{error:#}");
-    // Nor may the retry take a file that replaced it.
+    // Nor may the retry take a file that replaced it, though a filesystem
+    // may reuse an inode number once its file is gone: the record keeps the
+    // copy's file open, so the replacement has another.
     fs::remove_file(&target).unwrap();
     fs::write(&target, b"someone else's").unwrap();
+    assert_ne!(fs::metadata(&target).unwrap().ino(), created.ino());
     let error = prepare(&mut FsOps::new(), &copy, 2).unwrap_err();
     assert!(error.to_string().contains("appeared after"), "{error:#}");
     assert_eq!(fs::read(&target).unwrap(), b"someone else's");
