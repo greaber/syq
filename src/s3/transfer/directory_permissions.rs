@@ -74,6 +74,47 @@ impl TemporaryAccess {
         Ok(())
     }
 
+    /// Widen one existing directory that pruning must enter or empty, if
+    /// the option is on. Returns whether its mode changed.
+    pub(super) fn prepare_for_pruning(
+        &mut self,
+        root: &crate::rooted::Root,
+        path: &[u8],
+        metadata: &crate::rooted::RootMetadata,
+    ) -> Result<bool> {
+        // Restoration is keyed by UTF-8 names; leave any other name alone.
+        let Some(key) = self
+            .enabled
+            .then(|| String::from_utf8(path.to_vec()).ok())
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        if self.widened.contains_key(&key) {
+            return Ok(false);
+        }
+        let condition = TargetCondition::MatchesFingerprint {
+            dev: metadata.dev,
+            ino: metadata.ino,
+            ctime: metadata.ctime,
+            ctime_nsec: metadata.ctime_nsec,
+        };
+        let saved = crate::fsops::widen_directory(
+            root,
+            &RelativePath::new(path)?,
+            condition,
+            Path::new(&key),
+        )?;
+        Ok(saved.is_some_and(|saved| self.widened.insert(key, saved).is_none()))
+    }
+
+    /// A directory pruning removed has no mode to restore.
+    pub(super) fn forget(&mut self, path: &[u8]) {
+        if let Ok(path) = std::str::from_utf8(path) {
+            self.widened.remove(path);
+        }
+    }
+
     pub(super) fn into_restorations(self) -> BTreeMap<String, DirectoryMode> {
         self.widened
     }

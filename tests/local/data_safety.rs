@@ -1541,3 +1541,171 @@ fn rsync_widens_copied_directories_but_never_during_previews() {
         }
     }
 }
+
+/// With the option, pruning widens owned destination-only directories it
+/// must enter or empty, and removes them; a directory it keeps gets its mode
+/// back. syq rsync, like rsync, empties readable ones but does not enter
+/// unreadable ones. Dry runs and blocked deletions change nothing for good.
+#[test]
+fn pruning_widens_destination_only_directories_it_must_enter_or_empty() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Darwin opens a directory to change its mode only with read access, so
+    // there unreadable directories stay unlisted, as copies into them do.
+    let unreadable = cfg!(target_os = "linux");
+    let tree = |t: &Tmp, unreadable: bool| {
+        write(&t.path("src/a"), b"a");
+        write(&t.path("dst/kept/ignored.tmp"), b"ignored");
+        write(&t.path("dst/kept/extra"), b"extra");
+        write(&t.path("dst/e555/in/f"), b"f");
+        write(&t.path("dst/e555/g"), b"g");
+        let mut modes = vec![
+            ("dst/e555/in", 0o555),
+            ("dst/e555", 0o555),
+            ("dst/kept", 0o555),
+        ];
+        if unreadable {
+            write(&t.path("dst/e300/f"), b"f");
+            write(&t.path("dst/e100/n300/f"), b"f");
+            modes.extend([
+                ("dst/e300", 0o300),
+                ("dst/e100/n300", 0o300),
+                ("dst/e100", 0o100),
+            ]);
+        }
+        for (path, mode) in &modes {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(*mode)).unwrap();
+        }
+        modes
+    };
+    let restore = |t: &Tmp| {
+        for path in [
+            "dst/e100",
+            "dst/e100/n300",
+            "dst/e300",
+            "dst/e555",
+            "dst/e555/in",
+            "dst/kept",
+        ] {
+            let _ = fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o700));
+        }
+    };
+    for pruning in ["--prune", "--prune-before"] {
+        // Native copy with the option: everything extra goes.
+        let t = Tmp::new();
+        tree(&t, unreadable);
+        let out = native_syq(&[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            pruning,
+            "--ignore",
+            "*.tmp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        let kept = fs::metadata(t.path("dst/kept")).unwrap().mode() & 0o777;
+        restore(&t);
+        assert_output_ok(&out);
+        assert_eq!(kept, 0o555, "{pruning}");
+        assert_eq!(
+            listing(&t.path("dst")),
+            ["a", "kept", "kept/ignored.tmp"],
+            "{pruning}"
+        );
+
+        // Without the option nothing changes.
+        let t = Tmp::new();
+        let modes = tree(&t, unreadable);
+        let out = native_syq(&[
+            "cp",
+            pruning,
+            "--ignore",
+            "*.tmp",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        let after: Vec<_> = modes
+            .iter()
+            .rev()
+            .map(|(path, _)| fs::metadata(t.path(path)).unwrap().mode() & 0o777)
+            .collect();
+        restore(&t);
+        assert_eq!(out.status.code(), Some(23), "{out:?}");
+        assert_eq!(
+            after,
+            modes
+                .iter()
+                .rev()
+                .map(|(_, mode)| *mode)
+                .collect::<Vec<_>>()
+        );
+        assert!(t.path("dst/e555/g").exists());
+        assert_eq!(t.path("dst/e300/f").exists(), unreadable);
+    }
+
+    // syq rsync empties readable directories, as rsync does.
+    let t = Tmp::new();
+    tree(&t, false);
+    let out = syq(&["-r", "--delete", &format!("{}/", t.s("src")), &t.s("dst")]);
+    restore(&t);
+    assert_output_ok(&out);
+    assert_eq!(listing(&t.path("dst")), ["a"]);
+    // It does not enter unreadable ones, so nothing is deleted.
+    let t = Tmp::new();
+    tree(&t, true);
+    let out = syq(&["-r", "--delete", &format!("{}/", t.s("src")), &t.s("dst")]);
+    let e300 = fs::metadata(t.path("dst/e300")).unwrap().mode() & 0o777;
+    restore(&t);
+    assert_eq!(out.status.code(), Some(23), "{out:?}");
+    assert_eq!(e300, 0o300);
+    assert!(t.path("dst/e555/g").exists());
+
+    // A dry run and a deletion limit leave every mode as it was.
+    for extra in [vec!["--dry-run"], vec!["--max-delete", "1"]] {
+        let t = Tmp::new();
+        let modes = tree(&t, unreadable);
+        let before: Vec<_> = modes
+            .iter()
+            .rev()
+            .map(|(path, _)| fs::metadata(t.path(path)).unwrap())
+            .collect();
+        let mut args = vec![
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--prune",
+            "--srcs-in",
+        ];
+        let src = t.s("src");
+        let dst = t.s("dst");
+        args.extend([src.as_str(), "--into", dst.as_str()]);
+        args.extend(extra.iter().copied());
+        let out = native_syq(&args);
+        let after: Vec<_> = modes
+            .iter()
+            .rev()
+            .map(|(path, _)| fs::metadata(t.path(path)).unwrap())
+            .collect();
+        restore(&t);
+        assert_eq!(
+            out.status.success(),
+            !unreadable && extra[0] == "--dry-run",
+            "{extra:?}: {out:?}"
+        );
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(after.mode(), before.mode(), "{extra:?}");
+            if extra[0] == "--dry-run" {
+                assert_eq!(
+                    (after.ctime(), after.ctime_nsec()),
+                    (before.ctime(), before.ctime_nsec())
+                );
+            }
+        }
+        assert_eq!(t.path("dst/e300/f").exists(), unreadable);
+        assert!(t.path("dst/e555/in/f").exists());
+    }
+}

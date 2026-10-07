@@ -3144,13 +3144,30 @@ impl FsOps {
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
         {
+            // Pruning can remove directories it widened; their identities
+            // are looked up only then.
+            let removed_identities: Vec<Option<(u64, u64)>> =
+                if self.receiver_directories.has_widened() {
+                    ops.iter()
+                        .map(|op| match op {
+                            Op::Rmdir { path } => self
+                                .destination_mutation_target(path, guard)
+                                .ok()
+                                .and_then(|target| target.root.metadata(&target.relative).ok())
+                                .map(|metadata| (metadata.dev, metadata.ino)),
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let selected = apply::selected_removals(
                 ops,
                 guard,
                 self.destination_root.clone(),
                 self.destination_prefix.as_deref(),
             );
-            return self
+            let results: Vec<Option<WireError>> = self
                 .deletions
                 .get_or_insert_with(Default::default)
                 .run(selected)
@@ -3160,9 +3177,13 @@ impl FsOps {
                         .map(|result| result.err().as_ref().map(wire_error))
                         .collect()
                 })
-                .unwrap_or_else(|error| {
-                    (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
-                });
+                .unwrap_or_else(|error| (0..ops.len()).map(|_| Some(wire_error(&error))).collect());
+            for (identity, result) in removed_identities.iter().zip(&results) {
+                if let (Some(identity), None) = (identity, result) {
+                    self.receiver_directories.forget_widened(*identity);
+                }
+            }
+            return results;
         }
         let narrow = self.narrow_new_directories;
         // SetMeta depends on the object existing, so create everything first,

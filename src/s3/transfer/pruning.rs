@@ -15,11 +15,18 @@ struct Candidate {
 }
 
 impl Engine {
+    /// Remove destination-only entries. A local destination comes with its
+    /// directory access, which widens owned directories pruning must enter
+    /// or empty when the option is on.
     pub(super) async fn prune(
         self: &Arc<Self>,
         mut plan: Plan,
-        destination: Option<&Destination>,
+        local: Option<(&Destination, &mut directory_permissions::TemporaryAccess)>,
     ) -> Result<()> {
+        let (destination, mut access) = match local {
+            Some((destination, access)) => (Some(destination), Some(access)),
+            None => (None, None),
+        };
         self.check_cancelled()?;
         if !self.args.delete {
             return Ok(());
@@ -32,7 +39,10 @@ impl Engine {
         if plan.scopes.is_empty() {
             return Ok(());
         }
-        let found = match self.deletion_candidates(&mut plan, destination).await {
+        let (found, unwritable) = match self
+            .deletion_candidates(&mut plan, destination, access.as_deref_mut())
+            .await
+        {
             Ok(found) => found,
             Err(error) => {
                 self.check_cancelled()?;
@@ -64,11 +74,36 @@ impl Engine {
             }
         } else {
             let root = destination.unwrap().root.clone();
+            if let Some(access) = access.as_deref_mut() {
+                // Removing an entry needs write and search permission on its
+                // directory, and removing a directory needs it empty first.
+                let mut needed = BTreeSet::new();
+                for candidate in &found {
+                    let parent = candidate
+                        .path
+                        .iter()
+                        .rposition(|&byte| byte == b'/')
+                        .map_or(&[][..], |end| &candidate.path[..end]);
+                    needed.insert(parent);
+                    if candidate.kind == "dir" {
+                        needed.insert(&candidate.path[..]);
+                    }
+                }
+                let mut needed: Vec<_> = needed
+                    .into_iter()
+                    .filter_map(|path| unwritable.get_key_value(path))
+                    .collect();
+                needed.sort_by_key(|(path, _)| path.iter().filter(|&&c| c == b'/').count());
+                for (path, metadata) in needed {
+                    access.prepare_for_pruning(&root, path, metadata)?;
+                }
+            }
             let engine = self.clone();
             // Blocking filesystem calls belong off the async executor. Await
             // the worker even on cancellation, as Engine::run drains its work.
-            tokio::task::spawn_blocking(move || {
+            let removed = tokio::task::spawn_blocking(move || {
                 let mut found = found;
+                let mut removed = Vec::new();
                 found.sort_by_key(|c| std::cmp::Reverse(c.depth));
                 let mut deletion =
                     crate::deletion::Batch::with_cancellation(engine.cancelled.clone());
@@ -97,23 +132,39 @@ impl Engine {
                                 .collect(),
                         )?;
                         for (candidate, result) in chunk.iter().zip(results) {
+                            if result.is_ok() && candidate.kind == "dir" {
+                                removed.push(candidate.path.clone());
+                            }
                             engine.deletion_finished(candidate, result, "io");
                         }
                         engine.check_cancelled()?;
                     }
                 }
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(removed)
             })
             .await??;
+            if let Some(access) = access {
+                for path in removed {
+                    access.forget(&path);
+                }
+            }
         }
         Ok(())
     }
 
+    /// Destination-only entries, and the walked local directories whose owner
+    /// lacks write or search permission. With `access`, owned directories the
+    /// walk cannot list are widened first.
     async fn deletion_candidates(
         &self,
         plan: &mut Plan,
         destination: Option<&Destination>,
-    ) -> Result<Vec<Candidate>> {
+        mut access: Option<&mut directory_permissions::TemporaryAccess>,
+    ) -> Result<(
+        Vec<Candidate>,
+        std::collections::BTreeMap<Vec<u8>, crate::rooted::RootMetadata>,
+    )> {
+        let mut unwritable = std::collections::BTreeMap::new();
         let matcher = crate::scan::build_ignore(&self.args.ignore_lines)?;
         let mut identities = BTreeSet::new();
         // Claims outside the walked scopes can still have aliases inside them.
@@ -140,7 +191,7 @@ impl Engine {
                         continue;
                     }
                     let rel = RelativePath::new(&path)?;
-                    let Some(meta) = metadata_optional(&dst.root, &rel)? else {
+                    let Some(mut meta) = metadata_optional(&dst.root, &rel)? else {
                         continue;
                     };
                     if plan.keeps(&path) {
@@ -156,6 +207,18 @@ impl Engine {
                         continue;
                     }
                     if directory {
+                        // Only a directory this walk lists may be widened to
+                        // list or empty it.
+                        if meta.mode & 0o500 != 0o500 {
+                            if let Some(access) = access.as_deref_mut() {
+                                if access.prepare_for_pruning(&dst.root, &path, &meta)? {
+                                    meta = dst.root.metadata(&rel)?;
+                                }
+                            }
+                        }
+                        if meta.mode & 0o300 != 0o300 {
+                            unwritable.insert(path.clone(), meta);
+                        }
                         for name in dst.root.read_directory(&rel)? {
                             let mut child = path.clone();
                             if !child.is_empty() {
@@ -250,7 +313,7 @@ impl Engine {
         });
         // Children first; never recursively remove a local directory.
         found.sort_by(|a, b| b.path.cmp(&a.path));
-        Ok(found)
+        Ok((found, unwritable))
     }
 
     fn kept_recovery(&self, path: &[u8]) {
@@ -296,8 +359,9 @@ impl Engine {
             return Ok(());
         }
         let requests = self
-            .deletion_candidates(&mut plan.clone(), None)
+            .deletion_candidates(&mut plan.clone(), None, None)
             .await?
+            .0
             .iter()
             .map(|candidate| {
                 crate::s3::authorization::Unsigned::new("DELETE", candidate.key.as_ref().unwrap())

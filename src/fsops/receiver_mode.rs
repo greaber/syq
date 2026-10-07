@@ -49,6 +49,16 @@ impl ReceiverDirectories {
         self.widened.lock().unwrap().insert(identity, mode);
     }
 
+    pub(super) fn has_widened(&self) -> bool {
+        !self.widened.lock().unwrap().is_empty()
+    }
+
+    /// A removed directory's identity can come back for a new directory, which
+    /// must not take the mode saved when the old one was widened.
+    pub(super) fn forget_widened(&self, identity: (u64, u64)) {
+        self.widened.lock().unwrap().remove(&identity);
+    }
+
     /// `op` with its receiver-chosen mode resolved. Only a directory this
     /// connection widened, or created private, takes a mode; anything else
     /// keeps its own.

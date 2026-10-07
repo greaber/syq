@@ -477,8 +477,11 @@ impl Engine {
             let transferred = async {
                 if self.args.prune_before {
                     directory_access.prepare(&destination, &plan)?;
-                    self.prune(std::mem::take(&mut prune), Some(&destination))
-                        .await?;
+                    self.prune(
+                        std::mem::take(&mut prune),
+                        Some((&destination, &mut directory_access)),
+                    )
+                    .await?;
                 }
                 let mut service_times = service_times.into_iter();
                 parallel(plan, workers, |mut job| {
@@ -537,7 +540,8 @@ impl Engine {
                     "copy finalization",
                 )?;
                 if !self.args.prune_before {
-                    self.prune(prune, Some(&destination)).await?;
+                    self.prune(prune, Some((&destination, &mut directory_access)))
+                        .await?;
                 }
                 Ok::<_, anyhow::Error>(())
             }

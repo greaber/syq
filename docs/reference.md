@@ -430,8 +430,9 @@ existing directory permissions to make copying or pruning succeed, even when
 copying permission metadata. The requested final permissions still apply.
 `--temporarily-widen-dir-permissions` lets syq briefly add owner read, write and
 search permission to existing directories you own inside the copy: the
-destination directory and the directories beneath it that the copy fills, also
-with `--if-exists=keep`. It never changes a directory above the copy, such as
+destination directory and the directories beneath it that the copy fills or
+prunes, including ones only the destination has, also with `--if-exists=keep`.
+It never changes a directory above the copy, such as
 the parent of an `--as` target, and dry runs never change permissions. Syq puts
 back each directory's exact mode after its checks and after copying and pruning,
 also when the copy fails; explicitly requested permissions take precedence.

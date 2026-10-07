@@ -8284,3 +8284,45 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
         Response::DirectorySelection(_)
     ));
 }
+
+/// Pruning may remove a directory it widened. Its identity can come back
+/// for a new directory, which must not take the mode saved for the old one.
+#[test]
+fn removed_widened_directories_are_forgotten() {
+    if is_superuser() {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let dir = temporary.path().join("extra");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let metadata = fs::metadata(&dir).unwrap();
+    let mut operations = destination_ops(temporary.path());
+    let Response::WidenedDirectories(results) = operations.handle(&Request::WidenDirectories {
+        remember: true,
+        directories: vec![(
+            path_bytes(&dir),
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        )],
+        guard: None,
+    }) else {
+        panic!("unexpected response")
+    };
+    assert_eq!(results[0].as_ref().unwrap().unwrap().mode, 0o555);
+    assert!(operations.receiver_directories.has_widened());
+    let removed = operations.handle(&Request::Apply {
+        ops: vec![Op::Rmdir {
+            path: path_bytes(&dir),
+        }],
+        guard: None,
+    });
+    assert!(
+        matches!(&removed, Response::Applied(errors) if errors.iter().all(Option::is_none)),
+        "{removed:?}"
+    );
+    assert!(!dir.exists());
+    assert!(!operations.receiver_directories.has_widened());
+}
