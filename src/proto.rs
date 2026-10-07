@@ -1243,11 +1243,9 @@ pub enum WireRequest<Data> {
         selection: crate::inode_metadata::Selection,
         sparse: bool,
         destination: bool,
-        /// Entries are created as `syq rsync` creates them: a new entry's
-        /// permissions are limited by its directory's default ACL rather than
-        /// by the umask alone, and a new directory without owner access is
-        /// narrowed after its contents.
-        default_acl_creation: bool,
+        /// A new directory whose mode lacks owner access, as `syq rsync`
+        /// creates one, gets that mode only after its contents.
+        narrow_new_directories: bool,
     },
     NativeMap(crate::native_map::Options),
     /// Configure and select a bounded small push without reading its payloads.

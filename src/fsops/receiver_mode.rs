@@ -51,15 +51,13 @@ impl ReceiverDirectories {
 
     /// `op` with its receiver-chosen mode resolved. Only a directory this
     /// connection widened, or created private, takes a mode; anything else
-    /// keeps its own. `default_acl` limits a created directory's mode by
-    /// the default ACL it inherited rather than by the umask.
+    /// keeps its own.
     pub(super) fn resolve_op<'a>(
         &self,
         op: &'a Op,
         guard: Option<&ContainerGuard>,
         destination_root: Option<Arc<Root>>,
         destination_prefix: Option<&[u8]>,
-        default_acl: bool,
     ) -> Cow<'a, Op> {
         match op {
             Op::SetFileMetaIfSame { flags, .. } if flags & flags::RECEIVER_MODE != 0 => {
@@ -83,7 +81,7 @@ impl ReceiverDirectories {
                 let target =
                     apply::operation_target(path, guard, destination_root, destination_prefix);
                 if let Ok(Some((mode, identity))) =
-                    target.and_then(|target| self.directory_mode(&target, meta.mode, default_acl))
+                    target.and_then(|target| self.directory_mode(&target, meta.mode))
                 {
                     let matched = match condition {
                         TargetCondition::Any => true,
@@ -126,7 +124,6 @@ impl ReceiverDirectories {
         &self,
         target: &RootedTarget,
         proposed: u32,
-        default_acl: bool,
     ) -> Result<Option<(u32, (u64, u64))>> {
         let Some(metadata) = target.root.metadata_optional(&target.relative)? else {
             return Ok(None);
@@ -154,7 +151,7 @@ impl ReceiverDirectories {
         if !opened.is_dir() || (opened.dev(), opened.ino()) != identity {
             return Ok(None);
         }
-        let mode = apply::created_directory_mode(&directory, proposed, opened.mode(), default_acl)?;
+        let mode = apply::created_directory_mode(&directory, proposed, opened.mode())?;
         Ok(Some((mode | (proposed & created & 0o2000), identity)))
     }
 }
@@ -198,25 +195,11 @@ pub(super) fn note_inplace_open(copy_id: &CopyId, opened: &fs::Metadata, created
 }
 
 impl FsOps {
-    /// Permission bits a native copy keeps out of every object it creates:
-    /// the umask, which a directory's default ACL would otherwise replace.
-    /// `syq rsync` lets the kernel apply either, as rsync does.
-    pub(super) fn creation_umask(&self) -> u32 {
-        if self.default_acl_creation {
-            0
-        } else {
-            process_umask()
-        }
-    }
-
     /// The mode creating a file at `target` from `proposed` gives it: the
-    /// proposal's permission bits limited by the umask or, for `syq rsync`,
-    /// by its directory's default ACL when it has one. Each directory's ACL
-    /// is read once per connection.
+    /// proposal's permission bits limited by its directory's default ACL if
+    /// it has one, or else by the umask. Each directory's ACL is read once
+    /// per connection.
     pub(super) fn new_file_mode(&self, target: &RootedTarget, proposed: u32) -> Result<u32> {
-        if !self.default_acl_creation {
-            return Ok(proposed & 0o777 & !process_umask());
-        }
         let (parents, _) = target.relative.leaf()?;
         let identity = target.root.identity();
         let key = (identity.dev, identity.ino, parents.to_vec());
@@ -253,12 +236,11 @@ impl FsOps {
             return Ok(());
         }
         meta.mode = match scanned {
-            ScannedDestination::Unknown => target.root.receiver_file_mode(
-                &target.relative,
-                meta.mode,
-                self.default_acl_creation,
-                held,
-            )?,
+            ScannedDestination::Unknown => {
+                target
+                    .root
+                    .receiver_file_mode(&target.relative, meta.mode, held)?
+            }
             ScannedDestination::Absent => self.new_file_mode(target, meta.mode)?,
             ScannedDestination::File(mode) => mode & 0o7777,
         };
@@ -334,19 +316,15 @@ impl FsOps {
             } else {
                 mode
             };
-            return Ok(mode & !self.creation_umask());
+            return Ok(mode);
         }
         if flags & flags::RECEIVER_MODE == 0 {
             return Ok(staged_mode(mode, flags, acl));
         }
-        // What the scan found spares the lookup, and a new file limited
-        // only by the umask needs no target, whose container guard would
-        // be opened just to name it.
+        // What the scan found spares the lookup; a new file's mode depends
+        // on its directory's default ACL, read once per directory.
         let final_mode = match scanned {
             ScannedDestination::File(found) => found & 0o7777,
-            ScannedDestination::Absent if !self.default_acl_creation => {
-                mode & 0o777 & !process_umask()
-            }
             _ => {
                 let target = self.destination_mutation_target(path, guard)?;
                 let mut meta = Meta {

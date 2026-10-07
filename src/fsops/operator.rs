@@ -47,13 +47,11 @@ impl OperatorDirectorySelection {
         })
     }
 
-    /// Create the missing components, the last with `mode`, each without
-    /// the `umask` permission bits.
+    /// Create the missing components, the last with `mode`.
     pub(super) fn create_missing(
         &mut self,
         mode: u32,
         require_absent: bool,
-        umask: u32,
     ) -> Result<DirectoryAnchor> {
         while let Some(component) = self.missing.pop_front() {
             if component == b"." {
@@ -79,8 +77,7 @@ impl OperatorDirectorySelection {
                     // Match create_dir_all's historical behavior: intermediate
                     // components start at 0777 (subject to umask), while the
                     // requested mode applies to the selected destination root.
-                    let component_mode =
-                        (if self.missing.is_empty() { mode } else { 0o777 }) & !umask;
+                    let component_mode = if self.missing.is_empty() { mode } else { 0o777 };
                     match mkdir_operator_directory_at(
                         &self.directory,
                         &component,

@@ -75,10 +75,10 @@ impl FsOps {
         // mode after every writer is done. Never chmod an existing destination
         // here: its write permissions still decide whether an update is allowed.
         // The data arrives before finalization, so the file is created no
-        // wider than creating it allows a native copy: a directory's default
-        // ACL replaces the kernel's umask, so it is applied here, as for
-        // every other new object (`creation_umask`).
-        let mode = mode & 0o777 & !self.creation_umask();
+        // wider than its final mode: as creating it with that mode allows,
+        // limited by the directory's default ACL or else the umask, never
+        // with a special bit.
+        let mode = mode & 0o777;
         let file = root.create_file(relative, mode | 0o200)?;
         let created = file.metadata()?;
         receiver_mode::note_inplace_open(copy_id, &created, true);
@@ -1976,7 +1976,7 @@ impl FsOps {
                 meta.mode & 0o777
             } else {
                 meta.mode
-            } & !self.creation_umask();
+            };
             // How far the file's old contents may extend. They are written
             // over and only then cut to the new length, so a write that
             // fails leaves old data rather than an emptied file.
@@ -2962,7 +2962,7 @@ impl FsOps {
                 selection,
                 sparse,
                 destination,
-                default_acl_creation,
+                narrow_new_directories,
             } => {
                 let validation = if *destination {
                     selection.validate_destination()
@@ -2972,7 +2972,7 @@ impl FsOps {
                 validation.map(|()| {
                     self.inode_preservation = *selection;
                     self.sparse = *sparse;
-                    self.default_acl_creation = *default_acl_creation;
+                    self.narrow_new_directories = *narrow_new_directories;
                     Response::Ok
                 })
             }

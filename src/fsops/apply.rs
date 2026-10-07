@@ -14,14 +14,13 @@ pub(super) fn op_path(op: &Op) -> &[u8] {
     }
 }
 
-/// Carry out `op`, creating what it creates without the `umask`
-/// permission bits (see `FsOps::creation_umask`).
+/// Carry out `op`. What it creates is limited as creating it limits it: by
+/// its directory's default ACL, or else by the umask.
 pub(super) fn apply_one(
     op: &Op,
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
-    umask: u32,
 ) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
@@ -74,14 +73,14 @@ pub(super) fn apply_one(
                 dev: *dev,
                 ino: *ino,
             };
-            return apply_one_rooted(&operation, &target.as_rooted(), umask);
+            return apply_one_rooted(&operation, &target.as_rooted());
         }
-        return apply_one_rooted(op, &target.as_rooted(), umask);
+        return apply_one_rooted(op, &target.as_rooted());
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target, umask)
+    apply_one_rooted(op, &target)
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -354,13 +353,13 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
+fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
         Op::Mkdir {
             mode, condition, ..
-        } => mkdir_rooted(target, *mode, *condition, false, umask).map(drop),
+        } => mkdir_rooted(target, *mode, *condition, false).map(drop),
         Op::Symlink {
             target: link,
             condition,
@@ -403,8 +402,6 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
             condition,
             ..
         } => {
-            // Created without the umask bits, whatever a default ACL allows.
-            let mode = &(*mode & !umask);
             if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
                 match root.create_node(path, *mode, *rdev) {
                     Ok(()) => return Ok(()),
@@ -676,7 +673,6 @@ pub(super) fn create_identified_directory(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
-    umask: u32,
     private: bool,
 ) -> Result<Option<CreatedDirectory>> {
     let Op::Mkdir {
@@ -694,7 +690,7 @@ pub(super) fn create_identified_directory(
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
     let mode = if private { 0o700 } else { *mode };
-    mkdir_rooted(&target, mode, *condition, true, umask)
+    mkdir_rooted(&target, mode, *condition, true)
 }
 
 /// Give a directory this receiver created private, once it has taken its
@@ -710,7 +706,6 @@ pub(super) fn open_created_directory(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
-    default_acl: bool,
 ) -> Result<()> {
     let target = operation_target(path, guard, destination_root, destination_prefix)?;
     let directory = target.root.open_metadata(&target.relative)?;
@@ -720,32 +715,16 @@ pub(super) fn open_created_directory(
     }
     set_mode_handle(
         &directory,
-        created_directory_mode(
-            &directory,
-            (proposed & 0o7777) | 0o700,
-            current.mode(),
-            default_acl,
-        )?,
+        created_directory_mode(&directory, (proposed & 0o7777) | 0o700, current.mode())?,
     )
 }
 
 /// The mode creating `directory` with `proposed` would have given it, for a
-/// directory created private instead: permission bits limited by the umask
-/// or, with `default_acl`, by the default ACL it inherited, and the setgid
-/// bit of `current`, which it inherited from its parent. Creation never sets
-/// other bits.
-pub(crate) fn created_directory_mode(
-    directory: &File,
-    proposed: u32,
-    current: u32,
-    default_acl: bool,
-) -> Result<u32> {
-    let permitted = if default_acl {
-        crate::inode_metadata::default_permissions(directory)?
-    } else {
-        0o777 & !process_umask()
-    };
-    Ok((proposed & permitted & 0o777) | (current & 0o2000))
+/// directory created private instead: permission bits limited by the default
+/// ACL it inherited, or else by the umask, and the setgid bit of `current`,
+/// which it inherited from its parent. Creation never sets other bits.
+pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u32) -> Result<u32> {
+    Ok(crate::inode_metadata::creation_mode(directory, proposed)? | (current & 0o2000))
 }
 
 /// Create the directory `target` names, or accept an existing one as the
@@ -757,11 +736,9 @@ fn mkdir_rooted(
     mode: u32,
     condition: TargetCondition,
     identify: bool,
-    umask: u32,
 ) -> Result<Option<CreatedDirectory>> {
     let root = &target.root;
     let path = &target.relative;
-    let mode = mode & !umask;
     if path.is_empty() {
         if condition == TargetCondition::Absent {
             bail!("destination root {} already exists", target.label.display());
@@ -771,7 +748,7 @@ fn mkdir_rooted(
         return Ok(None);
     }
     let parent = if target.create_missing_parents {
-        root.resolve_parent_creating(path, 0o777 & !umask)?
+        root.resolve_parent_creating(path, 0o777)?
     } else {
         root.resolve_parent(path)?
     };

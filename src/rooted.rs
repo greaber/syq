@@ -982,23 +982,20 @@ impl Root {
 
     /// The mode a regular file published at `path` takes when the receiver
     /// chooses it: a regular file there keeps its mode, and a new one gets
-    /// `proposed` limited as creating it would limit it, with `default_acl`
-    /// by its directory's default ACL. `held` keeps the last parent open for
+    /// `proposed` limited as creating it would limit it, by its directory's
+    /// default ACL or else the umask. `held` keeps the last parent open for
     /// the next name in the same directory.
     pub(crate) fn receiver_file_mode(
         &self,
         path: &RelativePath,
         proposed: u32,
-        default_acl: bool,
         held: &mut Option<HeldParent>,
     ) -> Result<u32> {
         let (parent, leaf) = self.hold_parent(path, held)?;
         match metadata_at(parent.directory.as_raw_fd(), &component_cstring(leaf)) {
             Ok(metadata) if metadata.is_file() => Ok(metadata.mode & 0o7777),
-            Ok(_) => parent.creation_mode(proposed, default_acl),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                parent.creation_mode(proposed, default_acl)
-            }
+            Ok(_) => parent.creation_mode(proposed),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => parent.creation_mode(proposed),
             Err(error) => {
                 Err(error).with_context(|| format!("stat confined path {}", path.label()))
             }
@@ -1881,10 +1878,8 @@ pub(crate) struct HeldParent {
 }
 
 impl HeldParent {
-    fn creation_mode(&mut self, proposed: u32, default_acl: bool) -> Result<u32> {
-        let permitted = if !default_acl {
-            0o777 & !crate::fsops::process_umask()
-        } else if let Some(permitted) = self.permitted {
+    fn creation_mode(&mut self, proposed: u32) -> Result<u32> {
+        let permitted = if let Some(permitted) = self.permitted {
             permitted
         } else {
             *self

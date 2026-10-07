@@ -187,10 +187,10 @@ impl FileSession {
         source_meta: Option<crate::proto::Meta>,
     ) -> Result<Self> {
         let existed = !matches!(&selected, PinnedPath::Missing(_));
-        let new_mode =
-            source_meta.as_ref().map_or(0o666, |m| m.mode & 0o777) & !crate::fsops::process_umask();
         let (file, destination) = if write {
-            let (root, target, mode) = match selected {
+            // An existing file keeps its mode; None gives a new one its
+            // source's permissions, limited as creating it would limit them.
+            let (root, target, existing_mode) = match selected {
                 PinnedPath::Leaf(leaf) => {
                     if !leaf.metadata().is_file() && !leaf.metadata().is_symlink() {
                         bail!("stream destination must be a regular file or an absent path");
@@ -199,11 +199,7 @@ impl FileSession {
                     (
                         Root::from_directory(parent)?,
                         RelativePath::new(name.to_bytes())?,
-                        if meta.is_file() {
-                            meta.mode & 0o7777
-                        } else {
-                            new_mode
-                        },
+                        meta.is_file().then_some(meta.mode & 0o7777),
                     )
                 }
                 PinnedPath::Missing(missing) => {
@@ -212,12 +208,19 @@ impl FileSession {
                     (
                         Root::from_directory(parent)?,
                         RelativePath::new(&path)?,
-                        new_mode,
+                        None,
                     )
                 }
                 _ => bail!("stream destination must be a regular file or an absent path"),
             };
             root.create_missing_parents(&target, 0o777)?;
+            let mode = match existing_mode {
+                Some(mode) => mode,
+                None => {
+                    source_meta.as_ref().map_or(0o666, |m| m.mode & 0o777)
+                        & root.creation_permissions(&target)?
+                }
+            };
             // Keep the temporary in the target's own directory, including when
             // that directory is a mount point beneath the selected root.
             let mut bytes = target

@@ -681,7 +681,7 @@ fn rsync_new_files_follow_destination_default_acls_without_preserving_modes() {
 }
 
 #[test]
-fn default_acl_creation_keeps_native_and_explicit_preservation_semantics() {
+fn default_acls_limit_new_files_unless_permissions_are_copied() {
     use std::os::unix::process::CommandExt;
     for kind in ["native", "native-ranges", "preserve", "acl", "plain"] {
         let t = Tmp::new();
@@ -718,10 +718,12 @@ fn default_acl_creation_keeps_native_and_explicit_preservation_semantics() {
             });
         }
         assert_output_ok(&command.run().unwrap());
-        let expected = if kind == "preserve" || kind == "acl" {
-            0o666
-        } else {
-            0o600
+        // The parent's default ACL limits a new file's permissions in place
+        // of the umask, unless they are copied.
+        let expected = match kind {
+            "preserve" | "acl" => 0o666,
+            "plain" => 0o600,
+            _ => 0o640,
         };
         assert_eq!(
             fs::metadata(t.path("parent/file")).unwrap().mode() & 0o777,
@@ -933,19 +935,30 @@ fn remote_pull_with_xattrs_tolerates_its_own_writes_to_the_destination_root() {
 }
 
 /// A file an `--inplace` copy creates is never wider than its final mode,
-/// even while its contents are written: the umask limits it as it is
-/// created, though the directory's default ACL would let everyone in.
+/// even while its contents are written: the directory's default ACL, or
+/// else the umask, limits it as it is created.
 #[cfg(debug_assertions)]
 #[test]
-fn inplace_files_are_created_within_the_umask_under_a_permissive_default_acl() {
+fn inplace_files_are_created_within_their_final_mode() {
     use std::os::unix::process::CommandExt;
-    let mut everyone = 2u32.to_le_bytes().to_vec();
-    for tag in [1u16, 4, 32] {
-        everyone.extend(tag.to_le_bytes());
-        everyone.extend(7u16.to_le_bytes());
-        everyone.extend(u32::MAX.to_le_bytes());
-    }
-    for fail in [true, false] {
+    let default_acl = |permissions: [u16; 3]| {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions) in [1u16, 4, 32].into_iter().zip(permissions) {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        acl
+    };
+    let cases = [
+        (Some(default_acl([7, 7, 7])), 0o077, 0o666),
+        (Some(default_acl([7, 5, 0])), 0o022, 0o640),
+        (None, 0o077, 0o600),
+    ];
+    for ((acl, umask, expected), fail) in cases
+        .into_iter()
+        .flat_map(|case| [true, false].map(|fail| (case.clone(), fail)))
+    {
         let t = Tmp::new();
         // A second file keeps the receiver's sequential local copy in use.
         write(&t.path("src/small"), b"parallel file work");
@@ -955,7 +968,9 @@ fn inplace_files_are_created_within_the_umask_under_a_permissive_default_acl() {
                 .unwrap();
         }
         fs::create_dir(t.path("dst")).unwrap();
-        set_attr(&t.path("dst"), "system.posix_acl_default", &everyone);
+        if let Some(acl) = &acl {
+            set_attr(&t.path("dst"), "system.posix_acl_default", acl);
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args(["cp", "--inplace", "--no-progress", "--srcs-in"])
@@ -966,8 +981,8 @@ fn inplace_files_are_created_within_the_umask_under_a_permissive_default_acl() {
             command.env("SYQ_TEST_FAIL_COPY_LOCAL_AFTER_WRITE", "1");
         }
         unsafe {
-            command.pre_exec(|| {
-                libc::umask(0o077);
+            command.pre_exec(move || {
+                libc::umask(umask);
                 Ok(())
             });
         }
@@ -982,6 +997,6 @@ fn inplace_files_are_created_within_the_umask_under_a_permissive_default_acl() {
             assert_output_ok(&out);
             assert_eq!(read(&t.path("dst/file")), vec![7; 2 << 20]);
         }
-        assert_eq!(mode, 0o600, "fail={fail}: {mode:o}");
+        assert_eq!(mode, expected, "{umask:o} fail={fail}: {mode:o}");
     }
 }

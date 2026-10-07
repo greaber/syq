@@ -4778,7 +4778,7 @@ fn existing_signed_grants_never_authorize_inode_metadata() {
     fs::create_dir(&root).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let mut configuration = Request::ConfigurePreservation {
-        default_acl_creation: false,
+        narrow_new_directories: false,
         sparse: true,
         selection: crate::inode_metadata::Selection {
             acls: true,
@@ -6517,13 +6517,11 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn both_receivers_give_a_new_in_place_file_its_umask_mode_under_a_narrower_default_acl() {
+fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
     use std::os::unix::ffi::OsStrExt;
-    // The directory's default ACL grants only the owner, so the kernel creates
-    // the file narrower than the umask allows. A native copy limits a new
-    // file by the umask alone, whether or not the receiver takes its
-    // sender's word that the file is new.
-    let umask = crate::fsops::process_umask();
+    // The directory's default ACL grants only the owner. A new file gets the
+    // proposal limited by it, as creating the file would, whether or not the
+    // receiver takes its sender's word that the file is new.
     for restricted in [false, true] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
@@ -6597,7 +6595,7 @@ fn both_receivers_give_a_new_in_place_file_its_umask_mode_under_a_narrower_defau
         });
         assert_eq!(fs::read(target.join("new")).unwrap(), data);
         let mode = fs::metadata(target.join("new")).unwrap().mode() & 0o7777;
-        assert_eq!(mode, 0o644 & !umask, "restricted={restricted}");
+        assert_eq!(mode, 0o600, "restricted={restricted}");
     }
 }
 

@@ -638,15 +638,15 @@ fn configure_preservation(
     selection: crate::inode_metadata::Selection,
     sparse: bool,
     destination: bool,
-    default_acl_creation: bool,
+    narrow_new_directories: bool,
 ) -> Result<()> {
-    if selection.any() || selection.open_noatime || sparse || default_acl_creation {
+    if selection.any() || selection.open_noatime || sparse || narrow_new_directories {
         connection.send_expecting_ok(
             Request::ConfigurePreservation {
                 selection,
                 sparse,
                 destination,
-                default_acl_creation,
+                narrow_new_directories,
             },
             "configure inode metadata preservation",
         )?;

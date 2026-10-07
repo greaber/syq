@@ -644,10 +644,9 @@ pub struct FsOps {
     /// Directories this connection created private or widened, for the
     /// modes it chooses for them later.
     receiver_directories: receiver_mode::ReceiverDirectories,
-    /// Entries are created as `syq rsync` creates them: permissions limited
-    /// by a directory's default ACL rather than by the umask alone, and a
-    /// new directory without owner access narrowed after its contents.
-    default_acl_creation: bool,
+    /// A new directory whose mode lacks owner access, as `syq rsync` creates
+    /// one, gets that mode only after its contents.
+    narrow_new_directories: bool,
     /// The permission bits each directory's default ACL lets new files
     /// have, by root and directory, read once per connection.
     creation_permissions: Mutex<receiver_mode::CreationPermissions>,
@@ -861,7 +860,7 @@ impl FsOps {
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
             receiver_directories: Default::default(),
-            default_acl_creation: false,
+            narrow_new_directories: false,
             creation_permissions: Default::default(),
             prepared_small_copy: None,
             patch_stream: None,
@@ -945,17 +944,16 @@ impl FsOps {
         mode: u32,
         require_absent: bool,
     ) -> Result<DirectoryAnchor> {
-        let umask = self.creation_umask();
         // It has owner access while it is filled, as any new directory has.
         let anchor = self
             .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
-            .create_missing(mode | 0o700, require_absent, umask)?;
+            .create_missing(mode | 0o700, require_absent)?;
         // A destination created private is opened once its metadata is set,
         // and under `syq rsync` one whose mode lacks owner access is narrowed
         // once it is filled.
-        let narrowing = self.default_acl_creation && mode & 0o700 != 0o700;
+        let narrowing = self.narrow_new_directories && mode & 0o700 != 0o700;
         if mode & 0o7777 == 0o700 || narrowing {
             let created = self
                 .operator_selection
@@ -2943,8 +2941,7 @@ impl FsOps {
                 });
         }
         let directories = &self.receiver_directories;
-        let umask = self.creation_umask();
-        let default_acl = self.default_acl_creation;
+        let narrow = self.narrow_new_directories;
         // SetMeta depends on the object existing, so create everything first,
         // then apply metadata — otherwise a parallel SetMeta can beat its
         // Symlink/Mknod/Mkdir. Both phases still run in parallel internally.
@@ -2999,7 +2996,6 @@ impl FsOps {
                         guard,
                         destination_root.clone(),
                         destination_prefix,
-                        umask,
                         true,
                     )
                     .map(|created| {
@@ -3008,7 +3004,7 @@ impl FsOps {
                                 .lock()
                                 .unwrap()
                                 .insert(path.clone(), (*mode, (dev, ino)));
-                            if default_acl && mode & 0o700 != 0o700 {
+                            if narrow && mode & 0o700 != 0o700 {
                                 directories.created((dev, ino), created, true);
                             }
                         }
@@ -3020,7 +3016,7 @@ impl FsOps {
                 // `syq rsync` narrows one whose proposal lacks the owner
                 // access it is created with to fill it.
                 Op::Mkdir { mode, .. }
-                    if mode & 0o7777 == 0o700 || (default_acl && mode & 0o700 != 0o700) =>
+                    if mode & 0o7777 == 0o700 || (narrow && mode & 0o700 != 0o700) =>
                 {
                     let narrowing = mode & 0o700 != 0o700;
                     apply::create_identified_directory(
@@ -3028,7 +3024,6 @@ impl FsOps {
                         guard,
                         destination_root.clone(),
                         destination_prefix,
-                        umask,
                         !narrowing,
                     )
                     .map(|created| {
@@ -3037,13 +3032,7 @@ impl FsOps {
                         }
                     })
                 }
-                _ => apply_one(
-                    op,
-                    guard,
-                    destination_root.clone(),
-                    destination_prefix,
-                    umask,
-                ),
+                _ => apply_one(op, guard, destination_root.clone(), destination_prefix),
             };
             result.err().as_ref().map(wire_error)
         };
@@ -3073,15 +3062,8 @@ impl FsOps {
                 guard,
                 destination_root.clone(),
                 destination_prefix,
-                default_acl,
             );
-            let result = apply_one(
-                &op,
-                guard,
-                destination_root.clone(),
-                destination_prefix,
-                umask,
-            );
+            let result = apply_one(&op, guard, destination_root.clone(), destination_prefix);
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {
@@ -3093,7 +3075,6 @@ impl FsOps {
                         guard,
                         destination_root.clone(),
                         destination_prefix,
-                        default_acl,
                     )
                 }),
                 _ => None,

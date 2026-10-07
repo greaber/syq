@@ -284,7 +284,7 @@ impl SourceConnection {
             selection: policy.preservation,
             sparse: policy.sparse,
             destination: false,
-            default_acl_creation: false,
+            narrow_new_directories: false,
         });
         match response {
             Response::Ok => Ok(()),

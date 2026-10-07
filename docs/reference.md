@@ -430,7 +430,8 @@ explicitly requested permissions take precedence. Other processes can see the
 temporary permissions, and a crash or forced termination can leave them in place.
 `syq rsync` enables temporary widening without this option. Root skips widening.
 
-New files use the source read, write, and execute permissions, limited by the destination umask.
+New files use the source read, write, and execute permissions, limited by the
+umask, or by the directory's default ACL if it has one.
 For example, a new script with mode `755` stays executable with umask `022`.
 
 To preserve source permissions and ownership as well:
@@ -444,7 +445,7 @@ read-only directory could not take them, and adding entries changes its
 modification time anyway. Until then, syq limits who can enter or list it:
 
 - A new directory starts with the source's permissions and owner access,
-  limited by the umask. `syq rsync` removes that owner access after the
+  limited as a new file's are. `syq rsync` removes that owner access after the
   contents if the source lacks it, as rsync does.
   With `--copy-metadata=ownership`, it takes its copied owner and group before
   syq copies files into it. If it could start out with another group, it is

@@ -19,11 +19,13 @@ fn permission_bits(path: &Path) -> u32 {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn native_copies_limit_new_entries_by_the_umask_despite_a_permissive_default_acl() {
+fn native_copies_limit_new_entries_by_a_default_acl_or_else_the_umask() {
     use std::os::unix::ffi::OsStrExt;
-    // A default ACL granting everyone everything replaces the umask for the
-    // kernel; a native copy still limits new entries by the umask, whether
-    // it writes them in place, stages them or creates them directly.
+    // A directory's default ACL replaces the umask for new entries, whether
+    // a native copy writes them in place, stages them or creates them
+    // directly: one granting everyone everything lets the source's mode
+    // through a restrictive umask, and a narrower one limits it below a
+    // permissive umask.
     let t = Tmp::new();
     write(&t.path("src/small"), b"small");
     write(&t.path("src/large"), &prng(3 << 20, 7));
@@ -33,57 +35,75 @@ fn native_copies_limit_new_entries_by_the_umask_despite_a_permissive_default_acl
         let mode = if name == "directory" { 0o777 } else { 0o666 };
         fs::set_permissions(t.path("src").join(name), fs::Permissions::from_mode(mode)).unwrap();
     }
-    // version 2; USER_OBJ, GROUP_OBJ and OTHER, each rwx.
-    let mut acl = 2u32.to_le_bytes().to_vec();
-    for tag in [1u16, 4, 32] {
-        acl.extend(tag.to_le_bytes());
-        acl.extend(7u16.to_le_bytes());
-        acl.extend(u32::MAX.to_le_bytes());
-    }
+    // version 2; USER_OBJ, GROUP_OBJ and OTHER with these permissions.
+    let acl = |permissions: [u16; 3]| {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions) in [1u16, 4, 32].into_iter().zip(permissions) {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(permissions.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        acl
+    };
     let src = t.s("src");
-    for variant in ["inplace", "staged", "ranges"] {
-        let dst = t.path(variant);
-        fs::create_dir(&dst).unwrap();
-        let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
-        if unsafe {
-            libc::setxattr(
-                path.as_ptr(),
-                c"system.posix_acl_default".as_ptr(),
-                acl.as_ptr().cast(),
-                acl.len(),
-                0,
-            )
-        } != 0
-        {
-            eprintln!(
-                "skipped: this filesystem rejected a default ACL: {}",
-                std::io::Error::last_os_error()
-            );
-            return;
+    let cases = [
+        (
+            "permissive",
+            Some(acl([7, 7, 7])),
+            0o077,
+            ["666", "666", "666", "777"],
+        ),
+        (
+            "narrow",
+            Some(acl([7, 5, 0])),
+            0o022,
+            ["640", "640", "640", "750"],
+        ),
+        ("none", None, 0o022, ["644", "644", "644", "755"]),
+    ];
+    for (default_acl, acl, umask, expected) in cases {
+        for variant in ["inplace", "staged", "ranges"] {
+            let dst = t.path(&format!("{default_acl}-{variant}"));
+            fs::create_dir(&dst).unwrap();
+            if let Some(acl) = &acl {
+                let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
+                if unsafe {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        c"system.posix_acl_default".as_ptr(),
+                        acl.as_ptr().cast(),
+                        acl.len(),
+                        0,
+                    )
+                } != 0
+                {
+                    eprintln!(
+                        "skipped: this filesystem rejected a default ACL: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    return;
+                }
+            }
+            let mut args = vec![
+                "cp",
+                "--no-progress",
+                "--copy-metadata=specials",
+                "--srcs-in",
+                &src,
+                "--into",
+                dst.to_str().unwrap(),
+            ];
+            match variant {
+                "inplace" => args.push("--inplace"),
+                "ranges" => args.extend(["--inplace", "--performance-tuning", "copy-path=ranges"]),
+                _ => {}
+            }
+            let output = native_copy_with_umask(umask, &args);
+            assert_output_ok(&output);
+            let modes = ["small", "large", "fifo", "directory"]
+                .map(|name| format!("{:o}", permission_bits(&dst.join(name))));
+            assert_eq!(modes, expected, "{default_acl} {variant}");
         }
-        let mut args = vec![
-            "cp",
-            "--no-progress",
-            "--copy-metadata=specials",
-            "--srcs-in",
-            &src,
-            "--into",
-            dst.to_str().unwrap(),
-        ];
-        match variant {
-            "inplace" => args.push("--inplace"),
-            "ranges" => args.extend(["--inplace", "--performance-tuning", "copy-path=ranges"]),
-            _ => {}
-        }
-        let output = native_copy_with_umask(0o077, &args);
-        assert_output_ok(&output);
-        let modes = ["small", "large", "fifo", "directory"]
-            .map(|name| format!("{name} {:o}", permission_bits(&dst.join(name))));
-        assert_eq!(
-            modes,
-            ["small 600", "large 600", "fifo 600", "directory 700"],
-            "{variant}"
-        );
     }
 }
 

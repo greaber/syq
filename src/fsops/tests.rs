@@ -1350,7 +1350,7 @@ fn missing_operator_directory_is_created_under_retained_ancestor() {
 
     fs::rename(dir.join("parent"), dir.join("selected-and-moved")).unwrap();
     symlink(dir.join("outside"), dir.join("parent")).unwrap();
-    selection.create_missing(0o755, false, 0).unwrap();
+    selection.create_missing(0o755, false).unwrap();
 
     assert!(dir.join("selected-and-moved/missing/deeper").is_dir());
     assert!(!dir.join("outside/missing").exists());
@@ -1377,8 +1377,8 @@ fn concurrent_operator_directory_creation_reuses_the_real_directory() {
     assert!(first_anchor.is_none());
     assert!(second_anchor.is_none());
 
-    let first_anchor = first.create_missing(0o755, false, 0).unwrap();
-    let second_anchor = second.create_missing(0o755, false, 0).unwrap();
+    let first_anchor = first.create_missing(0o755, false).unwrap();
+    let second_anchor = second.create_missing(0o755, false).unwrap();
     assert_eq!(
         (first_anchor.dev, first_anchor.ino),
         (second_anchor.dev, second_anchor.ino)
@@ -1401,7 +1401,7 @@ fn new_operator_directory_rejects_a_concurrently_created_final_component() {
     assert!(anchor.is_none());
 
     fs::create_dir(&selected).unwrap();
-    let error = selection.create_missing(0o755, true, 0).unwrap_err();
+    let error = selection.create_missing(0o755, true).unwrap_err();
     assert!(error
         .to_string()
         .contains("appeared after the new-path precondition"));
