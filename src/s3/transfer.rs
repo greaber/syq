@@ -2822,7 +2822,7 @@ impl Engine {
             &self.args,
             existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
             explicit,
-            || self.file_permissions.lock().unwrap().for_file(root, &path),
+            || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
         )?;
         let m = file.metadata()?;
         if self.args.ignore_existing
@@ -2953,7 +2953,7 @@ impl Engine {
             })
             .await??;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
-                self.file_permissions.lock().unwrap().for_file(root, path)
+                local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
             })?;
             let m = file.metadata()?;
             if self.args.ignore_existing
