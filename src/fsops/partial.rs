@@ -79,7 +79,7 @@ impl FsOps {
         // limited by the directory's default ACL or else the umask, never
         // with a special bit.
         let mode = mode & 0o777;
-        let file = root.create_file(relative, mode | 0o200)?;
+        let file = self.create_new_inplace_file(root, relative, mode | 0o200, false)?;
         let created = file.metadata()?;
         receiver_mode::note_inplace_open(copy_id, &created, true);
         if created.mode() & 0o200 == 0 {
@@ -87,6 +87,35 @@ impl FsOps {
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
         }
         Ok(file)
+    }
+
+    /// Create, exclusively, a new file the copy writes in place. With ACL
+    /// copying on macOS it is created inside a private directory and moved
+    /// into place, as a stage is: a new file there takes its directory's
+    /// inheritable ACL entries whatever its mode, and they would let others
+    /// open it before finalize sets its ACL.
+    fn create_new_inplace_file(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+        write_only: bool,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        if write_only {
+            root.create_write_only_file(relative, mode)
+        } else {
+            root.create_file(relative, mode)
+        }
+    }
+
+    /// Whether every new in-place file is created through a private
+    /// directory (`create_new_inplace_file`), and so only exclusively.
+    fn creates_inplace_files_privately(&self) -> bool {
+        cfg!(target_os = "macos") && self.inode_preservation.acls
     }
 
     pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
@@ -1954,9 +1983,8 @@ impl FsOps {
             let file = match condition {
                 // The whole file is written here and never read back.
                 TargetCondition::Absent => {
-                    let file = rooted
-                        .root
-                        .create_write_only_file(&rooted.relative, create_mode)
+                    let file = self
+                        .create_new_inplace_file(&rooted.root, &rooted.relative, create_mode, true)
                         .with_context(|| format!("create {}", rooted.label.display()))?;
                     created = Some(file.metadata()?);
                     file
@@ -1981,6 +2009,8 @@ impl FsOps {
                     // existing one of that mode, so where the scan may have
                     // found one, an existing file is opened without
                     // creating one and a missing one is created exclusively.
+                    // One created through a private directory is only ever
+                    // created exclusively.
                     let mut expect_new = false;
                     let mut opened = if private && put.scanned != ScannedDestination::Absent {
                         match rooted.root.open_regular_write_known(&rooted.relative) {
@@ -1995,6 +2025,9 @@ impl FsOps {
                                 None
                             }
                         }
+                    } else if self.creates_inplace_files_privately() {
+                        expect_new = put.scanned == ScannedDestination::Absent;
+                        None
                     } else {
                         match rooted
                             .root
@@ -2038,10 +2071,12 @@ impl FsOps {
                                 bail!("destination {} is a directory", rooted.label.display())
                             }
                             Some(_) => rooted.root.unlink(&rooted.relative)?,
-                            None => match rooted
-                                .root
-                                .create_write_only_file(&rooted.relative, create_mode)
-                            {
+                            None => match self.create_new_inplace_file(
+                                &rooted.root,
+                                &rooted.relative,
+                                create_mode,
+                                true,
+                            ) {
                                 Ok(file) => {
                                     created = Some(file.metadata()?);
                                     opened = Some(file);
