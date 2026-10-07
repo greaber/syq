@@ -284,51 +284,72 @@ fn declining_small_copy_leaves_control_traffic_unpaced() {
 // apart under a cap, while the transport and tuner must keep seeing activity.
 #[cfg(debug_assertions)]
 #[test]
-fn capped_batches_provide_continuous_tuning_activity() {
-    for (mode, pull) in (0..2).flat_map(|mode| [false, true].map(|pull| (mode, pull))) {
-        let t = Tmp::new();
-        for n in 0..8192 {
-            write(&t.path(&format!("src/{n}")), &prng(8192, 8000 + n));
-        }
-        let history = t.path("history.sqlite");
-        let out = automatic_command(&t, mode, pull, "4M")
-            .arg("--no-compress")
-            .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
-            .env("SYQ_TUNING_HISTORY", &history)
-            .env("SYQ_TEST_TUNE_SAMPLE_MS", "100")
-            .args(paths(&t, pull, true))
-            .run()
-            .unwrap();
-        assert_output_ok(&out);
-        assert_same_tree(&t.path("src"), &t.path("dst"));
-        let db = rusqlite::Connection::open(history).unwrap();
-        let observations: Vec<serde_json::Value> = db
-            .prepare("SELECT data FROM events WHERE json_extract(data,'$.kind')='observation'")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
-            .collect();
-        assert!(observations.len() >= 20, "{out:?}");
-        let active = observations
-            .iter()
-            .filter(|event| event["data"]["rate"].as_f64().unwrap() > 0.0)
-            .count();
-        assert!(
-            active * 2 > observations.len(),
-            "bursty completion accounting: {observations:?}"
-        );
-        // Workers may claim the entire queue before the first observation.
-        // Those samples still verify accounting, but the remaining-work gate
-        // can exclude them from worker-count comparisons and cache inference.
-        // Learning eligibility is tested separately with sufficient queued work.
-        let mode: String = db
-            .query_row("SELECT mode FROM runs LIMIT 1", [], |row| row.get(0))
-            .unwrap();
-        assert!(mode.contains("bandwidth=4194304;"), "{mode}");
-        assert!(
-            mode.contains("bandwidth-accounting=transport-v1;activity=wire-bytes-v1"),
-            "{mode}"
-        );
+fn capped_batches_provide_continuous_tuning_activity_tcp_push() {
+    capped_batches_provide_continuous_tuning_activity(0, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn capped_batches_provide_continuous_tuning_activity_tcp_pull() {
+    capped_batches_provide_continuous_tuning_activity(0, true);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn capped_batches_provide_continuous_tuning_activity_no_tcp_push() {
+    capped_batches_provide_continuous_tuning_activity(1, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn capped_batches_provide_continuous_tuning_activity_no_tcp_pull() {
+    capped_batches_provide_continuous_tuning_activity(1, true);
+}
+
+#[cfg(debug_assertions)]
+fn capped_batches_provide_continuous_tuning_activity(mode: u8, pull: bool) {
+    let t = Tmp::new();
+    for n in 0..8192 {
+        write(&t.path(&format!("src/{n}")), &prng(8192, 8000 + n));
     }
+    let history = t.path("history.sqlite");
+    let out = automatic_command(&t, mode, pull, "4M")
+        .arg("--no-compress")
+        .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
+        .env("SYQ_TUNING_HISTORY", &history)
+        .env("SYQ_TEST_TUNE_SAMPLE_MS", "100")
+        .args(paths(&t, pull, true))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_same_tree(&t.path("src"), &t.path("dst"));
+    let db = rusqlite::Connection::open(history).unwrap();
+    let observations: Vec<serde_json::Value> = db
+        .prepare("SELECT data FROM events WHERE json_extract(data,'$.kind')='observation'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect();
+    assert!(observations.len() >= 20, "{out:?}");
+    let active = observations
+        .iter()
+        .filter(|event| event["data"]["rate"].as_f64().unwrap() > 0.0)
+        .count();
+    assert!(
+        active * 2 > observations.len(),
+        "bursty completion accounting: {observations:?}"
+    );
+    // Workers may claim the entire queue before the first observation.
+    // Those samples still verify accounting, but the remaining-work gate
+    // can exclude them from worker-count comparisons and cache inference.
+    // Learning eligibility is tested separately with sufficient queued work.
+    let mode: String = db
+        .query_row("SELECT mode FROM runs LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    assert!(mode.contains("bandwidth=4194304;"), "{mode}");
+    assert!(
+        mode.contains("bandwidth-accounting=transport-v1;activity=wire-bytes-v1"),
+        "{mode}"
+    );
 }
