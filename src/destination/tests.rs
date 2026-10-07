@@ -1218,9 +1218,22 @@ fn named_extended_attributes_ask_and_reconcile_the_user_namespace() {
 #[test]
 fn named_copies_change_no_file_in_place_that_has_names_outside() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for (options, contents) in [
-        (&["--inplace", "--copy-metadata", "mtime"][..], &b"new"[..]),
-        (&["--copy-metadata", "mtime,permissions"], b"old"),
+    // A large file is written in place through ranges, not with the small
+    // files.
+    let large_old = vec![1u8; 6 << 20];
+    let large_new = vec![2u8; 6 << 20];
+    for (options, contents, old) in [
+        (
+            &["--inplace", "--copy-metadata", "mtime"][..],
+            &b"new"[..],
+            &b"old"[..],
+        ),
+        (
+            &["--inplace", "--copy-metadata", "mtime"][..],
+            &large_new[..],
+            &large_old[..],
+        ),
+        (&["--copy-metadata", "mtime,permissions"], b"old", b"old"),
     ] {
         let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().join("receiving");
@@ -1240,7 +1253,7 @@ fn named_copies_change_no_file_in_place_that_has_names_outside() {
                 .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
                 .unwrap();
         }
-        fs::write(root.join("source/a"), b"old").unwrap();
+        fs::write(root.join("source/a"), old).unwrap();
         fs::set_permissions(root.join("source/a"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::hard_link(root.join("source/a"), root.join("outside/a")).unwrap();
         fs::write(root.join("source/b"), b"old").unwrap();
@@ -1253,10 +1266,10 @@ fn named_copies_change_no_file_in_place_that_has_names_outside() {
             "{options:?}"
         );
         let after = fs::metadata(root.join("outside/a")).unwrap();
-        assert_eq!(
-            fs::read(root.join("outside/a")).unwrap(),
-            b"old",
-            "{options:?}"
+        assert!(
+            fs::read(root.join("outside/a")).unwrap() == old,
+            "{options:?}, {} bytes",
+            old.len()
         );
         assert_eq!(
             (after.ino(), after.mode(), after.mtime(), after.mtime_nsec()),

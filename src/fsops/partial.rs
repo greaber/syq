@@ -526,6 +526,9 @@ impl FsOps {
             };
             match opened {
                 Ok(Some((file, mut opened))) if opened.is_file() => {
+                    // A restricted receiver discards the scan, so it never
+                    // opens here; the check keeps it so if that changes.
+                    self.require_names_inside(&target, &opened)?;
                     let euid = unsafe { libc::geteuid() };
                     let created =
                         euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600;

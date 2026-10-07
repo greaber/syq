@@ -8041,3 +8041,53 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
         0o444 & !crate::fsops::limits::process_umask()
     );
 }
+
+/// An in-place open of the file a scan found checks its names as the
+/// other opens do. Only a restricted receiver tracks names, and it
+/// discards the scan, so this guards that path should that change.
+#[test]
+fn an_in_place_open_of_a_scanned_file_refuses_one_with_names_outside() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let base = dir.path();
+    fs::create_dir(base.join("scope")).unwrap();
+    fs::create_dir(base.join("outside")).unwrap();
+    fs::write(base.join("scope/a"), b"old").unwrap();
+    fs::set_permissions(base.join("scope/a"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::hard_link(base.join("scope/a"), base.join("outside/a")).unwrap();
+    let bytes = |path: &Path| path.as_os_str().as_bytes().to_vec();
+    let identity = Root::open(base).unwrap().identity();
+    let guard = ContainerGuard {
+        root: bytes(base),
+        dev: identity.dev,
+        ino: identity.ino,
+    };
+    let mut operations = FsOps::new();
+    operations.set_scope_names(Arc::new(scope_names::ScopeNames::new(
+        bytes(base),
+        [(bytes(&base.join("scope")), true)],
+    )));
+    let target = bytes(&base.join("scope/a"));
+    let error = operations
+        .prepare(
+            PartialTarget {
+                path: &target,
+                id: &[7; 16],
+                guard: Some(&guard),
+            },
+            PrepareOptions {
+                condition: crate::proto::TargetCondition::Any,
+                size: 3,
+                inplace: true,
+                mode: 0o644,
+                attempt: 0,
+                create_if_missing: true,
+                scanned: ScannedDestination::File(0o644),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("has other names outside"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(base.join("outside/a")).unwrap(), b"old");
+}
