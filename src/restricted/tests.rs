@@ -648,6 +648,7 @@ fn test_authority_with_receipt(
             filters,
             root_existence,
             receipt_policy,
+            extra_options: Default::default(),
         },
         [0; 32],
         receipt_key,
@@ -4782,94 +4783,177 @@ fn restricted_authority_rejects_caller_source_registration() {
 }
 
 #[test]
-fn existing_signed_grants_never_authorize_hardlink_creation() {
+fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
+    use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let mut request = Request::Apply {
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/source"), b"payload").unwrap();
+    fs::write(root.join("target/existing"), b"existing").unwrap();
+    fs::write(root.join("outside"), b"outside").unwrap();
+    let link = |path: &str, source: &str| Request::Apply {
         ops: vec![Op::Hardlink {
-            path: path_bytes(&root.join("target")),
-            source: path_bytes(&root.join("source")),
+            path: path_bytes(&root.join(path)),
+            source: path_bytes(&root.join(source)),
             dev: 1,
             ino: 2,
+            condition: proto::TargetCondition::Any,
         }],
         guard: None,
     };
-    let error = authority.authorize(&mut request, false).unwrap_err();
+    let condition = |request: &Request| match request {
+        Request::Apply { ops, .. } => match &ops[0] {
+            Op::Hardlink { condition, .. } => *condition,
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    };
+    let with_policy = |existing| {
+        let mut authority = test_authority_with_existence(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            existing,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+        )
+        .unwrap();
+        authority.extra_options.hardlinks = true;
+        authority
+    };
+
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let error = authority
+        .authorize(&mut link("target/new", "target/source"), false)
+        .unwrap_err();
     assert!(
         error
             .to_string()
             .contains("hardlink creation is not authorized"),
         "{error:#}"
     );
-    assert!(!root.join("target").exists());
+    assert!(authority
+        .check_flags(proto::flags::REPORT_IDENTITY)
+        .is_err());
+    authority.extra_options.hardlinks = true;
+    authority
+        .check_flags(proto::flags::REPORT_IDENTITY)
+        .unwrap();
+
+    // Either name outside the signed scopes is refused.
+    let replace = with_policy(ExistingDestinationPolicy::Replace);
+    assert!(replace
+        .authorize(&mut link("target/new", "outside"), false)
+        .is_err());
+    assert!(replace
+        .authorize(&mut link("outside-link", "target/source"), false)
+        .is_err());
+    let mut request = link("target/existing", "target/source");
+    replace.authorize(&mut request, false).unwrap();
+    assert_eq!(condition(&request), proto::TargetCondition::Any);
+
+    // Keeping existing entries: a new name only, never a replacement.
+    let keep = with_policy(ExistingDestinationPolicy::Skip);
+    assert!(keep
+        .authorize(&mut link("target/existing", "target/source"), false)
+        .is_err());
+    let mut request = link("target/new", "target/source");
+    keep.authorize(&mut request, false).unwrap();
+    assert_eq!(condition(&request), proto::TargetCondition::Absent);
+
+    // Changing existing entries only: the name observed, and nothing else.
+    let update = with_policy(ExistingDestinationPolicy::MustExist);
+    assert!(update
+        .authorize(&mut link("target/new", "target/source"), false)
+        .is_err());
+    let mut request = link("target/existing", "target/source");
+    update.authorize(&mut request, false).unwrap();
+    let observed = fs::metadata(root.join("target/existing")).unwrap();
+    assert_eq!(
+        condition(&request),
+        proto::TargetCondition::Matches {
+            dev: observed.dev(),
+            ino: observed.ino(),
+        }
+    );
 }
 
 #[test]
-fn existing_signed_grants_never_authorize_inode_metadata() {
+fn signed_grants_authorize_only_their_inode_metadata() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     fs::create_dir(&root).unwrap();
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let mut configuration = Request::ConfigurePreservation {
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let everything = crate::inode_metadata::Selection {
+        acls: true,
+        xattrs: true,
+        atimes: true,
+        crtimes: true,
+        open_noatime: true,
+    };
+    let configuration = |selection, sparse| Request::ConfigurePreservation {
         default_acl_creation: false,
-        sparse: true,
-        selection: crate::inode_metadata::Selection {
-            acls: true,
-            xattrs: true,
-            atimes: true,
-            crtimes: true,
-            open_noatime: true,
-        },
+        sparse,
+        selection,
         destination: true,
     };
-    assert!(authority.authorize(&mut configuration, true).is_err());
-    let mut meta = plain_meta();
-    meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
-        acls: Some(crate::inode_metadata::PosixAcls {
-            access: None,
-            default: None,
-        }),
-        macos_acl: None,
-        xattrs: None,
-        atime: None,
-        crtime: None,
-    }));
-    let mut request = Request::Apply {
-        ops: vec![Op::SetMeta {
-            path: path_bytes(&root.join("target")),
-            meta,
-            flags: 0,
-            condition: proto::TargetCondition::Any,
-        }],
-        guard: None,
+    let acl_meta = || {
+        let mut meta = plain_meta();
+        meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
+            acls: Some(crate::inode_metadata::PosixAcls {
+                access: None,
+                default: None,
+            }),
+            ..Default::default()
+        }));
+        meta
     };
-    let error = authority.authorize(&mut request, false).unwrap_err();
+    let time_meta = || {
+        let mut meta = plain_meta();
+        meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
+            atime: Some(crate::inode_metadata::Timestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            }),
+            ..Default::default()
+        }));
+        meta
+    };
+    assert!(authority
+        .authorize(&mut configuration(everything, true), true)
+        .is_err());
+    let error = authority.check_metadata(&acl_meta(), 0).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("do not authorize additional inode metadata"),
+        error.to_string().contains("inode metadata not authorized"),
         "{error:#}"
     );
-    let mut time_meta = plain_meta();
-    time_meta.inode_metadata = Some(Box::new(crate::inode_metadata::InodeMetadata {
-        atime: Some(crate::inode_metadata::Timestamp {
-            seconds: 1,
-            nanoseconds: 0,
-        }),
+    assert!(authority.check_metadata(&time_meta(), 0).is_err());
+
+    authority.extra_options.acls = true;
+    authority.extra_options.sparse = true;
+    let acls_only = crate::inode_metadata::Selection {
+        acls: true,
         ..Default::default()
-    }));
-    let mut time_request = Request::Apply {
-        ops: vec![Op::SetMeta {
-            path: path_bytes(&root.join("target")),
-            meta: time_meta,
-            flags: 0,
-            condition: proto::TargetCondition::Any,
-        }],
-        guard: None,
     };
-    assert!(authority.authorize(&mut time_request, false).is_err());
+    authority
+        .authorize(&mut configuration(acls_only, true), true)
+        .unwrap();
+    assert!(authority
+        .authorize(&mut configuration(everything, true), true)
+        .is_err());
+    authority.check_metadata(&acl_meta(), 0).unwrap();
+    assert!(authority.check_metadata(&time_meta(), 0).is_err());
+    // The receiver's own creation rules are not the sender's to choose.
+    let mut rsync_creation = Request::ConfigurePreservation {
+        default_acl_creation: true,
+        sparse: false,
+        selection: acls_only,
+        destination: true,
+    };
+    assert!(authority.authorize(&mut rsync_creation, true).is_err());
 }
 
 #[test]

@@ -570,7 +570,8 @@ pub mod flags {
     pub const REQUIRE_OWNER: u8 = 32;
     pub const REQUIRE_GROUP: u8 = 64;
     /// Return the identity of the held, completed inode for hardlink followers.
-    /// This changes only the reply; restricted grants do not authorize it.
+    /// This changes only the reply; restricted grants authorize it with
+    /// hard links.
     pub const REPORT_IDENTITY: u8 = 128;
 }
 
@@ -648,6 +649,10 @@ pub enum Op {
         source: PathBytes,
         dev: u64,
         ino: u64,
+        /// What `path` must be when the link replaces it. Ordinary senders
+        /// send `Any`; a restricted receiver binds it to its signed
+        /// existing-object policy.
+        condition: TargetCondition,
     },
     /// Remove whatever currently occupies the path, recursively when it is a
     /// directory. Planned deletion uses Unlink/Rmdir instead.

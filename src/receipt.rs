@@ -119,14 +119,23 @@ pub(crate) fn generate_recipient() -> Result<(RecipientSecret, [u8; 32])> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum OperationAction {
-    PublishFile { size: u64, inplace: bool },
+    PublishFile {
+        size: u64,
+        inplace: bool,
+    },
     EnsureDirectory,
     CreateSymlink,
-    CreateSpecial { kind: Kind },
-    SetMetadata { flags: u8 },
+    CreateSpecial {
+        kind: Kind,
+    },
+    SetMetadata {
+        flags: u8,
+    },
     DeleteFile,
     DeleteDirectory,
     ObserveFileHash,
+    /// A new name for a file already in the destination.
+    LinkFile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -832,6 +841,7 @@ pub(crate) fn emit_automation_records(
                     OperationAction::DeleteFile => ("delete", Some("file"), None),
                     OperationAction::DeleteDirectory => ("delete", Some("dir"), None),
                     OperationAction::ObserveFileHash => ("observe_hash", Some("file"), None),
+                    OperationAction::LinkFile => ("transfer_file", Some("file"), Some(0)),
                 };
                 let mut value = serde_json::json!({
                     "type": "operation_result",

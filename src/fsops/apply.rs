@@ -65,6 +65,7 @@ pub(super) fn apply_one(
             source,
             dev,
             ino,
+            condition,
         } = op
         {
             let source = guarded_target(source, guard)?;
@@ -73,6 +74,7 @@ pub(super) fn apply_one(
                 source: source.relative.to_path_buf().into_os_string().into_vec(),
                 dev: *dev,
                 ino: *ino,
+                condition: *condition,
             };
             return apply_one_rooted(&operation, &target.as_rooted(), umask);
         }
@@ -277,7 +279,7 @@ pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<Guar
     guarded_target_unheld(path, guard)
 }
 
-fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
+pub(super) fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
     let root_path = resolve(&guard.root);
     let target = resolve(path);
     let relative = relative_under(&root_path, &target)?;
@@ -434,8 +436,12 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget, umask: u32) -> Result<()> {
             }
         }
         Op::Hardlink {
-            source, dev, ino, ..
-        } => root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino)),
+            source,
+            dev,
+            ino,
+            condition,
+            ..
+        } => root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino), *condition),
         Op::SetMeta {
             meta,
             flags,

@@ -169,6 +169,11 @@ pub(crate) enum Details {
         max_entries: u64,
         max_delete: u64,
         preserve_permissions: bool,
+        /// What the server could do with the requested options that a copy
+        /// of plain files cannot, each completing "The server ...". Absent
+        /// from requests stored by earlier releases.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warnings: Option<Vec<String>>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -283,6 +288,12 @@ impl Summary {
                 max_entries: request.copy.limits.max_entries,
                 max_delete: request.copy.limits.max_deletions,
                 preserve_permissions: request.copy.options.preserve_permissions,
+                // Plain copies keep the released shape. Without the field, a
+                // request that preserves permissions reads as one stored by an
+                // earlier release, so it records even an empty list.
+                warnings: Some(copy_warnings(request)).filter(|warnings| {
+                    !warnings.is_empty() || request.copy.options.preserve_permissions
+                }),
             },
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
                 + lifetime.as_secs(),
@@ -424,8 +435,18 @@ impl Summary {
             Details::Storage { description, .. } => description.clone(),
             Details::Ssh { destination, permission, .. }
             | Details::ProviderSsh { destination, permission, .. } => format!("{destination}\n{permission}"),
-            Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions } =>
-                format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\nPreserve permissions: {preserve_permissions}.\nSource contents have not been inspected by this machine."),
+            Details::Copy { destination, permission, max_bytes, max_entries, max_delete, preserve_permissions, warnings } => {
+                // A request from before warnings were recorded still says
+                // what preserving permissions allows.
+                let derived = [PERMISSIONS_WARNING.to_owned()];
+                let warnings = match warnings {
+                    Some(warnings) => &warnings[..],
+                    None if *preserve_permissions => &derived[..],
+                    None => &[],
+                };
+                let warnings: String = warnings.iter().map(|warning| format!("The server {warning}.\n")).collect();
+                format!("Destination: {destination}\n{permission}\nLimits: {max_bytes} bytes, {max_entries} entries; at most {max_delete} deletions.\n{warnings}Source contents have not been inspected by this machine.")
+            }
             Details::Command { argv, cwd, permission, .. } =>
                 format!("Command (literal arguments): {}\nWorking directory: {cwd}\n{permission}\nScripts and build files used by this command have not been inspected by syq.", argv.join(" ")),
         };
@@ -531,11 +552,44 @@ fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<St
             },
         }
     }
-    let deletions = request.copy.limits.max_deletions;
-    if deletions > 0 && !options.dry_run && !options.verify_only {
-        notes.push(format!("deletes up to {deletions} files or folders"));
-    }
+    notes.extend(copy_warnings(request));
     notes
+}
+
+const PERMISSIONS_WARNING: &str =
+    "can make files readable by others or create programs that run as you";
+
+/// One short line for each requested option that lets the server do more
+/// than copy plain files, each completing "The server ...".
+fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
+    let options = &request.copy.options;
+    let extra = &request.constraints.extra_options;
+    if options.dry_run || options.verify_only {
+        return Vec::new();
+    }
+    let deletions = request.copy.limits.max_deletions;
+    [
+        (deletions > 0).then(|| {
+            format!("can delete up to {deletions} files or folders anywhere in the destination")
+        }),
+        options
+            .preserve_permissions
+            .then(|| PERMISSIONS_WARNING.to_owned()),
+        options
+            .preserve_group
+            .then(|| "can give files to any group you belong to".to_owned()),
+        extra
+            .acls
+            .then(|| "can give other users access to files".to_owned()),
+        extra
+            .hardlinks
+            .then(|| "can link new names to files already in the destination".to_owned()),
+        (request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace)
+            .then(|| "can change existing files through every name they have".to_owned()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 /// Whether any named mutation root exists on this machine, or `None` when
 /// that cannot be told cheaply. Existing directory scopes need no recursive
@@ -1479,6 +1533,7 @@ mod tests {
                 max_entries: 3,
                 max_delete: 0,
                 preserve_permissions: false,
+                warnings: None,
             },
             expires_at: 0,
             notification: String::new(),
@@ -1592,6 +1647,59 @@ mod tests {
         assert!(!description.contains("Local command:"));
         assert!(!description.contains("syq persist receive approve request"));
         assert!(!description.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn copy_approvals_warn_once_for_each_risky_option() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("data");
+        let mut request = copy_request(&path);
+        let plain = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
+        assert!(!plain
+            .description(&crate::persistence::Domain::default(), str::to_owned)
+            .contains("The server can"));
+        request.copy.options.preserve_permissions = true;
+        request.copy.options.receiver_managed_modes = false;
+        request.copy.options.preserve_group = true;
+        request.copy.limits.max_deletions = 4;
+        request.constraints.extra_options.acls = true;
+        request.constraints.extra_options.hardlinks = true;
+        request.constraints.extra_options.xattrs = true;
+        let warnings = [
+            "can delete up to 4 files or folders anywhere in the destination",
+            "can make files readable by others or create programs that run as you",
+            "can give files to any group you belong to",
+            "can give other users access to files",
+            "can link new names to files already in the destination",
+        ];
+        let summary = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
+        let desktop = summary.desktop_description(false);
+        let details = summary.description(&crate::persistence::Domain::default(), str::to_owned);
+        for warning in warnings {
+            assert_eq!(desktop.matches(warning).count(), 1, "{desktop}");
+            assert!(
+                details.contains(&format!("\nThe server {warning}.\n")),
+                "{details}"
+            );
+        }
+        // Listing pending approvals reads the stored request.
+        let stored: Summary =
+            serde_json::from_value(serde_json::to_value(&summary).unwrap()).unwrap();
+        assert_eq!(
+            stored.description(&crate::persistence::Domain::default(), str::to_owned),
+            details
+        );
+        // A preview changes nothing, so it warns of nothing.
+        request.copy.options.dry_run = true;
+        let preview = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
+        assert!(!preview
+            .description(&crate::persistence::Domain::default(), str::to_owned)
+            .contains("The server can"));
+        // A request stored before warnings existed still names permissions.
+        let released: Summary = serde_json::from_str(r#"{"id":"fixture","from":"server","expires_at":123,"notification":"off","destination":"backup","permission":"copy","max_bytes":100,"max_entries":10,"max_delete":0,"preserve_permissions":true}"#).unwrap();
+        assert!(released
+            .description(&crate::persistence::Domain::default(), str::to_owned)
+            .contains(&format!("The server {PERMISSIONS_WARNING}.")));
     }
 
     #[test]
@@ -1966,12 +2074,12 @@ mod tests {
             copy_notes(&request, false),
             [
                 "replaces existing files",
-                "deletes up to 3 files or folders"
+                "can delete up to 3 files or folders anywhere in the destination"
             ]
         );
         assert_eq!(
             copy_notes(&request, true),
-            ["deletes up to 3 files or folders"]
+            ["can delete up to 3 files or folders anywhere in the destination"]
         );
 
         let summary = Summary::new(
@@ -1984,7 +2092,7 @@ mod tests {
         )
         .unwrap();
         assert!(summary.desktop_description(false).ends_with(&format!(
-            "to\n\n    {}\n\nreplaces existing files\n\ndeletes up to 3 files or folders\n\nsyq cp file",
+            "to\n\n    {}\n\nreplaces existing files\n\ncan delete up to 3 files or folders anywhere in the destination\n\nsyq cp file",
             file.display()
         )));
         // Pruning is a sync, whichever way it goes.
