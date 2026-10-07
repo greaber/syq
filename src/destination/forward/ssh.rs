@@ -511,7 +511,7 @@ impl Receiver {
             let peer = Peer::resolve(&session.target, deadline, &cancelled)?;
             let encoded =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session.target.as_bytes());
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = crate::process::self_command()?;
             command.args(["--return-ssh-connect", &encoded]);
             let mut child = ForwardChild::spawn_command(command)?;
             let result = (|| {

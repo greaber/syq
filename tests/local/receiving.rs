@@ -2032,3 +2032,41 @@ fn receiving_daemon_survives_clients_closed_before_accept() {
     assert!(daemon.close().unwrap().success());
     assert!(!socket_path.exists());
 }
+
+/// On Linux, syq starts its background services from the running image
+/// through /proc/self/exe. They still show syq's name and path to ps, pgrep
+/// and pkill, as when started from the file.
+#[cfg(target_os = "linux")]
+#[test]
+fn background_provider_keeps_the_syq_process_name_and_path() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let _persistence = PersistenceOff(&t);
+    fs::create_dir_all(t.path("root")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["persist", "receive"])
+            .args(args)
+            .env("HOME", t.path(""))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .current_dir(t.path(""))
+            .capture_output()
+            .unwrap()
+    };
+    assert_output_ok(&run(&["on", "--root", "root", "--notify", "off"]));
+    let output = run(&["status", "--json"]);
+    assert_output_ok(&output);
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pid = status["provider"]["pid"].as_u64().unwrap();
+    assert_eq!(
+        fs::read_to_string(format!("/proc/{pid}/comm")).unwrap(),
+        "syq\n"
+    );
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+    assert_eq!(
+        cmdline.split(|byte| *byte == 0).next().unwrap(),
+        env!("CARGO_BIN_EXE_syq").as_bytes()
+    );
+}

@@ -16,7 +16,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -863,7 +863,7 @@ impl Started {
     }
 }
 fn spawn(control: &Path) -> Result<Started> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = crate::process::self_command()?;
     command
         .arg("--receive-service")
         .arg(control)
@@ -1064,6 +1064,10 @@ fn aggregate(profiles: &[ProfileStatus]) -> (String, ConnectionState) {
 // workers remain in the same process, preserving streams and pending approvals.
 fn apply_preferences(domain: &Domain, config: &Preferences) -> Result<()> {
     if config.enabled() {
+        // A provider from another build may not read these settings, and a
+        // profile turned off must still lose access. Stop it; persist receive
+        // on then starts one from this build, and off and remove leave none.
+        provider::stop_other_build(domain)?;
         provider::refresh(domain)?;
     } else {
         provider::stop(domain)?;
@@ -1378,9 +1382,6 @@ fn configure_profile(domain: &Domain, options: Configure) -> Result<Settings> {
     }
     drop(_lock);
     domain.enable()?;
-    // A provider from another build may reject these settings when refreshed.
-    // Stop it first; configure then starts one from this build.
-    provider::stop_other_build(domain)?;
     apply_preferences(domain, &preferences)?;
     Ok(config)
 }

@@ -640,3 +640,61 @@ fn fresh_destination_skips_descendant_lookups_under_copy_if() {
         );
     }
 }
+
+/// An upgrade or rebuild can replace syq's file while a copy runs. The local
+/// receiver then starts from the running image, not from the replaced path.
+#[cfg(target_os = "linux")]
+#[test]
+fn local_receiver_starts_from_the_running_build_after_its_file_is_replaced() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"contents");
+    let program = t.path("bin/syq");
+    fs::create_dir_all(t.path("bin")).unwrap();
+    executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &program, 0o755);
+    let errors = File::create(t.path("stderr")).unwrap();
+    // The coordinator reads the whole manifest before it starts the receiver.
+    let mut child = Command::new(&program)
+        .args(["cp", "--mapping", "-", "-C", "src", "--into", "dst", "-q"])
+        .current_dir(t.path(""))
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(errors)
+        .start()
+        .unwrap();
+    // Replace the file as a package upgrade or cargo rebuild does. Running the
+    // replacement instead of the original build would fail the copy.
+    let replacement = t.path("bin/replacement");
+    executable_support::write_executable(
+        &replacement,
+        b"#!/bin/sh\necho replaced build ran >&2\nexit 97\n",
+        0o755,
+    );
+    fs::rename(&replacement, &program).unwrap();
+    let mut manifest = child.stdin.take().unwrap();
+    manifest
+        .write_all(entry_line("file", "file", None).as_bytes())
+        .unwrap();
+    drop(manifest);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+            panic!(
+                "copy did not finish after its file was replaced: {}",
+                String::from_utf8_lossy(&read(&t.path("stderr")))
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "{status:?}: {}",
+        String::from_utf8_lossy(&read(&t.path("stderr")))
+    );
+    assert_eq!(read(&t.path("dst/file")), b"contents");
+}

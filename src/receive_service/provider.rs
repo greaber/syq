@@ -796,7 +796,7 @@ pub(super) fn ensure(domain: &Domain) -> Result<()> {
     }
     let (mut startup, child_output) = crate::process::with_inheritance_guard(UnixStream::pair)?;
     startup.set_read_timeout(Some(STOP_TIMEOUT))?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = crate::process::self_command()?;
     command
         .arg(INTERNAL)
         .arg(domain.runtime_path())
@@ -1761,5 +1761,31 @@ mod tests {
         configure_profile(&domain, Configure::default()).unwrap();
         assert_eq!(old.join().unwrap(), ["status", "stop"]);
         assert!(!is_running(&domain).unwrap());
+    }
+
+    #[test]
+    fn receive_off_and_remove_stop_a_provider_from_another_build() {
+        for action in [
+            Action::Off {
+                name: Some("first".into()),
+            },
+            Action::Remove {
+                name: "first".into(),
+            },
+        ] {
+            let (_directory, domain, _) = fixture();
+            let old = other_build_provider(&domain);
+            run_command(&domain, ReceiveCommand { action }).unwrap();
+            // The old provider can no longer serve the profile that was turned
+            // off or removed; no provider runs until persist receive on.
+            assert_eq!(old.join().unwrap(), ["status", "stop"]);
+            assert!(!is_running(&domain).unwrap());
+            let remaining = preferences(&domain).unwrap();
+            assert!(remaining
+                .profiles
+                .iter()
+                .all(|profile| profile.name != "first" || !profile.enabled));
+            assert!(remaining.enabled());
+        }
     }
 }

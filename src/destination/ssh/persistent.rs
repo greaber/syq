@@ -934,7 +934,7 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
     };
     let signals = foreground::Signals::new()?;
     let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
-    let mut process = Command::new(std::env::current_exe()?);
+    let mut process = crate::process::self_command()?;
     use std::os::unix::process::CommandExt as _;
     process
         .arg(INTERNAL)

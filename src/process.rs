@@ -22,6 +22,49 @@ pub(crate) fn with_inheritance_guard<T>(operation: impl FnOnce() -> T) -> T {
     operation()
 }
 
+/// A command that runs this same build again, for receivers, services and
+/// other internal modes. An upgrade or rebuild can replace the file at the
+/// path syq started from while it runs. On Linux, /proc/self/exe still names
+/// the running image; the child keeps the original path as argv[0], and
+/// `restore_self_started_name` keeps its process name. macOS has no
+/// equivalent, so there the child runs whatever file the path names now.
+pub(crate) fn self_command() -> std::io::Result<Command> {
+    let path = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let command = {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new("/proc/self/exe");
+        command.arg0(path);
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let command = Command::new(path);
+    Ok(command)
+}
+
+/// A process started through /proc/self/exe is named "exe" in ps and pgrep.
+/// Name it after its executable file, as an ordinary start would.
+#[cfg(target_os = "linux")]
+pub(crate) fn restore_self_started_name() {
+    use std::os::unix::ffi::OsStrExt;
+    if std::fs::read("/proc/self/comm").ok().as_deref() != Some(b"exe\n") {
+        return;
+    }
+    let Ok(path) = std::fs::read_link("/proc/self/exe") else {
+        return;
+    };
+    let Some(name) = path.file_name() else {
+        return;
+    };
+    // The link names a replaced or removed file with this suffix.
+    let name = name.as_bytes();
+    let name = name.strip_suffix(b" (deleted)").unwrap_or(name);
+    // The kernel keeps 15 bytes of a process name.
+    if let Ok(name) = std::ffi::CString::new(&name[..name.len().min(15)]) {
+        unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+    }
+}
+
 pub(crate) trait CommandExt {
     fn spawn_guarded(&mut self) -> std::io::Result<Child>;
     fn status_guarded(&mut self) -> std::io::Result<ExitStatus>;
