@@ -24,8 +24,9 @@ pub(crate) fn main() {
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
         && env::var("PROFILE").as_deref() == Ok("debug")
     {
-        println!("cargo::rustc-link-arg-bins=-no-pie");
-        println!("cargo::rustc-link-arg-tests=-no-pie");
+        // Not `-tests`: Cargo rejects it when the package has no test target,
+        // as in the real-SSH image's dependency stage.
+        println!("cargo::rustc-link-arg=-no-pie");
     }
     println!("cargo::rerun-if-env-changed=SYQ_RELEASE_BUILD");
     println!("cargo::rerun-if-env-changed=SYQ_HELPER_RELEASE");
