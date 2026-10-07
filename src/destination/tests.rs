@@ -1354,6 +1354,54 @@ fn named_inplace_copies_change_only_existing_files() {
     assert!(!root.join("source/b").exists());
 }
 
+/// A laptop download of one file with --as-new --inplace creates the file in
+/// place; the receiver allows only creating it. (A name that already exists
+/// is refused when the copy asks for approval.)
+#[test]
+fn named_as_new_inplace_files_are_created_only() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("file");
+    fs::write(&source, vec![5u8; 3 << 20]).unwrap();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    let copy = |name: &str| {
+        let command: Vec<Vec<u8>> = [
+            "cp",
+            "--src",
+            source.to_str().unwrap(),
+            "--to",
+            "@laptop",
+            "--as-new",
+            name,
+            "--tcp-ports",
+            "0-0",
+            "--inplace",
+            "--performance-tuning",
+            "workers=2",
+        ]
+        .iter()
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect();
+        let mut args = crate::approval_command::parse(&command).unwrap();
+        let (request, secret) = request(&args);
+        let policy = request.constraints.receipt_policy.clone();
+        let approved = approve(&registration, command, request);
+        args.locations.last_mut().unwrap().host = Some("server".into());
+        args.locations.last_mut().unwrap().path = approved.destination.clone();
+        args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));
+        args.named_receipt = Some(Arc::new(NamedReceipt {
+            connection: None,
+            secret,
+            approved,
+            policy,
+        }));
+        crate::transfer::run(args)
+    };
+    assert_eq!(copy("new").unwrap(), 0);
+    assert_eq!(fs::read(root.join("new")).unwrap(), vec![5u8; 3 << 20]);
+}
+
 #[test]
 fn named_authorization_expires_before_control_opens() {
     let temp = crate::test_support::tempdir().unwrap();

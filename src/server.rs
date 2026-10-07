@@ -1913,6 +1913,7 @@ fn drop_after_handling_for_test(request: &Request) -> bool {
             Request::ReadRange { .. } | Request::ReadComparedRange { .. }
         ),
         "write" => matches!(request, Request::WriteRange { .. }),
+        "prepare" => matches!(request, Request::Prepare { .. }),
         "finalize" => matches!(request, Request::Finalize { .. }),
         "patch-data" => matches!(request, Request::PatchData { .. }),
         _ => false,

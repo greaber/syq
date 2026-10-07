@@ -3389,30 +3389,45 @@ fn inplace_requests_carry_the_condition_their_existing_file_policy_needs() {
             .to_string()
     };
 
-    // Keeping existing files: only an exclusive create, and the receiver's
-    // exclusive create then refuses a file that is already there.
+    // Keeping existing files: only an exclusive create, whatever the sender
+    // asked, and the receiver's exclusive create then refuses a file that
+    // is already there.
     let keep = inplace(
         ExistingDestinationPolicy::Skip,
         DestinationPlacement::DirectoryContents,
         RootExistence::Any,
     );
-    let error = refused(&keep, "existing", Any);
-    assert!(
-        error.contains("must create it without replacing"),
-        "{error}"
-    );
-    let mut create_over = prepare("existing", Absent);
-    keep.authorize(&mut create_over, false).unwrap();
-    let response = crate::fsops::FsOps::new().handle_in_place(&mut create_over);
-    assert!(
-        matches!(
-            &response,
-            crate::proto::Response::EndpointError(_) | crate::proto::Response::Err(_)
-        ),
-        "{response:?}"
-    );
-    assert_eq!(fs::read(root.join("target/existing")).unwrap(), b"kept");
-    keep.authorize(&mut prepare("new", Absent), false).unwrap();
+    for condition in [
+        Any,
+        Absent,
+        Matches {
+            dev: existing.dev(),
+            ino: existing.ino(),
+        },
+    ] {
+        let mut create_over = prepare("existing", condition);
+        keep.authorize(&mut create_over, false).unwrap();
+        assert!(
+            matches!(
+                &create_over,
+                Request::Prepare {
+                    condition: Absent,
+                    ..
+                }
+            ),
+            "{condition:?}"
+        );
+        let response = crate::fsops::FsOps::new().handle_in_place(&mut create_over);
+        assert!(
+            matches!(
+                &response,
+                crate::proto::Response::EndpointError(_) | crate::proto::Response::Err(_)
+            ),
+            "{response:?}"
+        );
+        assert_eq!(fs::read(root.join("target/existing")).unwrap(), b"kept");
+    }
+    keep.authorize(&mut prepare("new", Any), false).unwrap();
 
     // Changing existing files only: exactly the file the receiver observes.
     let update = inplace(

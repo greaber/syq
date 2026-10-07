@@ -1435,33 +1435,34 @@ impl RestrictedAuthority {
     pub(super) fn constrain_inplace(
         &self,
         path: &[u8],
-        condition: &proto::TargetCondition,
+        condition: &mut proto::TargetCondition,
         pending: &mut Vec<PendingCreation>,
     ) -> Result<()> {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
-        if self.created_by_this_grant(path) {
-            return Ok(());
-        }
+        let own = self.created_by_this_grant(path);
         let label = String::from_utf8_lossy(path);
         let root_must_be_new =
             self.root_existence == RootExistence::New && path == self.destination;
         match self.copy.policy.existing {
             ExistingDestinationPolicy::Replace if !root_must_be_new => {}
             ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip => {
-                if *condition != Absent {
-                    bail!(
-                        "in-place preparation of {label} must create it without replacing anything, as the signed existing-object policy requires"
-                    );
+                // The file may only be created: the receiver creates it
+                // exclusively, or reopens the one this copy created there
+                // for an earlier attempt, whatever the sender asked. A
+                // coordinator does not ask this of a new `--as-new` file.
+                *condition = Absent;
+                // Once created, the file is this grant's own: its metadata
+                // may follow.
+                if !own {
+                    pending.push(PendingCreation {
+                        index: 0,
+                        path: path.to_vec(),
+                        persist: true,
+                        link: false,
+                    });
                 }
-                // Once created, the file is this grant's own: its retries
-                // and metadata may follow.
-                pending.push(PendingCreation {
-                    index: 0,
-                    path: path.to_vec(),
-                    persist: true,
-                    link: false,
-                });
             }
+            ExistingDestinationPolicy::MustExist if own => {}
             ExistingDestinationPolicy::MustExist => {
                 let Some(metadata) = self.rooted_metadata(path)? else {
                     bail!("signed grant creates nothing: {label} does not exist")

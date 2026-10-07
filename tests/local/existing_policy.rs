@@ -323,3 +323,52 @@ fn inplace_files_open_their_names_as_the_existing_file_policy_requires() {
     assert!(!refused.status.success(), "{refused:?}");
     assert_eq!(read(&t.path("dst/a")), b"new a");
 }
+
+/// An `--as-new --inplace` file whose worker connection is lost, right after
+/// its preparation or after its first write, is finished through a new
+/// receiver process: an ordinary receiver gets no create-only condition
+/// for it, as on `master`, so the new process simply reopens the file.
+#[test]
+fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
+    for request in ["prepare", "write"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        fs::create_dir(t.path("remote-home")).unwrap();
+        let data = prng(4 << 20, 61);
+        write(&t.path("src/file"), &data);
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args([
+                "--no-tcp",
+                "--no-progress",
+                "--inplace",
+                "--performance-tuning",
+                "workers=1,copy-path=ranges,request-size=1M",
+            ])
+            .arg(t.path("src/file"))
+            .args(["--to", "fake", "--as-new"])
+            .arg(t.path("dst"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DROP_AFTER_REQUEST", request)
+            .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
+            .run()
+            .unwrap();
+        assert!(
+            t.path("dropped").exists(),
+            "{request}: no connection was lost"
+        );
+        assert_output_ok(&output);
+        assert!(read(&t.path("dst")) == data, "{request}");
+        // The control session, the first worker and its replacement.
+        let sessions = fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(sessions, 3, "{request}");
+    }
+}
