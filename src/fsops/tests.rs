@@ -1308,11 +1308,14 @@ fn ancestry_requires_an_available_source_directory() {
     )
     .unwrap();
     let check = || {
-        ops.check_operator_directory_ancestry(&[DirectoryAncestryCheck {
-            source_root: ticket.clone(),
-            source_is_directory: true,
-            suffixes: vec![Vec::new()],
-        }])
+        ops.check_operator_directory_ancestry(
+            &[DirectoryAncestryCheck {
+                source_root: ticket.clone(),
+                source_is_directory: true,
+                suffixes: vec![Vec::new()],
+            }],
+            None,
+        )
     };
     assert_eq!(check().unwrap(), vec![vec![DirectoryRelation::Same]]);
 
@@ -8101,4 +8104,183 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
         fs::metadata(&target).unwrap().mode() & 0o7777,
         0o444 & !crate::fsops::limits::process_umask()
     );
+}
+
+#[test]
+fn temporary_search_access_restores_retained_inode_after_rename() {
+    if is_superuser() {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let selected = temp.path().join("selected");
+    let moved = temp.path().join("moved");
+    fs::create_dir(&selected).unwrap();
+    let file = File::open(&selected).unwrap();
+    fs::set_permissions(&selected, fs::Permissions::from_mode(0o600)).unwrap();
+    {
+        let mut access = TemporaryDirectorySearchAccess::new(true, None);
+        access.prepare(&file).unwrap();
+        assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o700);
+        fs::rename(&selected, &moved).unwrap();
+        fs::create_dir(&selected).unwrap();
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o711)).unwrap();
+    }
+    assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&selected).unwrap().mode() & 0o777, 0o711);
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn ancestry_access_restores_after_request_error() {
+    if is_superuser() {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let session = DescriptorSessionSlot::default();
+    let ticket = session.register(File::open(&source).unwrap()).unwrap();
+    let mut ops = FsOps::new();
+    ops.check_operator_directory(
+        destination.as_os_str().as_bytes(),
+        false,
+        OperatorSymlinkPolicy::Refuse,
+    )
+    .unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = ops.check_operator_directory_ancestry(
+        &[DirectoryAncestryCheck {
+            source_root: ticket,
+            source_is_directory: true,
+            suffixes: vec![Vec::new(), b"invalid\0suffix".to_vec()],
+        }],
+        Some(true),
+    );
+    assert!(result.unwrap_err().to_string().contains("NUL"));
+    assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o600);
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The parent of an exact placement, or the nearest existing ancestor of a
+/// missing destination, lies outside the copy: ancestry access never widens
+/// it, while a directory inside the copy gains search only until the reply.
+#[test]
+fn ancestry_access_widens_only_directories_inside_the_copy() {
+    if is_superuser() {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let parent = temp.path().join("parent");
+    let copied = parent.join("copied");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&copied).unwrap();
+    let session = DescriptorSessionSlot::default();
+    let ticket = session.register(File::open(&source).unwrap()).unwrap();
+    let check = |selected: &Path, suffix: &[u8], selection_in_copy: bool| {
+        let mut ops = FsOps::new();
+        ops.check_operator_directory(
+            selected.as_os_str().as_bytes(),
+            true,
+            OperatorSymlinkPolicy::Refuse,
+        )?;
+        ops.check_operator_directory_ancestry(
+            &[DirectoryAncestryCheck {
+                source_root: ticket.clone(),
+                source_is_directory: true,
+                suffixes: vec![suffix.to_vec()],
+            }],
+            Some(selection_in_copy),
+        )
+    };
+    for (selected, suffix, selection_in_copy, succeeds) in [
+        // Exact placement of parent/copied: the parent is not widened.
+        (parent.clone(), b"copied".as_slice(), false, false),
+        // A missing destination beneath parent: its parent is not widened,
+        // whether selection or the ancestry walk meets it first.
+        (parent.join("missing"), b"".as_slice(), true, false),
+        (parent.clone(), b"missing".as_slice(), false, false),
+        // The container itself is in the copy.
+        (parent.clone(), b"".as_slice(), true, true),
+    ] {
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(&parent).unwrap();
+        let result = check(&selected, suffix, selection_in_copy);
+        let after = fs::metadata(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.is_ok(), succeeds, "{selected:?} {result:?}");
+        assert_eq!(after.mode() & 0o777, 0o600);
+        if !succeeds {
+            assert!(error_is_kind(
+                &result.unwrap_err(),
+                io::ErrorKind::PermissionDenied
+            ));
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec())
+            );
+        }
+    }
+    // Inside the copy, an unsearchable destination directory is widened
+    // only while its ancestry is checked.
+    fs::set_permissions(&copied, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = check(&parent, b"copied", false);
+    let after = fs::metadata(&copied).unwrap();
+    fs::set_permissions(&copied, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(result.unwrap(), vec![vec![DirectoryRelation::Separate]]);
+    assert_eq!(after.mode() & 0o777, 0o600);
+}
+
+#[test]
+fn searchable_destination_selection_checks_kernel_access_without_chmod() {
+    if is_superuser() {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let destination = temporary.path().join("selected");
+    fs::create_dir(&destination).unwrap();
+    for mode in [0o100, 0o300, 0o500, 0o600, 0o400] {
+        fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
+        let before = fs::metadata(&destination).unwrap();
+        let mut ops = FsOps::new();
+        let response = ops.handle(&Request::CheckSearchableOperatorDirectory {
+            path: path_bytes(&destination),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        });
+        assert_eq!(
+            matches!(response, Response::DirectorySelection(Some(_))),
+            mode & 0o100 != 0,
+            "mode {mode:o}: {response:?}"
+        );
+        assert_eq!(ops.operator_selection.is_some(), mode & 0o100 != 0);
+        let after = fs::metadata(&destination).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+    }
+    // Native copies can still select a readable unsearchable root.
+    assert!(matches!(
+        FsOps::new().handle(&Request::CheckOperatorDirectory {
+            path: path_bytes(&destination),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        }),
+        Response::DirectorySelection(Some(_))
+    ));
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+    let link = temporary.path().join("link");
+    std::os::unix::fs::symlink(&destination, &link).unwrap();
+    assert!(!matches!(
+        FsOps::new().handle(&Request::CheckSearchableOperatorDirectory {
+            path: path_bytes(&link),
+            allow_missing: false,
+            symlink_policy: OperatorSymlinkPolicy::Refuse,
+        }),
+        Response::DirectorySelection(_)
+    ));
 }

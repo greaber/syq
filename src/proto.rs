@@ -1357,6 +1357,21 @@ pub enum WireRequest<Data> {
         remember: bool,
         guard: Option<ContainerGuard>,
     },
+    /// Ancestry validation that may briefly add owner search permission to
+    /// owned directories it must enter. With `selection_in_copy` false, the
+    /// selected directory is the parent of an exact placement and keeps its
+    /// mode. The receiver restores modes before returning DirectoryRelations.
+    CheckOperatorDirectoryAncestryWithAccess {
+        checks: Vec<DirectoryAncestryCheck>,
+        selection_in_copy: bool,
+    },
+    /// Select an operator directory and require kernel-checked search access.
+    /// rsync enters its destination before changing any copied directories.
+    CheckSearchableOperatorDirectory {
+        path: PathBytes,
+        allow_missing: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

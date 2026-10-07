@@ -762,8 +762,12 @@ fn temporary_directory_permissions_restore_after_copy_failure() {
     assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
 }
 
+/// The option widens the destination directory a file is copied into, but
+/// never the parent of an exact placement: that directory lies outside the
+/// copy, so the copy fails and the parent keeps its mode and change time.
 #[test]
 fn explicit_directory_access_covers_file_destination_containers() {
+    let root = unsafe { libc::geteuid() } == 0;
     let modes: &[u32] = if cfg!(target_os = "macos") {
         &[0o500, 0o600]
     } else {
@@ -777,6 +781,7 @@ fn explicit_directory_access_covers_file_destination_containers() {
                 write(&t.path("src/file"), &data);
                 fs::create_dir(t.path("dst")).unwrap();
                 fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(mode)).unwrap();
+                let before = fs::metadata(t.path("dst")).unwrap();
                 let destination = if placement == "--into" {
                     "dst"
                 } else {
@@ -789,15 +794,64 @@ fn explicit_directory_access_covers_file_destination_containers() {
                     placement,
                     &t.s(destination),
                 ]);
-                let final_mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+                let after = fs::metadata(t.path("dst")).unwrap();
                 fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
-                assert!(
-                    out.status.success(),
-                    "mode {mode:o}, {placement}, size {size}: {out:?}"
-                );
-                assert_eq!(final_mode, mode);
-                assert_eq!(read(&t.path("dst/file")), data);
+                let case = format!("mode {mode:o}, {placement}, size {size}");
+                assert_eq!(after.mode() & 0o777, mode, "{case}");
+                if placement == "--into" || root {
+                    assert!(out.status.success(), "{case}: {out:?}");
+                    assert_eq!(read(&t.path("dst/file")), data);
+                } else {
+                    assert!(!out.status.success(), "{case}: {out:?}");
+                    assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+                    assert_eq!(
+                        (after.ctime(), after.ctime_nsec()),
+                        (before.ctime(), before.ctime_nsec()),
+                        "{case}"
+                    );
+                    assert!(!t.path("dst/file").exists(), "{case}");
+                }
             }
+        }
+    }
+}
+
+#[test]
+fn directory_access_does_not_widen_ancestors_of_a_destination_container() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for interface in ["cp", "rsync"] {
+        for dry_run in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"new contents");
+            write(&t.path("parent/dst/sentinel"), b"keep contents");
+            fs::set_permissions(t.path("parent"), fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::metadata(t.path("parent")).unwrap();
+            let src = t.s("src/file");
+            let dst = t.s("parent/dst/");
+            let mut args = vec![interface];
+            if interface == "cp" {
+                args.extend(["--temporarily-widen-dir-permissions", &src, "--into", &dst]);
+            } else {
+                args.extend([src.as_str(), dst.as_str()]);
+            }
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = native_syq(&args);
+            let after = fs::metadata(t.path("parent")).unwrap();
+            fs::set_permissions(t.path("parent"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!out.status.success(), "{interface}, dry={dry_run}: {out:?}");
+            assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+            assert_eq!(after.mode() & 0o777, 0o600);
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec()),
+                "{interface}, dry={dry_run}: the ancestor must not be chmodded"
+            );
+            assert_eq!(read(&t.path("parent/dst/sentinel")), b"keep contents");
+            assert!(!t.path("parent/dst/file").exists());
         }
     }
 }
@@ -1037,6 +1091,453 @@ fn inplace_small_files_write_before_cutting_and_keep_old_data_on_failure() {
             assert!(read(&t.path("dst/file")) == *expected, "{context}");
             assert_eq!(fs::metadata(t.path("dst/file")).unwrap().ino(), inode);
             assert!(partial_files(&t.0).is_empty(), "{context}");
+        }
+    }
+}
+
+/// A tree's own destination root is part of the copy: with the option, a live
+/// copy can enter, fill and prune an owned root without search permission and
+/// restores its mode, unless copied permissions take precedence.
+#[test]
+fn explicit_directory_access_covers_tree_roots() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for placement in ["contents", "as", "into"] {
+        for pruning in [None, Some("--prune"), Some("--prune-before")] {
+            let t = Tmp::new();
+            write(&t.path("src/sub/file"), b"new contents");
+            write(&t.path("src/existing"), b"changed contents");
+            let copied = if placement == "into" {
+                "dst/src"
+            } else {
+                "dst"
+            };
+            write(&t.path(&format!("{copied}/extra")), b"extra");
+            write(&t.path(&format!("{copied}/existing")), b"old");
+            fs::set_permissions(
+                t.path(&format!("{copied}/existing")),
+                fs::Permissions::from_mode(0o400),
+            )
+            .unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+            let src = t.s("src");
+            let dst = t.s("dst");
+            let mut args = vec![
+                "cp",
+                "--temporarily-widen-dir-permissions",
+                "--copy-metadata=permissions",
+            ];
+            match placement {
+                "contents" => args.extend(["--srcs-in", &src, "--into", &dst]),
+                "as" => args.extend([&src, "--as", &dst]),
+                _ => args.extend([&src, "--into", &dst]),
+            }
+            args.extend(pruning);
+            let out = native_syq(&args);
+            let mode = fs::metadata(t.path("dst")).unwrap().mode() & 0o777;
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_output_ok(&out);
+            if placement == "into" {
+                assert_eq!(mode, 0o600, "{placement}, {pruning:?}");
+            }
+            assert_eq!(
+                read(&t.path(&format!("{copied}/sub/file"))),
+                b"new contents"
+            );
+            assert_eq!(
+                t.path(&format!("{copied}/extra")).exists(),
+                pruning.is_none()
+            );
+            assert_eq!(
+                read(&t.path(&format!("{copied}/existing"))),
+                b"changed contents"
+            );
+        }
+    }
+}
+
+/// --if-exists=keep honors the option: it adds new entries to a read-only
+/// directory, keeps existing files and restores the mode.
+#[test]
+fn keep_existing_policy_honors_temporary_directory_access() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for widen in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/sub/new"), b"new contents");
+        write(&t.path("src/sub/kept"), b"source contents");
+        write(&t.path("dst/sub/kept"), b"destination contents");
+        fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o500)).unwrap();
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec!["cp", "--if-exists=keep", "--srcs-in", &src, "--into", &dst];
+        if widen {
+            args.push("--temporarily-widen-dir-permissions");
+        }
+        let out = native_syq(&args);
+        let mode = fs::metadata(t.path("dst/sub")).unwrap().mode() & 0o777;
+        fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode, 0o500, "widen={widen}");
+        assert_eq!(read(&t.path("dst/sub/kept")), b"destination contents");
+        if widen {
+            assert_output_ok(&out);
+            assert_eq!(read(&t.path("dst/sub/new")), b"new contents");
+        } else {
+            assert_eq!(out.status.code(), Some(23), "{out:?}");
+            assert!(
+                stderr_of(&out).contains("--temporarily-widen-dir-permissions"),
+                "{out:?}"
+            );
+            assert!(!t.path("dst/sub/new").exists());
+        }
+    }
+}
+
+#[test]
+fn ancestry_rejection_restores_search_permission() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for dry_run in [false, true] {
+        for widen in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"source contents");
+            write(&t.path("src/dst/keep"), b"existing contents");
+            fs::set_permissions(t.path("src/dst"), fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::metadata(t.path("src/dst")).unwrap();
+            let src = t.s("src");
+            let dst = t.s("src/dst");
+            let mut args = vec!["cp", "--srcs-in", &src, "--into", &dst];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            if widen {
+                args.push("--temporarily-widen-dir-permissions");
+            }
+            let out = native_syq(&args);
+            let after = fs::metadata(t.path("src/dst")).unwrap();
+            fs::set_permissions(t.path("src/dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!out.status.success(), "{out:?}");
+            assert_eq!(after.mode() & 0o777, 0o600);
+            if widen && !dry_run {
+                assert!(stderr_of(&out).contains("maps inside source"), "{out:?}");
+            } else {
+                assert_eq!(
+                    (before.ctime(), before.ctime_nsec()),
+                    (after.ctime(), after.ctime_nsec())
+                );
+            }
+            assert_eq!(read(&t.path("src/dst/keep")), b"existing contents");
+            assert!(!t.path("src/dst/file").exists());
+        }
+    }
+}
+
+#[test]
+fn destination_widening_does_not_change_source_permissions() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for dry_run in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"source contents");
+        fs::create_dir(t.path("dst")).unwrap();
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(t.path("src")).unwrap();
+        let src = t.s("src");
+        let dst = t.s("dst");
+        let mut args = vec![
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = native_syq(&args);
+        let after = fs::metadata(t.path("src")).unwrap();
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec())
+        );
+        assert!(!t.path("dst/file").exists());
+    }
+}
+
+#[test]
+fn dry_run_compares_requested_modes_with_original_directory_permissions() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for source_mode in [0o500, 0o700] {
+        let t = Tmp::new();
+        fs::create_dir(t.path("src")).unwrap();
+        fs::create_dir(t.path("dst")).unwrap();
+        for (path, mode) in [("src", source_mode), ("dst", 0o500)] {
+            timestamp(&t.path(path), 1_700_000_000, 0);
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args([
+                "cp",
+                &t.s("src"),
+                "--as",
+                &t.s("dst"),
+                "--dry-run",
+                "-v",
+                "--temporarily-widen-dir-permissions",
+                "--copy-metadata=permissions",
+            ])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).contains("requested directory metadata differs"),
+            source_mode != 0o500,
+            "{out:?}"
+        );
+        assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
+        fs::set_permissions(t.path("src"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// Dry runs never change permissions, native or rsync, with or without the
+/// option: every mode and change time stays as it was, whatever the preview
+/// could or could not inspect.
+#[test]
+fn dry_runs_never_change_directory_permissions() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for restricted in ["dst", "dst/sub"] {
+        for mode in [0o000, 0o100, 0o300, 0o400, 0o500, 0o600] {
+            for selection in [
+                "single",
+                "tree",
+                "contents",
+                "prune",
+                "rsync",
+                "rsync-prune",
+                "files-from",
+            ] {
+                for widen in [false, true] {
+                    if widen && (selection.starts_with("rsync") || selection == "files-from") {
+                        continue;
+                    }
+                    let t = Tmp::new();
+                    write(&t.path("src/sub/file"), b"new");
+                    write(&t.path("dst/sub/file"), b"old");
+                    write(&t.path("dst/sub/extra"), b"extra");
+                    write(&t.path("manifest"), b"sub/file\n");
+                    let path = t.path(restricted);
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                    let before = fs::metadata(&path).unwrap();
+                    let src = t.s("src");
+                    let src_contents = format!("{}/", t.s("src"));
+                    let dst = t.s("dst");
+                    let manifest = t.s("manifest");
+                    let source_file = t.s("src/sub/file");
+                    let destination_file = t.s("dst/sub/file");
+                    let mut args = vec!["cp", "--dry-run"];
+                    if widen {
+                        args.push("--temporarily-widen-dir-permissions");
+                    }
+                    match selection {
+                        "single" => args.extend([&source_file, "--as", &destination_file]),
+                        "tree" => args.extend([&src, "--as", &dst]),
+                        "contents" => args.extend(["--srcs-in", &src, "--into", &dst]),
+                        "prune" => args.extend(["--srcs-in", &src, "--into", &dst, "--prune"]),
+                        "rsync" => args = vec!["rsync", "-rn", &src_contents, &dst],
+                        "rsync-prune" => {
+                            args = vec!["rsync", "-rn", "--delete", &src_contents, &dst]
+                        }
+                        _ => args = vec!["rsync", "-rn", "--files-from", &manifest, &src, &dst],
+                    }
+                    let output = native_syq(&args);
+                    let after = fs::metadata(&path).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                    let case =
+                        format!("{restricted} {mode:o}, {selection}, widen={widen}: {output:?}");
+                    assert_eq!(after.mode(), before.mode(), "{case}");
+                    assert_eq!(
+                        (after.ctime(), after.ctime_nsec()),
+                        (before.ctime(), before.ctime_nsec()),
+                        "{case}"
+                    );
+                    assert_eq!(read(&t.path("dst/sub/file")), b"old", "{case}");
+                    assert_eq!(
+                        listing(&t.path("dst")),
+                        ["sub", "sub/extra", "sub/file"],
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Observed with upstream rsync 3.2.7 and 3.5.1 as a non-root owner.
+#[test]
+fn rsync_single_file_does_not_widen_its_destination_container() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for mode in [0o100, 0o300, 0o500] {
+        for dry_run in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"new contents");
+            write(&t.path("dst/file"), b"old");
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(mode)).unwrap();
+            let before = fs::metadata(t.path("dst")).unwrap();
+            let src = t.s("src/file");
+            let dst = t.s("dst/");
+            let mut args = vec!["-a", &src, &dst];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = syq(&args);
+            let after = fs::metadata(t.path("dst")).unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            let writable = mode & 0o200 != 0;
+            assert_eq!(
+                out.status.code(),
+                Some(if dry_run || writable { 0 } else { 23 }),
+                "{mode:o}, dry={dry_run}: {out:?}"
+            );
+            assert_eq!(after.mode(), before.mode());
+            if dry_run || !writable {
+                assert_eq!(
+                    (after.ctime(), after.ctime_nsec()),
+                    (before.ctime(), before.ctime_nsec())
+                );
+            }
+            assert_eq!(
+                read(&t.path("dst/file")),
+                if dry_run || !writable {
+                    b"old".as_slice()
+                } else {
+                    b"new contents".as_slice()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn rsync_refuses_unsearchable_destination_roots_without_chmod() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for selection in ["single", "contents", "files-from"] {
+        for dry_run in [false, true] {
+            let t = Tmp::new();
+            write(&t.path("src/file"), b"new contents");
+            write(&t.path("dst/file"), b"old");
+            write(&t.path("list"), b"file\n");
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+            let before = fs::metadata(t.path("dst")).unwrap();
+            let src = t.s(if selection == "single" {
+                "src/file"
+            } else {
+                "src/"
+            });
+            let dst = t.s("dst/");
+            let list = t.s("list");
+            let mut args = vec!["-a", &src, &dst];
+            if selection == "files-from" {
+                args.extend(["--files-from", &list]);
+            }
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = syq(&args);
+            let after = fs::metadata(t.path("dst")).unwrap();
+            fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!out.status.success(), "{selection}, dry={dry_run}: {out:?}");
+            assert!(stderr_of(&out).contains("Permission denied"), "{out:?}");
+            assert_eq!(after.mode(), before.mode());
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec())
+            );
+            assert_eq!(read(&t.path("dst/file")), b"old");
+        }
+    }
+}
+
+#[test]
+fn rsync_widens_copied_directories_but_never_during_previews() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Both releases widen implied --files-from parents. With a read-only
+    // copied directory lacking search access, 3.5.1 also completes without
+    // 3.2.7's late cleanup error. Follow the current release for that case.
+    for selection in ["named", "files-from"] {
+        for mode in [0o400, 0o500] {
+            for preserve in [false, true] {
+                for dry_run in [false, true] {
+                    let t = Tmp::new();
+                    write(&t.path("src/sub/file"), b"new contents");
+                    write(&t.path("dst/sub/file"), b"old");
+                    write(&t.path("list"), b"sub/file\n");
+                    fs::set_permissions(t.path("src/sub"), fs::Permissions::from_mode(0o750))
+                        .unwrap();
+                    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(mode))
+                        .unwrap();
+                    let before = fs::metadata(t.path("dst/sub")).unwrap();
+                    let src = t.s(if selection == "named" {
+                        "src/sub"
+                    } else {
+                        "src/"
+                    });
+                    let dst = t.s("dst/");
+                    let list = t.s("list");
+                    let mut args = vec![if preserve { "-a" } else { "-r" }, &src, &dst];
+                    if selection == "files-from" {
+                        args.extend(["--files-from", &list]);
+                    }
+                    if dry_run {
+                        args.push("--dry-run");
+                    }
+                    let out = syq(&args);
+                    let after = fs::metadata(t.path("dst/sub")).unwrap();
+                    fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    assert_eq!(
+                        out.status.success(),
+                        !dry_run || mode & 0o100 != 0,
+                        "{selection}, {mode:o}, preserve={preserve}, dry={dry_run}: {out:?}"
+                    );
+                    assert_eq!(
+                        after.mode() & 0o777,
+                        if preserve && !dry_run { 0o750 } else { mode }
+                    );
+                    if dry_run {
+                        assert_eq!(
+                            (after.ctime(), after.ctime_nsec()),
+                            (before.ctime(), before.ctime_nsec())
+                        );
+                    }
+                    assert_eq!(
+                        read(&t.path("dst/sub/file")),
+                        if dry_run {
+                            b"old".as_slice()
+                        } else {
+                            b"new contents".as_slice()
+                        }
+                    );
+                }
+            }
         }
     }
 }

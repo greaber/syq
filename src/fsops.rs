@@ -935,9 +935,25 @@ impl FsOps {
         Ok(anchor)
     }
 
+    fn check_searchable_operator_directory(
+        &mut self,
+        path: &[u8],
+        allow_missing: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    ) -> Result<Option<DirectoryAnchor>> {
+        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
+        // Looking up "." through the retained handle asks the kernel about
+        // search permission, including ACLs and the receiving user's identity.
+        open_operator_directory_at(&selection.directory, b".")
+            .context("search selected destination directory")?;
+        self.operator_selection = Some(selection);
+        Ok(anchor)
+    }
+
     fn check_operator_directory_ancestry(
         &self,
         checks: &[DirectoryAncestryCheck],
+        access: Option<bool>,
     ) -> Result<Vec<Vec<DirectoryRelation>>> {
         if checks.len() > DEFAULT_MAX_ROOTS {
             bail!(
@@ -960,7 +976,17 @@ impl FsOps {
             };
             &registered_selection
         };
-        checks
+        // With `access`, owned directories the walk must enter may gain owner
+        // search permission until this reply; the value says whether the
+        // selected directory itself belongs to the copy.
+        let mut temporary = match access {
+            Some(selection_in_copy) => TemporaryDirectorySearchAccess::new(
+                true,
+                selection.protected_identity(selection_in_copy)?,
+            ),
+            None => TemporaryDirectorySearchAccess::default(),
+        };
+        let relations = checks
             .iter()
             .map(|check| {
                 if !check.source_root.is_directory() {
@@ -972,7 +998,11 @@ impl FsOps {
                     .suffixes
                     .iter()
                     .map(|suffix| {
-                        let relation = selection.relation_to_source(&source, suffix)?;
+                        let relation = selection.relation_to_source_with_access(
+                            &source,
+                            suffix,
+                            &mut temporary,
+                        )?;
                         Ok(if check.source_is_directory {
                             relation
                         } else {
@@ -985,7 +1015,11 @@ impl FsOps {
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        match (relations, temporary.restore()) {
+            (_, Err(error)) => Err(error),
+            (relations, Ok(())) => relations,
+        }
     }
 
     fn create_operator_directory(
@@ -2436,6 +2470,8 @@ impl FsOps {
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
+            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
+            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }

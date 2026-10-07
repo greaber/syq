@@ -102,6 +102,8 @@ impl Conn for LocalConn {
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
+                    | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
+                    | Request::CheckSearchableOperatorDirectory { .. }
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }

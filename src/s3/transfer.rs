@@ -468,10 +468,10 @@ impl Engine {
                 .store(plan.iter().map(|s| s.size).sum(), Relaxed);
             self.progress.scan_done.store(true, Relaxed);
             let directories = Arc::new(Directories::new(&plan)?);
+            // Dry runs never change permissions. --if-exists=keep widens like
+            // any other policy; it only leaves existing directory metadata alone.
             let mut directory_access = directory_permissions::TemporaryAccess::new(
-                self.args.temporarily_widen_dir_permissions
-                    && !self.args.dry_run
-                    && !self.args.only_new_native_entries(),
+                self.args.temporarily_widen_dir_permissions && !self.args.dry_run,
             );
             let mut copies_finished = false;
             let transferred = async {
@@ -498,7 +498,6 @@ impl Engine {
                         }
                         .map_err(|error| {
                             if !engine.args.temporarily_widen_dir_permissions
-                                && !engine.args.only_new_native_entries()
                                 && error.chain().any(|cause| {
                                     cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
                                         e.kind() == std::io::ErrorKind::PermissionDenied

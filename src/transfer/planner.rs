@@ -370,6 +370,19 @@ impl Deletes {
     }
 }
 
+impl Drop for Planner<'_> {
+    fn drop(&mut self) {
+        // Early setup, planning or pruning errors must not bypass permission
+        // restoration. Normal completion has already restored these.
+        if !self.directory_restorations.is_empty() {
+            if let Err(error) = self.apply_deferred(true) {
+                self.progress
+                    .error(&format!("syq: restore directory permissions: {error:#}"));
+            }
+        }
+    }
+}
+
 impl Planner<'_> {
     pub(super) fn record_fresh_entry(
         &mut self,
@@ -1656,8 +1669,7 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
-            if opts.widen_directory_permissions
-                && !opts.dry_run
+            if opts.may_widen_directory_permissions()
                 && stats
                     .iter()
                     .flatten()
@@ -4061,10 +4073,7 @@ impl Planner<'_> {
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.widen_directory_permissions
-            || self.opts.dry_run
-            || self.opts.preserve_existing_directory_metadata
-        {
+        if !self.opts.may_widen_directory_permissions() {
             return Ok(());
         }
         self.assert_mutation_root()?;
@@ -4175,7 +4184,9 @@ impl Planner<'_> {
         } else {
             flags::RECEIVER_MODE
         };
-        let mut remaining = std::mem::take(&mut self.directory_restorations);
+        // Keep each saved mode until its restoration succeeds, so that an
+        // early error still restores it when the planner is dropped.
+        let mut remaining = self.directory_restorations.clone();
         for (path, meta, flags, _, condition) in &mut d {
             if let Some(saved) = remaining.remove(path) {
                 if *flags & (flags::MODE | flags::RECEIVER_MODE) == 0 {
@@ -4231,6 +4242,8 @@ impl Planner<'_> {
                         .then(|| strip_dst_root(path, &self.dst_root))
                         .flatten();
                     self.report_metadata_failure(dst, DeclaredKind::Dir, &error);
+                } else {
+                    self.directory_restorations.remove(path);
                 }
             }
             if let Some(error) = capacity_error {

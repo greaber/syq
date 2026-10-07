@@ -1903,6 +1903,7 @@ fn existing_destination_setup_pipelines_and_drains_failures() {
             OperatorSymlinkPolicy::FollowAll,
             &entry,
             path.to_vec(),
+            false,
         );
         // Unavailable filesystem counters are advisory, as before.
         assert_eq!(result.is_ok(), fail_at.is_none() || fail_at == Some(1));
@@ -1947,6 +1948,7 @@ fn existing_destination_setup_rejects_replaced_inode_without_writes() {
         OperatorSymlinkPolicy::FollowAll,
         &entry,
         path.to_vec(),
+        false,
     );
     assert!(result.is_err());
     assert_eq!(conn.received, 3);

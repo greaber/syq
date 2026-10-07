@@ -428,12 +428,17 @@ Existing files and directories keep their destination permissions unless you
 request permission or ACL metadata. Native `cp` does not automatically widen
 existing directory permissions to make copying or pruning succeed, even when
 copying permission metadata. The requested final permissions still apply.
-`--temporarily-widen-dir-permissions` allows adding owner read, write and search
-permission to existing directories being copied into, when the receiving user owns them.
-Syq restores only directories it actually widened, after copying and pruning;
-explicitly requested permissions take precedence. Other processes can see the
-temporary permissions, and a crash or forced termination can leave them in place.
-`syq rsync` enables temporary widening without this option. Root skips widening.
+`--temporarily-widen-dir-permissions` lets syq briefly add owner read, write and
+search permission to existing directories you own inside the copy: the
+destination directory and the directories beneath it that the copy fills, also
+with `--if-exists=keep`. It never changes a directory above the copy, such as
+the parent of an `--as` target, and dry runs never change permissions. Syq puts
+back each directory's exact mode after its checks and after copying and pruning,
+also when the copy fails; explicitly requested permissions take precedence.
+Other processes can see the temporary permissions, and a crash or forced
+termination can leave them in place. `syq rsync` widens the directories its
+file list includes without this option; see [rsync compatibility](rsync-compat.md).
+Root skips widening.
 
 New files use the source read, write, and execute permissions, limited by the
 umask, or by the directory's default ACL if it has one.

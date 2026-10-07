@@ -1841,8 +1841,13 @@ fn copy_error_message(error: &anyhow::Error, may_widen: bool) -> String {
 }
 
 impl Opts {
+    /// Dry runs never change permissions, with or without the option.
+    fn may_widen_directory_permissions(&self) -> bool {
+        self.widen_directory_permissions && !self.dry_run
+    }
+
     fn may_suggest_directory_access(&self) -> bool {
-        !self.widen_directory_permissions && !self.preserve_existing_directory_metadata
+        !self.widen_directory_permissions
     }
 
     fn wire_error_message(&self, error: &WireError) -> String {
@@ -3133,6 +3138,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             opts.operator_symlink_policy,
             dst_root_entry.as_ref().expect("existing destination"),
             request_prefix.clone(),
+            opts.rsync_creation,
         )?;
         prepared_anchor = Some(anchor);
         prepared_filesystem = Some(filesystem);
@@ -3142,6 +3148,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &mut *dst_ctl,
             &operator_directory,
             opts.operator_symlink_policy,
+            opts.rsync_creation,
         )?;
         prepared_filesystem = Some(filesystem);
         selection
@@ -3151,6 +3158,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &operator_directory,
             allow_missing,
             opts.operator_symlink_policy,
+            opts.rsync_creation,
         )?
     } else {
         None
@@ -3363,7 +3371,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let relations = if ancestry_checks.is_empty() {
             Vec::new()
         } else {
-            check_operator_directory_ancestry(&mut *dst_ctl, ancestry_checks)?
+            // A live copy that may widen directories prepares search access
+            // for this check too, but never for the parent of an exact
+            // placement. rsync's destination already passed its search check.
+            check_operator_directory_ancestry(
+                &mut *dst_ctl,
+                ancestry_checks,
+                opts.may_widen_directory_permissions()
+                    .then_some(dst_is_dir || expand_exact_home),
+            )?
         };
         if relations.len() != source_checks.len() {
             bail!(
@@ -3488,20 +3504,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         && defer_destination_mutations;
     // Selection already inspected the container. Carry its identity into
     // planning, so file-only copies can request access without another lookup
-    // on the ordinary writable-directory path.
-    let widen_container = widens_destination_container(&args, &opts);
+    // on the ordinary writable-directory path. Only the destination directory
+    // itself qualifies: the parent of an exact placement lies outside the
+    // copy, and rsync widens only directories its file list includes.
+    let widen_container = widens_destination_container(&opts, dst_is_dir || expand_exact_home);
     let mut container_access = if widen_container {
         if let Some(selection) = &directory_selection {
             selected_container_access(widen_container, &request_prefix, selection)
-        } else if dst_is_dir {
+        } else {
             dst_root_entry
                 .as_ref()
                 .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
                 .map(|entry| (dst_root.clone(), target_identity(entry)))
-        } else if opts.restricted_receiver {
-            Some((parent_path(&dst_root), TargetCondition::Any))
-        } else {
-            None
         }
     } else {
         None
@@ -4846,18 +4860,43 @@ fn stat_one_registered(
     .flatten())
 }
 
+/// rsync enters its destination before it widens anything the copy
+/// includes, so it also requires search permission on the selection.
+fn operator_directory_request(
+    path: &[u8],
+    allow_missing: bool,
+    symlink_policy: OperatorSymlinkPolicy,
+    require_search: bool,
+) -> Request {
+    if require_search {
+        Request::CheckSearchableOperatorDirectory {
+            path: path.to_vec(),
+            allow_missing,
+            symlink_policy,
+        }
+    } else {
+        Request::CheckOperatorDirectory {
+            path: path.to_vec(),
+            allow_missing,
+            symlink_policy,
+        }
+    }
+}
+
 fn check_operator_directory(
     conn: &mut dyn Conn,
     path: &[u8],
     allow_missing: bool,
     symlink_policy: OperatorSymlinkPolicy,
+    require_search: bool,
 ) -> Result<Option<DirectoryAnchor>> {
     match ok(
-        conn.call(Request::CheckOperatorDirectory {
-            path: path.to_vec(),
+        conn.call(operator_directory_request(
+            path,
             allow_missing,
             symlink_policy,
-        })?,
+            require_search,
+        ))?,
         "operator path",
     )? {
         Response::DirectorySelection(selection) => Ok(selection),
@@ -4865,14 +4904,22 @@ fn check_operator_directory(
     }
 }
 
+/// With `access`, owned directories the check must enter may briefly gain
+/// search permission; the value says whether the selected directory itself
+/// belongs to the copy.
 fn check_operator_directory_ancestry(
     conn: &mut dyn Conn,
     checks: Vec<DirectoryAncestryCheck>,
+    access: Option<bool>,
 ) -> Result<Vec<Vec<DirectoryRelation>>> {
-    match ok(
-        conn.call(Request::CheckOperatorDirectoryAncestry { checks })?,
-        "destination ancestry",
-    )? {
+    let request = match access {
+        Some(selection_in_copy) => Request::CheckOperatorDirectoryAncestryWithAccess {
+            checks,
+            selection_in_copy,
+        },
+        None => Request::CheckOperatorDirectoryAncestry { checks },
+    };
+    match ok(conn.call(request)?, "destination ancestry")? {
         Response::DirectoryRelations(relations) => Ok(relations),
         other => bail!("unexpected response {other:?}"),
     }
@@ -4958,11 +5005,13 @@ fn operator_directory_mode(opts: &Opts) -> u32 {
 /// Whether a destination container that lacks owner access is widened for
 /// its owner, the one rule for a root found existing, one another process
 /// created before syq's mkdir, and one found when the planner creates it
-/// after the scan.
-fn widens_destination_container(args: &Args, opts: &Opts) -> bool {
-    args.temporarily_widen_dir_permissions
-        && !opts.dry_run
-        && !opts.preserve_existing_directory_metadata
+/// after the scan. `in_copy` says whether that directory belongs to the
+/// copy: an `--into` target or a tree's own root does; the parent of an
+/// exact placement does not. rsync widens only directories its file list
+/// includes, which planning handles, never the container of named sources.
+/// Dry runs never widen.
+fn widens_destination_container(opts: &Opts, in_copy: bool) -> bool {
+    in_copy && !opts.rsync_creation && opts.may_widen_directory_permissions()
 }
 
 /// The access to request for the operator directory `selection`, known by
@@ -5054,16 +5103,18 @@ fn prepare_existing_destination(
     symlink_policy: OperatorSymlinkPolicy,
     expected: &Entry,
     request_prefix: PathBytes,
+    require_search: bool,
 ) -> Result<(
     Option<DirectoryAnchor>,
     Option<DestinationFilesystemInfo>,
     DestinationAnchor,
 )> {
-    conn.send(Request::CheckOperatorDirectory {
-        path: path.to_vec(),
-        allow_missing: false,
+    conn.send(operator_directory_request(
+        path,
+        false,
         symlink_policy,
-    })?;
+        require_search,
+    ))?;
     conn.send(Request::DestinationFilesystemInfo {
         check_empty: true,
         target: None,
@@ -5108,12 +5159,14 @@ fn check_missing_destination(
     conn: &mut dyn Conn,
     path: &[u8],
     symlink_policy: OperatorSymlinkPolicy,
+    require_search: bool,
 ) -> Result<(Option<DirectoryAnchor>, Option<DestinationFilesystemInfo>)> {
-    conn.send(Request::CheckOperatorDirectory {
-        path: path.to_vec(),
-        allow_missing: true,
+    conn.send(operator_directory_request(
+        path,
+        true,
         symlink_policy,
-    })?;
+        require_search,
+    ))?;
     conn.send(Request::DestinationFilesystemInfo {
         check_empty: false,
         target: None,

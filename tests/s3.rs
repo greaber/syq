@@ -31,6 +31,9 @@ mod existing_policy;
 #[path = "s3/recovery.rs"]
 mod recovery;
 
+#[path = "s3/directory_permissions.rs"]
+mod directory_permissions;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},

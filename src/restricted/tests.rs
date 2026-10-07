@@ -4105,6 +4105,21 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
     }]);
     assert!(authority.authorize(&mut small, false).is_err());
 
+    // Previews never widen, so a read-only grant needs no authority for it.
+    let existing = fs::metadata(&root).unwrap();
+    let mut widen = Request::WidenDirectories {
+        directories: vec![(
+            path_bytes(&root),
+            proto::TargetCondition::Matches {
+                dev: existing.dev(),
+                ino: existing.ino(),
+            },
+        )],
+        remember: true,
+        guard: None,
+    };
+    assert!(authority.authorize(&mut widen, false).is_err());
+
     let mut observation = Request::StatMany {
         paths: vec![target],
         sources: None,
