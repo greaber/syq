@@ -31,3 +31,30 @@ pub fn set_child_nofile_limit(command: &mut Command, requested: libc::rlim_t) {
         });
     }
 }
+
+/// Start the child with only standard input, output and error open, as an
+/// SSH session starts its remote command. A test runner can leave
+/// inheritable descriptors open in every process it starts, as the macOS CI
+/// runners do. The fake remote shell would hand them on to the helper, whose
+/// descriptor budget would then depend on the runner rather than on the
+/// limit the test sets.
+#[allow(dead_code)]
+pub fn inherit_only_standard_descriptors(command: &mut Command) {
+    let inherited: Vec<libc::c_int> = std::fs::read_dir("/proc/self/fd")
+        .or_else(|_| std::fs::read_dir("/dev/fd"))
+        .expect("list this process's descriptors")
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|&descriptor| descriptor > 2)
+        .collect();
+    unsafe {
+        command.pre_exec(move || {
+            for &descriptor in &inherited {
+                let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+            Ok(())
+        });
+    }
+}
