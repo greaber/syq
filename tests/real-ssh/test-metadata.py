@@ -136,19 +136,22 @@ from pathlib import Path
 root = Path({str(directory)!r})
 result = {{}}
 inodes = {{}}
-for path in sorted(root.rglob('*')):
+paths = sorted(root.rglob('*'))
+# Listing a directory changes its access time, and reading a file changes
+# that of every name it has, so record every entry before reading any.
+for path in paths:
     s = path.lstat()
     key = str(path.relative_to(root))
     entry = {{'mode': s.st_mode & 0o7777, 'mtime': s.st_mtime_ns,
         'xattrs': {{n: os.getxattr(path, n).hex() for n in os.listxattr(path)}},
         'link': inodes.setdefault(s.st_ino, key)}}
     if path.is_file():
-        # Listing a directory changes its access time; reading a file
-        # afterwards does too, so record it first.
         entry['atime'] = s.st_atime_ns
-        entry['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
         entry['sparse'] = s.st_blocks * 512 < s.st_size // 4
     result[key] = entry
+for path in paths:
+    if path.is_file():
+        result[str(path.relative_to(root))]['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
 print(json.dumps(result))
 '''))
 
