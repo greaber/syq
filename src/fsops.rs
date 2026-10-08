@@ -1017,7 +1017,8 @@ impl FsOps {
             })
             .collect();
         match (relations, temporary.restore()) {
-            (_, Err(error)) => Err(error),
+            (Err(error), Err(restore)) => Err(error.context(format!("{restore:#}"))),
+            (Ok(_), Err(restore)) => Err(restore),
             (relations, Ok(())) => relations,
         }
     }
