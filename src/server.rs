@@ -423,6 +423,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::FileHash { .. }
         | Request::Canonicalize { .. }
         | Request::TransportStats
+        | Request::ReceiverUser
         | Request::Receipt
         | Request::Shutdown
         | Request::ListDirDetails { .. }

@@ -425,21 +425,22 @@ S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 
 Existing files and directories keep their destination permissions unless you
-request permission or ACL metadata. Native `cp` does not automatically widen
-existing directory permissions to make copying or pruning succeed, even when
-copying permission metadata. The requested final permissions still apply.
-`--temporarily-widen-dir-permissions` lets syq briefly add owner read, write and
-search permission to existing directories you own inside the copy: the
-destination directory and the directories beneath it that the copy fills or
-prunes, including ones only the destination has, also with `--if-exists=keep`.
-It never changes a directory above the copy, such as
-the parent of an `--as` target, and dry runs never change permissions. Syq puts
-back each directory's exact mode after its checks and after copying and pruning,
-also when the copy fails; explicitly requested permissions take precedence.
-Other processes can see the temporary permissions, and a crash or forced
-termination can leave them in place. `syq rsync` widens the directories its
-file list includes without this option; see [rsync compatibility](rsync-compat.md).
-Root skips widening.
+request permission or ACL metadata; the requested final permissions still
+apply. When a directory you own lacks the write or search permission a change
+needs, native `cp` reports it once (a dry run lists it too) and leaves it
+alone unless you pass `--temporarily-widen-dir-permissions`. That option
+briefly adds owner read, write and search permission to such directories
+inside the copy: the destination directory and the directories beneath it that
+the copy fills or prunes, also with `--if-exists=keep`. It never changes a
+directory above the copy, such as the parent of an `--as` target. Syq restores
+each directory's exact mode after copying and pruning, also when the copy
+fails, unless you request permissions. Other processes can see the temporary
+permissions, and a crash or forced termination can leave them in place.
+`syq rsync` widens the directories its file list includes without this option;
+see [rsync compatibility](rsync-compat.md). Root skips widening.
+
+Dry runs never change permissions. A dry run reports a directory you own but
+cannot search as not inspected, and exits with status 23.
 
 New files use the source read, write, and execute permissions, limited by the
 umask, or by the directory's default ACL if it has one.

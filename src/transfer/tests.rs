@@ -432,6 +432,8 @@ fn pipeline_worker(
         sparse: false,
         inode_preservation: Default::default(),
         hardlink_completions: Mutex::new(Default::default()),
+        exact_destination: Default::default(),
+        access_noted: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,

@@ -2588,7 +2588,10 @@ impl RestrictedAuthority {
                     bail!("the receipt is issued only on the signed control connection");
                 }
             }
-            Request::TransportStats | Request::Shutdown | Request::WriteStreamFence => {}
+            Request::TransportStats
+            | Request::ReceiverUser
+            | Request::Shutdown
+            | Request::WriteStreamFence => {}
         }
         Ok(())
     }

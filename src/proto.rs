@@ -1372,6 +1372,10 @@ pub enum WireRequest<Data> {
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
     },
+    /// The receiving process's effective user ID, so the sender can tell
+    /// which existing directories it owns. Asked only once an existing
+    /// directory without owner write or search permission is found.
+    ReceiverUser,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1680,6 +1684,8 @@ pub enum Response {
         anchor: DirectoryAnchor,
         created: bool,
     },
+    /// Reply to ReceiverUser: the receiving process's effective user ID.
+    ReceiverUser(u32),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

@@ -213,6 +213,13 @@ pub struct Opts {
     pub sparse: bool,
     pub inode_preservation: crate::inode_metadata::Selection,
     hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
+    /// The target of an exact placement, set once the destination is
+    /// resolved. Its parent lies outside the copy and is never widened, so a
+    /// failure there does not suggest temporary access.
+    pub exact_destination: std::sync::OnceLock<PathBytes>,
+    /// Directories already named as needing temporary access; failures
+    /// beneath them do not repeat the hint.
+    pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
     pub devices: bool,
     pub checksum: bool,
     /// Don't trust matching size and time, but compare only the files block
@@ -1382,7 +1389,9 @@ fn attempt_small_copy(
                     os_kind_of(&error),
                     copy_error_message(
                         &error,
+                        // An exact target's directory lies outside the copy.
                         args.interface == Interface::NativeCp
+                            && args.placement == Placement::Into
                             && !args.temporarily_widen_dir_permissions
                             && !args.only_new_native_entries(),
                     ),
@@ -1850,11 +1859,48 @@ impl Opts {
         !self.widen_directory_permissions
     }
 
+    /// Whether a failure at `path` may suggest temporary access: not one
+    /// creating or replacing an exact placement's target, whose directory
+    /// lies outside the copy.
+    fn may_suggest_directory_access_at(&self, path: &[u8]) -> bool {
+        self.may_suggest_directory_access()
+            && self
+                .exact_destination
+                .get()
+                .is_none_or(|exact| exact != path)
+            && !self.access_noted_above(path)
+    }
+
+    /// Whether a directory containing `path` was already named as needing
+    /// temporary access, with the hint.
+    fn access_noted_above(&self, path: &[u8]) -> bool {
+        let noted = self.access_noted.lock().unwrap();
+        if noted.is_empty() {
+            return false;
+        }
+        let mut end = path.len();
+        while let Some(separator) = path[..end].iter().rposition(|&byte| byte == b'/') {
+            if noted.contains(&path[..separator]) {
+                return true;
+            }
+            end = separator;
+        }
+        false
+    }
+
     fn wire_error_message(&self, error: &WireError) -> String {
         permission_error_message(
             error.to_string(),
             error.io_kind,
             self.may_suggest_directory_access(),
+        )
+    }
+
+    fn wire_error_message_at(&self, error: &WireError, path: &[u8]) -> String {
+        permission_error_message(
+            error.to_string(),
+            error.io_kind,
+            self.may_suggest_directory_access_at(path),
         )
     }
 }
@@ -2167,6 +2213,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             open_noatime: args.open_noatime || args.atimes > 1,
         },
         hardlink_completions: Mutex::new(Default::default()),
+        exact_destination: Default::default(),
+        access_noted: Default::default(),
         devices: args.devices,
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,
@@ -3054,6 +3102,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
         },
     };
+    if !(dst_is_dir || expand_exact_home) {
+        let _ = opts.exact_destination.set(dst_root.clone());
+    }
     if args.placement == Placement::Into
         && args.target_existence == Existence::Existing
         && !dst_entry_is_dir
@@ -3374,12 +3425,40 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // A live copy that may widen directories prepares search access
             // for this check too, but never for the parent of an exact
             // placement. rsync's destination already passed its search check.
-            check_operator_directory_ancestry(
+            match check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
                 opts.may_widen_directory_permissions()
                     .then_some(dst_is_dir || expand_exact_home),
-            )?
+            ) {
+                // A preview never widens a directory to check this. It writes
+                // nothing, so it goes on to report what it cannot inspect,
+                // and lists no deletions.
+                Err(error) if opts.dry_run && os_kind_of(&error) == Some("permission_denied") => {
+                    progress.error(&format!(
+                        "syq: cannot check whether {} lies inside a source: {error:#}",
+                        display(&dst.path)
+                    ));
+                    prune_overlap_unsearchable = true;
+                    source_checks
+                        .iter()
+                        .map(|(_, checked)| vec![DirectoryRelation::Separate; checked.len()])
+                        .collect()
+                }
+                // The destination directory itself, part of the copy, lacks
+                // owner search permission.
+                Err(error)
+                    if opts.may_suggest_directory_access()
+                        && (dst_is_dir || expand_exact_home)
+                        && dst_root_entry.as_ref().is_some_and(|entry| {
+                            entry.kind == Kind::Dir && entry.mode & 0o100 == 0
+                        })
+                        && os_kind_of(&error) == Some("permission_denied") =>
+                {
+                    bail!("{error:#}; {DIRECTORY_ACCESS_HINT}")
+                }
+                result => result?,
+            }
         };
         if relations.len() != source_checks.len() {
             bail!(
@@ -3953,6 +4032,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         mapping_explicit_parents: std::collections::HashSet::new(),
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
+        receiver_uid: None,
+        // The destination directory itself, when it belongs to the copy and
+        // its owner lacks write or search permission.
+        root_access_check: dst_root_entry.clone().filter(|entry| {
+            (dst_is_dir || expand_exact_home)
+                && entry.kind == Kind::Dir
+                && entry.mode & 0o300 != 0o300
+        }),
+        access_limited: Default::default(),
+        access_reported: Default::default(),
+        restorations_attempted: false,
         container_access,
         widen_container,
         // Deferred root creation must succeed before mapped entries are applied.

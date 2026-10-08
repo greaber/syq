@@ -292,8 +292,11 @@ fn copy_repairs_destination_directories_without_search_permission() {
     }
 }
 
+/// A preview never widens: an owned directory it cannot search is reported
+/// as not inspected instead of claiming its contents are missing.
 #[test]
 fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
+    let root = unsafe { libc::geteuid() } == 0;
     for mode in [0o600, 0o000] {
         let t = Tmp::new();
         write(&t.path("src/sub/file"), b"new contents");
@@ -303,6 +306,7 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
         let out = native_syq(&[
             "cp",
             "--dry-run",
+            "-v",
             "--srcs-in",
             &t.s("src"),
             "--into",
@@ -310,7 +314,21 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
         ]);
         let after = fs::metadata(t.path("dst/sub")).unwrap();
         fs::set_permissions(t.path("dst/sub"), fs::Permissions::from_mode(0o755)).unwrap();
-        assert_output_ok(&out);
+        if root {
+            assert_output_ok(&out);
+        } else {
+            assert_eq!(out.status.code(), Some(23), "{out:?}");
+            let stderr = stderr_of(&out);
+            assert!(stderr.contains("sub: not inspected"), "{out:?}");
+            assert!(
+                stderr.contains("--temporarily-widen-dir-permissions"),
+                "{out:?}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("sub/file"),
+                "{out:?}"
+            );
+        }
         assert_eq!(after.mode(), before.mode());
         assert_eq!(
             (after.ctime(), after.ctime_nsec()),
@@ -1708,4 +1726,162 @@ fn pruning_widens_destination_only_directories_it_must_enter_or_empty() {
         assert_eq!(t.path("dst/e300/f").exists(), unreadable);
         assert!(t.path("dst/e555/in/f").exists());
     }
+}
+
+/// A dry run names each owned directory a real copy could not change without
+/// the option, once, using the modes its scan read. A real copy reports each
+/// one once too, before its per-file errors, and still copies what it can.
+#[test]
+fn copies_name_each_directory_that_needs_temporary_access_once() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let note = "dst/ro: you own this directory, but it lacks owner write permission; \
+                --temporarily-widen-dir-permissions may help";
+    for dry_run in [true, false] {
+        for widen in [false, true] {
+            let t = Tmp::new();
+            for name in ["a", "b", "c"] {
+                write(&t.path(&format!("src/ro/{name}")), b"new");
+            }
+            write(&t.path("src/open/file"), b"new");
+            fs::create_dir_all(t.path("dst/ro")).unwrap();
+            fs::create_dir_all(t.path("dst/open")).unwrap();
+            // A read-only directory with nothing to change needs no access.
+            fs::create_dir_all(t.path("src/idle")).unwrap();
+            fs::create_dir_all(t.path("dst/idle")).unwrap();
+            for path in ["dst/ro", "dst/idle"] {
+                fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            let src = t.s("src");
+            let dst = t.s("dst");
+            let mut args = vec!["cp", "--srcs-in", &src, "--into", &dst];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            if widen {
+                args.push("--temporarily-widen-dir-permissions");
+            }
+            let out = native_syq(&args);
+            let modes: Vec<_> = ["dst/ro", "dst/idle"]
+                .iter()
+                .map(|path| fs::metadata(t.path(path)).unwrap().mode() & 0o777)
+                .collect();
+            for path in ["dst/ro", "dst/idle"] {
+                fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let stderr = stderr_of(&out);
+            let case = format!("dry={dry_run}, widen={widen}: {out:?}");
+            assert_eq!(modes, [0o555, 0o555], "{case}");
+            assert_eq!(stderr.matches(note).count(), usize::from(!widen), "{case}");
+            // The per-file errors that follow do not repeat the hint.
+            assert_eq!(
+                stderr
+                    .matches("--temporarily-widen-dir-permissions")
+                    .count(),
+                usize::from(!widen),
+                "{case}"
+            );
+            assert!(!stderr.contains("dst/idle:"), "{case}");
+            if dry_run || widen {
+                assert_output_ok(&out);
+            } else {
+                assert_eq!(out.status.code(), Some(23), "{case}");
+                // The note comes before the per-file errors it explains.
+                assert!(
+                    stderr.find(note) < stderr.find("Permission denied"),
+                    "{case}"
+                );
+            }
+            assert_eq!(t.path("dst/open/file").exists(), !dry_run, "{case}");
+            assert_eq!(t.path("dst/ro/a").exists(), !dry_run && widen, "{case}");
+        }
+    }
+}
+
+/// The option cannot widen the directory above an exact placement, so a
+/// failure there does not suggest it; an `--into` target still does.
+#[test]
+fn exact_placement_failures_do_not_suggest_temporary_access() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for (placement, size) in [("--as", 3), ("--as", 128 << 10), ("--into", 3)] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), &vec![b'n'; size]);
+        fs::create_dir(t.path("dst")).unwrap();
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o555)).unwrap();
+        let destination = if placement == "--as" {
+            t.s("dst/file")
+        } else {
+            t.s("dst")
+        };
+        let out = native_syq(&["cp", &t.s("src/file"), placement, &destination]);
+        fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert_eq!(
+            stderr_of(&out).contains("--temporarily-widen-dir-permissions"),
+            placement == "--into",
+            "{placement}, {size}: {out:?}"
+        );
+    }
+}
+
+/// Several sources can reach the same directories in different batches:
+/// each directory is still named once, and an in-place update needs no
+/// directory write.
+#[test]
+fn directory_access_notes_stay_once_across_sources_and_skip_inplace_updates() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for dry_run in [true, false] {
+        let t = Tmp::new();
+        write(&t.path("one/ro/a"), b"new");
+        write(&t.path("two/ro/b"), b"new");
+        write(&t.path("one/closed/c"), b"new");
+        write(&t.path("two/closed/d"), b"new");
+        fs::create_dir_all(t.path("dst/ro")).unwrap();
+        fs::create_dir_all(t.path("dst/closed")).unwrap();
+        fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(t.path("dst/closed"), fs::Permissions::from_mode(0o600)).unwrap();
+        let (one, two, dst) = (t.s("one"), t.s("two"), t.s("dst"));
+        let mut args = vec!["cp", "--srcs-in", &one, "--srcs-in", &two, "--into", &dst];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = native_syq(&args);
+        for path in ["dst/ro", "dst/closed"] {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let stderr = stderr_of(&out);
+        assert_eq!(
+            stderr.matches("dst/ro: you own this directory").count(),
+            1,
+            "{out:?}"
+        );
+        let closed = if dry_run {
+            "dst/closed: not inspected"
+        } else {
+            "dst/closed: you own this directory"
+        };
+        assert_eq!(stderr.matches(closed).count(), 1, "{out:?}");
+    }
+
+    let t = Tmp::new();
+    write(&t.path("src/ro/file"), b"newer");
+    write(&t.path("dst/ro/file"), b"old");
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    for dry_run in [true, false] {
+        let (src, dst) = (t.s("src"), t.s("dst"));
+        let mut args = vec!["cp", "--inplace", "--srcs-in", &src, "--into", &dst];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = native_syq(&args);
+        assert_output_ok(&out);
+        assert!(!stderr_of(&out).contains("dst/ro:"), "{out:?}");
+    }
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(read(&t.path("dst/ro/file")), b"newer");
 }

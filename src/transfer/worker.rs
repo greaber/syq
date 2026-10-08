@@ -187,8 +187,10 @@ impl Worker {
                             }
                             return Err(e);
                         }
-                        let message =
-                            copy_error_message(&e, self.opts.may_suggest_directory_access());
+                        let suggest = fast
+                            .iter()
+                            .all(|&i| self.opts.may_suggest_directory_access_at(&self.job(i).dst));
+                        let message = copy_error_message(&e, suggest);
                         for &i in &fast {
                             self.file_error(i, anyhow::anyhow!(message.clone()))?;
                         }
@@ -852,7 +854,8 @@ impl Worker {
             };
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
-                let message = copy_error_message(&e, self.opts.may_suggest_directory_access());
+                let message =
+                    copy_error_message(&e, self.opts.may_suggest_directory_access_at(&j.dst));
                 self.progress.error_classified(
                     &format!("syq: {}: {message}", j.rel),
                     Some("io"),
@@ -953,7 +956,8 @@ impl Worker {
         if self.sched.fail_file(idx) {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
-            let message = copy_error_message(&e, self.opts.may_suggest_directory_access());
+            let message =
+                copy_error_message(&e, self.opts.may_suggest_directory_access_at(&job.dst));
             self.progress.error_classified(
                 &format!("syq: {}: {message}", job.rel),
                 Some("io"),

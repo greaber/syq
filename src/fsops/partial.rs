@@ -3131,6 +3131,7 @@ impl FsOps {
             Request::CheckOperatorDirectoryAncestry { checks } => self
                 .check_operator_directory_ancestry(checks, None)
                 .map(Response::DirectoryRelations),
+            Request::ReceiverUser => Ok(Response::ReceiverUser(unsafe { libc::geteuid() })),
             Request::CheckOperatorDirectoryAncestryWithAccess {
                 checks,
                 selection_in_copy,

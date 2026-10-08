@@ -2477,6 +2477,7 @@ impl FsOps {
             | Request::AnchorDestination { .. }
             | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats
+            | Request::ReceiverUser
             | Request::Receipt
             | Request::Shutdown
             | Request::PrepareSmallFiles(_)
