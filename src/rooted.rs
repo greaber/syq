@@ -1114,12 +1114,15 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
-    /// How many entries of the directory `path` name the inode `ino`.
-    pub(crate) fn count_entries_naming(&self, path: &RelativePath, ino: u64) -> Result<u64> {
+    /// How many entries of the directory `path` name each inode.
+    pub(crate) fn count_entries_by_inode(
+        &self,
+        path: &RelativePath,
+    ) -> Result<std::collections::HashMap<u64, u64>> {
         let directory = self.open_directory(path)?;
         let readable = open_readable_directory_at(&directory, b".")
             .context("open readable confined directory")?;
-        crate::sys::directory_entries_naming(readable, ino)
+        crate::sys::directory_entries_by_inode(readable)
             .with_context(|| format!("read confined directory {}", path.label()))
     }
 

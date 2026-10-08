@@ -671,7 +671,14 @@ impl Worker {
                         meta,
                         flags: self.publication_flags(job),
                         inplace: self.opts.inplace,
-                        condition: job.target_condition,
+                        // Written in place, a file is opened as the
+                        // existing-file policy requires (--only-existing:
+                        // only the file the scan found).
+                        condition: if self.opts.inplace {
+                            self.existing_file_condition(job)
+                        } else {
+                            job.target_condition
+                        },
                         guard: job.container_guard.clone(),
                         replaces: job.dst_entry.is_some(),
                         scanned: job.scanned,
@@ -1597,6 +1604,13 @@ impl Worker {
         if !job.inplace {
             return TargetCondition::Any;
         }
+        self.existing_file_condition(job)
+    }
+
+    /// The condition a file's name must meet as the copy's existing-file
+    /// policy requires, for a file written in place: the planner's, or the
+    /// policy's own when the planner set none.
+    fn existing_file_condition(&self, job: &WorkerJob) -> TargetCondition {
         match job.target_condition {
             TargetCondition::Any => {}
             condition => return condition,

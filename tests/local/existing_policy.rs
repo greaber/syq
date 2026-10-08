@@ -372,3 +372,50 @@ fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
         assert_eq!(sessions, 3, "{request}");
     }
 }
+
+/// Under `--if-exists=error` or `error-if-different`, an ordinary receiver
+/// stages a new `--inplace` file and publishes it without replacing
+/// anything, as before restricted receivers wrote such files in place: a
+/// worker connection lost right after the file's preparation is retried
+/// through a new receiver process, and the copy completes.
+#[test]
+fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
+    for policy in ["error", "error-if-different"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        fs::create_dir(t.path("remote-home")).unwrap();
+        let data = prng(4 << 20, 62);
+        write(&t.path("src/file"), &data);
+        fs::create_dir(t.path("dst")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args([
+                "--no-tcp",
+                "--no-progress",
+                "--inplace",
+                &format!("--if-exists={policy}"),
+                "--performance-tuning",
+                "workers=1,copy-path=ranges,request-size=1M",
+                "--srcs-in",
+            ])
+            .arg(t.path("src"))
+            .args(["--to", "fake", "--into"])
+            .arg(t.path("dst"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DROP_AFTER_REQUEST", "prepare")
+            .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
+            .run()
+            .unwrap();
+        assert!(
+            t.path("dropped").exists(),
+            "{policy}: no connection was lost"
+        );
+        assert_output_ok(&output);
+        assert!(read(&t.path("dst/file")) == data, "{policy}");
+    }
+}

@@ -7,6 +7,7 @@
 //! never looked; either way it is not changed in place.
 
 use super::*;
+use std::collections::BTreeSet;
 
 pub(crate) struct ScopeNames {
     /// The receiver's root, beneath which every name here lies.
@@ -18,7 +19,25 @@ pub(crate) struct ScopeNames {
     /// and while this receiver links a new name to a file, so that no link
     /// it makes can be counted against a link count read before it.
     counting: Mutex<()>,
+    /// How many entries of a directory name each inode, by the directory's
+    /// identity, as of its change time, which any added, removed or renamed
+    /// entry advances. Kept for a few directories at a time.
+    entries: Mutex<HashMap<(u64, u64), DirectoryEntries>>,
 }
+
+/// A directory's entry count per inode, as of its change time, for the
+/// inodes it lists more than once.
+struct DirectoryEntries {
+    changed: (i64, u32),
+    per_inode: HashMap<u64, u64>,
+}
+
+/// A directory holding names of a file: its path, change time, and the
+/// names in it, folded.
+type DirectoryNames = (Vec<u8>, (i64, u32), BTreeSet<Vec<u8>>);
+
+/// Directories whose entry counts a receiver keeps at once.
+const ENTRY_COUNT_DIRECTORIES: usize = 16;
 
 /// The names known inside, relative to the root, by file identity.
 type NamesByFile = HashMap<(u64, u64), Vec<Box<[u8]>>>;
@@ -33,6 +52,7 @@ impl ScopeNames {
             scopes: scopes.into_iter().collect(),
             names: Mutex::default(),
             counting: Mutex::default(),
+            entries: Mutex::default(),
         }
     }
 
@@ -116,12 +136,16 @@ impl ScopeNames {
     /// leads to it and every name it has can be confirmed inside the
     /// approved directories: names the receiver saw that still lead to the
     /// file, each directory entry counted once however it was spelled.
+    /// `opened_links` is the link count when the file was opened, for a file
+    /// held since: one with a single name then and now has only that name,
+    /// since this receiver never gives a file a name outside.
     pub(crate) fn require_inside(
         &self,
         root: &Root,
         relative: &RelativePath,
         label: &Path,
         current: &dyn Fn() -> Result<LinkedFile>,
+        opened_links: u64,
     ) -> Result<()> {
         let refuse = || {
             let label = label.as_os_str().as_bytes();
@@ -138,15 +162,15 @@ impl ScopeNames {
                 Ok(Some(metadata)) if (metadata.dev, metadata.ino) == (dev, ino)
             )
         };
+        let (dev, ino, nlink) = current()?;
+        if nlink.max(opened_links) <= 1 {
+            return Ok(());
+        }
         // The change goes through this name, so it must still lead to the
         // file: a held file whose name inside is gone may have only names
         // outside left.
-        let (dev, ino, nlink) = current()?;
         if !leads(relative, (dev, ino)) {
             return Err(refuse());
-        }
-        if nlink <= 1 {
-            return Ok(());
         }
         let _counting = self.counting.lock().unwrap();
         let (dev, ino, nlink) = current()?;
@@ -163,8 +187,8 @@ impl ScopeNames {
         // Names that still lead to the file, by the identity of the
         // directory holding them: one directory may be reached by several
         // spellings, or through a bind mount.
-        let mut directories: HashMap<Vec<u8>, Option<(u64, u64)>> = HashMap::new();
-        let mut groups: HashMap<(u64, u64), (Vec<u8>, u64)> = HashMap::new();
+        let mut directories: HashMap<Vec<u8>, Option<RootMetadata>> = HashMap::new();
+        let mut groups: HashMap<(u64, u64), DirectoryNames> = HashMap::new();
         for name in candidates {
             let Ok(path) = RelativePath::new(&name) else {
                 continue;
@@ -176,27 +200,45 @@ impl ScopeNames {
                 .iter()
                 .rposition(|byte| *byte == b'/')
                 .map_or(Vec::new(), |slash| name[..slash].to_vec());
-            let identity = *directories.entry(parent.clone()).or_insert_with(|| {
+            let directory = *directories.entry(parent.clone()).or_insert_with(|| {
                 let path = RelativePath::new(&parent).ok()?;
                 let metadata = root.metadata_optional(&path).ok()??;
-                metadata.is_dir().then_some((metadata.dev, metadata.ino))
+                metadata.is_dir().then_some(metadata)
             });
-            if let Some(identity) = identity {
-                groups.entry(identity).or_insert((parent, 0)).1 += 1;
+            if let Some(directory) = directory {
+                let leaf = &name[name.len() - path.leaf()?.1.len()..];
+                groups
+                    .entry((directory.dev, directory.ino))
+                    .or_insert_with(|| {
+                        (
+                            parent,
+                            (directory.ctime, directory.ctime_nsec),
+                            BTreeSet::new(),
+                        )
+                    })
+                    .2
+                    .insert(folded(leaf));
             }
         }
         // A name alone in its directory is one entry. Several names in one
         // directory are as many entries as the directory lists for the file,
-        // read once, however many spellings lead to them.
+        // read once, but no more than the distinct names left once folded as
+        // any filesystem might fold them: two spellings of one entry count
+        // once.
         let mut inside = 0;
-        for (parent, names) in groups.into_values() {
-            inside += if names == 1 {
+        for (identity, (parent, changed, names)) in groups {
+            // A name with another character might be any other name there.
+            let distinct = if names.contains(UNFOLDABLE) {
                 1
             } else {
-                RelativePath::new(&parent)
-                    .and_then(|path| root.count_entries_naming(&path, ino))
+                names.len() as u64
+            };
+            inside += if distinct == 1 {
+                1
+            } else {
+                self.entries_naming(root, &parent, (identity, changed), ino)
                     .unwrap_or(0)
-                    .min(names)
+                    .min(distinct)
             };
             if inside >= nlink {
                 return Ok(());
@@ -204,6 +246,65 @@ impl ScopeNames {
         }
         Err(refuse())
     }
+}
+
+impl ScopeNames {
+    /// How many entries of the directory `parent`, with this identity and
+    /// change time, name the inode `ino`. A directory is read once while it
+    /// stays unchanged, however many of its files are checked. Its entries
+    /// may change within one tick of a coarse clock; a count read too early
+    /// misses an entry added since, which can only refuse a change, or
+    /// counts one removed since, which the distinct names that still lead
+    /// to the file bound.
+    fn entries_naming(
+        &self,
+        root: &Root,
+        parent: &[u8],
+        (identity, changed): ((u64, u64), (i64, u32)),
+        ino: u64,
+    ) -> Result<u64> {
+        // A name that leads to the file is an entry for it, so an inode
+        // the directory does not list more than once has one.
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(known) = entries
+            .get(&identity)
+            .filter(|known| known.changed == changed)
+        {
+            return Ok(known.per_inode.get(&ino).copied().unwrap_or(1));
+        }
+        let mut per_inode = root.count_entries_by_inode(&RelativePath::new(parent)?)?;
+        per_inode.retain(|_, count| *count > 1);
+        let count = per_inode.get(&ino).copied().unwrap_or(1);
+        if entries.len() >= ENTRY_COUNT_DIRECTORIES {
+            entries.clear();
+        }
+        entries.insert(identity, DirectoryEntries { changed, per_inode });
+        Ok(count)
+    }
+}
+
+/// What a name with a character other than ASCII folds to: no name has a
+/// NUL byte.
+const UNFOLDABLE: &[u8] = b"\0";
+
+/// `name` as the most aggressive filesystem might fold it when telling
+/// names apart, or something coarser: folding too much can only refuse a
+/// change, never allow one. ASCII letters fold their case and trailing dots
+/// and spaces go, as some filesystems ignore them; any other character may
+/// fold to almost anything under Unicode case folding and normalization (a
+/// Kelvin sign to `k`, `ß` to `ss`, a precomposed letter to its parts), so
+/// a name with one folds to `UNFOLDABLE`, which may be any of the others.
+fn folded(name: &[u8]) -> Vec<u8> {
+    if !name.is_ascii() {
+        return UNFOLDABLE.to_vec();
+    }
+    let trimmed = name.len()
+        - name
+            .iter()
+            .rev()
+            .take_while(|byte| matches!(byte, b'.' | b' '))
+            .count();
+    name[..trimmed].to_ascii_lowercase()
 }
 
 impl FsOps {
@@ -242,8 +343,15 @@ impl FsOps {
 
     /// Refuse to change `target`'s file, open as `file`, in place unless all
     /// its names are confirmed inside the approved directories.
-    pub(super) fn require_names_inside(&self, target: &RootedTarget, file: &File) -> Result<()> {
-        require_names_inside(self.scope_names.as_deref(), target, file)
+    /// `opened_links` is its link count when it was opened, for a file held
+    /// since then.
+    pub(super) fn require_names_inside(
+        &self,
+        target: &RootedTarget,
+        file: &File,
+        opened_links: Option<u64>,
+    ) -> Result<()> {
+        require_names_inside(self.scope_names.as_deref(), target, file, opened_links)
     }
 }
 
@@ -252,18 +360,28 @@ pub(super) fn require_names_inside(
     names: Option<&ScopeNames>,
     target: &RootedTarget,
     file: &File,
+    opened_links: Option<u64>,
 ) -> Result<()> {
     let Some(names) = names else {
         return Ok(());
     };
+    // One read of the descriptor decides a file with a single name.
+    let metadata = file.metadata()?;
+    let opened_links = opened_links.unwrap_or(0);
+    if metadata.is_dir() || metadata.nlink().max(opened_links) <= 1 {
+        return Ok(());
+    }
     let current = || -> Result<LinkedFile> {
         let metadata = file.metadata()?;
         Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
     };
-    if file.metadata()?.is_dir() {
-        return Ok(());
-    }
-    names.require_inside(&target.root, &target.relative, &target.label, &current)
+    names.require_inside(
+        &target.root,
+        &target.relative,
+        &target.label,
+        &current,
+        opened_links,
+    )
 }
 
 /// Whether applying `meta` under `flags` would change the file `current`
@@ -325,6 +443,7 @@ mod tests {
                     let metadata = file.metadata()?;
                     Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
                 },
+                0,
             )
         }
     }
@@ -399,6 +518,34 @@ mod tests {
         assert!(t.check("scope/a").is_err());
         fs::remove_file(t.base.join("outside/a")).unwrap();
         t.check("scope/a").unwrap();
+    }
+
+    /// Two approved spellings of one entry, and a name the copy never
+    /// approved in the same directory: the two spellings fold to one name,
+    /// so only one of the file's two entries is confirmed. On a filesystem
+    /// that tells `a` from `A`, the same three names are three entries, and
+    /// folding still counts two of them as one: a refusal, never a pass.
+    #[test]
+    fn spellings_of_one_entry_do_not_confirm_another_name() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let t = Fixture::new(temporary.path());
+        fs::write(t.base.join("scope/a"), b"shared").unwrap();
+        fs::hard_link(t.base.join("scope/a"), t.base.join("scope/unapproved")).unwrap();
+        if !t.base.join("scope/A").exists() {
+            fs::hard_link(t.base.join("scope/a"), t.base.join("scope/A")).unwrap();
+        }
+        t.record("scope/a");
+        t.record("scope/A");
+        assert!(t.check("scope/a").is_err());
+        // Any name that is not ASCII might be any other name there.
+        let mut other = vec![b'k'; 1];
+        other.extend("\u{212a}".as_bytes());
+        let other = String::from_utf8(other).unwrap();
+        fs::hard_link(t.base.join("scope/a"), t.base.join("scope").join(&other)).unwrap();
+        t.record(&format!("scope/{other}"));
+        assert!(t.check("scope/a").is_err());
+        assert_eq!(folded(b"Name. ."), b"name");
+        assert_eq!(folded("\u{e9}".as_bytes()), UNFOLDABLE);
     }
 
     /// An enrollment root of `/` keeps names beneath it.
@@ -489,6 +636,66 @@ mod measure {
             .find_map(|line| line.strip_prefix("VmRSS:"))
             .and_then(|value| value.trim().trim_end_matches(" kB").trim().parse().ok())
             .unwrap()
+    }
+
+    fn cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+        seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    }
+
+    /// Checks of every file in one directory of linked pairs, as an
+    /// in-place copy changing each of them makes them; `SYQ_MEASURE_PAIRS`
+    /// sets the number of pairs (50,000 by default). Run explicitly in a
+    /// release build.
+    #[test]
+    #[ignore]
+    fn measure_same_directory_pairs() {
+        let pairs: usize = std::env::var("SYQ_MEASURE_PAIRS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50_000);
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        let scope = base.join("scope");
+        fs::create_dir(&scope).unwrap();
+        let bytes = |path: &Path| path.as_os_str().as_bytes().to_vec();
+        let names = ScopeNames::new(bytes(base), [(bytes(&scope), true)]);
+        let mut files = Vec::with_capacity(pairs);
+        for pair in 0..pairs {
+            let first = scope.join(format!("a{pair:06}"));
+            let second = scope.join(format!("b{pair:06}"));
+            fs::write(&first, b"x").unwrap();
+            fs::hard_link(&first, &second).unwrap();
+            let metadata = fs::metadata(&first).unwrap();
+            names.record(&bytes(&first), metadata.dev(), metadata.ino());
+            names.record(&bytes(&second), metadata.dev(), metadata.ino());
+            files.push(format!("scope/a{pair:06}"));
+        }
+        let root = Root::open(base).unwrap();
+        let (started, cpu) = (std::time::Instant::now(), cpu_seconds());
+        for name in &files {
+            let file = File::open(base.join(name)).unwrap();
+            names
+                .require_inside(
+                    &root,
+                    &RelativePath::new(name.as_bytes()).unwrap(),
+                    &base.join(name),
+                    &|| {
+                        let metadata = file.metadata()?;
+                        Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        eprintln!(
+            "MEASURE {pairs} same-directory pairs: {:.2}s elapsed, {:.2}s CPU",
+            started.elapsed().as_secs_f64(),
+            cpu_seconds() - cpu
+        );
     }
 
     /// Memory the names of 500,000 scanned linked names take, two names per

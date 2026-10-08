@@ -156,9 +156,11 @@ pub(crate) fn directory_names(directory: File) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
-/// How many entries of a directory name the inode `ino`, as the directory
-/// lists them. Takes over `directory` like [`directory_names`].
-pub(crate) fn directory_entries_naming(directory: File, ino: u64) -> io::Result<u64> {
+/// How many entries of a directory name each inode, as the directory lists
+/// them. Takes over `directory` like [`directory_names`].
+pub(crate) fn directory_entries_by_inode(
+    directory: File,
+) -> io::Result<std::collections::HashMap<u64, u64>> {
     struct DirectoryStream(*mut libc::DIR);
     impl Drop for DirectoryStream {
         fn drop(&mut self) {
@@ -174,7 +176,7 @@ pub(crate) fn directory_entries_naming(directory: File, ino: u64) -> io::Result<
         return Err(error);
     }
     let stream = DirectoryStream(stream);
-    let mut count = 0;
+    let mut counts = std::collections::HashMap::new();
     loop {
         set_errno(0);
         let entry = unsafe { libc::readdir(stream.0) };
@@ -183,11 +185,11 @@ pub(crate) fn directory_entries_naming(directory: File, ino: u64) -> io::Result<
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
-            return Ok(count);
+            return Ok(counts);
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." && unsafe { (*entry).d_ino } as u64 == ino {
-            count += 1;
+        if name != b"." && name != b".." {
+            *counts.entry(unsafe { (*entry).d_ino } as u64).or_insert(0) += 1;
         }
     }
 }

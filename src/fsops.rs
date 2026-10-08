@@ -720,6 +720,8 @@ struct HeldBasis {
     label: PathBuf,
     copy_id: CopyId,
     file: File,
+    /// The file's link count when it was first opened to be held.
+    links: u64,
 }
 
 struct SourceRootHandle {
@@ -2706,10 +2708,16 @@ impl FsOps {
             // A file written in place by name is the inode there now.
             if let Some(names) = self.scope_names.as_ref().filter(|_| !private) {
                 if !file.metadata()?.is_dir() {
-                    names.require_inside(root, relative, label, &|| {
-                        let opened = file.metadata()?;
-                        Ok((opened.dev(), opened.ino(), opened.nlink()))
-                    })?;
+                    names.require_inside(
+                        root,
+                        relative,
+                        label,
+                        &|| {
+                            let opened = file.metadata()?;
+                            Ok((opened.dev(), opened.ino(), opened.nlink()))
+                        },
+                        0,
+                    )?;
                 }
             }
             if private {

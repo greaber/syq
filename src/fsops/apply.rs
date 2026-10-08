@@ -469,7 +469,7 @@ fn apply_one_rooted(
             }
             require_open_target_known(&opened, &target.label, *condition)?;
             if scope_names::changes_metadata(&opened, meta, *flags) {
-                scope_names::require_names_inside(names, target, &file)?;
+                scope_names::require_names_inside(names, target, &file, None)?;
             }
             set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
             require_rooted_named_identity_known(
@@ -555,10 +555,16 @@ fn set_meta_confined(
         return Ok(());
     }
     if let Some(names) = names.filter(|_| !metadata.is_dir()) {
-        names.require_inside(&target.root, &target.relative, &target.label, &|| {
-            let metadata = parent.metadata()?;
-            Ok((metadata.dev, metadata.ino, metadata.nlink))
-        })?;
+        names.require_inside(
+            &target.root,
+            &target.relative,
+            &target.label,
+            &|| {
+                let metadata = parent.metadata()?;
+                Ok((metadata.dev, metadata.ino, metadata.nlink))
+            },
+            0,
+        )?;
     }
     if is_link {
         let handle = meta

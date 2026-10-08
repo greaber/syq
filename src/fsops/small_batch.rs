@@ -544,7 +544,7 @@ impl FsOps {
             return Ok(None);
         }
         if scope_names::changes_metadata(&current, meta, flags) {
-            self.require_names_inside(target, file)?;
+            self.require_names_inside(target, file, None)?;
         }
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;

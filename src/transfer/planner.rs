@@ -3402,15 +3402,17 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
-                // A conditioned in-place file meets its condition when it
-                // is opened (`Request::Prepare`).
+                // A restricted receiver opens a conditioned in-place file
+                // under its condition (`Request::Prepare`). Elsewhere one is
+                // staged and published under it, so that a retry can finish
+                // what an interrupted attempt left.
                 inplace: self.opts.inplace
-                    && matches!(
-                        target_condition,
-                        TargetCondition::Any
-                            | TargetCondition::Absent
-                            | TargetCondition::Matches { .. }
-                    )
+                    && (target_condition == TargetCondition::Any
+                        || (self.opts.restricted_receiver
+                            && matches!(
+                                target_condition,
+                                TargetCondition::Absent | TargetCondition::Matches { .. }
+                            )))
                     && self.container_guard.is_none(),
                 src_rel,
                 scanned,

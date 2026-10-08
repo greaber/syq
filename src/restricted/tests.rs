@@ -7397,9 +7397,7 @@ fn a_create_only_in_place_retry_is_refused_with_the_way_to_finish() {
             panic!("{response:?}")
         };
         assert!(
-            error
-                .as_str()
-                .contains("finish it with --as instead of --as-new"),
+            error.as_str().contains("finish an --as-new copy with --as"),
             "{error:?}"
         );
         assert_eq!(fs::read(&target).unwrap(), b"first");
