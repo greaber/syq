@@ -6,12 +6,16 @@ use crate::proto::{DirectoryMode, TargetCondition};
 use crate::rooted::RelativePath;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+/// Paths are bytes beneath the destination root: pruning can meet local
+/// names that are not UTF-8.
 pub(super) struct TemporaryAccess {
     enabled: bool,
-    prepared: HashSet<String>,
-    widened: BTreeMap<String, DirectoryMode>,
+    prepared: HashSet<Vec<u8>>,
+    widened: BTreeMap<Vec<u8>, DirectoryMode>,
 }
 
 impl TemporaryAccess {
@@ -29,7 +33,7 @@ impl TemporaryAccess {
         }
         let mut paths = BTreeSet::new();
         if destination.prefix.is_empty() {
-            paths.insert(String::new());
+            paths.insert(Vec::new());
         }
         for job in jobs {
             for (index, _) in job.path.match_indices('/') {
@@ -37,11 +41,11 @@ impl TemporaryAccess {
                 if super::super::prune::beneath(parent.as_bytes(), destination.prefix.as_bytes())
                     .is_some()
                 {
-                    paths.insert(parent.to_owned());
+                    paths.insert(parent.as_bytes().to_vec());
                 }
             }
             if job.kind == ObjectKind::Dir {
-                paths.insert(job.path.clone());
+                paths.insert(job.path.as_bytes().to_vec());
             }
         }
         // Parents precede descendants. Remember successful inspections as well
@@ -50,7 +54,7 @@ impl TemporaryAccess {
             if self.prepared.contains(&path) {
                 continue;
             }
-            let relative = RelativePath::new(path.as_bytes())?;
+            let relative = RelativePath::new(&path)?;
             if let Some(metadata) = destination.root.metadata_optional(&relative)? {
                 if metadata.is_dir() {
                     let condition = TargetCondition::MatchesFingerprint {
@@ -63,7 +67,7 @@ impl TemporaryAccess {
                         &destination.root,
                         &relative,
                         condition,
-                        Path::new(&path),
+                        Path::new(OsStr::from_bytes(&path)),
                     )? {
                         self.widened.insert(path.clone(), saved);
                     }
@@ -82,15 +86,7 @@ impl TemporaryAccess {
         path: &[u8],
         metadata: &crate::rooted::RootMetadata,
     ) -> Result<bool> {
-        // Restoration is keyed by UTF-8 names; leave any other name alone.
-        let Some(key) = self
-            .enabled
-            .then(|| String::from_utf8(path.to_vec()).ok())
-            .flatten()
-        else {
-            return Ok(false);
-        };
-        if self.widened.contains_key(&key) {
+        if !self.enabled || self.widened.contains_key(path) {
             return Ok(false);
         }
         let condition = TargetCondition::MatchesFingerprint {
@@ -103,19 +99,17 @@ impl TemporaryAccess {
             root,
             &RelativePath::new(path)?,
             condition,
-            Path::new(&key),
+            Path::new(OsStr::from_bytes(path)),
         )?;
-        Ok(saved.is_some_and(|saved| self.widened.insert(key, saved).is_none()))
+        Ok(saved.is_some_and(|saved| self.widened.insert(path.to_vec(), saved).is_none()))
     }
 
     /// A directory pruning removed has no mode to restore.
     pub(super) fn forget(&mut self, path: &[u8]) {
-        if let Ok(path) = std::str::from_utf8(path) {
-            self.widened.remove(path);
-        }
+        self.widened.remove(path);
     }
 
-    pub(super) fn into_restorations(self) -> BTreeMap<String, DirectoryMode> {
+    pub(super) fn into_restorations(self) -> BTreeMap<Vec<u8>, DirectoryMode> {
         self.widened
     }
 }
@@ -163,19 +157,22 @@ mod tests {
             fs::metadata(temporary.path().join("later")).unwrap().mode() & 0o777,
             0o500
         );
-        assert!(!access.prepared.contains("later"));
+        assert!(!access.prepared.contains(b"later".as_slice()));
         access.prepare(&destination, &[job("first/two")]).unwrap();
         assert_eq!(
-            access.widened.get("first").map(|saved| saved.mode),
+            access
+                .widened
+                .get(b"first".as_slice())
+                .map(|saved| saved.mode),
             (unsafe { libc::geteuid() } != 0).then_some(0o500)
         );
         access.prepare(&destination, &[job("later/one")]).unwrap();
         for (path, saved) in access.into_restorations() {
             crate::fsops::restore_directory_mode(
                 &destination.root,
-                &RelativePath::new(path.as_bytes()).unwrap(),
+                &RelativePath::new(&path).unwrap(),
                 saved,
-                Path::new(&path),
+                Path::new(OsStr::from_bytes(&path)),
             )
             .unwrap();
         }

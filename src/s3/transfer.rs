@@ -562,7 +562,7 @@ impl Engine {
         &self,
         destination: &Destination,
         directories: &DirectoryMetadata,
-        mut widened: BTreeMap<String, crate::proto::DirectoryMode>,
+        mut widened: BTreeMap<Vec<u8>, crate::proto::DirectoryMode>,
         aborted: bool,
     ) -> Result<()> {
         if self.args.dry_run {
@@ -578,18 +578,13 @@ impl Engine {
                 .iter()
                 .map(|(path, meta, mode, explicit)| {
                     let path = directory_key(&RelativePath::new(path.as_bytes())?);
-                    Ok((
-                        String::from_utf8(path)?,
-                        Some((meta.clone(), *mode, *explicit)),
-                    ))
+                    Ok((path, Some((meta.clone(), *mode, *explicit))))
                 })
                 .collect::<Result<_>>()?
         };
         if !aborted {
             for path in directories.created.lock().unwrap().iter() {
-                entries
-                    .entry(String::from_utf8(path.clone())?)
-                    .or_insert(None);
+                entries.entry(path.clone()).or_insert(None);
             }
         }
         for path in widened.keys() {
@@ -598,13 +593,14 @@ impl Engine {
         let mut entries: Vec<_> = entries.into_iter().collect();
         entries.sort_by_key(|(path, _)| {
             std::cmp::Reverse(
-                path.bytes().filter(|&c| c == b'/').count() + usize::from(!path.is_empty()),
+                path.iter().filter(|&&c| c == b'/').count() + usize::from(!path.is_empty()),
             )
         });
         let mut first_error = None;
         let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
-            let relative = RelativePath::new(path.as_bytes())?;
+            let relative = RelativePath::new(&path)?;
+            let label = String::from_utf8_lossy(&path).into_owned();
             let saved = widened.remove(&path);
             // Require the inode we widened before applying any final metadata.
             let result = (|| {
@@ -612,7 +608,7 @@ impl Engine {
                     let now = destination.root.metadata(&relative)?;
                     anyhow::ensure!(
                         (now.dev, now.ino) == (saved.dev, saved.ino),
-                        "directory {path} changed before restoring permissions"
+                        "directory {label} changed before restoring permissions"
                     );
                 }
                 if let Some((meta, mode, explicit)) = &metadata {
@@ -646,7 +642,9 @@ impl Engine {
                         &destination.root,
                         &relative,
                         saved,
-                        std::path::Path::new(&path),
+                        std::path::Path::new(
+                            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path),
+                        ),
                     ) {
                         first_error.get_or_insert(error);
                     }

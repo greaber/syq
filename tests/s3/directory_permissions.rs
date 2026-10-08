@@ -339,3 +339,41 @@ fn download_pruning_leaves_ignored_directories_alone() {
     );
     assert_eq!(fs::read(ignored.join("f")).unwrap(), b"keep");
 }
+
+/// Local names need not be UTF-8: pruning widens and removes such a
+/// directory too, and restores nothing it removed.
+#[test]
+fn download_pruning_widens_directories_with_non_utf8_names() {
+    use std::os::unix::ffi::OsStrExt;
+    if unsafe { libc::geteuid() } == 0 || !cfg!(target_os = "linux") {
+        return;
+    }
+    let server = Server::start("prefix-ok");
+    let temp = crate::test_support::tempdir().unwrap();
+    let dst = temp.path().join("dst");
+    let extra = dst.join(std::ffi::OsStr::from_bytes(b"extra-\xff"));
+    fs::create_dir_all(extra.join("inner")).unwrap();
+    fs::write(extra.join("inner/f"), b"extra").unwrap();
+    fs::write(extra.join("g"), b"extra").unwrap();
+    let restricted = [
+        RestrictedDirectory::new(extra.join("inner"), 0o555),
+        RestrictedDirectory::new(extra.clone(), 0o555),
+    ];
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "data",
+            "--into",
+            "dst",
+            "--prune",
+            "--temporarily-widen-dir-permissions",
+        ],
+    );
+    drop(restricted);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(!extra.exists());
+    assert_eq!(fs::read(dst.join("file")).unwrap(), vec![b'x'; 65536]);
+}
