@@ -184,6 +184,35 @@ os._exit(0)
     def test_waited_helper_cpu_is_not_counted_twice(self):
         self.measure_family(True)
 
+    @unittest.skipUnless(platform.system() == "Linux", "/proc sampling is Linux-only")
+    def test_linux_sampling_skips_an_exiting_process_it_can_no_longer_inspect(self):
+        # Linux makes an exiting process's fd directory owned by root once its
+        # memory is released, so listing it can fail before the process is a
+        # zombie. Deny that listing for a live helper and decide the recheck.
+        helper = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(helper.wait)
+        self.addCleanup(helper.kill)
+        with open(f"/proc/{helper.pid}/stat") as stream:
+            fields = stream.read().rsplit(")", 1)[1].split()
+        listdir = os.listdir
+
+        def denied(path):
+            if str(path) == f"/proc/{helper.pid}/fd":
+                raise PermissionError(13, "Permission denied", str(path))
+            return listdir(path)
+
+        with mock.patch.object(bench, "linux_group", return_value={helper.pid: fields}), \
+                mock.patch.object(bench.os, "listdir", side_effect=denied):
+            with mock.patch.object(bench, "exiting_or_gone", return_value=True):
+                self.assertEqual(bench.sample_linux(0), [])
+            with mock.patch.object(bench, "exiting_or_gone", return_value=False), \
+                    self.assertRaisesRegex(RuntimeError, f"cannot sample process {helper.pid}"):
+                bench.sample_linux(0)
+        self.assertFalse(bench.exiting_or_gone(helper.pid))
+        helper.kill()
+        helper.wait()
+        self.assertTrue(bench.exiting_or_gone(helper.pid))
+
     @unittest.skipUnless(platform.system() == "Linux", "complete exit accounting requires Linux")
     def test_disabled_sampling_keeps_unwaited_helper_cpu(self):
         self.measure_family(False, sample_processes=False)
