@@ -2763,13 +2763,17 @@ impl FsOps {
             // the identity use it instead of a read after the data, which an
             // NFS client answers with a request. A reopened file is read as
             // before.
-            let (file, opened) = match self.uncache_rooted_opened(&target.root, &target.relative) {
-                Some(opened) => opened,
-                None => (
-                    target.root.open_regular_write(&target.relative, false)?,
-                    None,
-                ),
-            };
+            // A descriptor an earlier step opened, whether or not it kept the
+            // metadata read then, has been held open since.
+            let (file, opened, held) =
+                match self.uncache_rooted_opened(&target.root, &target.relative) {
+                    Some((file, opened)) => (file, opened, true),
+                    None => (
+                        target.root.open_regular_write(&target.relative, false)?,
+                        None,
+                        false,
+                    ),
+                };
             // The file is read at most once here. A fingerprint condition
             // holds the file's ctime as it is now, after the writes, so that
             // condition needs fresh metadata; every other condition, the
@@ -2783,7 +2787,11 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
-            self.require_names_inside(target, &file, opened.as_ref().map(|opened| opened.nlink()))?;
+            self.require_names_inside(
+                target,
+                &file,
+                held.then(|| opened.as_ref().unwrap_or(&current).nlink()),
+            )?;
             check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;

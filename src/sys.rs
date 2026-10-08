@@ -180,38 +180,88 @@ pub(crate) fn name_folding(directory: &File) -> NameFolding {
     }
 }
 
-/// How `directory` may fold names, as far as the system says: exact on the
-/// local filesystems that compare names byte for byte, unless the directory
-/// folds case (ext4, f2fs and tmpfs `casefold`); folding on any other.
+/// How `directory` may fold names, as far as the system says.
 #[cfg(target_os = "linux")]
 pub(crate) fn name_folding(directory: &File) -> NameFolding {
-    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
         return NameFolding::Case;
     }
-    let exact = matches!(
-        unsafe { stats.assume_init() }.f_type as u32,
-        0xef53 // ext2, ext3, ext4
-            | 0x5846_5342 // xfs
-            | 0x9123_683e // btrfs
-            | 0x0102_1994 // tmpfs
-            | 0xf2f5_2010 // f2fs
-    );
-    if !exact {
-        return NameFolding::Case;
-    }
+    let file_system = unsafe { stats.assume_init() }.f_type as u32;
     // GETFLAGS encodes sizeof(long) in its request but returns an int.
     let mut flags: libc::c_int = 0;
-    let result = unsafe { libc::ioctl(directory.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
-    if result != 0 || flags & FS_CASEFOLD_FL != 0 {
-        // tmpfs answers no flags unless it supports casefolding.
-        if result != 0 && unsafe { stats.assume_init() }.f_type as u32 == 0x0102_1994 {
-            return NameFolding::Exact;
-        }
+    let flags = (unsafe { libc::ioctl(directory.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) }
+        == 0)
+        .then_some(flags);
+    let xfs_flags = (file_system == XFS_MAGIC)
+        .then(|| xfs_geometry_flags(directory))
+        .flatten();
+    linux_name_folding(file_system, flags, xfs_flags)
+}
+
+#[cfg(target_os = "linux")]
+const XFS_MAGIC: u32 = 0x5846_5342;
+#[cfg(target_os = "linux")]
+const TMPFS_MAGIC: u32 = 0x0102_1994;
+
+/// The flags of the XFS filesystem holding `directory`, from its geometry
+/// (`XFS_IOC_FSGEOMETRY_V1`, which every kernel answers).
+#[cfg(target_os = "linux")]
+fn xfs_geometry_flags(directory: &File) -> Option<u32> {
+    const XFS_IOC_FSGEOMETRY_V1: libc::c_ulong = 0x8070_5864;
+    // struct xfs_fsop_geom_v1: 112 bytes, `flags` at byte 92.
+    let mut geometry = [0u64; 14];
+    let result = unsafe {
+        libc::ioctl(
+            directory.as_raw_fd(),
+            XFS_IOC_FSGEOMETRY_V1 as _,
+            geometry.as_mut_ptr(),
+        )
+    };
+    (result == 0).then(|| {
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(geometry.as_ptr().cast(), 112) };
+        u32::from_ne_bytes(bytes[92..96].try_into().expect("four bytes"))
+    })
+}
+
+/// How a directory on the Linux filesystem `file_system` (its statfs type)
+/// may fold names, given its inode flags and, on XFS, the filesystem's
+/// geometry flags, each if they could be read. ext2/3/4, xfs, btrfs, f2fs
+/// and tmpfs compare names byte for byte, unless the directory has the
+/// casefold flag, or an XFS filesystem was made case-insensitive (`mkfs.xfs
+/// -n version=ci`, which sets no flag on directories). Any other filesystem
+/// may fold names, so is treated as folding case.
+#[cfg(target_os = "linux")]
+fn linux_name_folding(
+    file_system: u32,
+    flags: Option<libc::c_int>,
+    xfs_flags: Option<u32>,
+) -> NameFolding {
+    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
+    const XFS_FSOP_GEOM_FLAGS_DIRV2CI: u32 = 0x1000;
+    let byte_for_byte = matches!(
+        file_system,
+        0xef53 // ext2, ext3, ext4
+            | XFS_MAGIC
+            | 0x9123_683e // btrfs
+            | TMPFS_MAGIC
+            | 0xf2f5_2010 // f2fs
+    );
+    if !byte_for_byte {
         return NameFolding::Case;
     }
-    NameFolding::Exact
+    if file_system == XFS_MAGIC
+        && xfs_flags.is_none_or(|flags| flags & XFS_FSOP_GEOM_FLAGS_DIRV2CI != 0)
+    {
+        return NameFolding::Case;
+    }
+    match flags {
+        Some(flags) if flags & FS_CASEFOLD_FL != 0 => NameFolding::Case,
+        Some(_) => NameFolding::Exact,
+        // tmpfs answers no flags unless it supports casefolding.
+        None if file_system == TMPFS_MAGIC => NameFolding::Exact,
+        None => NameFolding::Case,
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -499,5 +549,55 @@ mod tests {
         }
         let read = walk_directory_entries(File::open(long.path()).unwrap(), 300).unwrap();
         assert!((1..300).contains(&read), "{read}");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod name_folding_tests {
+    use super::*;
+
+    #[test]
+    fn linux_directories_fold_names_as_their_filesystem_does() {
+        use NameFolding::{Case, Exact};
+        const EXT4: u32 = 0xef53;
+        const ZFS: u32 = 0x2fc1_2fc1;
+        const CASEFOLD: libc::c_int = 0x4000_0000;
+        const DIRV2CI: u32 = 0x1000;
+        for (file_system, flags, xfs, expected) in [
+            (EXT4, Some(0), None, Exact),
+            (EXT4, Some(CASEFOLD), None, Case),
+            (EXT4, None, None, Case),
+            (TMPFS_MAGIC, None, None, Exact),
+            (TMPFS_MAGIC, Some(CASEFOLD), None, Case),
+            (XFS_MAGIC, Some(0), Some(0x7f_cecb), Exact),
+            (XFS_MAGIC, Some(0), Some(0x7f_cecb | DIRV2CI), Case),
+            (XFS_MAGIC, Some(0), None, Case),
+            (ZFS, Some(0), None, Case),
+        ] {
+            assert_eq!(
+                linux_name_folding(file_system, flags, xfs),
+                expected,
+                "{file_system:#x} {flags:?} {xfs:?}"
+            );
+        }
+    }
+
+    /// The geometry of an XFS filesystem, where the tests run on one.
+    #[test]
+    fn xfs_geometry_reads_where_a_filesystem_is_xfs() {
+        for path in ["/", "/tmp", "/var/tmp"] {
+            let Ok(directory) = File::open(path) else {
+                continue;
+            };
+            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            if unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0
+                || unsafe { stats.assume_init() }.f_type as u32 != XFS_MAGIC
+            {
+                continue;
+            }
+            assert!(xfs_geometry_flags(&directory).is_some(), "{path}");
+            return;
+        }
+        eprintln!("no XFS filesystem here; nothing to check");
     }
 }

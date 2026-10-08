@@ -8091,3 +8091,90 @@ fn an_in_place_open_of_a_scanned_file_refuses_one_with_names_outside() {
     );
     assert_eq!(fs::read(base.join("outside/a")).unwrap(), b"old");
 }
+
+/// An in-place file held since a comparison and its preparation, moved
+/// outside the scope before it is finished, is not changed there: the
+/// descriptor finalize uses has been held open, whether or not the
+/// metadata read at its open was kept.
+#[test]
+fn a_held_in_place_file_moved_outside_is_not_finished_there() {
+    let dir = crate::test_support::tempdir().unwrap();
+    let base = dir.path();
+    fs::create_dir(base.join("scope")).unwrap();
+    fs::create_dir(base.join("outside")).unwrap();
+    fs::write(base.join("scope/a"), b"held").unwrap();
+    fs::set_permissions(base.join("scope/a"), fs::Permissions::from_mode(0o600)).unwrap();
+    let bytes = |path: &Path| path.as_os_str().as_bytes().to_vec();
+    let identity = Root::open(base).unwrap().identity();
+    let guard = ContainerGuard {
+        root: bytes(base),
+        dev: identity.dev,
+        ino: identity.ino,
+    };
+    let mut operations = FsOps::new();
+    operations.set_scope_names(Arc::new(scope_names::ScopeNames::new(
+        bytes(base),
+        [(bytes(&base.join("scope")), true)],
+    )));
+    let target = bytes(&base.join("scope/a"));
+    let copy_id = [8; 16];
+    operations
+        .hash_and_hold(
+            &target,
+            &copy_id,
+            MIN_HASH_BLOCK_BYTES,
+            4,
+            TargetCondition::Any,
+            Some(&guard),
+        )
+        .unwrap();
+    operations
+        .prepare(
+            PartialTarget {
+                path: &target,
+                id: &copy_id,
+                guard: Some(&guard),
+            },
+            PrepareOptions {
+                condition: TargetCondition::Any,
+                size: 4,
+                inplace: true,
+                mode: 0o644,
+                attempt: 0,
+                create_if_missing: true,
+                scanned: ScannedDestination::Unknown,
+            },
+        )
+        .unwrap();
+    fs::rename(base.join("scope/a"), base.join("outside/a")).unwrap();
+    let error = operations
+        .finalize_expected(
+            None,
+            &target,
+            true,
+            &copy_id,
+            &Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags::MODE,
+            ScannedDestination::Unknown,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: Some(&guard),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("can't confirm are inside"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::metadata(base.join("outside/a")).unwrap().mode() & 0o7777,
+        0o600
+    );
+}

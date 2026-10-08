@@ -51,6 +51,8 @@ rayon = "1.12"
 ignore = "0.4"
 globset = "0.4"
 regex = "1"
+# Already built for `url`'s IDNA support; compares names as filesystems do.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 time = { version = "0.3", features = ["parsing"] }
 blake3 = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

@@ -294,33 +294,49 @@ impl ScopeNames {
 
 /// How many of `names`, all in one directory, are distinct entries as a
 /// directory that folds names as `folding` says compares them, or fewer:
-/// counting too few can only refuse a change. Where a directory folds case,
-/// ASCII names fold their case and trailing dots and spaces, which some
-/// filesystems ignore; a name with any other character may fold to almost
-/// anything there (a Kelvin sign to `k`, `ß` to `ss`), so it adds none,
-/// though one name always counts. Where it compares Unicode composition
-/// only, names with other characters count once among themselves.
+/// counting too few can only refuse a change. One name always counts.
 fn distinct_names(names: &BTreeSet<Vec<u8>>, folding: crate::sys::NameFolding) -> u64 {
+    names
+        .iter()
+        .map(|name| name_key(name, folding))
+        .collect::<BTreeSet<_>>()
+        .len()
+        .max(1) as u64
+}
+
+/// A key that is the same for any two names `folding` lets a directory
+/// treat as one entry, and perhaps for others: byte for byte, the name
+/// itself; ignoring how Unicode composes characters (APFS), its canonical
+/// decomposition, so a Kelvin sign is `K`; folding case, or unknown, a
+/// compatibility decomposition folded through lower, upper and lower case
+/// (so `ß` is `ss`), without trailing dots and spaces, which some
+/// filesystems ignore.
+fn name_key(name: &[u8], folding: crate::sys::NameFolding) -> Vec<u8> {
     use crate::sys::NameFolding;
-    let ascii = names.iter().filter(|name| name.is_ascii());
-    let others = names.iter().any(|name| !name.is_ascii());
-    let count = match folding {
-        NameFolding::Exact => names.len(),
-        NameFolding::Normalization => ascii.count() + usize::from(others),
-        NameFolding::Case => ascii
-            .map(|name| {
-                let trimmed = name.len()
-                    - name
-                        .iter()
-                        .rev()
-                        .take_while(|byte| matches!(byte, b'.' | b' '))
-                        .count();
-                name[..trimmed].to_ascii_lowercase()
-            })
-            .collect::<BTreeSet<_>>()
-            .len(),
-    };
-    count.max(1) as u64
+    use icu_normalizer::DecomposingNormalizerBorrowed as Normalizer;
+    // A name that is not UTF-8 has its invalid bytes replaced, which can
+    // only make two names one.
+    let text = String::from_utf8_lossy(name);
+    match folding {
+        NameFolding::Exact => name.to_vec(),
+        NameFolding::Normalization => Normalizer::new_nfd()
+            .normalize(&text)
+            .into_owned()
+            .into_bytes(),
+        NameFolding::Case => {
+            let compatible = Normalizer::new_nfkd();
+            let folded = compatible
+                .normalize(&text)
+                .to_lowercase()
+                .to_uppercase()
+                .to_lowercase();
+            compatible
+                .normalize(&folded)
+                .trim_end_matches(['.', ' '])
+                .as_bytes()
+                .to_vec()
+        }
+    }
 }
 
 impl FsOps {
@@ -690,39 +706,84 @@ mod tests {
         }
     }
 
-    /// Where a directory folds case, two names that differ only in case,
-    /// or a name with other characters, may be one entry: they count once.
+    /// Where a directory ignores how Unicode composes characters
+    /// (case-sensitive APFS), a Kelvin sign leads to the entry `K`: approving
+    /// both does not confirm a link nobody approved.
     #[test]
-    fn folded_names_count_once_where_a_directory_folds_case() {
+    fn composition_spellings_of_one_entry_count_once() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let t = Fixture::new(temporary.path());
+        let folding = crate::sys::name_folding(&File::open(t.base.join("scope")).unwrap());
+        if folding != crate::sys::NameFolding::Normalization {
+            eprintln!("this directory is {folding:?}, not case-sensitive APFS; nothing to check");
+            return;
+        }
+        fs::write(t.base.join("scope/K"), b"shared").unwrap();
+        fs::hard_link(t.base.join("scope/K"), t.base.join("scope/unapproved")).unwrap();
+        assert!(t.base.join("scope/\u{212a}").exists());
+        t.record("scope/K");
+        t.record("scope/\u{212a}");
+        assert!(t.check("scope/K").is_err());
+    }
+
+    /// Where a directory folds case, or might, `a` and `A` are one name,
+    /// but `report` and `résumé` are two.
+    #[test]
+    fn folding_directories_tell_names_apart_as_they_may() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let t = Fixture::new(temporary.path());
+        let folding = crate::sys::name_folding(&File::open(t.base.join("scope")).unwrap());
+        if folding != crate::sys::NameFolding::Case {
+            eprintln!("this directory is {folding:?}; nothing to check");
+            return;
+        }
+        fs::write(t.base.join("scope/report"), b"shared").unwrap();
+        fs::hard_link(
+            t.base.join("scope/report"),
+            t.base.join("scope/r\u{e9}sum\u{e9}"),
+        )
+        .unwrap();
+        t.record("scope/report");
+        t.record("scope/r\u{e9}sum\u{e9}");
+        t.check("scope/report").unwrap();
+        fs::write(t.base.join("scope/a"), b"other").unwrap();
+        if !t.base.join("scope/A").exists() {
+            fs::hard_link(t.base.join("scope/a"), t.base.join("scope/A")).unwrap();
+        }
+        fs::hard_link(t.base.join("scope/a"), t.base.join("scope/unapproved")).unwrap();
+        t.record("scope/a");
+        t.record("scope/A");
+        assert!(t.check("scope/a").is_err());
+    }
+
+    /// Names are distinct entries as the directory compares them: byte for
+    /// byte; ignoring composition, where a Kelvin sign is `K` and a Greek
+    /// question mark is `;`; or folding case, where `a` is `A` and `ß` is
+    /// `ss` but `report` is not `résumé`.
+    #[test]
+    fn names_count_as_the_directory_compares_them() {
         let names = |list: &[&str]| -> BTreeSet<Vec<u8>> {
             list.iter().map(|name| name.as_bytes().to_vec()).collect()
         };
         use crate::sys::NameFolding::{Case, Exact, Normalization};
-        assert_eq!(distinct_names(&names(&["a", "A"]), Case), 1);
-        assert_eq!(distinct_names(&names(&["a", "A"]), Normalization), 2);
-        assert_eq!(distinct_names(&names(&["a", "A"]), Exact), 2);
-        assert_eq!(distinct_names(&names(&["Name. .", "name"]), Case), 1);
-        assert_eq!(
-            distinct_names(&names(&["report", "r\u{e9}sum\u{e9}"]), Case),
-            1
-        );
-        assert_eq!(
-            distinct_names(&names(&["report", "r\u{e9}sum\u{e9}"]), Exact),
-            2
-        );
-        assert_eq!(
-            distinct_names(&names(&["report", "r\u{e9}sum\u{e9}"]), Normalization),
-            2
-        );
-        assert_eq!(
-            distinct_names(&names(&["a", "b", "k\u{212a}", "\u{e9}"]), Case),
-            2
-        );
-        assert_eq!(
-            distinct_names(&names(&["e\u{301}", "\u{e9}"]), Normalization),
-            1
-        );
-        assert_eq!(distinct_names(&names(&["\u{e9}"]), Case), 1);
+        for (list, exact, normalization, case) in [
+            (&["a", "A"][..], 2, 2, 1),
+            (&["K", "\u{212a}"], 2, 1, 1),
+            (&[";", "\u{37e}"], 2, 1, 1),
+            (&["e\u{301}", "\u{e9}"], 2, 1, 1),
+            (&["stra\u{df}e", "STRASSE"], 2, 2, 1),
+            (&["Name. .", "name"], 2, 2, 1),
+            (&["report", "r\u{e9}sum\u{e9}"], 2, 2, 2),
+            (&["\u{e9}"], 1, 1, 1),
+        ] {
+            assert_eq!(distinct_names(&names(list), Exact), exact, "{list:?}");
+            assert_eq!(
+                distinct_names(&names(list), Normalization),
+                normalization,
+                "{list:?}"
+            );
+            assert_eq!(distinct_names(&names(list), Case), case, "{list:?}");
+        }
     }
 }
 
