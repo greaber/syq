@@ -5,7 +5,7 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 
@@ -154,6 +154,69 @@ pub(crate) fn directory_names(directory: File) -> io::Result<Vec<Vec<u8>>> {
         true
     })?;
     Ok(names)
+}
+
+/// How a directory may treat two different names as one entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameFolding {
+    /// Names are compared byte for byte.
+    Exact,
+    /// Names differing only in how Unicode composes their characters may
+    /// be one entry (case-sensitive APFS); ASCII names are exact.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Normalization,
+    /// Names may differ in case, Unicode composition or more (a case-folding
+    /// directory, or one that cannot be told apart from it).
+    Case,
+}
+
+/// How `directory` may fold names, as far as the system says.
+#[cfg(target_os = "macos")]
+pub(crate) fn name_folding(directory: &File) -> NameFolding {
+    // APFS compares names without regard to how Unicode composes them.
+    match unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_CASE_SENSITIVE) } {
+        1 => NameFolding::Normalization,
+        _ => NameFolding::Case,
+    }
+}
+
+/// How `directory` may fold names, as far as the system says: exact on the
+/// local filesystems that compare names byte for byte, unless the directory
+/// folds case (ext4, f2fs and tmpfs `casefold`); folding on any other.
+#[cfg(target_os = "linux")]
+pub(crate) fn name_folding(directory: &File) -> NameFolding {
+    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return NameFolding::Case;
+    }
+    let exact = matches!(
+        unsafe { stats.assume_init() }.f_type as u32,
+        0xef53 // ext2, ext3, ext4
+            | 0x5846_5342 // xfs
+            | 0x9123_683e // btrfs
+            | 0x0102_1994 // tmpfs
+            | 0xf2f5_2010 // f2fs
+    );
+    if !exact {
+        return NameFolding::Case;
+    }
+    // GETFLAGS encodes sizeof(long) in its request but returns an int.
+    let mut flags: libc::c_int = 0;
+    let result = unsafe { libc::ioctl(directory.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+    if result != 0 || flags & FS_CASEFOLD_FL != 0 {
+        // tmpfs answers no flags unless it supports casefolding.
+        if result != 0 && unsafe { stats.assume_init() }.f_type as u32 == 0x0102_1994 {
+            return NameFolding::Exact;
+        }
+        return NameFolding::Case;
+    }
+    NameFolding::Exact
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn name_folding(_directory: &File) -> NameFolding {
+    NameFolding::Case
 }
 
 /// How many entries of a directory name each inode, as the directory lists

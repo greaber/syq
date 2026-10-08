@@ -563,7 +563,7 @@ fn set_meta_confined(
                 let metadata = parent.metadata()?;
                 Ok((metadata.dev, metadata.ino, metadata.nlink))
             },
-            0,
+            None,
         )?;
     }
     if is_link {

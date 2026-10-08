@@ -2716,7 +2716,7 @@ impl FsOps {
                             let opened = file.metadata()?;
                             Ok((opened.dev(), opened.ino(), opened.nlink()))
                         },
-                        0,
+                        None,
                     )?;
                 }
             }

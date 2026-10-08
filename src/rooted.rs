@@ -1114,16 +1114,19 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
-    /// How many entries of the directory `path` name each inode.
-    pub(crate) fn count_entries_by_inode(
+    /// How the directory `path` compares names, and how many of its
+    /// entries name each inode.
+    pub(crate) fn directory_entries(
         &self,
         path: &RelativePath,
-    ) -> Result<std::collections::HashMap<u64, u64>> {
+    ) -> Result<(crate::sys::NameFolding, std::collections::HashMap<u64, u64>)> {
         let directory = self.open_directory(path)?;
         let readable = open_readable_directory_at(&directory, b".")
             .context("open readable confined directory")?;
-        crate::sys::directory_entries_by_inode(readable)
-            .with_context(|| format!("read confined directory {}", path.label()))
+        let folding = crate::sys::name_folding(&readable);
+        let entries = crate::sys::directory_entries_by_inode(readable)
+            .with_context(|| format!("read confined directory {}", path.label()))?;
+        Ok((folding, entries))
     }
 
     /// Whether a retained directory has no entries, reading only as far as

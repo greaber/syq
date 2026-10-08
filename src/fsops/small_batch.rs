@@ -543,8 +543,9 @@ impl FsOps {
         if current.len() != len {
             return Ok(None);
         }
+        // Held open since it was compared, the file is checked by name.
         if scope_names::changes_metadata(&current, meta, flags) {
-            self.require_names_inside(target, file, None)?;
+            self.require_names_inside(target, file, Some(current.nlink()))?;
         }
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;

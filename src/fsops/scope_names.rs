@@ -25,11 +25,12 @@ pub(crate) struct ScopeNames {
     entries: Mutex<HashMap<(u64, u64), DirectoryEntries>>,
 }
 
-/// A directory's entry count per inode, as of its change time, for the
-/// inodes it lists more than once.
+/// How a directory compares names, and its entry count per inode as of its
+/// change time, for the inodes it lists more than once.
 struct DirectoryEntries {
     changed: (i64, u32),
-    per_inode: HashMap<u64, u64>,
+    folding: crate::sys::NameFolding,
+    per_inode: Arc<HashMap<u64, u64>>,
 }
 
 /// A directory holding names of a file: its path, change time, and the
@@ -136,16 +137,15 @@ impl ScopeNames {
     /// leads to it and every name it has can be confirmed inside the
     /// approved directories: names the receiver saw that still lead to the
     /// file, each directory entry counted once however it was spelled.
-    /// `opened_links` is the link count when the file was opened, for a file
-    /// held since: one with a single name then and now has only that name,
-    /// since this receiver never gives a file a name outside.
+    /// `held_links` is the link count when the file was opened, for a file
+    /// held open since then, or None for one just opened by this name.
     pub(crate) fn require_inside(
         &self,
         root: &Root,
         relative: &RelativePath,
         label: &Path,
         current: &dyn Fn() -> Result<LinkedFile>,
-        opened_links: u64,
+        held_links: Option<u64>,
     ) -> Result<()> {
         let refuse = || {
             let label = label.as_os_str().as_bytes();
@@ -163,14 +163,18 @@ impl ScopeNames {
             )
         };
         let (dev, ino, nlink) = current()?;
-        if nlink.max(opened_links) <= 1 {
+        // A file just opened by this name with no other has only that name.
+        if held_links.is_none() && nlink <= 1 {
             return Ok(());
         }
         // The change goes through this name, so it must still lead to the
-        // file: a held file whose name inside is gone may have only names
-        // outside left.
+        // file: a file held open since may have been moved, or its name
+        // inside removed, leaving it only names outside.
         if !leads(relative, (dev, ino)) {
             return Err(refuse());
+        }
+        if nlink.max(held_links.unwrap_or(0)) <= 1 {
+            return Ok(());
         }
         let _counting = self.counting.lock().unwrap();
         let (dev, ino, nlink) = current()?;
@@ -217,28 +221,29 @@ impl ScopeNames {
                         )
                     })
                     .2
-                    .insert(folded(leaf));
+                    .insert(leaf.to_vec());
             }
         }
         // A name alone in its directory is one entry. Several names in one
         // directory are as many entries as the directory lists for the file,
-        // read once, but no more than the distinct names left once folded as
-        // any filesystem might fold them: two spellings of one entry count
-        // once.
+        // read once, but no more than the names that are distinct as that
+        // directory compares names: two spellings of one entry count once.
         let mut inside = 0;
         for (identity, (parent, changed, names)) in groups {
-            // A name with another character might be any other name there.
-            let distinct = if names.contains(UNFOLDABLE) {
+            inside += if names.len() == 1 {
                 1
             } else {
-                names.len() as u64
-            };
-            inside += if distinct == 1 {
-                1
-            } else {
-                self.entries_naming(root, &parent, (identity, changed), ino)
+                self.directory(root, &parent, (identity, changed))
+                    .map(|(folding, per_inode)| {
+                        // An inode listed once has the one entry a name
+                        // leading to it is.
+                        per_inode
+                            .get(&ino)
+                            .copied()
+                            .unwrap_or(1)
+                            .min(distinct_names(&names, folding))
+                    })
                     .unwrap_or(0)
-                    .min(distinct)
             };
             if inside >= nlink {
                 return Ok(());
@@ -249,62 +254,73 @@ impl ScopeNames {
 }
 
 impl ScopeNames {
-    /// How many entries of the directory `parent`, with this identity and
-    /// change time, name the inode `ino`. A directory is read once while it
-    /// stays unchanged, however many of its files are checked. Its entries
-    /// may change within one tick of a coarse clock; a count read too early
-    /// misses an entry added since, which can only refuse a change, or
-    /// counts one removed since, which the distinct names that still lead
-    /// to the file bound.
-    fn entries_naming(
+    /// How the directory `parent`, with this identity and change time,
+    /// compares names, and how many entries it lists for each inode listed
+    /// more than once. A directory is read once while it stays unchanged,
+    /// however many of its files are checked. Its entries may change within
+    /// one tick of a coarse clock; a count read too early misses an entry
+    /// added since, which can only refuse a change, or counts one removed
+    /// since, which the distinct names that still lead to the file bound.
+    fn directory(
         &self,
         root: &Root,
         parent: &[u8],
         (identity, changed): ((u64, u64), (i64, u32)),
-        ino: u64,
-    ) -> Result<u64> {
-        // A name that leads to the file is an entry for it, so an inode
-        // the directory does not list more than once has one.
+    ) -> Result<(crate::sys::NameFolding, Arc<HashMap<u64, u64>>)> {
         let mut entries = self.entries.lock().unwrap();
         if let Some(known) = entries
             .get(&identity)
             .filter(|known| known.changed == changed)
         {
-            return Ok(known.per_inode.get(&ino).copied().unwrap_or(1));
+            return Ok((known.folding, known.per_inode.clone()));
         }
-        let mut per_inode = root.count_entries_by_inode(&RelativePath::new(parent)?)?;
+        let (folding, mut per_inode) = root.directory_entries(&RelativePath::new(parent)?)?;
         per_inode.retain(|_, count| *count > 1);
-        let count = per_inode.get(&ino).copied().unwrap_or(1);
+        let per_inode = Arc::new(per_inode);
         if entries.len() >= ENTRY_COUNT_DIRECTORIES {
             entries.clear();
         }
-        entries.insert(identity, DirectoryEntries { changed, per_inode });
-        Ok(count)
+        entries.insert(
+            identity,
+            DirectoryEntries {
+                changed,
+                folding,
+                per_inode: per_inode.clone(),
+            },
+        );
+        Ok((folding, per_inode))
     }
 }
 
-/// What a name with a character other than ASCII folds to: no name has a
-/// NUL byte.
-const UNFOLDABLE: &[u8] = b"\0";
-
-/// `name` as the most aggressive filesystem might fold it when telling
-/// names apart, or something coarser: folding too much can only refuse a
-/// change, never allow one. ASCII letters fold their case and trailing dots
-/// and spaces go, as some filesystems ignore them; any other character may
-/// fold to almost anything under Unicode case folding and normalization (a
-/// Kelvin sign to `k`, `ß` to `ss`, a precomposed letter to its parts), so
-/// a name with one folds to `UNFOLDABLE`, which may be any of the others.
-fn folded(name: &[u8]) -> Vec<u8> {
-    if !name.is_ascii() {
-        return UNFOLDABLE.to_vec();
-    }
-    let trimmed = name.len()
-        - name
-            .iter()
-            .rev()
-            .take_while(|byte| matches!(byte, b'.' | b' '))
-            .count();
-    name[..trimmed].to_ascii_lowercase()
+/// How many of `names`, all in one directory, are distinct entries as a
+/// directory that folds names as `folding` says compares them, or fewer:
+/// counting too few can only refuse a change. Where a directory folds case,
+/// ASCII names fold their case and trailing dots and spaces, which some
+/// filesystems ignore; a name with any other character may fold to almost
+/// anything there (a Kelvin sign to `k`, `ß` to `ss`), so it adds none,
+/// though one name always counts. Where it compares Unicode composition
+/// only, names with other characters count once among themselves.
+fn distinct_names(names: &BTreeSet<Vec<u8>>, folding: crate::sys::NameFolding) -> u64 {
+    use crate::sys::NameFolding;
+    let ascii = names.iter().filter(|name| name.is_ascii());
+    let others = names.iter().any(|name| !name.is_ascii());
+    let count = match folding {
+        NameFolding::Exact => names.len(),
+        NameFolding::Normalization => ascii.count() + usize::from(others),
+        NameFolding::Case => ascii
+            .map(|name| {
+                let trimmed = name.len()
+                    - name
+                        .iter()
+                        .rev()
+                        .take_while(|byte| matches!(byte, b'.' | b' '))
+                        .count();
+                name[..trimmed].to_ascii_lowercase()
+            })
+            .collect::<BTreeSet<_>>()
+            .len(),
+    };
+    count.max(1) as u64
 }
 
 impl FsOps {
@@ -343,15 +359,15 @@ impl FsOps {
 
     /// Refuse to change `target`'s file, open as `file`, in place unless all
     /// its names are confirmed inside the approved directories.
-    /// `opened_links` is its link count when it was opened, for a file held
-    /// since then.
+    /// `held_links` is its link count when it was opened, for a file held
+    /// open since then, or None for one just opened by this name.
     pub(super) fn require_names_inside(
         &self,
         target: &RootedTarget,
         file: &File,
-        opened_links: Option<u64>,
+        held_links: Option<u64>,
     ) -> Result<()> {
-        require_names_inside(self.scope_names.as_deref(), target, file, opened_links)
+        require_names_inside(self.scope_names.as_deref(), target, file, held_links)
     }
 }
 
@@ -360,15 +376,14 @@ pub(super) fn require_names_inside(
     names: Option<&ScopeNames>,
     target: &RootedTarget,
     file: &File,
-    opened_links: Option<u64>,
+    held_links: Option<u64>,
 ) -> Result<()> {
     let Some(names) = names else {
         return Ok(());
     };
-    // One read of the descriptor decides a file with a single name.
+    // One read of the descriptor decides a file just opened by its only name.
     let metadata = file.metadata()?;
-    let opened_links = opened_links.unwrap_or(0);
-    if metadata.is_dir() || metadata.nlink().max(opened_links) <= 1 {
+    if metadata.is_dir() || (held_links.is_none() && metadata.nlink() <= 1) {
         return Ok(());
     }
     let current = || -> Result<LinkedFile> {
@@ -380,7 +395,7 @@ pub(super) fn require_names_inside(
         &target.relative,
         &target.label,
         &current,
-        opened_links,
+        held_links,
     )
 }
 
@@ -443,7 +458,7 @@ mod tests {
                     let metadata = file.metadata()?;
                     Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
                 },
-                0,
+                None,
             )
         }
     }
@@ -544,8 +559,6 @@ mod tests {
         fs::hard_link(t.base.join("scope/a"), t.base.join("scope").join(&other)).unwrap();
         t.record(&format!("scope/{other}"));
         assert!(t.check("scope/a").is_err());
-        assert_eq!(folded(b"Name. ."), b"name");
-        assert_eq!(folded("\u{e9}".as_bytes()), UNFOLDABLE);
     }
 
     /// An enrollment root of `/` keeps names beneath it.
@@ -569,13 +582,31 @@ mod tests {
     /// outside: finishing it there must not change that file.
     #[test]
     fn removed_inside_name_must_not_allow_finishing_outside_basis() {
+        finish_after(true, |base| fs::remove_file(base.join("scope/a")).unwrap());
+    }
+
+    /// A held file with one name, moved outside before its metadata is
+    /// finished, is not changed there.
+    #[test]
+    fn moved_outside_basis_is_not_finished_there() {
+        finish_after(false, |base| {
+            fs::rename(base.join("scope/a"), base.join("outside/a")).unwrap()
+        });
+    }
+
+    /// Hold `scope/a` (also linked as `outside/a` when `linked`) as a
+    /// comparison basis, run `between`, then finish its metadata: that must
+    /// fail and leave `outside/a` as it was.
+    fn finish_after(linked: bool, between: impl Fn(&Path)) {
         use std::os::unix::fs::PermissionsExt;
         let temporary = crate::test_support::tempdir().unwrap();
         let base = temporary.path();
         let t = Fixture::new(base);
         fs::write(base.join("scope/a"), b"held").unwrap();
         fs::set_permissions(base.join("scope/a"), fs::Permissions::from_mode(0o600)).unwrap();
-        fs::hard_link(base.join("scope/a"), base.join("outside/a")).unwrap();
+        if linked {
+            fs::hard_link(base.join("scope/a"), base.join("outside/a")).unwrap();
+        }
         let identity = t.root.identity();
         let guard = ContainerGuard {
             root: bytes(base),
@@ -596,7 +627,7 @@ mod tests {
                 Some(&guard),
             )
             .unwrap();
-        fs::remove_file(base.join("scope/a")).unwrap();
+        between(base);
         let error = operations
             .finish_basis(
                 &path,
@@ -622,6 +653,76 @@ mod tests {
             fs::metadata(base.join("outside/a")).unwrap().mode() & 0o7777,
             0o600
         );
+    }
+
+    /// Where a directory compares names byte for byte, distinct names count
+    /// as distinct entries, whatever their characters: `report` and
+    /// `résumé`, or `a` and `A`.
+    #[test]
+    fn distinct_names_count_where_names_are_exact() {
+        // The temporary directory, or else a tmpfs one, if names are exact
+        // there.
+        let exact = |temporary: tempfile::TempDir| {
+            let directory = File::open(temporary.path()).ok()?;
+            (crate::sys::name_folding(&directory) == crate::sys::NameFolding::Exact)
+                .then_some(temporary)
+        };
+        let Some(temporary) = exact(crate::test_support::tempdir().unwrap())
+            .or_else(|| tempfile::tempdir_in("/dev/shm").ok().and_then(&exact))
+        else {
+            eprintln!("no directory here compares names byte for byte; nothing to check");
+            return;
+        };
+        let t = Fixture::new(temporary.path());
+        for (first, second) in [("report", "r\u{e9}sum\u{e9}"), ("a", "A")] {
+            let _ = fs::remove_dir_all(t.base.join("scope"));
+            fs::create_dir(t.base.join("scope")).unwrap();
+            let first = format!("scope/{first}");
+            let second = format!("scope/{second}");
+            fs::write(t.base.join(&first), b"shared").unwrap();
+            fs::hard_link(t.base.join(&first), t.base.join(&second)).unwrap();
+            t.record(&first);
+            t.record(&second);
+            t.check(&first).unwrap();
+            // A third name nobody approved is still unconfirmed.
+            fs::hard_link(t.base.join(&first), t.base.join("scope/third")).unwrap();
+            assert!(t.check(&first).is_err(), "{second}");
+        }
+    }
+
+    /// Where a directory folds case, two names that differ only in case,
+    /// or a name with other characters, may be one entry: they count once.
+    #[test]
+    fn folded_names_count_once_where_a_directory_folds_case() {
+        let names = |list: &[&str]| -> BTreeSet<Vec<u8>> {
+            list.iter().map(|name| name.as_bytes().to_vec()).collect()
+        };
+        use crate::sys::NameFolding::{Case, Exact, Normalization};
+        assert_eq!(distinct_names(&names(&["a", "A"]), Case), 1);
+        assert_eq!(distinct_names(&names(&["a", "A"]), Normalization), 2);
+        assert_eq!(distinct_names(&names(&["a", "A"]), Exact), 2);
+        assert_eq!(distinct_names(&names(&["Name. .", "name"]), Case), 1);
+        assert_eq!(
+            distinct_names(&names(&["report", "r\u{e9}sum\u{e9}"]), Case),
+            1
+        );
+        assert_eq!(
+            distinct_names(&names(&["report", "r\u{e9}sum\u{e9}"]), Exact),
+            2
+        );
+        assert_eq!(
+            distinct_names(&names(&["report", "r\u{e9}sum\u{e9}"]), Normalization),
+            2
+        );
+        assert_eq!(
+            distinct_names(&names(&["a", "b", "k\u{212a}", "\u{e9}"]), Case),
+            2
+        );
+        assert_eq!(
+            distinct_names(&names(&["e\u{301}", "\u{e9}"]), Normalization),
+            1
+        );
+        assert_eq!(distinct_names(&names(&["\u{e9}"]), Case), 1);
     }
 }
 
@@ -687,7 +788,7 @@ mod measure {
                         let metadata = file.metadata()?;
                         Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
                     },
-                    0,
+                    None,
                 )
                 .unwrap();
         }
