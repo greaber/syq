@@ -217,6 +217,11 @@ pub struct Opts {
     /// resolved. Its parent lies outside the copy and is never widened, so a
     /// failure there does not suggest temporary access.
     pub exact_destination: std::sync::OnceLock<PathBytes>,
+    /// Owned existing directories, with their modes, that a copy without
+    /// temporary access could not change: each is named once, before the
+    /// first change planned inside it, by the planner or by a worker whose
+    /// preview comparison finds a change.
+    pub access_limited: Mutex<std::collections::HashMap<PathBytes, u32>>,
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
@@ -1871,6 +1876,41 @@ impl Opts {
             && !self.access_noted_above(path)
     }
 
+    /// Name, once and before the first change planned at `path`, its
+    /// directory when the user owns it but lacks the owner permission the
+    /// change needs.
+    pub(super) fn note_directory_change(
+        &self,
+        progress: &Progress,
+        path: &[u8],
+        replaces_entry: bool,
+    ) {
+        let parent = parent_path(path);
+        let mode = {
+            let mut limited = self.access_limited.lock().unwrap();
+            let Some(&mode) = limited.get(&parent) else {
+                return;
+            };
+            let needed = if replaces_entry { 0o300 } else { 0o100 };
+            if !mode & needed == 0 {
+                return;
+            }
+            limited.remove(&parent);
+            mode
+        };
+        self.access_noted.lock().unwrap().insert(parent.clone());
+        let missing = !mode & 0o300;
+        progress.warning(&format!(
+            "{}: you own this directory, but it lacks owner {} permission; {DIRECTORY_ACCESS_HINT}",
+            display(&parent),
+            match (missing & 0o200 != 0, missing & 0o100 != 0) {
+                (true, true) => "write and search",
+                (true, false) => "write",
+                _ => "search",
+            }
+        ));
+    }
+
     /// Whether a directory containing `path` was already named as needing
     /// temporary access, with the hint.
     fn access_noted_above(&self, path: &[u8]) -> bool {
@@ -2214,6 +2254,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         hardlink_completions: Mutex::new(Default::default()),
         exact_destination: Default::default(),
+        access_limited: Default::default(),
         access_noted: Default::default(),
         devices: args.devices,
         checksum: args.checksum,
@@ -3445,17 +3486,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .map(|(_, checked)| vec![DirectoryRelation::Separate; checked.len()])
                         .collect()
                 }
-                // The destination directory itself, part of the copy, lacks
-                // owner search permission.
+                // The destination directory itself lacks owner search
+                // permission. Whatever the placement, an existing directory
+                // there belongs to the copy and the option would widen it,
+                // if the receiving account owns it.
                 Err(error)
                     if opts.may_suggest_directory_access()
-                        && (dst_is_dir || expand_exact_home)
-                        && dst_root_entry.as_ref().is_some_and(|entry| {
-                            entry.kind == Kind::Dir && entry.mode & 0o100 == 0
-                        })
                         && os_kind_of(&error) == Some("permission_denied") =>
                 {
-                    bail!("{error:#}; {DIRECTORY_ACCESS_HINT}")
+                    let owned = match dst_root_entry
+                        .as_ref()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o100 == 0)
+                    {
+                        Some(entry) => matches!(
+                            dst_ctl.call(Request::ReceiverUser),
+                            Ok(Response::ReceiverUser(uid)) if uid != 0 && uid == entry.uid
+                        ),
+                        None => false,
+                    };
+                    if owned {
+                        bail!("{error:#}; {DIRECTORY_ACCESS_HINT}");
+                    }
+                    return Err(error);
                 }
                 result => result?,
             }
@@ -4040,7 +4092,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 && entry.kind == Kind::Dir
                 && entry.mode & 0o300 != 0o300
         }),
-        access_limited: Default::default(),
         access_reported: Default::default(),
         restorations_attempted: false,
         container_access,

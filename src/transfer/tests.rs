@@ -433,6 +433,7 @@ fn pipeline_worker(
         inode_preservation: Default::default(),
         hardlink_completions: Mutex::new(Default::default()),
         exact_destination: Default::default(),
+        access_limited: Default::default(),
         access_noted: Default::default(),
         devices: false,
         checksum: false,

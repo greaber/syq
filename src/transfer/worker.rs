@@ -2908,6 +2908,14 @@ impl Worker {
             self.opts.dry_run_metadata_files.fetch_add(1, Relaxed);
             (None, "metadata_differs")
         } else {
+            // A real copy would rewrite the file: in its directory, unless
+            // it writes an existing file in place.
+            self.opts.note_directory_change(
+                &self.progress,
+                &job.dst,
+                !(self.opts.inplace
+                    && job.dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File)),
+            );
             self.progress.add_files(1);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
             (Some(job.entry.size), "content_differs")

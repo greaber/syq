@@ -149,6 +149,7 @@ impl Planner<'_> {
                     );
                 }
             } else {
+                self.note_directory_change(&leaf.dst, true);
                 self.progress.files_total.fetch_add(1, Relaxed);
                 self.progress.bytes_total.fetch_add(leaf.e.size, Relaxed);
                 self.progress.bytes_done.fetch_add(leaf.e.size, Relaxed);
@@ -174,6 +175,7 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         } else {
+            self.note_directory_change(&leaf.dst, true);
             let representative = self.enqueue(
                 (leaf.src, leaf.source),
                 leaf.dst,
@@ -389,6 +391,8 @@ impl Planner<'_> {
             let (dev, ino) = group
                 .published
                 .expect("live completion has a destination identity");
+            self.opts
+                .note_directory_change(self.progress, &follower.dst, true);
             operations.push(Op::Hardlink {
                 path: follower.dst.clone(),
                 source: group.job.dst.clone(),
@@ -453,6 +457,7 @@ impl Planner<'_> {
         if published.is_some() && follower.destination == published {
             self.progress.files_unchanged.fetch_add(1, Relaxed);
         } else {
+            self.note_directory_change(&follower.dst, true);
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.add_files(1);
             self.dry_run_changes.metadata_files += 1;
@@ -477,7 +482,7 @@ impl Planner<'_> {
         self.progress.error(&format!(
             "syq: hardlink {}: {}",
             display(&follower.rel),
-            self.opts.wire_error_message(&error)
+            self.opts.wire_error_message_at(&error, &follower.dst)
         ));
         if !self.opts.dry_run {
             self.emit_entry_failed(

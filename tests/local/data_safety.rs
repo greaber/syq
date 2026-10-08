@@ -1885,3 +1885,106 @@ fn directory_access_notes_stay_once_across_sources_and_skip_inplace_updates() {
     fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(read(&t.path("dst/ro/file")), b"newer");
 }
+
+/// A preview names a directory that needs the option wherever it finds a
+/// change there: a content comparison, a hard link, or an `--as` target
+/// that is an existing directory.
+#[test]
+fn previews_name_directories_needing_access_for_compared_and_linked_files() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let note = |dir: &str| {
+        format!(
+            "{dir}: you own this directory, but it lacks owner write permission; \
+             --temporarily-widen-dir-permissions may help"
+        )
+    };
+    // Equal sizes and times: only the --hash comparison finds the change.
+    let t = Tmp::new();
+    write(&t.path("src/ro/file"), b"new1");
+    write(&t.path("dst/ro/file"), b"old1");
+    for path in ["src/ro/file", "dst/ro/file"] {
+        timestamp(&t.path(path), 1_700_000_000, 0);
+    }
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    let (src, dst, ro) = (t.s("src"), t.s("dst"), t.s("dst/ro"));
+    let out = native_syq(&[
+        "cp",
+        "--hash",
+        "--dry-run",
+        "--srcs-in",
+        &src,
+        "--into",
+        &dst,
+    ]);
+    let exact = native_syq(&["cp", "--hash", "--dry-run", &t.s("src/ro"), "--as", &ro]);
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    for out in [&out, &exact] {
+        assert_output_ok(out);
+        assert_eq!(stderr_of(out).matches(&note(&ro)).count(), 1, "{out:?}");
+    }
+
+    // Hard links into a read-only directory, previewed and copied.
+    let t = Tmp::new();
+    write(&t.path("src/ro/one"), b"linked");
+    fs::hard_link(t.path("src/ro/one"), t.path("src/ro/two")).unwrap();
+    fs::create_dir_all(t.path("dst/ro")).unwrap();
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    let (src, dst, ro) = (t.s("src"), t.s("dst"), t.s("dst/ro"));
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "cp",
+            "--copy-metadata=hardlinks",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = native_syq(&args);
+        assert_eq!(stderr_of(&out).matches(&note(&ro)).count(), 1, "{out:?}");
+        assert_eq!(
+            stderr_of(&out)
+                .matches("--temporarily-widen-dir-permissions")
+                .count(),
+            1,
+            "{out:?}"
+        );
+    }
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An existing directory named by `--as` belongs to the copy, so when it
+/// cannot be searched the failure suggests the option, which then works.
+#[test]
+fn exact_placement_onto_an_unsearchable_directory_suggests_and_takes_access() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/a/file"), b"new");
+    fs::create_dir_all(t.path("dst/a")).unwrap();
+    fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o600)).unwrap();
+    let (src, dst) = (t.s("src/a"), t.s("dst/a"));
+    let out = native_syq(&["cp", &src, "--as", &dst]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("--temporarily-widen-dir-permissions"),
+        "{out:?}"
+    );
+    let out = native_syq(&[
+        "cp",
+        "--temporarily-widen-dir-permissions",
+        &src,
+        "--as",
+        &dst,
+    ]);
+    let mode = fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777;
+    fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_output_ok(&out);
+    assert_eq!(mode, 0o600);
+    assert_eq!(read(&t.path("dst/a/file")), b"new");
+}

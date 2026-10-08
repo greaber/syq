@@ -78,10 +78,6 @@ pub(super) struct Planner<'a> {
     /// The destination directory's own entry when its owner lacks write or
     /// search permission, checked with the first batch.
     pub(super) root_access_check: Option<Entry>,
-    /// Owned existing directories, with their modes, that a copy without
-    /// temporary access could not change: each is reported once, before the
-    /// first change planned inside it.
-    pub(super) access_limited: std::collections::HashMap<PathBytes, u32>,
     /// Directories already reported, as needing access or not inspected:
     /// later batches can meet them again.
     pub(super) access_reported: std::collections::HashSet<PathBytes>,
@@ -2680,7 +2676,7 @@ impl Planner<'_> {
     /// operations below it. Existing directory access is prepared separately.
     fn create_directories(&mut self, planned: &[PlannedDir], dst_root: &[u8]) -> Result<bool> {
         let opts = self.opts;
-        if !self.access_limited.is_empty() {
+        if !self.opts.access_limited.lock().unwrap().is_empty() {
             for (path, _, _, st) in planned {
                 if !matches!(st, Some(d) if d.kind == Kind::Dir) {
                     self.note_directory_change(path, true);
@@ -4273,8 +4269,9 @@ impl Planner<'_> {
             if entry.kind != Kind::Dir
                 || entry.mode & 0o300 == 0o300
                 || !hint && entry.mode & 0o100 != 0
-                || self.access_limited.contains_key(&path)
+                || self.opts.access_limited.lock().unwrap().contains_key(&path)
                 || self.access_reported.contains(&path)
+                || self.opts.access_noted.lock().unwrap().contains(&path)
                 || !self.receiver_owns(&entry)?
             {
                 continue;
@@ -4296,7 +4293,11 @@ impl Planner<'_> {
                 );
                 uninspected.push(path);
             } else if hint {
-                self.access_limited.insert(path, entry.mode);
+                self.opts
+                    .access_limited
+                    .lock()
+                    .unwrap()
+                    .insert(path, entry.mode);
             }
         }
         Ok(uninspected)
@@ -4305,34 +4306,8 @@ impl Planner<'_> {
     /// Report, once and before the first change planned at `path`, that its
     /// directory is owned but lacks the owner permission the change needs.
     pub(super) fn note_directory_change(&mut self, path: &[u8], replaces_entry: bool) {
-        if self.access_limited.is_empty() {
-            return;
-        }
-        let parent = parent_path(path);
-        let Some(&mode) = self.access_limited.get(&parent) else {
-            return;
-        };
-        let needed = if replaces_entry { 0o300 } else { 0o100 };
-        if !mode & needed == 0 {
-            return;
-        }
-        let missing = !mode & 0o300;
-        self.access_limited.remove(&parent);
-        self.access_reported.insert(parent.clone());
         self.opts
-            .access_noted
-            .lock()
-            .unwrap()
-            .insert(parent.clone());
-        self.progress.warning(&format!(
-            "{}: you own this directory, but it lacks owner {} permission; {DIRECTORY_ACCESS_HINT}",
-            display(&parent),
-            match (missing & 0o200 != 0, missing & 0o100 != 0) {
-                (true, true) => "write and search",
-                (true, false) => "write",
-                _ => "search",
-            }
-        ));
+            .note_directory_change(self.progress, path, replaces_entry);
     }
 
     fn prepare_container_access(&mut self) -> Result<()> {
