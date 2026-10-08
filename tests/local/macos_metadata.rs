@@ -564,6 +564,63 @@ fn an_inheriting_sidecar_takes_no_bytes_its_readers_could_not_read() {
 
 #[cfg(debug_assertions)]
 #[test]
+fn new_in_place_files_are_private_before_their_acl_is_set() {
+    // A new file takes its directory's inheritable ACL entries whatever its
+    // mode. With --copy-metadata=acls a file written in place gets its own
+    // ACL only when it is finalized, so it is created inside a private
+    // directory and moved into place, as a stage is. A stopped copy fails
+    // its writes and leaves the file as it was while they were made.
+    for ranges in [false, true] {
+        for stopped in [true, false] {
+            let context = format!("ranges={ranges}, stopped={stopped}");
+            let t = Tmp::new();
+            let bytes = prng(32 * 1024, 919);
+            write(&t.path("source"), &bytes);
+            fs::set_permissions(t.path("source"), fs::Permissions::from_mode(0o644)).unwrap();
+            chmod(&t.path("source"), &["+a", "user:nobody deny read"]);
+            fs::create_dir(t.path("destination")).unwrap();
+            chmod(&t.path("destination"), &["+a", "everyone allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"]);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+            command.args([
+                "cp",
+                "--inplace",
+                "--copy-metadata=acls",
+                "--no-progress",
+                &t.s("source"),
+                "--as",
+                &t.s("destination/file"),
+            ]);
+            if ranges {
+                command.arg("--performance-tuning=copy-path=ranges,workers=1");
+            }
+            if stopped {
+                if ranges {
+                    command.env("SYQ_TEST_FAIL_WRITE_RANGE_NAME", "file");
+                } else {
+                    command.env("SYQ_TEST_FAIL_INPLACE_PUT", "1");
+                }
+            }
+            let output = command.run().unwrap();
+            assert_eq!(output.status.success(), !stopped, "{context}: {output:?}");
+            let file = t.path("destination/file");
+            if stopped {
+                let mode = fs::metadata(&file).unwrap().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{context}");
+                let entries = acl(&file);
+                assert!(
+                    entries.is_empty(),
+                    "{context}: inherited access {entries:?}"
+                );
+            } else {
+                assert_eq!(read(&file), bytes, "{context}");
+                assert_eq!(acl(&t.path("source")), acl(&file), "{context}");
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
 #[ignore = "requires root to exercise recovery reads through mode-000 publication"]
 fn acl_restoration_failure_cannot_be_accepted_as_a_content_match() {
     assert_eq!(

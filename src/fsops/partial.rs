@@ -79,7 +79,7 @@ impl FsOps {
         // limited by the directory's default ACL or else the umask, never
         // with a special bit.
         let mode = mode & 0o777;
-        let file = root.create_file(relative, mode | 0o200)?;
+        let file = self.create_new_inplace_file(root, relative, mode | 0o200, false)?;
         let created = file.metadata()?;
         receiver_mode::note_inplace_open(copy_id, &created, true);
         if created.mode() & 0o200 == 0 {
@@ -87,6 +87,64 @@ impl FsOps {
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
         }
         Ok(file)
+    }
+
+    /// Create, exclusively, a new file the copy writes in place. With ACL
+    /// copying on macOS it is created inside a private directory and moved
+    /// into place, as a stage is: a new file there takes its directory's
+    /// inheritable ACL entries whatever its mode, and they would let others
+    /// open it before finalize sets its ACL.
+    fn create_new_inplace_file(
+        &self,
+        root: &Root,
+        relative: &RelativePath,
+        mode: u32,
+        write_only: bool,
+    ) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if self.inode_preservation.acls {
+            return root.create_private_file(relative);
+        }
+        if write_only {
+            root.create_write_only_file(relative, mode)
+        } else {
+            root.create_file(relative, mode)
+        }
+    }
+
+    /// The mode for a new in-place file at `target`, created with `mode`
+    /// unless it would start with a group other than `group`, the one
+    /// publication gives it: then it is created owner-only, so the group the
+    /// kernel gives it cannot read what is written before finalize changes
+    /// it. Deciding looks up its directory, so it is done only when a file
+    /// is to be created and its group is set; within a small-file batch
+    /// (`in_batch`) once per directory.
+    pub(super) fn inplace_group_mode(
+        &self,
+        target: &RootedTarget,
+        mode: u32,
+        group: Option<u32>,
+        in_batch: bool,
+    ) -> u32 {
+        let differs = |group| {
+            if in_batch {
+                let mut parents = self.inplace_parents.lock().unwrap();
+                apply::new_file_group_may_differ(target, group, Some(&mut parents))
+            } else {
+                apply::new_file_group_may_differ(target, group, None)
+            }
+        };
+        if group.is_some_and(differs) {
+            PRIVATE_PARTIAL_MODE
+        } else {
+            mode
+        }
+    }
+
+    /// Whether every new in-place file is created through a private
+    /// directory (`create_new_inplace_file`), and so only exclusively.
+    fn creates_inplace_files_privately(&self) -> bool {
+        cfg!(target_os = "macos") && self.inode_preservation.acls
     }
 
     pub(super) fn reusable_partial_permissions(&self, file: &File) -> Result<bool> {
@@ -417,6 +475,7 @@ impl FsOps {
             attempt,
             create_if_missing,
             scanned,
+            group,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
@@ -459,68 +518,17 @@ impl FsOps {
                 self.cache_file(target.location(), attempt, false, file);
                 return Ok(Preparation::default());
             }
-            // Where the scan found a file, open the name directly, creating
-            // it when absent, as a small in-place put does; finalize checks
-            // the target condition as it always did. A regular file there,
-            // new or existing, is the destination: the open is read-write
-            // because a resume hashes an existing file through this
-            // descriptor, and a new file keeps owner access for the other
-            // range workers until publication sets its mode. The metadata
-            // read at the open serves finalize. Anything else at the name is
-            // sorted out by the checks below. A new file that its own mode
-            // would leave without owner access is created exclusively, so
-            // that finalize knows it is new.
-            let opened = if mode & 0o600 == 0o600 && matches!(scanned, ScannedDestination::File(_))
-            {
-                target
-                    .root
-                    .open_or_create_read_write_file(&target.relative, mode | 0o600)
-                    .map(Some)
-            } else {
-                Ok(None)
-            };
-            match opened {
-                Ok(Some((file, mut opened))) if opened.is_file() => {
-                    let euid = unsafe { libc::geteuid() };
-                    let created =
-                        euid != 0 && opened.uid() == euid && opened.mode() & 0o600 != 0o600;
-                    // Created or not, the file has the mode it was found or
-                    // created with until the writes.
-                    receiver_mode::note_inplace_open(copy_id, &opened, created);
-                    if created {
-                        // A umask or inherited default ACL can remove even
-                        // owner access from a new file; a file of ours that
-                        // opened read-write with less can only be new, since
-                        // the open checks owner bits for everyone but root,
-                        // whose workers reopen any file regardless. An
-                        // existing file of another account that admitted the
-                        // open through other bits is never chmod'ed. Finalize
-                        // decides its chmod from the metadata kept here, so
-                        // read it again.
-                        file.set_permissions(fs::Permissions::from_mode(
-                            opened.mode() & 0o7777 | 0o600,
-                        ))?;
-                        opened = file.metadata()?;
-                    }
-                    self.set_copy_length(&file, size).with_context(|| {
-                        format!("resize confined file {}", target.label.display())
-                    })?;
-                    self.cache_opened_file(target.location(), attempt, false, file, opened);
-                    return Ok(Preparation::default());
-                }
-                Ok(_) => {}
-                Err(error) if existing_leaf_refused(&error) => {}
-                Err(error) => return Err(error),
-            }
             // Where the scan found nothing, the file is created exclusively
-            // at once; with nothing known, an existing file is opened first.
-            // Either way finalize knows whether the copy created it, on
-            // every receiver.
+            // at once; otherwise an existing file is opened first, read-write
+            // because a resume hashes it through this descriptor, and its
+            // metadata, read at the open, serves finalize. A file the copy
+            // creates is always created exclusively, so finalize knows on
+            // every receiver whether it is new: one created owner-only, to
+            // wait for its group or ACL, could pass for an existing file.
             let mut expect_new = scanned == ScannedDestination::Absent;
-            if scanned == ScannedDestination::Unknown {
-                match target.root.open_regular_read_write(&target.relative) {
-                    Ok(file) => {
-                        let opened = file.metadata()?;
+            if !expect_new {
+                match target.root.open_regular_read_write_known(&target.relative) {
+                    Ok((file, opened)) => {
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -564,7 +572,7 @@ impl FsOps {
                     None => match self.create_inplace_file(
                         &target.root,
                         &target.relative,
-                        mode,
+                        self.inplace_group_mode(&target, mode, group, false),
                         copy_id,
                     ) {
                         Ok(file) => {
@@ -1259,6 +1267,7 @@ impl FsOps {
         self.held_basis.take();
         let CopyLocalPolicy {
             inplace,
+            group,
             replace_partial,
             allow_sequential_nfs_fallback,
             allow_sequential_local_fallback,
@@ -1387,6 +1396,9 @@ impl FsOps {
                     }
                     Some(_) => destination_root.unlink(&target_relative)?,
                     None => {
+                        // The coordinator sends the in-place creation mode
+                        // (`inplace_creation_mode`).
+                        let mode = self.inplace_group_mode(&target, mode, group, false);
                         match self.create_inplace_file(
                             &destination_root,
                             &target_relative,
@@ -1992,12 +2004,14 @@ impl FsOps {
             // The mode of the existing file opened, read before the writes
             // that clear its set-ID bits, or `None` for a new file.
             let mut found = None;
-            // A proposal's special bits are never created.
-            let create_mode = if flags & flags::RECEIVER_MODE != 0 {
-                meta.mode & 0o777
-            } else {
-                meta.mode
-            };
+            let acl = has_acl(meta.inode_metadata.as_deref());
+            // The group publication sets, which a new file created with
+            // another one waits for owner-only (`inplace_group_mode`).
+            let group = (flags & flags::GROUP != 0).then_some(meta.gid);
+            // Whether a new file may be created owner-only.
+            let private = group.is_some() || acl;
+            let create_mode = inplace_creation_mode(meta.mode, flags, acl);
+            let creation_mode = || self.inplace_group_mode(&rooted, create_mode, group, true);
             // How far the file's old contents may extend. They are written
             // over and only then cut to the new length, so a write that
             // fails leaves old data rather than an emptied file.
@@ -2005,9 +2019,13 @@ impl FsOps {
             let file = match condition {
                 // The whole file is written here and never read back.
                 TargetCondition::Absent => {
-                    let file = rooted
-                        .root
-                        .create_write_only_file(&rooted.relative, create_mode)
+                    let file = self
+                        .create_new_inplace_file(
+                            &rooted.root,
+                            &rooted.relative,
+                            creation_mode(),
+                            true,
+                        )
                         .with_context(|| format!("create {}", rooted.label.display()))?;
                     created = Some(file.metadata()?);
                     file
@@ -2027,30 +2045,60 @@ impl FsOps {
                     // destination. Looking the name up first cost an NFS
                     // client a request for every new file. Anything else
                     // at the name, or an open the kernel refused, is sorted
-                    // out by the checks below.
-                    let mut opened = match rooted
-                        .root
-                        .open_or_create_write_only_file(&rooted.relative, create_mode)
-                    {
-                        Ok((file, metadata)) if metadata.is_file() => {
-                            old_len = metadata.len();
-                            // The open may have created the file; the scan
-                            // says whether one was there.
-                            if put.scanned != ScannedDestination::Absent {
+                    // out by the checks below. A file created owner-only,
+                    // to wait for its group or ACL, could pass for an
+                    // existing one of that mode, so where the scan may have
+                    // found one, an existing file is opened without
+                    // creating one and a missing one is created exclusively.
+                    // One created through a private directory is only ever
+                    // created exclusively.
+                    let mut expect_new = false;
+                    let mut opened = if private && put.scanned != ScannedDestination::Absent {
+                        match rooted.root.open_regular_write_known(&rooted.relative) {
+                            Ok((file, metadata)) => {
+                                old_len = metadata.len();
                                 found = Some(metadata.mode());
+                                created = Some(metadata);
+                                Some(file)
                             }
-                            created = Some(metadata);
-                            Some(file)
+                            Err(error) => {
+                                expect_new = error_is_kind(&error, io::ErrorKind::NotFound);
+                                None
+                            }
                         }
-                        Ok(_) => None,
-                        Err(error) if existing_leaf_refused(&error) => None,
-                        Err(error) => return Err(error),
+                    } else if self.creates_inplace_files_privately() {
+                        expect_new = put.scanned == ScannedDestination::Absent;
+                        None
+                    } else {
+                        match rooted
+                            .root
+                            .open_or_create_write_only_file(&rooted.relative, creation_mode())
+                        {
+                            Ok((file, metadata)) if metadata.is_file() => {
+                                old_len = metadata.len();
+                                // The open may have created the file; the
+                                // scan says whether one was there.
+                                if put.scanned != ScannedDestination::Absent {
+                                    found = Some(metadata.mode());
+                                }
+                                created = Some(metadata);
+                                Some(file)
+                            }
+                            Ok(_) => None,
+                            Err(error) if existing_leaf_refused(&error) => None,
+                            Err(error) => return Err(error),
+                        }
                     };
                     for _ in 0..8 {
                         if opened.is_some() {
                             break;
                         }
-                        match rooted.root.metadata_optional(&rooted.relative)? {
+                        let existing = if std::mem::take(&mut expect_new) {
+                            None
+                        } else {
+                            rooted.root.metadata_optional(&rooted.relative)?
+                        };
+                        match existing {
                             Some(metadata) if metadata.is_file() => {
                                 let file =
                                     rooted.root.open_regular_write(&rooted.relative, false)?;
@@ -2064,10 +2112,12 @@ impl FsOps {
                                 bail!("destination {} is a directory", rooted.label.display())
                             }
                             Some(_) => rooted.root.unlink(&rooted.relative)?,
-                            None => match rooted
-                                .root
-                                .create_write_only_file(&rooted.relative, create_mode)
-                            {
+                            None => match self.create_new_inplace_file(
+                                &rooted.root,
+                                &rooted.relative,
+                                creation_mode(),
+                                true,
+                            ) {
                                 Ok(file) => {
                                     created = Some(file.metadata()?);
                                     opened = Some(file);
@@ -3095,7 +3145,7 @@ impl FsOps {
                 require_absent,
             } => self
                 .create_operator_directory(*mode, *require_absent)
-                .map(|anchor| Response::DirectorySelection(Some(anchor))),
+                .map(|(anchor, created)| Response::OperatorDirectoryCreated { anchor, created }),
             Request::AnchorDestination {
                 expected_dev,
                 expected_ino,
@@ -3223,6 +3273,7 @@ impl FsOps {
                 attempt,
                 create_if_missing,
                 guard,
+                group,
             } => self
                 .creation_mode(
                     path,
@@ -3247,6 +3298,7 @@ impl FsOps {
                             attempt: *attempt,
                             create_if_missing: *create_if_missing,
                             scanned: *scanned,
+                            group: *group,
                         },
                     )
                 })
@@ -3417,12 +3469,14 @@ impl FsOps {
                 copy_id,
                 size,
                 mode,
+                group,
             } => self
                 .copy_local(
                     source,
                     dst,
                     CopyLocalPolicy {
                         inplace: *inplace,
+                        group: *group,
                         replace_partial: *replace_partial,
                         allow_sequential_nfs_fallback: *allow_sequential_nfs_fallback,
                         allow_sequential_local_fallback: *allow_sequential_local_fallback,
@@ -3784,6 +3838,24 @@ pub(crate) fn staged_mode(mode: u32, flags: u8, acl: bool) -> u32 {
         mode & 0o777
     } else {
         PRIVATE_PARTIAL_MODE
+    }
+}
+
+/// The mode a file the copy writes in place is created with, which its
+/// directory's default ACL, or else the umask, then limits. Like a sidecar,
+/// it stays private while an ACL is still to be set: the ACL mask its group
+/// bits set would let others read what is written before finalize sets the
+/// ACL. Otherwise it has the permission bits it will end with, so that
+/// finalize needs no chmod; a proposal's special bits are never created.
+/// The receiver also keeps it private when its group will change
+/// (`FsOps::inplace_group_mode`).
+pub(crate) fn inplace_creation_mode(mode: u32, flags: u8, acl: bool) -> u32 {
+    if acl {
+        PRIVATE_PARTIAL_MODE
+    } else if flags & flags::RECEIVER_MODE != 0 {
+        mode & 0o777
+    } else {
+        mode
     }
 }
 

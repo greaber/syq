@@ -142,6 +142,7 @@ fn bridged_control_accepts_metadata_but_refuses_file_payloads() {
             attempt: 0,
             create_if_missing: true,
             guard: None,
+            group: None,
         }),
         Response::Prepared(_)
     ));
@@ -234,6 +235,7 @@ fn ordinary_ssh_control_keeps_its_existing_payload_support() {
             attempt: 0,
             create_if_missing: true,
             guard: None,
+            group: None,
         }),
         Response::Prepared(_)
     ));

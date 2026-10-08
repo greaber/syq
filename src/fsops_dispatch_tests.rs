@@ -300,6 +300,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         attempt: 0,
         create_if_missing: false,
         guard: None,
+        group: None,
     });
     assert!(matches!(reply, Response::Prepared(_)), "{reply:?}");
     let mut reader = setup();

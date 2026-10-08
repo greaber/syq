@@ -66,6 +66,9 @@ pub(super) struct Planner<'a> {
     pub(super) blocked_mapping_parents: std::collections::HashSet<PathBytes>,
     /// One pending destination container, including a file-only copy's parent.
     pub(super) container_access: Option<(PathBytes, TargetCondition)>,
+    /// Whether a destination container that lacks owner access is widened
+    /// (`widens_destination_container`), decided once for every root.
+    pub(super) widen_container: bool,
     /// Original receiver modes, only for directories actually widened.
     pub(super) directory_restorations:
         std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
@@ -1544,9 +1547,12 @@ impl Planner<'_> {
                         .filter(|_| is_destination_root)
                         .unwrap_or_else(|| operator_directory_mode(self.opts)),
                 };
-                let selection = create_operator_directory(self.dst, condition, mode)?;
+                let (selection, created) = create_operator_directory(self.dst, condition, mode)?;
+                if is_destination_root && !created {
+                    self.adopt_existing_root(&root, &selection);
+                }
                 let anchor = activate_control_destination(self.dst, selection, root.clone())?;
-                if is_destination_root {
+                if is_destination_root && created {
                     self.mutation_root_condition = TargetCondition::Matches {
                         dev: anchor.dev,
                         ino: anchor.ino,
@@ -2561,6 +2567,19 @@ impl Planner<'_> {
             }
         }
         Ok(early)
+    }
+
+    /// Treat the destination root as an existing directory after its
+    /// creation found another process had created it since it was found
+    /// missing: it gets no new root's metadata, what it holds is looked up
+    /// before anything is written, and it is widened for its owner as any
+    /// existing directory is.
+    pub(super) fn adopt_existing_root(&mut self, root: &[u8], selection: &DirectoryAnchor) {
+        self.created_dirs.remove(&self.dst_root);
+        self.private_root = None;
+        self.destination_root_known_missing = false;
+        self.destination_children_known_missing = false;
+        self.container_access = selected_container_access(self.widen_container, root, selection);
     }
 
     /// Give a private destination root whose final metadata sets no mode the
