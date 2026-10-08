@@ -876,8 +876,14 @@ fn remote_copy_if_batches_directory_and_leaf_observations() {
             .any(|line| line.starts_with("batch ") && line.ends_with(" 2 true")),
         "{lookups}"
     );
-    assert!(
-        !lookups.lines().any(|line| line.starts_with("lookup ")),
+    // The initial placement check is strict even without expression fields.
+    // Subsequent directory and leaf observations must remain batched.
+    assert_eq!(
+        lookups
+            .lines()
+            .filter(|line| line.starts_with("lookup "))
+            .collect::<Vec<_>>(),
+        ["lookup 1"],
         "{lookups}"
     );
 }

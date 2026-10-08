@@ -2821,6 +2821,33 @@ impl FsOps {
         paths: &[PathBytes],
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
+        // An anchored destination takes the ordinary lookups' fast path: NFS
+        // directories listed first, and each parent opened once for its
+        // names. Only a missing entry still reads as absent.
+        if let Some(root) = self
+            .destination_root
+            .clone()
+            .filter(|_| guard.is_none() && !paths.iter().any(|path| path.starts_with(b"/")))
+        {
+            #[cfg(target_os = "linux")]
+            list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
+            let minimum = self.destination_parallel_minimum(
+                None,
+                paths.len(),
+                paths.iter().map(Vec::as_slice),
+            );
+            return parallel_map_init_from(
+                minimum,
+                paths,
+                || None,
+                |parent, path| {
+                    strict_stat_with_parent(&root, parent, path)
+                        .with_context(|| format!("inspect {}", resolve(path).display()))
+                },
+            )
+            .into_iter()
+            .collect();
+        }
         let minimum =
             self.destination_parallel_minimum(guard, paths.len(), paths.iter().map(Vec::as_slice));
         parallel_map_from(minimum, paths, |path| {
@@ -3410,6 +3437,61 @@ fn list_nfs_directories_before_stats(
         if settled {
             requests.insert(parent.to_vec(), None);
         }
+    }
+}
+
+/// `stat_with_parent` for lookups that must tell absence from an error: a
+/// missing entry or parent is absent, any other failure is returned. A parent
+/// that does not open falls back to resolving the whole path, so its error is
+/// the one a plain lookup gives.
+fn strict_stat_with_parent(
+    root: &Arc<Root>,
+    parent: &mut Option<HeldMetadataParent>,
+    path: &[u8],
+) -> Result<Option<Entry>> {
+    let absent = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)))
+    };
+    let lookup = |relative: &RelativePath| match root.metadata(relative) {
+        Ok(metadata) => rooted_entry(root, relative, Vec::new(), metadata).map(Some),
+        Err(error) if absent(&error) => Ok(None),
+        Err(error) => Err(error),
+    };
+    let Some(separator) = path.iter().rposition(|byte| *byte == b'/') else {
+        *parent = None;
+        return lookup(&RelativePath::new(path)?);
+    };
+    let parent_path = &path[..separator];
+    let name = &path[separator + 1..];
+    if matches!(name, b"" | b"." | b"..") {
+        *parent = None;
+        return lookup(&RelativePath::new(path)?);
+    }
+    if parent
+        .as_ref()
+        .is_none_or(|held| !Arc::ptr_eq(&held.root, root) || held.path != parent_path)
+    {
+        *parent = None;
+        match root.open_directory(&RelativePath::new(parent_path)?) {
+            Ok(directory) => {
+                *parent = Some(HeldMetadataParent {
+                    root: root.clone(),
+                    path: parent_path.to_vec(),
+                    directory,
+                })
+            }
+            Err(_) => return lookup(&RelativePath::new(path)?),
+        }
+    }
+    let directory = &parent.as_ref().expect("held parent").directory;
+    match root.metadata_in_directory(directory, name) {
+        Ok(metadata) => {
+            rooted_entry_in_directory(root, directory, name, Vec::new(), metadata, true).map(Some)
+        }
+        Err(error) if absent(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

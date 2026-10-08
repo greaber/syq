@@ -2952,7 +2952,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         let (entry, canonical) = stat_and_canonicalize(&mut *dst_ctl, &operator_dst_root)?;
         (canonical.as_os_str().as_bytes().to_vec(), entry)
     } else {
-        let entry = stat_one(&mut *dst_ctl, &operator_dst_root, false)?;
+        // Only a missing entry establishes a fresh destination. In particular,
+        // permission denial must not bypass existing-file selection policies.
+        let entry = inspect_placement_target(&mut *dst_ctl, &operator_dst_root)?;
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;
         // exact placement preserves the final directory entry.
@@ -4692,6 +4694,33 @@ fn stat_many_registered(
     }
 }
 
+/// Look up destination paths, keeping a denied lookup an error rather than an
+/// absent entry. Batches follow the ordinary path budget.
+fn inspect_destination_paths(
+    conn: &mut dyn Conn,
+    mut paths: Vec<PathBytes>,
+    guard: Option<ContainerGuard>,
+    context: &'static str,
+) -> Result<Vec<Option<Entry>>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = paths.iter().fold(0usize, |sum, path| {
+        sum.saturating_add(source_request_bytes(path, None))
+    });
+    if paths.len() > 1 && bytes > SOURCE_BATCH_PATH_BYTES {
+        let tail = paths.split_off(paths.len() / 2);
+        let mut entries = inspect_destination_paths(conn, paths, guard.clone(), context)?;
+        entries.extend(inspect_destination_paths(conn, tail, guard, context)?);
+        return Ok(entries);
+    }
+    let count = paths.len();
+    match ok(conn.call(Request::PruneLookup { paths, guard })?, context)? {
+        Response::Stats(entries) if entries.len() == count => Ok(entries),
+        other => bail!("unexpected destination inspection response {other:?}"),
+    }
+}
+
 fn target_identity(entry: &Entry) -> TargetCondition {
     TargetCondition::Matches {
         dev: entry.dev,
@@ -4789,6 +4818,16 @@ fn stat_one(conn: &mut dyn Conn, path: &[u8], follow: bool) -> Result<Option<Ent
     Ok(stat_many(conn, vec![path.to_vec()], follow)?
         .pop()
         .flatten())
+}
+
+/// Placement conditions and fresh-tree planning need a real absence: a denied
+/// lookup must not let --as-new or --if-exists=keep replace an existing entry.
+fn inspect_placement_target(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<Entry>> {
+    Ok(
+        inspect_destination_paths(conn, vec![path.to_vec()], None, "inspect placement target")?
+            .pop()
+            .flatten(),
+    )
 }
 
 fn stat_one_registered(

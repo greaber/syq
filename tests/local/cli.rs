@@ -122,6 +122,97 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     assert!(!Path::new(&contents_target).exists());
 }
 
+/// A denied lookup is not an absent target: placement checks and
+/// --if-exists=keep must fail rather than replace a file they could not see.
+/// The parent of an exact placement lies outside the copy, so even the
+/// temporary-permission option leaves it alone.
+#[test]
+fn native_copy_placement_checks_keep_denied_and_missing_distinct() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for (placement, policy) in [
+        ("--as-new", "--if-exists=update"),
+        ("--as-existing", "--if-exists=update"),
+        ("--as", "--if-exists=keep"),
+    ] {
+        for exists in [false, true] {
+            for widen in [false, true] {
+                for dry_run in [false, true] {
+                    let t = Tmp::new();
+                    write(&t.path("src"), b"replacement contents");
+                    fs::create_dir(t.path("dst")).unwrap();
+                    if exists {
+                        write(&t.path("dst/file"), b"original sentinel");
+                    }
+                    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+                    let before = fs::metadata(t.path("dst")).unwrap();
+                    let src = t.s("src");
+                    let dst = t.s("dst/file");
+                    let mut args = vec!["cp", policy, &src, placement, &dst];
+                    if widen {
+                        args.push("--temporarily-widen-dir-permissions");
+                    }
+                    if dry_run {
+                        args.push("--dry-run");
+                    }
+                    let output = native_syq(&args);
+                    let after = fs::metadata(t.path("dst")).unwrap();
+                    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+                    assert!(!output.status.success(), "{args:?}: {output:?}");
+                    let stderr = stderr_of(&output);
+                    assert!(stderr.contains("Permission denied"), "{args:?}: {output:?}");
+                    assert!(!stderr.contains("does not exist"), "{output:?}");
+                    assert!(!stderr.contains("already exists"), "{output:?}");
+                    assert_eq!(after.mode() & 0o7777, 0o600, "{args:?}");
+                    assert_eq!(
+                        (before.ctime(), before.ctime_nsec()),
+                        (after.ctime(), after.ctime_nsec()),
+                        "{args:?}"
+                    );
+                    if exists {
+                        assert_eq!(read(&t.path("dst/file")), b"original sentinel");
+                    } else {
+                        assert!(!t.path("dst/file").exists());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_copy_placement_access_does_not_widen_an_unselected_ancestor() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src"), b"replacement contents");
+    write(&t.path("ancestor/dst/file"), b"original sentinel");
+    fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(t.path("ancestor")).unwrap();
+    let output = native_syq(&[
+        "cp",
+        "--temporarily-widen-dir-permissions",
+        &t.s("src"),
+        "--as-new",
+        &t.s("ancestor/dst/file"),
+    ]);
+    let after = fs::metadata(t.path("ancestor")).unwrap();
+    fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr_of(&output).contains("Permission denied"),
+        "{output:?}"
+    );
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert_eq!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec())
+    );
+    assert_eq!(read(&t.path("ancestor/dst/file")), b"original sentinel");
+}
+
 #[test]
 fn native_copy_requires_sources_before_the_destination() {
     let t = Tmp::new();

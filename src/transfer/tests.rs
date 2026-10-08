@@ -5720,3 +5720,80 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
     let plain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
     assert!(!copy_error_message(&plain, true).contains(DIRECTORY_ACCESS_HINT));
 }
+
+#[test]
+fn strict_destination_inspection_uses_path_bytes_instead_of_a_small_count_limit() {
+    for long in [false, true] {
+        let prefix = if long {
+            format!("{}/", "a".repeat(250)).repeat(12)
+        } else {
+            String::new()
+        };
+        let paths: Vec<PathBytes> = (0..4096)
+            .map(|i| format!("{prefix}{i:04}").into_bytes())
+            .collect();
+        let observed = Arc::new(Mutex::new(Vec::<Vec<PathBytes>>::new()));
+        let requests = Arc::clone(&observed);
+        let mut conn = AnsweringConn {
+            answer: move |request| {
+                let Request::PruneLookup { paths, guard } = request else {
+                    panic!("wrong inspection request")
+                };
+                let guard = guard.expect("missing container guard");
+                assert_eq!(
+                    (guard.root.as_slice(), guard.dev, guard.ino),
+                    (b"root".as_slice(), 1, 2)
+                );
+                let bytes = paths
+                    .iter()
+                    .map(|path| source_request_bytes(path, None))
+                    .sum::<usize>();
+                assert!(bytes <= SOURCE_BATCH_PATH_BYTES);
+                let response = Response::Stats(vec![None; paths.len()]);
+                requests.lock().unwrap().push(paths);
+                response
+            },
+            replies: Default::default(),
+        };
+        let entries = inspect_destination_paths(
+            &mut conn,
+            paths.clone(),
+            Some(ContainerGuard {
+                root: b"root".to_vec(),
+                dev: 1,
+                ino: 2,
+            }),
+            "preview",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), paths.len());
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), if long { 4 } else { 1 });
+        assert_eq!(
+            observed.iter().flatten().collect::<Vec<_>>(),
+            paths.iter().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn strict_destination_inspection_keeps_denials_and_checks_reply_count() {
+    let denied = crate::fsops::wire_error(&std::io::Error::from_raw_os_error(libc::EACCES).into());
+    let mut conn = AnsweringConn {
+        answer: move |_| Response::EndpointError(denied.clone()),
+        replies: Default::default(),
+    };
+    let error = inspect_destination_paths(&mut conn, vec![b"denied".to_vec()], None, "preview")
+        .unwrap_err();
+    assert_eq!(os_kind_of(&error), Some("permission_denied"));
+    let mut conn = AnsweringConn {
+        answer: |_| Response::Stats(Vec::new()),
+        replies: Default::default(),
+    };
+    assert!(inspect_destination_paths(&mut conn, vec![b"file".to_vec()], None, "preview").is_err());
+    assert!(
+        inspect_destination_paths(&mut conn, Vec::new(), None, "preview")
+            .unwrap()
+            .is_empty()
+    );
+}

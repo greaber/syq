@@ -47,6 +47,61 @@ fn prune_lookup_distinguishes_missing_paths_from_inspection_errors() {
         error.downcast_ref::<io::Error>().unwrap().kind(),
         io::ErrorKind::PermissionDenied
     );
+    // Siblings share one opened parent, as ordinary lookups do; a readable
+    // parent without search permission still denies, and a file or a
+    // symlink in place of a parent reads as it does path by path.
+    fs::write(root.join("sub/other"), b"x").unwrap();
+    fs::write(root.join("plain"), b"x").unwrap();
+    symlink("sub", root.join("link")).unwrap();
+    let paths = [
+        b"sub/file".to_vec(),
+        b"sub/absent".to_vec(),
+        b"sub/other".to_vec(),
+        b"plain/child".to_vec(),
+        b"link/file".to_vec(),
+    ];
+    let shared = ops.prune_lookup(&paths, None);
+    // The same paths resolved one by one under the root.
+    let confined = Root::open(root).unwrap();
+    let separate: Vec<Result<Option<u64>>> = paths
+        .iter()
+        .map(
+            |path| match confined.metadata(&RelativePath::new(path).unwrap()) {
+                Ok(metadata) => Ok(Some(metadata.len)),
+                Err(error)
+                    if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                        matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+                    }) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            },
+        )
+        .collect();
+    match shared {
+        Ok(stats) => {
+            assert!(separate.iter().all(Result::is_ok));
+            for (shared, separate) in stats.iter().zip(&separate) {
+                assert_eq!(
+                    shared.as_ref().map(|entry| entry.size),
+                    *separate.as_ref().unwrap()
+                );
+            }
+        }
+        Err(error) => assert!(separate.iter().any(Result::is_err), "{error:#}"),
+    }
+    fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o600)).unwrap();
+    let denied = ops.prune_lookup(&[b"sub/absent".to_vec(), b"sub/file".to_vec()], None);
+    fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        denied
+            .unwrap_err()
+            .downcast_ref::<io::Error>()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
 }
 
 use super::*;

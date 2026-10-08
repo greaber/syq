@@ -3031,12 +3031,14 @@ impl Planner<'_> {
     }
 
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
-        // Keep the remote receiver's combined metadata lookup, but no longer
-        // ask it to compute temporary names for every source file.
+        // Keep the remote receiver's combined metadata lookup, but wait for
+        // container access first: an inaccessible child must not be cached as
+        // absent before apply_mapped makes its container searchable.
         if self.opts.inode_preservation.any()
             || !self.opts.dst_remote
             || self.buffer.is_some()
             || self.opts.dry_run
+            || self.container_access.is_some()
             || self.destination_children_known_missing
             || self.container_guard.is_some()
         {
@@ -3878,27 +3880,31 @@ impl Planner<'_> {
         Ok(stats)
     }
 
-    pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
-        let entries = if self.opts.expressions.update.is_some() {
+    pub(super) fn stat_many(&mut self, mut paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+        let strict_preview =
+            self.opts.dry_run && (self.opts.restricted_receiver || self.opts.rsync_creation);
+        let entries = if self.opts.expressions.update.is_some() || strict_preview {
             // This existing endpoint operation distinguishes absence from an
             // unreadable path, unlike ordinary planning stats. It has the same
             // destination-observation authority and needs no wire extension.
-            let mut inspected = Vec::with_capacity(paths.len());
-            for chunk in paths.chunks(512) {
-                match ok(
-                    self.dst.call(Request::PruneLookup {
-                        paths: chunk.to_vec(),
-                        guard: self.container_guard.clone(),
-                    })?,
-                    "inspect destination for --copy-if",
-                )? {
-                    Response::Stats(entries) if entries.len() == chunk.len() => {
-                        inspected.extend(entries)
-                    }
-                    other => bail!("unexpected destination inspection response {other:?}"),
-                }
-            }
-            if self.opts.inode_preservation.any() && inspected.iter().any(Option::is_some) {
+            // Previews never change permissions, so a denied lookup stays an
+            // error rather than a missing file.
+            let preserve = self.opts.inode_preservation.any();
+            let inspected = inspect_destination_paths(
+                self.dst,
+                if preserve {
+                    paths.clone()
+                } else {
+                    std::mem::take(&mut paths)
+                },
+                self.container_guard.clone(),
+                if strict_preview {
+                    "inspect destination for preview"
+                } else {
+                    "inspect destination for --copy-if"
+                },
+            )?;
+            if preserve && inspected.iter().any(Option::is_some) {
                 // Strict lookup supplies expression fields. Rich preservation
                 // still uses the existing metadata capture request.
                 let captured = stat_many(self.dst, paths, false)?;
