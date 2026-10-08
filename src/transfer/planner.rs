@@ -3602,53 +3602,77 @@ impl Planner<'_> {
             let mut partial_parents = std::collections::HashMap::new();
             let mut alias_parents = std::collections::HashSet::new();
             // A native copy that may widen directories enters owned
-            // destination-only directories it cannot list, then walks again;
-            // rsync leaves them unlisted, as rsync does.
+            // destination-only directories it cannot list, then walks beneath
+            // them; rsync leaves them unlisted, as rsync does. Anchored ignore
+            // patterns apply from the root, so with those the whole root is
+            // walked again instead.
             let enter = self.opts.may_widen_directory_permissions() && !self.opts.rsync_creation;
+            let subtrees = ignore
+                .iter()
+                .all(|pattern| ignore_pattern_is_unanchored(pattern));
             let mut attempted = std::collections::HashSet::new();
-            let (mut walk, protected, warnings) = loop {
-                let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
-                // Destination directories that hold an ignored path, so must stay.
-                let mut protected: std::collections::HashSet<PathBytes> =
-                    std::collections::HashSet::new();
-                let mut warnings = Vec::new();
-                self.dst.scan(
-                    &root,
-                    None,
-                    false,
-                    &ignore,
-                    true,
-                    &mut |batch: Vec<Entry>| {
-                        for entry in batch {
-                            walk.push(entry, &root, &nested);
-                        }
-                        Ok(())
-                    },
-                    &mut |paths: Vec<PathBytes>| {
-                        for p in paths {
-                            // Every ancestor of an ignored path is protected.
-                            protected
-                                .extend(ancestor_prefixes(&p).map(|prefix| join(&root, prefix)));
-                        }
-                        Ok(())
-                    },
-                    &mut |w| warnings.push(w),
-                )?;
-                let unreadable: Vec<_> = if enter && !warnings.is_empty() {
-                    // Shielded entries stay; nothing beneath them is entered.
-                    walk.finish_scan(&root);
-                    walk.entries
-                        .iter()
-                        .filter(|entry| {
-                            entry.kind == Kind::Dir
-                                && entry.mode & 0o500 != 0o500
-                                && attempted.insert(entry.path.clone())
-                        })
-                        .map(|entry| (entry.path.clone(), directory_fingerprint(entry)))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
+            // Destination directories that hold an ignored path, so must stay.
+            let mut protected: std::collections::HashSet<PathBytes> =
+                std::collections::HashSet::new();
+            // Each walk warning with the directory its walk started from.
+            let mut warnings: Vec<(PathBytes, String)> = Vec::new();
+            let mut bases = vec![root.clone()];
+            loop {
+                for base in std::mem::take(&mut bases) {
+                    let prefix = base
+                        .get(root.len()..)
+                        .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
+                        .unwrap_or_default();
+                    self.dst.scan(
+                        &base,
+                        None,
+                        false,
+                        &ignore,
+                        true,
+                        &mut |batch: Vec<Entry>| {
+                            for mut entry in batch {
+                                if base != root {
+                                    // Its own entry came from the walk above.
+                                    if entry.path.is_empty() {
+                                        continue;
+                                    }
+                                    entry.path = join(&prefix, &entry.path);
+                                }
+                                walk.push(entry, &root, &nested);
+                            }
+                            Ok(())
+                        },
+                        &mut |paths: Vec<PathBytes>| {
+                            for p in paths {
+                                // Every ancestor of an ignored path is protected.
+                                let p = join(&prefix, &p);
+                                protected.extend(
+                                    ancestor_prefixes(&p).map(|prefix| join(&root, prefix)),
+                                );
+                            }
+                            Ok(())
+                        },
+                        &mut |w| warnings.push((base.clone(), w)),
+                    )?;
+                }
+                if !enter || warnings.is_empty() {
+                    break;
+                }
+                // Shielded entries stay; nothing beneath them is entered.
+                walk.finish_scan(&root);
+                let unreadable: Vec<_> = walk
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.kind == Kind::Dir
+                            && entry.mode & 0o500 != 0o500
+                            && attempted.insert(entry.path.clone())
+                    })
+                    .map(|entry| (entry.path.clone(), directory_fingerprint(entry)))
+                    .collect();
+                let candidates: Vec<PathBytes> =
+                    unreadable.iter().map(|(path, _)| path.clone()).collect();
                 if unreadable.is_empty()
                     || widen_directory_batch(
                         self.dst,
@@ -3659,12 +3683,43 @@ impl Planner<'_> {
                         unreadable,
                     )? == 0
                 {
-                    break (walk, protected, warnings);
+                    break;
                 }
-            };
-            for w in warnings {
+                let widened: Vec<PathBytes> = candidates
+                    .into_iter()
+                    .filter(|path| self.directory_restorations.contains_key(path))
+                    .collect();
+                if subtrees {
+                    // Walking beneath them again answers their warnings.
+                    warnings.retain(|(base, warning)| {
+                        !walk_warning_path(base, warning).is_some_and(|path| {
+                            widened.iter().any(|directory| {
+                                path == *directory || path_is_inside(&path, directory)
+                            })
+                        })
+                    });
+                    bases = widened;
+                } else {
+                    walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
+                    protected.clear();
+                    warnings.clear();
+                    bases = vec![root.clone()];
+                }
+            }
+            for (base, warning) in warnings {
                 self.delete_walk_failed = true;
-                self.progress.error(&format!("syq: delete: {w}"));
+                // A preview names the directory it could not inspect.
+                match walk_warning_path(&base, &warning).filter(|_| self.opts.dry_run) {
+                    Some(path) => self.progress.error(&format!(
+                        "syq: {}: not inspected: {}",
+                        display(&path),
+                        warning
+                            .strip_prefix("scan: ")
+                            .and_then(|rest| rest.split_once(": "))
+                            .map_or(warning.as_str(), |(_, error)| error)
+                    )),
+                    None => self.progress.error(&format!("syq: delete: {warning}")),
+                }
             }
             if self.delete_walk_failed {
                 return Ok(());
@@ -3689,7 +3744,11 @@ impl Planner<'_> {
                 if self.opts.may_widen_directory_permissions() {
                     walk.entries
                         .iter()
-                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                        .filter(|entry| {
+                            entry.kind == Kind::Dir
+                                && entry.mode & 0o300 != 0o300
+                                && !self.directory_restorations.contains_key(&entry.path)
+                        })
                         .map(|entry| (entry.path.clone(), directory_fingerprint(entry)))
                         .collect()
                 } else {
@@ -4545,6 +4604,22 @@ impl Planner<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether an ignore pattern matches the same names from any directory, so a
+/// subtree can be walked on its own: it names no path with a `/` other than a
+/// trailing one.
+fn ignore_pattern_is_unanchored(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+    !pattern.trim_end_matches('/').contains('/')
+}
+
+/// The destination path a walk warning (`scan: <path>: <error>`) names,
+/// beneath the directory the walk started from.
+fn walk_warning_path(base: &[u8], warning: &str) -> Option<PathBytes> {
+    let (relative, _) = warning.strip_prefix("scan: ")?.split_once(": ")?;
+    Some(join(base, relative.as_bytes()))
 }
 
 /// Strict destination lookups that survive denials. When a batch is denied,

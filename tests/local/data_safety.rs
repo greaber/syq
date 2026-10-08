@@ -1988,3 +1988,60 @@ fn exact_placement_onto_an_unsearchable_directory_suggests_and_takes_access() {
     assert_eq!(mode, 0o600);
     assert_eq!(read(&t.path("dst/a/file")), b"new");
 }
+
+/// Pruning enters nested unreadable directories one level at a time,
+/// walking only beneath each newly widened one unless an anchored ignore
+/// pattern needs the whole root; a preview names what it cannot inspect.
+#[test]
+fn pruning_enters_nested_unreadable_directories() {
+    if unsafe { libc::geteuid() } == 0 || !cfg!(target_os = "linux") {
+        return;
+    }
+    for ignore in ["*.tmp", "/keep/*.tmp"] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"a");
+        write(&t.path("dst/keep/saved.tmp"), b"ignored");
+        let chain = ["dst/x0", "dst/x0/x1", "dst/x0/x1/x2"];
+        for directory in chain {
+            write(&t.path(&format!("{directory}/f")), b"extra");
+        }
+        for directory in chain.iter().rev() {
+            fs::set_permissions(t.path(directory), fs::Permissions::from_mode(0o100)).unwrap();
+        }
+        let (src, dst) = (t.s("src"), t.s("dst"));
+        let preview = native_syq(&[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--prune",
+            "--ignore",
+            ignore,
+            "--dry-run",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ]);
+        let out = native_syq(&[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--prune",
+            "--ignore",
+            ignore,
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ]);
+        let _ = Command::new("chmod").args(["-R", "u+rwx", &dst]).status();
+        assert_eq!(preview.status.code(), Some(23), "{preview:?}");
+        let stderr = stderr_of(&preview);
+        assert!(stderr.contains("dst/x0: not inspected: "), "{preview:?}");
+        assert!(!stderr.contains("delete: scan:"), "{preview:?}");
+        assert_output_ok(&out);
+        assert_eq!(
+            listing(&t.path("dst")),
+            ["a", "keep", "keep/saved.tmp"],
+            "{ignore}"
+        );
+    }
+}
