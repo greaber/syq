@@ -828,6 +828,8 @@ struct PrepareOptions {
     create_if_missing: bool,
     /// What the sender's scan found at the path.
     scanned: ScannedDestination,
+    /// The group publication gives an in-place file, when it sets one.
+    group: Option<u32>,
 }
 
 struct HashOptions {

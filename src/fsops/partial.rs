@@ -475,6 +475,7 @@ impl FsOps {
             attempt,
             create_if_missing,
             scanned,
+            group,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
         // Existing finals get their equality check first. For new files,
@@ -571,7 +572,7 @@ impl FsOps {
                     None => match self.create_inplace_file(
                         &target.root,
                         &target.relative,
-                        mode,
+                        self.inplace_group_mode(&target, mode, group, false),
                         copy_id,
                     ) {
                         Ok(file) => {
@@ -3282,7 +3283,6 @@ impl FsOps {
                     *flags,
                     *acl,
                     *scanned,
-                    *group,
                 )
                 .and_then(|mode| {
                     self.prepare(
@@ -3298,6 +3298,7 @@ impl FsOps {
                             attempt: *attempt,
                             create_if_missing: *create_if_missing,
                             scanned: *scanned,
+                            group: *group,
                         },
                     )
                 })

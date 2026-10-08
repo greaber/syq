@@ -296,10 +296,9 @@ impl FsOps {
 
     /// The mode `Prepare` creates its file in: an `--inplace` file in the
     /// publication's mode, as creating it limits a receiver-chosen one, or
-    /// owner-only while its ACL is to come or when it would start with a
-    /// group other than `group`, the one publication sets; a sidecar in its
-    /// staged mode, from the mode publication will give it, with `scanned`
-    /// what the sender's scan found at `path`.
+    /// owner-only while its ACL is to come; a sidecar in its staged mode,
+    /// from the mode publication will give it, with `scanned` what the
+    /// sender's scan found at `path`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn creation_mode(
         &mut self,
@@ -310,15 +309,11 @@ impl FsOps {
         mut flags: u8,
         acl: bool,
         scanned: ScannedDestination,
-        group: Option<u32>,
     ) -> Result<u32> {
         if inplace {
-            let mode = inplace_creation_mode(mode, flags, acl);
-            if group.is_none() || mode == PRIVATE_PARTIAL_MODE {
-                return Ok(mode);
-            }
-            let target = self.destination_mutation_target(path, guard)?;
-            return Ok(self.inplace_group_mode(&target, mode, group, false));
+            // Whether a group change keeps a new file owner-only is decided
+            // when Prepare creates one (`inplace_group_mode`).
+            return Ok(inplace_creation_mode(mode, flags, acl));
         }
         if flags & flags::RECEIVER_MODE == 0 {
             return Ok(staged_mode(mode, flags, acl));
