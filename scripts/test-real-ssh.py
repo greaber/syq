@@ -250,7 +250,8 @@ def list_cases():
 def cleanup(compose, state, root, passed, remove_image):
     if not passed:
         with open(f"{state}/compose.log", "w") as log:
-            subprocess.run([*compose, "logs", "--no-color"], stdout=log, stderr=subprocess.STDOUT)
+            subprocess.run([*compose, "logs", "--no-color", "--timestamps"], stdout=log,
+                           stderr=subprocess.STDOUT)
     subprocess.run([*compose, "down", "--volumes", "--remove-orphans"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if remove_image:
