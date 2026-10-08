@@ -5802,3 +5802,70 @@ fn strict_destination_inspection_keeps_denials_and_checks_reply_count() {
             .is_empty()
     );
 }
+
+#[test]
+fn preview_lookups_skip_a_denied_directory_and_keep_going() {
+    let paths: Vec<PathBytes> = (0..1000)
+        .map(|i| {
+            if i % 10 == 3 {
+                format!("root/secret/{i:04}").into_bytes()
+            } else {
+                format!("root/open/{i:04}").into_bytes()
+            }
+        })
+        .collect();
+    let requests = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&requests);
+    let denied = crate::fsops::wire_error(&std::io::Error::from_raw_os_error(libc::EACCES).into());
+    let mut conn = AnsweringConn {
+        answer: move |request| {
+            let Request::PruneLookup { paths, .. } = request else {
+                panic!("wrong inspection request")
+            };
+            *counted.lock().unwrap() += 1;
+            if paths.iter().any(|path| path.starts_with(b"root/secret/")) {
+                Response::EndpointError(denied.clone())
+            } else {
+                Response::Stats(vec![None; paths.len()])
+            }
+        },
+        replies: Default::default(),
+    };
+    let mut blocked = std::collections::HashSet::new();
+    let mut reported = Vec::new();
+    let entries = planner::inspect_tolerating_denials(
+        &mut conn,
+        &paths,
+        None,
+        b"root",
+        &mut blocked,
+        &mut |directory, error| {
+            assert_eq!(os_kind_of(error), Some("permission_denied"));
+            reported.push(directory.to_vec());
+        },
+    )
+    .unwrap();
+    assert_eq!(entries.len(), paths.len());
+    assert_eq!(reported, [b"root/secret".to_vec()]);
+    assert!(blocked.contains(b"root/secret".as_slice()));
+    // One denied directory costs a search through halves, not a lookup per path.
+    assert!(
+        *requests.lock().unwrap() <= 2 * 11,
+        "{}",
+        requests.lock().unwrap()
+    );
+    // Other errors still end the preview.
+    let mut failing = AnsweringConn {
+        answer: |_| Response::Err("broken".into()),
+        replies: Default::default(),
+    };
+    assert!(planner::inspect_tolerating_denials(
+        &mut failing,
+        &paths,
+        None,
+        b"root",
+        &mut std::collections::HashSet::new(),
+        &mut |_, _| panic!("not a denial"),
+    )
+    .is_err());
+}

@@ -1764,6 +1764,10 @@ impl Planner<'_> {
         };
         let mut leaf_ops = LeafOps::default();
         for (p, dst_entry) in others.into_iter().zip(stats) {
+            // A preview reported this entry's directory as not inspected.
+            if opts.dry_run && Self::under_any(&self.blocked_directory_paths, &p.dst, dst_root) {
+                continue;
+            }
             let target_condition = self.exact_condition_for(&p.dst);
             let target_condition_holds = match (target_condition, &dst_entry) {
                 (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
@@ -4054,27 +4058,26 @@ impl Planner<'_> {
     pub(super) fn stat_many(&mut self, mut paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
         let strict_preview =
             self.opts.dry_run && (self.opts.restricted_receiver || self.opts.rsync_creation);
-        let entries = if self.opts.expressions.update.is_some() || strict_preview {
+        let preserve = self.opts.inode_preservation.any();
+        let entries = if self.opts.expressions.update.is_some() {
             // This existing endpoint operation distinguishes absence from an
             // unreadable path, unlike ordinary planning stats. It has the same
             // destination-observation authority and needs no wire extension.
-            // Previews never change permissions, so a denied lookup stays an
-            // error rather than a missing file.
-            let preserve = self.opts.inode_preservation.any();
-            let inspected = inspect_destination_paths(
-                self.dst,
-                if preserve {
-                    paths.clone()
-                } else {
-                    std::mem::take(&mut paths)
-                },
-                self.container_guard.clone(),
-                if strict_preview {
-                    "inspect destination for preview"
-                } else {
-                    "inspect destination for --copy-if"
-                },
-            )?;
+            let lookup = if preserve {
+                paths.clone()
+            } else {
+                std::mem::take(&mut paths)
+            };
+            let inspected = if strict_preview {
+                self.inspect_preview(lookup)?
+            } else {
+                inspect_destination_paths(
+                    self.dst,
+                    lookup,
+                    self.container_guard.clone(),
+                    "inspect destination for --copy-if",
+                )?
+            };
             if preserve && inspected.iter().any(Option::is_some) {
                 // Strict lookup supplies expression fields. Rich preservation
                 // still uses the existing metadata capture request.
@@ -4105,12 +4108,77 @@ impl Planner<'_> {
             } else {
                 inspected
             }
+        } else if strict_preview && preserve {
+            // One rich lookup, as an ordinary preview makes. Only the paths it
+            // did not find need the strict one, to tell a denial from absence.
+            let mut captured = stat_many(self.dst, paths.clone(), false)?;
+            let missing: Vec<usize> = (0..captured.len())
+                .filter(|&index| captured[index].is_none())
+                .collect();
+            if !missing.is_empty() {
+                let inspected = self
+                    .inspect_preview(missing.iter().map(|&index| paths[index].clone()).collect())?;
+                for (&index, entry) in missing.iter().zip(inspected) {
+                    captured[index] = entry;
+                }
+            }
+            captured
+        } else if strict_preview {
+            // Previews never change permissions, so a denied lookup stays an
+            // error rather than a missing file.
+            self.inspect_preview(paths)?
         } else {
             stat_many(self.dst, paths, false)?
         };
         self.progress
             .observe_destination_devices(entries.iter().flatten());
         Ok(entries)
+    }
+
+    /// Strict lookups for a preview. A denied directory does not end it: it
+    /// is reported once as not inspected and its contents are skipped, as
+    /// rsync reports a path it cannot stat and goes on.
+    fn inspect_preview(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+        // Inside a directory this preview found missing nothing exists.
+        let mut results = vec![None; paths.len()];
+        let needed: Vec<usize> = (0..paths.len())
+            .filter(|&index| {
+                !self
+                    .dry_run_changes
+                    .directories
+                    .contains(&parent_path(&paths[index]))
+            })
+            .collect();
+        if needed.is_empty() {
+            return Ok(results);
+        }
+        let lookups: Vec<PathBytes> = if needed.len() == paths.len() {
+            paths
+        } else {
+            needed.iter().map(|&index| paths[index].clone()).collect()
+        };
+        let reported = &mut self.access_reported;
+        let progress = self.progress;
+        let entries = inspect_tolerating_denials(
+            self.dst,
+            &lookups,
+            self.container_guard.clone(),
+            &self.dst_root,
+            &mut self.blocked_directory_paths,
+            &mut |directory, error| {
+                if reported.insert(directory.to_vec()) {
+                    progress.error_classified(
+                        &format!("syq: {}: not inspected: {error:#}", display(directory)),
+                        Some("io"),
+                        Some("permission_denied"),
+                    );
+                }
+            },
+        )?;
+        for (index, entry) in needed.into_iter().zip(entries) {
+            results[index] = entry;
+        }
+        Ok(results)
     }
 
     /// Avoid querying descendants of a directory conflict. The planner skips
@@ -4181,6 +4249,8 @@ impl Planner<'_> {
             for (index, entry) in visible_indexes.into_iter().zip(self.stat_many(visible)?) {
                 results[index] = entry;
             }
+            // Directories found uninspectable by those lookups hide theirs.
+            blocked.extend(self.blocked_directory_paths.iter().cloned());
             // A directory this preview cannot search hides its contents.
             let candidates = indexes
                 .iter()
@@ -4475,6 +4545,66 @@ impl Planner<'_> {
         }
         Ok(())
     }
+}
+
+/// Strict destination lookups that survive denials. When a batch is denied,
+/// its paths are looked up again in halves to find the denied ones; each
+/// one's parent directory goes into `blocked` and to `report`, and paths
+/// beneath a blocked directory are skipped, reading as absent.
+pub(super) fn inspect_tolerating_denials(
+    conn: &mut dyn Conn,
+    paths: &[PathBytes],
+    guard: Option<ContainerGuard>,
+    dst_root: &[u8],
+    blocked: &mut std::collections::HashSet<PathBytes>,
+    report: &mut dyn FnMut(&[u8], &anyhow::Error),
+) -> Result<Vec<Option<Entry>>> {
+    let mut results = vec![None; paths.len()];
+    let visible: Vec<usize> = (0..paths.len())
+        .filter(|&index| !Planner::under_any(blocked, &paths[index], dst_root))
+        .collect();
+    if visible.is_empty() {
+        return Ok(results);
+    }
+    let batch = visible.iter().map(|&index| paths[index].clone()).collect();
+    match inspect_destination_paths(
+        conn,
+        batch,
+        guard.clone(),
+        "inspect destination for preview",
+    ) {
+        Ok(entries) => {
+            for (&index, entry) in visible.iter().zip(entries) {
+                results[index] = entry;
+            }
+        }
+        Err(error) if os_kind_of(&error) == Some("permission_denied") => {
+            if let [index] = visible[..] {
+                let parent = parent_path(&paths[index]);
+                report(&parent, &error);
+                blocked.insert(parent);
+            } else {
+                let (first, second) = visible.split_at(visible.len() / 2);
+                for half in [first, second] {
+                    let subset: Vec<PathBytes> =
+                        half.iter().map(|&index| paths[index].clone()).collect();
+                    let entries = inspect_tolerating_denials(
+                        conn,
+                        &subset,
+                        guard.clone(),
+                        dst_root,
+                        blocked,
+                        report,
+                    )?;
+                    for (&index, entry) in half.iter().zip(entries) {
+                        results[index] = entry;
+                    }
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(results)
 }
 
 /// Temporarily add owner access to `directories` and remember the original
