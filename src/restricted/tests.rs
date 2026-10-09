@@ -7444,3 +7444,57 @@ fn a_create_only_in_place_retry_is_refused_with_the_way_to_finish() {
         assert_eq!(fs::read(&target).unwrap(), b"first");
     }
 }
+
+/// Keeping existing objects, the receiver changes what it created through
+/// the descriptor it checked: a new directory's and symlink's times and a
+/// new directory's mode, as a copy's final metadata sets them.
+#[test]
+fn created_objects_take_their_metadata_through_their_descriptor() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let mut authority = keeping_link_authority(&root);
+    authority.copy.options.preserve_times = true;
+    authority.copy.options.preserve_symlinks = true;
+    let request = |ops| Request::Apply { ops, guard: None };
+    let directory = root.join("target/new-dir");
+    let link = root.join("target/new-link");
+    assert!(all_applied(
+        &execute(
+            &authority,
+            request(vec![
+                Op::Mkdir {
+                    path: path_bytes(&directory),
+                    mode: 0o755,
+                    condition: proto::TargetCondition::Any,
+                },
+                Op::Symlink {
+                    path: path_bytes(&link),
+                    target: b"kept".to_vec(),
+                    condition: proto::TargetCondition::Any,
+                },
+            ]),
+        )
+        .unwrap()
+    ));
+    let times = |path: &Path, mode: u32| Op::SetMeta {
+        path: path_bytes(path),
+        meta: proto::Meta {
+            mode,
+            mtime: 1_500_000_000,
+            ..plain_meta()
+        },
+        flags: proto::flags::TIMES | proto::flags::MODE,
+        condition: proto::TargetCondition::Any,
+    };
+    let response = execute(
+        &authority,
+        request(vec![times(&directory, 0o40750), times(&link, 0o120777)]),
+    )
+    .unwrap();
+    assert!(all_applied(&response), "{response:?}");
+    let directory = fs::metadata(&directory).unwrap();
+    assert_eq!(directory.mtime(), 1_500_000_000);
+    assert_eq!(directory.permissions().mode() & 0o7777, 0o750);
+    assert_eq!(fs::symlink_metadata(&link).unwrap().mtime(), 1_500_000_000);
+}
