@@ -20,6 +20,10 @@ struct Follower {
     dst: PathBytes,
     rel: PathBytes,
     destination: Option<(u64, u64)>,
+    /// What the name must hold when the link is made, as for a file
+    /// published there: nothing, for a new name the existing-file policy
+    /// protects.
+    condition: TargetCondition,
     compare_before_link: bool,
 }
 
@@ -59,6 +63,7 @@ pub(super) fn validate_macos_acls<'a>(entries: impl Iterator<Item = &'a Planned>
 impl Planner<'_> {
     pub(super) fn plan_hardlinked_file(&mut self, leaf: Planned, destination: Option<Entry>) {
         let identity = (leaf.e.dev, leaf.e.ino);
+        let condition = self.leaf_condition_for(&leaf.dst, destination.as_ref());
         if let Some(&index) = self.hardlinks.by_inode.get(&identity) {
             let group = &mut self.hardlinks.groups[index];
             let jobs = self.sched.jobs.lock().unwrap();
@@ -91,6 +96,7 @@ impl Planner<'_> {
                         || !self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)
                 });
             group.followers.push(Follower {
+                condition,
                 compare_before_link,
                 src: leaf.src,
                 source: leaf.source,
@@ -394,7 +400,7 @@ impl Planner<'_> {
                 source: group.job.dst.clone(),
                 dev,
                 ino,
-                condition: crate::proto::TargetCondition::Any,
+                condition: follower.condition,
             });
             pending.push((group, follower));
         }
