@@ -82,9 +82,6 @@ impl FsOps {
         let file = self.create_new_inplace_file(root, relative, mode | 0o200, false)?;
         let created = file.metadata()?;
         receiver_mode::note_inplace_open(copy_id, &created, true);
-        if let Some(owned) = &self.owned {
-            owned.record(&created);
-        }
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -105,14 +102,23 @@ impl FsOps {
         write_only: bool,
     ) -> Result<File> {
         #[cfg(target_os = "macos")]
-        if self.inode_preservation.acls {
-            return root.create_private_file(relative);
-        }
-        if write_only {
+        let file = if self.inode_preservation.acls {
+            root.create_private_file(relative)
+        } else if write_only {
             root.create_write_only_file(relative, mode)
         } else {
             root.create_file(relative, mode)
+        }?;
+        #[cfg(not(target_os = "macos"))]
+        let file = if write_only {
+            root.create_write_only_file(relative, mode)
+        } else {
+            root.create_file(relative, mode)
+        }?;
+        if let Some(owned) = &self.owned {
+            owned.record(&file.metadata()?);
         }
+        Ok(file)
     }
 
     /// The mode for a new in-place file at `target`, created with `mode`
