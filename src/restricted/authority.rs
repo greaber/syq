@@ -130,9 +130,20 @@ pub(crate) struct RestrictedAuthority {
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
+    /// The objects this receiver created for the grant, shared with every
+    /// connection's operations.
+    pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
 }
 
 impl RestrictedAuthority {
+    /// The objects whose metadata this receiver may change, when the grant
+    /// keeps existing objects: those it created for the grant.
+    pub(crate) fn owned_objects(
+        &self,
+    ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
+        (self.copy.policy.existing == ExistingDestinationPolicy::Skip).then(|| self.owned.clone())
+    }
+
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
         self.hashing.as_ref().map_or(
             crate::hashing::HashPolicy {
@@ -238,6 +249,7 @@ impl RestrictedAuthority {
         let authority = Self {
             hashing,
             extra_options,
+            owned: Default::default(),
             tcp_congestion,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
@@ -1351,16 +1363,12 @@ impl RestrictedAuthority {
             .iter()
             .any(|creation| creation.path == path && !creation.link);
         match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if created_here => Ok(()),
-            // A name an earlier request created may have been removed and
-            // given to an existing file since, on another connection, before
-            // this change runs: the change is held to the file there now.
-            ExistingDestinationPolicy::Skip if created_before => {
-                self.pin_update(path, &label, condition)
-            }
-            ExistingDestinationPolicy::Skip => {
-                bail!("signed grant retains existing objects: {label} may not be modified")
-            }
+            // Keeping existing objects, the receiver changes the metadata
+            // only of objects it created for this grant, which it checks on
+            // the very descriptor the change goes through (`OwnedObjects`):
+            // whatever this or another request does to the name meanwhile,
+            // the change cannot reach an object that was there before.
+            ExistingDestinationPolicy::Skip => Ok(()),
             ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
             // Updates are pinned to the observed object, like publications:
             // nothing hostA supplies names an inode on its own authority.

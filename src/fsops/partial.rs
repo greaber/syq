@@ -82,6 +82,9 @@ impl FsOps {
         let file = root.create_file(relative, mode | 0o200)?;
         let created = file.metadata()?;
         receiver_mode::note_inplace_open(copy_id, &created, true);
+        if let Some(owned) = &self.owned {
+            owned.record(&created);
+        }
         if created.mode() & 0o200 == 0 {
             // A umask or inherited default ACL can remove even owner write.
             file.set_permissions(fs::Permissions::from_mode(created.mode() | 0o200))?;
@@ -804,6 +807,7 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
+        self.require_owned(&held.file.metadata()?, meta, flags, &held.label)?;
         set_meta_file(&held.file, meta, flags)
             .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
         if guard.is_some() {
@@ -2723,6 +2727,7 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
+            self.require_owned(&current, meta, flags, &target.label)?;
             check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;
@@ -2808,6 +2813,7 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
+            self.owned.as_deref(),
         )
         .map_err(|error| {
             if error
@@ -3648,12 +3654,16 @@ impl FsOps {
     }
 }
 
+/// Publish the private partial `staged` at `source` as `target`. With
+/// `owned`, the published file, which this receiver wrote, is recorded as
+/// its own.
 pub(super) fn publish_partial_rooted(
     root: &Root,
     source: &RelativePath,
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
+    owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
@@ -3683,6 +3693,9 @@ pub(super) fn publish_partial_rooted(
         ),
     }?;
     sidecars::forget(staged_identity);
+    if let Some(owned) = owned {
+        owned.record(&metadata);
+    }
     Ok(())
 }
 

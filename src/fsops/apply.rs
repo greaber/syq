@@ -21,6 +21,7 @@ pub(super) fn apply_one(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
@@ -74,14 +75,14 @@ pub(super) fn apply_one(
                 ino: *ino,
                 condition: *condition,
             };
-            return apply_one_rooted(&operation, &target.as_rooted());
+            return apply_one_rooted(&operation, &target.as_rooted(), owned);
         }
-        return apply_one_rooted(op, &target.as_rooted());
+        return apply_one_rooted(op, &target.as_rooted(), owned);
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target)
+    apply_one_rooted(op, &target, owned)
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -354,7 +355,51 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
+/// Carry out `op` at `target`. With `owned`, record what it creates and
+/// change the metadata only of objects recorded there.
+fn apply_one_rooted(
+    op: &Op,
+    target: &RootedTarget,
+    owned: Option<&owned::OwnedObjects>,
+) -> Result<()> {
+    match op {
+        Op::Mkdir {
+            mode, condition, ..
+        } => {
+            let created = mkdir_rooted(target, *mode, *condition, owned.is_some())?;
+            if let (Some(owned), Some((dev, ino, _))) = (owned, created) {
+                owned.record_identity(dev, ino);
+            }
+            Ok(())
+        }
+        Op::Symlink { .. } | Op::Mknod { .. } => {
+            apply_one_rooted_unowned(op, target, None)?;
+            // Hard links reach only regular files, so whatever else is at
+            // the name now is what this just created.
+            if let Some(owned) = owned {
+                let created = target.root.metadata(&target.relative)?;
+                if !created.is_file() && !created.is_dir() {
+                    owned.record_identity(created.dev, created.ino);
+                }
+            }
+            Ok(())
+        }
+        Op::SetMeta {
+            meta,
+            flags,
+            condition,
+            ..
+        } => set_meta_rooted(target, meta, *flags, *condition, owned),
+        _ => apply_one_rooted_unowned(op, target, owned),
+    }
+}
+
+/// As `apply_one_rooted`, recording nothing it creates.
+fn apply_one_rooted_unowned(
+    op: &Op,
+    target: &RootedTarget,
+    owned: Option<&owned::OwnedObjects>,
+) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
@@ -443,7 +488,7 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
             flags,
             condition,
             ..
-        } => set_meta_rooted(target, meta, *flags, *condition),
+        } => set_meta_rooted(target, meta, *flags, *condition, None),
         Op::SetFileMetaIfSame {
             condition,
             meta,
@@ -459,6 +504,9 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
                 );
             }
             require_open_target_known(&opened, &target.label, *condition)?;
+            if let Some(owned) = owned {
+                owned.require(&opened, &target.label)?;
+            }
             set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
             require_rooted_named_identity_known(
                 &target.root,
@@ -484,7 +532,11 @@ pub(super) fn set_meta_rooted(
     meta: &Meta,
     flags: u8,
     condition: TargetCondition,
+    owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
+    if let Some(owned) = owned {
+        return set_meta_owned(target, meta, flags, condition, owned);
+    }
     if target.relative.is_empty() {
         let metadata = target.root.metadata(&target.relative)?;
         require_rooted_condition(metadata, condition, &target.label)?;
@@ -1143,6 +1195,85 @@ pub(super) fn set_meta_handle_known_portable(
     current: &fs::Metadata,
 ) -> Result<()> {
     set_meta_file_known(file, meta, flags, current)
+}
+
+/// As `set_meta_rooted`, changing only an object this receiver created: the
+/// object is opened once, its identity checked against `owned`, and every
+/// change made through that one descriptor, never its name, so nothing put
+/// at the name meanwhile can take the change.
+fn set_meta_owned(
+    target: &RootedTarget,
+    meta: &Meta,
+    flags: u8,
+    condition: TargetCondition,
+    owned: &owned::OwnedObjects,
+) -> Result<()> {
+    let handle = target.root.open_metadata(&target.relative)?;
+    let opened = handle.metadata()?;
+    require_open_target_known(&opened, &target.label, condition)?;
+    let is_link = opened.file_type().is_symlink();
+    let owner_differs = (flags & flags::OWNER != 0
+        && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
+        && opened.uid() != meta.uid)
+        || (flags & flags::GROUP != 0 && opened.gid() != meta.gid);
+    let mode_differs =
+        flags & flags::MODE != 0 && !is_link && opened.mode() & 0o7777 != meta.mode & 0o7777;
+    let time_differs = flags & flags::TIMES != 0
+        && (opened.mtime() != meta.mtime || opened.mtime_nsec() as u32 != meta.mtime_nsec);
+    if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
+        return Ok(());
+    }
+    owned.require(&opened, &target.label)?;
+    if time_differs {
+        set_times_handle(
+            &handle,
+            &[
+                timespec(0, libc::UTIME_OMIT as u32),
+                timespec(meta.mtime, meta.mtime_nsec),
+            ],
+        )
+        .with_context(|| format!("set times on confined path {}", target.label.display()))?;
+    }
+    // Birth time follows mtime: macOS may lower birth time when setting an
+    // older modification time.
+    set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)
+}
+
+/// Set times through `handle`, an O_PATH descriptor on Linux, never through
+/// a name.
+fn set_times_handle(handle: &File, times: &[libc::timespec; 2]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let result = unsafe {
+            libc::utimensat(
+                handle.as_raw_fd(),
+                c"".as_ptr(),
+                times.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // Kernels before AT_EMPTY_PATH support here: procfs resolves the
+        // descriptor, never the name, for anything but a symlink.
+        if error.raw_os_error() != Some(libc::EINVAL) || handle.metadata()?.is_symlink() {
+            return Err(error.into());
+        }
+        let path = CString::new(crate::sys::proc_fd_path(handle))?;
+        if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if unsafe { libc::futimens(handle.as_raw_fd(), times.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

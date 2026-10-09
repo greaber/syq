@@ -750,6 +750,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
+        ops.set_owned_objects(authority.owned_objects());
     }
     if let Some(source) = &source_permit {
         source.initialize(&mut ops)?;

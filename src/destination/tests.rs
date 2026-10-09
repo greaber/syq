@@ -1050,6 +1050,46 @@ fn named_hard_links_ask_and_link_new_names_to_existing_files() {
     );
 }
 
+/// Keeping existing files, a hard-link group with an existing member ends
+/// as rsync leaves it: the existing name and its file untouched, and the
+/// group's new names linked to a new file of their own.
+#[test]
+fn named_hard_links_keep_an_existing_group_member_untouched() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"source contents").unwrap();
+    fs::hard_link(source.join("a"), source.join("b")).unwrap();
+    fs::hard_link(source.join("a"), source.join("c")).unwrap();
+    fs::write(root.join("source/a"), b"kept").unwrap();
+    fs::set_permissions(root.join("source/a"), fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(root.join("source/a")).unwrap();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let shown = approve_pending(&receiver);
+    assert_eq!(
+        named_copy(
+            &registration,
+            &source,
+            &["--if-exists=keep", "--copy-metadata", "mtime,hardlinks"],
+        ),
+        0
+    );
+    shown.join().unwrap();
+    let after = fs::metadata(root.join("source/a")).unwrap();
+    assert_eq!(fs::read(root.join("source/a")).unwrap(), b"kept");
+    assert_eq!(
+        (after.ino(), after.mode(), after.nlink(), after.mtime()),
+        (before.ino(), before.mode(), 1, before.mtime())
+    );
+    let new = |name: &str| fs::metadata(root.join("source").join(name)).unwrap();
+    assert_eq!(fs::read(root.join("source/b")).unwrap(), b"source contents");
+    assert_eq!(new("b").ino(), new("c").ino());
+    assert_ne!(new("b").ino(), after.ino());
+}
+
 /// Extended attributes reach as an ordinary copy by the same account: the
 /// user namespace, with values the source lacks removed.
 #[cfg(target_os = "linux")]
