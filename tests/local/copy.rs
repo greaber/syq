@@ -640,3 +640,106 @@ fn fresh_destination_skips_descendant_lookups_under_copy_if() {
         );
     }
 }
+
+/// An upgrade or rebuild can replace syq's file while a copy runs. The local
+/// receiver then starts from the running image, not from the replaced path,
+/// and still shows that path and syq's name.
+#[cfg(target_os = "linux")]
+#[test]
+fn local_receiver_starts_from_the_running_build_after_its_file_is_replaced() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"contents");
+    let program = t.path("bin/syq");
+    fs::create_dir_all(t.path("bin")).unwrap();
+    executable_support::copy_executable(Path::new(env!("CARGO_BIN_EXE_syq")), &program, 0o755);
+    let errors = File::create(t.path("stderr")).unwrap();
+    let ready = t.path("receiver-ready");
+    let continuation = t.path("receiver-continue");
+    // The coordinator reads the whole manifest before it starts the receiver.
+    // A debug receiver pauses after creating dst, so the test can inspect it.
+    let mut child = Command::new(&program)
+        .args(["cp", "--mapping", "-", "-C", "src", "--into", "dst", "-q"])
+        .current_dir(t.path(""))
+        .env("SYQ_TEST_CREATED_DIRECTORY_SUFFIX", "dst")
+        .env("SYQ_TEST_CREATED_DIRECTORY_READY_FILE", &ready)
+        .env("SYQ_TEST_CREATED_DIRECTORY_CONTINUE_FILE", &continuation)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(errors)
+        .start()
+        .unwrap();
+    // Replace the file as a package upgrade or cargo rebuild does. Running the
+    // replacement instead of the original build would fail the copy.
+    let replacement = t.path("bin/replacement");
+    executable_support::write_executable(
+        &replacement,
+        b"#!/bin/sh\necho replaced build ran >&2\nexit 97\n",
+        0o755,
+    );
+    fs::rename(&replacement, &program).unwrap();
+    let mut manifest = child.stdin.take().unwrap();
+    manifest
+        .write_all(entry_line("file", "file", None).as_bytes())
+        .unwrap();
+    drop(manifest);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let stop = |child: &mut std::process::Child, stage: &str| -> ! {
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.wait();
+        panic!(
+            "copy did not {stage} after its file was replaced: {}",
+            String::from_utf8_lossy(&read(&t.path("stderr")))
+        );
+    };
+    #[cfg(debug_assertions)]
+    {
+        while !ready.exists() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                stop(&mut child, "start its receiver");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The receiver is the coordinator's child that runs --local-receiver.
+        let coordinator = child.id().to_string();
+        let receiver = fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                fs::read_to_string(entry.path().join("stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, fields)| fields.split(' ').nth(1))
+                        == Some(coordinator.as_str())
+                }) && fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| {
+                    cmdline
+                        .split(|byte| *byte == 0)
+                        .any(|argument| argument == b"--local-receiver")
+                })
+            })
+            .expect("the paused receiver is the coordinator's child")
+            .path();
+        assert_eq!(fs::read_to_string(receiver.join("comm")).unwrap(), "syq\n");
+        let expected = fs::canonicalize(t.path("bin")).unwrap().join("syq");
+        let cmdline = fs::read(receiver.join("cmdline")).unwrap();
+        assert_eq!(
+            cmdline.split(|byte| *byte == 0).next().unwrap(),
+            std::os::unix::ffi::OsStrExt::as_bytes(expected.as_os_str())
+        );
+    }
+    write(&continuation, b"");
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            stop(&mut child, "finish");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "{status:?}: {}",
+        String::from_utf8_lossy(&read(&t.path("stderr")))
+    );
+    assert_eq!(read(&t.path("dst/file")), b"contents");
+}

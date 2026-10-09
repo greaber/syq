@@ -16,6 +16,18 @@ pub(crate) fn main() {
         println!("cargo::rustc-link-lib=framework=CoreWLAN");
         println!("cargo::rerun-if-changed=src/server/interfaces/link_speed.m");
     }
+    // Link Linux debug and test executables without PIE. A PIE build rewrites
+    // about 600 pages of pointers every time it starts, which dominates the
+    // cost of the many short processes tests start: one per test under
+    // nextest, plus every syq a test runs. Release builds stay PIE.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
+        && env::var("PROFILE").as_deref() == Ok("debug")
+    {
+        // Not `-tests`: Cargo rejects it when the package has no test target,
+        // as in the real-SSH image's dependency stage.
+        println!("cargo::rustc-link-arg=-no-pie");
+    }
     println!("cargo::rerun-if-env-changed=SYQ_RELEASE_BUILD");
     println!("cargo::rerun-if-env-changed=SYQ_HELPER_RELEASE");
     let packaged = packaged_revision();

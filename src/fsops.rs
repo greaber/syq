@@ -224,6 +224,8 @@ enum FileSystemKey {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy<'a> {
     inplace: bool,
+    /// The group publication gives an in-place file, when it sets one.
+    group: Option<u32>,
     replace_partial: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
@@ -685,6 +687,9 @@ pub struct FsOps {
     /// Directories this connection created private or widened, for the
     /// modes it chooses for them later.
     receiver_directories: receiver_mode::ReceiverDirectories,
+    /// The parents of the in-place files the current small-file batch
+    /// creates, looked up once per directory.
+    inplace_parents: Mutex<apply::InplaceParents>,
     /// A new directory whose mode lacks owner access, as `syq rsync` creates
     /// one, gets that mode only after its contents.
     narrow_new_directories: bool,
@@ -827,6 +832,8 @@ struct PrepareOptions {
     create_if_missing: bool,
     /// What the sender's scan found at the path.
     scanned: ScannedDestination,
+    /// The group publication gives an in-place file, when it sets one.
+    group: Option<u32>,
 }
 
 struct HashOptions {
@@ -905,6 +912,7 @@ impl FsOps {
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
             receiver_directories: Default::default(),
+            inplace_parents: Default::default(),
             narrow_new_directories: false,
             creation_permissions: Default::default(),
             prepared_small_copy: None,
@@ -989,28 +997,35 @@ impl FsOps {
         &mut self,
         mode: u32,
         require_absent: bool,
-    ) -> Result<DirectoryAnchor> {
+    ) -> Result<(DirectoryAnchor, bool)> {
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_OPERATOR_DIRECTORY_READY_FILE",
+            "SYQ_TEST_OPERATOR_DIRECTORY_CONTINUE_FILE",
+            "destination directory creation",
+        )?;
         // It has owner access while it is filled, as any new directory has.
-        let anchor = self
+        let (anchor, created) = self
             .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
             .create_missing(mode | 0o700, require_absent)?;
         // A destination created private is opened once its metadata is set,
         // and under `syq rsync` one whose mode lacks owner access is narrowed
-        // once it is filled.
+        // once it is filled. A directory found at its name, which another
+        // process created after it was found missing, keeps its mode.
         let narrowing = self.narrow_new_directories && mode & 0o700 != 0o700;
-        if mode & 0o7777 == 0o700 || narrowing {
-            let created = self
+        if created && (mode & 0o7777 == 0o700 || narrowing) {
+            let metadata = self
                 .operator_selection
                 .as_ref()
                 .context("no checked destination directory")?
                 .directory
                 .metadata()?;
             self.receiver_directories
-                .created((anchor.dev, anchor.ino), created.mode(), narrowing);
+                .created((anchor.dev, anchor.ino), metadata.mode(), narrowing);
         }
-        Ok(anchor)
+        Ok((anchor, created))
     }
 
     fn anchor_destination(
@@ -1740,13 +1755,19 @@ impl FsOps {
         let registrations: Vec<_> = resolved
             .iter()
             .map(|(directory, relative, expected_leaf, object)| {
-                (
+                let directory_mode = if relative.is_empty() {
+                    Some(directory.metadata()?.mode() & 0o777)
+                } else {
+                    None
+                };
+                Ok((
                     relative.clone(),
                     expected_leaf.clone(),
                     filesystem_hint(object.as_ref().unwrap_or(directory)),
-                )
+                    directory_mode,
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let tickets = self.descriptor_session.register_source_handles(
             resolved
                 .into_iter()
@@ -1757,7 +1778,7 @@ impl FsOps {
             .into_iter()
             .zip(registrations)
             .map(
-                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem))| {
+                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem, directory_mode))| {
                     let selection = RegisteredPath::new(ticket.root_id(), relative)?;
                     Ok(RegisteredSourceRoot {
                         filesystem,
@@ -1766,6 +1787,7 @@ impl FsOps {
                         selection,
                         expected_leaf,
                         allow_unconfined_paths,
+                        directory_mode,
                     })
                 },
             )

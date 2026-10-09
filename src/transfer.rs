@@ -3244,7 +3244,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // A missing single-file target may still have a resumable sidecar. Bound
     // its initial SSH workers speculatively, then restore concurrency if the
     // worker discovers a basis with potentially disjoint changed ranges.
-    let fresh_destination = dst_root_entry.is_none()
+    let mut fresh_destination = dst_root_entry.is_none()
         || (dst_entry_is_dir
             && initial_destination_filesystem
                 .as_ref()
@@ -3453,7 +3453,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // complete scan has passed its final-destination conflict checks.
     let may_create_directories = !args.dry_run && !args.existing;
     let root_creatable = dst_root_entry.is_none() && dst_is_dir && !args.existing;
-    let create_root = root_creatable && !args.dry_run;
+    let mut create_root = root_creatable && !args.dry_run;
     let dry_run_creates_root = root_creatable && args.dry_run;
     let root_create_condition = TargetCondition::Any;
     // A directory target takes a contents source's metadata, which the
@@ -3467,25 +3467,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let contents_source = srcs.iter().position(Location::copies_contents).filter(|_| {
         create_root && dst_is_dir && args.files_from.is_none() && args.native_mapping.is_none()
     });
-    let private_root = (contents_source.is_some()
+    let mut private_root = (contents_source.is_some()
         && opts.flags & (flags::MODE | flags::GROUP) != 0)
         .then_some(if use_operator_anchor && opts.rsync_creation {
             0o777
         } else {
             0o755
         });
-    let root_source_mode =
-        match contents_source.filter(|_| private_root.is_none() && opts.rsync_creation) {
-            Some(index) => stat_one_registered(
-                &mut *src_ctl,
-                &srcs[index].path,
-                &source_roots.get().expect("source roots registered")[index].selection,
-                srcs[index].follows_root(args.follows_native_source_paths()),
-            )?
-            .filter(|entry| entry.kind == Kind::Dir)
-            .map(|entry| entry.mode & 0o777),
-            None => None,
-        };
+    // Registering the source root read its mode, so this takes no lookup.
+    let root_source_mode = contents_source
+        .filter(|_| private_root.is_none() && opts.rsync_creation)
+        .and_then(|index| {
+            source_roots.get().expect("source roots registered")[index].directory_mode
+        });
     let defer_operator_directory_creation = use_operator_anchor
         && directory_selection.is_none()
         && may_create_directories
@@ -3493,20 +3487,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Selection already inspected the container. Carry its identity into
     // planning, so file-only copies can request access without another lookup
     // on the ordinary writable-directory path.
-    let container_access = if args.temporarily_widen_dir_permissions
-        && !opts.dry_run
-        && !opts.preserve_existing_directory_metadata
-    {
+    let widen_container = widens_destination_container(&args, &opts);
+    let mut container_access = if widen_container {
         if let Some(selection) = &directory_selection {
-            selection.needs_owner_access.then(|| {
-                (
-                    request_prefix.clone(),
-                    TargetCondition::Matches {
-                        dev: selection.dev,
-                        ino: selection.ino,
-                    },
-                )
-            })
+            selected_container_access(widen_container, &request_prefix, selection)
         } else if dst_is_dir {
             dst_root_entry
                 .as_ref()
@@ -3530,14 +3514,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             } else {
                 TargetCondition::Any
             };
-            directory_selection = Some(create_operator_directory(
+            let (selection, created) = create_operator_directory(
                 &mut *dst_ctl,
                 condition,
                 private_root.filter(|_| dst_is_dir).map_or_else(
                     || root_source_mode.unwrap_or_else(|| operator_directory_mode(&opts)),
                     |_| 0o700,
                 ),
-            )?);
+            )?;
+            if dst_is_dir && !created {
+                // Another process created the destination root after it was
+                // found missing. It is an existing directory: it gets no new
+                // root's metadata, what it holds is looked up before anything
+                // is written, and it is widened for its owner as any existing
+                // directory is.
+                create_root = false;
+                private_root = None;
+                dst_initially_missing = false;
+                fresh_destination = false;
+                container_access =
+                    selected_container_access(widen_container, &request_prefix, &selection);
+            }
+            directory_selection = Some(selection);
         }
         if let Some(selection) = directory_selection.take() {
             let anchor = match prepared_anchor.take() {
@@ -3940,6 +3938,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         container_access,
+        widen_container,
         // Deferred root creation must succeed before mapped entries are applied.
         created_dirs: if create_root {
             std::collections::HashSet::from([dst_root.clone()])
@@ -4917,11 +4916,42 @@ fn operator_directory_mode(opts: &Opts) -> u32 {
     }
 }
 
+/// Whether a destination container that lacks owner access is widened for
+/// its owner, the one rule for a root found existing, one another process
+/// created before syq's mkdir, and one found when the planner creates it
+/// after the scan.
+fn widens_destination_container(args: &Args, opts: &Opts) -> bool {
+    args.temporarily_widen_dir_permissions
+        && !opts.dry_run
+        && !opts.preserve_existing_directory_metadata
+}
+
+/// The access to request for the operator directory `selection`, known by
+/// `request_prefix`: widening for its owner, when `widen` allows it and the
+/// directory lacks owner access.
+fn selected_container_access(
+    widen: bool,
+    request_prefix: &[u8],
+    selection: &DirectoryAnchor,
+) -> Option<(PathBytes, TargetCondition)> {
+    (widen && selection.needs_owner_access).then(|| {
+        (
+            request_prefix.to_vec(),
+            TargetCondition::Matches {
+                dev: selection.dev,
+                ino: selection.ino,
+            },
+        )
+    })
+}
+
+/// Create the checked operator directory, returning it and whether the
+/// receiver created it rather than finding a directory at its name.
 fn create_operator_directory(
     conn: &mut dyn Conn,
     condition: TargetCondition,
     mode: u32,
-) -> Result<DirectoryAnchor> {
+) -> Result<(DirectoryAnchor, bool)> {
     match ok(
         conn.call(Request::CreateOperatorDirectory {
             mode,
@@ -4929,7 +4959,7 @@ fn create_operator_directory(
         })?,
         "create destination directory",
     )? {
-        Response::DirectorySelection(Some(selection)) => Ok(selection),
+        Response::OperatorDirectoryCreated { anchor, created } => Ok((anchor, created)),
         other => bail!("unexpected response {other:?}"),
     }
 }

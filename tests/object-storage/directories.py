@@ -7,6 +7,7 @@ after every object is written and before any directory metadata is applied.
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 import time
@@ -91,6 +92,60 @@ def check():
             after = {path: mode(destination / path) for path in directories}
             assert after == {path: value & ~UMASK for path, value in expected.items()}, after
             assert private(during), {path: oct(value) for path, value in during.items()}
+
+        # Without -p, a marker directory ends as creating it there would have
+        # left it, as in a local copy: it keeps the setgid bit it inherited,
+        # and an inherited default ACL limits its mode instead of the umask,
+        # as it limits the files' modes.
+        setgid = root / 'setgid'
+        setgid.mkdir()
+        setgid.chmod(0o2755)
+        c.run(['--from', remote, prefix + '/source', '--into', setgid / 'download'])
+        after = {path: mode(setgid / 'download' / path) for path in directories}
+        assert after == {path: value & ~UMASK | 0o2000 for path, value in expected.items()}, after
+        acl = root / 'acl'
+        acl.mkdir()
+        try:
+            # Owner rwx, owning group r-x, others nothing.
+            os.setxattr(acl, 'system.posix_acl_default', struct.pack(
+                '<I' + 'HHI' * 3, 2, 0x01, 7, 0xffffffff, 0x04, 5, 0xffffffff, 0x20, 0, 0xffffffff))
+        except (AttributeError, OSError) as error:
+            print(f'Skipping the default ACL download check: {error}', flush=True)
+        else:
+            c.run(['--from', remote, prefix + '/source', '--into', acl / 'download'])
+            after = {path: mode(acl / 'download' / path) for path in directories}
+            assert after == {path: value & 0o750 for path, value in expected.items()}, after
+            # New files follow the same default ACL: 644 objects give 640.
+            files = ['source/private/deep/file', 'source/shared/file']
+            assert all(mode(source / path.removeprefix('source/')) == 0o644 for path in files)
+            after = {path: mode(acl / 'download' / path) for path in files}
+            assert after == {path: 0o640 for path in files}, after
+
+        # Without -p, a read-only marker's directory gets owner access, as a
+        # native copy gives every new directory, so a later download can still
+        # update what it holds. With -p it gets the marker's mode.
+        readonly = root / 'readonly-source'
+        (readonly / 'locked').mkdir(parents=True)
+        (readonly / 'locked/file').write_bytes(b'first')
+        (readonly / 'locked').chmod(0o555)
+        upload = [readonly, '--to', remote, '--into', prefix, '--copy-metadata=permissions']
+        c.run(upload)
+        download = {preserve: ['--from', remote, prefix + '/readonly-source', '--into',
+                               root / f'readonly-{preserve}'] for preserve in (False, True)}
+        download[True].append('--copy-metadata=permissions')
+        for preserve, expected_mode in [(False, 0o755), (True, 0o555)]:
+            c.run(download[preserve])
+            locked = root / f'readonly-{preserve}/readonly-source/locked'
+            assert mode(locked) == expected_mode, (preserve, oct(mode(locked)))
+            assert (locked / 'file').read_bytes() == b'first'
+        (readonly / 'locked').chmod(0o755)
+        (readonly / 'locked/file').write_bytes(b'second')
+        (readonly / 'locked').chmod(0o555)
+        c.run(upload)
+        c.run(download[False])
+        assert (root / 'readonly-False/readonly-source/locked/file').read_bytes() == b'second'
+        for path in (readonly, root / 'readonly-True/readonly-source'):
+            (path / 'locked').chmod(0o755)
 
         # A directory a file's download creates before its own marker's job runs
         # still receives the marker's mode. One object at a time, in mapping order.

@@ -398,8 +398,13 @@ keeps whatever old data was there, up to the file's new length. Writes through
 a hard link also affect its other names.
 Changing an existing file’s contents requires write permission; an unchanged
 read-only file can still be checked with `--hash`. New files keep owner-write
-permission until the copy succeeds and applies their final permissions; an
-interrupted copy can leave that write permission in place.
+permission until the copy succeeds and applies their final permissions. When
+the copy gives them a different group than they start with, or sets their
+ACL, they are open only to their owner until then. On macOS, a copy that sets
+the group but not the ACL leaves new files with the ACL entries they inherit
+from their directory, as those are part of their final permissions.
+An interrupted copy can leave a file owner-only, and a rerun keeps that mode
+unless it also copies permissions.
 See [Update policies](commands/cp.md#update-policies) before combining
 in-place writes with other copy policies.
 

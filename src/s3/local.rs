@@ -8,11 +8,12 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     fs::File,
     io::Read,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -545,6 +546,56 @@ impl Destination {
     }
 }
 
+/// The permission bits creating an entry allows, read once per parent
+/// directory: the parent's default ACL, which a new directory also
+/// inherits, or else the umask. Siblings share it, so one lookup serves
+/// them all; on a network filesystem that lookup is a request.
+#[derive(Default)]
+pub(super) struct CreationPermissions(HashMap<PathBuf, u32>);
+
+/// Parent directories whose permissions a download remembers before it
+/// starts over.
+const CREATION_PERMISSION_DIRECTORIES: usize = 4096;
+
+impl CreationPermissions {
+    fn remember(&mut self, parent: PathBuf, permitted: u32) {
+        if self.0.len() >= CREATION_PERMISSION_DIRECTORIES {
+            self.0.clear();
+        }
+        self.0.insert(parent, permitted);
+    }
+
+    /// For the directory `path` that this download created, open as
+    /// `directory`, which inherited its parent's default ACL.
+    fn permitted(&mut self, path: &RelativePath, directory: &File) -> Result<u32> {
+        let parent = path.to_path_buf().parent().map(Path::to_path_buf);
+        if let Some(permitted) = parent.as_ref().and_then(|parent| self.0.get(parent)) {
+            return Ok(*permitted);
+        }
+        let permitted = crate::inode_metadata::default_permissions(directory)?;
+        if let Some(parent) = parent {
+            self.remember(parent, permitted);
+        }
+        Ok(permitted)
+    }
+
+    /// For a new file at `path` beneath `root`.
+    pub(super) fn for_file(&mut self, root: &Root, path: &RelativePath) -> Result<u32> {
+        let parent = path
+            .to_path_buf()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        if let Some(permitted) = self.0.get(&parent) {
+            return Ok(*permitted);
+        }
+        let permitted = root.creation_permissions(path)?;
+        self.remember(parent, permitted);
+        Ok(permitted)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_metadata(
     root: &Root,
     path: &RelativePath,
@@ -553,6 +604,7 @@ pub(super) fn apply_metadata(
     existing_mode: Option<u32>,
     explicit: crate::mapping::Metadata,
     copied: bool,
+    creation: &mut CreationPermissions,
 ) -> Result<()> {
     if metadata.kind == super::client::ObjectKind::File && !copied {
         let flags = args.matching_meta_flags() | explicit.apply_flags();
@@ -579,6 +631,7 @@ pub(super) fn apply_metadata(
             args,
             existing_mode,
             explicit,
+            || creation.for_file(root, path),
         );
     }
     if args.owner || args.group || explicit.uid.is_some() || explicit.gid.is_some() {
@@ -596,10 +649,18 @@ pub(super) fn apply_metadata(
         } else {
             root.open_regular_read(path)?
         };
+        // Without -p, a directory this download created gets its marker's
+        // permission bits and, as a native copy gives every new directory,
+        // owner access, so that a later download can update it. Creating it
+        // limits them by the default ACL it inherited, or else by the umask,
+        // and it keeps the setgid bit it inherited.
         let mode = if args.perms || explicit.mode.is_some() {
             metadata.mode
+        } else if let Some(existing) = existing_mode {
+            existing
         } else {
-            existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
+            let permitted = creation.permitted(path, &file)?;
+            ((metadata.mode | 0o700) & permitted & 0o777) | (file.metadata()?.mode() & 0o2000)
         };
         crate::fsops::set_mode_handle(&file, mode)?;
     }
@@ -622,19 +683,25 @@ pub(super) fn apply_metadata(
 }
 
 // Use the file we wrote, so replacement of a temporary pathname cannot redirect
-// chmod, chown or timestamp restoration to a different inode.
+// chmod, chown or timestamp restoration to a different inode. Without -p, a new
+// file gets its object's permission bits limited as creating it would limit
+// them, by the bits `permitted` returns: its directory's default ACL, or else
+// the umask.
 pub(super) fn apply_file_metadata(
     file: &File,
     metadata: &Metadata,
     args: &Args,
     existing_mode: Option<u32>,
     explicit: crate::mapping::Metadata,
+    permitted: impl FnOnce() -> Result<u32>,
 ) -> Result<()> {
     use crate::proto::{flags, Meta};
     let mode = if args.perms || explicit.mode.is_some() {
         metadata.mode
+    } else if let Some(existing) = existing_mode {
+        existing
     } else {
-        existing_mode.unwrap_or(metadata.mode & 0o777 & !crate::fsops::process_umask())
+        metadata.mode & 0o777 & permitted()?
     };
     crate::fsops::set_meta_file(
         file,

@@ -1093,6 +1093,7 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     let mut included_prepare = prepare(included);
     authority.authorize(&mut included_prepare, false).unwrap();
@@ -1175,6 +1176,7 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     let mut cache_root = prepare(cache.clone());
     authority.authorize(&mut cache_root, false).unwrap();
@@ -1208,6 +1210,7 @@ fn signed_inplace_policy_requires_inplace_file_mutations() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     let mut inplace = prepare(true);
     authority.authorize(&mut inplace, false).unwrap();
@@ -1278,6 +1281,7 @@ fn prepare_request(path: &Path) -> Request {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     }
 }
 
@@ -3094,6 +3098,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     let settlement = authority.authorize(&mut prepare, false).unwrap();
     fs::write(&image, b"half").unwrap();
@@ -3148,6 +3153,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     let settlement = finished.authorize(&mut prepare, false).unwrap();
     finished.settle(settlement, &proto::Response::Ok);
@@ -3223,6 +3229,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             attempt: 0,
             create_if_missing: true,
             guard: None,
+            group: None,
         });
         assert!(
             matches!(prepared, proto::Response::Prepared(_)),
@@ -3957,6 +3964,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     authority.authorize(&mut prepare, false).unwrap();
 
@@ -4327,6 +4335,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         attempt: 0,
         create_if_missing: true,
         guard: None,
+        group: None,
     };
     authority.authorize(&mut prepare("a", 10), false).unwrap();
     // A second file would take the aggregate past the ceiling.
@@ -6539,6 +6548,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 attempt: 0,
                 create_if_missing: true,
                 guard: None,
+                group: None,
             });
             receiver.send(Request::WriteRange {
                 path: path(name),
@@ -6689,6 +6699,7 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 attempt: 0,
                 create_if_missing: true,
                 guard: None,
+                group: None,
             });
             receiver.send(Request::WriteRange {
                 path: path("large"),
@@ -6747,6 +6758,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             attempt: 0,
             create_if_missing: true,
             guard: None,
+            group: None,
         });
         receiver.send(Request::WriteRange {
             path: path.clone(),
@@ -6831,6 +6843,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             attempt: 0,
             create_if_missing: true,
             guard: None,
+            group: None,
         });
         receiver.send(Request::WriteRange {
             path: path.clone(),
