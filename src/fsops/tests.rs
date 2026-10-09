@@ -4886,7 +4886,6 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         &meta,
         flags::MODE | flags::TIMES,
         TargetCondition::Any,
-        None,
     )
     .unwrap();
     let before = fs::symlink_metadata(&dir).unwrap();
@@ -4898,7 +4897,6 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         &meta,
         flags::MODE | flags::TIMES,
         TargetCondition::Any,
-        None,
     )
     .unwrap();
     let after = fs::symlink_metadata(&dir).unwrap();

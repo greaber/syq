@@ -543,7 +543,6 @@ impl FsOps {
         if current.len() != len {
             return Ok(None);
         }
-        self.require_owned(&current, meta, flags, &target.label)?;
         // Held open since it was compared, the file is checked by name.
         if scope_names::changes_metadata(&current, meta, flags) {
             self.require_names_inside(target, file, Some(current.nlink()))?;

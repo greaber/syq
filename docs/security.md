@@ -244,10 +244,9 @@ HostA cannot:
 
 - Change the signed destination scope to write into `/etc` or an SSH
   configuration directory.
-- Overwrite existing files, or change their permissions, owner or other
-  metadata, when the grant permits only creating new ones, or delete files
-  without permission. Hard links can then give an existing file new names in
-  the scope, but nothing more.
+- Overwrite existing files, change their permissions, owner or other
+  metadata, or give them new names with hard links, when the grant permits
+  only creating new ones, or delete files without permission.
 - Change in place a file that also has names outside the scope.
 - Exceed the signed byte, entry, or deletion limits.
 - Reuse the grant for another copy or use the restricted key to run a shell.

@@ -1244,22 +1244,6 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }
 
-/// Authorize `request` and carry it out as the restricted receiver does,
-/// with the authority's record of the objects it created.
-fn execute(authority: &RestrictedAuthority, mut request: Request) -> Result<proto::Response> {
-    let settlement = authority.authorize(&mut request, false)?;
-    let mut ops = crate::fsops::FsOps::new();
-    ops.set_owned_objects(authority.owned_objects());
-    let response = ops.handle(&request);
-    authority.settle(settlement, &response);
-    Ok(response)
-}
-
-/// Whether every operation of an executed `Apply` succeeded.
-fn all_applied(response: &proto::Response) -> bool {
-    matches!(response, proto::Response::Applied(errors) if errors.iter().all(Option::is_none))
-}
-
 fn plain_meta() -> proto::Meta {
     proto::Meta {
         inode_metadata: None,
@@ -1381,53 +1365,33 @@ fn set_meta(path: &Path) -> Op {
     }
 }
 
-/// A mode change to `path`, which a grant copying permissions authorizes.
-fn mode_change(path: &Path) -> Op {
-    Op::SetMeta {
-        path: path_bytes(path),
-        meta: proto::Meta {
-            mode: 0o40777,
-            ..plain_meta()
-        },
-        flags: proto::flags::MODE,
-        condition: proto::TargetCondition::Any,
-    }
-}
-
 #[test]
 fn signed_only_new_rejects_existing_directory_mutation() {
-    use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let dir = root.join("target/dir");
     let new_dir = root.join("target/new-dir");
     fs::create_dir_all(&dir).unwrap();
-    let mut authority = existence_authority(
+    let authority = existence_authority(
         &root,
         ExistingDestinationPolicy::Skip,
         DestinationPlacement::ExactPath,
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.options.preserve_permissions = true;
-    authority.copy.options.receiver_managed_modes = false;
     let mut existing = apply(mkdir(&dir));
     authority.authorize(&mut existing, false).unwrap();
     assert_eq!(op_condition(&existing), proto::TargetCondition::Absent);
-    // The existing directory's metadata is not changed; a new one's is.
-    let before = fs::metadata(&dir).unwrap();
-    assert!(!all_applied(
-        &execute(&authority, apply(mode_change(&dir))).unwrap()
-    ));
-    assert_eq!(fs::metadata(&dir).unwrap().mode(), before.mode());
-    assert!(all_applied(
-        &execute(&authority, apply(mkdir(&new_dir))).unwrap()
-    ));
-    assert!(all_applied(
-        &execute(&authority, apply(mode_change(&new_dir))).unwrap()
-    ));
-    assert_eq!(fs::metadata(&new_dir).unwrap().mode() & 0o7777, 0o777);
-    let _ = MetadataExt::ino(&before);
+    assert!(authority
+        .authorize(&mut apply(set_meta(&dir)), false)
+        .is_err());
+    let mut create = apply(mkdir(&new_dir));
+    let settlement = authority.authorize(&mut create, false).unwrap();
+    assert_eq!(op_condition(&create), proto::TargetCondition::Absent);
+    authority.settle(settlement, &proto::Response::Applied(vec![None]));
+    authority
+        .authorize(&mut apply(set_meta(&new_dir)), false)
+        .unwrap();
 }
 
 #[test]
@@ -1468,15 +1432,13 @@ fn signed_skip_directory_race_preserves_metadata_and_allows_siblings() {
         fs::create_dir_all(&target).unwrap();
         let raced = target.join("raced");
         let sibling = target.join("sibling");
-        let mut authority = existence_authority(
+        let authority = existence_authority(
             &root,
             ExistingDestinationPolicy::Skip,
             DestinationPlacement::ExactPath,
             RootExistence::Any,
         )
         .unwrap();
-        authority.copy.options.preserve_permissions = true;
-        authority.copy.options.receiver_managed_modes = false;
         let create_foreign = || {
             fs::create_dir(&raced).unwrap();
             fs::set_permissions(&raced, fs::Permissions::from_mode(0o555)).unwrap();
@@ -1496,9 +1458,7 @@ fn signed_skip_directory_race_preserves_metadata_and_allows_siblings() {
         let Request::Apply { ops, guard } = &batch else {
             unreachable!()
         };
-        let mut executor = crate::fsops::FsOps::new();
-        executor.set_owned_objects(authority.owned_objects());
-        let results = executor.apply(ops, guard.as_ref());
+        let results = crate::fsops::FsOps::new().apply(ops, guard.as_ref());
         assert!(results[0].is_some());
         assert!(results[1].is_none(), "{results:?}");
         authority.settle(settlement, &proto::Response::Applied(results));
@@ -1509,15 +1469,12 @@ fn signed_skip_directory_race_preserves_metadata_and_allows_siblings() {
             (after.mtime(), after.mtime_nsec()),
             (before.mtime(), before.mtime_nsec())
         );
-        // The raced directory existed before its creation ran: its metadata
-        // is not changed, while the sibling's is.
-        assert!(!all_applied(
-            &execute(&authority, apply(mode_change(&raced))).unwrap()
-        ));
-        assert_eq!(fs::metadata(&raced).unwrap().mode(), before.mode());
-        assert!(all_applied(
-            &execute(&authority, apply(mode_change(&sibling))).unwrap()
-        ));
+        assert!(authority
+            .authorize(&mut apply(set_meta(&raced)), false)
+            .is_err());
+        authority
+            .authorize(&mut apply(set_meta(&sibling)), false)
+            .unwrap();
         fs::set_permissions(&raced, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
@@ -1658,10 +1615,9 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                     matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_some))
                 );
                 assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
-                // A mapping parent's metadata becomes the receiver's choice,
-                // which leaves an existing directory as it is.
-                execute(&authority, apply(mode_change(&parent))).unwrap();
-                assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
+                assert!(authority
+                    .authorize(&mut apply(set_meta(&parent)), false)
+                    .is_err());
             } else {
                 assert!(
                     matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
@@ -2075,15 +2031,13 @@ fn signed_skip_policy_retains_preexisting_objects() {
     let link = target.join("link");
     fs::create_dir_all(&dir).unwrap();
     fs::write(&kept, b"old").unwrap();
-    let mut authority = existence_authority(
+    let authority = existence_authority(
         &root,
         ExistingDestinationPolicy::Skip,
         DestinationPlacement::ExactPath,
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.options.preserve_permissions = true;
-    authority.copy.options.receiver_managed_modes = false;
 
     // New files are staged and published without replacing anything;
     // staging for a pre-existing object fails before bytes move.
@@ -2134,62 +2088,30 @@ fn signed_skip_policy_retains_preexisting_objects() {
     authority.settle(settlement, &proto::Response::Applied(vec![None]));
     let mut meta_link = apply(set_meta(&link));
     authority.authorize(&mut meta_link, false).unwrap();
-    // Pre-existing objects never take a metadata change, which the
-    // receiver checks on the object it opens to make it.
-    let mut ops = crate::fsops::FsOps::new();
-    ops.set_owned_objects(authority.owned_objects());
-    let mut run = |mut request: Request| {
-        let settlement = authority.authorize(&mut request, false).unwrap();
-        let response = ops.handle(&request);
-        authority.settle(settlement, &response);
-        response
-    };
-    let (dir_before, kept_before) = (fs::metadata(&dir).unwrap(), fs::metadata(&kept).unwrap());
-    let mut changed = plain_meta();
-    changed.mode = 0o100666;
-    for request in [
-        apply(mode_change(&dir)),
-        apply(mode_change(&kept)),
-        apply(Op::SetFileMetaIfSame {
-            path: path_bytes(&kept),
-            condition: Any,
-            meta: changed.clone(),
-            flags: proto::flags::MODE,
-        }),
-    ] {
-        assert!(!all_applied(&run(request)));
-    }
-    let block = authority.copy.limits.hash_block_bytes;
-    run(Request::HashAndHold {
-        off: 0,
+    let mut meta_dir = apply(set_meta(&dir));
+    assert!(authority.authorize(&mut meta_dir, false).is_err());
+    let mut meta_kept = apply(set_meta(&kept));
+    assert!(authority.authorize(&mut meta_kept, false).is_err());
+    let mut same_kept = apply(Op::SetFileMetaIfSame {
         path: path_bytes(&kept),
-        copy_id: [1; 16],
-        block,
-        len: 3,
         condition: Any,
-        guard: None,
+        meta: plain_meta(),
+        flags: 0,
     });
-    let finished = run(Request::FinishBasis {
-        expected_hash: None,
-        path: path_bytes(&kept),
-        copy_id: [1; 16],
-        meta: changed,
-        flags: proto::flags::MODE,
-        condition: Any,
-        guard: None,
-    });
-    assert!(
-        matches!(
-            finished,
-            proto::Response::Err(_) | proto::Response::EndpointError(_)
-        ),
-        "{finished:?}"
-    );
-    assert_eq!(fs::metadata(&dir).unwrap().mode(), dir_before.mode());
-    assert_eq!(fs::metadata(&kept).unwrap().mode(), kept_before.mode());
+    assert!(authority.authorize(&mut same_kept, false).is_err());
 
     // Content repair of a pre-existing file is refused; deletion remains
     // governed by the separately signed deletion policy.
+    let mut finish = Request::FinishBasis {
+        expected_hash: None,
+        path: path_bytes(&kept),
+        copy_id: [1; 16],
+        meta: plain_meta(),
+        flags: 0,
+        condition: Any,
+        guard: None,
+    };
+    assert!(authority.authorize(&mut finish, false).is_err());
     let mut seed = Request::SeedBasis {
         final_ranges: None,
         path: path_bytes(&kept),
@@ -7061,10 +6983,42 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
     assert_eq!(ordinary, [(0o750, group), (0o755 & !umask, group)]);
 }
 
-/// A grant that keeps existing objects, copies hard links and may delete,
-/// over a directory holding `kept`, a file that existed before the copy
-/// with mode 0600.
-fn keeping_link_authority(root: &Path) -> RestrictedAuthority {
+/// Authorize `request` and carry it out as the restricted receiver does,
+/// with the authority's record of the files it created.
+fn execute(authority: &RestrictedAuthority, mut request: Request) -> Result<proto::Response> {
+    let settlement = authority.authorize(&mut request, false)?;
+    let mut ops = crate::fsops::FsOps::new();
+    ops.set_owned_objects(authority.owned_objects());
+    let response = ops.handle(&request);
+    authority.settle(settlement, &response);
+    Ok(response)
+}
+
+/// The result of each operation of an executed `Apply`.
+fn applied(response: &proto::Response) -> &[Option<crate::proto::WireError>] {
+    let proto::Response::Applied(results) = response else {
+        panic!("{response:?}")
+    };
+    results
+}
+
+/// Whether every operation of an executed `Apply` succeeded.
+fn all_applied(response: &proto::Response) -> bool {
+    applied(response).iter().all(Option::is_none)
+}
+
+/// Whether `result` is the refusal of a hard link to a file this copy did
+/// not create.
+fn refused_link(result: &Option<crate::proto::WireError>) -> bool {
+    result
+        .as_ref()
+        .is_some_and(|error| error.as_str().contains("a file this copy did not create"))
+}
+
+/// A grant under `existing` that copies hard links and permissions and may
+/// delete, over a directory holding `kept`, a file that existed before the
+/// copy with mode 0600.
+fn link_authority(root: &Path, existing: ExistingDestinationPolicy) -> RestrictedAuthority {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(root.join("target")).unwrap();
     fs::write(root.join("target/kept"), b"kept").unwrap();
@@ -7076,7 +7030,7 @@ fn keeping_link_authority(root: &Path) -> RestrictedAuthority {
         0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
-        ExistingDestinationPolicy::Skip,
+        existing,
         DestinationPlacement::DirectoryContents,
         RootExistence::Any,
     )
@@ -7088,16 +7042,25 @@ fn keeping_link_authority(root: &Path) -> RestrictedAuthority {
     authority
 }
 
-fn link_to_kept(root: &Path, name: &str) -> Op {
+fn keeping_link_authority(root: &Path) -> RestrictedAuthority {
+    link_authority(root, ExistingDestinationPolicy::Skip)
+}
+
+/// A hard link at `name` to the file at `source`, both in the target.
+fn link_to(root: &Path, name: &str, source: &str) -> Op {
     use std::os::unix::fs::MetadataExt;
-    let kept = fs::metadata(root.join("target/kept")).unwrap();
+    let file = fs::metadata(root.join("target").join(source)).unwrap();
     Op::Hardlink {
         path: path_bytes(&root.join("target").join(name)),
-        source: path_bytes(&root.join("target/kept")),
-        dev: kept.dev(),
-        ino: kept.ino(),
+        source: path_bytes(&root.join("target").join(source)),
+        dev: file.dev(),
+        ino: file.ino(),
         condition: proto::TargetCondition::Any,
     }
+}
+
+fn link_to_kept(root: &Path, name: &str) -> Op {
+    link_to(root, name, "kept")
 }
 
 fn make_world_writable(root: &Path, name: &str) -> Op {
@@ -7112,154 +7075,146 @@ fn make_world_writable(root: &Path, name: &str) -> Op {
     }
 }
 
-fn kept_mode(root: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    fs::metadata(root.join("target/kept"))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o7777
+/// The kept file's mode and link count.
+fn kept_state(root: &Path) -> (u32, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let kept = fs::metadata(root.join("target/kept")).unwrap();
+    (kept.mode() & 0o7777, kept.nlink())
 }
 
-/// Keeping existing files, a link gives an existing file a new name and
-/// nothing more: a change through that name, in the same request or a
-/// later one, is refused on the object it opens, and a link never replaces
-/// a name the grant created.
+/// A symlink at `name` that the grant creates.
+fn create_symlink(authority: &RestrictedAuthority, root: &Path, name: &str) {
+    let response = execute(
+        authority,
+        apply(Op::Symlink {
+            path: path_bytes(&root.join("target").join(name)),
+            target: b"kept".to_vec(),
+            condition: proto::TargetCondition::Absent,
+        }),
+    )
+    .unwrap();
+    assert!(all_applied(&response), "{response:?}");
+}
+
+/// Keeping existing files, a hard link gives a new name only to a file the
+/// copy created: one to an existing file is refused as it is made, while a
+/// group's new names can share a file the copy wrote.
 #[test]
-fn hard_links_never_make_an_existing_file_the_grants_own() {
+fn keeping_existing_files_links_only_to_files_the_copy_created() {
+    use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let authority = keeping_link_authority(&root);
-    let request = |ops| Request::Apply { ops, guard: None };
+    let response = execute(&authority, apply(link_to_kept(&root, "new"))).unwrap();
+    assert!(refused_link(&applied(&response)[0]), "{response:?}");
+    assert!(fs::symlink_metadata(root.join("target/new")).is_err());
+    assert_eq!(kept_state(&root), (0o600, 1));
 
-    // In one request: link a new name, then change the file through it.
-    let response = execute(
-        &authority,
-        request(vec![
-            link_to_kept(&root, "new"),
-            make_world_writable(&root, "new"),
-        ]),
-    )
-    .unwrap();
-    let proto::Response::Applied(results) = &response else {
-        panic!("{response:?}")
-    };
-    assert!(results[0].is_none(), "{results:?}");
-    assert!(results[1].is_some(), "{results:?}");
-    // Later, through the name the link made.
-    assert!(!all_applied(
-        &execute(&authority, request(vec![make_world_writable(&root, "new")])).unwrap()
-    ));
-    assert_eq!(kept_mode(&root), 0o600);
+    let mine = root.join("target/mine");
+    let mut ops = crate::fsops::FsOps::new();
+    ops.set_owned_objects(authority.owned_objects());
+    let mut put = small_put(&mine);
+    let settlement = authority.authorize(&mut put, false).unwrap();
+    let response = ops.handle(&put);
+    authority.settle(settlement, &response);
+    assert_eq!(fs::read(&mine).unwrap(), b"new", "{response:?}");
+    let response = execute(&authority, apply(link_to(&root, "also", "mine"))).unwrap();
+    assert!(all_applied(&response), "{response:?}");
+    assert_eq!(
+        fs::metadata(root.join("target/also")).unwrap().ino(),
+        fs::metadata(&mine).unwrap().ino()
+    );
+}
 
-    // A link onto a name this grant created replaces nothing.
-    assert!(all_applied(
-        &execute(
-            &authority,
-            request(vec![Op::Symlink {
-                path: path_bytes(&root.join("target/mine")),
-                target: b"kept".to_vec(),
-                condition: proto::TargetCondition::Any,
-            }]),
-        )
-        .unwrap()
-    ));
-    assert!(!all_applied(
-        &execute(&authority, request(vec![link_to_kept(&root, "mine")])).unwrap()
-    ));
-    assert!(fs::symlink_metadata(root.join("target/mine"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
-    assert_eq!(kept_mode(&root), 0o600);
+/// A link onto an existing file is an ordinary copy's step under a grant
+/// that may replace existing files, and refused only under one that keeps
+/// them.
+#[test]
+fn a_link_to_an_existing_file_is_refused_only_when_keeping_existing_files() {
+    use std::os::unix::fs::MetadataExt;
+    for existing in [
+        ExistingDestinationPolicy::Skip,
+        ExistingDestinationPolicy::Replace,
+    ] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let authority = link_authority(&root, existing);
+        let response = execute(&authority, apply(link_to_kept(&root, "new"))).unwrap();
+        if existing == ExistingDestinationPolicy::Skip {
+            assert!(refused_link(&applied(&response)[0]), "{response:?}");
+            assert_eq!(kept_state(&root), (0o600, 1));
+        } else {
+            assert!(all_applied(&response), "{response:?}");
+            assert_eq!(kept_state(&root), (0o600, 2));
+            assert_eq!(
+                fs::metadata(root.join("target/new")).unwrap().ino(),
+                fs::metadata(root.join("target/kept")).unwrap().ino()
+            );
+        }
+    }
 }
 
 /// Keeping existing files, a request on one connection approved to change a
 /// name this grant created cannot be turned onto an existing file by another
-/// connection: not by linking the name to it, which replaces nothing, nor by
-/// deleting the name and then linking it, since the change is refused on the
-/// object it opens.
+/// connection linking the name to it, whether or not it deletes the name
+/// first: the link is refused.
 #[test]
 fn another_connections_relink_does_not_redirect_an_approved_change() {
     for delete_first in [false, true] {
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path().join("root");
         let authority = keeping_link_authority(&root);
-        let request = |ops| Request::Apply { ops, guard: None };
-        let mine = root.join("target/mine");
-        assert!(all_applied(
-            &execute(
-                &authority,
-                request(vec![Op::Symlink {
-                    path: path_bytes(&mine),
-                    target: b"kept".to_vec(),
-                    condition: proto::TargetCondition::Absent,
-                }]),
-            )
-            .unwrap()
-        ));
+        create_symlink(&authority, &root, "mine");
         // Connection 2 is approved to change `mine` and has not run.
-        let mut change = request(vec![make_world_writable(&root, "mine")]);
+        let mut change = apply(make_world_writable(&root, "mine"));
         let pending = authority.authorize(&mut change, false).unwrap();
         // Connection 1 links `mine` to the kept file, deleting it first.
         if delete_first {
-            assert!(all_applied(
-                &execute(
-                    &authority,
-                    request(vec![Op::Unlink {
-                        path: path_bytes(&mine),
-                    }]),
-                )
-                .unwrap()
-            ));
+            let unlink = Op::Unlink {
+                path: path_bytes(&root.join("target/mine")),
+            };
+            assert!(all_applied(&execute(&authority, apply(unlink)).unwrap()));
         }
-        let linked =
-            all_applied(&execute(&authority, request(vec![link_to_kept(&root, "mine")])).unwrap());
-        assert_eq!(linked, delete_first);
+        let response = execute(&authority, apply(link_to_kept(&root, "mine"))).unwrap();
+        assert!(refused_link(&applied(&response)[0]), "{response:?}");
         // Connection 2's change then runs.
         let mut ops = crate::fsops::FsOps::new();
         ops.set_owned_objects(authority.owned_objects());
         let response = ops.handle(&change);
         authority.settle(pending, &response);
-        assert!(!delete_first || !all_applied(&response), "{response:?}");
-        assert_eq!(kept_mode(&root), 0o600, "delete_first={delete_first}");
+        assert_eq!(kept_state(&root), (0o600, 1), "delete_first={delete_first}");
     }
 }
 
-/// Keeping existing files, one request that deletes a name this grant
-/// created, links it to an existing file and then changes it does not
-/// change the existing file.
+/// Keeping existing files, one request that creates a name, changes it, and
+/// deletes and links it to an existing file does not change that file,
+/// although the executor makes the link before the change: the link is
+/// refused.
 #[test]
-fn a_relink_earlier_in_a_request_does_not_redirect_its_change() {
+fn a_relink_in_the_same_request_does_not_redirect_its_change() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let authority = keeping_link_authority(&root);
-    let request = |ops| Request::Apply { ops, guard: None };
-    let mine = root.join("target/mine");
-    assert!(all_applied(
-        &execute(
-            &authority,
-            request(vec![Op::Symlink {
-                path: path_bytes(&mine),
-                target: b"kept".to_vec(),
-                condition: proto::TargetCondition::Absent,
-            }]),
-        )
-        .unwrap()
-    ));
+    let mine = path_bytes(&root.join("target/mine"));
     let response = execute(
         &authority,
-        request(vec![
-            Op::Unlink {
-                path: path_bytes(&mine),
-            },
-            link_to_kept(&root, "mine"),
-            make_world_writable(&root, "mine"),
-        ]),
+        Request::Apply {
+            ops: vec![
+                Op::Symlink {
+                    path: mine.clone(),
+                    target: b"kept".to_vec(),
+                    condition: proto::TargetCondition::Absent,
+                },
+                make_world_writable(&root, "mine"),
+                Op::Unlink { path: mine },
+                link_to_kept(&root, "mine"),
+            ],
+            guard: None,
+        },
     )
     .unwrap();
-    assert!(!all_applied(&response), "{response:?}");
-    assert_eq!(kept_mode(&root), 0o600);
+    assert!(refused_link(&applied(&response)[3]), "{response:?}");
+    assert_eq!(kept_state(&root), (0o600, 1));
 }
 
 /// Keeping existing files, no content reaches an existing file: a staged
@@ -7443,58 +7398,4 @@ fn a_create_only_in_place_retry_is_refused_with_the_way_to_finish() {
         );
         assert_eq!(fs::read(&target).unwrap(), b"first");
     }
-}
-
-/// Keeping existing objects, the receiver changes what it created through
-/// the descriptor it checked: a new directory's and symlink's times and a
-/// new directory's mode, as a copy's final metadata sets them.
-#[test]
-fn created_objects_take_their_metadata_through_their_descriptor() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path().join("root");
-    let mut authority = keeping_link_authority(&root);
-    authority.copy.options.preserve_times = true;
-    authority.copy.options.preserve_symlinks = true;
-    let request = |ops| Request::Apply { ops, guard: None };
-    let directory = root.join("target/new-dir");
-    let link = root.join("target/new-link");
-    assert!(all_applied(
-        &execute(
-            &authority,
-            request(vec![
-                Op::Mkdir {
-                    path: path_bytes(&directory),
-                    mode: 0o755,
-                    condition: proto::TargetCondition::Any,
-                },
-                Op::Symlink {
-                    path: path_bytes(&link),
-                    target: b"kept".to_vec(),
-                    condition: proto::TargetCondition::Any,
-                },
-            ]),
-        )
-        .unwrap()
-    ));
-    let times = |path: &Path, mode: u32| Op::SetMeta {
-        path: path_bytes(path),
-        meta: proto::Meta {
-            mode,
-            mtime: 1_500_000_000,
-            ..plain_meta()
-        },
-        flags: proto::flags::TIMES | proto::flags::MODE,
-        condition: proto::TargetCondition::Any,
-    };
-    let response = execute(
-        &authority,
-        request(vec![times(&directory, 0o40750), times(&link, 0o120777)]),
-    )
-    .unwrap();
-    assert!(all_applied(&response), "{response:?}");
-    let directory = fs::metadata(&directory).unwrap();
-    assert_eq!(directory.mtime(), 1_500_000_000);
-    assert_eq!(directory.permissions().mode() & 0o7777, 0o750);
-    assert_eq!(fs::symlink_metadata(&link).unwrap().mtime(), 1_500_000_000);
 }

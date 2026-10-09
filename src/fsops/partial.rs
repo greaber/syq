@@ -869,7 +869,6 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
-        self.require_owned(&held.file.metadata()?, meta, flags, &held.label)?;
         if self.scope_names.is_some() {
             let current = held.file.metadata()?;
             if scope_names::changes_metadata(&current, meta, flags) {
@@ -2844,7 +2843,6 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
-            self.require_owned(&current, meta, flags, &target.label)?;
             self.require_names_inside(
                 target,
                 &file,

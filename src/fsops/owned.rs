@@ -1,16 +1,25 @@
-//! Under a grant that keeps existing objects, a restricted receiver changes
-//! the metadata only of objects it created for that grant. It records each
-//! object it creates by device and inode, read from the object it just
-//! created, and checks a later change against the identity of the very
-//! descriptor the change goes through. Names never confer ownership: a name
-//! this grant created may since lead to an existing file, linked there, and
-//! no check of a name before the change can rule that out.
+//! A grant that keeps existing objects lets a restricted receiver replace a
+//! file or change metadata only at a name this grant created. The one step
+//! that could bring an existing file under such a name is a hard link to
+//! it, so under such a grant a hard link may give a new name only to a file
+//! this receiver created for the grant. The receiver records those files
+//! here by device and inode, read from the file it just created or
+//! published.
 //!
-//! An existing object's inode is in use for as long as the object exists,
-//! so its number cannot be given to another object while the copy runs.
-//! Only objects this grant created can leave numbers to reuse, so a number
-//! in this record names, at worst, a newer object, never one the grant
-//! keeps.
+//! Checking the link's identity before linking needs no lock held across
+//! the link. The publication links only the file with that identity: on
+//! Linux through the descriptor it opened and checked, elsewhere checking
+//! the new link before publishing it. Nor can any other step such a grant
+//! permits make a name lead to an existing file: the names of existing
+//! objects are never replaced, existing objects are never renamed, and
+//! every link leads to a recorded file. A name this grant created therefore
+//! leads only to an object it created whenever a change through it runs,
+//! so changes run exactly as on any receiver.
+//!
+//! An existing file's inode is in use for as long as the file exists, so its
+//! number cannot be given to another file while the copy runs. Only files
+//! this grant created can leave numbers to reuse, so a number in this
+//! record names, at worst, a newer file, never one the grant keeps.
 
 use super::*;
 use std::collections::HashSet;
@@ -19,70 +28,32 @@ use std::collections::HashSet;
 pub(crate) struct OwnedObjects(Mutex<HashSet<(u64, u64)>>);
 
 impl OwnedObjects {
-    /// Remember the object `created` describes, which this receiver created.
+    /// Remember the file `created` describes, which this receiver created.
     pub(crate) fn record(&self, created: &fs::Metadata) {
-        self.record_identity(created.dev(), created.ino());
-    }
-
-    /// Remember the object `(dev, ino)`, which this receiver created.
-    pub(crate) fn record_identity(&self, dev: u64, ino: u64) {
-        self.0.lock().unwrap().insert((dev, ino));
-    }
-
-    /// Refuse a metadata change to the object open as `opened` (`label`
-    /// names it) unless this receiver created it for this grant.
-    pub(crate) fn require(&self, opened: &fs::Metadata, label: &Path) -> Result<()> {
-        if self
-            .0
+        self.0
             .lock()
             .unwrap()
-            .contains(&(opened.dev(), opened.ino()))
-        {
+            .insert((created.dev(), created.ino()));
+    }
+
+    /// Refuse the hard link `label` to the file `identity` unless this
+    /// receiver created that file for this grant.
+    pub(crate) fn require_link(&self, identity: (u64, u64), label: &Path) -> Result<()> {
+        if self.0.lock().unwrap().contains(&identity) {
             return Ok(());
         }
         bail!(
-            "{} existed before this copy, which keeps existing objects: its metadata is not changed",
+            "hard link {} would give a new name to a file this copy did not create, \
+             and it keeps existing files",
             label.display()
         )
     }
 }
 
 impl FsOps {
-    /// Change the metadata only of objects this receiver created, as a grant
-    /// that keeps existing objects requires.
+    /// Give new names by hard link only to the files recorded in `owned`,
+    /// as a grant that keeps existing objects requires.
     pub(crate) fn set_owned_objects(&mut self, owned: Option<Arc<OwnedObjects>>) {
         self.owned = owned;
     }
-
-    /// Refuse to change the metadata of the object open as `opened` (`label`
-    /// names it) to `meta` under `flags` unless this receiver created it, or
-    /// the change would change nothing.
-    pub(super) fn require_owned(
-        &self,
-        opened: &fs::Metadata,
-        meta: &Meta,
-        flags: u8,
-        label: &Path,
-    ) -> Result<()> {
-        match &self.owned {
-            Some(owned) if changes_metadata(opened, meta, flags) => owned.require(opened, label),
-            _ => Ok(()),
-        }
-    }
-}
-
-/// Whether applying `meta` under `flags` would change the object `current`
-/// describes, as the metadata step changes only what differs. An owner
-/// change by a receiver that is not root is skipped unless required.
-pub(super) fn changes_metadata(current: &fs::Metadata, meta: &Meta, flags: u8) -> bool {
-    meta.inode_metadata.is_some()
-        || (flags & flags::MODE != 0
-            && !current.file_type().is_symlink()
-            && current.mode() & 0o7777 != meta.mode & 0o7777)
-        || (flags & flags::OWNER != 0
-            && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
-            && current.uid() != meta.uid)
-        || (flags & flags::GROUP != 0 && current.gid() != meta.gid)
-        || (flags & flags::TIMES != 0
-            && (current.mtime() != meta.mtime || current.mtime_nsec() as u32 != meta.mtime_nsec))
 }

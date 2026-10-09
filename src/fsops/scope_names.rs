@@ -415,7 +415,21 @@ pub(super) fn require_names_inside(
     )
 }
 
-pub(super) use super::owned::changes_metadata;
+/// Whether applying `meta` under `flags` would change the file `current`
+/// describes, as the metadata step changes only what differs. An owner
+/// change by a receiver that is not root is skipped unless required.
+pub(super) fn changes_metadata(current: &fs::Metadata, meta: &Meta, flags: u8) -> bool {
+    meta.inode_metadata.is_some()
+        || (flags & flags::MODE != 0
+            && !current.file_type().is_symlink()
+            && current.mode() & 0o7777 != meta.mode & 0o7777)
+        || (flags & flags::OWNER != 0
+            && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
+            && current.uid() != meta.uid)
+        || (flags & flags::GROUP != 0 && current.gid() != meta.gid)
+        || (flags & flags::TIMES != 0
+            && (current.mtime() != meta.mtime || current.mtime_nsec() as u32 != meta.mtime_nsec))
+}
 
 #[cfg(test)]
 mod tests {
