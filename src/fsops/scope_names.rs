@@ -309,8 +309,9 @@ fn distinct_names(names: &BTreeSet<Vec<u8>>, folding: crate::sys::NameFolding) -
 /// itself; ignoring how Unicode composes characters (APFS), its canonical
 /// decomposition, so a Kelvin sign is `K`; folding case, or unknown, a
 /// compatibility decomposition folded through lower, upper and lower case
-/// (so `ß` is `ss`), without trailing dots and spaces, which some
-/// filesystems ignore.
+/// (so `ß` is `ss`), without the characters some filesystems skip: the
+/// invisible ones Unicode lets text ignore (HFS+ skips zero-width joiners
+/// and the byte-order mark), and trailing dots and spaces.
 fn name_key(name: &[u8], folding: crate::sys::NameFolding) -> Vec<u8> {
     use crate::sys::NameFolding;
     use icu_normalizer::DecomposingNormalizerBorrowed as Normalizer;
@@ -330,13 +331,41 @@ fn name_key(name: &[u8], folding: crate::sys::NameFolding) -> Vec<u8> {
                 .to_lowercase()
                 .to_uppercase()
                 .to_lowercase();
-            compatible
+            let visible: String = compatible
                 .normalize(&folded)
-                .trim_end_matches(['.', ' '])
-                .as_bytes()
-                .to_vec()
+                .chars()
+                .filter(|&character| !default_ignorable(character))
+                .collect();
+            visible.trim_end_matches(['.', ' ']).as_bytes().to_vec()
         }
     }
+}
+
+/// Whether Unicode lets text ignore `character` (its
+/// `Default_Ignorable_Code_Point` property): invisible formatting characters
+/// such as zero-width joiners, the byte-order mark and variation selectors.
+/// HFS+ skips some of them when it compares names.
+fn default_ignorable(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x00AD
+            | 0x034F
+            | 0x061C
+            | 0x115F..=0x1160
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x3164
+            | 0xFE00..=0xFE0F
+            | 0xFEFF
+            | 0xFFA0
+            | 0xFFF0..=0xFFF8
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0000..=0xE0FFF
+    )
 }
 
 impl FsOps {
@@ -765,10 +794,54 @@ mod tests {
         assert!(t.check("scope/a").is_err());
     }
 
+    /// Where the filesystem itself makes two spellings one entry (HFS+
+    /// skips zero-width joiners and the byte-order mark; APFS and HFS+ fold
+    /// case and composition), approving both spellings does not confirm an
+    /// unapproved link beside them. Spellings this directory keeps apart
+    /// are not checked.
+    #[test]
+    fn spellings_the_filesystem_makes_one_do_not_confirm_another_name() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let mut checked = Vec::new();
+        for (index, (first, second)) in [
+            ("ab", "a\u{200b}b"),
+            ("ab", "a\u{200c}b"),
+            ("ab", "a\u{200d}b"),
+            ("ab", "a\u{feff}b"),
+            ("ab", "a\u{ad}b"),
+            ("ab", "a\u{34f}b"),
+            ("ab", "a\u{2060}b"),
+            ("ab", "a\u{fe0f}b"),
+            ("K", "\u{212a}"),
+            ("\u{e9}", "e\u{301}"),
+            ("STRASSE", "stra\u{df}e"),
+            ("\u{3a3}\u{3a3}", "\u{3c3}\u{3c3}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = Fixture::new(&temporary.path().join(index.to_string()));
+            let (first, second) = (format!("scope/{first}"), format!("scope/{second}"));
+            fs::write(t.base.join(&first), b"protected").unwrap();
+            let same = fs::metadata(t.base.join(&second))
+                .is_ok_and(|alias| alias.ino() == fs::metadata(t.base.join(&first)).unwrap().ino());
+            if !same {
+                continue;
+            }
+            fs::hard_link(t.base.join(&first), t.base.join("scope/unapproved")).unwrap();
+            t.record(&first);
+            t.record(&second);
+            assert!(t.check(&first).is_err(), "{first:?} and {second:?}");
+            checked.push(second);
+        }
+        eprintln!("spellings this filesystem makes one: {checked:?}");
+    }
+
     /// Names are distinct entries as the directory compares them: byte for
     /// byte; ignoring composition, where a Kelvin sign is `K` and a Greek
     /// question mark is `;`; or folding case, where `a` is `A` and `ß` is
-    /// `ss` but `report` is not `résumé`.
+    /// `ss` but `report` is not `résumé`, and invisible characters some
+    /// filesystems skip, such as zero-width joiners, count for nothing.
     #[test]
     fn names_count_as_the_directory_compares_them() {
         let names = |list: &[&str]| -> BTreeSet<Vec<u8>> {
@@ -783,6 +856,13 @@ mod tests {
             (&["stra\u{df}e", "STRASSE"], 2, 2, 1),
             (&["Name. .", "name"], 2, 2, 1),
             (&["report", "r\u{e9}sum\u{e9}"], 2, 2, 2),
+            (&["ab", "a\u{200b}b", "a\u{200c}b", "a\u{200d}b"], 4, 4, 1),
+            (
+                &["ab", "a\u{feff}b", "a\u{ad}b", "a\u{2060}b", "a\u{fe0f}b"],
+                5,
+                5,
+                1,
+            ),
             (&["\u{e9}"], 1, 1, 1),
         ] {
             assert_eq!(distinct_names(&names(list), Exact), exact, "{list:?}");
