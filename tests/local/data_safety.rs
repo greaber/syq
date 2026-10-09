@@ -2095,3 +2095,44 @@ fn pruning_enters_unreadable_directories_with_unusual_names() {
         assert_eq!(listing(&t.path("dst")), ["a"], "{case}");
     }
 }
+
+/// Files and hard links the copy finds unchanged need no directory write,
+/// so nothing suggests temporary access for them.
+#[test]
+fn unchanged_files_and_hard_links_do_not_suggest_temporary_access() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/ro/one"), b"linked");
+    fs::hard_link(t.path("src/ro/one"), t.path("src/ro/two")).unwrap();
+    write(&t.path("src/ro/plain"), b"plain");
+    let (src, dst) = (t.s("src"), t.s("dst"));
+    run_native_ok(&[
+        "cp",
+        "--copy-metadata=hardlinks,mtime",
+        "--srcs-in",
+        &src,
+        "--into",
+        &dst,
+    ]);
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    for extra in [vec![], vec!["--hash"], vec!["--hash", "--dry-run"]] {
+        let mut args = vec![
+            "cp",
+            "--copy-metadata=hardlinks,mtime",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ];
+        args.extend(extra.iter().copied());
+        let out = native_syq(&args);
+        assert_output_ok(&out);
+        assert!(
+            !stderr_of(&out).contains("--temporarily-widen-dir-permissions"),
+            "{extra:?}: {out:?}"
+        );
+    }
+    fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+}

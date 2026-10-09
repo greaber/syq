@@ -2070,10 +2070,12 @@ impl Planner<'_> {
                 self.progress.println(&action);
             }
         } else {
-            // Writing an existing file in place needs no directory write.
-            let replaces_entry =
-                !(opts.inplace && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File));
-            self.note_directory_change(&dst_path, replaces_entry);
+            if opts.changes_directory_certainly(&e, dst_entry.as_ref()) {
+                // Writing an existing file in place needs no directory write.
+                let replaces_entry =
+                    !(opts.inplace && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File));
+                self.note_directory_change(&dst_path, replaces_entry);
+            }
             self.enqueue(
                 (src_path, source),
                 dst_path,

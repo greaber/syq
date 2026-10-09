@@ -175,7 +175,17 @@ impl Planner<'_> {
                 followers: Vec::new(),
             });
         } else {
-            self.note_directory_change(&leaf.dst, true);
+            // The workers compare a representative that may be unchanged.
+            if self
+                .opts
+                .changes_directory_certainly(&leaf.e, destination.as_ref())
+                && !(self.opts.trusts_size_and_time()
+                    && destination
+                        .as_ref()
+                        .is_some_and(|d| self.opts.metadata_matches(&leaf.dst_rel, &leaf.e, d)))
+            {
+                self.note_directory_change(&leaf.dst, true);
+            }
             let representative = self.enqueue(
                 (leaf.src, leaf.source),
                 leaf.dst,
@@ -391,8 +401,11 @@ impl Planner<'_> {
             let (dev, ino) = group
                 .published
                 .expect("live completion has a destination identity");
-            self.opts
-                .note_directory_change(self.progress, &follower.dst, true);
+            // A follower already linked to the representative is unchanged.
+            if follower.destination != group.published {
+                self.opts
+                    .note_directory_change(self.progress, &follower.dst, true);
+            }
             operations.push(Op::Hardlink {
                 path: follower.dst.clone(),
                 source: group.job.dst.clone(),

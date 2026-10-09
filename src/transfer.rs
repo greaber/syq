@@ -301,6 +301,24 @@ impl Opts {
             || (self.hash_or_copy && self.reuses_blocks(size, existing))
     }
 
+    /// Whether copying `source` over `existing` certainly changes the
+    /// directory holding it: a new entry, another type or size, or one the
+    /// copy rewrites without first comparing contents. A file the copy
+    /// compares may turn out unchanged; a preview that finds it changed names
+    /// the directory then, and a failed write carries the hint itself.
+    pub(super) fn changes_directory_certainly(
+        &self,
+        source: &Entry,
+        existing: Option<&Entry>,
+    ) -> bool {
+        existing.is_none_or(|existing| {
+            existing.kind != Kind::File
+                || existing.size != source.size
+                || !(self.previews_by_comparing(source.size, Some(existing))
+                    || self.reuses_blocks(source.size, Some(existing)))
+        })
+    }
+
     fn adaptive_ranges(&self) -> bool {
         !self.same_host
             && !self.block_explicit
