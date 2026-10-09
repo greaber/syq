@@ -543,7 +543,6 @@ impl FsOps {
         if current.len() != len {
             return Ok(None);
         }
-        self.require_owned(&current, meta, flags, &target.label)?;
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;
         set_meta_file_known(file, meta, flags, &current)

@@ -130,14 +130,14 @@ pub(crate) struct RestrictedAuthority {
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
-    /// The objects this receiver created for the grant, shared with every
+    /// The files this receiver created for the grant, shared with every
     /// connection's operations.
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
 }
 
 impl RestrictedAuthority {
-    /// The objects whose metadata this receiver may change, when the grant
-    /// keeps existing objects: those it created for the grant.
+    /// The files that may take new names by hard link, when the grant keeps
+    /// existing objects: those this receiver created for the grant.
     pub(crate) fn owned_objects(
         &self,
     ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
@@ -1356,19 +1356,22 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
-        // metadata, say) counts: the batch executes in order, so the
-        // metadata only ever lands on this request's own creation.
+        // metadata, say) counts: the request's metadata runs only once its
+        // no-replace creations have all succeeded.
         let created_before = self.created_by_this_grant(path);
         let created_here = pending
             .iter()
             .any(|creation| creation.path == path && !creation.link);
         match self.copy.policy.existing {
-            // Keeping existing objects, the receiver changes the metadata
-            // only of objects it created for this grant, which it checks on
-            // the very descriptor the change goes through (`OwnedObjects`):
-            // whatever this or another request does to the name meanwhile,
-            // the change cannot reach an object that was there before.
-            ExistingDestinationPolicy::Skip => Ok(()),
+            // A name this grant created leads only to an object it created,
+            // whatever runs on other connections meanwhile: the one step
+            // that could give it an existing file is a hard link, which
+            // this policy allows only to the grant's own files
+            // (`OwnedObjects`).
+            ExistingDestinationPolicy::Skip if created_before || created_here => Ok(()),
+            ExistingDestinationPolicy::Skip => {
+                bail!("signed grant retains existing objects: {label} may not be modified")
+            }
             ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
             // Updates are pinned to the observed object, like publications:
             // nothing hostA supplies names an inode on its own authority.
@@ -1738,9 +1741,11 @@ impl RestrictedAuthority {
 
     /// A new name for a file already in the signed scopes: a representative
     /// this copy published or kept, as for an ordinary copy. The new name
-    /// follows the existing-object policy like any creation; the file it
-    /// names is not this grant's own, so later requests cannot change it
-    /// through that name under a policy that keeps existing objects.
+    /// follows the existing-object policy like any creation, and does not
+    /// make the file the grant's own. Keeping existing objects, the receiver
+    /// links only to files it created for the grant, which it checks as it
+    /// links (`OwnedObjects`); an honest copy then gives a group's new names
+    /// a new file of their own, as rsync does.
     fn authorize_hardlink(
         &self,
         (path, source, identity, condition): (
@@ -1767,10 +1772,9 @@ impl RestrictedAuthority {
         }
         self.constrain_creation(path, condition, false, index, pending)?;
         // Keeping existing files, a link replaces nothing, not even a name
-        // this grant created: another request may still hold that name as
-        // the grant's own, and would change the existing file the link gave
-        // it. The receiver links to the final name, which the kernel refuses
-        // when it exists. Ordinary copies link only new names there.
+        // this grant created, as an honest copy links only new names there.
+        // The receiver links to the final name, which the kernel refuses
+        // when it exists.
         let keep = self.copy.policy.existing == ExistingDestinationPolicy::Skip;
         if keep {
             *condition = proto::TargetCondition::Absent;

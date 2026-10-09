@@ -821,7 +821,6 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
-        self.require_owned(&held.file.metadata()?, meta, flags, &held.label)?;
         set_meta_file(&held.file, meta, flags)
             .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
         if guard.is_some() {
@@ -2783,7 +2782,6 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
-            self.require_owned(&current, meta, flags, &target.label)?;
             check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;

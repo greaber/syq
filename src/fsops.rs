@@ -666,8 +666,8 @@ pub struct FsOps {
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
     hash_policy: crate::hashing::HashPolicy,
-    /// Objects this receiver created for a grant that keeps existing ones,
-    /// the only objects whose metadata it then changes.
+    /// Files this receiver created for a grant that keeps existing objects,
+    /// the only files it then gives new names by hard link.
     owned: Option<Arc<owned::OwnedObjects>>,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
@@ -3181,9 +3181,6 @@ impl FsOps {
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
-                            if let Some(owned) = owned {
-                                owned.record_identity(dev, ino);
-                            }
                             private
                                 .lock()
                                 .unwrap()
@@ -3212,9 +3209,6 @@ impl FsOps {
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
-                            if let Some(owned) = owned {
-                                owned.record_identity(dev, ino);
-                            }
                             directories.created((dev, ino), created, narrowing);
                         }
                     })
