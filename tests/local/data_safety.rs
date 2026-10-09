@@ -2136,3 +2136,28 @@ fn unchanged_files_and_hard_links_do_not_suggest_temporary_access() {
     }
     fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// An existing, empty directory named by `--as` is part of the copy: a
+/// dry run names it when it lacks owner write, as the real copy does.
+#[test]
+fn exact_placement_onto_a_read_only_directory_is_named_in_previews() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/a/file"), b"new");
+    fs::create_dir_all(t.path("dst/a")).unwrap();
+    fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o500)).unwrap();
+    let (src, dst) = (t.s("src/a"), t.s("dst/a"));
+    let note = format!(
+        "{dst}: you own this directory, but it lacks owner write permission; \
+         --temporarily-widen-dir-permissions may help"
+    );
+    let preview = native_syq(&["cp", &src, "--as", &dst, "--dry-run"]);
+    let out = native_syq(&["cp", &src, "--as", &dst]);
+    fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_output_ok(&preview);
+    assert_eq!(stderr_of(&preview).matches(&note).count(), 1, "{preview:?}");
+    assert_eq!(out.status.code(), Some(23), "{out:?}");
+    assert_eq!(stderr_of(&out).matches(&note).count(), 1, "{out:?}");
+}

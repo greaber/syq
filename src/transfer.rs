@@ -4103,13 +4103,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         blocked_mapping_parents: std::collections::HashSet::new(),
         directory_restorations: Default::default(),
         receiver_uid: None,
-        // The destination directory itself, when it belongs to the copy and
-        // its owner lacks write or search permission.
-        root_access_check: dst_root_entry.clone().filter(|entry| {
-            (dst_is_dir || expand_exact_home)
-                && entry.kind == Kind::Dir
-                && entry.mode & 0o300 != 0o300
-        }),
+        // The destination directory itself when its owner lacks write or
+        // search permission. Whatever the placement, an existing directory
+        // at the destination path belongs to the copy.
+        root_access_check: dst_root_entry
+            .clone()
+            .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300),
         access_reported: Default::default(),
         restorations_attempted: false,
         container_access,
