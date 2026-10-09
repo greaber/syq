@@ -150,10 +150,9 @@ pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) {
     if is_running(control) {
         return;
     }
-    let Ok(program) = std::env::current_exe() else {
+    let Ok(mut command) = crate::process::self_command() else {
         return;
     };
-    let mut command = Command::new(program);
     command
         .arg("--session-pool")
         .arg(control)

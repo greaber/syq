@@ -289,6 +289,7 @@ mod tests {
             create_if_missing: true,
             condition: crate::proto::TargetCondition::Any,
             guard: None,
+            group: None,
         };
         first_writer.write_msg(&prepare("target/a", 1024)).unwrap();
         assert!(matches!(

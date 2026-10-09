@@ -301,6 +301,7 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         create_if_missing: false,
         condition: crate::proto::TargetCondition::Any,
         guard: None,
+        group: None,
     });
     assert!(matches!(reply, Response::Prepared(_)), "{reply:?}");
     let mut reader = setup();

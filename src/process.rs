@@ -22,6 +22,59 @@ pub(crate) fn with_inheritance_guard<T>(operation: impl FnOnce() -> T) -> T {
     operation()
 }
 
+/// A command that runs this same build again, for receivers, services and
+/// other internal modes. An upgrade or rebuild can replace the file at the
+/// path syq started from while it runs. On Linux, /proc/self/exe still names
+/// the running image; the child gets the original path as argv[0], and
+/// `restore_self_started_name` gives it the file's name. macOS has no
+/// equivalent, so there the child runs whatever file the path names now.
+pub(crate) fn self_command() -> std::io::Result<Command> {
+    let path = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let command = {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new(SELF_EXE);
+        // Linux reports a replaced or removed file's path with this suffix.
+        let path = path.as_os_str().as_bytes();
+        let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+        command.arg0(std::ffi::OsStr::from_bytes(path));
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let command = Command::new(path);
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+const SELF_EXE: &str = "/proc/self/exe";
+
+/// A process started through /proc/self/exe is named "exe" in ps and pgrep.
+/// Name it after the file in its argv[0], as an ordinary start would. Every
+/// syq start runs this check, so it reads the path given to exec from the
+/// auxiliary vector, which needs no system call.
+#[cfg(target_os = "linux")]
+pub(crate) fn restore_self_started_name() {
+    use std::os::unix::ffi::OsStrExt;
+    let execfn = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+    if execfn.is_null()
+        || unsafe { std::ffi::CStr::from_ptr(execfn) }.to_bytes() != SELF_EXE.as_bytes()
+    {
+        return;
+    }
+    let Some(path) = std::env::args_os().next() else {
+        return;
+    };
+    let Some(name) = std::path::Path::new(&path).file_name() else {
+        return;
+    };
+    // The kernel keeps 15 bytes of a process name.
+    let name = name.as_bytes();
+    if let Ok(name) = std::ffi::CString::new(&name[..name.len().min(15)]) {
+        unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+    }
+}
+
 pub(crate) trait CommandExt {
     fn spawn_guarded(&mut self) -> std::io::Result<Child>;
     fn status_guarded(&mut self) -> std::io::Result<ExitStatus>;

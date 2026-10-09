@@ -543,6 +543,7 @@ impl FsOps {
         if current.len() != len {
             return Ok(None);
         }
+        self.require_owned(&current, meta, flags, &target.label)?;
         // Held open since it was compared, the file is checked by name.
         if scope_names::changes_metadata(&current, meta, flags) {
             self.require_names_inside(target, file, Some(current.nlink()))?;
@@ -889,6 +890,19 @@ impl FsOps {
     /// patches rather than from their data. Puts `built` from patches,
     /// whose data was checked as it arrived, carry no payload hash to check.
     fn put_small_sources(
+        &mut self,
+        puts: &mut [SmallPut],
+        sources: &[Option<PatchSource<'_>>],
+        built: bool,
+    ) -> Vec<SmallOutcome> {
+        // In-place files look their directories up once per batch.
+        self.inplace_parents.lock().unwrap().clear();
+        let results = self.put_small_sources_in_batch(puts, sources, built);
+        self.inplace_parents.lock().unwrap().clear();
+        results
+    }
+
+    fn put_small_sources_in_batch(
         &mut self,
         puts: &mut [SmallPut],
         sources: &[Option<PatchSource<'_>>],
@@ -1395,6 +1409,7 @@ impl FsOps {
             &stage.target.relative,
             &stage.file,
             put.condition,
+            self.owned.as_deref(),
         )
     }
 

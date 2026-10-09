@@ -751,6 +751,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
         ops.set_scope_names(authority.scope_names());
+        ops.set_owned_objects(authority.owned_objects());
     }
     if let Some(source) = &source_permit {
         source.initialize(&mut ops)?;

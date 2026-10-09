@@ -114,6 +114,8 @@ pub(super) struct Engine {
     authorization: Option<Arc<super::authorization::Authorization>>,
     /// The destination rejected an upload without a checksum; send Content-MD5.
     content_md5: std::sync::atomic::AtomicBool,
+    /// What new downloaded files' directories let them have.
+    file_permissions: std::sync::Mutex<local::CreationPermissions>,
     outage: Arc<super::outage::Outage>,
 }
 impl Drop for Engine {
@@ -281,6 +283,7 @@ impl Engine {
             upload_keys: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
             content_md5: content_md5.into(),
+            file_permissions: Default::default(),
             copy_tagging_unsupported: Default::default(),
             outage,
         }))
@@ -596,6 +599,7 @@ impl Engine {
             )
         });
         let mut first_error = None;
+        let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
             let relative = RelativePath::new(path.as_bytes())?;
             let saved = widened.remove(&path);
@@ -617,6 +621,7 @@ impl Engine {
                         *mode,
                         *explicit,
                         mode.is_none(),
+                        &mut creation,
                     )?;
                 } else if saved.is_none() {
                     let directory = destination.root.open_directory(&relative)?;
@@ -2564,7 +2569,16 @@ impl Engine {
                     }
                     self.progress.symlinks_created.fetch_add(1, Relaxed);
                 }
-                local::apply_metadata(root, &path, &metadata, &self.args, None, explicit, !same)?;
+                local::apply_metadata(
+                    root,
+                    &path,
+                    &metadata,
+                    &self.args,
+                    None,
+                    explicit,
+                    !same,
+                    &mut Default::default(),
+                )?;
             }
             if same {
                 return Ok(None);
@@ -2632,6 +2646,7 @@ impl Engine {
                     existing.map(|m| m.mode & 0o7777),
                     explicit,
                     false,
+                    &mut Default::default(),
                 )?;
             }
             self.progress
@@ -2804,6 +2819,7 @@ impl Engine {
             &self.args,
             existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
             explicit,
+            || self.file_permissions.lock().unwrap().for_file(root, &path),
         )?;
         let m = file.metadata()?;
         if self.args.ignore_existing
@@ -2933,7 +2949,9 @@ impl Engine {
                 crate::fsops::check_destination_writes(&writer, &label)
             })
             .await??;
-            local::apply_file_metadata(&file, metadata, &self.args, mode, explicit)?;
+            local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
+                self.file_permissions.lock().unwrap().for_file(root, path)
+            })?;
             let m = file.metadata()?;
             if self.args.ignore_existing
                 || self.args.target_existence == Existence::New

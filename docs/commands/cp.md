@@ -340,7 +340,8 @@ it does not truncate it. A literal `-` is a filename.
 
 When a regular file is copied to a named destination, syq preserves its
 modification time. New named files use the source permissions limited by the
-destination umask; existing files keep their permissions. S3 uploads store file
+destination umask, or by the directory's default ACL if it has one; existing
+files keep their permissions. S3 uploads store file
 attributes in object metadata.
 
 Output descriptors use the timestamps from normal writes, including when
@@ -352,8 +353,8 @@ when attributes are requested; time preservation uses S3's modification time if
 no syq attributes are stored.
 
 Input pipes, sockets, and devices have no payload metadata, so they reject
-`--copy-metadata`. Their new named destinations use `0666` limited by the umask
-and the time of the write; existing files keep their permissions.
+`--copy-metadata`. Their new named destinations use `0666` limited by the umask,
+or by the directory's default ACL if it has one, and the time of the write; existing files keep their permissions.
 Output pipes likewise cannot preserve times, permissions, or ownership. Parent
 directories are created as needed. The source `--cwd` / `--root` options
 apply to pathname sources. `--root` with `--src-fd` is rejected because it cannot

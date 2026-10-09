@@ -548,7 +548,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     let result =
         crate::process::capture_output_bounded(&mut probe, deadline, &cancelled, 16 * 1024)?;
     if crate::remote_helper::needs_install(result.status.code()) {
-        let mut install = Command::new(std::env::current_exe()?);
+        let mut install = crate::process::self_command()?;
         install
             .arg(INSTALL)
             .arg(serde_json::to_string(&owner.record)?);
@@ -593,7 +593,7 @@ fn launch_keeper(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = crate::process::self_command()?;
     command
         .arg(KEEPER)
         .process_group(0)

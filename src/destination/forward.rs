@@ -346,7 +346,7 @@ impl ForwardChild {
         cancelled: &impl Fn() -> bool,
     ) -> Result<(Self, Reply)> {
         for install in [false, true] {
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = crate::process::self_command()?;
             command.args([
                 if install {
                     "--return-connect-install"

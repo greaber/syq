@@ -143,6 +143,7 @@ fn bridged_control_accepts_metadata_but_refuses_file_payloads() {
             create_if_missing: true,
             condition: crate::proto::TargetCondition::Any,
             guard: None,
+            group: None,
         }),
         Response::Prepared(_)
     ));
@@ -236,6 +237,7 @@ fn ordinary_ssh_control_keeps_its_existing_payload_support() {
             create_if_missing: true,
             condition: crate::proto::TargetCondition::Any,
             guard: None,
+            group: None,
         }),
         Response::Prepared(_)
     ));

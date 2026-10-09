@@ -3168,71 +3168,77 @@ fn adaptive_batches_leave_work_for_peers_including_empty_files() {
 }
 
 #[test]
-fn aged_batch_requests_drain_before_refill_at_either_endpoint() {
-    for slow_source in [true, false] {
-        let size = 1024;
-        let delay = std::time::Duration::from_millis(600);
-        let src = Arc::new(Mutex::new(PipelineState {
-            auto_small_size: Some(size),
-            latency: slow_source.then_some(delay),
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState {
-            auto_small_size: Some(size),
-            latency: (!slow_source).then_some(delay),
-            ..Default::default()
-        }));
-        let mut worker =
-            pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
-        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
-        let jobs: Vec<_> = (0..512)
-            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
-            .collect();
-        let mut next = 0;
-        let mut limits = Vec::new();
-        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-        worker
-            .transfer_small_batches(
-                &jobs,
-                |limit| {
-                    if next == jobs.len() {
-                        return None;
-                    }
-                    limits.push(limit);
-                    let end = (next + limit.files.min((limit.bytes / size).max(1) as usize))
-                        .min(jobs.len());
-                    let group = next..end;
-                    next = end;
-                    Some(group)
-                },
-                &mut results,
-            )
-            .unwrap();
-        assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
-        let source = src.lock().unwrap();
-        if slow_source {
-            assert_eq!(
-                &source.sent_at_receive[..4],
-                &[4, 4, 4, 4],
-                "old reads stop refill before any acknowledgment"
-            );
-        } else {
-            assert_eq!(
-                &source.sent_at_receive[4..7],
-                &[7, 7, 7],
-                "old writes also stop source refill"
-            );
-        }
-        assert!(
-            limits
-                .iter()
-                .skip(4)
-                .any(|limit| limit.bytes < (64 << 10) && limit.files < 64),
-            "slow service shrinks both budgets: {limits:?}"
+fn aged_batch_requests_drain_before_refill_at_slow_source() {
+    aged_batch_requests_drain_before_refill(true);
+}
+
+#[test]
+fn aged_batch_requests_drain_before_refill_at_slow_destination() {
+    aged_batch_requests_drain_before_refill(false);
+}
+
+fn aged_batch_requests_drain_before_refill(slow_source: bool) {
+    let size = 1024;
+    let delay = std::time::Duration::from_millis(600);
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_small_size: Some(size),
+        latency: slow_source.then_some(delay),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_small_size: Some(size),
+        latency: (!slow_source).then_some(delay),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
+    Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+    let jobs: Vec<_> = (0..512)
+        .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
+        .collect();
+    let mut next = 0;
+    let mut limits = Vec::new();
+    let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+    worker
+        .transfer_small_batches(
+            &jobs,
+            |limit| {
+                if next == jobs.len() {
+                    return None;
+                }
+                limits.push(limit);
+                let end =
+                    (next + limit.files.min((limit.bytes / size).max(1) as usize)).min(jobs.len());
+                let group = next..end;
+                next = end;
+                Some(group)
+            },
+            &mut results,
+        )
+        .unwrap();
+    assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
+    let source = src.lock().unwrap();
+    if slow_source {
+        assert_eq!(
+            &source.sent_at_receive[..4],
+            &[4, 4, 4, 4],
+            "old reads stop refill before any acknowledgment"
         );
-        assert!(source.replies.is_empty());
-        assert!(dst.lock().unwrap().replies.is_empty());
+    } else {
+        assert_eq!(
+            &source.sent_at_receive[4..7],
+            &[7, 7, 7],
+            "old writes also stop source refill"
+        );
     }
+    assert!(
+        limits
+            .iter()
+            .skip(4)
+            .any(|limit| limit.bytes < (64 << 10) && limit.files < 64),
+        "slow service shrinks both budgets: {limits:?}"
+    );
+    assert!(source.replies.is_empty());
+    assert!(dst.lock().unwrap().replies.is_empty());
 }
 
 #[test]

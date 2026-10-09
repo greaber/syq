@@ -729,6 +729,10 @@ pub struct RegisteredSourceRoot {
     /// Permit this explicitly opted-in rsync session to use legacy unconfined
     /// source pathnames for `--insecure-links` compatibility.
     pub allow_unconfined_paths: bool,
+    /// A selected directory's permission bits when it was registered, so a
+    /// coordinator that creates a destination for its contents needs no
+    /// lookup of its own. None for an exact leaf.
+    pub directory_mode: Option<u32>,
 }
 
 impl RegisteredSourceRoot {
@@ -985,7 +989,8 @@ pub enum WireRequest<Data> {
         independent_handoff_workers: usize,
     },
     /// Create the missing suffix retained by CheckOperatorDirectory, then
-    /// return the selected directory's stable identity.
+    /// return the selected directory's stable identity and whether this
+    /// request created it (`OperatorDirectoryCreated`).
     CreateOperatorDirectory {
         mode: u32,
         /// Refuse a concurrently-created final directory instead of reusing
@@ -1065,6 +1070,10 @@ pub enum WireRequest<Data> {
         /// they are published instead.
         condition: TargetCondition,
         guard: Option<ContainerGuard>,
+        /// The group publication gives the file, when it sets one. A new
+        /// in-place file that would start with another group is created
+        /// owner-only.
+        group: Option<u32>,
     },
     /// Hash an existing final file and retain that open inode as the repair
     /// basis until FinishBasis or SeedBasis consumes it. Offset zero opens a
@@ -1121,7 +1130,12 @@ pub enum WireRequest<Data> {
         allow_sequential_local_fallback: bool,
         copy_id: CopyId,
         size: u64,
+        /// The mode an in-place file this creates starts with
+        /// (`fsops::inplace_creation_mode`).
         mode: u32,
+        /// The group publication gives the file, when it sets one, as in
+        /// `Prepare`.
+        group: Option<u32>,
     },
     HashBlocks {
         off: u64,
@@ -1654,6 +1668,13 @@ pub enum Response {
     DifferingBlocks(Vec<std::result::Result<DifferingBlocks, String>>),
     PatchedBatch(Vec<std::result::Result<SmallPatched, SmallPatchError>>),
     WidenedDirectories(Vec<std::result::Result<Option<DirectoryMode>, WireError>>),
+    /// The directory `CreateOperatorDirectory` selected. `created` is false
+    /// when its final component already existed, as when another process
+    /// created it after it was found missing.
+    OperatorDirectoryCreated {
+        anchor: DirectoryAnchor,
+        created: bool,
+    },
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

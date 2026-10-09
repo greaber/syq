@@ -224,6 +224,7 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
                     attempt: 0,
                     create_if_missing: true,
                     scanned: ScannedDestination::Unknown,
+                    group: None,
                 },
             )
             .unwrap()
@@ -365,6 +366,7 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap_err();
@@ -400,6 +402,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
                     attempt: 0,
                     create_if_missing: true,
                     scanned: ScannedDestination::Unknown,
+                    group: None,
                 },
             )
             .unwrap()
@@ -656,6 +659,7 @@ fn payload_integrity_checks_are_explicit() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -740,6 +744,7 @@ fn expected_hash_failure_preserves_existing_destination() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -879,6 +884,7 @@ fn macos_receiver_refuses_inplace_copy_without_touching_files() {
             copy_id: [38; 16],
             size: 9,
             mode: 0o600,
+            group: None,
         });
         assert!(
             matches!(response, Response::CopyLocalUnsupported),
@@ -911,6 +917,7 @@ fn direct_copy_rejects_eof_before_the_planned_size() {
             allow_sequential_nfs_fallback: false,
             allow_sequential_local_fallback: true,
             progress: &mut |_| Ok(()),
+            group: None,
         },
         &[37; 16],
         100,
@@ -1026,6 +1033,7 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -1082,6 +1090,7 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .is_err());
@@ -1384,12 +1393,15 @@ fn concurrent_operator_directory_creation_reuses_the_real_directory() {
     assert!(first_anchor.is_none());
     assert!(second_anchor.is_none());
 
-    let first_anchor = first.create_missing(0o755, false).unwrap();
-    let second_anchor = second.create_missing(0o755, false).unwrap();
+    let (first_anchor, first_created) = first.create_missing(0o755, false).unwrap();
+    let (second_anchor, second_created) = second.create_missing(0o755, false).unwrap();
     assert_eq!(
         (first_anchor.dev, first_anchor.ino),
         (second_anchor.dev, second_anchor.ino)
     );
+    // Only the first created it; the second found it there.
+    assert!(first_created);
+    assert!(!second_created);
 
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -2914,6 +2926,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -2937,6 +2950,7 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .is_err());
@@ -3060,6 +3074,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -3108,6 +3123,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -3194,6 +3210,7 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -3287,6 +3304,7 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -3864,6 +3882,7 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                     attempt: 0,
                     create_if_missing: true,
                     scanned: ScannedDestination::Unknown,
+                    group: None,
                 },
             )
             .unwrap();
@@ -3999,6 +4018,7 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         );
         super::partial::FALLOCATE_ERRNO.set(None);
@@ -4118,6 +4138,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         attempt: 0,
                         create_if_missing: true,
                         scanned: ScannedDestination::Unknown,
+                        group: None,
                     },
                 )
                 .unwrap();
@@ -4156,6 +4177,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         attempt: 1,
                         create_if_missing: true,
                         scanned: ScannedDestination::Unknown,
+                        group: None,
                     },
                 )
                 .unwrap();
@@ -4272,6 +4294,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                             attempt,
                             create_if_missing: true,
                             scanned: ScannedDestination::Unknown,
+                            group: None,
                         },
                     )
                     .unwrap()
@@ -4314,6 +4337,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                         attempt: 0,
                         create_if_missing: true,
                         scanned: ScannedDestination::Unknown,
+                        group: None,
                     };
                     ops.prepare(other, options).unwrap();
                 }
@@ -4428,6 +4452,7 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         attempt,
         create_if_missing: true,
         scanned: ScannedDestination::Unknown,
+        group: None,
     };
     ops.prepare(target(), options(0o644, 0)).unwrap();
     for (index, chunk) in old.chunks(block).enumerate() {
@@ -4613,6 +4638,7 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 attempt: 0,
                 create_if_missing: false,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -4634,6 +4660,7 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -4667,6 +4694,7 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                     attempt: 0,
                     create_if_missing: false,
                     scanned: ScannedDestination::Unknown,
+                    group: None,
                 },
             )
             .unwrap()
@@ -4736,6 +4764,7 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
                 attempt: 0,
                 create_if_missing: false,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -4857,6 +4886,7 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         &meta,
         flags::MODE | flags::TIMES,
         TargetCondition::Any,
+        None,
     )
     .unwrap();
     let before = fs::symlink_metadata(&dir).unwrap();
@@ -4868,6 +4898,7 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         &meta,
         flags::MODE | flags::TIMES,
         TargetCondition::Any,
+        None,
     )
     .unwrap();
     let after = fs::symlink_metadata(&dir).unwrap();
@@ -6822,6 +6853,7 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();
@@ -6953,6 +6985,7 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         );
         assert!(result.is_err(), "accepted {replacement} replacement");
@@ -7685,6 +7718,7 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                     attempt: 0,
                     create_if_missing: true,
                     scanned: ScannedDestination::Unknown,
+                    group: None,
                 },
             )
             .unwrap();
@@ -7777,6 +7811,7 @@ fn native_copy_reports_original_writer_close_error() {
                 allow_sequential_nfs_fallback: false,
                 allow_sequential_local_fallback: true,
                 progress: &mut |_| Ok(()),
+                group: None,
             },
             &[84; 16],
             1 << 20,
@@ -7996,6 +8031,7 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
                 attempt: 1,
                 create_if_missing: true,
                 scanned: ScannedDestination::Absent,
+                group: None,
             },
         )
         .unwrap();
@@ -8082,6 +8118,7 @@ fn an_in_place_open_of_a_scanned_file_refuses_one_with_names_outside() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::File(0o644),
+                group: None,
             },
         )
         .unwrap_err();
@@ -8143,6 +8180,7 @@ fn a_held_in_place_file_moved_outside_is_not_finished_there() {
                 attempt: 0,
                 create_if_missing: true,
                 scanned: ScannedDestination::Unknown,
+                group: None,
             },
         )
         .unwrap();

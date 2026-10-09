@@ -38,6 +38,7 @@ mod btrfs;
 mod entry;
 mod limits;
 mod operator;
+pub(crate) mod owned;
 mod partial;
 mod paths;
 mod receiver_mode;
@@ -224,6 +225,8 @@ enum FileSystemKey {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct CopyLocalPolicy<'a> {
     inplace: bool,
+    /// The group publication gives an in-place file, when it sets one.
+    group: Option<u32>,
     replace_partial: bool,
     allow_sequential_nfs_fallback: bool,
     allow_sequential_local_fallback: bool,
@@ -664,6 +667,9 @@ pub struct FsOps {
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
     hash_policy: crate::hashing::HashPolicy,
+    /// Objects this receiver created for a grant that keeps existing ones,
+    /// the only objects whose metadata it then changes.
+    owned: Option<Arc<owned::OwnedObjects>>,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
     #[cfg(target_os = "linux")]
@@ -682,6 +688,9 @@ pub struct FsOps {
     /// Directories this connection created private or widened, for the
     /// modes it chooses for them later.
     receiver_directories: receiver_mode::ReceiverDirectories,
+    /// The parents of the in-place files the current small-file batch
+    /// creates, looked up once per directory.
+    inplace_parents: Mutex<apply::InplaceParents>,
     /// A new directory whose mode lacks owner access, as `syq rsync` creates
     /// one, gets that mode only after its contents.
     narrow_new_directories: bool,
@@ -831,6 +840,8 @@ struct PrepareOptions {
     scanned: ScannedDestination,
     /// What an in-place file's name must hold when it is opened.
     condition: TargetCondition,
+    /// The group publication gives an in-place file, when it sets one.
+    group: Option<u32>,
 }
 
 struct HashOptions {
@@ -891,6 +902,7 @@ impl FsOps {
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,
+            owned: None,
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
@@ -908,6 +920,7 @@ impl FsOps {
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
             receiver_directories: Default::default(),
+            inplace_parents: Default::default(),
             narrow_new_directories: false,
             creation_permissions: Default::default(),
             prepared_small_copy: None,
@@ -993,28 +1006,35 @@ impl FsOps {
         &mut self,
         mode: u32,
         require_absent: bool,
-    ) -> Result<DirectoryAnchor> {
+    ) -> Result<(DirectoryAnchor, bool)> {
+        #[cfg(debug_assertions)]
+        test_race_barrier(
+            "SYQ_TEST_OPERATOR_DIRECTORY_READY_FILE",
+            "SYQ_TEST_OPERATOR_DIRECTORY_CONTINUE_FILE",
+            "destination directory creation",
+        )?;
         // It has owner access while it is filled, as any new directory has.
-        let anchor = self
+        let (anchor, created) = self
             .operator_selection
             .as_mut()
             .context("no checked destination directory to create")?
             .create_missing(mode | 0o700, require_absent)?;
         // A destination created private is opened once its metadata is set,
         // and under `syq rsync` one whose mode lacks owner access is narrowed
-        // once it is filled.
+        // once it is filled. A directory found at its name, which another
+        // process created after it was found missing, keeps its mode.
         let narrowing = self.narrow_new_directories && mode & 0o700 != 0o700;
-        if mode & 0o7777 == 0o700 || narrowing {
-            let created = self
+        if created && (mode & 0o7777 == 0o700 || narrowing) {
+            let metadata = self
                 .operator_selection
                 .as_ref()
                 .context("no checked destination directory")?
                 .directory
                 .metadata()?;
             self.receiver_directories
-                .created((anchor.dev, anchor.ino), created.mode(), narrowing);
+                .created((anchor.dev, anchor.ino), metadata.mode(), narrowing);
         }
-        Ok(anchor)
+        Ok((anchor, created))
     }
 
     fn anchor_destination(
@@ -1429,6 +1449,7 @@ impl FsOps {
                             } else {
                                 TargetCondition::Any
                             },
+                            None,
                         )
                         .err()
                         .map(|error| wire_error(&error)),
@@ -1743,13 +1764,19 @@ impl FsOps {
         let registrations: Vec<_> = resolved
             .iter()
             .map(|(directory, relative, expected_leaf, object)| {
-                (
+                let directory_mode = if relative.is_empty() {
+                    Some(directory.metadata()?.mode() & 0o777)
+                } else {
+                    None
+                };
+                Ok((
                     relative.clone(),
                     expected_leaf.clone(),
                     filesystem_hint(object.as_ref().unwrap_or(directory)),
-                )
+                    directory_mode,
+                ))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let tickets = self.descriptor_session.register_source_handles(
             resolved
                 .into_iter()
@@ -1760,7 +1787,7 @@ impl FsOps {
             .into_iter()
             .zip(registrations)
             .map(
-                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem))| {
+                |((ticket, leaf_ticket), (relative, expected_leaf, filesystem, directory_mode))| {
                     let selection = RegisteredPath::new(ticket.root_id(), relative)?;
                     Ok(RegisteredSourceRoot {
                         filesystem,
@@ -1769,6 +1796,7 @@ impl FsOps {
                         selection,
                         expected_leaf,
                         allow_unconfined_paths,
+                        directory_mode,
                     })
                 },
             )
@@ -3134,6 +3162,7 @@ impl FsOps {
         );
         let directories = &self.receiver_directories;
         let scope_names = self.scope_names.as_deref();
+        let owned = self.owned.as_deref();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
@@ -3177,6 +3206,9 @@ impl FsOps {
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
+                            if let Some(owned) = owned {
+                                owned.record_identity(dev, ino);
+                            }
                             private
                                 .lock()
                                 .unwrap()
@@ -3205,6 +3237,9 @@ impl FsOps {
                     )
                     .map(|created| {
                         if let Some((dev, ino, created)) = created {
+                            if let Some(owned) = owned {
+                                owned.record_identity(dev, ino);
+                            }
                             directories.created((dev, ino), created, narrowing);
                         }
                     })
@@ -3215,6 +3250,7 @@ impl FsOps {
                     destination_root.clone(),
                     destination_prefix,
                     scope_names,
+                    owned,
                 ),
             };
             result.err().as_ref().map(wire_error)
@@ -3252,6 +3288,7 @@ impl FsOps {
                 destination_root.clone(),
                 destination_prefix,
                 scope_names,
+                owned,
             );
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
