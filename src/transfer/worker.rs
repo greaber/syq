@@ -1609,12 +1609,8 @@ impl Worker {
     }
 
     /// What an in-place file's name must hold when Prepare opens it, as the
-    /// copy's existing-file policy requires: nothing for a file the copy
-    /// creates under --if-exists=keep, exactly the scanned file under
-    /// --only-existing. A retry sends the same condition, so a file an
-    /// earlier attempt created is refused rather than reopened. A new --as-new file
-    /// gets only the pathname check before the copy starts, as staged ones
-    /// do; a restricted receiver adds the create-only condition itself.
+    /// copy's existing-file policy requires: exactly the scanned file under
+    /// --only-existing. A file that must be new is staged instead.
     fn inplace_condition(&self, job: &WorkerJob) -> TargetCondition {
         if !job.inplace {
             return TargetCondition::Any;
@@ -1631,7 +1627,6 @@ impl Worker {
             condition => return condition,
         }
         match job.dst_entry.as_ref() {
-            None if self.opts.ignore_existing => TargetCondition::Absent,
             Some(destination) if self.opts.existing && destination.kind == Kind::File => {
                 TargetCondition::Matches {
                     dev: destination.dev,

@@ -220,6 +220,8 @@ pub struct Opts {
     pub hash_or_copy: bool,
     pub precise_mtime: bool,
     pub inplace: bool,
+    /// The placement requires a new destination (`--as-new`, `--into-new`).
+    pub new_target: bool,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
     /// for the proven local-filesystem -> asynchronous-NFS topology.
@@ -2169,6 +2171,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         hash_or_copy: args.hash_or_copy && !args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
         inplace: args.inplace,
+        new_target: args.target_existence == Existence::New,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
         src_remote: src_ep.is_remote(),
@@ -4232,9 +4235,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             && jobs.iter().enumerate().all(|(idx, job)| {
                                 job.entry.size <= fast_file_size_limit(&opts, None)
                                     && jobs.destination(idx).is_none()
-                                    && (!opts.inplace
-                                        || (job.target_condition == TargetCondition::Any
-                                            && job.container_guard.is_none()))
+                                    && (!opts.inplace || job.inplace)
                             }),
                         jobs.len(),
                         jobs.iter()

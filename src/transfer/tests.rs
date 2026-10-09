@@ -452,6 +452,7 @@ fn pipeline_worker(
         delete_excluded: false,
         max_delete: None,
         max_delete_from_approver: false,
+        new_target: false,
         expressions: Default::default(),
         update: false,
         ignore_existing: false,

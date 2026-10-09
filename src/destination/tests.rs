@@ -1394,9 +1394,10 @@ fn named_inplace_copies_change_only_existing_files() {
     assert!(!root.join("source/b").exists());
 }
 
-/// A laptop download of one file with --as-new --inplace creates the file in
-/// place; the receiver allows only creating it. (A name that already exists
-/// is refused when the copy asks for approval.)
+/// A laptop download of one file with --as-new --inplace stages the file,
+/// which must be new, and publishes it without replacing anything, as the
+/// receiver's in-place grant accepts. (A name that already exists is refused
+/// when the copy asks for approval.)
 #[test]
 fn named_as_new_inplace_files_are_created_only() {
     let temp = crate::test_support::tempdir().unwrap();

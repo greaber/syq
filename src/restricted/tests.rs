@@ -3341,6 +3341,7 @@ fn new_directory_placement_root_must_be_created_as_a_directory() {
 /// carries the condition the signed existing-file policy needs, and the
 /// receiver opens the name only on that condition. A compromised sender
 /// cannot drop the condition, and its condition cannot name another file.
+/// A file the policy only allows creating is staged instead.
 #[test]
 fn inplace_requests_carry_the_condition_their_existing_file_policy_needs() {
     use proto::TargetCondition::{Absent, Any, Matches};
@@ -3386,45 +3387,40 @@ fn inplace_requests_carry_the_condition_their_existing_file_policy_needs() {
             .to_string()
     };
 
-    // Keeping existing files: only an exclusive create, whatever the sender
-    // asked, and the receiver's exclusive create then refuses a file that
-    // is already there.
+    // Keeping existing files: nothing in place, which would write a name as
+    // it is opened; a new file is staged, and only a new one.
     let keep = inplace(
         ExistingDestinationPolicy::Skip,
         DestinationPlacement::DirectoryContents,
         RootExistence::Any,
     );
-    for condition in [
-        Any,
-        Absent,
-        Matches {
-            dev: existing.dev(),
-            ino: existing.ino(),
-        },
-    ] {
-        let mut create_over = prepare("existing", condition);
-        keep.authorize(&mut create_over, false).unwrap();
-        assert!(
-            matches!(
-                &create_over,
-                Request::Prepare {
-                    condition: Absent,
-                    ..
-                }
-            ),
-            "{condition:?}"
-        );
-        let response = crate::fsops::FsOps::new().handle_in_place(&mut create_over);
-        assert!(
-            matches!(
-                &response,
-                crate::proto::Response::EndpointError(_) | crate::proto::Response::Err(_)
-            ),
-            "{response:?}"
-        );
-        assert_eq!(fs::read(root.join("target/existing")).unwrap(), b"kept");
+    for name in ["existing", "new"] {
+        for condition in [
+            Any,
+            Absent,
+            Matches {
+                dev: existing.dev(),
+                ino: existing.ino(),
+            },
+        ] {
+            let error = refused(&keep, name, condition);
+            assert!(
+                error.contains("only creates"),
+                "{name} {condition:?}: {error}"
+            );
+        }
     }
-    keep.authorize(&mut prepare("new", Any), false).unwrap();
+    let staged = |name: &str| {
+        let mut request = prepare(name, Any);
+        let Request::Prepare { inplace, .. } = &mut request else {
+            unreachable!()
+        };
+        *inplace = false;
+        request
+    };
+    assert!(keep.authorize(&mut staged("existing"), false).is_err());
+    keep.authorize(&mut staged("new"), false).unwrap();
+    assert_eq!(fs::read(root.join("target/existing")).unwrap(), b"kept");
 
     // Changing existing files only: exactly the file the receiver observes.
     let update = inplace(
@@ -7337,11 +7333,13 @@ fn names_a_lookup_returned_count_inside() {
     }
 }
 
-/// A restricted receiver creates an `--as-new` file in place and refuses a
-/// retry once the file exists, even one this copy created, telling how to
-/// finish it; it never writes into the existing file.
+/// Under a grant that publishes in place, a file that must be new (here an
+/// `--as-new` root) is staged and published without replacing anything,
+/// never written in place, so a retry after an interrupted attempt simply
+/// stages it again.
 #[test]
-fn a_create_only_in_place_retry_is_refused_with_the_way_to_finish() {
+fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing() {
+    use proto::TargetCondition::{Absent, Any};
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     fs::create_dir_all(&root).unwrap();
@@ -7358,44 +7356,84 @@ fn a_create_only_in_place_retry_is_refused_with_the_way_to_finish() {
     )
     .unwrap();
     let target = root.join("target");
-    let prepare = |attempt| {
-        let mut request = Request::Prepare {
-            path: path_bytes(&target),
-            size: 5,
-            inplace: true,
-            copy_id: [1; 16],
-            mode: 0o644,
-            flags: 0,
-            acl: false,
-            scanned: crate::proto::ScannedDestination::Unknown,
-            group: None,
-            attempt,
-            create_if_missing: true,
-            condition: proto::TargetCondition::Any,
-            guard: None,
-        };
-        let settlement = authority.authorize(&mut request, false).unwrap();
-        let response = crate::fsops::FsOps::new().handle_in_place(&mut request);
+    let mut ops = crate::fsops::FsOps::new();
+    let mut run = |mut request: Request| -> Result<(Request, proto::Response)> {
+        let settlement = authority.authorize(&mut request, false)?;
+        let response = ops.handle(&request);
         authority.settle(settlement, &response);
-        response
+        Ok((request, response))
     };
-    // The first attempt creates the file.
-    let response = prepare(0);
+    let prepare = |inplace, attempt| Request::Prepare {
+        path: path_bytes(&target),
+        size: 5,
+        inplace,
+        copy_id: [1; 16],
+        mode: 0o644,
+        flags: 0,
+        acl: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+        group: None,
+        attempt,
+        create_if_missing: true,
+        condition: Any,
+        guard: None,
+    };
+    let write = |inplace, attempt| {
+        let data = b"hello".to_vec();
+        Request::WriteRange {
+            path: path_bytes(&target),
+            inplace,
+            copy_id: [1; 16],
+            attempt,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.into(),
+            guard: None,
+        }
+    };
+    let error = run(prepare(true, 0)).unwrap_err().to_string();
+    assert!(error.contains("only creates"), "{error}");
+    // Staged, its writes stay staged; an interrupted attempt is retried.
+    for attempt in [0, 1] {
+        let (_, response) = run(prepare(false, attempt)).unwrap();
+        assert!(
+            matches!(response, proto::Response::Prepared(_)),
+            "{response:?}"
+        );
+        assert!(run(write(true, attempt)).is_err());
+        let (_, response) = run(write(false, attempt)).unwrap();
+        assert!(
+            !matches!(
+                response,
+                proto::Response::Err(_) | proto::Response::EndpointError(_)
+            ),
+            "{response:?}"
+        );
+        assert!(!target.exists());
+    }
+    let mut finalize = finalize_request(&target, Any);
+    if let Request::Finalize { meta, .. } = &mut finalize {
+        meta.mode = 0o100644;
+    }
+    let (finalize, response) = run(finalize).unwrap();
     assert!(
-        matches!(response, proto::Response::Prepared(_)),
+        matches!(
+            finalize,
+            Request::Finalize {
+                condition: Absent,
+                ..
+            }
+        ),
+        "{finalize:?}"
+    );
+    assert!(
+        !matches!(
+            response,
+            proto::Response::Err(_) | proto::Response::EndpointError(_)
+        ),
         "{response:?}"
     );
-    fs::write(&target, b"first").unwrap();
-    // A retry, on any connection, is refused and writes nothing.
-    for attempt in [0, 1] {
-        let response = prepare(attempt);
-        let proto::Response::EndpointError(error) = &response else {
-            panic!("{response:?}")
-        };
-        assert!(
-            error.as_str().contains("finish an --as-new copy with --as"),
-            "{error:?}"
-        );
-        assert_eq!(fs::read(&target).unwrap(), b"first");
-    }
+    assert_eq!(fs::read(&target).unwrap(), b"hello");
+    // Once it exists, it is not staged again.
+    assert!(run(prepare(false, 2)).is_err());
 }

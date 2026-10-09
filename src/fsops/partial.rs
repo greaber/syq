@@ -510,29 +510,13 @@ impl FsOps {
                 .as_ref()
                 .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id);
             match condition {
-                // Only a new file: created exclusively, never one already
-                // there, even one an earlier attempt of this copy created.
+                // A file that must be new is staged, and published without
+                // replacing anything: in place there is nothing to update.
                 TargetCondition::Absent => {
-                    let file = self
-                        .create_inplace_file(&target.root, &target.relative, mode, copy_id)
-                        .map_err(|error| {
-                            if error.downcast_ref::<io::Error>().is_some_and(|error| {
-                                error.kind() == io::ErrorKind::AlreadyExists
-                            }) {
-                                anyhow!(
-                                    "{} already exists, and this copy may only create it; if an interrupted attempt of this copy created it, finish an --as-new copy with --as, or remove the file and copy it again",
-                                    target.label.display()
-                                )
-                            } else {
-                                error
-                            }
-                        })?;
-                    let opened = file.metadata()?;
-                    self.set_copy_length(&file, size).with_context(|| {
-                        format!("resize confined file {}", target.label.display())
-                    })?;
-                    self.cache_opened_file(target.location(), attempt, false, file, opened);
-                    return Ok(Preparation::default());
+                    bail!(
+                        "{} must be new, so it is staged rather than written in place",
+                        target.label.display()
+                    )
                 }
                 // Only the file the scan found: opened, never created.
                 TargetCondition::Matches { .. } if !held_here => {

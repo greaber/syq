@@ -1104,6 +1104,10 @@ ssh destination 'mkdir -p /tmp/syq-real-ssh/inplace-policy && printf old > /tmp/
 syq cp --inplace --only-existing --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-policy-source \
     --to destination --into /tmp/syq-real-ssh/inplace-policy
 ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/a)" = new && test ! -e /tmp/syq-real-ssh/inplace-policy/b'
+# A file that must be new is staged, and published without replacing one.
+syq cp --inplace --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
+    --to destination --as-new /tmp/syq-real-ssh/inplace-policy/created
+ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/created)" = new'
 
 printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in

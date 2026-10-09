@@ -290,7 +290,8 @@ fn prune_does_not_require_permission_to_replace_source_matches() {
 }
 
 /// In place, the name is written as it is opened, so `--only-existing` opens
-/// only the file the scan found and `--as-new` creates its file exclusively.
+/// only the file the scan found; an `--as-new` file must be new, and the copy
+/// refuses a name that exists.
 #[test]
 fn inplace_files_open_their_names_as_the_existing_file_policy_requires() {
     let t = Tmp::new();
@@ -324,10 +325,45 @@ fn inplace_files_open_their_names_as_the_existing_file_policy_requires() {
     assert_eq!(read(&t.path("dst/a")), b"new a");
 }
 
+/// With `--inplace`, a file that must be new is staged: nothing is at its
+/// name until it is published, and nothing would be in place to update.
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_that_must_be_new_is_staged_under_inplace() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"new contents");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "-q",
+            "--inplace",
+            "--performance-tuning",
+            "copy-path=ranges",
+        ])
+        .arg(t.path("src/file"))
+        .arg("--as-new")
+        .arg(t.path("dst/new"))
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
+    assert!(!t.path("dst/new").exists());
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/new")), b"new contents");
+}
+
 /// An `--as-new --inplace` file whose worker connection is lost, right after
 /// its preparation or after its first write, is finished through a new
-/// receiver process: an ordinary receiver gets no create-only condition
-/// for it, as on `master`, so the new process simply reopens the file.
+/// receiver process: the file must be new, so it is staged, and the new
+/// process resumes it.
 #[test]
 fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
     for request in ["prepare", "write"] {
@@ -373,11 +409,10 @@ fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
     }
 }
 
-/// Under `--if-exists=error` or `error-if-different`, an ordinary receiver
-/// stages a new `--inplace` file and publishes it without replacing
-/// anything, as before restricted receivers wrote such files in place: a
-/// worker connection lost right after the file's preparation is retried
-/// through a new receiver process, and the copy completes.
+/// Under `--if-exists=error` or `error-if-different`, a new `--inplace` file
+/// is staged and published without replacing anything: a worker connection
+/// lost right after the file's preparation is retried through a new
+/// receiver process, and the copy completes.
 #[test]
 fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
     for policy in ["error", "error-if-different"] {

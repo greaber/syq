@@ -3394,6 +3394,17 @@ impl Planner<'_> {
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
+        // A file that must be new (an --as-new file, or a new file the error
+        // policies protect) has nothing to update in place: it is staged and
+        // published without replacing anything, so readers see no partial
+        // file and a retry finishes what an interrupted attempt left.
+        let inplace = self.opts.inplace
+            && matches!(
+                target_condition,
+                TargetCondition::Any | TargetCondition::Matches { .. }
+            )
+            && !(self.opts.new_target && dst == self.dst_root)
+            && self.container_guard.is_none();
         let src_rel = self.mapping_source_rel(&rel_bytes);
         let scanned = match &dst_entry {
             Some(d) if d.kind == Kind::File => {
@@ -3421,18 +3432,7 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
-                // A restricted receiver opens a conditioned in-place file
-                // under its condition (`Request::Prepare`). Elsewhere one is
-                // staged and published under it, so that a retry can finish
-                // what an interrupted attempt left.
-                inplace: self.opts.inplace
-                    && (target_condition == TargetCondition::Any
-                        || (self.opts.restricted_receiver
-                            && matches!(
-                                target_condition,
-                                TargetCondition::Absent | TargetCondition::Matches { .. }
-                            )))
-                    && self.container_guard.is_none(),
+                inplace,
                 src_rel,
                 scanned,
             },
