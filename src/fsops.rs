@@ -729,7 +729,8 @@ struct HeldBasis {
     label: PathBuf,
     copy_id: CopyId,
     file: File,
-    /// The file's link count when it was first opened to be held.
+    /// The file's link count when it was first opened to be held, read
+    /// only by a receiver that checks names (`FsOps::links_when_held`).
     links: u64,
 }
 

@@ -377,6 +377,15 @@ impl FsOps {
     /// its names are confirmed inside the approved directories.
     /// `held_links` is its link count when it was opened, for a file held
     /// open since then, or None for one just opened by this name.
+    /// The link count of `file` as it is first held, which only a receiver
+    /// that checks names reads: others skip the extra lookup.
+    pub(super) fn links_when_held(&self, file: &File) -> Result<u64> {
+        Ok(match self.scope_names {
+            Some(_) => file.metadata()?.nlink(),
+            None => 0,
+        })
+    }
+
     pub(super) fn require_names_inside(
         &self,
         target: &RootedTarget,

@@ -790,13 +790,13 @@ impl FsOps {
             (held.file, held.location, held.label, held.links)
         } else if let Some(target) = &rooted {
             let file = target.root.open_regular_read(&target.relative)?;
-            let links = file.metadata()?.nlink();
+            let links = self.links_when_held(&file)?;
             (file, target.location(), target.label.clone(), links)
         } else {
             let p = resolve(path);
             let file = open_existing_regular(&p, false)
                 .with_context(|| format!("open {} as repair basis", p.display()))?;
-            let links = file.metadata()?.nlink();
+            let links = self.links_when_held(&file)?;
             (file, FileLocation::Path(p.clone()), p, links)
         };
         require_open_target(&file, &label, condition)?;
