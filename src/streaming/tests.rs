@@ -55,7 +55,7 @@ impl Conn for FinishingConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> anyhow::Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> anyhow::Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> anyhow::Result<u64> {
         unreachable!()
     }

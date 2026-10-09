@@ -363,7 +363,7 @@ impl Conn for PipelineConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -1868,7 +1868,7 @@ impl Conn for SetupConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -2212,7 +2212,7 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
             _: bool,
             _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
             _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-            _: &mut dyn FnMut(String),
+            _: &mut dyn FnMut(crate::proto::ScanWarning),
         ) -> Result<u64> {
             unreachable!()
         }
@@ -4132,7 +4132,7 @@ impl<F: FnMut(Request) -> Response + Send> Conn for AnsweringConn<F> {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -4265,7 +4265,7 @@ impl Conn for QueuingSource {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -4865,7 +4865,7 @@ impl Conn for FailingConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }

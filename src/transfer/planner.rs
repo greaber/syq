@@ -3616,7 +3616,7 @@ impl Planner<'_> {
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
             // Each walk warning with the directory its walk started from.
-            let mut warnings: Vec<(PathBytes, String)> = Vec::new();
+            let mut warnings: Vec<(PathBytes, crate::proto::ScanWarning)> = Vec::new();
             let mut bases = vec![root.clone()];
             loop {
                 for base in std::mem::take(&mut bases) {
@@ -3692,7 +3692,8 @@ impl Planner<'_> {
                 if subtrees {
                     // Walking beneath them again answers their warnings.
                     warnings.retain(|(base, warning)| {
-                        !walk_warning_path(base, warning).is_some_and(|path| {
+                        !warning.path.as_ref().is_some_and(|path| {
+                            let path = join(base, path);
                             widened.iter().any(|directory| {
                                 path == *directory || path_is_inside(&path, directory)
                             })
@@ -3709,14 +3710,11 @@ impl Planner<'_> {
             for (base, warning) in warnings {
                 self.delete_walk_failed = true;
                 // A preview names the directory it could not inspect.
-                match walk_warning_path(&base, &warning).filter(|_| self.opts.dry_run) {
+                match warning.path.as_ref().filter(|_| self.opts.dry_run) {
                     Some(path) => self.progress.error(&format!(
                         "syq: {}: not inspected: {}",
-                        display(&path),
-                        warning
-                            .strip_prefix("scan: ")
-                            .and_then(|rest| rest.split_once(": "))
-                            .map_or(warning.as_str(), |(_, error)| error)
+                        display(&join(&base, path)),
+                        warning.error
                     )),
                     None => self.progress.error(&format!("syq: delete: {warning}")),
                 }
@@ -4613,13 +4611,6 @@ fn ignore_pattern_is_unanchored(pattern: &str) -> bool {
     let pattern = pattern.trim();
     let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
     !pattern.trim_end_matches('/').contains('/')
-}
-
-/// The destination path a walk warning (`scan: <path>: <error>`) names,
-/// beneath the directory the walk started from.
-fn walk_warning_path(base: &[u8], warning: &str) -> Option<PathBytes> {
-    let (relative, _) = warning.strip_prefix("scan: ")?.split_once(": ")?;
-    Some(join(base, relative.as_bytes()))
 }
 
 /// Strict destination lookups that survive denials. When a batch is denied,

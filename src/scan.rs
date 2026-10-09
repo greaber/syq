@@ -7,7 +7,7 @@ use crate::fsops::{
 #[cfg(test)]
 use crate::process::CommandExt as _;
 use crate::proto::ContainerGuard;
-use crate::proto::{Entry, PathBytes, SourceLeafIdentity};
+use crate::proto::{Entry, PathBytes, ScanWarning, SourceLeafIdentity};
 use crate::rooted::{RelativePath, Root, RootIdentity, RootMetadata};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -75,7 +75,7 @@ pub(crate) fn selected_file_is_ignored(matcher: Option<&Gitignore>, path: &[u8])
 enum ScanEvent {
     Entry(Entry),
     Ignored(PathBytes),
-    Warning(String),
+    Warning(ScanWarning),
 }
 
 type ScanChunk = Vec<ScanEvent>;
@@ -137,7 +137,10 @@ fn produce_scan(
         let mut de = match item {
             Ok(de) => de,
             Err(e) => {
-                chunk.push(ScanEvent::Warning(format!("scan: {e}")));
+                chunk.push(ScanEvent::Warning(ScanWarning {
+                    path: None,
+                    error: e.to_string(),
+                }));
                 if chunk.len() >= FIRST_BATCH
                     && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
                 {
@@ -153,8 +156,11 @@ fn produce_scan(
             .as_ref()
             .and_then(|children| children.error())
         {
-            let warning = format!("scan: {}: {e}", de.path().display());
-            chunk.push(ScanEvent::Warning(warning));
+            let full = de.path();
+            chunk.push(ScanEvent::Warning(ScanWarning {
+                path: Some(path_bytes(full.strip_prefix(&root).unwrap_or(&full))),
+                error: e.to_string(),
+            }));
         }
         if de.depth == 0 {
             if chunk.len() >= FIRST_BATCH
@@ -182,7 +188,11 @@ fn produce_scan(
                 ScanEvent::Ignored(path_bytes(full.strip_prefix(&root).unwrap_or(&full)))
             }
             State::Failed => {
-                ScanEvent::Warning(format!("scan: cannot stat {}", de.path().display()))
+                let full = de.path();
+                ScanEvent::Warning(ScanWarning {
+                    path: Some(path_bytes(full.strip_prefix(&root).unwrap_or(&full))),
+                    error: "cannot stat".into(),
+                })
             }
         };
         chunk.push(event);
@@ -321,10 +331,10 @@ impl DescriptorScan<'_> {
             let (entry, metadata) = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    events.push(ScanEvent::Warning(format!(
-                        "scan: cannot stat {}: {error:#}",
-                        String::from_utf8_lossy(&relative)
-                    )));
+                    events.push(ScanEvent::Warning(ScanWarning {
+                        path: Some(relative),
+                        error: format!("cannot stat: {error:#}"),
+                    }));
                     continue;
                 }
             };
@@ -355,10 +365,10 @@ impl DescriptorScan<'_> {
                             Some(child)
                         }
                         Err(error) => {
-                            events.push(ScanEvent::Warning(format!(
-                                "scan: {}: {error:#}",
-                                String::from_utf8_lossy(&relative)
-                            )));
+                            events.push(ScanEvent::Warning(ScanWarning {
+                                path: Some(relative),
+                                error: format!("{error:#}"),
+                            }));
                             continue;
                         }
                     }
@@ -433,9 +443,11 @@ fn produce_descriptor_scan(
                 let inspect = |(index, directory): (usize, DescriptorDirectory)| {
                     let label = directory.relative.clone();
                     let retain = available / count + usize::from(index < available % count);
-                    scan.step(directory, retain, count == 1).map_err(|error| {
-                        format!("scan: {}: {error:#}", String::from_utf8_lossy(&label))
-                    })
+                    scan.step(directory, retain, count == 1)
+                        .map_err(|error| ScanWarning {
+                            path: Some(label),
+                            error: format!("{error:#}"),
+                        })
                 };
                 let steps: Vec<_> = if pool.is_some() {
                     work.into_par_iter().enumerate().map(inspect).collect()
@@ -514,7 +526,7 @@ fn receive_scan(
     ignored_batch: &mut Vec<PathBytes>,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<()> {
     let mut first_batch = true;
     loop {
@@ -571,7 +583,7 @@ pub fn scan(
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<u64> {
     let ignore = build_ignore(ignore)?;
     let md = if follow_root {
@@ -639,7 +651,7 @@ pub(crate) fn scan_descriptor(
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<u64> {
     if follow_root {
         anyhow::bail!("a descriptor-rooted scan never follows a root symlink");
@@ -718,7 +730,7 @@ pub(crate) fn scan_descriptor_selected(
     scan_root: &[u8],
     selections: &[PathBytes],
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-    warn: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<()> {
     let mut directories = Vec::with_capacity(selections.len());
     for relative in selections {
@@ -776,7 +788,7 @@ pub fn scan_rooted(
     guard: &ContainerGuard,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(String),
+    warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<u64> {
     if follow_root {
         anyhow::bail!("a signed receiver never follows a destination root symlink");
@@ -819,10 +831,10 @@ pub fn scan_rooted(
         let mut names = match root.read_directory(&directory) {
             Ok(names) => names,
             Err(error) => {
-                warn(format!(
-                    "scan: {}: {error:#}",
-                    String::from_utf8_lossy(&relative_to_scan)
-                ));
+                warn(ScanWarning {
+                    path: Some(relative_to_scan.clone()),
+                    error: format!("{error:#}"),
+                });
                 continue;
             }
         };
@@ -838,10 +850,10 @@ pub fn scan_rooted(
             let metadata = match root.metadata(&child) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    warn(format!(
-                        "scan: {}: {error:#}",
-                        String::from_utf8_lossy(&relative)
-                    ));
+                    warn(ScanWarning {
+                        path: Some(relative.clone()),
+                        error: format!("{error:#}"),
+                    });
                     continue;
                 }
             };
@@ -938,7 +950,7 @@ mod tests {
                 ignored.extend(batch);
                 Ok(())
             },
-            &mut |warning| warnings.push(warning),
+            &mut |warning| warnings.push(warning.to_string()),
         )
         .unwrap();
         (entries, ignored, warnings)

@@ -269,7 +269,7 @@ impl Conn for LocalConn {
         report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        warn: &mut dyn FnMut(String),
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         let mut capture = |mut batch: Vec<Entry>| {
             self.ops
@@ -321,7 +321,7 @@ impl Conn for LocalConn {
         source: &RegisteredPath,
         selections: &[PathBytes],
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-        warn: &mut dyn FnMut(String),
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<bool> {
         let Some(source) = self.ops.source_scan_root(Some(source))? else {
             return Ok(false);

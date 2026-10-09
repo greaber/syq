@@ -5398,6 +5398,7 @@ fn scan_into_planner(
         &mut |batch| f(pl, batch),
         &mut |_| Ok(()),
         &mut |w| {
+            let w = w.to_string();
             // "skipping …" is a notice (nothing the copy owes is missing);
             // anything else from the scanner means an entry was lost.
             if w.starts_with("skipping ") {

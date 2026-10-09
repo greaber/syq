@@ -2045,3 +2045,53 @@ fn pruning_enters_nested_unreadable_directories() {
         );
     }
 }
+
+/// Walk warnings carry their paths as bytes, so pruning recognizes the
+/// unreadable directories it widened whatever their names hold.
+#[test]
+fn pruning_enters_unreadable_directories_with_unusual_names() {
+    use std::os::unix::ffi::OsStrExt;
+    if unsafe { libc::geteuid() } == 0 || !cfg!(target_os = "linux") {
+        return;
+    }
+    for name in [b"extra-\xff".as_slice(), b"extra: spaced".as_slice()] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"a");
+        let extra = t.path("dst").join(std::ffi::OsStr::from_bytes(name));
+        fs::create_dir_all(extra.join("inner")).unwrap();
+        fs::write(extra.join("inner/f"), b"extra").unwrap();
+        fs::write(extra.join("g"), b"extra").unwrap();
+        fs::set_permissions(extra.join("inner"), fs::Permissions::from_mode(0o100)).unwrap();
+        fs::set_permissions(&extra, fs::Permissions::from_mode(0o100)).unwrap();
+        let (src, dst) = (t.s("src"), t.s("dst"));
+        let preview = native_syq(&[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--prune",
+            "--dry-run",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ]);
+        let out = native_syq(&[
+            "cp",
+            "--temporarily-widen-dir-permissions",
+            "--prune",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+        ]);
+        let _ = Command::new("chmod").args(["-R", "u+rwx", &dst]).status();
+        let case = String::from_utf8_lossy(name).into_owned();
+        assert_eq!(preview.status.code(), Some(23), "{case}: {preview:?}");
+        assert!(
+            stderr_of(&preview).contains(": not inspected: "),
+            "{case}: {preview:?}"
+        );
+        assert_output_ok(&out);
+        assert!(!extra.exists(), "{case}");
+        assert_eq!(listing(&t.path("dst")), ["a"], "{case}");
+    }
+}
