@@ -3430,7 +3430,11 @@ impl Planner<'_> {
         })
     }
 
-    fn leaf_condition_for(&self, path: &[u8], destination: Option<&Entry>) -> TargetCondition {
+    pub(super) fn leaf_condition_for(
+        &self,
+        path: &[u8],
+        destination: Option<&Entry>,
+    ) -> TargetCondition {
         let placement = self.exact_condition_for(path);
         if placement == TargetCondition::Any
             && destination.is_none()
