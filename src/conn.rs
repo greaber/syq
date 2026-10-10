@@ -1301,11 +1301,6 @@ impl Conn for RemoteConn {
                 Response::ScanIgnored(v) => ignored(v)?,
                 Response::ScanIgnoredCount(count) => ignored_count = count,
                 Response::ScanWarnAt(w) => warn(w),
-                // Text alone, as an older helper sent it.
-                Response::ScanWarn(w) => warn(crate::proto::ScanWarning {
-                    path: None,
-                    error: w.strip_prefix("scan: ").unwrap_or(&w).to_owned(),
-                }),
                 Response::ScanDone if saw_root => return Ok(ignored_count),
                 Response::ScanDone => bail!("{}: remote scan returned no root entry", self.label),
                 Response::Err(e) => bail!("{}: scan: {e}", self.label),

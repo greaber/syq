@@ -1583,6 +1583,8 @@ pub enum Response {
     /// failures, for which the coordinator may safely fall back to SSH.
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
+    /// No longer sent; ScanWarnAt replaced it. Kept so later responses keep
+    /// their wire numbers.
     ScanWarn(String),
     /// Paths (relative to the root) skipped because the ignore patterns matched them.
     ScanIgnored(Vec<PathBytes>),
@@ -1704,7 +1706,7 @@ pub enum Response {
     },
     /// Reply to ReceiverUser: the receiving process's effective user ID.
     ReceiverUser(u32),
-    /// A scan warning with its path. Replaces ScanWarn, which carries only
+    /// A scan warning with its path. Replaces ScanWarn, which carried only
     /// text.
     ScanWarnAt(ScanWarning),
 }
