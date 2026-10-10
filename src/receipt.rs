@@ -119,14 +119,23 @@ pub(crate) fn generate_recipient() -> Result<(RecipientSecret, [u8; 32])> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum OperationAction {
-    PublishFile { size: u64, inplace: bool },
+    PublishFile {
+        size: u64,
+        inplace: bool,
+    },
     EnsureDirectory,
     CreateSymlink,
-    CreateSpecial { kind: Kind },
-    SetMetadata { flags: u8 },
+    CreateSpecial {
+        kind: Kind,
+    },
+    SetMetadata {
+        flags: u8,
+    },
     DeleteFile,
     DeleteDirectory,
     ObserveFileHash,
+    /// A new name for a file already in the destination.
+    LinkFile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +343,11 @@ impl ReceiptStreamWriter {
         self.record_count
     }
 
+    #[cfg(test)]
+    pub(crate) fn summary(&self) -> &ReceiptSummary {
+        &self.summary
+    }
+
     pub(crate) fn mark_recording_failure(&mut self) {
         self.recording_failure
             .get_or_insert(RecordingFailure::StorageFailed);
@@ -487,6 +501,13 @@ fn summarize(record: &ReceiptRecord, summary: &mut ReceiptSummary) {
                 {
                     summary.published_files += 1;
                     summary.published_bytes = summary.published_bytes.saturating_add(size);
+                }
+                // Another name for a file counts as a file transferred, with
+                // no bytes, as an ordinary copy counts it.
+                OperationAction::LinkFile
+                    if record.disposition == OperationDisposition::Succeeded =>
+                {
+                    summary.published_files += 1;
                 }
                 OperationAction::DeleteFile | OperationAction::DeleteDirectory
                     if record.disposition == OperationDisposition::Succeeded =>
@@ -832,6 +853,7 @@ pub(crate) fn emit_automation_records(
                     OperationAction::DeleteFile => ("delete", Some("file"), None),
                     OperationAction::DeleteDirectory => ("delete", Some("dir"), None),
                     OperationAction::ObserveFileHash => ("observe_hash", Some("file"), None),
+                    OperationAction::LinkFile => ("transfer_file", Some("file"), Some(0)),
                 };
                 let mut value = serde_json::json!({
                     "type": "operation_result",

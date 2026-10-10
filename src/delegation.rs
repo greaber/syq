@@ -410,6 +410,36 @@ pub(crate) enum RootExistence {
     Existing,
 }
 
+const EXTRA_OPTIONS_EXTENSION: &str = "copy-options-v1";
+
+/// Copy options released after the signed `CopyOptions`. They are signed in
+/// a grant extension, so a receiver that predates them refuses the grant
+/// instead of silently dropping them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExtraCopyOptions {
+    pub hardlinks: bool,
+    pub acls: bool,
+    pub xattrs: bool,
+    pub atimes: bool,
+    pub crtimes: bool,
+    pub sparse: bool,
+    pub open_noatime: bool,
+}
+
+impl ExtraCopyOptions {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    /// The inode metadata these options let a request apply or select.
+    pub(crate) fn allows(&self, selection: crate::inode_metadata::Selection) -> bool {
+        (!selection.acls || self.acls)
+            && (!selection.xattrs || self.xattrs)
+            && (!selection.atimes || self.atimes)
+            && (!selection.crtimes || self.crtimes)
+            && (!selection.open_noatime || self.open_noatime)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct GrantBody {
     grant: Grant,
@@ -442,6 +472,7 @@ pub(crate) struct SignedGrantEnvelope {
     pub tcp_congestion: Option<String>,
     pub mapping: Option<crate::mapping::Authorization>,
     pub hashing: Option<crate::hashing::CopyHashing>,
+    pub extra_options: ExtraCopyOptions,
 }
 
 impl SignedGrantEnvelope {
@@ -456,6 +487,7 @@ impl SignedGrantEnvelope {
             tcp_congestion: None,
             mapping: None,
             hashing: None,
+            extra_options: ExtraCopyOptions::default(),
             signature,
         }
     }
@@ -472,6 +504,7 @@ impl SignedGrantEnvelope {
             self.tcp_congestion.as_deref(),
             self.mapping.as_ref(),
             self.hashing.as_ref(),
+            &self.extra_options,
         )?;
         if body.len() > MAX_GRANT_BYTES {
             bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -514,17 +547,22 @@ impl SignedGrantEnvelope {
         let body_bytes = &bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + grant_len];
         let (body, extension): (GrantBody, &[u8]) =
             postcard::take_from_bytes(body_bytes).context("decode signed grant")?;
-        let (tcp_congestion, mapping, hashing) = if extension.is_empty() {
-            (None, None, None)
+        let (tcp_congestion, mapping, hashing, extra_options) = if extension.is_empty() {
+            (None, None, None, ExtraCopyOptions::default())
         } else {
             let (kind, rest): (String, &[u8]) =
                 postcard::take_from_bytes(extension).context("decode signed grant extension")?;
             match kind.as_str() {
-                "tcp-congestion-v1" => (Some(postcard::from_bytes(rest)?), None, None),
+                "tcp-congestion-v1" => (
+                    Some(postcard::from_bytes(rest)?),
+                    None,
+                    None,
+                    ExtraCopyOptions::default(),
+                ),
                 "mapping-v1" => {
                     let (tcp, mapping): (Option<String>, crate::mapping::Authorization) =
                         postcard::from_bytes(rest)?;
-                    (tcp, Some(mapping), None)
+                    (tcp, Some(mapping), None, ExtraCopyOptions::default())
                 }
                 "copy-hashing-v2" => {
                     let (tcp, mapping, hashing): (
@@ -532,8 +570,9 @@ impl SignedGrantEnvelope {
                         Option<crate::mapping::Authorization>,
                         crate::hashing::CopyHashing,
                     ) = postcard::from_bytes(rest)?;
-                    (tcp, mapping, Some(hashing))
+                    (tcp, mapping, Some(hashing), ExtraCopyOptions::default())
                 }
+                EXTRA_OPTIONS_EXTENSION => postcard::from_bytes(rest)?,
                 _ => bail!("unknown signed grant extension"),
             }
         };
@@ -553,6 +592,7 @@ impl SignedGrantEnvelope {
             tcp_congestion.as_deref(),
             mapping.as_ref(),
             hashing.as_ref(),
+            &extra_options,
         )? != body_bytes
         {
             bail!("signed grant uses a noncanonical encoding");
@@ -572,6 +612,7 @@ impl SignedGrantEnvelope {
             tcp_congestion,
             mapping,
             hashing,
+            extra_options,
         })
     }
 
@@ -585,6 +626,7 @@ impl SignedGrantEnvelope {
             self.tcp_congestion.as_deref(),
             self.mapping.as_ref(),
             self.hashing.as_ref(),
+            &self.extra_options,
         )
     }
 }
@@ -614,6 +656,7 @@ pub(crate) fn validate_return_request(request: &crate::destination::CopyRequest)
         policy.tcp_congestion.as_deref(),
         policy.mapping.as_ref(),
         policy.hashing.as_ref(),
+        &policy.extra_options,
     )?;
     Ok(())
 }
@@ -649,6 +692,7 @@ pub(crate) fn sign_grant_with(
         tcp_congestion,
         mapping,
         hashing,
+        extra_options,
     } = constraints;
     filters.normalize();
     filters.validate(&grant)?;
@@ -661,6 +705,7 @@ pub(crate) fn sign_grant_with(
         tcp_congestion.as_deref(),
         mapping.as_ref(),
         hashing.as_ref(),
+        &extra_options,
     )?;
     let signature = sign(&payload)?;
     SignedGrantEnvelope {
@@ -673,6 +718,7 @@ pub(crate) fn sign_grant_with(
         tcp_congestion,
         mapping,
         hashing,
+        extra_options,
     }
     .encode()
 }
@@ -688,6 +734,7 @@ fn signing_payload_default(grant: &Grant, max_file_data_bytes_per_second: u64) -
         None,
         None,
         None,
+        &ExtraCopyOptions::default(),
     )
 }
 
@@ -701,6 +748,7 @@ fn signing_payload(
     tcp_congestion: Option<&str>,
     mapping: Option<&crate::mapping::Authorization>,
     hashing: Option<&crate::hashing::CopyHashing>,
+    extra_options: &ExtraCopyOptions,
 ) -> Result<Vec<u8>> {
     grant.validate_static()?;
     filters.validate(grant)?;
@@ -713,6 +761,7 @@ fn signing_payload(
         tcp_congestion,
         mapping,
         hashing,
+        extra_options,
     )?;
     if body.len() > MAX_GRANT_BYTES {
         bail!("canonical grant exceeds {MAX_GRANT_BYTES} bytes");
@@ -734,6 +783,7 @@ fn canonical_body_bytes(
     tcp_congestion: Option<&str>,
     mapping: Option<&crate::mapping::Authorization>,
     hashing: Option<&crate::hashing::CopyHashing>,
+    extra_options: &ExtraCopyOptions,
 ) -> Result<Vec<u8>> {
     receipt_policy.validate()?;
     // Preserve the released v0.4.1 body byte for byte when no override is
@@ -750,16 +800,27 @@ fn canonical_body_bytes(
     if let Some(algorithm) = tcp_congestion {
         crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
     }
-    if let Some(hashing) = hashing {
-        if let Some(expected) = &hashing.expected_hash {
-            expected.validate()?;
+    if let Some(expected) = hashing.and_then(|hashing| hashing.expected_hash.as_ref()) {
+        expected.validate()?;
+    }
+    if mapping.is_some() {
+        let GrantOperation::Copy(copy) = &grant.operation;
+        if copy.policy.deletion != DeletionPolicy::Forbid {
+            bail!("mapping authorization does not permit pruning");
         }
-        if mapping.is_some() {
-            let GrantOperation::Copy(copy) = &grant.operation;
-            if copy.policy.deletion != DeletionPolicy::Forbid {
-                bail!("mapping authorization does not permit pruning");
-            }
+    }
+    if !extra_options.is_default() {
+        let GrantOperation::Copy(copy) = &grant.operation;
+        if extra_options.acls && !copy.options.preserve_permissions {
+            bail!("ACL preservation requires permission preservation");
         }
+        // Released receivers reject this unknown extension, so a grant
+        // carrying these options never reaches a receiver that ignores them.
+        bytes.extend(postcard::to_stdvec(&(
+            EXTRA_OPTIONS_EXTENSION,
+            (tcp_congestion, mapping, hashing, extra_options),
+        ))?);
+    } else if let Some(hashing) = hashing {
         bytes.extend(postcard::to_stdvec(&(
             "copy-hashing-v2",
             tcp_congestion,
@@ -767,10 +828,6 @@ fn canonical_body_bytes(
             hashing,
         ))?);
     } else if let Some(mapping) = mapping {
-        let GrantOperation::Copy(copy) = &grant.operation;
-        if copy.policy.deletion != DeletionPolicy::Forbid {
-            bail!("mapping authorization does not permit pruning");
-        }
         bytes.extend(postcard::to_stdvec(&(
             "mapping-v1",
             tcp_congestion,
@@ -1226,6 +1283,7 @@ pub(crate) struct VerifiedGrant {
     pub tcp_congestion: Option<String>,
     pub mapping: Option<crate::mapping::Authorization>,
     pub hashing: Option<crate::hashing::CopyHashing>,
+    extra_options: ExtraCopyOptions,
 }
 
 /// Signed receiver policy carried alongside the copy grant.
@@ -1240,6 +1298,8 @@ pub(crate) struct GrantConstraints {
     pub mapping: Option<crate::mapping::Authorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hashing: Option<crate::hashing::CopyHashing>,
+    #[serde(default, skip_serializing_if = "ExtraCopyOptions::is_default")]
+    pub extra_options: ExtraCopyOptions,
 }
 
 #[cfg(test)]
@@ -1253,6 +1313,7 @@ impl Default for GrantConstraints {
             tcp_congestion: None,
             mapping: None,
             hashing: None,
+            extra_options: ExtraCopyOptions::default(),
         }
     }
 }
@@ -1274,6 +1335,7 @@ impl VerifiedGrant {
                 tcp_congestion: self.tcp_congestion,
                 mapping: self.mapping,
                 hashing: self.hashing,
+                extra_options: self.extra_options,
             },
             self.grant_digest,
             self.execution_deadline,
@@ -1319,6 +1381,7 @@ pub(crate) fn verify_and_redeem(
         tcp_congestion: envelope.tcp_congestion,
         mapping: envelope.mapping,
         hashing: envelope.hashing,
+        extra_options: envelope.extra_options,
         grant_digest,
         execution_deadline,
     })

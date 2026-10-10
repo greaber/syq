@@ -331,7 +331,7 @@ The three directory settings are independent:
 |---|---|---|
 | `--cwd DIR` | Starting directory for relative paths | `--auto-cwd` |
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
-| `--auto-approve-root DIR` | Downloads confined here skip approval | `--no-auto-approve-root` |
+| `--auto-approve-root DIR` | Downloads confined here skip approval, unless they copy ACLs, extended attributes, or hard links | `--no-auto-approve-root` |
 
 Each requires an existing directory with a UTF-8 path; neither root can be `/`.
 An explicit cwd must be inside the hard root, if set. Otherwise the starting
@@ -356,7 +356,7 @@ falling back to SSH when TCP is unreachable. `--no-tcp` forces SSH;
 The receiving connection must stay open throughout the copy.
 
 Copies support directories, symlinks, modification times, filters, hashing,
-resume, mappings, `--copy-metadata=permissions,ownership,specials`, and the
+resume, mappings, the `--copy-metadata` options, `--sparse`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
 `--inplace` is unsupported, and copies are refused while syq runs as root, so
 ownership and special files work as for any copy by an ordinary account.

@@ -21,6 +21,7 @@ pub(super) fn apply_one(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
+    owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
         let path = op_path(op);
@@ -63,6 +64,7 @@ pub(super) fn apply_one(
             source,
             dev,
             ino,
+            condition,
         } = op
         {
             let source = guarded_target(source, guard)?;
@@ -71,15 +73,16 @@ pub(super) fn apply_one(
                 source: source.relative.to_path_buf().into_os_string().into_vec(),
                 dev: *dev,
                 ino: *ino,
+                condition: *condition,
             };
-            return apply_one_rooted(&operation, &target.as_rooted());
+            return apply_one_rooted(&operation, &target.as_rooted(), owned);
         }
-        return apply_one_rooted(op, &target.as_rooted());
+        return apply_one_rooted(op, &target.as_rooted(), owned);
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target)
+    apply_one_rooted(op, &target, owned)
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -275,7 +278,7 @@ pub(super) fn guarded_target(path: &[u8], guard: &ContainerGuard) -> Result<Guar
     guarded_target_unheld(path, guard)
 }
 
-fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
+pub(super) fn guarded_target_unheld(path: &[u8], guard: &ContainerGuard) -> Result<GuardedTarget> {
     let root_path = resolve(&guard.root);
     let target = resolve(path);
     let relative = relative_under(&root_path, &target)?;
@@ -352,7 +355,13 @@ pub(super) fn observe_rooted_condition(
     }
 }
 
-fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
+/// Carry out `op` at `target`. With `owned`, a hard link gives a new name
+/// only to a file recorded there.
+fn apply_one_rooted(
+    op: &Op,
+    target: &RootedTarget,
+    owned: Option<&owned::OwnedObjects>,
+) -> Result<()> {
     let root = &target.root;
     let path = &target.relative;
     match op {
@@ -430,8 +439,19 @@ fn apply_one_rooted(op: &Op, target: &RootedTarget) -> Result<()> {
             }
         }
         Op::Hardlink {
-            source, dev, ino, ..
-        } => root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino)),
+            source,
+            dev,
+            ino,
+            condition,
+            ..
+        } => {
+            // The publication links only the file with this identity, so
+            // checking the identity checks the file linked (`OwnedObjects`).
+            if let Some(owned) = owned {
+                owned.require_link((*dev, *ino), &target.label)?;
+            }
+            root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino), *condition)
+        }
         Op::SetMeta {
             meta,
             flags,

@@ -129,9 +129,24 @@ pub(crate) struct RestrictedAuthority {
     pub(super) tcp_congestion: Option<String>,
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
+    pub(super) extra_options: crate::delegation::ExtraCopyOptions,
+    /// The files this receiver created for the grant, shared with every
+    /// connection's operations.
+    pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
 }
 
 impl RestrictedAuthority {
+    /// The files that may take new names by hard link, when the grant keeps
+    /// existing objects and copies hard links: those this receiver created
+    /// for the grant. Without hard links nothing is recorded.
+    pub(crate) fn owned_objects(
+        &self,
+    ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
+        (self.copy.policy.existing == ExistingDestinationPolicy::Skip
+            && self.extra_options.hardlinks)
+            .then(|| self.owned.clone())
+    }
+
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
         self.hashing.as_ref().map_or(
             crate::hashing::HashPolicy {
@@ -188,6 +203,7 @@ impl RestrictedAuthority {
             tcp_congestion,
             mapping,
             hashing,
+            extra_options,
         } = extensions;
         let enrollment_id = grant.enrollment_id;
         let request_id = grant.request_id;
@@ -235,6 +251,8 @@ impl RestrictedAuthority {
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
         let authority = Self {
             hashing,
+            extra_options,
+            owned: Default::default(),
             tcp_congestion,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
@@ -1060,6 +1078,21 @@ impl RestrictedAuthority {
                         error,
                     );
                 }
+                PendingOutcome::LogicalIfFailed {
+                    index,
+                    path,
+                    action,
+                } => {
+                    if let Some(error) = outcome_error(index) {
+                        self.append_operation(
+                            &mut state,
+                            &path,
+                            action,
+                            crate::receipt::OperationDisposition::Failed,
+                            Some(error),
+                        );
+                    }
+                }
                 PendingOutcome::Logical {
                     index,
                     path,
@@ -1280,6 +1313,7 @@ impl RestrictedAuthority {
                         index,
                         path: path.to_vec(),
                         persist: false,
+                        link: false,
                     });
                 }
                 Ok(())
@@ -1304,6 +1338,7 @@ impl RestrictedAuthority {
                     index,
                     path: path.to_vec(),
                     persist: true,
+                    link: false,
                 });
                 Ok(())
             }
@@ -1322,63 +1357,82 @@ impl RestrictedAuthority {
         condition: Option<&mut proto::TargetCondition>,
         pending: &[PendingCreation],
     ) -> Result<()> {
-        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let label = String::from_utf8_lossy(path);
         // A creation earlier in this same request (a symlink followed by its
-        // metadata, say) counts: the batch executes in order, so the
-        // metadata only ever lands on this request's own creation.
-        let own = self.created_by_this_grant(path)
-            || pending.iter().any(|creation| creation.path == path);
+        // metadata, say) counts: the request's metadata runs only once its
+        // no-replace creations have all succeeded.
+        let created_before = self.created_by_this_grant(path);
+        let created_here = pending
+            .iter()
+            .any(|creation| creation.path == path && !creation.link);
         match self.copy.policy.existing {
-            ExistingDestinationPolicy::Skip if own => Ok(()),
+            // A name this grant created leads only to an object it created,
+            // whatever runs on other connections meanwhile: the one step
+            // that could give it an existing file is a hard link, which
+            // this policy allows only to the grant's own files
+            // (`OwnedObjects`).
+            ExistingDestinationPolicy::Skip if created_before || created_here => Ok(()),
             ExistingDestinationPolicy::Skip => {
                 bail!("signed grant retains existing objects: {label} may not be modified")
             }
-            ExistingDestinationPolicy::MustExist if own => Ok(()),
-            ExistingDestinationPolicy::MustExist => {
-                // Updates are pinned to the observed object, like
-                // publications: nothing hostA supplies names an inode on its
-                // own authority.
-                let Some(metadata) = self.rooted_metadata(path)? else {
-                    bail!("signed grant creates nothing: {label} does not exist")
-                };
-                let Some(condition) = condition else {
-                    return Ok(());
-                };
-                match *condition {
-                    Any => {
-                        *condition = Matches {
-                            dev: metadata.dev,
-                            ino: metadata.ino,
-                        }
-                    }
-                    Absent => bail!(
-                        "no-replace update of {label} contradicts the signed existing-object policy"
-                    ),
-                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
-                    MatchesFingerprint {
-                        dev,
-                        ino,
-                        ctime,
-                        ctime_nsec,
-                    } if (dev, ino, ctime, ctime_nsec)
-                        == (
-                            metadata.dev,
-                            metadata.ino,
-                            metadata.ctime,
-                            metadata.ctime_nsec,
-                        ) => {}
-                    Matches { .. } | MatchesFingerprint { .. } => bail!(
-                        "requested identity for {label} does not match the object the receiver observed"
-                    ),
-                }
-                Ok(())
-            }
+            ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
+            // Updates are pinned to the observed object, like publications:
+            // nothing hostA supplies names an inode on its own authority.
+            ExistingDestinationPolicy::MustExist => self.pin_update(path, &label, condition),
             ExistingDestinationPolicy::Replace => Ok(()),
             ExistingDestinationPolicy::UpdateIfOlder => {
                 bail!("update-if-older existing-object policy is not enforceable by the receiver")
             }
         }
+    }
+
+    /// Hold an update of `path` to the object the receiver observes there
+    /// now: its device and inode, or the identity the sender named if it is
+    /// that object's. Execution then refuses a name that has come to lead
+    /// to another object. A change time would also tell an inode number
+    /// reused by a new file, but this copy's own links and publications
+    /// change it too, so it would refuse legitimate updates.
+    fn pin_update(
+        &self,
+        path: &[u8],
+        label: &str,
+        condition: Option<&mut proto::TargetCondition>,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let Some(metadata) = self.rooted_metadata(path)? else {
+            bail!("signed grant creates nothing: {label} does not exist")
+        };
+        let Some(condition) = condition else {
+            return Ok(());
+        };
+        match *condition {
+            Any => {
+                *condition = Matches {
+                    dev: metadata.dev,
+                    ino: metadata.ino,
+                }
+            }
+            Absent => {
+                bail!("no-replace update of {label} contradicts the signed existing-object policy")
+            }
+            Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+            MatchesFingerprint {
+                dev,
+                ino,
+                ctime,
+                ctime_nsec,
+            } if (dev, ino, ctime, ctime_nsec)
+                == (
+                    metadata.dev,
+                    metadata.ino,
+                    metadata.ctime,
+                    metadata.ctime_nsec,
+                ) => {}
+            Matches { .. } | MatchesFingerprint { .. } => bail!(
+                "requested identity for {label} does not match the object the receiver observed"
+            ),
+        }
+        Ok(())
     }
 
     /// Refuse staging work whose eventual publication the existing-object
@@ -1406,6 +1460,13 @@ impl RestrictedAuthority {
             | proto::flags::TIMES
             | proto::flags::REQUIRE_OWNER
             | proto::flags::REQUIRE_GROUP;
+        // A hard-link representative reports the identity its followers
+        // link to; that changes only the reply.
+        let known = if self.extra_options.hardlinks {
+            known | proto::flags::REPORT_IDENTITY
+        } else {
+            known
+        };
         if flags & !known != 0 {
             bail!("request contains unknown metadata flags");
         }
@@ -1456,15 +1517,25 @@ impl RestrictedAuthority {
         root.metadata_optional(&relative)
     }
 
-    /// Check metadata a request applies: the grant's flags, and no other
-    /// inode metadata. A receiver-chosen mode is the receiver's own to
-    /// decide, as on every receiver (`fsops::receiver_mode`).
+    /// Check metadata a request applies: the grant's flags, and only the
+    /// inode metadata the grant selects. A receiver-chosen mode is the
+    /// receiver's own to decide, as on every receiver
+    /// (`fsops::receiver_mode`).
     pub(super) fn check_metadata(&self, meta: &proto::Meta, flags: u8) -> Result<()> {
         self.check_flags(flags)?;
-        anyhow::ensure!(
-            meta.inode_metadata.is_none(),
-            "signed grants do not authorize additional inode metadata"
-        );
+        if let Some(metadata) = &meta.inode_metadata {
+            let requested = crate::inode_metadata::Selection {
+                acls: metadata.acls.is_some() || metadata.macos_acl.is_some(),
+                xattrs: metadata.xattrs.is_some(),
+                atimes: metadata.atime.is_some(),
+                crtimes: metadata.crtime.is_some(),
+                open_noatime: false,
+            };
+            anyhow::ensure!(
+                self.extra_options.allows(requested),
+                "request applies inode metadata not authorized by the signed grant"
+            );
+        }
         Ok(())
     }
 
@@ -1671,6 +1742,86 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// A new name for a file already in the signed scopes: a representative
+    /// this copy published or kept, as for an ordinary copy. The new name
+    /// follows the existing-object policy like any creation, and does not
+    /// make the file the grant's own. Keeping existing objects, the receiver
+    /// links only to files it created for the grant, which it checks as it
+    /// links (`OwnedObjects`); an honest copy then gives a group's new names
+    /// a new file of their own, as rsync does.
+    fn authorize_hardlink(
+        &self,
+        (path, source, identity, condition): (
+            &[u8],
+            &[u8],
+            (u64, u64),
+            &mut proto::TargetCondition,
+        ),
+        index: usize,
+        pending: &mut Vec<PendingCreation>,
+        outcomes: &mut Vec<PendingOutcome>,
+        touched: &mut Vec<Vec<u8>>,
+    ) -> Result<()> {
+        if !self.extra_options.hardlinks {
+            bail!("hardlink creation is not authorized by the signed grant");
+        }
+        if self.expected_hash(path)?.is_some() || self.expected_hash(source)?.is_some() {
+            bail!("expected hashes require their own file publications, not hard links");
+        }
+        self.check_mutation_path(source, false)?;
+        self.check_mutation_path(path, false)?;
+        if matches!(condition, proto::TargetCondition::MatchesFingerprint { .. }) {
+            bail!("hardlink publication accepts no fingerprint condition");
+        }
+        self.constrain_creation(path, condition, false, index, pending)?;
+        // Keeping existing files, a link replaces nothing, not even a name
+        // this grant created, as an honest copy links only new names there.
+        // The receiver links to the final name, which the kernel refuses
+        // when it exists.
+        let keep = self.copy.policy.existing == ExistingDestinationPolicy::Skip;
+        if keep {
+            *condition = proto::TargetCondition::Absent;
+        }
+        // The link replaces whatever this grant made at that name, in this
+        // request or before, so that name no longer makes a file its own.
+        for creation in pending.iter_mut().filter(|creation| creation.path == path) {
+            creation.persist = false;
+            creation.link = true;
+        }
+        self.state.lock().unwrap().created.remove(path);
+        // A name already linked to the file changes nothing; the copy
+        // reports it unchanged, as an ordinary copy does. The link is then
+        // held to that file, so that it succeeds only by finding the name
+        // still linked, and fails rather than link it again if the name
+        // changes first; a failure is recorded.
+        let linked = self
+            .rooted_metadata(path)?
+            .is_some_and(|metadata| (metadata.dev, metadata.ino) == identity);
+        if linked && !keep {
+            *condition = proto::TargetCondition::Matches {
+                dev: identity.0,
+                ino: identity.1,
+            };
+        }
+        touched.push(path.to_vec());
+        let path = path.to_vec();
+        let action = crate::receipt::OperationAction::LinkFile;
+        outcomes.push(if linked {
+            PendingOutcome::LogicalIfFailed {
+                index,
+                path,
+                action,
+            }
+        } else {
+            PendingOutcome::Logical {
+                index,
+                path,
+                action,
+            }
+        });
+        Ok(())
+    }
+
     pub(super) fn authorize_op(
         &self,
         operation: &mut Op,
@@ -1679,8 +1830,21 @@ impl RestrictedAuthority {
         outcomes: &mut Vec<PendingOutcome>,
         touched: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
-        if matches!(operation, Op::Hardlink { .. }) {
-            bail!("hardlink creation is not authorized by the signed grant");
+        if let Op::Hardlink {
+            path,
+            source,
+            dev,
+            ino,
+            condition,
+        } = operation
+        {
+            return self.authorize_hardlink(
+                (&*path, &*source, (*dev, *ino), condition),
+                index,
+                pending,
+                outcomes,
+                touched,
+            );
         }
         let path = match &*operation {
             Op::Mkdir { path, .. }
@@ -1698,7 +1862,7 @@ impl RestrictedAuthority {
                 }
                 path
             }
-            Op::Hardlink { .. } => unreachable!("hardlinks rejected above"),
+            Op::Hardlink { .. } => unreachable!("hardlinks are authorized above"),
             Op::Remove { .. } => {
                 bail!("recursive remove is not supported by the root-confined receiver")
             }
@@ -1740,7 +1904,7 @@ impl RestrictedAuthority {
             bail!("expected hash requires a regular file");
         }
         match operation {
-            Op::Hardlink { .. } => bail!("hardlink creation is not authorized by the signed grant"),
+            Op::Hardlink { .. } => unreachable!("hardlinks are authorized above"),
             Op::Mkdir {
                 path,
                 mode,
@@ -2574,8 +2738,18 @@ impl RestrictedAuthority {
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a command-restricted destination")
             }
-            Request::ConfigurePreservation { .. } => {
-                bail!("signed grants do not authorize additional inode metadata or read policies")
+            Request::ConfigurePreservation {
+                selection,
+                sparse,
+                narrow_new_directories,
+                ..
+            } => {
+                if *narrow_new_directories
+                    || (*sparse && !self.extra_options.sparse)
+                    || !self.extra_options.allows(*selection)
+                {
+                    bail!("inode metadata or read policy is not authorized by the signed grant");
+                }
             }
             Request::DescriptorCopy(_) | Request::BindStream(_) => {
                 bail!("descriptor copies are not valid on a command-restricted receiver")
@@ -2757,6 +2931,12 @@ pub(super) enum PendingOutcome {
         path: Vec<u8>,
         action: crate::receipt::OperationAction,
     },
+    /// An operation expected to change nothing, recorded only if it fails.
+    LogicalIfFailed {
+        index: usize,
+        path: Vec<u8>,
+        action: crate::receipt::OperationAction,
+    },
     FileStage {
         index: usize,
         path: Vec<u8>,
@@ -2793,4 +2973,7 @@ pub(crate) struct PendingCreation {
     pub(super) index: usize,
     pub(super) path: Vec<u8>,
     pub(super) persist: bool,
+    /// The name a hard link made, for a file that may already have been
+    /// there: never the grant's own, even later in its own request.
+    pub(super) link: bool,
 }

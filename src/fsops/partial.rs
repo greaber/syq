@@ -102,14 +102,23 @@ impl FsOps {
         write_only: bool,
     ) -> Result<File> {
         #[cfg(target_os = "macos")]
-        if self.inode_preservation.acls {
-            return root.create_private_file(relative);
-        }
-        if write_only {
+        let file = if self.inode_preservation.acls {
+            root.create_private_file(relative)
+        } else if write_only {
             root.create_write_only_file(relative, mode)
         } else {
             root.create_file(relative, mode)
+        }?;
+        #[cfg(not(target_os = "macos"))]
+        let file = if write_only {
+            root.create_write_only_file(relative, mode)
+        } else {
+            root.create_file(relative, mode)
+        }?;
+        if let Some(owned) = &self.owned {
+            owned.record(&file.metadata()?);
         }
+        Ok(file)
     }
 
     /// The mode for a new in-place file at `target`, created with `mode`
@@ -2858,6 +2867,7 @@ impl FsOps {
             &target.relative,
             &file,
             condition,
+            self.owned.as_deref(),
         )
         .map_err(|error| {
             if error
@@ -3702,12 +3712,16 @@ impl FsOps {
     }
 }
 
+/// Publish the private partial `staged` at `source` as `target`. With
+/// `owned`, the published file, which this receiver wrote, is recorded as
+/// its own.
 pub(super) fn publish_partial_rooted(
     root: &Root,
     source: &RelativePath,
     target: &RelativePath,
     staged: &File,
     condition: TargetCondition,
+    owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
     let metadata = staged.metadata()?;
     if !is_safe_partial(&metadata) {
@@ -3737,6 +3751,9 @@ pub(super) fn publish_partial_rooted(
         ),
     }?;
     sidecars::forget(staged_identity);
+    if let Some(owned) = owned {
+        owned.record(&metadata);
+    }
     Ok(())
 }
 

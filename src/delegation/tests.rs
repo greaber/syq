@@ -400,6 +400,7 @@ fn raw_envelope_with_rate(
         None,
         None,
         None,
+        &ExtraCopyOptions::default(),
     )
     .expect("encode test grant");
     let mut out = Vec::new();
@@ -500,6 +501,111 @@ fn congestion_extension_is_signed_and_cannot_be_removed_or_changed() {
         verified.into_parts().1.tcp_congestion.as_deref(),
         Some("cubic")
     );
+}
+
+#[test]
+fn extra_copy_options_are_signed_in_an_extension_released_readers_reject() {
+    let private = PrivateKey::new(
+        ssh_key::private::Ed25519Keypair::from_seed(&[42; 32]).into(),
+        "syq-test",
+    )
+    .unwrap();
+    let fixture = Fixture::ordinary();
+    fs::write(
+        &fixture.allowed_signers,
+        format!("{SIGNER} {}\n", private.public_key().to_openssh().unwrap()),
+    )
+    .unwrap();
+    let options = ExtraCopyOptions {
+        hardlinks: true,
+        acls: true,
+        xattrs: true,
+        sparse: true,
+        ..Default::default()
+    };
+    let encoded = sign_grant(
+        fixture_grant(44),
+        GrantConstraints {
+            tcp_congestion: Some("cubic".into()),
+            extra_options: options,
+            ..Default::default()
+        },
+        &private,
+    )
+    .unwrap();
+    let decoded = SignedGrantEnvelope::decode(&encoded).unwrap();
+    assert_eq!(decoded.extra_options, options);
+    assert_eq!(decoded.tcp_congestion.as_deref(), Some("cubic"));
+    assert_eq!(decoded.encode().unwrap(), encoded);
+
+    // Released readers know only these extensions and refuse any other, so
+    // they never run a copy whose options they would drop.
+    let body_length = u32::from_be_bytes(encoded[8..12].try_into().unwrap()) as usize;
+    let body = &encoded[WIRE_HEADER_LEN..WIRE_HEADER_LEN + body_length];
+    let (_, extension): (GrantBody, &[u8]) = postcard::take_from_bytes(body).unwrap();
+    let (kind, _): (String, &[u8]) = postcard::take_from_bytes(extension).unwrap();
+    assert!(!["tcp-congestion-v1", "mapping-v1", "copy-hashing-v2"].contains(&kind.as_str()));
+
+    // Without these options, grants keep their released encodings.
+    let plain = sign_grant(
+        fixture_grant(44),
+        GrantConstraints {
+            tcp_congestion: Some("cubic".into()),
+            ..Default::default()
+        },
+        &private,
+    )
+    .unwrap();
+    let body_length = u32::from_be_bytes(plain[8..12].try_into().unwrap()) as usize;
+    let body = &plain[WIRE_HEADER_LEN..WIRE_HEADER_LEN + body_length];
+    let (_, extension): (GrantBody, &[u8]) = postcard::take_from_bytes(body).unwrap();
+    let (kind, _): (String, &[u8]) = postcard::take_from_bytes(extension).unwrap();
+    assert_eq!(kind, "tcp-congestion-v1");
+
+    let replay = fixture.replay("extra-options-replay");
+    for changed in [
+        ExtraCopyOptions::default(),
+        ExtraCopyOptions {
+            xattrs: false,
+            ..options
+        },
+    ] {
+        let mut tampered = decoded.clone();
+        tampered.extra_options = changed;
+        assert!(verify_and_redeem(
+            &tampered.encode().unwrap(),
+            &context(SIGNER, TARGET, NOW, 0),
+            &fixture.policy(),
+            &replay
+        )
+        .is_err());
+    }
+    let verified = verify_and_redeem(
+        &encoded,
+        &context(SIGNER, TARGET, NOW, 0),
+        &fixture.policy(),
+        &replay,
+    )
+    .unwrap();
+    assert_eq!(verified.into_parts().1.extra_options, options);
+
+    // ACLs change permissions, so they need permission preservation.
+    let mut grant = fixture_grant(46);
+    let GrantOperation::Copy(copy) = &mut grant.operation;
+    copy.options.preserve_permissions = false;
+    copy.options.receiver_managed_modes = true;
+    assert!(sign_grant(
+        grant,
+        GrantConstraints {
+            extra_options: ExtraCopyOptions {
+                acls: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &private,
+    )
+    .is_err());
 }
 
 #[test]
