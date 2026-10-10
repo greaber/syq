@@ -501,9 +501,10 @@ With `--inplace`, writes still affect every existing name for that destination
 inode, including names outside the copy. A restricted receiver or receiving
 machine instead leaves unchanged a file with names it can't confirm are inside
 the copy's directory, for in-place writes and metadata updates alike, and
-reports an error for it. It confirms only names it has seen there, such as
-those the copy compared, so a file also linked from an excluded or unscanned
-name inside is left unchanged too.
+reports an error for that file. To confirm them, it lists the directory once
+per copy, the first time such a file has more than one name, and counts that
+file's names there. A file linked again after that listing, other than by the
+copy itself, is left unchanged too.
 
 Hardlink preservation scans all selected sources before changing the destination.
 Large trees therefore take longer to start copying and require memory for the
