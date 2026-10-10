@@ -5,13 +5,14 @@
 //! directories, from its own listing of them, and refuses the change unless
 //! it finds as many as the file has links.
 //!
-//! The listing is read once per copy, on the first such file. It walks each
-//! approved directory without following symlinks or entering another device
-//! (a file's links cannot cross devices), reads each directory once however
-//! it is reached (a bind mount, nested approved directories), and keeps the
-//! names of the files it finds more than once. Entries are what directories
-//! list: a directory that ignores case lists `a` once however it is spelled,
-//! so no name is ever compared with another.
+//! The listing is read once per copy, on the first such file, with the
+//! parallel scan copies use for destinations: it never follows a symlink.
+//! It keeps the names of the files with more than one link, leaving out
+//! directories on another device (a file's links cannot cross devices) and
+//! any directory reached a second time (a bind mount, nested approved
+//! directories). Entries are what directories list: a directory that
+//! ignores case lists `a` once however it is spelled, so no name is ever
+//! compared with another.
 //!
 //! Stale data only ever refuses. A check counts the names it kept that still
 //! lead to the file, so an entry removed, replaced or moved away since no
@@ -138,7 +139,7 @@ impl ScopeNames {
     /// name.
     pub(crate) fn require_inside(
         &self,
-        root: &Root,
+        root: &Arc<Root>,
         relative: &RelativePath,
         label: &Path,
         current: &dyn Fn() -> Result<LinkedFile>,
@@ -184,41 +185,33 @@ impl ScopeNames {
         }
     }
 
-    /// Read the approved directories: the names of every file found inside
-    /// more than once. A directory that cannot be read is left out, which can
-    /// only refuse a change.
-    fn list(&self, root: &Root) -> Listing {
+    /// Read the approved directories with the parallel scan copies use:
+    /// the names of the files with more than one link found inside. A
+    /// directory that cannot be read is left out, which can only refuse a
+    /// change.
+    fn list(&self, root: &Arc<Root>) -> Listing {
+        let mut listing = Listing::new();
         let mut visited = HashSet::new();
-        let mut directories = Vec::new();
-        // Each entry inside that is not a directory: its file, and the index
-        // of the directory listing it (none for an approved path itself).
-        let mut entries: Vec<(u64, u64, u32)> = Vec::new();
+        // Outer directories first, so that one nested in another is not
+        // scanned again.
+        let mut scopes: Vec<_> = self.scopes.iter().collect();
+        scopes.sort_by_key(|(scope, _)| scope.len());
         let mut exact = Vec::new();
-        for (scope, descendants) in &self.scopes {
-            let Some(path) = self
-                .relative(scope)
-                .and_then(|relative| RelativePath::new(relative).ok())
-            else {
+        for (scope, descendants) in scopes {
+            let Some(relative) = self.relative(scope) else {
                 continue;
             };
-            let walked = *descendants
-                && root
-                    .walk_directory_tree(
-                        &path,
-                        &mut visited,
-                        &mut directories,
-                        &mut |index, _, (dev, ino)| entries.push((dev, ino, index as u32)),
-                    )
-                    .unwrap_or(false);
-            if !walked {
+            let Ok(path) = RelativePath::new(relative) else {
+                continue;
+            };
+            if !(*descendants && list_tree(root, relative, &mut visited, &mut listing)) {
                 exact.push(path);
             }
         }
         // An approved path that is not a directory is one entry, counted
         // once per directory and file: two approved spellings of one entry
-        // must not count twice, and an entry in a directory read above has
-        // been counted there.
-        let mut exact_names = Vec::new();
+        // must not count twice, and an entry in a directory scanned above
+        // has been counted there.
         let mut counted = HashSet::new();
         for path in exact {
             let Ok(Some(file)) = root.metadata_optional(&path) else {
@@ -233,55 +226,84 @@ impl ScopeNames {
                 continue;
             };
             let directory = (directory.dev, directory.ino);
-            if file.is_dir()
-                || visited.contains(&directory)
-                || !counted.insert((directory, (file.dev, file.ino)))
+            if !file.is_dir()
+                && file.nlink > 1
+                && !visited.contains(&directory)
+                && counted.insert((directory, (file.dev, file.ino)))
             {
-                continue;
-            }
-            entries.push((file.dev, file.ino, u32::MAX));
-            exact_names.push(((file.dev, file.ino), path_bytes(&path)));
-        }
-        // The files listed more than once, and the directories listing them.
-        entries.sort_unstable();
-        let mut several = HashSet::new();
-        let mut holding = HashSet::new();
-        for run in entries.chunk_by(|left, right| (left.0, left.1) == (right.0, right.1)) {
-            if run.len() > 1 {
-                several.insert((run[0].0, run[0].1));
-                holding.extend(
-                    run.iter()
-                        .map(|entry| entry.2)
-                        .filter(|&index| index != u32::MAX),
-                );
-            }
-        }
-        drop(entries);
-        let mut listing = Listing::new();
-        for index in holding {
-            let (relative, identity) = &directories[index as usize];
-            let Ok(path) = RelativePath::new(relative) else {
-                continue;
-            };
-            let _ = root.read_directory_inodes(&path, *identity, &mut |name, ino| {
-                let file = (identity.0, ino);
-                if several.contains(&file) {
-                    let name = if relative.is_empty() {
-                        name.to_vec()
-                    } else {
-                        join(relative, name)
-                    };
-                    listing.entry(file).or_default().push(name.into());
-                }
-            });
-        }
-        for (file, name) in exact_names {
-            if several.contains(&file) {
-                listing.entry(file).or_default().push(name.into());
+                listing
+                    .entry((file.dev, file.ino))
+                    .or_default()
+                    .push(path_bytes(&path).into());
             }
         }
         listing
     }
+}
+
+/// Add to `listing` the names of the files with more than one link in the
+/// directory tree at `relative` beneath `root`, scanned as a copy scans a
+/// destination: without following a symlink. A directory on another device
+/// is left out, since a file's links cannot cross devices, and so is one
+/// already read under another name (`visited`: a bind mount, or an approved
+/// directory nested in another). Returns whether `relative` is a directory.
+fn list_tree(
+    root: &Arc<Root>,
+    relative: &[u8],
+    visited: &mut HashSet<(u64, u64)>,
+    listing: &mut Listing,
+) -> bool {
+    let top = match RelativePath::new(relative).map(|path| root.metadata_optional(&path)) {
+        Ok(Ok(Some(top))) if top.is_dir() => top,
+        _ => return false,
+    };
+    if !visited.insert((top.dev, top.ino)) {
+        return true;
+    }
+    // Whether each directory scanned counts, by its path in the tree. The
+    // scan reports a directory before anything in it.
+    let mut counted = HashMap::from([(Vec::new(), true)]);
+    let _ = crate::scan::scan_descriptor(
+        root.clone(),
+        relative,
+        None,
+        false,
+        false,
+        &[],
+        false,
+        &mut |batch| {
+            for entry in batch {
+                if entry.path.is_empty() {
+                    continue;
+                }
+                let parent = entry
+                    .path
+                    .iter()
+                    .rposition(|byte| *byte == b'/')
+                    .map_or(&entry.path[..0], |slash| &entry.path[..slash]);
+                let inside = counted.get(parent).copied().unwrap_or(false);
+                if entry.kind == Kind::Dir {
+                    let counts =
+                        inside && entry.dev == top.dev && visited.insert((entry.dev, entry.ino));
+                    counted.insert(entry.path, counts);
+                } else if inside && entry.nlink > 1 {
+                    let name = if relative.is_empty() {
+                        entry.path
+                    } else {
+                        join(relative, &entry.path)
+                    };
+                    listing
+                        .entry((entry.dev, entry.ino))
+                        .or_default()
+                        .push(name.into());
+                }
+            }
+            Ok(())
+        },
+        &mut |_| Ok(()),
+        &mut |_| {},
+    );
+    true
 }
 
 /// The bytes of `path`.
@@ -385,7 +407,7 @@ mod tests {
     /// the file at `name` beneath `base` as the receiver makes it.
     struct Fixture {
         base: PathBuf,
-        root: Root,
+        root: Arc<Root>,
         names: ScopeNames,
     }
 
@@ -400,7 +422,7 @@ mod tests {
         fn with_scopes(base: &Path, scopes: &[(&str, bool)]) -> Self {
             Self {
                 base: base.to_path_buf(),
-                root: Root::open(base).unwrap(),
+                root: Arc::new(Root::open(base).unwrap()),
                 names: ScopeNames::new(
                     bytes(base),
                     scopes
@@ -814,22 +836,10 @@ mod measure {
         (seconds(usage.ru_utime), seconds(usage.ru_stime))
     }
 
-    /// The listing of an approved directory of `SYQ_MEASURE_ENTRIES` files
-    /// (500,000 by default, 1,000 to a directory), which one file with two
-    /// names among them makes the receiver read; and a check of a file with
-    /// one name, which reads nothing. `SYQ_MEASURE_DIRECTORY` names an
-    /// existing tree to use instead. Run explicitly in a release build.
-    #[test]
-    #[ignore]
-    fn measure_scope_listing() {
-        let entries: usize = std::env::var("SYQ_MEASURE_ENTRIES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(500_000);
-        let temporary = crate::test_support::tempdir().unwrap();
-        let base = temporary.path();
-        let scope = base.join("scope");
-        fs::create_dir(&scope).unwrap();
+    /// `entries` empty files in `scope`, 1,000 to a directory, one of them
+    /// also linked as `d0000/linked`.
+    pub(super) fn create_measured_tree(scope: &Path, entries: usize) {
+        fs::create_dir(scope).unwrap();
         for index in 0..entries {
             let directory = scope.join(format!("d{:04}", index / 1000));
             if index % 1000 == 0 {
@@ -838,9 +848,44 @@ mod measure {
             File::create(directory.join(format!("f{index:07}"))).unwrap();
         }
         fs::hard_link(scope.join("d0000/f0000000"), scope.join("d0000/linked")).unwrap();
+    }
+
+    /// The tree `create_measured_tree` makes, at `SYQ_MEASURE_DIRECTORY`/scope
+    /// with `SYQ_MEASURE_ENTRIES` entries. Run explicitly.
+    #[test]
+    #[ignore]
+    fn create_measured_scope() {
+        let base = PathBuf::from(std::env::var_os("SYQ_MEASURE_DIRECTORY").unwrap());
+        let entries = std::env::var("SYQ_MEASURE_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(500_000);
+        create_measured_tree(&base.join("scope"), entries);
+    }
+
+    /// The listing of an approved directory of `SYQ_MEASURE_ENTRIES` files
+    /// (500,000 by default, 1,000 to a directory), which one file with two
+    /// names among them makes the receiver read; and a check of a file with
+    /// one name, which reads nothing. `SYQ_MEASURE_DIRECTORY` names a
+    /// directory holding such a tree (`create_measured_scope`) to use
+    /// instead. Run explicitly in a release build.
+    #[test]
+    #[ignore]
+    fn measure_scope_listing() {
+        let entries: usize = std::env::var("SYQ_MEASURE_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(500_000);
+        let temporary = crate::test_support::tempdir().unwrap();
+        let given = std::env::var_os("SYQ_MEASURE_DIRECTORY").map(PathBuf::from);
+        let base = given.as_deref().unwrap_or(temporary.path());
+        let scope = base.join("scope");
+        if given.is_none() {
+            create_measured_tree(&scope, entries);
+        }
         let bytes = |path: &Path| path.as_os_str().as_bytes().to_vec();
         let names = ScopeNames::new(bytes(base), [(bytes(&scope), true)]);
-        let root = Root::open(base).unwrap();
+        let root = Arc::new(Root::open(base).unwrap());
         let check = |name: &str| {
             let file = File::open(base.join(name)).unwrap();
             names.require_inside(
@@ -864,11 +909,16 @@ mod measure {
             rss,
             status_kb("VmRSS:"),
         );
+        // The listing itself, as a check of a file with two names reads it.
+        // Read directly, so that it is measured on filesystems that report
+        // one link for every file too (SSHFS).
+        let linked = fs::metadata(scope.join("d0000/linked")).unwrap().nlink() > 1;
         let started = std::time::Instant::now();
-        check("scope/d0000/f0000000").unwrap();
+        let listing = names.list(&root);
         let (user_after, system_after) = cpu_seconds();
         eprintln!(
-            "MEASURE listing {entries} entries: {:.3}s elapsed, {:.3}s user, {:.3}s system; peak RSS {} kB (before {} kB, peak before {} kB), RSS after {} kB",
+            "MEASURE listing {} directories: {:.3}s elapsed, {:.3}s user, {:.3}s system; peak RSS {} kB (before {} kB, peak before {} kB), RSS after {} kB; {} files with several links",
+            fs::read_dir(&scope).unwrap().count(),
             started.elapsed().as_secs_f64(),
             user_after - user,
             system_after - system,
@@ -876,12 +926,20 @@ mod measure {
             rss,
             peak,
             status_kb("VmRSS:"),
+            listing.len(),
         );
-        let started = std::time::Instant::now();
-        check("scope/d0000/linked").unwrap();
-        eprintln!(
-            "MEASURE a second check: {:.6}s",
-            started.elapsed().as_secs_f64()
-        );
+        if linked {
+            *names.listing.lock().unwrap() = Some(listing);
+            let started = std::time::Instant::now();
+            check("scope/d0000/f0000000").unwrap();
+            check("scope/d0000/linked").unwrap();
+            eprintln!(
+                "MEASURE two checks after it: {:.6}s",
+                started.elapsed().as_secs_f64()
+            );
+        } else {
+            eprintln!("MEASURE this filesystem reports one link for every file");
+        }
+        let _ = entries;
     }
 }

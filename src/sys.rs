@@ -156,47 +156,6 @@ pub(crate) fn directory_names(directory: File) -> io::Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
-/// Each entry of `directory` but `.` and `..`, as the directory lists it:
-/// its name, its inode number and its type (`DT_UNKNOWN` where the
-/// directory does not say). Takes over `directory` like [`directory_names`].
-pub(crate) fn for_each_directory_entry(
-    directory: File,
-    mut entry: impl FnMut(&[u8], u64, u8),
-) -> io::Result<()> {
-    struct DirectoryStream(*mut libc::DIR);
-    impl Drop for DirectoryStream {
-        fn drop(&mut self) {
-            let _ = unsafe { libc::closedir(self.0) };
-        }
-    }
-
-    let descriptor = directory.into_raw_fd();
-    let stream = unsafe { libc::fdopendir(descriptor) };
-    if stream.is_null() {
-        let error = io::Error::last_os_error();
-        let _ = unsafe { libc::close(descriptor) };
-        return Err(error);
-    }
-    let stream = DirectoryStream(stream);
-    loop {
-        set_errno(0);
-        let listed = unsafe { libc::readdir(stream.0) };
-        if listed.is_null() {
-            let errno = get_errno();
-            if errno != 0 {
-                return Err(io::Error::from_raw_os_error(errno));
-            }
-            return Ok(());
-        }
-        let name = unsafe { CStr::from_ptr((*listed).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            entry(name, unsafe { (*listed).d_ino } as u64, unsafe {
-                (*listed).d_type
-            });
-        }
-    }
-}
-
 /// Whether a directory has no entries but `.` and `..`, reading no further
 /// than the first one. Takes over `directory` like [`directory_names`].
 pub(crate) fn directory_is_empty(directory: File) -> io::Result<bool> {

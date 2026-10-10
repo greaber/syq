@@ -2715,7 +2715,7 @@ impl FsOps {
     fn cached_rooted(
         &mut self,
         label: &Path,
-        root: &Root,
+        root: &Arc<Root>,
         relative: &RelativePath,
         attempt: u32,
         private: bool,

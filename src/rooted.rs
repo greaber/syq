@@ -1129,107 +1129,6 @@ impl Root {
         directory_names(readable).context("read confined directory")
     }
 
-    /// Read the directory tree at `path` without following a symlink or
-    /// entering another device, and each directory once however it is
-    /// reached: `visited` holds the identities of the directories read. Each
-    /// directory read is added to `directories`, with its path and identity,
-    /// and `entry` sees every entry in it that is not a directory: the
-    /// directory's index there, the entry's name, and its file: the
-    /// directory's device and the inode number the directory lists. A directory that cannot be opened or read is left
-    /// out. Returns whether `path` is a directory.
-    pub(crate) fn walk_directory_tree(
-        &self,
-        path: &RelativePath,
-        visited: &mut std::collections::HashSet<(u64, u64)>,
-        directories: &mut Vec<(Vec<u8>, (u64, u64))>,
-        entry: &mut ListedEntry<'_>,
-    ) -> Result<bool> {
-        let Ok(start) = open_directory_components(&self.directory, &path.components) else {
-            return Ok(false);
-        };
-        let metadata = start.metadata()?;
-        let device = metadata.dev();
-        let identity = (device, metadata.ino());
-        if !visited.insert(identity) {
-            return Ok(true);
-        }
-        // Directories still to read, by their parent, held open meanwhile;
-        // depth first, so only the parents of one path are open at a time.
-        let mut pending: Vec<PendingDirectory> = Vec::new();
-        let mut next = Some((start, path.components.join(&b'/'), identity));
-        loop {
-            let (directory, relative, identity) = match next.take() {
-                Some(next) => next,
-                None => {
-                    let Some((parent, parent_path, name)) = pending.pop() else {
-                        return Ok(true);
-                    };
-                    let Ok(child) = open_directory_at(&parent, &name) else {
-                        continue;
-                    };
-                    let Ok(metadata) = child.metadata() else {
-                        continue;
-                    };
-                    let identity = (metadata.dev(), metadata.ino());
-                    if identity.0 != device || !visited.insert(identity) {
-                        continue;
-                    }
-                    let mut relative = parent_path.to_vec();
-                    if !relative.is_empty() {
-                        relative.push(b'/');
-                    }
-                    relative.extend_from_slice(&name);
-                    (child, relative, identity)
-                }
-            };
-            let index = directories.len();
-            directories.push((relative.clone(), identity));
-            let Ok(readable) = open_readable_directory_at(&directory, b".") else {
-                continue;
-            };
-            let mut subdirectories = Vec::new();
-            let _ = crate::sys::for_each_directory_entry(readable, |name, ino, kind| {
-                if is_listed_directory(&directory, name, kind) {
-                    subdirectories.push(name.to_vec());
-                } else {
-                    entry(index, name, (device, ino));
-                }
-            });
-            let directory = std::rc::Rc::new(directory);
-            let relative: std::rc::Rc<[u8]> = relative.into();
-            pending.extend(
-                subdirectories
-                    .into_iter()
-                    .map(|name| (directory.clone(), relative.clone(), name)),
-            );
-        }
-    }
-
-    /// Each entry of the directory `path`, while it is still the directory
-    /// `identity`, that is not a directory: its name and its inode number as
-    /// the directory lists it.
-    pub(crate) fn read_directory_inodes(
-        &self,
-        path: &RelativePath,
-        identity: (u64, u64),
-        entry: &mut dyn FnMut(&[u8], u64),
-    ) -> Result<()> {
-        let directory = open_directory_components(&self.directory, &path.components)
-            .with_context(|| format!("open confined directory {}", path.label()))?;
-        let metadata = directory.metadata()?;
-        if (metadata.dev(), metadata.ino()) != identity {
-            bail!("confined directory {} changed", path.label());
-        }
-        let readable = open_readable_directory_at(&directory, b".")
-            .context("open readable confined directory")?;
-        crate::sys::for_each_directory_entry(readable, |name, ino, kind| {
-            if !is_listed_directory(&directory, name, kind) {
-                entry(name, ino);
-            }
-        })
-        .with_context(|| format!("read confined directory {}", path.label()))
-    }
-
     /// Whether a retained directory has no entries, reading only as far as
     /// the first.
     pub(crate) fn open_directory_is_empty(&self, directory: &File) -> Result<bool> {
@@ -2678,27 +2577,6 @@ fn open_components_openat2(
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
-    }
-}
-
-/// What a directory tree walk sees of each entry that is not a directory:
-/// the index of the directory listing it, its name, and its file (device and
-/// listed inode number).
-pub(crate) type ListedEntry<'a> = dyn FnMut(usize, &[u8], (u64, u64)) + 'a;
-
-/// A directory a tree walk still has to read: its parent, held open, the
-/// parent's path, and its name.
-type PendingDirectory = (std::rc::Rc<File>, std::rc::Rc<[u8]>, Vec<u8>);
-
-/// Whether the entry `name` of `directory`, listed as of type `kind`, is a
-/// directory, looking only when the listing does not say.
-fn is_listed_directory(directory: &File, name: &[u8], kind: u8) -> bool {
-    match kind {
-        libc::DT_DIR => true,
-        libc::DT_UNKNOWN => CString::new(name).is_ok_and(|name| {
-            metadata_at(directory.as_raw_fd(), &name).is_ok_and(|metadata| metadata.is_dir())
-        }),
-        _ => false,
     }
 }
 

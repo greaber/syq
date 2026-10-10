@@ -3380,8 +3380,8 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     fs::create_dir_all(&second).unwrap();
     fs::write(first.join("same"), b"first").unwrap();
     fs::write(second.join("same"), b"second").unwrap();
-    let first_root = Root::open(&first).unwrap();
-    let second_root = Root::open(&second).unwrap();
+    let first_root = Arc::new(Root::open(&first).unwrap());
+    let second_root = Arc::new(Root::open(&second).unwrap());
     let relative = RelativePath::new(b"same").unwrap();
     let mut operations = FsOps::new();
 
