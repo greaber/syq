@@ -96,6 +96,14 @@ impl HttpConnector for Responses {
         let fault = self.fault;
         HttpConnectorFuture::new(async move {
             let mut response = HttpResponse::new(206.try_into().unwrap(), SdkBody::empty());
+            if fault == "unreadable-metadata" {
+                let mut raw = response.try_into_http1x().unwrap();
+                raw.headers_mut().insert(
+                    "x-amz-meta-label",
+                    http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+                );
+                response = HttpResponse::try_from(raw).unwrap();
+            }
             if fault == "changed" {
                 *response.status_mut() = 412.try_into().unwrap();
                 return Ok(response);
@@ -219,8 +227,16 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
         )
         .await;
     seed.await.unwrap();
-    let failed = matches!(fault, "changed" | "corrupt" | "range");
+    let failed = matches!(
+        fault,
+        "changed" | "corrupt" | "range" | "unreadable-metadata"
+    );
     assert_eq!(result.is_err(), failed, "{fault}: {result:?}");
+    if fault == "unreadable-metadata" {
+        let message = format!("{:#}", result.as_ref().unwrap_err());
+        assert!(message.contains("S3 GET failed"), "{message}");
+        assert!(message.contains("Metadata"), "{message}");
+    }
     let expected_requests = if retries == 0 || !peers || paced || fault == "uniform" {
         0
     } else if matches!(fault, "truncated" | "throttled") {
@@ -284,6 +300,11 @@ async fn slow_read_recovery_preserves_contents_and_identity() {
     ] {
         copy(fault, if fault == "truncated" { 2 } else { 1 }, true, false).await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_metadata_in_replacement_get_reports_header() {
+    copy("unreadable-metadata", 3, true, false).await;
 }
 
 #[tokio::test(start_paused = true)]
