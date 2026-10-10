@@ -1651,6 +1651,24 @@ impl Root {
         let source_parent = self.resolve_parent(source)?;
         #[cfg(any(target_os = "linux", test))]
         let _permit = self.mutation_permit(target)?;
+        // On Linux the link is made from the descriptor checked above, so a
+        // new name needs no temporary: one link to the final name, which the
+        // kernel refuses while the name exists. Elsewhere the source is
+        // linked by name, and the temporary lets the receiver check what it
+        // linked before publishing it.
+        #[cfg(target_os = "linux")]
+        if condition == Absent {
+            return retry_zero(|| unsafe {
+                libc::linkat(
+                    libc::AT_FDCWD,
+                    source_name.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    parent.leaf.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            })
+            .with_context(|| format!("publish hardlink {}", target.label()));
+        }
         let temporary = create_temporary(&parent, |fd, name| {
             #[cfg(target_os = "linux")]
             let result = retry_zero(|| unsafe {
