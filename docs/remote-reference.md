@@ -25,7 +25,9 @@ Use a real directory, not a symlink. Transfers cannot overwrite the receiver's
 SSH configuration, programs, or enrollment state. Manage that state with
 `syq receiver` commands; it is not a disposable cache.
 
-New enrollments match the SSH key that authenticated setup. Ed25519 stays
+Each enrollment has a grant-signing key and a separate Ed25519 SSH key that can
+only enter the receiver. The grant-signing key matches the SSH key that
+authenticated setup. Ed25519 stays
 Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
 Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
 hardware-backed key with the same effective touch and PIN requirements;
@@ -35,7 +37,7 @@ PIN-protected keys need a working `SSH_ASKPASS` program in that agent's
 environment; the agent cannot use syq's terminal for its PIN prompt. Enrollment
 stops before installation if the signing check fails.
 
-For a passphrase-protected Ed25519 or RSA login, the receiver key is encrypted
+For a passphrase-protected Ed25519 or RSA login, the grant-signing key is encrypted
 using a secret derived through the login key's SSH agent. There is no new
 passphrase. If the login key is not loaded, `ssh-add` asks for its usual
 passphrase. Syq uses the agent selected by the destination's `IdentityAgent`
@@ -57,8 +59,13 @@ for interruption and retry behavior.
 
 Stop active copies before upgrading: replacing the executable does not update
 running receivers. Repeat `syq receiver enroll hostB:/destination` afterward
-to refresh the installed receiver. Compatible enrollment keys and replay records
-are preserved. Different client builds cannot share one installed receiver
+to refresh the installed receiver. Compatible grant-signing keys and replay records
+are preserved. An older enrollment that used one key for both purposes gains a
+separate SSH key on its next copy or explicit enrollment; the original key
+continues signing grants. A dry run requires this upgrade to be completed first
+with `receiver enroll`. The upgrade also preserves its receipt key and identity.
+Older clients cannot use the upgraded enrollment; use the newer build to manage
+or revoke it. Different client builds cannot share one installed receiver
 concurrently; each needs a matching receiver.
 
 An incompatible enrollment requires fresh setup, which needs ordinary SSH
@@ -123,7 +130,8 @@ right contents. See [A compromised source server](security.md#a-compromised-sour
 | `--peer-auth full-agent` | Ordinary, unrestricted agent forwarding |
 | `--rsh COMMAND` | Whatever your supplied SSH command permits |
 
-With `--peer-auth broker`, syq uses the coordinating host's configured
+`--peer-auth broker` requires OpenSSH 8.9 or newer on the invoking machine,
+the coordinating client, and the peer SSH server. It uses the coordinating host's configured
 `IdentityAgent` for the outer SSH connection and the peer host's configured
 agent for forwarded authentication. The two hosts can use separate agents.
 

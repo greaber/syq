@@ -362,8 +362,11 @@ pub(super) fn enroll(
         bail!(privileged_receiver_message(existing.as_deref()));
     }
     if !refresh_existing {
-        if let Some(existing) = active.take() {
-            return Ok(existing);
+        if active
+            .as_ref()
+            .is_some_and(|(metadata, _, _)| metadata.version == CONFIG_VERSION)
+        {
+            return Ok(active.take().unwrap());
         }
     }
     let retry_state = if active.is_some() {
@@ -407,7 +410,9 @@ pub(super) fn enroll(
         }
     };
     let public_key = private_key.to_openssh()?;
+    let ssh_key = ensure_ssh_key(&directory)?;
     let request = InstallRequest {
+        ssh_public_key: Some(ssh_key.public_key().to_openssh()?),
         security_key_flags: pending.security_key_flags,
         version: CONFIG_VERSION,
         id: pending.id,
@@ -604,7 +609,9 @@ fn create_over_route(
         &serde_json::to_vec(&pending)?,
         0o600,
     )?;
+    let ssh_key = ensure_ssh_key(&directory)?;
     let request = InstallRequest {
+        ssh_public_key: Some(ssh_key.public_key().to_openssh()?),
         version: CONFIG_VERSION,
         id,
         target_login: login.to_owned(),

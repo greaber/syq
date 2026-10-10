@@ -218,6 +218,7 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             };
             let public_key = load_enrollment_public_key(&directory)?;
             let request = RevokeRequest {
+                ssh_public_key: optional_ssh_public_key(&directory)?,
                 security_key_flags,
                 version: CONFIG_VERSION,
                 id,

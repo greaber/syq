@@ -719,6 +719,7 @@ fn constrained_agent_forwarding_requires_openssh_8_9() {
         Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
+                "--peer-auth=broker",
                 "--srcs-in",
                 "/src",
                 "--from",
