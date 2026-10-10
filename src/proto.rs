@@ -1367,8 +1367,9 @@ pub enum WireRequest<Data> {
         checks: Vec<DirectoryAncestryCheck>,
         selection_in_copy: bool,
     },
-    /// Select an operator directory and require kernel-checked search access.
-    /// rsync enters its destination before changing any copied directories.
+    /// Select an operator directory and require kernel-checked search access:
+    /// a copy that cannot widen its destination refuses one it cannot enter,
+    /// as rsync does.
     CheckSearchableOperatorDirectory {
         path: PathBytes,
         allow_missing: bool,

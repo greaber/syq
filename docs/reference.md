@@ -436,17 +436,17 @@ to change its entries, and read to list it.
 - `rsync`, the `syq rsync` default, widens the directories the copy includes, as
   rsync does: the destination of a contents copy, an existing `--as`
   directory, and the directories beneath them that the copy fills or prunes,
-  also with `--if-exists=keep`. Like rsync, it requires the destination to be
-  searchable already: the `--into` directory, an existing `--as` directory, or
-  the directory another `--as` target goes into. It does not widen the
-  directory a named source or an `--as` target goes into, or enter
-  destination-only directories it cannot read.
+  also with `--if-exists=keep`. It does not widen the directory a named source
+  or an `--as` target goes into, or enter destination-only directories it
+  cannot read.
 - `all` also widens the directory the copy goes into and the directories above
   it, including the one where syq creates missing parents, and enters unreadable
   destination-only directories to prune them.
 
-A change that fails in a directory you own suggests the mode that would have
-made it. Syq restores each directory's exact mode after copying and pruning,
+Under `none` and `rsync`, both commands refuse, as rsync does, a destination
+they cannot search: the `--into` directory, an existing `--as` directory, or
+the directory another `--as` target goes into. A change that fails in a
+directory you own suggests the mode that would have made it. Syq restores each directory's exact mode after copying and pruning,
 also when the copy fails, unless you request permissions. Other processes can
 see the temporary permissions, and a crash or forced termination can leave
 them in place. Root skips widening. A restricted receiver refuses `all`.

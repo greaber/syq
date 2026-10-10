@@ -829,10 +829,11 @@ fn temporary_directory_permissions_restore_after_copy_failure() {
 }
 
 /// What each mode widens, for every placement: `rsync` widens only
-/// directories the copy includes, a contents copy's destination among them,
-/// and in both commands requires the destination to be searchable already;
+/// directories the copy includes, a contents copy's destination among them;
 /// `all` also widens the directory the copy goes into and the owned
-/// directories above it, including where missing parents are created.
+/// directories above it, including where missing parents are created. Under
+/// `none` and `rsync` both commands refuse up front, previews too, a
+/// destination they cannot search.
 /// Every mode restores the exact mode afterwards, and no dry run changes
 /// anything. `syq cp` widens nothing by default, `syq rsync` what rsync does.
 /// A failure names the mode that would have avoided it.
@@ -850,6 +851,7 @@ fn directory_widening_modes_choose_which_directories_change() {
         ("tree-as", "ro", 0o600, "all"),
         ("named", "ro", 0o500, "all"),
         ("file-into", "ro", 0o500, "all"),
+        ("file-into", "ro", 0o600, "all"),
         ("file-as", "ro", 0o500, "all"),
         ("ancestor", "anc", 0o600, "all"),
         ("missing-parent", "anc", 0o500, "all"),
@@ -910,6 +912,18 @@ fn directory_widening_modes_choose_which_directories_change() {
                     _ => effective == "all",
                 };
                 assert_eq!(after.mode() & 0o7777, mode, "{label}");
+                // The destination itself cannot be searched: refused before
+                // anything is planned, as rsync does, unless `all` widens it.
+                let refused = restricted == t.path("ro") && mode & 0o100 == 0 && effective != "all";
+                if refused {
+                    assert_eq!(out.status.code(), Some(1), "{label}");
+                    let hint = if effective == "none" {
+                        "widen-dirs may help"
+                    } else {
+                        "widen-dirs=all may help"
+                    };
+                    assert!(stderr_of(&out).contains(hint), "{label}");
+                }
                 if dry_run {
                     assert_eq!(
                         (after.ctime(), after.ctime_nsec()),

@@ -3287,14 +3287,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // identity anchoring must enforce. These receiver-local operations can run
     // in order without waiting for the client between them. Keep same-machine
     // copies on the path that performs ancestry checks before anchoring.
-    // rsync enters its destination before widening anything, so `rsync`
-    // requires it searchable in both commands; `all` widens it instead, and
-    // `none` keeps each command's own rule.
-    let require_search = match opts.widen_dirs {
-        WidenDirs::Rsync => true,
-        WidenDirs::None => opts.rsync_creation,
-        WidenDirs::All => false,
-    };
+    // rsync enters its destination before widening anything. Both commands
+    // do the same under `none` and `rsync`, which cannot widen it, and refuse
+    // up front a destination they cannot search; `all` widens it instead.
+    let require_search = opts.widen_dirs != WidenDirs::All;
     let prepare_existing = use_operator_anchor
         && dst.is_remote()
         && !srcs[0].is_remote()
@@ -3345,9 +3341,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         );
     }
     // An existing directory named by `--as` is the destination rsync would
-    // enter, so `rsync` requires it searchable too. For a directory the
-    // receiving user owns, its owner bits say whether it is.
-    if opts.widen_dirs == WidenDirs::Rsync && !dst_is_dir && !expand_exact_home {
+    // enter, so it must be searchable too unless `all` widens it. For a
+    // directory the receiving user owns, its owner bits say whether it is.
+    if require_search && !dst_is_dir && !expand_exact_home {
         if let Some(entry) = dst_root_entry
             .as_ref()
             .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o100 == 0)
@@ -3357,7 +3353,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 Response::ReceiverUser(uid) if uid != 0 && uid == entry.uid
             ) {
                 bail!(
-                    "search destination directory {}: Permission denied (os error 13); {}",
+                    "search destination directory {}: Permission denied (os error 13); \
+                     an owned destination directory lacks the required owner permissions; {}",
                     display(&dst_root),
                     opts.failure_hint().unwrap_or_default()
                 );
@@ -3594,28 +3591,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .iter()
                         .map(|(_, checked)| vec![DirectoryRelation::Separate; checked.len()])
                         .collect()
-                }
-                // The destination directory itself lacks owner search
-                // permission. A wider mode would widen it, if the receiving
-                // account owns it.
-                Err(error)
-                    if opts.failure_hint().is_some()
-                        && os_kind_of(&error) == Some("permission_denied") =>
-                {
-                    let owned = match dst_root_entry
-                        .as_ref()
-                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o100 == 0)
-                    {
-                        Some(entry) => matches!(
-                            dst_ctl.call(Request::ReceiverUser),
-                            Ok(Response::ReceiverUser(uid)) if uid != 0 && uid == entry.uid
-                        ),
-                        None => false,
-                    };
-                    if let Some(hint) = opts.failure_hint().filter(|_| owned) {
-                        bail!("{error:#}; {hint}");
-                    }
-                    return Err(error);
                 }
                 result => result?,
             }
@@ -5124,8 +5099,8 @@ fn stat_one_registered(
     .flatten())
 }
 
-/// rsync enters its destination before it widens anything the copy
-/// includes, so it also requires search permission on the selection.
+/// A copy that cannot widen its destination requires search permission on
+/// the selection, as rsync, which enters its destination first, does.
 fn operator_directory_request(
     path: &[u8],
     allow_missing: bool,
