@@ -38,6 +38,7 @@ mod btrfs;
 mod entry;
 mod limits;
 mod operator;
+pub(crate) mod owned;
 mod partial;
 mod paths;
 mod receiver_mode;
@@ -704,6 +705,9 @@ pub struct FsOps {
     stream_worker: Option<crate::descriptor_copy::FileWorker>,
     stream_ticket: Option<crate::descriptor_broker::DescriptorTicket>,
     hash_policy: crate::hashing::HashPolicy,
+    /// Files this receiver created for a grant that keeps existing objects,
+    /// the only files it then gives new names by hard link.
+    owned: Option<Arc<owned::OwnedObjects>>,
     pub(crate) observations: Arc<crate::transfer_observations::Registry>,
     operation: Arc<crate::transfer_observations::Actor>,
     #[cfg(target_os = "linux")]
@@ -932,6 +936,7 @@ impl FsOps {
             descriptor_copy: Default::default(),
             stream_worker: None,
             stream_ticket: None,
+            owned: None,
             hash_policy: crate::hashing::HashPolicy {
                 algorithm: crate::hashing::HashAlgorithm::Blake3,
                 transfer_integrity: true,
@@ -1513,6 +1518,7 @@ impl FsOps {
                             } else {
                                 TargetCondition::Any
                             },
+                            None,
                         )
                         .err()
                         .map(|error| wire_error(&error)),
@@ -3282,6 +3288,7 @@ impl FsOps {
             !short.is_empty() && self.destination_on_network_file_system(guard, &short),
         );
         let directories = &self.receiver_directories;
+        let owned = self.owned.as_deref();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
@@ -3357,7 +3364,13 @@ impl FsOps {
                         }
                     })
                 }
-                _ => apply_one(op, guard, destination_root.clone(), destination_prefix),
+                _ => apply_one(
+                    op,
+                    guard,
+                    destination_root.clone(),
+                    destination_prefix,
+                    owned,
+                ),
             };
             result.err().as_ref().map(wire_error)
         };
@@ -3388,7 +3401,13 @@ impl FsOps {
                 destination_root.clone(),
                 destination_prefix,
             );
-            let result = apply_one(&op, guard, destination_root.clone(), destination_prefix);
+            let result = apply_one(
+                &op,
+                guard,
+                destination_root.clone(),
+                destination_prefix,
+                owned,
+            );
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {

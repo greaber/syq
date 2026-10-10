@@ -337,6 +337,21 @@ def linux_group(pgid):
     return members
 
 
+# PF_EXITING in /proc/<pid>/stat's flags field: the task has begun to exit.
+PF_EXITING = 0x4
+
+
+def exiting_or_gone(pid):
+    """Whether a process has exited or begun to. Linux makes an exiting
+    process's /proc/<pid>/fd and io owned by root once its memory is released."""
+    try:
+        with open(f"/proc/{pid}/stat") as stream:
+            fields = stream.read().rsplit(")", 1)[1].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return fields[0] in ("Z", "X") or bool(int(fields[6]) & PF_EXITING)
+
+
 def sample_linux(launcher):
     """Sample every process in the group, including the local receiver."""
     samples = []
@@ -362,6 +377,12 @@ def sample_linux(launcher):
                                 read_bytes=int(io["read_bytes"]), write_bytes=int(io["write_bytes"])))
         except (FileNotFoundError, ProcessLookupError):
             pass  # A process can exit between reads; wait accounting still captures its CPU.
+        except PermissionError as error:
+            # So can one that is exiting, which the same accounting covers. A
+            # live process this user cannot inspect is not one the benchmark
+            # can measure.
+            if not exiting_or_gone(pid):
+                raise RuntimeError(f"cannot sample process {pid} in the benchmarked group: {error}") from error
     return samples
 
 

@@ -975,6 +975,200 @@ fn named_requests_sign_the_senders_bandwidth_limit() {
     assert_eq!(request.constraints.max_file_data_bytes_per_second, 1 << 20);
 }
 
+/// Approve the next copy `receiver` asks about, returning what it showed.
+fn approve_pending(receiver: &Arc<Receiver>) -> std::thread::JoinHandle<String> {
+    let approvals = receiver.approvals.clone();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(summary) = approvals.snapshots().into_iter().next() {
+                let description =
+                    summary.description(&crate::persistence::Domain::default(), str::to_owned);
+                approvals
+                    .decide(&summary.id, true, crate::receive_approval::Kind::Copy)
+                    .unwrap();
+                return description;
+            }
+            assert!(Instant::now() < deadline, "no copy approval was requested");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+}
+
+/// Run the copy of `source` that `options` describe through `registration`.
+fn named_copy(registration: &Registration, source: &Path, options: &[&str]) -> i32 {
+    let (command, request, secret) = requested(source, options);
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    let policy = request.constraints.receipt_policy.clone();
+    let approved = approve(registration, command, request);
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));
+    args.named_receipt = Some(Arc::new(NamedReceipt {
+        connection: None,
+        secret,
+        approved,
+        policy,
+    }));
+    crate::transfer::run(args).unwrap()
+}
+
+/// Hard links can join files already in the destination, so even a
+/// download into the automatically approved directory asks, and the prompt
+/// says so. A rerun links a new name to the file the first copy left.
+#[test]
+fn named_hard_links_ask_and_link_new_names_to_existing_files() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"shared").unwrap();
+    fs::hard_link(source.join("a"), source.join("b")).unwrap();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let options = ["--copy-metadata", "mtime,hardlinks"];
+
+    let shown = approve_pending(&receiver);
+    assert_eq!(named_copy(&registration, &source, &options), 0);
+    let shown = shown.join().unwrap();
+    assert!(
+        shown.contains("The server can link new names to files already in the destination."),
+        "{shown}"
+    );
+    let inode = |name: &str| fs::metadata(root.join("source").join(name)).unwrap().ino();
+    assert_eq!(inode("a"), inode("b"));
+
+    fs::hard_link(source.join("a"), source.join("c")).unwrap();
+    let existing = inode("a");
+    let shown = approve_pending(&receiver);
+    assert_eq!(named_copy(&registration, &source, &options), 0);
+    shown.join().unwrap();
+    assert_eq!(
+        (inode("a"), inode("b"), inode("c")),
+        (existing, existing, existing)
+    );
+}
+
+/// Keeping existing files, a hard-link group with an existing member ends
+/// as rsync leaves it: the existing name and its file untouched, and the
+/// group's new names linked to a new file of their own.
+#[test]
+fn named_hard_links_keep_an_existing_group_member_untouched() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("a"), b"source contents").unwrap();
+    fs::hard_link(source.join("a"), source.join("b")).unwrap();
+    fs::hard_link(source.join("a"), source.join("c")).unwrap();
+    fs::write(root.join("source/a"), b"kept").unwrap();
+    fs::set_permissions(root.join("source/a"), fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(root.join("source/a")).unwrap();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let shown = approve_pending(&receiver);
+    assert_eq!(
+        named_copy(
+            &registration,
+            &source,
+            &["--if-exists=keep", "--copy-metadata", "mtime,hardlinks"],
+        ),
+        0
+    );
+    shown.join().unwrap();
+    let after = fs::metadata(root.join("source/a")).unwrap();
+    assert_eq!(fs::read(root.join("source/a")).unwrap(), b"kept");
+    assert_eq!(
+        (after.ino(), after.mode(), after.nlink(), after.mtime()),
+        (before.ino(), before.mode(), 1, before.mtime())
+    );
+    let new = |name: &str| fs::metadata(root.join("source").join(name)).unwrap();
+    assert_eq!(fs::read(root.join("source/b")).unwrap(), b"source contents");
+    assert_eq!(new("b").ino(), new("c").ino());
+    assert_ne!(new("b").ino(), after.ino());
+}
+
+/// Extended attributes reach as an ordinary copy by the same account: the
+/// user namespace, with values the source lacks removed.
+#[cfg(target_os = "linux")]
+#[test]
+fn named_extended_attributes_ask_and_reconcile_the_user_namespace() {
+    use std::ffi::CString;
+    let attributes = |path: &Path| {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut names = vec![0u8; 4096];
+        let length =
+            unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+        assert!(length >= 0, "{}", std::io::Error::last_os_error());
+        names.truncate(length as usize);
+        let mut found = names
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                let name = CString::new(name).unwrap();
+                let mut value = vec![0u8; 4096];
+                let length = unsafe {
+                    libc::lgetxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_mut_ptr().cast(),
+                        value.len(),
+                    )
+                };
+                assert!(length >= 0);
+                value.truncate(length as usize);
+                (name.into_bytes(), value)
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    };
+    let set = |path: &Path, name: &str, value: &[u8]| {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        let result = unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    };
+    let temp = crate::test_support::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let source = base.join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("file"), b"attributes").unwrap();
+    set(&source.join("file"), "user.kept", b"value");
+    let root = base.join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    fs::write(root.join("source/file"), b"old").unwrap();
+    set(&root.join("source/file"), "user.stale", b"old");
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let shown = approve_pending(&receiver);
+    assert_eq!(
+        named_copy(&registration, &source, &["--copy-metadata", "mtime,xattrs"]),
+        0
+    );
+    // The prompt says why it asks.
+    let shown = shown.join().unwrap();
+    assert!(
+        shown.contains("The server can set extended attributes, which some programs act on."),
+        "{shown}"
+    );
+    // As `tests/local/inode_metadata.rs` checks for ordinary copies: the
+    // source's user attributes, and none the source lacks.
+    assert_eq!(
+        attributes(&root.join("source/file")),
+        [(b"user.kept".to_vec(), b"value".to_vec())]
+    );
+}
+
 #[test]
 fn named_authorization_expires_before_control_opens() {
     let temp = crate::test_support::tempdir().unwrap();

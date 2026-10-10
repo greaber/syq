@@ -138,6 +138,7 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         "ProxyJump=none",
         "ProxyCommand=none",
         "LogLevel=ERROR",
+        "ConnectTimeout=10",
         "HostKeyAlgorithms=ssh-ed25519",
         "2222",
     ] {

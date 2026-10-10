@@ -627,6 +627,10 @@ fn constrained_destination_rsh(port: u16, host_key_algorithms: &str) -> String {
         "GlobalKnownHostsFile=/dev/null".to_owned(),
         "-o".to_owned(),
         "UpdateHostKeys=no".to_owned(),
+        // Like the other server-to-server SSH paths, fail a stalled connect or
+        // handshake in bounded time instead of waiting for the TCP timeout.
+        "-o".to_owned(),
+        "ConnectTimeout=10".to_owned(),
         "-o".to_owned(),
         format!("HostKeyAlgorithms={host_key_algorithms}"),
         "-p".to_owned(),

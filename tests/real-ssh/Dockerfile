@@ -119,3 +119,8 @@ COPY tests/real-ssh/test-map-generation.py /usr/local/libexec/syq-test-map-gener
 COPY tests/real-ssh/test-metadata.py /usr/local/libexec/syq-test-metadata.py
 
 COPY tests/real-ssh/test-receiver-keys.py /usr/local/libexec/syq-test-receiver-keys.py
+
+# Every python3 in the lab imports this; in the runner it prints the process
+# tables of all three containers before a timed-out subprocess.run is killed.
+COPY tests/real-ssh/timeout-diagnostics.py /usr/lib/python3/dist-packages/syq_real_ssh_timeouts.py
+RUN printf 'import syq_real_ssh_timeouts\n' > /usr/lib/python3/dist-packages/syq-real-ssh-timeouts.pth

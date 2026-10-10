@@ -288,3 +288,63 @@ fn prune_does_not_require_permission_to_replace_source_matches() {
     assert_eq!(read(&t.path("dst/new")), b"new");
     assert!(!t.path("dst/extra").exists());
 }
+
+/// A hard link is made under the conditions its name would be published
+/// under as a file: under the error policies, a name that appears after the
+/// scan is refused rather than replaced, while the default policy replaces
+/// it, as it replaces files.
+#[cfg(debug_assertions)]
+#[test]
+fn hard_links_meet_the_existing_file_policy_of_their_names() {
+    for policy in [
+        Some("--if-exists=error"),
+        Some("--if-exists=error-if-different"),
+        None,
+    ] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"source");
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        fs::create_dir_all(t.path("dst")).unwrap();
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let (src, dst) = (t.s("src"), t.s("dst"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "-q",
+            "--srcs-in",
+            &src,
+            "--into",
+            &dst,
+            "--copy-metadata=hardlinks",
+        ]);
+        command.args(policy);
+        let mut child = command
+            .env("SYQ_TEST_FINALIZATION_READY_FILE", &ready)
+            .env("SYQ_TEST_FINALIZATION_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "copy finalization");
+        // The name the link would take appears after the scan.
+        let (linked, appeared) = if t.path("dst/a").exists() {
+            ("a", "b")
+        } else {
+            ("b", "a")
+        };
+        write(&t.path(&format!("dst/{appeared}")), b"appeared");
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        let linked = fs::metadata(t.path(&format!("dst/{linked}"))).unwrap();
+        let appeared_metadata = fs::metadata(t.path(&format!("dst/{appeared}"))).unwrap();
+        if policy.is_some() {
+            assert!(!output.status.success(), "{policy:?}: {output:?}");
+            assert_eq!(read(&t.path(&format!("dst/{appeared}"))), b"appeared");
+            assert_ne!(linked.ino(), appeared_metadata.ino());
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(linked.ino(), appeared_metadata.ino());
+        }
+    }
+}

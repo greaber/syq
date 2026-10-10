@@ -1404,6 +1404,7 @@ impl FsOps {
             &stage.target.relative,
             &stage.file,
             put.condition,
+            self.owned.as_deref(),
         )
     }
 

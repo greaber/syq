@@ -216,6 +216,7 @@ to purge all versions, rerun the original `--s3-all-versions` command through
 that endpoint; this also removes the extra markers.
 
 Named removal selectors choose exact keys; `--src-dir` and `--srcs-in` choose
-prefix trees and accept a trailing `/`. When deleting an exact directory-marker
+prefix trees and accept a trailing `/`. Removing an object does not require its
+metadata to be valid UTF-8. When deleting an exact directory-marker
 version, keep the trailing `/` in its key. An empty S3 source prefix is rejected
 by `cp`, so it cannot prune an entire local destination.
