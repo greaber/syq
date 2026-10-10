@@ -97,23 +97,56 @@ pub(crate) fn prepare_destination_path(
     } else {
         std::env::current_dir()?.join(path)
     };
+    prepare_resolved_path(create_missing, access, |search| {
+        OperatorResolver::resolve_process_with_search(
+            path.as_os_str().as_bytes(),
+            symlink_policy,
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            },
+            true,
+            &mut Vec::new(),
+            search,
+        )
+    })
+}
+
+/// The same for `relative` beneath `root`, the enrolled root of a restricted
+/// receiver: nothing above `root` is looked up or widened, and no symlink is
+/// followed. `root` itself may gain search permission.
+pub(crate) fn prepare_destination_path_beneath(
+    root: &File,
+    relative: &[u8],
+    create_missing: bool,
+    access: &mut TemporaryDirectorySearchAccess,
+) -> Result<()> {
+    let resolver = OperatorResolver::beneath(root, true, OperatorSymlinkPolicy::Refuse)?;
+    prepare_resolved_path(create_missing, access, |search| {
+        resolver.resolve_with_search(
+            relative,
+            OperatorFinalComponent::Entry {
+                follow_symlink: false,
+            },
+            true,
+            &mut Vec::new(),
+            search,
+        )
+    })
+}
+
+fn prepare_resolved_path(
+    create_missing: bool,
+    access: &mut TemporaryDirectorySearchAccess,
+    resolve: impl FnOnce(&mut dyn FnMut(&File) -> Result<bool>) -> Result<PinnedPath>,
+) -> Result<()> {
     let mut failure = None;
-    let resolved = OperatorResolver::resolve_process_with_search(
-        path.as_os_str().as_bytes(),
-        symlink_policy,
-        OperatorFinalComponent::Entry {
-            follow_symlink: false,
-        },
-        true,
-        &mut Vec::new(),
-        &mut |directory| match access.widen(directory, 0o100) {
-            Ok(changed) => Ok(changed),
-            Err(error) => {
-                failure = Some(error);
-                Ok(false)
-            }
-        },
-    );
+    let resolved = resolve(&mut |directory| match access.widen(directory, 0o100) {
+        Ok(changed) => Ok(changed),
+        Err(error) => {
+            failure = Some(error);
+            Ok(false)
+        }
+    });
     if let Some(error) = failure {
         return Err(error.context("give a destination ancestor search permission"));
     }

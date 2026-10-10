@@ -3117,16 +3117,16 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Under `all`, before anything looks the destination up, the owned
     // directories on the way to it get the owner access reaching it and
     // creating its missing parents needs. The receiver keeps their modes
-    // until the copy ends. A restricted receiver widens nothing above the
-    // directory it was enrolled for.
-    let destination_path_prepared =
-        widens_destination_container(&opts) && args.restricted_grant.is_none();
+    // until the copy ends. A restricted receiver walks only from the
+    // directory it was enrolled for down.
+    let destination_path_prepared = widens_destination_container(&opts);
     if destination_path_prepared {
         match ok(
             dst_ctl.call(Request::PrepareDestinationPath {
                 path: operator_dst_root.clone(),
                 symlink_policy: opts.operator_symlink_policy,
                 create_missing: !args.existing,
+                guard: None,
             })?,
             "prepare the destination path",
         )? {
@@ -4683,16 +4683,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         progress.specials_created.load(Relaxed),
     );
     drop(st);
-    // The destination's own directories are restored; its ancestors last.
-    if destination_path_prepared {
-        let restored = dst_ctl
-            .call(Request::RestoreDestinationPath)
-            .and_then(|response| ok(response, "restore destination ancestors"));
-        if let Err(error) = restored {
-            progress.error(&format!("syq: restore directory permissions: {error:#}"));
-        }
-    }
-
     // With a command-restricted receiver, ask for its signed receipt now that
     // every mutation is settled, and hand its bounded frames to the invoking
     // machine as marked lines. That machine verifies it; this coordinator's
@@ -4742,6 +4732,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                 }
             }
+        }
+    }
+
+    // The destination's own directories are restored; its ancestors last,
+    // after a restricted receiver has observed what landed for its receipt.
+    if destination_path_prepared {
+        let restored = dst_ctl
+            .call(Request::RestoreDestinationPath)
+            .and_then(|response| ok(response, "restore destination ancestors"));
+        if let Err(error) = restored {
+            progress.error(&format!("syq: restore directory permissions: {error:#}"));
         }
     }
 

@@ -3146,12 +3146,36 @@ impl FsOps {
                 path,
                 symlink_policy,
                 create_missing,
-            } => prepare_destination_path(
-                path,
-                *symlink_policy,
-                *create_missing,
-                &mut self.destination_path_access,
-            )
+                guard,
+            } => match guard {
+                None => prepare_destination_path(
+                    path,
+                    *symlink_policy,
+                    *create_missing,
+                    &mut self.destination_path_access,
+                ),
+                // A restricted receiver walks only from its enrolled root down.
+                Some(guard) => (|| {
+                    let root_path = Path::new(OsStr::from_bytes(&guard.root));
+                    let relative = Path::new(OsStr::from_bytes(path))
+                        .strip_prefix(root_path)
+                        .context("destination is outside the enrolled root")?;
+                    let root = Root::open_verified(
+                        root_path,
+                        RootIdentity {
+                            dev: guard.dev,
+                            ino: guard.ino,
+                        },
+                    )?;
+                    let directory = root.open_directory(&RelativePath::new(b"")?)?;
+                    prepare_destination_path_beneath(
+                        &directory,
+                        relative.as_os_str().as_bytes(),
+                        *create_missing,
+                        &mut self.destination_path_access,
+                    )
+                })(),
+            }
             .map(|()| Response::Ok),
             Request::RestoreDestinationPath => self
                 .destination_path_access
@@ -3719,6 +3743,19 @@ impl FsOps {
                     Some(paths.first().map_or(&[][..], Vec::as_slice)),
                     error,
                 ),
+            // A restricted receiver's lookup of its destination, which needs
+            // search permission on the directories from its root down.
+            (
+                Request::PruneLookup {
+                    paths,
+                    guard: Some(guard),
+                },
+                Response::EndpointError(error),
+            ) => {
+                if let Some(path) = paths.first() {
+                    self.annotate_permission_failure(path, Some(guard), 0o100, error);
+                }
+            }
             (
                 Request::CheckOperatorDirectory { path, .. }
                 | Request::CheckSearchableOperatorDirectory { path, .. },

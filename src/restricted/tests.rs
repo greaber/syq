@@ -1347,6 +1347,74 @@ fn restricted_widening_follows_the_approved_mode() {
     }
 }
 
+/// Under an approved `all`, a restricted receiver gives the owned directories
+/// from its enrolled root down to the destination, the root included, the
+/// search permission reaching it needs, as an ordinary receiver does, and
+/// restores them when asked. It never walks above the root, and refuses a
+/// destination named outside it.
+#[test]
+fn restricted_all_widens_ancestors_beneath_the_enrolled_root() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let middle = root.join("middle");
+    let destination = middle.join("target");
+    fs::create_dir_all(&destination).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o777;
+    let above = mode(temp.path());
+    let prepare = |path: &Path| Request::PrepareDestinationPath {
+        path: path_bytes(path),
+        symlink_policy: proto::OperatorSymlinkPolicy::FollowAll,
+        create_missing: true,
+        guard: None,
+    };
+    for widen in [
+        DirectoryWidening::None,
+        DirectoryWidening::Rsync,
+        DirectoryWidening::All,
+    ] {
+        let mut authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+        )
+        .unwrap();
+        // A destination deeper than its root, as a download's can be.
+        authority.destination = path_bytes(&destination);
+        authority.extra_options.widen_dirs = widen;
+        let mut request = prepare(&destination);
+        let authorized = authority.authorize(&mut request, false);
+        assert_eq!(
+            authorized.is_ok(),
+            widen == DirectoryWidening::All,
+            "{widen:?}"
+        );
+        let Ok(settlement) = authorized else {
+            continue;
+        };
+        assert!(authority
+            .authorize(&mut prepare(temp.path()), false)
+            .is_err());
+        fs::set_permissions(&middle, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        assert!(matches!(response, proto::Response::Ok), "{response:?}");
+        assert_eq!([mode(&root), mode(&middle)], [0o700, 0o700]);
+        assert_eq!(mode(temp.path()), above);
+        let response = execute_authorized(&authority, &mut ops, Request::RestoreDestinationPath);
+        assert!(matches!(response, proto::Response::Ok), "{response:?}");
+        assert_eq!(mode(&root), 0o600);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode(&middle), 0o600);
+        fs::set_permissions(&middle, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }

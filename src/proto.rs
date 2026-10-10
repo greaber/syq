@@ -1388,12 +1388,15 @@ pub enum WireRequest<Data> {
     /// destination `path`: give the owned directories on the way to it the
     /// owner search permission reaching it needs and, with `create_missing`,
     /// the nearest existing one write permission to create its missing part.
-    /// The connection keeps the saved modes until RestoreDestinationPath, or
-    /// restores them when it ends. Replies Ok.
+    /// With `guard`, set by a restricted receiver's authority, only the
+    /// directories from the enrolled root down are walked. The connection
+    /// keeps the saved modes until RestoreDestinationPath, or restores them
+    /// when it ends. Replies Ok.
     PrepareDestinationPath {
         path: PathBytes,
         symlink_policy: OperatorSymlinkPolicy,
         create_missing: bool,
+        guard: Option<ContainerGuard>,
     },
     /// Restore the modes PrepareDestinationPath changed. Replies Ok.
     RestoreDestinationPath,

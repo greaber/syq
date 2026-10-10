@@ -498,6 +498,11 @@ impl RestrictedAuthority {
     /// enrolled root, before any request is served. `New` is then kept true
     /// by `constrain_creation`, which forces no-replace creation of the root.
     pub(super) fn check_root_existence(&self) -> Result<()> {
+        // Either answer will do, so nothing is looked up: the destination
+        // may lie in a root only an approved `all` lets the copy search.
+        if self.root_existence == RootExistence::Any {
+            return Ok(());
+        }
         let observed = self.rooted_metadata(&self.destination)?;
         let destination = String::from_utf8_lossy(&self.destination);
         match (self.root_existence, observed) {
@@ -888,7 +893,9 @@ impl RestrictedAuthority {
         })
     }
 
-    pub(super) fn check_mutation_authority(&self, path: &[u8]) -> Result<()> {
+    /// Whether the grant allows changes at all now: not a read-only one, and
+    /// not after its receipt.
+    fn check_mutation_allowed(&self) -> Result<()> {
         if self.copy.options.dry_run || self.copy.options.verify_only {
             bail!("signed read-only transfer forbids destination mutations");
         }
@@ -903,7 +910,11 @@ impl RestrictedAuthority {
         {
             bail!("the signed grant is closed because receipt recording failed");
         }
-        drop(state);
+        Ok(())
+    }
+
+    pub(super) fn check_mutation_authority(&self, path: &[u8]) -> Result<()> {
+        self.check_mutation_allowed()?;
         Self::validate_request_path(path)?;
         if !self
             .copy
@@ -2133,6 +2144,8 @@ impl RestrictedAuthority {
         let mut touched = Vec::new();
         // Requests the server executes and then settles; the receipt waits
         // for all of them. The others are answered inline without settling.
+        // Restoring the destination's ancestors only undoes what this
+        // connection widened, after the receipt has observed what landed.
         let tracked = !matches!(
             request,
             Request::Hello { .. }
@@ -2142,6 +2155,7 @@ impl RestrictedAuthority {
                 | Request::WriteStreamFence
                 | Request::Receipt
                 | Request::Shutdown
+                | Request::RestoreDestinationPath
         );
         // Admission and closure are decided under one lock: a request either
         // counts as in flight before the receipt can observe the count, or
@@ -2429,6 +2443,36 @@ impl RestrictedAuthority {
                 }
                 *guard = Some(self.guard.clone());
             }
+            Request::PrepareDestinationPath {
+                path,
+                symlink_policy,
+                guard,
+                ..
+            } => {
+                // Only an approved `all` widens the directories on the way to
+                // the destination, and only from the enrolled root down: the
+                // walk goes to the signed destination, beneath that root, and
+                // follows no symlink.
+                anyhow::ensure!(
+                    self.extra_options.widen_dirs == DirectoryWidening::All,
+                    "the approved copy does not widen the directories on the way to its destination"
+                );
+                self.check_mutation_allowed()?;
+                if path.starts_with(b"/") {
+                    let root = &self.guard.root;
+                    anyhow::ensure!(
+                        path.len() > root.len()
+                            && path.starts_with(root)
+                            && path[root.len()] == b'/',
+                        "the destination's ancestors outside the enrolled root are never widened"
+                    );
+                }
+                *path = self.destination.clone();
+                *symlink_policy = proto::OperatorSymlinkPolicy::Refuse;
+                *guard = Some(self.guard.clone());
+            }
+            // It restores only what the request above changed.
+            Request::RestoreDestinationPath => {}
             Request::Apply { ops, guard } => {
                 let outer = (self.extra_options.widen_dirs == DirectoryWidening::All)
                     .then(|| self.outer_directory())
@@ -2820,8 +2864,6 @@ impl RestrictedAuthority {
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::CheckSearchableOperatorDirectory { .. }
-            | Request::PrepareDestinationPath { .. }
-            | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {

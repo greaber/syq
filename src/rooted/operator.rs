@@ -291,6 +291,20 @@ impl OperatorResolver {
         })
     }
 
+    /// Like `resolve`, but when looking up a component is denied, `search`
+    /// may give its directory search permission, reporting whether it did,
+    /// and the lookup is tried once more.
+    pub(crate) fn resolve_with_search(
+        &self,
+        path: &[u8],
+        final_component: OperatorFinalComponent,
+        allow_missing: bool,
+        hops: &mut Vec<OperatorSymlinkHop>,
+        search: &mut dyn FnMut(&File) -> Result<bool>,
+    ) -> Result<PinnedPath> {
+        self.resolve_searching(path, final_component, allow_missing, hops, search)
+    }
+
     fn resolve_searching(
         &self,
         path: &[u8],

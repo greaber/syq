@@ -198,6 +198,19 @@ def direct():
             if widen != "all":
                 assert b"--widen-dirs=all may help" in result.stderr, result.stderr
         ssh("destination", f"from pathlib import Path; p=Path({exact_root!r}); assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o555; p.chmod(0o755)")
+        # Under `all` the receiver also gives the directories from its
+        # enrolled root down to the destination the search permission
+        # reaching it needs, here the root itself, and nothing above it;
+        # under `rsync` the copy is refused and names `all`.
+        unsearchable = root + "/unsearchable-root"
+        ssh("destination", f"from pathlib import Path; (Path({unsearchable!r})/'into').mkdir(parents=True)")
+        run(["syq", "receiver", "enroll", "destination:" + unsearchable + "/into"])
+        ssh("destination", f"from pathlib import Path; Path({unsearchable!r}).chmod(0o600)")
+        into = prefix + ["file", "--to", "destination", "--into", unsearchable + "/into", "--no-tcp"]
+        refused = run(into + ["--widen-dirs=rsync"], expected=1)
+        assert b"--widen-dirs=all may help" in refused.stderr, refused.stderr
+        run(into + ["--widen-dirs=all"])
+        ssh("destination", f"from pathlib import Path; p=Path({unsearchable!r}); assert p.stat().st_mode & 0o7777 == 0o600; p.chmod(0o755); assert (p/'into'/'file').read_bytes()==b'mapped contents'")
         # A signed preview never changes permissions, with or without the
         # option, so read-only grants need no authority for it. A directory it
         # cannot search is reported rather than treated as empty.
