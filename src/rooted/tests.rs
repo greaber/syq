@@ -1966,11 +1966,17 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
 
 /// A temporary link that turns out not to name the representative is
 /// removed, whatever the condition: no exchange ran, so nothing it holds was
-/// displaced from the destination.
+/// displaced from the destination. On Linux a new name is linked from the
+/// checked descriptor straight to its final name, with no temporary.
 #[test]
 fn hardlink_publication_removes_a_temporary_that_names_another_file() {
     use crate::proto::TargetCondition::{Absent, Any, Matches};
-    for condition in ["any", "absent", "matches"] {
+    let conditions: &[&str] = if cfg!(target_os = "linux") {
+        &["any", "matches"]
+    } else {
+        &["any", "absent", "matches"]
+    };
+    for &condition in conditions {
         let tree = TestDir::new("hardlink-temporary");
         let root = Root::open(tree.path()).unwrap();
         fs::write(tree.path().join("source"), b"payload").unwrap();
