@@ -148,11 +148,14 @@ impl RestrictedAuthority {
     }
 
     /// The files that may take new names by hard link, when the grant keeps
-    /// existing objects: those this receiver created for the grant.
+    /// existing objects and copies hard links: those this receiver created
+    /// for the grant. Without hard links nothing is recorded.
     pub(crate) fn owned_objects(
         &self,
     ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
-        (self.copy.policy.existing == ExistingDestinationPolicy::Skip).then(|| self.owned.clone())
+        (self.copy.policy.existing == ExistingDestinationPolicy::Skip
+            && self.extra_options.hardlinks)
+            .then(|| self.owned.clone())
     }
 
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {

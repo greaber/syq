@@ -7122,6 +7122,22 @@ fn keeping_existing_files_links_only_to_files_the_copy_created() {
     );
 }
 
+/// Only a grant that keeps existing files and copies hard links records the
+/// files it creates: the record serves only to check links.
+#[test]
+fn only_keeping_grants_with_hard_links_record_created_files() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let mut keep = keeping_link_authority(&root);
+    assert!(keep.owned_objects().is_some());
+    keep.extra_options.hardlinks = false;
+    assert!(keep.owned_objects().is_none());
+    let mut replace = link_authority(&root, ExistingDestinationPolicy::Replace);
+    assert!(replace.owned_objects().is_none());
+    replace.extra_options.hardlinks = false;
+    assert!(replace.owned_objects().is_none());
+}
+
 /// A link onto an existing file is an ordinary copy's step under a grant
 /// that may replace existing files, and refused only under one that keeps
 /// them.
