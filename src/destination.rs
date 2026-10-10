@@ -1327,9 +1327,13 @@ impl Receiver {
                 }
                 let generation = self.generation.load(Ordering::Acquire);
                 // ACLs, extended attributes and hard links reach beyond the
-                // files being written, so they always ask.
+                // files being written, so they always ask, as does widening
+                // the directory the copy goes into.
                 let extra = &request.constraints.extra_options;
-                let automatic = !(extra.acls || extra.xattrs || extra.hardlinks)
+                let automatic = !(extra.acls
+                    || extra.xattrs
+                    || extra.hardlinks
+                    || extra.widen_dirs == crate::delegation::DirectoryWidening::All)
                     && self.auto_approve_root.as_ref().is_some_and(|root| {
                         destination.starts_with(root)
                             && !(destination == *root

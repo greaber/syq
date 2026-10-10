@@ -589,6 +589,8 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .then(|| "can link new names to files already in the destination".to_owned()),
         (request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace)
             .then(|| "can change existing files through every name they have".to_owned()),
+        (extra.widen_dirs != crate::delegation::DirectoryWidening::None)
+            .then(|| "can temporarily make read-only folders writable".to_owned()),
     ]
     .into_iter()
     .flatten()
@@ -1668,6 +1670,7 @@ mod tests {
         request.constraints.extra_options.acls = true;
         request.constraints.extra_options.hardlinks = true;
         request.constraints.extra_options.xattrs = true;
+        request.constraints.extra_options.widen_dirs = crate::delegation::DirectoryWidening::All;
         let warnings = [
             "can delete up to 4 files or folders anywhere in the destination",
             "can make files readable by others or create programs that run as you",
@@ -1675,6 +1678,7 @@ mod tests {
             "can give other users access to files",
             "can set extended attributes, which some programs act on",
             "can link new names to files already in the destination",
+            "can temporarily make read-only folders writable",
         ];
         let summary = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
         let desktop = summary.desktop_description(false);

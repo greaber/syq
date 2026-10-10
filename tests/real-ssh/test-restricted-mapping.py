@@ -185,11 +185,19 @@ def direct():
             run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update", "--widen-dirs=rsync"] + extra,
                 data=manifest([("file", "parent/item", "file")]))
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
-        # A grant covers what the copy creates beneath its root, so a
-        # restricted receiver refuses to widen the directories around it.
-        refused = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/readonly-0", "--no-tcp", "--widen-dirs=all"],
-                      data=manifest([("file", "parent/item", "file")]), expected=1)
-        assert b"--widen-dirs=all is not available with a restricted receiver" in refused.stderr, refused.stderr
+        # The grant names how far the receiver may widen. An exact target
+        # in a read-only enrolled directory needs `all`, which widens that
+        # directory, but nothing above it, and restores it; under `none` or
+        # `rsync` the copy fails and names `all`.
+        exact_root = root + "/readonly-exact"
+        ssh("destination", f"from pathlib import Path; p=Path({exact_root!r}); p.mkdir(); p.chmod(0o555)")
+        run(["syq", "receiver", "enroll", "destination:" + exact_root + "/item"])
+        for widen in ["none", "rsync", "all"]:
+            result = run(prefix + ["file", "--to", "destination", "--as", exact_root + "/item", "--no-tcp", f"--widen-dirs={widen}"],
+                         expected=0 if widen == "all" else 23)
+            if widen != "all":
+                assert b"--widen-dirs=all may help" in result.stderr, result.stderr
+        ssh("destination", f"from pathlib import Path; p=Path({exact_root!r}); assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o555; p.chmod(0o755)")
         # A signed preview never changes permissions, with or without the
         # option, so read-only grants need no authority for it. A directory it
         # cannot search is reported rather than treated as empty.

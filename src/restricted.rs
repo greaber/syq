@@ -3,8 +3,8 @@
 use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
     self, CopyLimits, CopyOperation, CopyOptions, CopyPolicy, DeletionPolicy, DestinationPlacement,
-    ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, GrantOperation,
-    MutationScope, PublicationPolicy, RequestId, RootExistence,
+    DirectoryWidening, ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints,
+    GrantOperation, MutationScope, PublicationPolicy, RequestId, RootExistence,
 };
 use crate::enrollment::{
     self, AuthorizedKeyEntry, AuthorizedKeysChange, EnrollmentId, EnrollmentPublicKey,

@@ -90,7 +90,7 @@ their original limits.
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
-| `--widen-dirs=all` | Unsupported; `rsync` widens only directories the copy includes |
+| `--widen-dirs` | Approved as part of the copy; `all` widens the directory the copy goes into, but nothing above the directory the receiver was set up for |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
 

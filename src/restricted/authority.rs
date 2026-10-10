@@ -837,6 +837,57 @@ impl RestrictedAuthority {
         self.record_path(path)
     }
 
+    /// The directory the copy goes into without filling it, which only an
+    /// approved `all` widens: the destination of named sources, or the
+    /// directory an exact target is in. The signed destination lies beneath
+    /// the enrolled root, so this is the root or a directory inside it, never
+    /// one above it.
+    fn outer_directory(&self) -> Option<Vec<u8>> {
+        match self.copy.policy.placement {
+            DestinationPlacement::DirectoryAsChild => Some(self.destination.clone()),
+            DestinationPlacement::ExactPath => {
+                let end = self.destination.iter().rposition(|&byte| byte == b'/')?;
+                Some(if end == 0 {
+                    b"/".to_vec()
+                } else {
+                    self.destination[..end].to_vec()
+                })
+            }
+            DestinationPlacement::DirectoryContents => None,
+        }
+    }
+
+    /// Pin the directory the copy goes into as this authority finds it now,
+    /// beneath the enrolled root; the sender cannot observe it.
+    fn outer_directory_condition(
+        &self,
+        path: &[u8],
+        condition: proto::TargetCondition,
+    ) -> Result<proto::TargetCondition> {
+        let metadata = self
+            .rooted_metadata(path)?
+            .context("the directory the copy goes into does not exist")?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "the directory the copy goes into is not a directory"
+        );
+        match condition {
+            proto::TargetCondition::Any => {}
+            proto::TargetCondition::Matches { dev, ino }
+            | proto::TargetCondition::MatchesFingerprint { dev, ino, .. } => anyhow::ensure!(
+                (dev, ino) == (metadata.dev, metadata.ino),
+                "the directory the copy goes into changed"
+            ),
+            proto::TargetCondition::Absent => {
+                bail!("temporary directory access requires an existing directory")
+            }
+        }
+        Ok(proto::TargetCondition::Matches {
+            dev: metadata.dev,
+            ino: metadata.ino,
+        })
+    }
+
     pub(super) fn check_mutation_authority(&self, path: &[u8]) -> Result<()> {
         if self.copy.options.dry_run || self.copy.options.verify_only {
             bail!("signed read-only transfer forbids destination mutations");
@@ -2317,14 +2368,39 @@ impl RestrictedAuthority {
                 directories,
                 remember,
                 guard,
-                // The receiver adds only owner permission, whatever it is.
-                access: _,
+                access,
             } => {
+                // The approved mode bounds what is widened, and how: `rsync`
+                // only the directories the copy includes, for write and
+                // search, and read too when the copy prunes and so lists
+                // them, never to enter a directory it could not read; `all`
+                // also the directory the copy goes into.
+                let approved = self.extra_options.widen_dirs;
+                match approved {
+                    DirectoryWidening::None => {
+                        bail!("the approved copy does not widen read-only directories")
+                    }
+                    DirectoryWidening::Rsync => anyhow::ensure!(
+                        *access & !0o300 == 0
+                            || *access == 0o700
+                                && self.copy.policy.deletion
+                                    == DeletionPolicy::DeleteDestinationOnly,
+                        "the approved copy widens only directories it includes, as rsync does"
+                    ),
+                    DirectoryWidening::All => {}
+                }
+                let outer = (approved == DirectoryWidening::All)
+                    .then(|| self.outer_directory())
+                    .flatten();
                 // The receiver restores what it widened when asked to choose
                 // a mode, as it always is for a mapping parent, whose
                 // restoration this authority turns into a receiver-chosen mode.
                 *remember = true;
                 for (index, (path, condition)) in directories.iter_mut().enumerate() {
+                    if outer.as_deref() == Some(path.as_slice()) {
+                        *condition = self.outer_directory_condition(path, *condition)?;
+                        continue;
+                    }
                     // Widening is the existing-directory part of EnsureDirectory.
                     // Apply exactly the same signed path/policy/quota checks,
                     // but require an observed directory: this request cannot create.
@@ -2354,7 +2430,20 @@ impl RestrictedAuthority {
                 *guard = Some(self.guard.clone());
             }
             Request::Apply { ops, guard } => {
+                let outer = (self.extra_options.widen_dirs == DirectoryWidening::All)
+                    .then(|| self.outer_directory())
+                    .flatten();
                 for (index, operation) in ops.iter_mut().enumerate() {
+                    // The directory the copy goes into lies outside the signed
+                    // scopes. Under an approved `all` its metadata can only be
+                    // the receiver's choice: the mode it had before this
+                    // connection widened it, or else its own.
+                    if let Op::SetMeta { path, flags, .. } = operation {
+                        if outer.as_deref() == Some(path.as_slice()) {
+                            *flags = proto::flags::RECEIVER_MODE;
+                            continue;
+                        }
+                    }
                     self.authorize_op(operation, index, pending, outcomes, touched)?;
                 }
                 *guard = Some(self.guard.clone());

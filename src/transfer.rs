@@ -2109,14 +2109,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "a signed receiver grant is valid only for a local-to-remote coordinator using encrypted data connections"
         );
     }
-    // A grant covers what the copy creates beneath its root, not the
-    // directories around it.
-    if args.restricted_grant.is_some() && args.widen_dirs == WidenDirs::All {
-        bail!(
-            "{}=all is not available with a restricted receiver",
-            interface_option(&args, "--widen-dirs", "--syq-widen-dirs")
-        );
-    }
     for source in original_srcs {
         if !source.same_host(&original_srcs[0]) {
             bail!("all sources must be on the same host");
@@ -3125,8 +3117,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // Under `all`, before anything looks the destination up, the owned
     // directories on the way to it get the owner access reaching it and
     // creating its missing parents needs. The receiver keeps their modes
-    // until the copy ends.
-    let destination_path_prepared = widens_destination_container(&opts);
+    // until the copy ends. A restricted receiver widens nothing above the
+    // directory it was enrolled for.
+    let destination_path_prepared =
+        widens_destination_container(&opts) && args.restricted_grant.is_none();
     if destination_path_prepared {
         match ok(
             dst_ctl.call(Request::PrepareDestinationPath {
@@ -3767,6 +3761,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let mut container_access = if widen_container {
         if let Some(selection) = &directory_selection {
             selected_container_access(widen_container, &request_prefix, selection, container_bits)
+        } else if !use_operator_anchor && !dst_is_dir && !expand_exact_home {
+            // A restricted receiver lets the sender observe nothing outside
+            // the copy, so it pins the directory an exact target is in.
+            Some((parent_path(&dst_root), TargetCondition::Any, container_bits))
         } else {
             dst_root_entry
                 .as_ref()

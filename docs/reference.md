@@ -449,7 +449,9 @@ the directory another `--as` target goes into. A change that fails in a
 directory you own suggests the mode that would have made it. Syq restores each directory's exact mode after copying and pruning,
 also when the copy fails, unless you request permissions. Other processes can
 see the temporary permissions, and a crash or forced termination can leave
-them in place. Root skips widening. A restricted receiver refuses `all`.
+them in place. Root skips widening. A restricted receiver widens only as the approved
+mode allows, never above the directory it was set up for, and its approval
+prompt says when a copy can make read-only folders writable.
 
 Dry runs never change permissions. A dry run reports a directory you own but
 cannot search as not inspected, and exits with status 23.
