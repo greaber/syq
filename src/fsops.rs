@@ -693,6 +693,9 @@ pub struct FsOps {
     /// have, by root and directory, read once per connection.
     creation_permissions: Mutex<receiver_mode::CreationPermissions>,
     operator_selection: Option<OperatorDirectorySelection>,
+    /// Destination ancestors `--widen-dirs=all` widened, restored when the
+    /// copy asks or this connection ends.
+    destination_path_access: TemporaryDirectorySearchAccess,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
     allow_unconfined_source_paths: bool,
@@ -913,6 +916,7 @@ impl FsOps {
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,
+            destination_path_access: Default::default(),
             descriptor_session,
             source_roots: HashMap::new(),
             allow_unconfined_source_paths: false,
@@ -2473,6 +2477,8 @@ impl FsOps {
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::CheckSearchableOperatorDirectory { .. }
+            | Request::PrepareDestinationPath { .. }
+            | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }

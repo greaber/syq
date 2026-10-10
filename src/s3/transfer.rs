@@ -15,7 +15,7 @@ use super::{
     Options,
 };
 use crate::{
-    cli::{Args, Existence, Placement, SourceSelection},
+    cli::{Args, Existence, Location, Placement, SourceSelection, WidenDirs},
     hashing::{Digest, HashAlgorithm},
     progress::Progress,
     rooted::{RelativePath, Root},
@@ -453,6 +453,24 @@ impl Engine {
                 self.prune(prune, None).await?;
             }
         } else {
+            // Dry runs never change permissions.
+            let widen = if self.args.dry_run {
+                WidenDirs::None
+            } else {
+                self.args.widen_dirs
+            };
+            // Under `all`, the owned directories on the way to the
+            // destination first get the owner access reaching it and creating
+            // its missing parents needs, until the copy ends.
+            let mut path_access = crate::fsops::TemporaryDirectorySearchAccess::default();
+            if widen == WidenDirs::All {
+                crate::fsops::prepare_destination_path(
+                    &self.args.locations.last().unwrap().path,
+                    Destination::symlink_policy(&self.args),
+                    !self.args.existing,
+                    &mut path_access,
+                )?;
+            }
             let destination = Arc::new(Destination::open(&self.args)?);
             let DownloadPlan {
                 jobs: mut plan,
@@ -468,10 +486,15 @@ impl Engine {
                 .store(plan.iter().map(|s| s.size).sum(), Relaxed);
             self.progress.scan_done.store(true, Relaxed);
             let directories = Arc::new(Directories::new(&plan)?);
-            // Dry runs never change permissions. --if-exists=keep widens like
-            // any other policy; it only leaves existing directory metadata alone.
+            // --if-exists=keep widens like any other policy; it only leaves
+            // existing directory metadata alone. `rsync` widens the
+            // destination itself only when a contents source fills it.
             let mut directory_access = directory_permissions::TemporaryAccess::new(
-                self.args.temporarily_widen_dir_permissions && !self.args.dry_run,
+                widen,
+                self.args.native_mapping.is_none()
+                    && self.args.locations[..self.args.locations.len() - 1]
+                        .iter()
+                        .any(Location::copies_contents),
             );
             let mut copies_finished = false;
             let transferred = async {
@@ -500,7 +523,7 @@ impl Engine {
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
-                            if !engine.args.temporarily_widen_dir_permissions
+                            if engine.args.widen_dirs == WidenDirs::None
                                 && error.chain().any(|cause| {
                                     cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
                                         e.kind() == std::io::ErrorKind::PermissionDenied
@@ -546,14 +569,19 @@ impl Engine {
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            self.finish_directories(
-                &destination,
-                &directories,
-                directory_access.into_restorations(),
-                !copies_finished,
-            )
-            .await?;
+            let finished = self
+                .finish_directories(
+                    &destination,
+                    &directories,
+                    directory_access.into_restorations(),
+                    !copies_finished,
+                )
+                .await;
+            // The destination's ancestors are restored last.
+            let restored = path_access.restore();
+            finished?;
             transferred?;
+            restored?;
         }
         Ok(())
     }

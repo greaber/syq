@@ -2565,6 +2565,8 @@ impl RestrictedAuthority {
             | Request::CheckOperatorDirectoryAncestry { .. }
             | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
             | Request::CheckSearchableOperatorDirectory { .. }
+            | Request::PrepareDestinationPath { .. }
+            | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {

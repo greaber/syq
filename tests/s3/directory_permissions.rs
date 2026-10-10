@@ -16,17 +16,18 @@ impl Drop for RestrictedDirectory {
     }
 }
 
-/// A denied lookup is never an absent target, and the parent of an exact
-/// placement lies outside the copy: it is not widened, so the download fails
-/// without changing the directory or the file in it.
+/// A denied lookup is never an absent target. Only `all` widens the parent
+/// of an exact placement, and then the placement checks see what is really
+/// there; otherwise, and in every dry run, the download fails without
+/// changing the directory or the file in it.
 #[test]
-fn download_named_files_fail_without_widening_their_parent() {
+fn download_named_files_widen_their_parent_only_for_all() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
     let server = Server::start("existing-policy");
     for dry_run in [false, true] {
-        for widening in [false, true] {
+        for widening in [None, Some("--widen-dirs=rsync"), Some("--widen-dirs=all")] {
             for (placement, present) in [
                 ("--as-new", true),
                 ("--as-new", false),
@@ -47,26 +48,43 @@ fn download_named_files_fail_without_widening_their_parent() {
                 if placement == "--as" {
                     args.push("--if-exists=keep");
                 }
-                if widening {
-                    args.push("--temporarily-widen-dir-permissions");
-                }
+                args.extend(widening);
                 if dry_run {
                     args.push("--dry-run");
                 }
                 let output = server.cp(temp.path(), &args);
+                let after = fs::metadata(&directory).unwrap();
+                assert_eq!(after.mode() & 0o7777, 0o600, "{args:?}");
+                drop(restricted);
+                if widening == Some("--widen-dirs=all") && !dry_run {
+                    let refused = match placement {
+                        "--as-new" => present,
+                        "--as-existing" => !present,
+                        _ => false,
+                    };
+                    assert_eq!(
+                        output.status.success(),
+                        !refused,
+                        "{args:?}: {}",
+                        output_text(&output)
+                    );
+                    if present && placement != "--as-existing" {
+                        assert_eq!(fs::read(&file).unwrap(), b"sentinel", "{args:?}");
+                    } else {
+                        assert_eq!(file.exists(), !refused, "{args:?}");
+                    }
+                    continue;
+                }
                 assert!(
                     !output.status.success(),
                     "{args:?}: {}",
                     output_text(&output)
                 );
-                let after = fs::metadata(&directory).unwrap();
-                assert_eq!(after.mode() & 0o7777, 0o600, "{args:?}");
                 assert_eq!(
                     (before.ctime(), before.ctime_nsec()),
                     (after.ctime(), after.ctime_nsec()),
                     "{args:?}"
                 );
-                drop(restricted);
                 if present {
                     assert_eq!(fs::read(&file).unwrap(), b"sentinel");
                 } else {
@@ -99,7 +117,7 @@ fn download_dry_runs_never_change_directory_permissions() {
                 "--into",
                 "dst",
                 "--dry-run",
-                "--temporarily-widen-dir-permissions",
+                "--widen-dirs=all",
                 "--copy-metadata=permissions,mtime",
             ];
             args.extend(pruning);
@@ -121,35 +139,42 @@ fn download_dry_runs_never_change_directory_permissions() {
     }
 }
 
+/// --if-exists=keep widens like any other policy. A contents source fills
+/// the destination itself, which `rsync` widens; a named one goes into it,
+/// which only `all` widens.
 #[test]
 fn download_keep_existing_policy_still_allows_temporary_container_access() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
     let server = Server::start("prefix-ok");
-    let temp = crate::test_support::tempdir().unwrap();
-    let directory = temp.path().join("dst");
-    fs::create_dir(&directory).unwrap();
-    fs::write(directory.join("keep"), b"keep").unwrap();
-    let restricted = RestrictedDirectory::new(directory.clone(), 0o500);
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--from",
-            "s3://bucket",
-            "--srcs-in",
-            "data",
-            "--into",
-            "dst",
-            "--if-exists=keep",
-            "--temporarily-widen-dir-permissions",
-        ],
-    );
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o500);
-    drop(restricted);
-    assert_eq!(fs::read(directory.join("keep")).unwrap(), b"keep");
-    assert_eq!(fs::read(directory.join("file")).unwrap(), vec![b'x'; 65536]);
+    for contents in [true, false] {
+        for widen in ["--widen-dirs=rsync", "--widen-dirs=all"] {
+            let temp = crate::test_support::tempdir().unwrap();
+            let directory = temp.path().join("dst");
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("keep"), b"keep").unwrap();
+            let restricted = RestrictedDirectory::new(directory.clone(), 0o500);
+            let mut args = vec!["--from", "s3://bucket"];
+            if contents {
+                args.push("--srcs-in");
+            }
+            args.extend(["data", "--into", "dst", "--if-exists=keep", widen]);
+            let output = server.cp(temp.path(), &args);
+            let widens = contents || widen == "--widen-dirs=all";
+            assert_eq!(
+                output.status.success(),
+                widens,
+                "{args:?}: {}",
+                output_text(&output)
+            );
+            assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o500);
+            drop(restricted);
+            assert_eq!(fs::read(directory.join("keep")).unwrap(), b"keep");
+            let copied = if contents { "file" } else { "data/file" };
+            assert_eq!(directory.join(copied).exists(), widens, "{args:?}");
+        }
+    }
 }
 
 #[test]
@@ -173,7 +198,7 @@ fn download_dry_run_leaves_requested_directory_metadata_unapplied() {
             "--as",
             "dst",
             "--dry-run",
-            "--temporarily-widen-dir-permissions",
+            "--widen-dirs=all",
             "--copy-metadata=permissions,mtime",
         ],
     );
@@ -220,7 +245,7 @@ fn search_only_download_preview_does_not_widen_a_named_container() {
             "--dry-run",
         ];
         if widen {
-            args.push("--temporarily-widen-dir-permissions");
+            args.push("--widen-dirs=all");
         }
         let output = server.cp(temp.path(), &args);
         assert!(output.status.success(), "{}", output_text(&output));
@@ -271,7 +296,7 @@ fn download_pruning_widens_destination_only_directories() {
                 pruning,
             ];
             if widen {
-                args.push("--temporarily-widen-dir-permissions");
+                args.push("--widen-dirs=all");
             }
             let output = server.cp(temp.path(), &args);
             let e555 = fs::symlink_metadata(dst.join("e555")).ok();
@@ -326,7 +351,7 @@ fn download_pruning_leaves_ignored_directories_alone() {
             "--prune",
             "--ignore",
             "*.tmp",
-            "--temporarily-widen-dir-permissions",
+            "--widen-dirs=all",
         ],
     );
     let after = fs::metadata(&ignored).unwrap();
@@ -369,7 +394,7 @@ fn download_pruning_widens_directories_with_non_utf8_names() {
             "--into",
             "dst",
             "--prune",
-            "--temporarily-widen-dir-permissions",
+            "--widen-dirs=all",
         ],
     );
     drop(restricted);

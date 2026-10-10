@@ -77,7 +77,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--follow-src` | Follow symlinks in directly supplied source paths |
 | `--follow-dst` | Follow symlinks in directly supplied destination paths |
 | `--copy-metadata <FEATURE>` | Match selected source metadata, including on unchanged files (repeatable/comma-separated)<br><br>Possible values:<br>- mtime: Match source modification times, including on unchanged files<br>- permissions: Preserve permission bits<br>- ownership: Preserve owner and group IDs<br>- specials: Copy device nodes and special files<br>- hardlinks: Preserve hard links between selected regular files<br>- acls: Preserve native Linux or macOS ACLs and permission bits<br>- xattrs: Preserve Linux or macOS extended attributes<br>- atimes: Preserve access times captured before reading<br>- crtimes: Preserve birth times; requires a macOS destination<br>- content-type: Match Content-Type on S3-to-S3 copies<br>- content-encoding: Match Content-Encoding on S3-to-S3 copies<br>- content-language: Match Content-Language on S3-to-S3 copies<br>- content-disposition: Match Content-Disposition on S3-to-S3 copies<br>- cache-control: Match Cache-Control on S3-to-S3 copies<br>- expires: Match Expires on S3-to-S3 copies<br>- website-redirect: Match the website redirect on S3-to-S3 copies<br>- user-metadata: Match application user metadata on S3-to-S3 copies (excluding syq-* keys)<br>- tags: Match the complete tag set on S3-to-S3 copies<br>- storage-class: Use the source storage class on S3-to-S3 copies |
-| `--temporarily-widen-dir-permissions` | Temporarily add owner read, write and search permission to existing destination directories |
+| `--widen-dirs <MODE>` | Which directories you own may briefly get the owner permission the copy needs; each is restored afterwards<br><br>Possible values:<br>- none: Never change directory permissions<br>- rsync: Directories the copy includes, as rsync does, but not the directory it copies into<br>- all: Also the directory the copy goes into and the directories above it<br><br>[default: none] |
 | `--open-noatime` | Request reads without access-time updates; warn and continue if unavailable |
 | `--sparse` | Turn written zero ranges into sparse holes |
 
@@ -176,8 +176,9 @@ do not change whether size/time or hashes are used for comparison. See
 [existing-file policies](../reference.md#choose-which-existing-files-to-update).
 
 `--into-existing` requires the destination directory to exist but allows new
-files inside it. `--if-exists=keep` can add children to an existing directory, but
-does not change that directory's permissions to make it writable.
+files inside it. `--if-exists=keep` can add children to an existing directory; it
+makes a read-only one writable only as
+[`--widen-dirs`](../reference.md#copy-metadata) allows.
 
 `--if-exists=keep` and `update-if-older` cannot combine with `--inplace`: an
 interrupted write could leave a file that a retry skips. With

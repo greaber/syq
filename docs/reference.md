@@ -427,17 +427,25 @@ class](object-storage.md#copies-between-s3-buckets).
 Existing files and directories keep their destination permissions unless you
 request permission or ACL metadata; the requested final permissions still
 apply. When a directory you own lacks the write or search permission a change
-needs, native `cp` reports it once (a dry run lists it too) and leaves it
-alone unless you pass `--temporarily-widen-dir-permissions`. That option
-briefly adds owner read, write and search permission to such directories
-inside the copy: the destination directory and the directories beneath it that
-the copy fills or prunes, also with `--if-exists=keep`. It never changes a
-directory above the copy, such as the parent of an `--as` target. Syq restores
-each directory's exact mode after copying and pruning, also when the copy
-fails, unless you request permissions. Other processes can see the temporary
-permissions, and a crash or forced termination can leave them in place.
-`syq rsync` widens the directories its file list includes without this option;
-see [rsync compatibility](rsync-compat.md). Root skips widening.
+needs, `--widen-dirs` (`--syq-widen-dirs` for `syq rsync`) decides whether syq
+briefly adds owner read, write and search permission to it:
+
+- `none`, the `syq cp` default, never does. Syq names the directory once (a dry
+  run lists it too), and the changes in it fail.
+- `rsync`, the `syq rsync` default, widens the directories the copy includes, as
+  rsync does: the destination of a contents copy, an existing `--as`
+  directory, and the directories beneath them that the copy fills or prunes,
+  also with `--if-exists=keep`. It does not widen the directory a named source
+  or an `--as` target goes into, or enter destination-only directories it
+  cannot read.
+- `all` also widens the directory the copy goes into and the directories above
+  it, including the one where syq creates missing parents, and enters unreadable
+  destination-only directories to prune them.
+
+Syq restores each directory's exact mode after copying and pruning, also when
+the copy fails, unless you request permissions. Other processes can see the
+temporary permissions, and a crash or forced termination can leave them in
+place. Root skips widening. A restricted receiver refuses `all`.
 
 Dry runs never change permissions. A dry run reports a directory you own but
 cannot search as not inspected, and exits with status 23.

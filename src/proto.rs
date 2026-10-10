@@ -1376,6 +1376,19 @@ pub enum WireRequest<Data> {
     /// which existing directories it owns. Asked only once an existing
     /// directory without owner write or search permission is found.
     ReceiverUser,
+    /// For `--widen-dirs=all`, before anything looks up the operator
+    /// destination `path`: give the owned directories on the way to it the
+    /// owner search permission reaching it needs and, with `create_missing`,
+    /// the nearest existing one write permission to create its missing part.
+    /// The connection keeps the saved modes until RestoreDestinationPath, or
+    /// restores them when it ends. Replies Ok.
+    PrepareDestinationPath {
+        path: PathBytes,
+        symlink_policy: OperatorSymlinkPolicy,
+        create_missing: bool,
+    },
+    /// Restore the modes PrepareDestinationPath changed. Replies Ok.
+    RestoreDestinationPath,
 }
 
 /// A non-fatal scan problem. `path` is where it happened, relative to the

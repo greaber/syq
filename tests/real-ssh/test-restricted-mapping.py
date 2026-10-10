@@ -182,9 +182,14 @@ def direct():
         for extra in [[], ["--only-existing"], ["--copy-metadata=permissions"]]:
             readonly = root + "/readonly-" + str(len(extra)) + ("-p" if "--copy-metadata=permissions" in extra else "")
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r}); (p/'parent').mkdir(parents=True); (p/'parent'/'item').write_bytes(b'old'); (p/'parent').chmod(0o2550)")
-            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update", "--temporarily-widen-dir-permissions"] + extra,
+            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update", "--widen-dirs=rsync"] + extra,
                 data=manifest([("file", "parent/item", "file")]))
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
+        # A grant covers what the copy creates beneath its root, so a
+        # restricted receiver refuses to widen the directories around it.
+        refused = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/readonly-0", "--no-tcp", "--widen-dirs=all"],
+                      data=manifest([("file", "parent/item", "file")]), expected=1)
+        assert b"--widen-dirs=all is not available with a restricted receiver" in refused.stderr, refused.stderr
         # A signed preview never changes permissions, with or without the
         # option, so read-only grants need no authority for it. A directory it
         # cannot search is reported rather than treated as empty.
@@ -209,7 +214,7 @@ def direct():
                     command = prefix + sources + ["--to", "destination", placement, destination,
                                                    "--no-tcp", "--if-exists=update", "--dry-run"]
                     if widen:
-                        command.append("--temporarily-widen-dir-permissions")
+                        command.append("--widen-dirs=rsync")
                     expected = 0 if mode == 0o500 else 23 if placement == "--into" else 1
                     preview = run(command, data=data, expected=expected)
                     if mode == 0o600:

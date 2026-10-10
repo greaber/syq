@@ -403,6 +403,8 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::CheckOperatorDirectoryAncestry { .. }
         | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
         | Request::CheckSearchableOperatorDirectory { .. }
+        | Request::PrepareDestinationPath { .. }
+        | Request::RestoreDestinationPath
         | Request::RegisterSourceRoots { .. }
         | Request::CreateOperatorDirectory { .. }
         | Request::AnchorDestination { .. }
@@ -969,6 +971,8 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::CheckOperatorDirectoryAncestry { .. }
                     | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
                     | Request::CheckSearchableOperatorDirectory { .. }
+                    | Request::PrepareDestinationPath { .. }
+                    | Request::RestoreDestinationPath
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }

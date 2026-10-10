@@ -3132,6 +3132,21 @@ impl FsOps {
                 .check_operator_directory_ancestry(checks, None)
                 .map(Response::DirectoryRelations),
             Request::ReceiverUser => Ok(Response::ReceiverUser(unsafe { libc::geteuid() })),
+            Request::PrepareDestinationPath {
+                path,
+                symlink_policy,
+                create_missing,
+            } => prepare_destination_path(
+                path,
+                *symlink_policy,
+                *create_missing,
+                &mut self.destination_path_access,
+            )
+            .map(|()| Response::Ok),
+            Request::RestoreDestinationPath => self
+                .destination_path_access
+                .restore()
+                .map(|()| Response::Ok),
             Request::CheckOperatorDirectoryAncestryWithAccess {
                 checks,
                 selection_in_copy,

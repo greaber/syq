@@ -8130,6 +8130,59 @@ fn temporary_search_access_restores_retained_inode_after_rename() {
     fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+/// `--widen-dirs=all` gives each owned ancestor the search permission the
+/// lookup needs, the nearest existing one write permission when part of the
+/// destination is missing, and nothing else; restoring puts every exact mode
+/// back, last change first.
+#[test]
+fn destination_path_access_widens_only_what_reaching_the_destination_needs() {
+    if is_superuser() {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let modes = [("a", 0o600), ("a/b", 0o500), ("a/b/c", 0o500)];
+    fs::create_dir_all(temp.path().join("a/b/c")).unwrap();
+    // Open the tree from the top, then narrow it from the bottom.
+    let set = |modes: &[(&str, u32)]| {
+        for (path, _) in modes {
+            fs::set_permissions(temp.path().join(path), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for (path, mode) in modes.iter().rev() {
+            fs::set_permissions(temp.path().join(path), fs::Permissions::from_mode(*mode)).unwrap();
+        }
+    };
+    let mode = |path: &str| fs::metadata(temp.path().join(path)).unwrap().mode() & 0o7777;
+    for (create_missing, target) in [
+        (true, "a/b/c/new/leaf"),
+        (false, "a/b/c/new/leaf"),
+        (true, "a/b/c"),
+    ] {
+        set(&modes);
+        let mut access = TemporaryDirectorySearchAccess::default();
+        prepare_destination_path(
+            temp.path().join(target).as_os_str().as_bytes(),
+            OperatorSymlinkPolicy::Refuse,
+            create_missing,
+            &mut access,
+        )
+        .unwrap();
+        let case = format!("{target}, create={create_missing}");
+        // `a` needed search to reach `b`; `b` already had it.
+        assert_eq!(mode("a"), 0o700, "{case}");
+        assert_eq!(mode("a/b"), 0o500, "{case}");
+        // `c` is the nearest existing directory of a missing destination,
+        // or the destination itself, which this never changes.
+        let creates = create_missing && target != "a/b/c";
+        assert_eq!(mode("a/b/c"), if creates { 0o700 } else { 0o500 }, "{case}");
+        access.restore().unwrap();
+        assert_eq!(mode("a"), 0o600, "{case}");
+        // Reopen `a` to read what lies beneath it.
+        set(&[("a", 0o700)]);
+        assert_eq!(mode("a/b"), 0o500, "{case}");
+        assert_eq!(mode("a/b/c"), 0o500, "{case}");
+    }
+}
+
 #[test]
 fn ancestry_access_restores_after_request_error() {
     if is_superuser() {

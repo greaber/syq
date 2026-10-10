@@ -233,6 +233,31 @@ impl OperatorResolver {
         .resolve(path, final_component, allow_missing, hops)
     }
 
+    /// Like `resolve_process`, but when looking up a component is denied,
+    /// `search` may give its directory search permission, reporting whether
+    /// it did, and the lookup is tried once more.
+    pub(crate) fn resolve_process_with_search(
+        path: &[u8],
+        symlink_policy: OperatorSymlinkPolicy,
+        final_component: OperatorFinalComponent,
+        allow_missing: bool,
+        hops: &mut Vec<OperatorSymlinkHop>,
+        search: &mut dyn FnMut(&File) -> Result<bool>,
+    ) -> Result<PinnedPath> {
+        let base = open_operator_start(path.starts_with(b"/"))?;
+        let base_identity = operator_directory_identity(&base)?;
+        let base_is_process_root = operator_base_is_process_root(base_identity)?;
+        Self {
+            base,
+            base_identity,
+            base_is_process_root,
+            confined: false,
+            relative_input: false,
+            symlink_policy,
+        }
+        .resolve_searching(path, final_component, allow_missing, hops, search)
+    }
+
     /// Begin at an already-open directory. The supplied path must be relative;
     /// a confined resolver also refuses `..` and symlink targets that would
     /// escape that directory.
@@ -260,6 +285,19 @@ impl OperatorResolver {
         final_component: OperatorFinalComponent,
         allow_missing: bool,
         hops: &mut Vec<OperatorSymlinkHop>,
+    ) -> Result<PinnedPath> {
+        self.resolve_searching(path, final_component, allow_missing, hops, &mut |_| {
+            Ok(false)
+        })
+    }
+
+    fn resolve_searching(
+        &self,
+        path: &[u8],
+        final_component: OperatorFinalComponent,
+        allow_missing: bool,
+        hops: &mut Vec<OperatorSymlinkHop>,
+        search: &mut dyn FnMut(&File) -> Result<bool>,
     ) -> Result<PinnedPath> {
         if path.contains(&0) {
             bail!("operator path contains NUL");
@@ -338,6 +376,15 @@ impl OperatorResolver {
             let current = stack.last().expect("operator resolver stack is nonempty");
             let name = operator_component_cstring(&component)?;
             let metadata = match metadata_at(current.directory.as_raw_fd(), &name) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && search(&current.directory)? =>
+                {
+                    metadata_at(current.directory.as_raw_fd(), &name)
+                }
+                result => result,
+            };
+            let metadata = match metadata {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound && allow_missing => {
                     components.push_front(component);

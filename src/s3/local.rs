@@ -485,13 +485,17 @@ pub(super) struct Destination {
     pub prefix: String,
 }
 impl Destination {
-    pub fn open(args: &Args) -> Result<Self> {
-        let path = crate::fsops::resolve(&args.locations.last().unwrap().path);
-        let policy = if args.follows_native_destination_paths() {
+    pub fn symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+        if args.follows_native_destination_paths() {
             OperatorSymlinkPolicy::FollowAll
         } else {
             OperatorSymlinkPolicy::Refuse
-        };
+        }
+    }
+
+    pub fn open(args: &Args) -> Result<Self> {
+        let path = crate::fsops::resolve(&args.locations.last().unwrap().path);
+        let policy = Self::symlink_policy(args);
         let final_component = if args.placement == Placement::Into {
             OperatorFinalComponent::Directory
         } else {

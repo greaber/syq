@@ -1443,7 +1443,7 @@ fn native_cp_mapping_restores_only_reopened_implicit_parents() {
             fs::set_permissions(t.path("dst/parent"), fs::Permissions::from_mode(mode)).unwrap();
             let before = fs::metadata(t.path("dst/parent")).unwrap();
             let mut args = vec![
-                "--temporarily-widen-dir-permissions",
+                "--widen-dirs=all",
                 "--mapping",
                 "-",
                 "-C",

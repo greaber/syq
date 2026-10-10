@@ -2,6 +2,7 @@
 //! early pruning needs a complete destination walk before downloads begin.
 
 use super::{Destination, Download, ObjectKind};
+use crate::cli::WidenDirs;
 use crate::proto::{DirectoryMode, TargetCondition};
 use crate::rooted::RelativePath;
 use anyhow::Result;
@@ -13,26 +14,38 @@ use std::path::Path;
 /// Paths are bytes beneath the destination root: pruning can meet local
 /// names that are not UTF-8.
 pub(super) struct TemporaryAccess {
-    enabled: bool,
+    mode: WidenDirs,
+    /// A contents source fills the destination directory itself.
+    contents: bool,
     prepared: HashSet<Vec<u8>>,
     widened: BTreeMap<Vec<u8>, DirectoryMode>,
 }
 
 impl TemporaryAccess {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(super) fn new(mode: WidenDirs, contents: bool) -> Self {
         Self {
-            enabled,
+            mode,
+            contents,
             prepared: HashSet::new(),
             widened: BTreeMap::new(),
         }
     }
 
+    /// Only `all` enters a destination-only directory pruning cannot read;
+    /// `rsync`, as rsync does, only empties the ones it can.
+    pub(super) fn enters_unreadable(&self) -> bool {
+        self.mode == WidenDirs::All
+    }
+
     pub(super) fn prepare(&mut self, destination: &Destination, jobs: &[Download]) -> Result<()> {
-        if !self.enabled {
+        if self.mode == WidenDirs::None {
             return Ok(());
         }
         let mut paths = BTreeSet::new();
-        if destination.prefix.is_empty() {
+        // The directory opened as the destination: under `all` always, the
+        // one the copy goes into; under `rsync` only one a contents source
+        // fills.
+        if self.mode == WidenDirs::All || destination.prefix.is_empty() && self.contents {
             paths.insert(Vec::new());
         }
         for job in jobs {
@@ -86,7 +99,7 @@ impl TemporaryAccess {
         path: &[u8],
         metadata: &crate::rooted::RootMetadata,
     ) -> Result<bool> {
-        if !self.enabled || self.widened.contains_key(path) {
+        if self.mode == WidenDirs::None || self.widened.contains_key(path) {
             return Ok(false);
         }
         let condition = TargetCondition::MatchesFingerprint {
@@ -151,7 +164,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(true);
+        let mut access = TemporaryAccess::new(WidenDirs::Rsync, true);
         access.prepare(&destination, &[job("first/one")]).unwrap();
         assert_eq!(
             fs::metadata(temporary.path().join("later")).unwrap().mode() & 0o777,
@@ -196,7 +209,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(false);
+        let mut access = TemporaryAccess::new(WidenDirs::None, true);
         access
             .prepare(&destination, &[job("missing/file")])
             .unwrap();

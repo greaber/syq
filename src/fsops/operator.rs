@@ -25,13 +25,19 @@ impl TemporaryDirectorySearchAccess {
         if !self.enabled {
             return Ok(());
         }
+        self.widen(directory, 0o100).map(|_| ())
+    }
+
+    /// Add the owner permission `bits` to `directory` when the receiving
+    /// user owns it and it lacks them, and report whether its mode changed.
+    fn widen(&mut self, directory: &File, bits: u32) -> Result<bool> {
         let metadata = directory.metadata()?;
         if is_superuser()
             || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o100 != 0
+            || metadata.mode() & bits == bits
             || self.protected == Some((metadata.dev(), metadata.ino()))
         {
-            return Ok(());
+            return Ok(false);
         }
         anyhow::ensure!(
             metadata.is_dir(),
@@ -41,9 +47,9 @@ impl TemporaryDirectorySearchAccess {
         // failure cannot leave an unrecorded permission change behind.
         let retained = directory.try_clone()?;
         self.changed.try_reserve(1)?;
-        set_mode_handle(&retained, metadata.mode() | 0o100)?;
+        set_mode_handle(&retained, metadata.mode() | bits)?;
         self.changed.push((retained, metadata.mode() & 0o7777));
-        Ok(())
+        Ok(true)
     }
 
     /// Open `name` beneath `directory`, adding search permission to
@@ -71,6 +77,53 @@ impl TemporaryDirectorySearchAccess {
         }
         failure.map_or(Ok(()), Err)
     }
+}
+
+/// For `--widen-dirs=all`: give each owned directory on the way to `path`
+/// the owner search permission looking it up needs and, when
+/// `create_missing` and part of the path is missing, the nearest existing
+/// one owner write and search permission to create the rest. `access` keeps
+/// every change until it restores them. A path that does not resolve is
+/// left for the copy itself to report.
+pub(crate) fn prepare_destination_path(
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+    create_missing: bool,
+    access: &mut TemporaryDirectorySearchAccess,
+) -> Result<()> {
+    let path = resolve(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut failure = None;
+    let resolved = OperatorResolver::resolve_process_with_search(
+        path.as_os_str().as_bytes(),
+        symlink_policy,
+        OperatorFinalComponent::Entry {
+            follow_symlink: false,
+        },
+        true,
+        &mut Vec::new(),
+        &mut |directory| match access.widen(directory, 0o100) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                failure = Some(error);
+                Ok(false)
+            }
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error.context("give a destination ancestor search permission"));
+    }
+    if let (Ok(PinnedPath::Missing(missing)), true) = (resolved, create_missing) {
+        let (directory, _) = missing.into_parts();
+        access
+            .widen(&directory, 0o300)
+            .context("give a destination ancestor write permission")?;
+    }
+    Ok(())
 }
 
 impl Drop for TemporaryDirectorySearchAccess {

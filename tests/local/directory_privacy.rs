@@ -616,7 +616,7 @@ fn narrowing_existing_permissions_does_not_implicitly_widen_owner_access() {
         ]);
         command.current_dir(&t.0);
         if widen {
-            command.arg("--temporarily-widen-dir-permissions");
+            command.arg("--widen-dirs=all");
         }
         let (during, output) = observe_before_finalization(&t, command, || mode(&t.path("dst/d")));
         let can_copy = widen || unsafe { libc::geteuid() } == 0;
@@ -736,21 +736,8 @@ fn a_raced_root_without_owner_access_is_widened_as_an_existing_one_is() {
     // when one found there before the copy would be: before planning (one
     // source) and after the scan (two sources, or -H).
     let cases: [&[&str]; 3] = [
-        &[
-            "cp",
-            "--temporarily-widen-dir-permissions",
-            "src",
-            "--into",
-            "dst",
-        ],
-        &[
-            "cp",
-            "--temporarily-widen-dir-permissions",
-            "src",
-            "other",
-            "--into",
-            "dst",
-        ],
+        &["cp", "--widen-dirs=all", "src", "--into", "dst"],
+        &["cp", "--widen-dirs=all", "src", "other", "--into", "dst"],
         &["rsync", "-rH", "src", "dst/"],
     ];
     for args in cases {

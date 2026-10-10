@@ -210,7 +210,10 @@ impl Engine {
                         // Only a directory this walk lists may be widened to
                         // list or empty it.
                         if meta.mode & 0o500 != 0o500 {
-                            if let Some(access) = access.as_deref_mut() {
+                            if let Some(access) = access
+                                .as_deref_mut()
+                                .filter(|access| access.enters_unreadable())
+                            {
                                 if access.prepare_for_pruning(&dst.root, &path, &meta)? {
                                     meta = dst.root.metadata(&rel)?;
                                 }

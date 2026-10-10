@@ -3608,7 +3608,8 @@ impl Planner<'_> {
             // them; rsync leaves them unlisted, as rsync does. Anchored ignore
             // patterns apply from the root, so with those the whole root is
             // walked again instead.
-            let enter = self.opts.may_widen_directory_permissions() && !self.opts.rsync_creation;
+            let enter = self.opts.widen_dirs == crate::cli::WidenDirs::All
+                && self.opts.may_widen_directory_permissions();
             let subtrees = ignore
                 .iter()
                 .all(|pattern| ignore_pattern_is_unanchored(pattern));
@@ -4412,7 +4413,7 @@ impl Planner<'_> {
                         "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
                         display(&path),
                         if hint {
-                            format!("; {DIRECTORY_ACCESS_HINT}")
+                            format!("; {}", self.opts.directory_access_hint())
                         } else {
                             String::new()
                         }

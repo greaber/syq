@@ -2725,8 +2725,8 @@ fn missing_remote_directory_reports_shared_directory_created_once() {
 
 /// A remote receiver must not report children of an unsearchable container as
 /// absent before the container is widened: --if-exists=keep, --only-existing
-/// and `dst.exists` would then replace or skip the wrong files. The parent of
-/// an exact placement is never widened, so that form fails without changes.
+/// and `dst.exists` would then replace or skip the wrong files. `all` widens
+/// the parent of an exact placement as it does an `--into` target.
 #[test]
 fn native_remote_container_access_refreshes_cached_existence() {
     if unsafe { libc::geteuid() } == 0 {
@@ -2743,7 +2743,6 @@ fn native_remote_container_access_refreshes_cached_existence() {
                     write(&t.path("dst/file"), b"old destination contents");
                 }
                 fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
-                let before = fs::metadata(t.path("dst")).unwrap();
                 let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
                 command
                     .args(["cp", &t.s("src/file"), "--to", "fake", placement])
@@ -2753,7 +2752,7 @@ fn native_remote_container_access_refreshes_cached_existence() {
                         t.path("dst/file")
                     })
                     .args([
-                        "--temporarily-widen-dir-permissions",
+                        "--widen-dirs=all",
                         "--no-tcp",
                         "-q",
                         "--performance-tuning=workers=1",
@@ -2782,19 +2781,6 @@ fn native_remote_container_access_refreshes_cached_existence() {
                 fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
                 let case = format!("{placement}, policy={policy}, present={present}");
                 assert_eq!(after.mode() & 0o7777, 0o600, "{case}");
-                if placement == "--as" {
-                    assert!(!output.status.success(), "{case}: {output:?}");
-                    assert_eq!(
-                        (before.ctime(), before.ctime_nsec()),
-                        (after.ctime(), after.ctime_nsec()),
-                        "{case}"
-                    );
-                    assert_eq!(t.path("dst/file").exists(), present, "{case}");
-                    if present {
-                        assert_eq!(read(&t.path("dst/file")), b"old destination contents");
-                    }
-                    continue;
-                }
                 assert_output_ok(&output);
                 if policy == "only-existing" && !present {
                     assert!(!t.path("dst/file").exists(), "{case}");
