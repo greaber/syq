@@ -8183,6 +8183,8 @@ fn destination_path_access_widens_only_what_reaching_the_destination_needs() {
         assert_eq!(mode("a/b"), 0o500, "{case}");
         assert_eq!(mode("a/b/c"), 0o500, "{case}");
     }
+    // Leave the tree removable.
+    set(&[("a", 0o700), ("a/b", 0o700), ("a/b/c", 0o700)]);
 }
 
 #[test]
