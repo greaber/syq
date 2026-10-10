@@ -1,8 +1,7 @@
 //! A fail-closed SSH-agent proxy for native remote-to-remote transfers.
 //!
-//! The default mode exposes only the transfer's enrollment key. Native
-//! `--peer-auth broker` instead advertises supported ambient-agent identities,
-//! while applying the same signature restrictions. OpenSSH's session-bind
+//! Native `--peer-auth broker` and approved account access advertise supported
+//! ambient-agent identities with destination restrictions. OpenSSH's session-bind
 //! messages prove the coordinator and peer sessions, and the host-bound
 //! userauth request binds each signature to the peer host key and login
 //! user.
@@ -1027,52 +1026,6 @@ impl ConstrainedAgentBroker {
         )
     }
 
-    /// Start a peer-bound broker which advertises and signs only with
-    /// one local private key. The ambient agent remains available solely for
-    /// authenticating the outer local-to-coordinator SSH connection.
-    pub fn start_with_private_key(
-        policy: BrokerPolicy,
-        max_connections: usize,
-        private_key: PrivateKey,
-    ) -> Result<Self> {
-        if private_key.is_encrypted()
-            || !matches!(
-                private_key.algorithm(),
-                Algorithm::Ed25519 | Algorithm::Rsa { .. } | Algorithm::Ecdsa { .. }
-            )
-        {
-            bail!("enrollment key must be an unlocked software key");
-        }
-        let ambient = policy.coordinator.as_ref().context("receiver broker requires a coordinating host")?.agent_socket.clone().context(
-            "authenticating to the source host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
-        )?;
-        Self::start_with_backend(
-            ambient,
-            SigningBackend::Private(Arc::new(private_key)),
-            policy,
-            max_connections,
-        )
-    }
-
-    /// Expose only this enrollment key from the local agent. The remote
-    /// caller still has to satisfy the same host, account and session checks.
-    pub(crate) fn start_with_agent_key(
-        policy: BrokerPolicy,
-        max_connections: usize,
-        socket: PathBuf,
-        key: KeyData,
-    ) -> Result<Self> {
-        let ambient = policy.coordinator.as_ref().context("receiver broker requires a coordinating host")?.agent_socket.clone().context(
-            "authenticating to the source host needs its configured SSH agent; configure IdentityAgent or SSH_AUTH_SOCK",
-        )?;
-        Self::start_with_backend(
-            ambient,
-            SigningBackend::SelectedAgent { socket, key },
-            policy,
-            max_connections,
-        )
-    }
-
     #[cfg(test)]
     fn start_with_private_key_and_socket(
         ambient_socket: PathBuf,
@@ -1143,7 +1096,7 @@ impl ConstrainedAgentBroker {
     }
 }
 
-fn validate_openssh_option_path(path: &Path, label: &str) -> Result<()> {
+pub(crate) fn validate_openssh_option_path(path: &Path, label: &str) -> Result<()> {
     let text = path
         .to_str()
         .with_context(|| format!("{label} is not valid UTF-8"))?;
@@ -1356,10 +1309,7 @@ fn serve_client(
                 let binding = parse_session_bind(&frame);
                 match binding.and_then(|binding| {
                     state.add(policy, binding)?;
-                    if matches!(
-                        backend,
-                        SigningBackend::Ambient(_) | SigningBackend::SelectedAgent { .. }
-                    ) {
+                    if backend.uses_agent() {
                         if let Some(stream) = upstream.as_mut() {
                             replay_session_bind(
                                 stream,
@@ -1390,7 +1340,7 @@ fn serve_client(
     Ok(())
 }
 
-fn parse_sign_request(frame: &[u8]) -> Result<SignRequest> {
+pub(crate) fn parse_sign_request(frame: &[u8]) -> Result<SignRequest> {
     // ssh-agent-lib's nested Vec decoder allocates from the encoded u32 before
     // it notices that the bytes are absent. Walk every attacker-controlled
     // length as a borrowed slice before invoking its typed decoders.
@@ -1606,11 +1556,26 @@ fn validate_public_credential_wire(encoded: &[u8]) -> Result<()> {
 
 enum SigningBackend {
     Ambient(PathBuf),
+    #[cfg(test)]
     Private(Arc<PrivateKey>),
-    SelectedAgent { socket: PathBuf, key: KeyData },
+    #[cfg(test)]
+    SelectedAgent {
+        socket: PathBuf,
+        key: KeyData,
+    },
 }
 
 impl SigningBackend {
+    fn uses_agent(&self) -> bool {
+        match self {
+            Self::Ambient(_) => true,
+            #[cfg(test)]
+            Self::SelectedAgent { .. } => true,
+            #[cfg(test)]
+            Self::Private(_) => false,
+        }
+    }
+
     fn identities(
         &self,
         upstream: &mut Option<TrackedStream>,
@@ -1623,10 +1588,12 @@ impl SigningBackend {
                 let response = upstream_request(upstream, socket, connections, bindings, request)?;
                 decode_identities_response(&response)
             }
+            #[cfg(test)]
             Self::SelectedAgent { key, .. } => Ok(vec![Identity {
                 credential: key.clone().into(),
                 comment: String::new(),
             }]),
+            #[cfg(test)]
             Self::Private(private) => Ok(vec![Identity {
                 credential: private.public_key().key_data().clone().into(),
                 comment: String::new(),
@@ -1639,25 +1606,27 @@ impl SigningBackend {
         upstream: &mut Option<TrackedStream>,
         connections: &Arc<ConnectionRegistry>,
         bindings: &[SessionBind],
-        request: &SignRequest,
+        _request: &SignRequest,
         frame: &[u8],
     ) -> Result<Vec<u8>> {
         match self {
             Self::Ambient(socket) => {
                 upstream_request(upstream, socket, connections, bindings, frame)
             }
+            #[cfg(test)]
             Self::SelectedAgent { socket, key } => {
-                if request.credential != PublicCredential::Key(key.clone()) {
+                if _request.credential != PublicCredential::Key(key.clone()) {
                     bail!("sign request did not select the enrollment key");
                 }
                 upstream_request(upstream, socket, connections, bindings, frame)
             }
+            #[cfg(test)]
             Self::Private(private) => {
                 let expected = PublicCredential::Key(private.public_key().key_data().clone());
-                if !credentials_equal_on_wire(&request.credential, &expected) {
+                if !credentials_equal_on_wire(&_request.credential, &expected) {
                     bail!("sign request did not select the enrollment key");
                 }
-                let signature = sign_private_key(private, &request.data, request.flags)?;
+                let signature = sign_private_key(private, &_request.data, _request.flags)?;
                 let mut response = Vec::new();
                 Response::SignResponse(signature).encode(&mut response)?;
                 Ok(response)

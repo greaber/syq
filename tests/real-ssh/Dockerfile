@@ -18,6 +18,18 @@ FROM dependencies AS builder
 COPY tests/real-ssh/sk-api.h tests/real-ssh/sk-provider.c /tmp/sk-provider/
 RUN cc -shared -fPIC -Wno-deprecated-declarations /tmp/sk-provider/sk-provider.c -lcrypto -o /tmp/syq-test-sk.so
 
+# A pre-session-binding OpenSSH for restricted-copy compatibility coverage.
+# SHA256 is from https://www.openssh.org/txt/release-8.8.
+RUN curl -fsSLo /tmp/openssh.tar.gz https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-8.8p1.tar.gz \
+    && echo '4590890ea9bb9ace4f71ae331785a3a5823232435161960ed5fc86588f331fe9  /tmp/openssh.tar.gz' | sha256sum -c - \
+    && tar -C /tmp -xzf /tmp/openssh.tar.gz \
+    && cd /tmp/openssh-8.8p1 \
+    && ./configure --prefix=/opt/openssh-8.8 --without-pam --without-zlib \
+    && make -j4 ssh sshd ssh-agent ssh-add ssh-keygen \
+    && mkdir -p /opt/openssh-8.8/bin /opt/openssh-8.8/sbin \
+    && cp ssh ssh-agent ssh-add ssh-keygen /opt/openssh-8.8/bin/ \
+    && cp sshd /opt/openssh-8.8/sbin/
+
 COPY schemas ./schemas
 COPY src ./src
 # The second PATH fixture has a real distinct identity and return wire version.
@@ -74,6 +86,7 @@ COPY tests/object-storage/check.py /usr/local/libexec/syq-storage-check.py
 COPY tests/real-ssh/test-storage-authorization.py /usr/local/libexec/syq-test-storage-authorization.py
 COPY tests/real-ssh/storage-streams.py /usr/local/libexec/syq-storage-streams.py
 
+COPY --from=builder /opt/openssh-8.8 /opt/openssh-8.8
 COPY --from=builder /tmp/syq-test-sk.so /usr/local/lib/syq-test-sk.so
 COPY --from=builder /tmp/syq /usr/local/bin/syq
 COPY --from=builder /tmp/syq-other-build /usr/local/bin/syq-other-build
@@ -124,3 +137,5 @@ COPY tests/real-ssh/test-receiver-keys.py /usr/local/libexec/syq-test-receiver-k
 # tables of all three containers before a timed-out subprocess.run is killed.
 COPY tests/real-ssh/timeout-diagnostics.py /usr/lib/python3/dist-packages/syq_real_ssh_timeouts.py
 RUN printf 'import syq_real_ssh_timeouts\n' > /usr/lib/python3/dist-packages/syq-real-ssh-timeouts.pth
+
+COPY tests/real-ssh/test-receiver-separate-keys.py /usr/local/libexec/syq-test-receiver-separate-keys.py

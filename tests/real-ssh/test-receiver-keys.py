@@ -220,10 +220,14 @@ Host source
                 assert metadata.get('security_key_flags') == flags
                 auth = remote('cat ~/.ssh/authorized_keys', stdout=subprocess.PIPE).stdout.decode()
                 installed = next(line for line in auth.splitlines() if f'syq-enrollment:{identifier}' in line)
-                if flags is not None:
-                    assert ('no-touch-required' in installed) == (not flags & 1), installed
-                    assert ('verify-required' in installed) == bool(flags & 4), installed
-                elif kind == 'rsa':
+                ssh_public = run('ssh-keygen', '-y', '-f', str(metadata_path.parent / 'ssh-key'),
+                                 stdout=subprocess.PIPE).stdout.decode().strip()
+                assert ssh_public in installed and ssh_public.startswith('ssh-ed25519 '), installed
+                assert 'no-touch-required' not in installed and 'verify-required' not in installed
+                signers = remote(f'cat ~/.local/share/syq/restricted/{identifier}/allowed-signers',
+                                 stdout=subprocess.PIPE).stdout.decode()
+                assert ssh_public.split()[1] not in signers, 'SSH key can sign grants'
+                if kind == 'rsa':
                     if protected:
                         encoded = json.loads(stored.split(b'\n', 1)[1])['header']['public_key']
                     else:

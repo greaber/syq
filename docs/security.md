@@ -185,18 +185,17 @@ limiting the access hostA receives.
 The protection has several parts:
 
 1. **Set up a restricted entry point on hostB.** Your laptop uses its normal
-   SSH access to install a receiver and a dedicated public key. That key's
-   `authorized_keys` entry permits only the receiver command, with SSH
-   forwarding disabled. The key stays on your laptop or hardware token,
-   matching the setup login's protection. Later copies reuse this setup. The
-   receiver refuses to run as root.
-2. **Authenticate hostA's connection without handing it the key.** A small
-   signing service on your laptop answers hostA's SSH authentication requests.
-   Before signing, it checks OpenSSH's cryptographic proof of which server
-   the connection reaches, along with the requested login account. HostA
-   cannot use it to authenticate
-   to a different host or account, sign arbitrary messages, or access your
-   other agent keys.
+   SSH access to install a receiver, a dedicated SSH public key, and a separate
+   public key for verifying copy grants. The SSH key's `authorized_keys` entry
+   permits only the receiver command, with SSH forwarding disabled. The receiver
+   refuses to run as root.
+2. **Keep the grant-signing key on your laptop.** A dedicated agent exposes only
+   the receiver's SSH key to hostA. That key can authenticate to the receiver,
+   but cannot sign valid copy grants. It is a software key stored on your laptop;
+   your ordinary SSH agent and the grant-signing key are not forwarded. Ordinary
+   SSH host-key checking on hostA uses the destination keys trusted by your laptop.
+   Keep this SSH key dedicated to the receiver: authorizing it elsewhere would
+   give hostA that access too.
 3. **Authorize the particular copy separately.** Your laptop signs a grant
    stating the permitted destination paths, write and deletion permissions,
    limits, and expiry. HostB's receiver verifies the signature, records that
@@ -211,12 +210,12 @@ Your laptop provides authorization and verifies the result without carrying
 the file data. See [Copy between servers](remote-to-remote.md) for setup and
 revoking access.
 
-For passphrase-protected software logins, syq encrypts the receiver key on disk
+For passphrase-protected software logins, syq encrypts the grant-signing key on disk
 and uses the original key's agent to unlock it locally. Anyone able to request
 unrestricted signatures from that agent and read the encrypted file can also
-unlock it. Syq's constrained signing service does not expose that operation.
+unlock it. The dedicated SSH agent does not expose that operation.
 The decrypted software key exists in local memory during a copy; a FIDO
-receiver key continues to require its hardware device. See
+grant-signing key continues to require its hardware device. See
 [key matching and supported logins](remote-reference.md#enrollment).
 
 Alternative authentication modes grant more authority. `--peer-auth broker`

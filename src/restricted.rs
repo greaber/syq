@@ -38,6 +38,7 @@ mod enroll;
 mod grant;
 mod install;
 mod keys;
+mod login_agent;
 mod privilege;
 mod receiver;
 pub(crate) mod source;
@@ -45,6 +46,7 @@ mod ssh;
 mod statefs;
 mod temporary_key;
 
+pub(crate) use login_agent::ReceiverAgent;
 pub(crate) use temporary_key::TemporaryKey;
 
 pub(crate) use authority::*;
@@ -59,13 +61,12 @@ pub(crate) use receiver::*;
 pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;
 
-// Generation 5 adds protected local keys and receiver-enforced FIDO policy.
-// Generation 4 state remains readable without changing keys or replay records;
-// older clients must not interpret generation 5 enrollments as Ed25519-only.
-const CONFIG_VERSION: u16 = 5;
+// Generation 6 separates SSH admission from grant signing. Older enrollments
+// retain their grant keys and replay records when the SSH key is installed.
+const CONFIG_VERSION: u16 = 6;
 
 fn supported_config_version(version: u16) -> bool {
-    matches!(version, 4 | CONFIG_VERSION)
+    matches!(version, 4 | 5 | CONFIG_VERSION)
 }
 const MAX_STATE_FILE: usize = 256 * 1024;
 const MAX_AUTHORIZED_KEYS: usize = 16 * 1024 * 1024;
@@ -100,6 +101,8 @@ struct InstallRequest {
     requested_destination: String,
     public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     security_key_flags: Option<u8>,
 }
 
@@ -125,6 +128,8 @@ struct RevokeRequest {
     id: EnrollmentId,
     target_login: String,
     public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_public_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     security_key_flags: Option<u8>,
 }
@@ -160,7 +165,7 @@ struct PendingEnrollment {
 }
 
 pub(crate) struct PreparedTransfer {
-    pub(crate) private_key: EnrollmentSigningKey,
+    pub(crate) ssh_key: PrivateKey,
     pub(crate) canonical_destination: Vec<u8>,
     pub(crate) grant: String,
     pub(crate) enrollment_id: EnrollmentId,
