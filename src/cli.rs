@@ -117,8 +117,9 @@ impl IfExists {
 }
 
 /// Which existing directories you own a copy may temporarily give the owner
-/// permission it needs. Each is restored to its exact mode afterwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// permission it needs. Each is restored to its exact mode afterwards. Each
+/// mode widens everything the one before it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum WidenDirs {
     /// Never change directory permissions
     None,

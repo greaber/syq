@@ -313,7 +313,7 @@ fn dry_run_leaves_unsearchable_destination_permissions_unchanged() {
             assert_eq!(out.status.code(), Some(23), "{out:?}");
             let stderr = stderr_of(&out);
             assert!(stderr.contains("sub: not inspected"), "{out:?}");
-            assert!(stderr.contains("--widen-dirs may help"), "{out:?}");
+            assert!(stderr.contains("--widen-dirs=rsync may help"), "{out:?}");
             assert!(
                 !String::from_utf8_lossy(&out.stdout).contains("sub/file"),
                 "{out:?}"
@@ -662,7 +662,10 @@ fn native_copy_leaves_existing_directory_permissions_alone_by_default() {
         assert_eq!(fs::metadata(t.path("dst")).unwrap().mode() & 0o777, 0o500);
         assert_eq!(read(&t.path("dst/extra")), b"keep");
         assert!(!t.path("dst/new").exists());
-        assert!(stderr_of(&out).contains("--widen-dirs may help"), "{out:?}");
+        assert!(
+            stderr_of(&out).contains("--widen-dirs=rsync may help"),
+            "{out:?}"
+        );
     }
 }
 
@@ -917,12 +920,9 @@ fn directory_widening_modes_choose_which_directories_change() {
                 let refused = restricted == t.path("ro") && mode & 0o100 == 0 && effective != "all";
                 if refused {
                     assert_eq!(out.status.code(), Some(1), "{label}");
-                    let hint = if effective == "none" {
-                        "widen-dirs may help"
-                    } else {
-                        "widen-dirs=all may help"
-                    };
-                    assert!(stderr_of(&out).contains(hint), "{label}");
+                    // The refused destination is one only `all` widens.
+                    let hint = format!("widen-dirs={needed} may help");
+                    assert!(stderr_of(&out).contains(&hint), "{label}");
                 }
                 if dry_run {
                     assert_eq!(
@@ -941,12 +941,9 @@ fn directory_widening_modes_choose_which_directories_change() {
                         (before.ctime(), before.ctime_nsec()),
                         "{label}"
                     );
-                    let hint = if effective == "none" {
-                        "widen-dirs may help"
-                    } else {
-                        "widen-dirs=all may help"
-                    };
-                    assert!(stderr_of(&out).contains(hint), "{label}");
+                    // The hint names the narrowest mode that avoids the failure.
+                    let hint = format!("widen-dirs={needed} may help");
+                    assert!(stderr_of(&out).contains(&hint), "{label}");
                 }
             }
         }
@@ -1341,7 +1338,10 @@ fn keep_existing_policy_honors_temporary_directory_access() {
             assert_eq!(read(&t.path("dst/sub/new")), b"new contents");
         } else {
             assert_eq!(out.status.code(), Some(23), "{out:?}");
-            assert!(stderr_of(&out).contains("--widen-dirs may help"), "{out:?}");
+            assert!(
+                stderr_of(&out).contains("--widen-dirs=rsync may help"),
+                "{out:?}"
+            );
             assert!(!t.path("dst/sub/new").exists());
         }
     }
@@ -1794,6 +1794,14 @@ fn pruning_widens_destination_only_directories_it_must_enter_or_empty() {
         );
         assert!(t.path("dst/e555/g").exists());
         assert_eq!(t.path("dst/e300/f").exists(), unreadable);
+        // Only `all` enters a directory it cannot read; `rsync` empties one
+        // it can.
+        let hint = if unreadable {
+            "--widen-dirs=all may help"
+        } else {
+            "--widen-dirs=rsync may help"
+        };
+        assert!(stderr_of(&out).contains(hint), "{out:?}");
     }
 
     // syq rsync, and the `rsync` mode, empty readable directories, as rsync
@@ -1830,6 +1838,10 @@ fn pruning_widens_destination_only_directories_it_must_enter_or_empty() {
         assert_eq!(out.status.code(), Some(23), "native={native}: {out:?}");
         assert_eq!(e300, 0o300);
         assert!(t.path("dst/e555/g").exists());
+        assert!(
+            stderr_of(&out).contains("widen-dirs=all may help"),
+            "native={native}: {out:?}"
+        );
     }
 
     // A dry run and a deletion limit leave every mode as it was.
@@ -1881,7 +1893,7 @@ fn copies_name_each_directory_that_needs_temporary_access_once() {
         return;
     }
     let note = "dst/ro: you own this directory, but it lacks owner write permission; \
-                --widen-dirs may help";
+                --widen-dirs=rsync may help";
     for dry_run in [true, false] {
         for widen in [false, true] {
             let t = Tmp::new();
@@ -1920,7 +1932,7 @@ fn copies_name_each_directory_that_needs_temporary_access_once() {
             assert_eq!(stderr.matches(note).count(), usize::from(!widen), "{case}");
             // The per-file errors that follow do not repeat the hint.
             assert_eq!(
-                stderr.matches("--widen-dirs may help").count(),
+                stderr.matches("--widen-dirs=rsync may help").count(),
                 usize::from(!widen),
                 "{case}"
             );
@@ -1961,7 +1973,7 @@ fn container_failures_suggest_the_option() {
         let out = native_syq(&["cp", &t.s("src/file"), placement, &destination]);
         assert!(!out.status.success(), "{out:?}");
         assert!(
-            stderr_of(&out).contains("--widen-dirs may help"),
+            stderr_of(&out).contains("--widen-dirs=all may help"),
             "{placement}, {size}: {out:?}"
         );
         let out = native_syq(&[
@@ -2049,7 +2061,7 @@ fn previews_name_directories_needing_access_for_compared_and_linked_files() {
     let note = |dir: &str| {
         format!(
             "{dir}: you own this directory, but it lacks owner write permission; \
-             --widen-dirs may help"
+             --widen-dirs=rsync may help"
         )
     };
     // Equal sizes and times: only the --hash comparison finds the change.
@@ -2099,7 +2111,9 @@ fn previews_name_directories_needing_access_for_compared_and_linked_files() {
         let out = native_syq(&args);
         assert_eq!(stderr_of(&out).matches(&note(&ro)).count(), 1, "{out:?}");
         assert_eq!(
-            stderr_of(&out).matches("--widen-dirs may help").count(),
+            stderr_of(&out)
+                .matches("--widen-dirs=rsync may help")
+                .count(),
             1,
             "{out:?}"
         );
@@ -2123,7 +2137,10 @@ fn exact_placement_onto_an_unsearchable_directory_suggests_and_takes_access() {
     let (src, dst) = (t.s("src/a"), t.s("dst/a"));
     let out = native_syq(&["cp", &src, "--as", &dst]);
     assert!(!out.status.success(), "{out:?}");
-    assert!(stderr_of(&out).contains("--widen-dirs may help"), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("--widen-dirs=all may help"),
+        "{out:?}"
+    );
     let out = native_syq(&["cp", "--widen-dirs=rsync", &src, "--as", &dst]);
     assert!(!out.status.success(), "{out:?}");
     assert!(
@@ -2278,10 +2295,7 @@ fn unchanged_files_and_hard_links_do_not_suggest_temporary_access() {
         args.extend(extra.iter().copied());
         let out = native_syq(&args);
         assert_output_ok(&out);
-        assert!(
-            !stderr_of(&out).contains("--widen-dirs may help"),
-            "{extra:?}: {out:?}"
-        );
+        assert!(!stderr_of(&out).contains("may help"), "{extra:?}: {out:?}");
     }
     fs::set_permissions(t.path("dst/ro"), fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -2300,7 +2314,7 @@ fn exact_placement_onto_a_read_only_directory_is_named_in_previews() {
     let (src, dst) = (t.s("src/a"), t.s("dst/a"));
     let note = format!(
         "{dst}: you own this directory, but it lacks owner write permission; \
-         --widen-dirs may help"
+         --widen-dirs=rsync may help"
     );
     let preview = native_syq(&["cp", &src, "--as", &dst, "--dry-run"]);
     let out = native_syq(&["cp", &src, "--as", &dst]);

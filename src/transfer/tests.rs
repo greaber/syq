@@ -433,6 +433,7 @@ fn pipeline_worker(
         inode_preservation: Default::default(),
         hardlink_completions: Mutex::new(Default::default()),
         access_limited: Default::default(),
+        outer_directory: Default::default(),
         access_noted: Default::default(),
         devices: false,
         checksum: false,
@@ -5719,11 +5720,15 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
     };
     assert_eq!(wire_os_kind(&error), Some("permission_denied"));
     let error = endpoint_error(error).context("prepare file");
-    assert!(copy_error_message(&error, Some(DIRECTORY_ACCESS_HINT)).contains(DIRECTORY_ACCESS_HINT));
-    assert!(!copy_error_message(&error, None).contains(DIRECTORY_ACCESS_HINT));
+    assert!(
+        copy_error_message(&error, Some("--widen-dirs=rsync may help"))
+            .contains("--widen-dirs=rsync may help")
+    );
+    assert!(!copy_error_message(&error, None).contains("--widen-dirs=rsync may help"));
     let plain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
     assert!(
-        !copy_error_message(&plain, Some(DIRECTORY_ACCESS_HINT)).contains(DIRECTORY_ACCESS_HINT)
+        !copy_error_message(&plain, Some("--widen-dirs=rsync may help"))
+            .contains("--widen-dirs=rsync may help")
     );
 }
 

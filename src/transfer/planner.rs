@@ -1665,8 +1665,15 @@ impl Planner<'_> {
         }
         if let Some(entry) = self.root_access_check.take() {
             let root = self.dst_root.clone();
+            // Only `all` widens a destination the copy goes into without
+            // filling it.
+            let needed = if self.opts.outer_directory.get() == Some(&root) {
+                crate::cli::WidenDirs::All
+            } else {
+                crate::cli::WidenDirs::Rsync
+            };
             if !self
-                .check_directory_access(vec![(root.clone(), entry)])?
+                .check_directory_access(vec![(root.clone(), entry)], needed)?
                 .is_empty()
             {
                 // Nothing beneath an uninspected root can be previewed.
@@ -1725,7 +1732,7 @@ impl Planner<'_> {
                     })
                     .collect::<Vec<_>>();
                 if !candidates.is_empty() {
-                    self.check_directory_access(candidates)?;
+                    self.check_directory_access(candidates, crate::cli::WidenDirs::Rsync)?;
                 }
             }
             let planned = self.filter_dirs(dirs, stats, dst_root)?;
@@ -2748,7 +2755,9 @@ impl Planner<'_> {
                 self.progress.error_classified(
                     &format!(
                         "syq: {}",
-                        self.opts.wire_error_message_at(&error, &self.dst_root)
+                        // Creating it changes the directory it goes into.
+                        self.opts
+                            .wire_error_message_needing(&error, crate::cli::WidenDirs::All)
                     ),
                     Some("io"),
                     os_kind,
@@ -3721,16 +3730,47 @@ impl Planner<'_> {
                     bases = vec![root.clone()];
                 }
             }
+            // Only `all` enters a destination-only directory pruning cannot
+            // read, so one the receiving account owns names that mode.
+            let unlisted: std::collections::HashMap<&[u8], &Entry> = if warnings.is_empty()
+                || self.opts.hint_for(crate::cli::WidenDirs::All).is_none()
+            {
+                Default::default()
+            } else {
+                walk.entries
+                    .iter()
+                    .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
+                    .map(|entry| (entry.path.as_slice(), entry))
+                    .collect()
+            };
             for (base, warning) in warnings {
                 self.delete_walk_failed = true;
+                let directory = warning.path.as_ref().map(|path| join(&base, path));
+                let owned = match directory
+                    .as_deref()
+                    .and_then(|directory| unlisted.get(directory))
+                {
+                    Some(entry) => receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)?,
+                    None => false,
+                };
+                let hint = match self
+                    .opts
+                    .hint_for(crate::cli::WidenDirs::All)
+                    .filter(|_| owned)
+                {
+                    Some(hint) => format!("; {hint}"),
+                    None => String::new(),
+                };
                 // A preview names the directory it could not inspect.
-                match warning.path.as_ref().filter(|_| self.opts.dry_run) {
-                    Some(path) => self.progress.error(&format!(
-                        "syq: {}: not inspected: {}",
-                        display(&join(&base, path)),
+                match directory.filter(|_| self.opts.dry_run) {
+                    Some(directory) => self.progress.error(&format!(
+                        "syq: {}: not inspected: {}{hint}",
+                        display(&directory),
                         warning.error
                     )),
-                    None => self.progress.error(&format!("syq: delete: {warning}")),
+                    None => self
+                        .progress
+                        .error(&format!("syq: delete: {warning}{hint}")),
                 }
             }
             if self.delete_walk_failed {
@@ -3883,7 +3923,8 @@ impl Planner<'_> {
         if !access_candidates.is_empty() {
             // Walked directories are listable, so none is reported here as
             // uninspected; the rest are noted before their first removal.
-            self.check_directory_access(access_candidates)?;
+            // `rsync` empties destination-only directories, as rsync does.
+            self.check_directory_access(access_candidates, crate::cli::WidenDirs::Rsync)?;
         }
         Ok(())
     }
@@ -4057,7 +4098,7 @@ impl Planner<'_> {
                             }
                         }
                         Some(e) => me.progress.error_classified(
-                            &format!("syq: delete {rel}: {e}"),
+                            &format!("syq: delete {rel}: {}", opts.wire_error_message_at(&e, p)),
                             Some("io"),
                             None,
                         ),
@@ -4340,7 +4381,7 @@ impl Planner<'_> {
                 })
                 .collect::<Vec<_>>();
             if !candidates.is_empty() {
-                for path in self.check_directory_access(candidates)? {
+                for path in self.check_directory_access(candidates, crate::cli::WidenDirs::Rsync)? {
                     blocked.insert(path.clone());
                     self.blocked_directory_paths.insert(path);
                 }
@@ -4387,14 +4428,7 @@ impl Planner<'_> {
     /// Whether the receiving account owns `entry`. The receiver is asked its
     /// account once, only after a directory needing access has been found.
     fn receiver_owns(&mut self, entry: &Entry) -> Result<bool> {
-        if self.receiver_uid.is_none() {
-            let uid = match ok(self.dst.call(Request::ReceiverUser)?, "receiving account")? {
-                Response::ReceiverUser(uid) => uid,
-                other => bail!("unexpected receiving account response {other:?}"),
-            };
-            self.receiver_uid = Some((uid != 0).then_some(uid));
-        }
-        Ok(self.receiver_uid.flatten() == Some(entry.uid))
+        receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)
     }
 
     /// Sort existing directories whose owner lacks write or search
@@ -4406,6 +4440,7 @@ impl Planner<'_> {
     fn check_directory_access(
         &mut self,
         candidates: Vec<(PathBytes, Entry)>,
+        needed: crate::cli::WidenDirs,
     ) -> Result<Vec<PathBytes>> {
         let mut uninspected = Vec::new();
         let hint = self.opts.may_suggest_directory_access();
@@ -4430,10 +4465,9 @@ impl Planner<'_> {
                     &format!(
                         "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
                         display(&path),
-                        if hint {
-                            format!("; {}", self.opts.directory_access_hint())
-                        } else {
-                            String::new()
+                        match self.opts.hint_for(needed).filter(|_| hint) {
+                            Some(hint) => format!("; {hint}"),
+                            None => String::new(),
                         }
                     ),
                     Some("io"),
@@ -4445,7 +4479,7 @@ impl Planner<'_> {
                     .access_limited
                     .lock()
                     .unwrap()
-                    .insert(path, entry.mode);
+                    .insert(path, (entry.mode, needed));
             }
         }
         Ok(uninspected)
@@ -4702,6 +4736,22 @@ pub(super) fn inspect_tolerating_denials(
 /// Temporarily add owner access to `directories` and remember the original
 /// modes of those actually changed; returns how many changed. The receiver
 /// widens only owned directories, never as root.
+/// Whether the receiving account, asked once into `cache`, owns `entry`.
+fn receiver_owns(
+    dst: &mut dyn Conn,
+    cache: &mut Option<Option<u32>>,
+    entry: &Entry,
+) -> Result<bool> {
+    if cache.is_none() {
+        let uid = match ok(dst.call(Request::ReceiverUser)?, "receiving account")? {
+            Response::ReceiverUser(uid) => uid,
+            other => bail!("unexpected receiving account response {other:?}"),
+        };
+        *cache = Some((uid != 0).then_some(uid));
+    }
+    Ok(cache.flatten() == Some(entry.uid))
+}
+
 fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,

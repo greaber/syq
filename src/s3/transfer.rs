@@ -489,12 +489,14 @@ impl Engine {
             // --if-exists=keep widens like any other policy; it only leaves
             // existing directory metadata alone. `rsync` widens the
             // destination itself only when a contents source fills it.
+            // A contents source fills the destination directory itself.
+            let fills_destination = self.args.native_mapping.is_none()
+                && self.args.locations[..self.args.locations.len() - 1]
+                    .iter()
+                    .any(Location::copies_contents);
             let mut directory_access = directory_permissions::TemporaryAccess::new(
                 widen,
-                self.args.native_mapping.is_none()
-                    && self.args.locations[..self.args.locations.len() - 1]
-                        .iter()
-                        .any(Location::copies_contents),
+                fills_destination,
                 self.args.delete,
             );
             let mut copies_finished = false;
@@ -524,8 +526,17 @@ impl Engine {
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
+                            // Only `all` widens the directory the download
+                            // goes into without filling it.
+                            let into_outer = !(job.path.contains('/')
+                                || dst.prefix.is_empty() && fills_destination);
+                            let needed = if into_outer {
+                                WidenDirs::All
+                            } else {
+                                WidenDirs::Rsync
+                            };
                             let suggestion =
-                                crate::transfer::failure_hint(engine.args.widen_dirs, false);
+                                crate::transfer::mode_hint(engine.args.widen_dirs, needed, false);
                             if let Some(suggestion) = suggestion.filter(|_| {
                                 error.chain().any(|cause| {
                                     cause.downcast_ref::<std::io::Error>().is_some_and(|e| {

@@ -213,11 +213,15 @@ pub struct Opts {
     pub sparse: bool,
     pub inode_preservation: crate::inode_metadata::Selection,
     hardlink_completions: Mutex<std::collections::HashMap<usize, Option<(u64, u64)>>>,
-    /// Owned existing directories, with their modes, that a copy without
-    /// temporary access could not change: each is named once, before the
-    /// first change planned inside it, by the planner or by a worker whose
-    /// preview comparison finds a change.
-    pub access_limited: Mutex<std::collections::HashMap<PathBytes, u32>>,
+    /// Owned existing directories, with their modes and the mode that would
+    /// widen them, that a copy without temporary access could not change:
+    /// each is named once, before the first change planned inside it, by the
+    /// planner or by a worker whose preview comparison finds a change.
+    pub access_limited: Mutex<std::collections::HashMap<PathBytes, (u32, WidenDirs)>>,
+    /// The directory the copy goes into without filling it, once known: the
+    /// `--into` directory of named sources, or the parent of an `--as`
+    /// target. Only `all` widens it.
+    pub outer_directory: std::sync::OnceLock<PathBytes>,
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
@@ -1410,7 +1414,8 @@ fn attempt_small_copy(
                     os_kind_of(&error),
                     copy_error_message(
                         &error,
-                        opts.failure_hint()
+                        // It writes only into the directory the copy goes into.
+                        opts.hint_for(WidenDirs::All)
                             .filter(|_| !args.only_new_native_entries()),
                     ),
                 ))
@@ -1849,26 +1854,33 @@ fn wire_os_kind(error: &WireError) -> Option<&'static str> {
     })
 }
 
-pub(crate) const DIRECTORY_ACCESS_HINT: &str = "--widen-dirs may help";
-const RSYNC_DIRECTORY_ACCESS_HINT: &str = "--syq-widen-dirs may help";
-
 /// The hint for a failure in a directory the receiving user owns but lacks
-/// the owner permission for, naming the mode that would have widened it:
-/// any under `none`, `all` under `rsync`, and none under `all`.
-pub(crate) fn failure_hint(mode: WidenDirs, rsync: bool) -> Option<&'static str> {
-    match (mode, rsync) {
-        (WidenDirs::None, false) => Some(DIRECTORY_ACCESS_HINT),
-        (WidenDirs::None, true) => Some(RSYNC_DIRECTORY_ACCESS_HINT),
-        (WidenDirs::Rsync, false) => Some("--widen-dirs=all may help"),
-        (WidenDirs::Rsync, true) => Some("--syq-widen-dirs=all may help"),
-        (WidenDirs::All, _) => None,
+/// the owner permission for, naming `needed`, the mode that would have
+/// widened it, unless the `current` mode already does.
+pub(crate) fn mode_hint(
+    current: WidenDirs,
+    needed: WidenDirs,
+    rsync: bool,
+) -> Option<&'static str> {
+    if current >= needed {
+        return None;
     }
+    Some(match (needed, rsync) {
+        (WidenDirs::Rsync, false) => "--widen-dirs=rsync may help",
+        (WidenDirs::Rsync, true) => "--syq-widen-dirs=rsync may help",
+        (_, false) => "--widen-dirs=all may help",
+        (_, true) => "--syq-widen-dirs=all may help",
+    })
 }
 
-/// Add the hint to a failed destination lookup the receiver found blocked
-/// by an owned directory lacking owner permission.
+/// Add the hint to a failed lookup or creation of the destination path, which
+/// the receiver found blocked by an owned directory lacking owner permission.
+/// Only `all` widens the directories on the way to the destination.
 fn with_failure_hint(opts: &Opts, mut error: anyhow::Error) -> anyhow::Error {
-    if let (Some(hint), Some(wire)) = (opts.failure_hint(), error.downcast_mut::<WireError>()) {
+    if let (Some(hint), Some(wire)) = (
+        opts.hint_for(WidenDirs::All),
+        error.downcast_mut::<WireError>(),
+    ) {
         if wire.io_kind == Some(WireIoKind::OwnedDirectoryPermissions) {
             wire.message.push_str("; ");
             wire.message.push_str(hint);
@@ -1911,25 +1923,31 @@ impl Opts {
         self.widen_dirs == WidenDirs::None
     }
 
-    /// The hint naming the option, as this command spells it, for those
-    /// directories.
-    pub(super) fn directory_access_hint(&self) -> &'static str {
-        if self.rsync_creation {
-            RSYNC_DIRECTORY_ACCESS_HINT
-        } else {
-            DIRECTORY_ACCESS_HINT
-        }
+    /// The hint naming `needed`, as this command spells it, when this copy's
+    /// mode is narrower.
+    pub(super) fn hint_for(&self, needed: WidenDirs) -> Option<&'static str> {
+        mode_hint(self.widen_dirs, needed, self.rsync_creation)
     }
 
-    /// The hint for a failure a wider mode would have avoided.
+    /// The hint for a failure inside the copy, which `rsync` widens.
     pub(super) fn failure_hint(&self) -> Option<&'static str> {
-        failure_hint(self.widen_dirs, self.rsync_creation)
+        self.hint_for(WidenDirs::Rsync)
     }
 
-    /// The hint for a failure at `path`: none beneath a directory already
-    /// named.
+    /// The hint for a failure at `path`: `all` for one in the directory the
+    /// copy goes into, `rsync` for one inside the copy, and none beneath a
+    /// directory already named.
     fn failure_hint_at(&self, path: &[u8]) -> Option<&'static str> {
-        self.failure_hint()
+        let needed = if self
+            .outer_directory
+            .get()
+            .is_some_and(|outer| *outer == parent_path(path))
+        {
+            WidenDirs::All
+        } else {
+            WidenDirs::Rsync
+        };
+        self.hint_for(needed)
             .filter(|_| !self.access_noted_above(path))
     }
 
@@ -1943,9 +1961,9 @@ impl Opts {
         replaces_entry: bool,
     ) {
         let parent = parent_path(path);
-        let mode = {
+        let (mode, widens) = {
             let mut limited = self.access_limited.lock().unwrap();
-            let Some(&mode) = limited.get(&parent) else {
+            let Some(&(mode, widens)) = limited.get(&parent) else {
                 return;
             };
             let needed = if replaces_entry { 0o300 } else { 0o100 };
@@ -1953,7 +1971,7 @@ impl Opts {
                 return;
             }
             limited.remove(&parent);
-            mode
+            (mode, widens)
         };
         self.access_noted.lock().unwrap().insert(parent.clone());
         let missing = !mode & 0o300;
@@ -1965,7 +1983,7 @@ impl Opts {
                 (true, false) => "write",
                 _ => "search",
             },
-            self.directory_access_hint()
+            self.hint_for(widens).unwrap_or_default()
         ));
     }
 
@@ -1992,6 +2010,11 @@ impl Opts {
 
     fn wire_error_message_at(&self, error: &WireError, path: &[u8]) -> String {
         permission_error_message(error.to_string(), error.io_kind, self.failure_hint_at(path))
+    }
+
+    /// A failure only `needed` would have avoided.
+    fn wire_error_message_needing(&self, error: &WireError, needed: WidenDirs) -> String {
+        permission_error_message(error.to_string(), error.io_kind, self.hint_for(needed))
     }
 }
 
@@ -2311,6 +2334,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         hardlink_completions: Mutex::new(Default::default()),
         access_limited: Default::default(),
+        outer_directory: Default::default(),
         access_noted: Default::default(),
         devices: args.devices,
         checksum: args.checksum,
@@ -3218,6 +3242,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             None => multiple_source_operands || dst.copies_contents() || args.files_from.is_some(),
         },
     };
+    // Whether a source fills the destination directory itself, as a contents
+    // copy does. If not, it is only the directory the copy goes into, as is
+    // the parent of an `--as` target; only `all` widens that directory.
+    let fills_root = expand_exact_home
+        || args.files_from.is_some()
+        || srcs.iter().any(Location::copies_contents);
+    let outer_directory = if dst_is_dir && !fills_root {
+        Some(dst_root.clone())
+    } else if !dst_is_dir && !expand_exact_home {
+        Some(parent_path(&dst_root))
+    } else {
+        None
+    };
+    if let Some(outer) = outer_directory {
+        let _ = opts.outer_directory.set(outer);
+    }
     if args.placement == Placement::Into
         && args.target_existence == Existence::Existing
         && !dst_entry_is_dir
@@ -3356,7 +3396,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "search destination directory {}: Permission denied (os error 13); \
                      an owned destination directory lacks the required owner permissions; {}",
                     display(&dst_root),
-                    opts.failure_hint().unwrap_or_default()
+                    opts.hint_for(WidenDirs::All).unwrap_or_default()
                 );
             }
         }
@@ -3568,10 +3608,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             // goes into, and `rsync` only when a source fills it. rsync's
             // destination already passed its search check.
             let selection_in_copy = opts.widen_dirs == WidenDirs::All
-                || (dst_is_dir || expand_exact_home)
-                    && (expand_exact_home
-                        || args.files_from.is_some()
-                        || srcs.iter().any(Location::copies_contents));
+                || (dst_is_dir || expand_exact_home) && fills_root;
             match check_operator_directory_ancestry(
                 &mut *dst_ctl,
                 ancestry_checks,
