@@ -7437,3 +7437,93 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
     // Once it exists, it is not staged again.
     assert!(run(prepare(false, 2)).is_err());
 }
+
+/// A refused in-place preparation leaves a new file staged: under a grant
+/// that only creates it (an `--as-new` root, or keeping existing files), a
+/// file that appears at its name meanwhile takes no in-place write. (The
+/// reviewer's reproducer.)
+#[test]
+fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
+    for keep in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        if keep {
+            fs::create_dir(root.join("target")).unwrap();
+        }
+        let target = if keep {
+            root.join("target/file")
+        } else {
+            root.join("target")
+        };
+        let authority = test_authority_with_existence(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            if keep {
+                ExistingDestinationPolicy::Skip
+            } else {
+                ExistingDestinationPolicy::Replace
+            },
+            if keep {
+                DestinationPlacement::DirectoryContents
+            } else {
+                DestinationPlacement::ExactPath
+            },
+            if keep {
+                RootExistence::Any
+            } else {
+                RootExistence::New
+            },
+        )
+        .unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        ops.set_scope_names(authority.scope_names());
+        let mut run = |mut request: Request| -> Result<proto::Response> {
+            let settlement = authority.authorize(&mut request, false)?;
+            let response = ops.handle(&request);
+            authority.settle(settlement, &response);
+            Ok(response)
+        };
+        let prepare = |inplace| Request::Prepare {
+            path: path_bytes(&target),
+            size: 5,
+            inplace,
+            copy_id: [1; 16],
+            mode: 0o644,
+            flags: 0,
+            acl: false,
+            scanned: proto::ScannedDestination::Unknown,
+            group: None,
+            attempt: 0,
+            create_if_missing: true,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        let response = run(prepare(false)).unwrap();
+        assert!(
+            matches!(response, proto::Response::Prepared(_)),
+            "{response:?}"
+        );
+        // An unrelated file arrives before the new file is published.
+        fs::write(&target, b"theirs").unwrap();
+        let error = run(prepare(true)).unwrap_err();
+        assert!(error.to_string().contains("only creates"), "{error}");
+        let data = b"HELLO".to_vec();
+        let write = run(Request::WriteRange {
+            path: path_bytes(&target),
+            inplace: true,
+            copy_id: [1; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.into(),
+            guard: None,
+        });
+        assert!(write.is_err(), "keep={keep}: {write:?}");
+        assert_eq!(fs::read(&target).unwrap(), b"theirs", "keep={keep}");
+    }
+}

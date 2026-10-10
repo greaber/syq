@@ -159,7 +159,8 @@ pub(crate) fn directory_names(directory: File) -> io::Result<Vec<Vec<u8>>> {
 /// How a directory may treat two different names as one entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NameFolding {
-    /// Names are compared byte for byte.
+    /// Names are compared byte for byte. No macOS filesystem does.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Exact,
     /// Names differing only in how Unicode composes their characters may
     /// be one entry (case-sensitive APFS); ASCII names are exact.

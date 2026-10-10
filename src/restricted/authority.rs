@@ -1489,7 +1489,7 @@ impl RestrictedAuthority {
     /// file, which is then published without replacing anything. Staging a
     /// new file is safer than writing it in place, and costs nothing more:
     /// there is nothing to update.
-    fn constrain_staged_new(&self, path: &[u8], copy_id: proto::CopyId) -> Result<()> {
+    fn constrain_staged_new(&self, path: &[u8]) -> Result<()> {
         let label = String::from_utf8_lossy(path);
         if self.copy.policy.existing == ExistingDestinationPolicy::MustExist {
             bail!("signed grant creates nothing: {label} is changed in place");
@@ -1497,11 +1497,6 @@ impl RestrictedAuthority {
         if self.rooted_metadata(path)?.is_some() {
             bail!("signed grant writes {label} in place: only a new file is staged");
         }
-        self.state
-            .lock()
-            .unwrap()
-            .staged_new
-            .insert((path.to_vec(), copy_id));
         Ok(())
     }
 
@@ -2606,20 +2601,27 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 if *inplace {
-                    self.state
-                        .lock()
-                        .unwrap()
-                        .staged_new
-                        .remove(&(path.clone(), *copy_id));
                     self.constrain_inplace(path, condition)?;
                 } else {
                     self.constrain_prepare(path)?;
                     if in_place_grant {
-                        self.constrain_staged_new(path, *copy_id)?;
+                        self.constrain_staged_new(path)?;
                     }
                 }
                 let observation_hold =
                     self.reserve_bytes(path, *copy_id, *size, !*create_if_missing)?;
+                // Only an approved preparation changes how the file's writes
+                // and publication go: a refused in-place one leaves a new
+                // file staged.
+                if in_place_grant {
+                    let key = (path.clone(), *copy_id);
+                    let staged_new = &mut self.state.lock().unwrap().staged_new;
+                    if *inplace {
+                        staged_new.remove(&key);
+                    } else {
+                        staged_new.insert(key);
+                    }
+                }
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
