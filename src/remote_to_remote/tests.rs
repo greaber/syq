@@ -480,3 +480,29 @@ fn requester_loss_counts_only_input_that_ends_after_the_marker() {
         );
     }
 }
+
+#[test]
+fn receiver_ssh_uses_ordinary_auth_and_pinned_host_keys() {
+    use clap::Parser;
+    let mut args = Args::parse_from(["syq", "src", "dst"]);
+    args.restricted_grant = Some("signed-grant".into());
+    args.rsh = Some(receiver_destination_rsh(2222, "ssh-ed25519"));
+    let key =
+        ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+            .unwrap();
+    let known_hosts = format!(
+        "{RECEIVER_HOST_ALIAS} {}\n",
+        key.public_key().to_openssh().unwrap()
+    );
+    let guard = prepare_receiver_ssh_with(&mut args, &known_hosts).unwrap();
+    let command = parse_rsh(&args.rsh).unwrap();
+    assert!(command.contains(&"StrictHostKeyChecking=yes".into()));
+    assert!(command.contains(&"PubkeyAuthentication=yes".into()));
+    assert!(!command.contains(&"PubkeyAuthentication=host-bound".into()));
+    let path = guard.path().join("known_hosts");
+    assert!(command.contains(&format!("UserKnownHostsFile={}", path.display())));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), known_hosts);
+    drop(guard);
+    assert!(!path.exists());
+    assert!(prepare_receiver_ssh_with(&mut args, "@cert-authority * bad").is_err());
+}

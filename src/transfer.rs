@@ -1667,6 +1667,7 @@ fn announce_detached_ready() -> Result<()> {
 }
 
 pub fn run(mut args: Args) -> Result<i32> {
+    let _receiver_ssh = crate::remote_to_remote::prepare_receiver_ssh(&mut args)?;
     // Authorization selection may open the destination SSH connection. Count
     // that setup in the total run, including across a local helper exec.
     let show_progress = !args.no_progress && !args.quiet && !args.dry_run;

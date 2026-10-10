@@ -26,8 +26,10 @@ for what this protects against.
 
 - SSH access from your machine to both servers, with their host keys already
   trusted. Connect with ordinary SSH once if either server is new to you.
-- An SSH agent on your machine, and OpenSSH 8.9 or newer on your machine,
-  hostA's SSH client, and hostB's SSH server.
+- An SSH agent on your machine and an SSH client that can forward a separate
+  agent socket (OpenSSH 8.2 or newer). HostB needs `ssh-keygen -Y verify`
+  for copy grants (OpenSSH 8.1 or newer); hardware keys need support for their
+  key type. HostA and hostB do not need the OpenSSH 8.9 agent extensions.
 - SSH connectivity from hostA to hostB. A reachable TCP data port
   on hostB, normally in `47600–47699`, enables encrypted TCP workers; see
   [Make TCP reachable](server-tuning.md#make-tcp-reachable). Otherwise
@@ -41,8 +43,9 @@ The copy stops if your laptop command ends, so keep it running until the copy fi
 ### First copy and access management
 
 The first copy sets up a restricted receiver on hostB automatically. It adds
-a restricted key to `authorized_keys`; the private key stays on your machine.
-Later copies reuse this setup.
+a restricted SSH key to `authorized_keys` and a separate public key for checking
+copy grants. Both private keys stay on your machine; only the SSH key is
+available to hostA through a dedicated agent. Later copies reuse this setup.
 
 To prepare `/archive` on hostB ahead of time, including before a dry run:
 

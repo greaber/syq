@@ -91,7 +91,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.pscope_explicit {
         bail!(
-            "--pscope is not available with the command-restricted receiver: its host-bound authentication is verified per fresh connection"
+            "--pscope is not available with the command-restricted receiver: its SSH authorization belongs to this copy"
         );
     }
     if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
@@ -315,8 +315,8 @@ pub(crate) fn prepare_transfer(
         }
     }
     let (metadata, directory, canonical_destination) = match selected {
-        Some(selected) => selected,
-        None => {
+        Some(selected) if selected.0.version == CONFIG_VERSION => selected,
+        _ => {
             if !allow_enrollment {
                 bail!(
                     "read-only operations will not install a receiver enrollment; pre-enroll this destination with `syq receiver enroll` or explicitly use --peer-auth broker"
@@ -343,6 +343,7 @@ pub(crate) fn prepare_transfer(
         }
     };
     let private_key = load_signing_key(&directory, destination_agent)?;
+    let ssh_key = load_ssh_key(&directory)?;
     let receipt_public_key = metadata.receipt_public_key.clone();
     let grant = grant_for(
         args,
@@ -402,7 +403,7 @@ pub(crate) fn prepare_transfer(
     )?;
     let grant_digest = delegation::signed_grant_digest(&grant)?;
     Ok(PreparedTransfer {
-        private_key,
+        ssh_key,
         request_id,
         receipt_public_key,
         receipt_recipient_secret,

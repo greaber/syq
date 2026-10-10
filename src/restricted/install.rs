@@ -269,6 +269,23 @@ pub(crate) fn remote_install() -> Result<()> {
     let root = crate::rooted::Root::open(&canonical_root)?;
     let root_identity = root.identity();
     let enrollment_key = EnrollmentPublicKey::parse(&request.public_key)?;
+    let ssh_key = request
+        .ssh_public_key
+        .as_deref()
+        .map(EnrollmentPublicKey::parse)
+        .transpose()?;
+    if request.version >= 6 && ssh_key.is_none() {
+        bail!("separate-key enrollment requires an SSH public key");
+    }
+    if let Some(ssh_key) = &ssh_key {
+        anyhow::ensure!(
+            ssh_key != &enrollment_key
+                && ssh_key::PublicKey::from_openssh(request.ssh_public_key.as_deref().unwrap())?
+                    .algorithm()
+                    == ssh_key::Algorithm::Ed25519,
+            "receiver SSH key must be a distinct Ed25519 key"
+        );
+    }
     let signer = signer_name(request.id);
     let public_words: Vec<&str> = request.public_key.split_ascii_whitespace().collect();
     if public_words.len() < 2 {
@@ -289,12 +306,30 @@ pub(crate) fn remote_install() -> Result<()> {
     let entry = AuthorizedKeyEntry::with_security_key_flags(
         request.id,
         &receiver_path,
-        &enrollment_key,
-        request.security_key_flags,
+        ssh_key.as_ref().unwrap_or(&enrollment_key),
+        if ssh_key.is_some() {
+            None
+        } else {
+            request.security_key_flags
+        },
     )?;
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
+    let normalized = if ssh_key.is_some() {
+        replace_legacy_ssh_authorization(
+            &normalized,
+            &entry,
+            &AuthorizedKeyEntry::with_security_key_flags(
+                request.id,
+                &receiver_path,
+                &enrollment_key,
+                request.security_key_flags,
+            )?,
+        )?
+    } else {
+        normalized
+    };
     let (updated, change) = enrollment::install_authorized_key(&normalized, &entry)?;
 
     // Publish the forced authorization last. A failed preflight therefore
@@ -310,7 +345,11 @@ pub(crate) fn remote_install() -> Result<()> {
     )?;
     let config = ReceiverEnrollment {
         security_key_flags: request.security_key_flags,
-        version: CONFIG_VERSION,
+        version: if ssh_key.is_some() {
+            CONFIG_VERSION
+        } else {
+            request.version
+        },
         id: request.id,
         target_login: request.target_login.clone(),
         signer,
@@ -438,6 +477,20 @@ pub(super) fn revoke_for_account(
     let original =
         read_leaf(&directory, "authorized_keys", MAX_AUTHORIZED_KEYS, false)?.unwrap_or_default();
     let normalized = normalize_managed_authorized_keys(&original, &entry.marker());
+    let entry = if let Some(public) = &request.ssh_public_key {
+        let ssh_key = EnrollmentPublicKey::parse(public)?;
+        let ssh_entry = AuthorizedKeyEntry::new(request.id, &receiver_path, &ssh_key)?;
+        if normalized
+            .split(|byte| *byte == b'\n')
+            .any(|line| line == ssh_entry.line().as_bytes())
+        {
+            ssh_entry
+        } else {
+            entry
+        }
+    } else {
+        entry
+    };
     let (updated, _) = enrollment::revoke_authorized_key(&normalized, &entry)?;
     atomic_write_locked(&directory, "authorized_keys", &updated, 0o600, false)?;
     if let Some(state) = remove_state {
@@ -505,4 +558,63 @@ pub(super) fn normalize_managed_authorized_keys(original: &[u8], marker: &str) -
         }
     }
     normalized
+}
+
+/// Replace only the exact old forced authorization. A conflicting entry or
+/// duplicate remains an error; retries with the new entry are unchanged.
+fn replace_legacy_ssh_authorization(
+    original: &[u8],
+    new: &AuthorizedKeyEntry,
+    old: &AuthorizedKeyEntry,
+) -> Result<Vec<u8>> {
+    if original
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == new.line().as_bytes())
+    {
+        return Ok(original.to_vec());
+    }
+    let (without_old, _) = enrollment::revoke_authorized_key(original, old)?;
+    Ok(without_old)
+}
+
+#[cfg(test)]
+mod separate_key_tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_replaces_only_exact_legacy_authorization_and_is_retryable() {
+        let id = EnrollmentId::random();
+        let grant = generate_enrollment_key(id).unwrap();
+        let login = generate_enrollment_key(id).unwrap();
+        let entry = |key: &PrivateKey| {
+            AuthorizedKeyEntry::new(
+                id,
+                Path::new("/usr/bin/syq"),
+                &EnrollmentPublicKey::parse(&key.public_key().to_openssh().unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+        let old = entry(&grant);
+        let new = entry(&login);
+        let original = format!("# unrelated\n{}\n", old.line()).into_bytes();
+        let without = replace_legacy_ssh_authorization(&original, &new, &old).unwrap();
+        let (installed, _) = enrollment::install_authorized_key(&without, &new).unwrap();
+        assert_eq!(
+            installed,
+            format!("# unrelated\n{}\n", new.line()).as_bytes()
+        );
+        assert_eq!(
+            replace_legacy_ssh_authorization(&installed, &new, &old).unwrap(),
+            installed
+        );
+        let changed = original
+            .windows(b"restrict".len())
+            .position(|b| b == b"restrict")
+            .unwrap();
+        let mut conflicting = original.clone();
+        conflicting[changed] = b'X';
+        assert!(replace_legacy_ssh_authorization(&conflicting, &new, &old).is_err());
+        let duplicate = [original.as_slice(), original.as_slice()].concat();
+        assert!(replace_legacy_ssh_authorization(&duplicate, &new, &old).is_err());
+    }
 }

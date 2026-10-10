@@ -2,6 +2,12 @@
 # Trace only transport-selection options while delegating every connection to OpenSSH.
 set -u
 
+# Only the compatibility case selects the old client, in its isolated lab.
+ssh_client=/usr/bin/ssh
+if [ -f /tmp/syq-real-ssh-legacy-client ]; then
+    ssh_client=/opt/openssh-8.8/bin/ssh
+fi
+
 control_master='unset'
 control_path='unset'
 host='unset'
@@ -54,10 +60,10 @@ if [ "$restricted_worker" = yes ] && [ -f /tmp/syq-real-ssh-block-restricted-wor
 elif [ "$strict_mux" = yes ]; then
     # A live control socket is tried first. If sshd rejects that channel,
     # prevent OpenSSH from hiding the rejection with its own direct fallback.
-    /usr/bin/ssh -o ProxyCommand=false "$@"
+    "$ssh_client" -o ProxyCommand=false "$@"
     status=$?
 else
-    /usr/bin/ssh "$@"
+    "$ssh_client" "$@"
     status=$?
 fi
 printf 'phase=end\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\tstatus=%s\treturn_receiver=%s\n' \

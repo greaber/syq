@@ -13,7 +13,7 @@ The source and destination have separate filesystems, homes, host keys, sshd
 processes, and network namespaces. The runner generates a new test-only client
 key for every invocation. Only its public key enters the endpoint containers;
 the source has no independent destination credential. A successful default
-direct transfer therefore exercises syq's constrained forwarded-agent path.
+direct transfer therefore exercises syq's isolated receiver-key agent.
 The destination's network namespace also rejects one dedicated TCP port with a
 real firewall rule; a transfer aimed at that port must automatically fall back
 to SSH data connections.
@@ -279,3 +279,10 @@ local sockets and state. It also checks that reconnect probes send only Ping
 to an unresponsive old connection without displacing it, and that readiness
 checks verify the identity of the registered receiver. Dirty baseline builds
 are rejected.
+
+The separate-receiver-keys case uses a checksum-pinned OpenSSH 8.8 build for
+both clients, the laptop agent, and a second destination server. It checks SSH
+and TCP copies, rejection of an untrusted destination key, forced-command
+confinement, and upgrading a single-key enrollment without replacing its grant
+key, receipt key, identity, or existing replay records. The unchanged v0.7.1
+state fixtures are also exercised by the Rust tests.
