@@ -8,7 +8,8 @@ the option lists.
 ## SSH configurations
 
 Host-certificate-only trust, `KnownHostsCommand`, and `RevokedHostKeys` are
-unsupported by the broker. Custom known-hosts paths must be unambiguous:
+unsupported by the default restricted path and the authentication broker.
+Custom known-hosts paths must be unambiguous:
 one absolute, whitespace-free filename per configured user/global directive.
 The default known-hosts file list works. Syq reports unsupported configurations
 instead of relaxing host verification.
@@ -27,8 +28,7 @@ SSH configuration, programs, or enrollment state. Manage that state with
 
 Each enrollment has a grant-signing key and a separate Ed25519 SSH key that can
 only enter the receiver. The grant-signing key matches the SSH key that
-authenticated setup. Ed25519 stays
-Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
+authenticated setup. Ed25519 stays Ed25519; RSA uses at least 3,072 bits and at least the login key's size.
 Unencrypted ECDSA keeps its curve. FIDO (`*-sk`) logins create a separate
 hardware-backed key with the same effective touch and PIN requirements;
 creating and checking that key can require touching the device. Syq checks
@@ -97,7 +97,7 @@ their original limits.
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
 | `--inplace` with `--as-new` | Unsupported |
-| `--detach` | Unsupported; the local broker must remain attached |
+| `--detach` | Unsupported; the local authorization process must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
 
 Restricted copies use encrypted TCP when reachable and otherwise use SSH

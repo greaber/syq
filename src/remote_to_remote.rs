@@ -1496,7 +1496,7 @@ fn run_remote(
         Some(c) => {
             if peer_bridge.is_none()
                 && args.rsh.is_none()
-                && matches!(args.peer_auth, PeerAuth::Restricted | PeerAuth::Broker)
+                && args.peer_auth == PeerAuth::Broker
                 && !same_host
             {
                 bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))

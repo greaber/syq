@@ -91,7 +91,7 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     }
     if args.pscope_explicit {
         bail!(
-            "--pscope is not available with the command-restricted receiver: its host-bound authentication is verified per fresh connection"
+            "--pscope is not available with the command-restricted receiver: its SSH authorization belongs to this copy"
         );
     }
     if args.connections_opt.is_some() && args.connections > usize::from(delegation::MAX_CONNECTIONS)
