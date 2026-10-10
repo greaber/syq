@@ -1,5 +1,5 @@
-//! Enrollment key protection and local signing. Only the dedicated key is
-//! exposed to a coordinating server; the login identity is never forwarded.
+//! Protected grant signing stays local; a separate software key admits SSH
+//! connections to the restricted receiver.
 use super::*;
 use crate::process::CommandExt as _;
 use ssh_key::{Algorithm, PublicKey};

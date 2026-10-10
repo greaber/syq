@@ -46,7 +46,6 @@ def main():
     root = '/tmp/syq-real-ssh/separate-keys-' + uuid.uuid4().hex
     marker = '/tmp/syq-real-ssh-legacy-client'
     agent = None
-    identifier = None
     with tempfile.TemporaryDirectory(prefix='syq-old-ssh-') as temporary:
         local = Path(temporary)
         try:
@@ -107,8 +106,10 @@ LogLevel VERBOSE
             signer = metadata_path.parent / 'enrollment-key'
             signer_bytes = signer.read_bytes()
             signer_public = run('ssh-keygen', '-y', '-f', str(signer), stdout=subprocess.PIPE).stdout.decode().strip()
+            signer_public = ' '.join(signer_public.split()[:2])
             ssh_key = metadata_path.parent / 'ssh-key'
             ssh_public = run('ssh-keygen', '-y', '-f', str(ssh_key), stdout=subprocess.PIPE).stdout.decode().strip()
+            ssh_public = ' '.join(ssh_public.split()[:2])
             assert signer_public != ssh_public
             protected = remote_python('destination', f'''
 import hashlib, json
@@ -164,7 +165,6 @@ for name, digest in {snapshots!r}.items():
             remote('destination', f'test ! -e {root}/untrusted')
             known_hosts.write_text(f'[destination]:22222 {public}\n')
             run('syq', 'receiver', 'revoke', identifier, env=environment)
-            identifier = None
             remote('destination', f'test ! -e {state}')
             print('Separate receiver keys, migration, and OpenSSH 8.8 passed', flush=True)
         finally:
@@ -176,7 +176,7 @@ for name, digest in {snapshots!r}.items():
                 agent.wait(timeout=10)
             # The daemon and any SSH children belong to this one process group.
             remote_python('destination', f'''
-import os, signal, time
+import os, signal
 from pathlib import Path
 p = Path({root!r}) / 'process.pid'
 if p.exists():
