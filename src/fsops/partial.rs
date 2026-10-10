@@ -3687,6 +3687,13 @@ impl FsOps {
                 | Request::StageBasis { path, guard, .. },
                 Response::EndpointError(error),
             ) => self.annotate_permission_failure(path, guard.as_ref(), 0o300, error),
+            (Request::CopyLocal { dst, inplace, .. }, Response::EndpointError(error)) => self
+                .annotate_permission_failure(
+                    dst,
+                    None,
+                    if *inplace { 0o100 } else { 0o300 },
+                    error,
+                ),
             (Request::PutSmallBatch(puts), Response::Applied(errors)) => {
                 for (put, error) in puts.iter().zip(errors) {
                     if let Some(error) = error {
