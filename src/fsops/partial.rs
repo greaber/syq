@@ -3257,6 +3257,7 @@ impl FsOps {
                 directories,
                 remember,
                 guard,
+                access,
             } => {
                 let minimum = self.destination_parallel_minimum(
                     guard.as_ref(),
@@ -3273,6 +3274,7 @@ impl FsOps {
                                 &target.root,
                                 &target.relative,
                                 *condition,
+                                *access,
                                 &target.label,
                             )?;
                             if let Some(widened) = widened.as_ref().filter(|_| *remember) {
@@ -3702,6 +3704,19 @@ impl FsOps {
                 | Request::StageBasis { path, guard, .. },
                 Response::EndpointError(error),
             ) => self.annotate_permission_failure(path, guard.as_ref(), 0o300, error),
+            (Request::PruneLookup { paths, guard: None }, Response::EndpointError(error)) => self
+                .annotate_operator_failure(
+                    Some(paths.first().map_or(&[][..], Vec::as_slice)),
+                    error,
+                ),
+            (
+                Request::CheckOperatorDirectory { path, .. }
+                | Request::CheckSearchableOperatorDirectory { path, .. },
+                Response::EndpointError(error),
+            ) => self.annotate_operator_failure(Some(path), error),
+            (Request::CreateOperatorDirectory { .. }, Response::EndpointError(error)) => {
+                self.annotate_operator_failure(None, error)
+            }
             (Request::CopyLocal { dst, inplace, .. }, Response::EndpointError(error)) => self
                 .annotate_permission_failure(
                     dst,

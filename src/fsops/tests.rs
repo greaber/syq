@@ -7916,6 +7916,7 @@ fn temporary_directory_access_is_explicit_and_reports_only_changes() {
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o500);
     let metadata = fs::metadata(&dir).unwrap();
     let request = Request::WidenDirectories {
+        access: 0o700,
         remember: true,
         directories: vec![(
             path_bytes(&dir),
@@ -7961,6 +7962,7 @@ fn temporary_directory_access_rejects_unrooted_and_stale_requests() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
     let metadata = fs::metadata(&dir).unwrap();
     let request = Request::WidenDirectories {
+        access: 0o700,
         remember: true,
         directories: vec![(
             path_bytes(&dir),
@@ -8352,6 +8354,7 @@ fn removed_widened_directories_are_forgotten() {
     let metadata = fs::metadata(&dir).unwrap();
     let mut operations = destination_ops(temporary.path());
     let Response::WidenedDirectories(results) = operations.handle(&Request::WidenDirectories {
+        access: 0o700,
         remember: true,
         directories: vec![(
             path_bytes(&dir),

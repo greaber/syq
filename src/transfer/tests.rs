@@ -5719,10 +5719,12 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
     };
     assert_eq!(wire_os_kind(&error), Some("permission_denied"));
     let error = endpoint_error(error).context("prepare file");
-    assert!(copy_error_message(&error, true).contains(DIRECTORY_ACCESS_HINT));
-    assert!(!copy_error_message(&error, false).contains(DIRECTORY_ACCESS_HINT));
+    assert!(copy_error_message(&error, Some(DIRECTORY_ACCESS_HINT)).contains(DIRECTORY_ACCESS_HINT));
+    assert!(!copy_error_message(&error, None).contains(DIRECTORY_ACCESS_HINT));
     let plain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
-    assert!(!copy_error_message(&plain, true).contains(DIRECTORY_ACCESS_HINT));
+    assert!(
+        !copy_error_message(&plain, Some(DIRECTORY_ACCESS_HINT)).contains(DIRECTORY_ACCESS_HINT)
+    );
 }
 
 #[test]

@@ -65,7 +65,8 @@ pub(super) struct Planner<'a> {
     /// Observed obstructions at implicit parents fail only mapped descendants.
     pub(super) blocked_mapping_parents: std::collections::HashSet<PathBytes>,
     /// One pending destination container, including a file-only copy's parent.
-    pub(super) container_access: Option<(PathBytes, TargetCondition)>,
+    /// The directory the copy goes into, with the owner permission it needs.
+    pub(super) container_access: Option<(PathBytes, TargetCondition, u32)>,
     /// Whether a destination container that lacks owner access is widened
     /// (`widens_destination_container`), decided once for every root.
     pub(super) widen_container: bool,
@@ -1579,7 +1580,8 @@ impl Planner<'_> {
                         .filter(|_| is_destination_root)
                         .unwrap_or_else(|| operator_directory_mode(self.opts)),
                 };
-                let (selection, created) = create_operator_directory(self.dst, condition, mode)?;
+                let (selection, created) = create_operator_directory(self.dst, condition, mode)
+                    .map_err(|error| with_failure_hint(self.opts, error))?;
                 if is_destination_root && !created {
                     self.adopt_existing_root(&root, &selection);
                 }
@@ -1698,11 +1700,12 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
+            let fill = self.fill_access();
             if opts.may_widen_directory_permissions()
                 && stats
                     .iter()
                     .flatten()
-                    .any(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+                    .any(|entry| entry.kind == Kind::Dir && entry.mode & fill != fill)
             {
                 self.prepare_existing_directories(
                     dirs.iter().map(|(path, _, _)| path.clone()).collect(),
@@ -2651,7 +2654,9 @@ impl Planner<'_> {
         self.private_root = None;
         self.destination_root_known_missing = false;
         self.destination_children_known_missing = false;
-        self.container_access = selected_container_access(self.widen_container, root, selection);
+        // The root was missing, so the copy creates what goes into it.
+        self.container_access =
+            selected_container_access(self.widen_container, root, selection, 0o300);
     }
 
     /// Give a private destination root whose final metadata sets no mode the
@@ -3664,6 +3669,7 @@ impl Planner<'_> {
                 }
                 // Shielded entries stay; nothing beneath them is entered.
                 walk.finish_scan(&root);
+                // Entering a directory takes owner read and search.
                 let unreadable: Vec<_> = walk
                     .entries
                     .iter()
@@ -3684,6 +3690,7 @@ impl Planner<'_> {
                         self.container_guard.clone(),
                         &mut self.directory_restorations,
                         unreadable,
+                        0o500,
                     )? == 0
                 {
                     break;
@@ -3740,17 +3747,23 @@ impl Planner<'_> {
                 );
             }
             // Destination-only directories whose entries a removal needs to
-            // change but whose owner lacks write or search permission.
+            // change but whose owner lacks write or search permission. One
+            // already widened to be entered has a new change time, so only
+            // its identity is required.
             let unwritable: std::collections::HashMap<PathBytes, TargetCondition> =
                 if self.opts.may_widen_directory_permissions() {
                     walk.entries
                         .iter()
-                        .filter(|entry| {
-                            entry.kind == Kind::Dir
-                                && entry.mode & 0o300 != 0o300
-                                && !self.directory_restorations.contains_key(&entry.path)
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                        .map(|entry| {
+                            let condition = if self.directory_restorations.contains_key(&entry.path)
+                            {
+                                target_identity(entry)
+                            } else {
+                                directory_fingerprint(entry)
+                            };
+                            (entry.path.clone(), condition)
                         })
-                        .map(|entry| (entry.path.clone(), directory_fingerprint(entry)))
                         .collect()
                 } else {
                     std::collections::HashMap::new()
@@ -3987,7 +4000,8 @@ impl Planner<'_> {
             // Parents first; a removed directory's saved mode is dropped below.
             access.sort_by_key(|(path, _)| path.iter().filter(|&&c| c == b'/').count());
             access.dedup_by(|a, b| a.0 == b.0);
-            self.widen_directories(access)?;
+            // Removing an entry takes owner write and search.
+            self.widen_directories(access, 0o300)?;
         }
         let mut n = 0u64;
         let mut run = |me: &mut Self,
@@ -4441,16 +4455,27 @@ impl Planner<'_> {
     }
 
     fn prepare_container_access(&mut self) -> Result<()> {
-        if let Some(directory) = self.container_access.take() {
-            self.widen_directories(vec![directory])?;
+        if let Some((path, condition, access)) = self.container_access.take() {
+            self.widen_directories(vec![(path, condition)], access)?;
         }
         Ok(())
+    }
+
+    /// The owner permission a directory the copy fills needs: write and
+    /// search to change its entries, and read when pruning lists it.
+    fn fill_access(&self) -> u32 {
+        if self.opts.delete {
+            0o700
+        } else {
+            0o300
+        }
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
         if !self.opts.may_widen_directory_permissions() {
             return Ok(());
         }
+        let fill = self.fill_access();
         self.assert_mutation_root()?;
         paths.sort_by(|a, b| {
             a.iter()
@@ -4469,32 +4494,25 @@ impl Planner<'_> {
                     .iter()
                     .zip(stats)
                     .filter_map(|(path, entry)| {
-                        let entry = entry.filter(|entry| {
-                            entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700
-                        })?;
-                        (!self.directory_restorations.contains_key(path)).then(|| {
-                            (
-                                path.clone(),
-                                TargetCondition::MatchesFingerprint {
-                                    dev: entry.dev,
-                                    ino: entry.ino,
-                                    ctime: entry.ctime,
-                                    ctime_nsec: entry.ctime_nsec,
-                                },
-                            )
-                        })
+                        let entry = entry
+                            .filter(|entry| entry.kind == Kind::Dir && entry.mode & fill != fill)?;
+                        Some((path.clone(), directory_fingerprint(&entry)))
                     })
                     .collect();
                 if directories.is_empty() {
                     continue;
                 }
-                self.widen_directories(directories)?;
+                self.widen_directories(directories, fill)?;
             }
         }
         Ok(())
     }
 
-    fn widen_directories(&mut self, directories: Vec<(PathBytes, TargetCondition)>) -> Result<()> {
+    fn widen_directories(
+        &mut self,
+        directories: Vec<(PathBytes, TargetCondition)>,
+        access: u32,
+    ) -> Result<()> {
         widen_directory_batch(
             self.dst,
             self.opts,
@@ -4502,6 +4520,7 @@ impl Planner<'_> {
             self.container_guard.clone(),
             &mut self.directory_restorations,
             directories,
+            access,
         )
         .map(|_| ())
     }
@@ -4686,6 +4705,7 @@ fn widen_directory_batch(
     guard: Option<ContainerGuard>,
     restorations: &mut std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
     directories: Vec<(PathBytes, TargetCondition)>,
+    access: u32,
 ) -> Result<usize> {
     let mut widened = 0;
     let mut directories = directories.into_iter().peekable();
@@ -4698,6 +4718,7 @@ fn widen_directory_batch(
                 // Without -p the receiver restores the modes it saves.
                 remember: !opts.perms,
                 guard: guard.clone(),
+                access,
             })?,
             "prepare directory permissions",
         )?;
@@ -4710,8 +4731,10 @@ fn widen_directory_batch(
         );
         for (path, result) in names.into_iter().zip(results) {
             match result {
+                // A directory widened again, for more permission, is
+                // restored to the mode it had before the first time.
                 Ok(Some(mode)) => {
-                    restorations.insert(path, mode);
+                    restorations.entry(path).or_insert(mode);
                     widened += 1;
                 }
                 Ok(None) => {}

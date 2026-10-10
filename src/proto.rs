@@ -1347,15 +1347,17 @@ pub enum WireRequest<Data> {
     PatchEnd {
         commit: bool,
     },
-    /// Temporarily add owner access to existing destination directories.
-    /// Returns original modes only for directories actually changed. With
-    /// `remember`, the receiver keeps them to restore when it is later asked
-    /// to choose these directories' modes; without, the sender restores them
-    /// with the modes returned.
+    /// Temporarily add the owner permission bits `access` (within `0o700`)
+    /// that existing destination directories lack. Returns original modes
+    /// only for directories actually changed. With `remember`, the receiver
+    /// keeps the first mode it saved for each, to restore when it is later
+    /// asked to choose these directories' modes; without, the sender restores
+    /// them with the modes returned.
     WidenDirectories {
         directories: Vec<(PathBytes, TargetCondition)>,
         remember: bool,
         guard: Option<ContainerGuard>,
+        access: u32,
     },
     /// Ancestry validation that may briefly add owner search permission to
     /// owned directories it must enter. With `selection_in_copy` false, the

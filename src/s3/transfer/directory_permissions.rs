@@ -17,15 +17,23 @@ pub(super) struct TemporaryAccess {
     mode: WidenDirs,
     /// A contents source fills the destination directory itself.
     contents: bool,
+    /// Pruning lists the directories the copy fills.
+    pruning: bool,
     prepared: HashSet<Vec<u8>>,
     widened: BTreeMap<Vec<u8>, DirectoryMode>,
 }
 
+/// Owner read and search, to list a directory.
+pub(super) const LIST: u32 = 0o500;
+/// Owner write and search, to change a directory's entries.
+pub(super) const CHANGE: u32 = 0o300;
+
 impl TemporaryAccess {
-    pub(super) fn new(mode: WidenDirs, contents: bool) -> Self {
+    pub(super) fn new(mode: WidenDirs, contents: bool, pruning: bool) -> Self {
         Self {
             mode,
             contents,
+            pruning,
             prepared: HashSet::new(),
             widened: BTreeMap::new(),
         }
@@ -61,6 +69,9 @@ impl TemporaryAccess {
                 paths.insert(job.path.as_bytes().to_vec());
             }
         }
+        // Downloads change the entries of the directories they fill, which
+        // pruning also lists.
+        let access = if self.pruning { CHANGE | LIST } else { CHANGE };
         // Parents precede descendants. Remember successful inspections as well
         // as changes: siblings do not need another stat/chmod of their parent.
         for path in paths {
@@ -80,9 +91,10 @@ impl TemporaryAccess {
                         &destination.root,
                         &relative,
                         condition,
+                        access,
                         Path::new(OsStr::from_bytes(&path)),
                     )? {
-                        self.widened.insert(path.clone(), saved);
+                        self.widened.entry(path.clone()).or_insert(saved);
                     }
                 }
             }
@@ -91,30 +103,44 @@ impl TemporaryAccess {
         Ok(())
     }
 
-    /// Widen one existing directory that pruning must enter or empty, if
-    /// the option is on. Returns whether its mode changed.
+    /// Give one existing directory that pruning must enter (`LIST`) or
+    /// empty (`CHANGE`) that owner permission, if the mode allows it. Returns
+    /// whether its mode changed. A directory widened before keeps the mode it
+    /// had first, and is identified without its changed change time.
     pub(super) fn prepare_for_pruning(
         &mut self,
         root: &crate::rooted::Root,
         path: &[u8],
         metadata: &crate::rooted::RootMetadata,
+        access: u32,
     ) -> Result<bool> {
-        if self.mode == WidenDirs::None || self.widened.contains_key(path) {
+        if self.mode == WidenDirs::None {
             return Ok(false);
         }
-        let condition = TargetCondition::MatchesFingerprint {
-            dev: metadata.dev,
-            ino: metadata.ino,
-            ctime: metadata.ctime,
-            ctime_nsec: metadata.ctime_nsec,
+        let condition = if self.widened.contains_key(path) {
+            TargetCondition::Matches {
+                dev: metadata.dev,
+                ino: metadata.ino,
+            }
+        } else {
+            TargetCondition::MatchesFingerprint {
+                dev: metadata.dev,
+                ino: metadata.ino,
+                ctime: metadata.ctime,
+                ctime_nsec: metadata.ctime_nsec,
+            }
         };
         let saved = crate::fsops::widen_directory(
             root,
             &RelativePath::new(path)?,
             condition,
+            access,
             Path::new(OsStr::from_bytes(path)),
         )?;
-        Ok(saved.is_some_and(|saved| self.widened.insert(path.to_vec(), saved).is_none()))
+        Ok(saved.is_some_and(|saved| {
+            self.widened.entry(path.to_vec()).or_insert(saved);
+            true
+        }))
     }
 
     /// A directory pruning removed has no mode to restore.
@@ -164,7 +190,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(WidenDirs::Rsync, true);
+        let mut access = TemporaryAccess::new(WidenDirs::Rsync, true, false);
         access.prepare(&destination, &[job("first/one")]).unwrap();
         assert_eq!(
             fs::metadata(temporary.path().join("later")).unwrap().mode() & 0o777,
@@ -209,7 +235,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(WidenDirs::None, true);
+        let mut access = TemporaryAccess::new(WidenDirs::None, true, false);
         access
             .prepare(&destination, &[job("missing/file")])
             .unwrap();

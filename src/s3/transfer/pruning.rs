@@ -95,7 +95,12 @@ impl Engine {
                     .collect();
                 needed.sort_by_key(|(path, _)| path.iter().filter(|&&c| c == b'/').count());
                 for (path, metadata) in needed {
-                    access.prepare_for_pruning(&root, path, metadata)?;
+                    access.prepare_for_pruning(
+                        &root,
+                        path,
+                        metadata,
+                        directory_permissions::CHANGE,
+                    )?;
                 }
             }
             let engine = self.clone();
@@ -214,7 +219,12 @@ impl Engine {
                                 .as_deref_mut()
                                 .filter(|access| access.enters_unreadable())
                             {
-                                if access.prepare_for_pruning(&dst.root, &path, &meta)? {
+                                if access.prepare_for_pruning(
+                                    &dst.root,
+                                    &path,
+                                    &meta,
+                                    directory_permissions::LIST,
+                                )? {
                                     meta = dst.root.metadata(&rel)?;
                                 }
                             }

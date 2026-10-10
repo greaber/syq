@@ -558,25 +558,31 @@ fn statvfs_counter<T: Into<u64>>(value: T) -> u64 {
     value.into()
 }
 
-/// Widen only an owned existing directory and report an actual change. The
-/// opened metadata handle pins the inode; a supplied identity prevents a stale
-/// plan from chmodding a replacement. No group/other bits are added.
+/// Add to an owned existing directory the owner permission bits `access`
+/// it lacks, and report an actual change. The opened metadata handle pins
+/// the inode; a supplied identity prevents a stale plan from chmodding a
+/// replacement. No group/other bits are added.
 pub(crate) fn widen_directory(
     root: &Root,
     path: &RelativePath,
     condition: TargetCondition,
+    access: u32,
     label: &Path,
 ) -> Result<Option<crate::proto::DirectoryMode>> {
+    anyhow::ensure!(
+        access != 0 && access & !0o700 == 0,
+        "directory access {access:o} is not owner permission"
+    );
     let metadata = root.metadata(path)?;
     apply::require_rooted_condition(metadata, condition, label)?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", label.display());
     let uid = unsafe { libc::geteuid() };
-    if uid == 0 || uid != metadata.uid || metadata.mode & 0o700 == 0o700 {
+    if uid == 0 || uid != metadata.uid || metadata.mode & access == access {
         return Ok(None);
     }
     let directory = root.open_metadata(path)?;
     apply::require_rooted_metadata(&directory, metadata, label)?;
-    set_mode_handle(&directory, metadata.mode | 0o700)?;
+    set_mode_handle(&directory, metadata.mode | access)?;
     Ok(Some(crate::proto::DirectoryMode {
         mode: metadata.mode & 0o7777,
         dev: metadata.dev,
@@ -598,6 +604,41 @@ pub(crate) fn restore_directory_mode(
         label.display()
     );
     set_mode_handle(&directory, saved.mode)
+}
+
+/// For an operator-supplied destination path whose lookup was denied: whether
+/// a directory on the way to it, or the path itself, is one the receiving
+/// user owns but lacks owner search permission on. Only a failure pays for
+/// these stats.
+pub(crate) fn operator_path_permission_hint(path: &[u8]) -> Option<String> {
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        return None;
+    }
+    let path = resolve(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut ancestors: Vec<&Path> = path.ancestors().collect();
+    ancestors.reverse();
+    for directory in ancestors {
+        let metadata = fs::metadata(directory).ok()?;
+        if metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o100 == 0 {
+            return Some(OWNED_DIRECTORY_PERMISSION_HINT.into());
+        }
+    }
+    None
+}
+
+const OWNED_DIRECTORY_PERMISSION_HINT: &str =
+    "an owned destination directory lacks the required owner permissions";
+
+fn mark_owned_directory_permissions(error: &mut WireError, hint: &str) {
+    error.io_kind = Some(WireIoKind::OwnedDirectoryPermissions);
+    error.message.push_str("; ");
+    error.message.push_str(hint);
 }
 
 /// Diagnose only a failed operation; the successful path does no extra stats.
@@ -632,9 +673,7 @@ pub(crate) fn directory_permission_hint(
             0o100
         };
         if metadata.is_dir() && metadata.uid == uid && metadata.mode & required != required {
-            return Some(
-                "an owned destination directory lacks the required owner permissions".into(),
-            );
+            return Some(OWNED_DIRECTORY_PERMISSION_HINT.into());
         }
     }
     None
@@ -3055,9 +3094,29 @@ impl FsOps {
             return;
         };
         if let Some(hint) = directory_permission_hint(&target.root, &target.relative, access) {
-            error.io_kind = Some(WireIoKind::OwnedDirectoryPermissions);
-            error.message.push_str("; ");
-            error.message.push_str(&hint);
+            mark_owned_directory_permissions(error, &hint);
+        }
+    }
+
+    /// Annotate a denied lookup or creation of the operator destination,
+    /// before anything is anchored.
+    fn annotate_operator_failure(&self, path: Option<&[u8]>, error: &mut WireError) {
+        if error.io_kind != Some(WireIoKind::PermissionDenied) || self.destination_root.is_some() {
+            return;
+        }
+        let hint = match path {
+            Some(path) => operator_path_permission_hint(path),
+            // Creating the missing part of the destination needs write and
+            // search permission on the directory found nearest to it.
+            None => self.operator_selection.as_ref().and_then(|selection| {
+                let metadata = selection.directory.metadata().ok()?;
+                let uid = unsafe { libc::geteuid() };
+                (uid != 0 && metadata.uid() == uid && metadata.mode() & 0o300 != 0o300)
+                    .then(|| OWNED_DIRECTORY_PERMISSION_HINT.to_owned())
+            }),
+        };
+        if let Some(hint) = hint {
+            mark_owned_directory_permissions(error, &hint);
         }
     }
 

@@ -495,6 +495,7 @@ impl Engine {
                     && self.args.locations[..self.args.locations.len() - 1]
                         .iter()
                         .any(Location::copies_contents),
+                self.args.delete,
             );
             let mut copies_finished = false;
             let transferred = async {
@@ -523,21 +524,20 @@ impl Engine {
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
-                            if engine.args.widen_dirs == WidenDirs::None
-                                && error.chain().any(|cause| {
+                            let suggestion =
+                                crate::transfer::failure_hint(engine.args.widen_dirs, false);
+                            if let Some(suggestion) = suggestion.filter(|_| {
+                                error.chain().any(|cause| {
                                     cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
                                         e.kind() == std::io::ErrorKind::PermissionDenied
                                     })
                                 })
-                            {
+                            }) {
                                 if let Ok(path) = RelativePath::new(job.path.as_bytes()) {
                                     if let Some(hint) = crate::fsops::directory_permission_hint(
                                         &dst.root, &path, 0o300,
                                     ) {
-                                        return error.context(format!(
-                                            "{hint}; {}",
-                                            crate::transfer::DIRECTORY_ACCESS_HINT
-                                        ));
+                                        return error.context(format!("{hint}; {suggestion}"));
                                     }
                                 }
                             }

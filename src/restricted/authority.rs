@@ -2153,6 +2153,8 @@ impl RestrictedAuthority {
                 directories,
                 remember,
                 guard,
+                // The receiver adds only owner permission, whatever it is.
+                access: _,
             } => {
                 // The receiver restores what it widened when asked to choose
                 // a mode, as it always is for a mapping parent, whose

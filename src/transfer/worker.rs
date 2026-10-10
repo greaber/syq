@@ -187,10 +187,11 @@ impl Worker {
                             }
                             return Err(e);
                         }
-                        let suggest = fast
-                            .iter()
-                            .all(|&i| self.opts.may_suggest_directory_access_at(&self.job(i).dst));
-                        let message = copy_error_message(&e, suggest);
+                        let hint = self.opts.failure_hint().filter(|_| {
+                            fast.iter()
+                                .all(|&i| self.opts.failure_hint_at(&self.job(i).dst).is_some())
+                        });
+                        let message = copy_error_message(&e, hint);
                         for &i in &fast {
                             self.file_error(i, anyhow::anyhow!(message.clone()))?;
                         }
@@ -854,8 +855,7 @@ impl Worker {
             };
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
-                let message =
-                    copy_error_message(&e, self.opts.may_suggest_directory_access_at(&j.dst));
+                let message = copy_error_message(&e, self.opts.failure_hint_at(&j.dst));
                 self.progress.error_classified(
                     &format!("syq: {}: {message}", j.rel),
                     Some("io"),
@@ -956,8 +956,7 @@ impl Worker {
         if self.sched.fail_file(idx) {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
-            let message =
-                copy_error_message(&e, self.opts.may_suggest_directory_access_at(&job.dst));
+            let message = copy_error_message(&e, self.opts.failure_hint_at(&job.dst));
             self.progress.error_classified(
                 &format!("syq: {}: {message}", job.rel),
                 Some("io"),

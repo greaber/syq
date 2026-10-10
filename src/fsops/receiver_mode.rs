@@ -45,8 +45,10 @@ impl ReceiverDirectories {
         }
     }
 
+    /// A directory widened twice, for more permission, keeps the mode it
+    /// had before the first.
     pub(super) fn widened(&self, identity: (u64, u64), mode: u32) {
-        self.widened.lock().unwrap().insert(identity, mode);
+        self.widened.lock().unwrap().entry(identity).or_insert(mode);
     }
 
     pub(super) fn has_widened(&self) -> bool {

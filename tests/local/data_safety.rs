@@ -732,6 +732,74 @@ fn copy_does_not_restore_a_directory_it_never_widened() {
     }
 }
 
+/// `all` adds only the owner permission each directory needs: search to
+/// pass through an ancestor and the directory an existing `--as` directory
+/// is in, and write and search to fill a directory, with no read unless
+/// pruning lists it. Seen while the copy waits before restoring them.
+#[cfg(debug_assertions)]
+#[test]
+fn widening_adds_only_the_permission_each_directory_needs() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Linux can change the mode of a directory it cannot read; macOS cannot.
+    let tree = if cfg!(target_os = "linux") {
+        0o100
+    } else {
+        0o500
+    };
+    for prune in [false, true] {
+        let t = Tmp::new();
+        write(&t.path("src/file"), b"new contents");
+        fs::create_dir_all(t.path("anc/ro/tree")).unwrap();
+        for (path, mode) in [("anc/ro/tree", tree), ("anc/ro", 0o400), ("anc", 0o400)] {
+            fs::set_permissions(t.path(path), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--widen-dirs=all",
+            "-q",
+            &t.s("src"),
+            "--as",
+            &t.s("anc/ro/tree"),
+        ]);
+        if prune {
+            command.arg("--prune");
+        }
+        let child = command
+            .env("SYQ_TEST_FINALIZATION_READY_FILE", &ready)
+            .env("SYQ_TEST_FINALIZATION_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for(
+            "copy finalization",
+            std::time::Duration::from_secs(10),
+            || ready.exists(),
+        );
+        let mode = |path: &str| fs::metadata(t.path(path)).unwrap().mode() & 0o7777;
+        let during = [mode("anc"), mode("anc/ro"), mode("anc/ro/tree")];
+        fs::write(&continuation, b"continue").unwrap();
+        let out = child.wait_with_output().unwrap();
+        // Read the restored modes from the top, opening each to go on.
+        let anc = mode("anc");
+        fs::set_permissions(t.path("anc"), fs::Permissions::from_mode(0o700)).unwrap();
+        let ro = mode("anc/ro");
+        fs::set_permissions(t.path("anc/ro"), fs::Permissions::from_mode(0o700)).unwrap();
+        let restored = mode("anc/ro/tree");
+        fs::set_permissions(t.path("anc/ro/tree"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_output_ok(&out);
+        let filled = if prune { tree | 0o700 } else { tree | 0o300 };
+        assert_eq!(during, [0o500, 0o500, filled], "prune={prune}");
+        assert_eq!([anc, ro, restored], [0o400, 0o400, tree], "prune={prune}");
+        assert_eq!(read(&t.path("anc/ro/tree/file")), b"new contents");
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn temporary_directory_permissions_restore_after_copy_failure() {
@@ -761,11 +829,13 @@ fn temporary_directory_permissions_restore_after_copy_failure() {
 }
 
 /// What each mode widens, for every placement: `rsync` widens only
-/// directories the copy includes, a contents copy's destination among them;
+/// directories the copy includes, a contents copy's destination among them,
+/// and in both commands requires the destination to be searchable already;
 /// `all` also widens the directory the copy goes into and the owned
 /// directories above it, including where missing parents are created.
 /// Every mode restores the exact mode afterwards, and no dry run changes
 /// anything. `syq cp` widens nothing by default, `syq rsync` what rsync does.
+/// A failure names the mode that would have avoided it.
 #[test]
 fn directory_widening_modes_choose_which_directories_change() {
     if unsafe { libc::geteuid() } == 0 {
@@ -775,12 +845,16 @@ fn directory_widening_modes_choose_which_directories_change() {
     // the narrowest mode that widens it.
     let cases: &[(&str, &str, u32, &str)] = &[
         ("contents", "ro", 0o500, "rsync"),
+        ("contents", "ro", 0o600, "all"),
+        ("tree-as", "ro", 0o500, "rsync"),
+        ("tree-as", "ro", 0o600, "all"),
         ("named", "ro", 0o500, "all"),
         ("file-into", "ro", 0o500, "all"),
         ("file-as", "ro", 0o500, "all"),
         ("ancestor", "anc", 0o600, "all"),
         ("missing-parent", "anc", 0o500, "all"),
         ("rsync-contents", "ro", 0o500, "rsync"),
+        ("rsync-contents", "ro", 0o600, "all"),
         ("rsync-named", "ro", 0o500, "all"),
     ];
     for &(case, restricted, mode, needed) in cases {
@@ -801,6 +875,7 @@ fn directory_widening_modes_choose_which_directories_change() {
                     (t.s("ro/name"), t.s("anc/dst"), t.s("anc/new/dst"));
                 let (mut args, written) = match case {
                     "contents" => (vec!["cp", "--srcs-in", &src, "--into", &ro], "ro/file"),
+                    "tree-as" => (vec!["cp", &src, "--as", &ro], "ro/file"),
                     "named" => (vec!["cp", &src, "--into", &ro], "ro/src/file"),
                     "file-into" => (vec!["cp", &src_file, "--into", &ro], "ro/file"),
                     "file-as" => (vec!["cp", &src_file, "--as", &ro_name], "ro/name"),
@@ -824,7 +899,7 @@ fn directory_widening_modes_choose_which_directories_change() {
                 let out = native_syq(&args);
                 let after = fs::metadata(&restricted).unwrap();
                 fs::set_permissions(&restricted, fs::Permissions::from_mode(0o700)).unwrap();
-                let label = format!("{case}, {widen}, dry={dry_run}: {out:?}");
+                let label = format!("{case} {mode:o}, {widen}, dry={dry_run}: {out:?}");
                 let effective = match widen {
                     "default" if rsync => "rsync",
                     "default" => "none",
@@ -852,6 +927,12 @@ fn directory_widening_modes_choose_which_directories_change() {
                         (before.ctime(), before.ctime_nsec()),
                         "{label}"
                     );
+                    let hint = if effective == "none" {
+                        "widen-dirs may help"
+                    } else {
+                        "widen-dirs=all may help"
+                    };
+                    assert!(stderr_of(&out).contains(hint), "{label}");
                 }
             }
         }
@@ -934,9 +1015,9 @@ fn readonly_container_allows_inplace_updates_without_widening() {
 }
 
 /// `syq rsync` widens what rsync does by default, so a failure in the
-/// directory it copies into names no option.
+/// directory it copies into suggests `all`, which would widen it.
 #[test]
-fn rsync_container_failures_do_not_suggest_an_option() {
+fn rsync_container_failures_suggest_all() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
@@ -950,7 +1031,10 @@ fn rsync_container_failures_do_not_suggest_an_option() {
         .unwrap();
     fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
     assert!(!out.status.success(), "{out:?}");
-    assert!(!stderr_of(&out).contains("widen-dirs"), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("--syq-widen-dirs=all may help"),
+        "{out:?}"
+    );
 }
 
 /// In-place lengths of interest beside a new length that is not a multiple
@@ -1151,19 +1235,17 @@ fn inplace_small_files_write_before_cutting_and_keep_old_data_on_failure() {
     }
 }
 
-/// A tree's own destination root is part of the copy: `rsync` and `all` let
-/// a live copy enter, fill and prune an owned root without search permission
-/// and restore its mode, unless copied permissions take precedence. Only
-/// `all` widens the directory a named tree goes into.
+/// `all` lets a live copy enter, fill and prune an owned destination root
+/// without search permission, and restores its mode, unless copied
+/// permissions take precedence. `rsync`, as rsync does, requires the root to
+/// be searchable already (see the mode matrix).
 #[test]
 fn explicit_directory_access_covers_tree_roots() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
     for (placement, widen) in [
-        ("contents", "--widen-dirs=rsync"),
         ("contents", "--widen-dirs=all"),
-        ("as", "--widen-dirs=rsync"),
         ("as", "--widen-dirs=all"),
         ("into", "--widen-dirs=all"),
     ] {
@@ -2012,7 +2094,9 @@ fn previews_name_directories_needing_access_for_compared_and_linked_files() {
 }
 
 /// An existing directory named by `--as` belongs to the copy, so when it
-/// cannot be searched the failure suggests the option, and `rsync` widens it.
+/// cannot be searched the failure suggests the option. `rsync` requires it
+/// searchable, as rsync requires its destination, and suggests `all`, which
+/// widens it.
 #[test]
 fn exact_placement_onto_an_unsearchable_directory_suggests_and_takes_access() {
     if unsafe { libc::geteuid() } == 0 {
@@ -2027,6 +2111,12 @@ fn exact_placement_onto_an_unsearchable_directory_suggests_and_takes_access() {
     assert!(!out.status.success(), "{out:?}");
     assert!(stderr_of(&out).contains("--widen-dirs may help"), "{out:?}");
     let out = native_syq(&["cp", "--widen-dirs=rsync", &src, "--as", &dst]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("--widen-dirs=all may help"),
+        "{out:?}"
+    );
+    let out = native_syq(&["cp", "--widen-dirs=all", &src, "--as", &dst]);
     let mode = fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777;
     fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o700)).unwrap();
     assert_output_ok(&out);

@@ -1410,7 +1410,8 @@ fn attempt_small_copy(
                     os_kind_of(&error),
                     copy_error_message(
                         &error,
-                        opts.may_suggest_directory_access() && !args.only_new_native_entries(),
+                        opts.failure_hint()
+                            .filter(|_| !args.only_new_native_entries()),
                     ),
                 ))
             }
@@ -1851,6 +1852,31 @@ fn wire_os_kind(error: &WireError) -> Option<&'static str> {
 pub(crate) const DIRECTORY_ACCESS_HINT: &str = "--widen-dirs may help";
 const RSYNC_DIRECTORY_ACCESS_HINT: &str = "--syq-widen-dirs may help";
 
+/// The hint for a failure in a directory the receiving user owns but lacks
+/// the owner permission for, naming the mode that would have widened it:
+/// any under `none`, `all` under `rsync`, and none under `all`.
+pub(crate) fn failure_hint(mode: WidenDirs, rsync: bool) -> Option<&'static str> {
+    match (mode, rsync) {
+        (WidenDirs::None, false) => Some(DIRECTORY_ACCESS_HINT),
+        (WidenDirs::None, true) => Some(RSYNC_DIRECTORY_ACCESS_HINT),
+        (WidenDirs::Rsync, false) => Some("--widen-dirs=all may help"),
+        (WidenDirs::Rsync, true) => Some("--syq-widen-dirs=all may help"),
+        (WidenDirs::All, _) => None,
+    }
+}
+
+/// Add the hint to a failed destination lookup the receiver found blocked
+/// by an owned directory lacking owner permission.
+fn with_failure_hint(opts: &Opts, mut error: anyhow::Error) -> anyhow::Error {
+    if let (Some(hint), Some(wire)) = (opts.failure_hint(), error.downcast_mut::<WireError>()) {
+        if wire.io_kind == Some(WireIoKind::OwnedDirectoryPermissions) {
+            wire.message.push_str("; ");
+            wire.message.push_str(hint);
+        }
+    }
+    error
+}
+
 fn permission_error_message(
     message: String,
     kind: Option<WireIoKind>,
@@ -1864,17 +1890,13 @@ fn permission_error_message(
     }
 }
 
-/// A native copy failure, with the hint when `suggest` allows it.
-fn copy_error_message(error: &anyhow::Error, suggest: bool) -> String {
+/// A copy failure, with `hint` when it is one the hint is for.
+fn copy_error_message(error: &anyhow::Error, hint: Option<&str>) -> String {
     let kind = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<WireError>())
         .and_then(|error| error.io_kind);
-    permission_error_message(
-        format!("{error:#}"),
-        kind,
-        suggest.then_some(DIRECTORY_ACCESS_HINT),
-    )
+    permission_error_message(format!("{error:#}"), kind, hint)
 }
 
 impl Opts {
@@ -1883,12 +1905,14 @@ impl Opts {
         self.widen_dirs != WidenDirs::None && !self.dry_run
     }
 
-    /// Only a copy that widens nothing suggests the option.
+    /// Only a copy that widens nothing names, ahead of time, the directories
+    /// it would need to widen.
     fn may_suggest_directory_access(&self) -> bool {
         self.widen_dirs == WidenDirs::None
     }
 
-    /// The hint naming the option, as this command spells it.
+    /// The hint naming the option, as this command spells it, for those
+    /// directories.
     pub(super) fn directory_access_hint(&self) -> &'static str {
         if self.rsync_creation {
             RSYNC_DIRECTORY_ACCESS_HINT
@@ -1897,10 +1921,16 @@ impl Opts {
         }
     }
 
-    /// Whether a failure at `path` may suggest the option: not one beneath a
-    /// directory already named.
-    fn may_suggest_directory_access_at(&self, path: &[u8]) -> bool {
-        self.may_suggest_directory_access() && !self.access_noted_above(path)
+    /// The hint for a failure a wider mode would have avoided.
+    pub(super) fn failure_hint(&self) -> Option<&'static str> {
+        failure_hint(self.widen_dirs, self.rsync_creation)
+    }
+
+    /// The hint for a failure at `path`: none beneath a directory already
+    /// named.
+    fn failure_hint_at(&self, path: &[u8]) -> Option<&'static str> {
+        self.failure_hint()
+            .filter(|_| !self.access_noted_above(path))
     }
 
     /// Name, once and before the first change planned at `path`, its
@@ -1957,21 +1987,11 @@ impl Opts {
     }
 
     fn wire_error_message(&self, error: &WireError) -> String {
-        permission_error_message(
-            error.to_string(),
-            error.io_kind,
-            self.may_suggest_directory_access()
-                .then(|| self.directory_access_hint()),
-        )
+        permission_error_message(error.to_string(), error.io_kind, self.failure_hint())
     }
 
     fn wire_error_message_at(&self, error: &WireError, path: &[u8]) -> String {
-        permission_error_message(
-            error.to_string(),
-            error.io_kind,
-            self.may_suggest_directory_access_at(path)
-                .then(|| self.directory_access_hint()),
-        )
+        permission_error_message(error.to_string(), error.io_kind, self.failure_hint_at(path))
     }
 }
 
@@ -3102,7 +3122,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     } else {
         // Only a missing entry establishes a fresh destination. In particular,
         // permission denial must not bypass existing-file selection policies.
-        let entry = inspect_placement_target(&mut *dst_ctl, &operator_dst_root)?;
+        let entry = inspect_placement_target(&mut *dst_ctl, &operator_dst_root)
+            .map_err(|error| with_failure_hint(&opts, error))?;
         // Rsync retains its destination-directory compatibility rule. Native
         // container placement follows links only under the destination policy;
         // exact placement preserves the final directory entry.
@@ -3266,9 +3287,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // identity anchoring must enforce. These receiver-local operations can run
     // in order without waiting for the client between them. Keep same-machine
     // copies on the path that performs ancestry checks before anchoring.
-    // rsync enters its destination before widening anything; `all` widens
-    // the destination itself instead.
-    let require_search = opts.rsync_creation && opts.widen_dirs != WidenDirs::All;
+    // rsync enters its destination before widening anything, so `rsync`
+    // requires it searchable in both commands; `all` widens it instead, and
+    // `none` keeps each command's own rule.
+    let require_search = match opts.widen_dirs {
+        WidenDirs::Rsync => true,
+        WidenDirs::None => opts.rsync_creation,
+        WidenDirs::All => false,
+    };
     let prepare_existing = use_operator_anchor
         && dst.is_remote()
         && !srcs[0].is_remote()
@@ -3285,7 +3311,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             dst_root_entry.as_ref().expect("existing destination"),
             request_prefix.clone(),
             require_search,
-        )?;
+        )
+        .map_err(|error| with_failure_hint(&opts, error))?;
         prepared_anchor = Some(anchor);
         prepared_filesystem = Some(filesystem);
         selection
@@ -3295,7 +3322,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             &operator_directory,
             opts.operator_symlink_policy,
             require_search,
-        )?;
+        )
+        .map_err(|error| with_failure_hint(&opts, error))?;
         prepared_filesystem = Some(filesystem);
         selection
     } else if use_operator_anchor {
@@ -3305,7 +3333,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             allow_missing,
             opts.operator_symlink_policy,
             require_search,
-        )?
+        )
+        .map_err(|error| with_failure_hint(&opts, error))?
     } else {
         None
     };
@@ -3314,6 +3343,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "syq: destination selection complete at {:.2}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+    // An existing directory named by `--as` is the destination rsync would
+    // enter, so `rsync` requires it searchable too. For a directory the
+    // receiving user owns, its owner bits say whether it is.
+    if opts.widen_dirs == WidenDirs::Rsync && !dst_is_dir && !expand_exact_home {
+        if let Some(entry) = dst_root_entry
+            .as_ref()
+            .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o100 == 0)
+        {
+            if matches!(
+                ok(dst_ctl.call(Request::ReceiverUser)?, "receiving account")?,
+                Response::ReceiverUser(uid) if uid != 0 && uid == entry.uid
+            ) {
+                bail!(
+                    "search destination directory {}: Permission denied (os error 13); {}",
+                    display(&dst_root),
+                    opts.failure_hint().unwrap_or_default()
+                );
+            }
+        }
     }
     if use_operator_anchor && dst_is_dir {
         let planned_identity = dst_root_entry.as_ref().map(|entry| (entry.dev, entry.ino));
@@ -3547,11 +3596,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         .collect()
                 }
                 // The destination directory itself lacks owner search
-                // permission. Whatever the placement, an existing directory
-                // there belongs to the copy and the option would widen it,
-                // if the receiving account owns it.
+                // permission. A wider mode would widen it, if the receiving
+                // account owns it.
                 Err(error)
-                    if opts.may_suggest_directory_access()
+                    if opts.failure_hint().is_some()
                         && os_kind_of(&error) == Some("permission_denied") =>
                 {
                     let owned = match dst_root_entry
@@ -3564,8 +3612,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         ),
                         None => false,
                     };
-                    if owned {
-                        bail!("{error:#}; {}", opts.directory_access_hint());
+                    if let Some(hint) = opts.failure_hint().filter(|_| owned) {
+                        bail!("{error:#}; {hint}");
                     }
                     return Err(error);
                 }
@@ -3697,14 +3745,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // planning, so file-only copies can request access without another lookup
     // on the ordinary writable-directory path.
     let widen_container = widens_destination_container(&opts);
+    // The copy only passes through the directory an existing `--as`
+    // directory is in; elsewhere it creates or replaces entries in it.
+    let container_bits = if !dst_is_dir && !expand_exact_home && dst_entry_is_dir {
+        0o100
+    } else {
+        0o300
+    };
     let mut container_access = if widen_container {
         if let Some(selection) = &directory_selection {
-            selected_container_access(widen_container, &request_prefix, selection)
+            selected_container_access(widen_container, &request_prefix, selection, container_bits)
         } else {
             dst_root_entry
                 .as_ref()
-                .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
-                .map(|entry| (dst_root.clone(), target_identity(entry)))
+                .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                .map(|entry| (dst_root.clone(), target_identity(entry), 0o300))
         }
     } else {
         None
@@ -3726,7 +3781,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     || root_source_mode.unwrap_or_else(|| operator_directory_mode(&opts)),
                     |_| 0o700,
                 ),
-            )?;
+            )
+            .map_err(|error| with_failure_hint(&opts, error))?;
             if dst_is_dir && !created {
                 // Another process created the destination root after it was
                 // found missing. It is an existing directory: it gets no new
@@ -3737,8 +3793,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 private_root = None;
                 dst_initially_missing = false;
                 fresh_destination = false;
-                container_access =
-                    selected_container_access(widen_container, &request_prefix, &selection);
+                container_access = selected_container_access(
+                    widen_container,
+                    &request_prefix,
+                    &selection,
+                    container_bits,
+                );
             }
             directory_selection = Some(selection);
         }
@@ -4417,10 +4477,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     if let Some(e) = &scan_err {
         let os_kind = os_kind_of(e);
         progress.error_classified(
-            &format!(
-                "syq: {}",
-                copy_error_message(e, opts.may_suggest_directory_access())
-            ),
+            &format!("syq: {}", copy_error_message(e, opts.failure_hint())),
             os_kind.map(|_| "io"),
             os_kind,
         );
@@ -5221,13 +5278,14 @@ fn widens_destination_container(opts: &Opts) -> bool {
 }
 
 /// The access to request for the operator directory `selection`, known by
-/// `request_prefix`: widening for its owner, when `widen` allows it and the
-/// directory lacks owner access.
+/// `request_prefix`: the owner permission `access`, when `widen` allows it
+/// and the directory lacks some owner access.
 fn selected_container_access(
     widen: bool,
     request_prefix: &[u8],
     selection: &DirectoryAnchor,
-) -> Option<(PathBytes, TargetCondition)> {
+    access: u32,
+) -> Option<(PathBytes, TargetCondition, u32)> {
     (widen && selection.needs_owner_access).then(|| {
         (
             request_prefix.to_vec(),
@@ -5235,6 +5293,7 @@ fn selected_container_access(
                 dev: selection.dev,
                 ino: selection.ino,
             },
+            access,
         )
     })
 }

@@ -1620,6 +1620,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                 );
                 assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
                 let mut access = Request::WidenDirectories {
+                    access: 0o700,
                     remember: true,
                     directories: vec![(
                         path_bytes(&parent),
@@ -3636,6 +3637,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         &authority,
         &mut ops,
         Request::WidenDirectories {
+            access: 0o700,
             remember: true,
             directories: vec![(
                 path(&existing_directory),
@@ -4108,6 +4110,7 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
     // Previews never widen, so a read-only grant needs no authority for it.
     let existing = fs::metadata(&root).unwrap();
     let mut widen = Request::WidenDirectories {
+        access: 0o700,
         directories: vec![(
             path_bytes(&root),
             proto::TargetCondition::Matches {
@@ -6262,6 +6265,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
         // their final modes at the end.
         let observed = fs::metadata(target.join("read-only-dir")).unwrap();
         let widened = receiver.send(Request::WidenDirectories {
+            access: 0o700,
             remember: !preserve,
             directories: vec![(
                 path("read-only-dir"),
