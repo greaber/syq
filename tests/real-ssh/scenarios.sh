@@ -1080,6 +1080,35 @@ syq cp --prune --no-progress --performance-tuning workers=2 \
     --to destination --into-existing /tmp/syq-real-ssh/prune-destination
 ssh destination 'cd /tmp/syq-real-ssh/prune-destination && test ! -e extra && test ! -e other && test "$(cat kept)" = kept'
 
+printf 'case: restricted receiver changes no file in place that has names outside its scope\n'
+# A snapshot-style destination: scope/a shares its file with outside/a.
+ssh source 'mkdir -p /tmp/syq-real-ssh/outside-source && printf new > /tmp/syq-real-ssh/outside-source/a && printf new > /tmp/syq-real-ssh/outside-source/b && touch -m -d @1600000000 /tmp/syq-real-ssh/outside-source/a /tmp/syq-real-ssh/outside-source/b'
+ssh destination 'mkdir -p /tmp/syq-real-ssh/outside-links/scope /tmp/syq-real-ssh/outside-links/outside && cd /tmp/syq-real-ssh/outside-links && printf old > scope/a && ln scope/a outside/a && printf old > scope/b'
+if outside_output=$(syq cp --inplace --no-progress --from source --srcs-in /tmp/syq-real-ssh/outside-source \
+    --to destination --into-existing /tmp/syq-real-ssh/outside-links/scope 2>&1); then
+    echo 'an in-place update through a name outside the scope unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$outside_output" in
+    *"has names this copy can't confirm are inside"*) ;;
+    *)
+        printf 'in-place refusal did not explain the unconfirmed names:\n%s\n' "$outside_output" >&2
+        exit 1
+        ;;
+esac
+ssh destination 'cd /tmp/syq-real-ssh/outside-links && test "$(cat outside/a)" = old && test "$(cat scope/a)" = old && test "$(cat scope/b)" = new'
+
+printf 'case: restricted receiver writes in place only where the existing-file policy allows\n'
+ssh source 'mkdir -p /tmp/syq-real-ssh/inplace-policy-source && printf new > /tmp/syq-real-ssh/inplace-policy-source/a && printf new > /tmp/syq-real-ssh/inplace-policy-source/b'
+ssh destination 'mkdir -p /tmp/syq-real-ssh/inplace-policy && printf old > /tmp/syq-real-ssh/inplace-policy/a'
+syq cp --inplace --only-existing --no-progress --from source --srcs-in /tmp/syq-real-ssh/inplace-policy-source \
+    --to destination --into /tmp/syq-real-ssh/inplace-policy
+ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/a)" = new && test ! -e /tmp/syq-real-ssh/inplace-policy/b'
+# A file that must be new is staged, and published without replacing one.
+syq cp --inplace --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
+    --to destination --as-new /tmp/syq-real-ssh/inplace-policy/created
+ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/created)" = new'
+
 printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in
 # their second block; the even names' did not. Keeping an even name sets the

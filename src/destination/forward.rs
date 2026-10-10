@@ -86,11 +86,7 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     {
         bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
-    if args.owner || args.group || args.devices || args.inplace {
-        bail!("return authorization does not accept ownership, special-file preservation, or --inplace");
-    }
     crate::restricted::validate_restricted_args(args)?;
-    super::require_deletion_ceiling(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
     Ok(target)
@@ -207,6 +203,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     let Reply::Approved(approved) = reply else {
         bail!("unexpected remote copy approval response");
     };
+    super::apply_deletion_limit(args, &approved);
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     // The actual authority never leaves the destination helper. This internal
@@ -319,6 +316,7 @@ impl Receiver {
         let session =
             ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
         approved.token = session.token();
+        approved.max_delete = Some(self.max_delete.min(self.max_entries));
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();
@@ -1320,6 +1318,23 @@ mod tests {
         args.connections_opt = Some(129);
         args.connections = 129;
         assert!(eligible_target(&args).is_err());
+    }
+
+    /// As on other routes to an ordinary account, ownership, special files
+    /// and in-place writes are accepted.
+    #[test]
+    fn return_authorization_accepts_ownership_special_files_and_inplace() {
+        let root = crate::test_support::tempdir().unwrap();
+        let mut args = args(root.path(), "output");
+        args.owner = true;
+        args.group = true;
+        args.devices = true;
+        assert_eq!(eligible_target(&args).unwrap(), "server");
+        // Pruning states no limit of its own; the approving machine's applies.
+        args.delete = true;
+        assert_eq!(eligible_target(&args).unwrap(), "server");
+        args.inplace = true;
+        assert_eq!(eligible_target(&args).unwrap(), "server");
     }
 
     fn forward_command(source: &Path) -> Vec<Vec<u8>> {

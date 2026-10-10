@@ -306,6 +306,9 @@ impl FsOps {
             )?;
         }
         let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
+        if !follow {
+            self.record_looked_up_names(paths, &entries, guard);
+        }
         if self.inode_preservation.any() {
             for (index, entry) in entries.iter_mut().enumerate() {
                 if let Some(entry) = entry {

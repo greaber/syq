@@ -30,6 +30,9 @@ pub(super) struct AuthorityState {
     pub(super) receipt_stream: Option<crate::receipt::ReceiptStreamWriter>,
     pub(super) touched: BTreeSet<Vec<u8>>,
     pub(super) file_lifecycles: HashMap<(Vec<u8>, proto::CopyId), FileLifecycle>,
+    /// Files a grant that publishes in place has staged instead, because
+    /// they must be new: their writes and publication stay staged.
+    pub(super) staged_new: HashSet<(Vec<u8>, proto::CopyId)>,
     /// Requests authorized for execution whose outcome has not been settled
     /// yet, across every connection. The receipt waits for zero.
     pub(super) in_flight: u64,
@@ -130,12 +133,20 @@ pub(crate) struct RestrictedAuthority {
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
+    /// The names this receiver knows files have inside the signed scopes,
+    /// shared with every connection's operations, which change no file in
+    /// place that has others.
+    pub(super) scope_names: std::sync::Arc<crate::fsops::scope_names::ScopeNames>,
     /// The files this receiver created for the grant, shared with every
     /// connection's operations.
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
 }
 
 impl RestrictedAuthority {
+    pub(crate) fn scope_names(&self) -> std::sync::Arc<crate::fsops::scope_names::ScopeNames> {
+        self.scope_names.clone()
+    }
+
     /// The files that may take new names by hard link, when the grant keeps
     /// existing objects and copies hard links: those this receiver created
     /// for the grant. Without hard links nothing is recorded.
@@ -214,16 +225,6 @@ impl RestrictedAuthority {
             // coordinator reports, so the receiver cannot enforce it.
             bail!("update-if-older existing-object policy is not enforceable by the receiver");
         }
-        if copy.policy.publication == PublicationPolicy::InPlace
-            && (copy.policy.existing != ExistingDestinationPolicy::Replace
-                || (root_existence == RootExistence::New
-                    && copy.policy.placement == DestinationPlacement::ExactPath))
-        {
-            // In-place preparation opens, creates, or replaces the final
-            // pathname with no condition to attach, so it can neither retain
-            // a pre-existing object nor be pinned to one.
-            bail!("in-place publication cannot honor a signed existing-object policy");
-        }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(&config.root);
@@ -249,9 +250,16 @@ impl RestrictedAuthority {
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
+        let scope_names = std::sync::Arc::new(crate::fsops::scope_names::ScopeNames::new(
+            config.root.as_bytes().to_vec(),
+            copy.mutation_scopes
+                .iter()
+                .map(|scope| (scope.path.clone(), scope.descendants)),
+        ));
         let authority = Self {
             hashing,
             extra_options,
+            scope_names,
             owned: Default::default(),
             tcp_congestion,
             mapping: mapping.map(|authorization| {
@@ -294,6 +302,7 @@ impl RestrictedAuthority {
                 receipt_stream,
                 touched: BTreeSet::new(),
                 file_lifecycles: HashMap::new(),
+                staged_new: HashSet::new(),
                 in_flight: 0,
                 receipt_closing: false,
                 receipt_issued: false,
@@ -1435,6 +1444,89 @@ impl RestrictedAuthority {
         Ok(())
     }
 
+    /// Bind an in-place file's opening to the signed existing-object policy.
+    /// A file the policy only allows creating (keeping existing files, or a
+    /// root that must be new) is staged and published without replacing
+    /// anything (`constrain_staged_new`), never written in place, unless
+    /// this grant created it; when the policy changes existing files only,
+    /// the request must name exactly the file the receiver observes.
+    pub(super) fn constrain_inplace(
+        &self,
+        path: &[u8],
+        condition: &mut proto::TargetCondition,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        let own = self.created_by_this_grant(path);
+        let label = String::from_utf8_lossy(path);
+        let root_must_be_new =
+            self.root_existence == RootExistence::New && path == self.destination;
+        match self.copy.policy.existing {
+            ExistingDestinationPolicy::Replace if !root_must_be_new => {}
+            ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip if own => {}
+            ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip => bail!(
+                "signed grant only creates {label}: it is staged and published without replacing anything, not written in place"
+            ),
+            ExistingDestinationPolicy::MustExist if own => {}
+            ExistingDestinationPolicy::MustExist => {
+                let Some(metadata) = self.rooted_metadata(path)? else {
+                    bail!("signed grant creates nothing: {label} does not exist")
+                };
+                match *condition {
+                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
+                    Matches { .. } => bail!(
+                        "requested identity for {label} does not match the object the receiver observed"
+                    ),
+                    Any | Absent | MatchesFingerprint { .. } => bail!(
+                        "in-place preparation of {label} must name the existing file it changes, as the signed existing-object policy requires"
+                    ),
+                }
+            }
+            ExistingDestinationPolicy::UpdateIfOlder => {
+                bail!("update-if-older existing-object policy is not enforceable by the receiver")
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit a staged file under a grant that publishes in place: only a new
+    /// file, which is then published without replacing anything. Staging a
+    /// new file is safer than writing it in place, and costs nothing more:
+    /// there is nothing to update.
+    fn constrain_staged_new(&self, path: &[u8]) -> Result<()> {
+        let label = String::from_utf8_lossy(path);
+        if self.copy.policy.existing == ExistingDestinationPolicy::MustExist {
+            bail!("signed grant creates nothing: {label} is changed in place");
+        }
+        if self.rooted_metadata(path)?.is_some() {
+            bail!("signed grant writes {label} in place: only a new file is staged");
+        }
+        Ok(())
+    }
+
+    /// Whether a write or publication of `path` in mode `inplace` matches how
+    /// the signed policy publishes it: staged under a staged grant; under an
+    /// in-place grant, in place, or staged for a new file staged as such.
+    fn require_publication_mode(
+        &self,
+        path: &[u8],
+        copy_id: proto::CopyId,
+        inplace: bool,
+        what: &str,
+    ) -> Result<()> {
+        let staged_new = self.copy.policy.publication == PublicationPolicy::InPlace
+            && self
+                .state
+                .lock()
+                .unwrap()
+                .staged_new
+                .contains(&(path.to_vec(), copy_id));
+        let expected = self.copy.policy.publication == PublicationPolicy::InPlace && !staged_new;
+        if inplace != expected {
+            bail!("{what} does not match the signed publication policy");
+        }
+        Ok(())
+    }
+
     /// Refuse staging work whose eventual publication the existing-object
     /// policy would reject, so the transfer fails before moving bytes.
     pub(super) fn constrain_prepare(&self, path: &[u8]) -> Result<()> {
@@ -2445,9 +2537,9 @@ impl RestrictedAuthority {
                 ..
             } => {
                 self.check_hash_request(*block, if bounded_basis { 0 } else { *len })?;
-                if self.copy.policy.publication != PublicationPolicy::AtomicStaged {
-                    bail!("in-place signed receiver forbids staged basis creation");
-                }
+                // Under an in-place grant, only to resume a new file staged
+                // as such.
+                self.require_publication_mode(path, *copy_id, false, "staged basis creation")?;
                 if *len > self.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
@@ -2495,13 +2587,15 @@ impl RestrictedAuthority {
                 flags,
                 scanned,
                 create_if_missing,
+                condition,
                 guard,
                 ..
             } => {
                 // The receiver looks for itself at what a file replaces: a
                 // sender's word could give an existing file a new mode.
                 *scanned = proto::ScannedDestination::Unknown;
-                if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
+                let in_place_grant = self.copy.policy.publication == PublicationPolicy::InPlace;
+                if *inplace && !in_place_grant {
                     bail!("file preparation does not match the signed publication policy");
                 }
                 self.check_flags(*flags)?;
@@ -2509,9 +2603,28 @@ impl RestrictedAuthority {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
-                self.constrain_prepare(path)?;
+                if *inplace {
+                    self.constrain_inplace(path, condition)?;
+                } else {
+                    self.constrain_prepare(path)?;
+                    if in_place_grant {
+                        self.constrain_staged_new(path)?;
+                    }
+                }
                 let observation_hold =
                     self.reserve_bytes(path, *copy_id, *size, !*create_if_missing)?;
+                // Only an approved preparation changes how the file's writes
+                // and publication go: a refused in-place one leaves a new
+                // file staged.
+                if in_place_grant {
+                    let key = (path.clone(), *copy_id);
+                    let staged_new = &mut self.state.lock().unwrap().staged_new;
+                    if *inplace {
+                        staged_new.remove(&key);
+                    } else {
+                        staged_new.insert(key);
+                    }
+                }
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,
                     path: path.clone(),
@@ -2537,10 +2650,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                anyhow::ensure!(
-                    self.copy.policy.publication == PublicationPolicy::AtomicStaged,
-                    "in-place signed receiver forbids staged block reuse"
-                );
+                self.require_publication_mode(path, *copy_id, false, "staged block reuse")?;
                 self.check_mutation_path(path, false)?;
                 let declared = self.declared_size(path, *copy_id)?;
                 anyhow::ensure!(
@@ -2573,9 +2683,7 @@ impl RestrictedAuthority {
                 guard,
                 ..
             } => {
-                if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
-                    bail!("file write does not match the signed publication policy");
-                }
+                self.require_publication_mode(path, *copy_id, *inplace, "file write")?;
                 let declared = self.declared_size(path, *copy_id)?;
                 if off
                     .checked_add(data.len() as u64)
@@ -2616,11 +2724,21 @@ impl RestrictedAuthority {
                 // process.
                 *scanned = proto::ScannedDestination::Unknown;
                 *expected_hash = self.expected_hash(path)?.map(Into::into);
-                if *inplace != (self.copy.policy.publication == PublicationPolicy::InPlace) {
-                    bail!("file finalization does not match the signed publication policy");
-                }
+                self.require_publication_mode(path, *copy_id, *inplace, "file finalization")?;
                 self.check_mutation_path(path, false)?;
                 self.check_published_length(path, *copy_id, *inplace)?;
+                if !*inplace && self.copy.policy.publication == PublicationPolicy::InPlace {
+                    // A new file staged under an in-place grant replaces
+                    // nothing.
+                    match *condition {
+                        proto::TargetCondition::Any | proto::TargetCondition::Absent => {
+                            *condition = proto::TargetCondition::Absent
+                        }
+                        _ => bail!(
+                            "a new file staged under an in-place grant is published without replacing anything"
+                        ),
+                    }
+                }
                 self.constrain_creation(path, condition, false, 0, pending)?;
                 outcomes.push(PendingOutcome::FileStage {
                     index: 0,

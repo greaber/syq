@@ -750,6 +750,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let mut ops = FsOps::with_descriptor_session(descriptor_session.clone());
     if let Some(authority) = &authority {
         ops.set_hash_policy(authority.hash_policy());
+        ops.set_scope_names(authority.scope_names());
         ops.set_owned_objects(authority.owned_objects());
     }
     if let Some(source) = &source_permit {
@@ -1331,6 +1332,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                             &requested_root,
                             batch.iter().map(|entry| entry.path.as_slice()),
                         )?;
+                        ops.record_scope_names(&requested_root, &batch);
                     }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {
@@ -1912,6 +1914,7 @@ fn drop_after_handling_for_test(request: &Request) -> bool {
             Request::ReadRange { .. } | Request::ReadComparedRange { .. }
         ),
         "write" => matches!(request, Request::WriteRange { .. }),
+        "prepare" => matches!(request, Request::Prepare { .. }),
         "finalize" => matches!(request, Request::Finalize { .. }),
         "patch-data" => matches!(request, Request::PatchData { .. }),
         _ => false,

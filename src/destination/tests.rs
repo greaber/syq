@@ -374,6 +374,20 @@ pub(super) fn broker(
     Registration,
     mpsc::Receiver<Prompt>,
 ) {
+    broker_with_max_delete(root, approval, 0)
+}
+
+/// The same, permitting pruning of up to `max_delete` entries per copy.
+fn broker_with_max_delete(
+    root: &Path,
+    approval: Approval,
+    max_delete: u64,
+) -> (
+    PrivateBroker,
+    Arc<Receiver>,
+    Registration,
+    mpsc::Receiver<Prompt>,
+) {
     let (prompts, requests) = mpsc::sync_channel(1);
     let receiver = Arc::new(Receiver {
         tcp_peer: crate::conn::RemoteSpec::local_receiver(false),
@@ -392,7 +406,7 @@ pub(super) fn broker(
         secret: random_token().unwrap(),
         max_bytes: 10_000_000,
         max_entries: 1000,
-        max_delete: 0,
+        max_delete,
         approval,
         prompts,
         sessions: Mutex::new(HashMap::new()),
@@ -947,23 +961,88 @@ fn named_copy_accepts_ownership_and_special_files() {
 }
 
 #[test]
-fn named_requests_keep_inplace_refused_and_need_a_stated_deletion_ceiling() {
+fn named_requests_accept_inplace_and_prune_within_the_machines_limit() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut inplace = args(&temporary.path().join("source"), "output");
     inplace.inplace = true;
-    let (request, _) = request(&inplace);
-    let error = constrain(request, temporary.path(), 1000, 1000, 0).unwrap_err();
-    assert!(error.to_string().contains("--inplace"), "{error:#}");
+    let (accepted, _) = request(&inplace);
+    let constrained = constrain(accepted, temporary.path(), 1000, 1000, 0).unwrap();
+    assert_eq!(
+        constrained.copy.policy.publication,
+        crate::delegation::PublicationPolicy::InPlace
+    );
 
+    // Without --max-delete, the request may delete what this machine allows.
     let mut pruning = args(&temporary.path().join("source"), "output");
     pruning.delete = true;
-    let error = require_deletion_ceiling(&pruning).unwrap_err();
-    assert!(error.to_string().contains("--max-delete"), "{error:#}");
-    pruning.max_delete = Some(3);
-    require_deletion_ceiling(&pruning).unwrap();
-    pruning.max_delete = None;
-    pruning.dry_run = true;
-    require_deletion_ceiling(&pruning).unwrap();
+    let (prune, _) = request(&pruning);
+    let error = constrain(prune.clone(), temporary.path(), 1000, 1000, 0).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("pruning needs a positive --max-delete"),
+        "{error:#}"
+    );
+    let constrained = constrain(prune.clone(), temporary.path(), 1000, 1000, 5).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 5);
+    let constrained = constrain(prune.clone(), temporary.path(), 1000, 3, 5).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 3);
+
+    // The sender plans against the machine's limit, or its own if lower.
+    let approved = Approved {
+        token: String::new(),
+        destination: Vec::new(),
+        enrollment: crate::enrollment::EnrollmentId::random(),
+        request: crate::delegation::RequestId::fresh(1).unwrap(),
+        digest: [0; 32],
+        receipt_key: String::new(),
+        max_delete: None,
+    };
+    for (stated, machine, planned, from_machine) in [
+        (None, Some(5), Some(5), true),
+        (Some(3), Some(5), Some(3), false),
+        (Some(9), Some(5), Some(5), true),
+        (None, None, None, false),
+        (Some(9), None, Some(9), false),
+    ] {
+        let mut approved = approved.clone();
+        approved.max_delete = machine;
+        pruning.max_delete = stated;
+        pruning.max_delete_from_approver = false;
+        apply_deletion_limit(&mut pruning, &approved);
+        assert_eq!(
+            (pruning.max_delete, pruning.max_delete_from_approver),
+            (planned, from_machine),
+            "{stated:?} {machine:?}"
+        );
+    }
+}
+
+/// Pruning stays all or nothing against the receiving machine's own limit:
+/// more planned deletions than it allows remove nothing, as any --max-delete.
+#[test]
+fn named_pruning_plans_against_the_receiving_machines_limit() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    for name in ["kept", "extra-1", "extra-2"] {
+        fs::write(root.join("source").join(name), b"old").unwrap();
+    }
+    {
+        let (_broker, _receiver, registration, _) =
+            broker_with_max_delete(&root, Approval::Always, 1);
+        assert_eq!(named_copy(&registration, &source, &["--prune"]), 25);
+        assert!(root.join("source/extra-1").exists());
+        assert!(root.join("source/extra-2").exists());
+    }
+    let (_broker, _receiver, registration, _) = broker_with_max_delete(&root, Approval::Always, 2);
+    assert_eq!(named_copy(&registration, &source, &["--prune"]), 0);
+    assert!(!root.join("source/extra-1").exists());
+    assert!(!root.join("source/extra-2").exists());
+    assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"kept");
 }
 
 #[test]
@@ -1001,6 +1080,8 @@ fn named_copy(registration: &Registration, source: &Path, options: &[&str]) -> i
     let mut args = crate::approval_command::parse(&command).unwrap();
     let policy = request.constraints.receipt_policy.clone();
     let approved = approve(registration, command, request);
+    // As `prepare` does with the approval.
+    apply_deletion_limit(&mut args, &approved);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));
@@ -1167,6 +1248,199 @@ fn named_extended_attributes_ask_and_reconcile_the_user_namespace() {
         attributes(&root.join("source/file")),
         [(b"user.kept".to_vec(), b"value".to_vec())]
     );
+}
+
+/// A downloaded file whose destination shares its inode with a name outside
+/// the copy's directory, as snapshot trees do, is not changed in place:
+/// neither its contents with `--inplace` nor its metadata alone. That file
+/// fails; the copy's other files and other names are as an ordinary copy
+/// leaves them.
+#[test]
+fn named_copies_change_no_file_in_place_that_has_names_outside() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A large file is written in place through ranges, not with the small
+    // files.
+    let large_old = vec![1u8; 6 << 20];
+    let large_new = vec![2u8; 6 << 20];
+    for (options, contents, old) in [
+        (
+            &["--inplace", "--copy-metadata", "mtime"][..],
+            &b"new"[..],
+            &b"old"[..],
+        ),
+        (
+            &["--inplace", "--copy-metadata", "mtime"][..],
+            &large_new[..],
+            &large_old[..],
+        ),
+        (&["--copy-metadata", "mtime,permissions"], b"old", b"old"),
+    ] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        let source = fs::canonicalize(temp.path()).unwrap().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(source.join("a"), contents).unwrap();
+        fs::write(source.join("b"), b"new").unwrap();
+        fs::set_permissions(source.join("a"), fs::Permissions::from_mode(0o600)).unwrap();
+        // Older than the destination, so that no file looks unchanged.
+        for name in ["a", "b"] {
+            fs::File::options()
+                .write(true)
+                .open(source.join(name))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+                .unwrap();
+        }
+        fs::write(root.join("source/a"), old).unwrap();
+        fs::set_permissions(root.join("source/a"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(root.join("source/a"), root.join("outside/a")).unwrap();
+        fs::write(root.join("source/b"), b"old").unwrap();
+        let before = fs::metadata(root.join("outside/a")).unwrap();
+        let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+        // A partial transfer: that one file failed.
+        assert_eq!(
+            named_copy(&registration, &source, options),
+            23,
+            "{options:?}"
+        );
+        let after = fs::metadata(root.join("outside/a")).unwrap();
+        assert!(
+            fs::read(root.join("outside/a")).unwrap() == old,
+            "{options:?}, {} bytes",
+            old.len()
+        );
+        assert_eq!(
+            (after.ino(), after.mode(), after.mtime(), after.mtime_nsec()),
+            (
+                before.ino(),
+                before.mode(),
+                before.mtime(),
+                before.mtime_nsec()
+            ),
+            "{options:?}"
+        );
+        assert_eq!(
+            fs::read(root.join("source/b")).unwrap(),
+            b"new",
+            "{options:?}"
+        );
+    }
+}
+
+/// Names the copy's own scan found inside its directory are not outside:
+/// a linked pair there is updated in place as usual.
+#[test]
+fn named_inplace_copies_update_link_groups_inside_their_directory() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(root.join("source")).unwrap();
+    fs::write(source.join("x"), b"new contents").unwrap();
+    fs::hard_link(source.join("x"), source.join("y")).unwrap();
+    fs::write(root.join("source/x"), b"old").unwrap();
+    fs::hard_link(root.join("source/x"), root.join("source/y")).unwrap();
+    let inode = fs::metadata(root.join("source/x")).unwrap().ino();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let shown = approve_pending(&receiver);
+    assert_eq!(
+        named_copy(
+            &registration,
+            &source,
+            &["--inplace", "--copy-metadata", "mtime,hardlinks"]
+        ),
+        0
+    );
+    let shown = shown.join().unwrap();
+    assert!(
+        shown.contains("The server can rewrite existing files in place."),
+        "{shown}"
+    );
+    for name in ["x", "y"] {
+        let path = root.join("source").join(name);
+        assert_eq!(fs::read(&path).unwrap(), b"new contents");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode, "{name}");
+    }
+}
+
+/// A laptop download with --inplace --only-existing changes the files the
+/// destination has, in place, and creates none.
+#[test]
+fn named_inplace_copies_change_only_existing_files() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(root.join("source")).unwrap();
+    fs::write(source.join("a"), b"new contents").unwrap();
+    fs::write(source.join("b"), b"not wanted").unwrap();
+    fs::write(root.join("source/a"), b"old").unwrap();
+    let inode = fs::metadata(root.join("source/a")).unwrap().ino();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    assert_eq!(
+        named_copy(
+            &registration,
+            &source,
+            &["--inplace", "--only-existing", "--copy-metadata", "mtime"]
+        ),
+        0
+    );
+    assert_eq!(fs::read(root.join("source/a")).unwrap(), b"new contents");
+    assert_eq!(fs::metadata(root.join("source/a")).unwrap().ino(), inode);
+    assert!(!root.join("source/b").exists());
+}
+
+/// A laptop download of one file with --as-new --inplace stages the file,
+/// which must be new, and publishes it without replacing anything, as the
+/// receiver's in-place grant accepts. (A name that already exists is refused
+/// when the copy asks for approval.)
+#[test]
+fn named_as_new_inplace_files_are_created_only() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("file");
+    fs::write(&source, vec![5u8; 3 << 20]).unwrap();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    let copy = |name: &str| {
+        let command: Vec<Vec<u8>> = [
+            "cp",
+            "--src",
+            source.to_str().unwrap(),
+            "--to",
+            "@laptop",
+            "--as-new",
+            name,
+            "--tcp-ports",
+            "0-0",
+            "--inplace",
+            "--performance-tuning",
+            "workers=2",
+        ]
+        .iter()
+        .map(|arg| arg.as_bytes().to_vec())
+        .collect();
+        let mut args = crate::approval_command::parse(&command).unwrap();
+        let (request, secret) = request(&args);
+        let policy = request.constraints.receipt_policy.clone();
+        let approved = approve(&registration, command, request);
+        args.locations.last_mut().unwrap().host = Some("server".into());
+        args.locations.last_mut().unwrap().path = approved.destination.clone();
+        args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));
+        args.named_receipt = Some(Arc::new(NamedReceipt {
+            connection: None,
+            secret,
+            approved,
+            policy,
+        }));
+        crate::transfer::run(args)
+    };
+    assert_eq!(copy("new").unwrap(), 0);
+    assert_eq!(fs::read(root.join("new")).unwrap(), vec![5u8; 3 << 20]);
 }
 
 #[test]

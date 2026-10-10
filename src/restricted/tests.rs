@@ -1092,6 +1092,7 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -1175,6 +1176,7 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -1209,6 +1211,7 @@ fn signed_inplace_policy_requires_inplace_file_mutations() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -1264,6 +1267,7 @@ fn prepare_request(path: &Path) -> Request {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     }
@@ -3019,6 +3023,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -3074,6 +3079,7 @@ fn in_place_files_appear_in_the_receipt_before_their_final_step() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -3150,6 +3156,7 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
             group: None,
         });
@@ -3330,12 +3337,21 @@ fn new_directory_placement_root_must_be_created_as_a_directory() {
     assert_eq!(op_condition(&as_directory), Absent);
 }
 
+/// In place, a name is written as it is opened, so each in-place request
+/// carries the condition the signed existing-file policy needs, and the
+/// receiver opens the name only on that condition. A compromised sender
+/// cannot drop the condition, and its condition cannot name another file.
+/// A file the policy only allows creating is staged instead.
 #[test]
-fn inplace_publication_cannot_honor_no_replace_policies() {
+fn inplace_requests_carry_the_condition_their_existing_file_policy_needs() {
+    use proto::TargetCondition::{Absent, Any, Matches};
+    use std::os::unix::fs::MetadataExt;
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
-    let inplace = |existing, placement, root_existence| {
+    fs::create_dir_all(root.join("target")).unwrap();
+    fs::write(root.join("target/existing"), b"kept").unwrap();
+    let existing = fs::metadata(root.join("target/existing")).unwrap();
+    let inplace = |policy, placement, root_existence| {
         test_authority_with_existence(
             &root,
             DeletionPolicy::Forbid,
@@ -3343,42 +3359,123 @@ fn inplace_publication_cannot_honor_no_replace_policies() {
             0,
             FilterPolicy::default(),
             PublicationPolicy::InPlace,
-            existing,
+            policy,
             placement,
             root_existence,
         )
+        .unwrap()
     };
-    assert!(inplace(
+    let prepare = |name: &str, condition| Request::Prepare {
+        path: path_bytes(&root.join("target").join(name)),
+        size: 4,
+        inplace: true,
+        copy_id: [1; 16],
+        mode: 0o600,
+        flags: 0,
+        acl: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+        group: None,
+        attempt: 0,
+        create_if_missing: true,
+        condition,
+        guard: None,
+    };
+    let refused = |authority: &RestrictedAuthority, name: &str, condition| {
+        authority
+            .authorize(&mut prepare(name, condition), false)
+            .unwrap_err()
+            .to_string()
+    };
+
+    // Keeping existing files: nothing in place, which would write a name as
+    // it is opened; a new file is staged, and only a new one.
+    let keep = inplace(
         ExistingDestinationPolicy::Skip,
-        DestinationPlacement::ExactPath,
+        DestinationPlacement::DirectoryContents,
         RootExistence::Any,
-    )
-    .is_err());
-    assert!(inplace(
+    );
+    for name in ["existing", "new"] {
+        for condition in [
+            Any,
+            Absent,
+            Matches {
+                dev: existing.dev(),
+                ino: existing.ino(),
+            },
+        ] {
+            let error = refused(&keep, name, condition);
+            assert!(
+                error.contains("only creates"),
+                "{name} {condition:?}: {error}"
+            );
+        }
+    }
+    let staged = |name: &str| {
+        let mut request = prepare(name, Any);
+        let Request::Prepare { inplace, .. } = &mut request else {
+            unreachable!()
+        };
+        *inplace = false;
+        request
+    };
+    assert!(keep.authorize(&mut staged("existing"), false).is_err());
+    keep.authorize(&mut staged("new"), false).unwrap();
+    assert_eq!(fs::read(root.join("target/existing")).unwrap(), b"kept");
+
+    // Changing existing files only: exactly the file the receiver observes.
+    let update = inplace(
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    );
+    let observed = Matches {
+        dev: existing.dev(),
+        ino: existing.ino(),
+    };
+    let error = refused(&update, "missing", observed);
+    assert!(error.contains("creates nothing"), "{error}");
+    assert!(!root.join("target/missing").exists());
+    let error = refused(&update, "existing", Any);
+    assert!(error.contains("must name the existing file"), "{error}");
+    let error = refused(
+        &update,
+        "existing",
+        Matches {
+            dev: existing.dev(),
+            ino: existing.ino() + 1,
+        },
+    );
+    assert!(error.contains("does not match"), "{error}");
+    update
+        .authorize(&mut prepare("existing", observed), false)
+        .unwrap();
+
+    // A new root exactly at the destination is created, never replaced.
+    let as_new = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::ExactPath,
         RootExistence::New,
-    )
-    .is_err());
-    // In-place preparation cannot be pinned to an observed object either,
-    // so MustExist is refused as well; only Replace remains, and a new
-    // directory root is fine because mkdir creates it.
-    assert!(inplace(
-        ExistingDestinationPolicy::MustExist,
-        DestinationPlacement::ExactPath,
-        RootExistence::Any,
-    )
-    .is_err());
-    inplace(
+    );
+    // The test destination already exists, so redemption refuses it.
+    assert!(as_new.is_err());
+
+    // Replacing: any condition, as before.
+    let replace = inplace(
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::DirectoryContents,
-        RootExistence::New,
-    )
-    .unwrap();
+        RootExistence::Any,
+    );
+    replace
+        .authorize(&mut prepare("existing", Any), false)
+        .unwrap();
 
-    // The coordinator refuses the same combination before signing. The
-    // rsync-shaped parser already makes --inplace and --ignore-existing
-    // conflict, so the reachable case is the native --as-new placement.
+    // The coordinator signs these combinations now.
     let mut args = Args::try_parse_from([
         "syq rsync",
         "-r",
@@ -3388,11 +3485,10 @@ fn inplace_publication_cannot_honor_no_replace_policies() {
     ])
     .unwrap();
     args.normalize();
-    validate_restricted_args(&args).unwrap();
     args.placement = Placement::As;
     args.target_existence = Existence::New;
-    assert!(validate_restricted_args(&args).is_err());
-    args.placement = Placement::Into;
+    validate_restricted_args(&args).unwrap();
+    args.existing = true;
     validate_restricted_args(&args).unwrap();
 }
 
@@ -3885,6 +3981,7 @@ fn signed_file_data_rate_is_enforced_across_requests() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -4256,6 +4353,7 @@ fn preparation_and_seeding_are_charged_against_the_byte_ceiling() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: true,
+        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     };
@@ -6469,6 +6567,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
                 scanned: crate::proto::ScannedDestination::Unknown,
                 attempt: 0,
                 create_if_missing: true,
+                condition: crate::proto::TargetCondition::Any,
                 guard: None,
                 group: None,
             });
@@ -6620,6 +6719,7 @@ fn only_an_ordinary_receiver_takes_a_senders_word_for_what_a_file_replaces() {
                 scanned,
                 attempt: 0,
                 create_if_missing: true,
+                condition: crate::proto::TargetCondition::Any,
                 guard: None,
                 group: None,
             });
@@ -6679,6 +6779,7 @@ fn both_receivers_restore_set_id_bits_after_writing_in_place() {
             scanned: proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
             group: None,
         });
@@ -6764,6 +6865,7 @@ fn both_receivers_limit_a_new_in_place_file_by_a_narrower_default_acl() {
             scanned,
             attempt: 0,
             create_if_missing: true,
+            condition: crate::proto::TargetCondition::Any,
             guard: None,
             group: None,
         });
@@ -7177,4 +7279,267 @@ fn kept_files_take_no_content() {
     );
     assert_eq!(fs::read(&late).unwrap(), b"theirs");
     assert_eq!(fs::read(root.join("target/kept")).unwrap(), b"kept");
+}
+
+/// A restricted receiver counts the names its own lookups returned, whether
+/// a stat or a planning batch asked. A file whose eight names were looked
+/// up together, all inside the signed scope, takes a time change through
+/// any of them.
+#[test]
+fn names_a_lookup_returned_count_inside() {
+    use std::os::unix::fs::MetadataExt;
+    for planning in [true, false] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let names: Vec<PathBuf> = (0..8).map(|i| target.join(format!("name{i}"))).collect();
+        fs::write(&names[0], b"shared").unwrap();
+        for name in &names[1..] {
+            fs::hard_link(&names[0], name).unwrap();
+        }
+        let authority = time_preserving_test_authority_for(&root, 1 << 20, 64, false);
+        let mut ops = crate::fsops::FsOps::new();
+        ops.set_scope_names(authority.scope_names());
+        let mut send = |mut request: Request| {
+            let settlement = authority.authorize(&mut request, false).unwrap();
+            let response = ops.handle(&request);
+            authority.settle(settlement, &response);
+            response
+        };
+        let paths: Vec<_> = names.iter().map(|name| path_bytes(name)).collect();
+        send(if planning {
+            Request::PlanBatch {
+                partial_paths: Vec::new(),
+                copy_id: [3; 16],
+                directories: vec![path_bytes(&target)],
+                others: paths,
+                guard: None,
+                strict_metadata: false,
+            }
+        } else {
+            Request::StatMany {
+                paths,
+                sources: None,
+                follow: false,
+                guard: None,
+            }
+        });
+        let before = fs::metadata(&names[0]).unwrap();
+        let response = send(Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: path_bytes(&names[0]),
+                meta: proto::Meta {
+                    mtime: 1_600_000_000,
+                    ..plain_meta()
+                },
+                flags: proto::flags::TIMES,
+                condition: proto::TargetCondition::Matches {
+                    dev: before.dev(),
+                    ino: before.ino(),
+                },
+            }],
+            guard: None,
+        });
+        assert!(
+            matches!(&response, proto::Response::Applied(errors) if errors.iter().all(Option::is_none)),
+            "planning={planning}: {response:?}"
+        );
+        assert_eq!(fs::metadata(&names[7]).unwrap().mtime(), 1_600_000_000);
+    }
+}
+
+/// Under a grant that publishes in place, a file that must be new (here an
+/// `--as-new` root) is staged and published without replacing anything,
+/// never written in place, so a retry after an interrupted attempt simply
+/// stages it again.
+#[test]
+fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing() {
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::New,
+    )
+    .unwrap();
+    let target = root.join("target");
+    let mut ops = crate::fsops::FsOps::new();
+    let mut run = |mut request: Request| -> Result<(Request, proto::Response)> {
+        let settlement = authority.authorize(&mut request, false)?;
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        Ok((request, response))
+    };
+    let prepare = |inplace, attempt| Request::Prepare {
+        path: path_bytes(&target),
+        size: 5,
+        inplace,
+        copy_id: [1; 16],
+        mode: 0o644,
+        flags: 0,
+        acl: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+        group: None,
+        attempt,
+        create_if_missing: true,
+        condition: Any,
+        guard: None,
+    };
+    let write = |inplace, attempt| {
+        let data = b"hello".to_vec();
+        Request::WriteRange {
+            path: path_bytes(&target),
+            inplace,
+            copy_id: [1; 16],
+            attempt,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.into(),
+            guard: None,
+        }
+    };
+    let error = run(prepare(true, 0)).unwrap_err().to_string();
+    assert!(error.contains("only creates"), "{error}");
+    // Staged, its writes stay staged; an interrupted attempt is retried.
+    for attempt in [0, 1] {
+        let (_, response) = run(prepare(false, attempt)).unwrap();
+        assert!(
+            matches!(response, proto::Response::Prepared(_)),
+            "{response:?}"
+        );
+        assert!(run(write(true, attempt)).is_err());
+        let (_, response) = run(write(false, attempt)).unwrap();
+        assert!(
+            !matches!(
+                response,
+                proto::Response::Err(_) | proto::Response::EndpointError(_)
+            ),
+            "{response:?}"
+        );
+        assert!(!target.exists());
+    }
+    let mut finalize = finalize_request(&target, Any);
+    if let Request::Finalize { meta, .. } = &mut finalize {
+        meta.mode = 0o100644;
+    }
+    let (finalize, response) = run(finalize).unwrap();
+    assert!(
+        matches!(
+            finalize,
+            Request::Finalize {
+                condition: Absent,
+                ..
+            }
+        ),
+        "{finalize:?}"
+    );
+    assert!(
+        !matches!(
+            response,
+            proto::Response::Err(_) | proto::Response::EndpointError(_)
+        ),
+        "{response:?}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"hello");
+    // Once it exists, it is not staged again.
+    assert!(run(prepare(false, 2)).is_err());
+}
+
+/// A refused in-place preparation leaves a new file staged: under a grant
+/// that only creates it (an `--as-new` root, or keeping existing files), a
+/// file that appears at its name meanwhile takes no in-place write. (The
+/// reviewer's reproducer.)
+#[test]
+fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
+    for keep in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        if keep {
+            fs::create_dir(root.join("target")).unwrap();
+        }
+        let target = if keep {
+            root.join("target/file")
+        } else {
+            root.join("target")
+        };
+        let authority = test_authority_with_existence(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            if keep {
+                ExistingDestinationPolicy::Skip
+            } else {
+                ExistingDestinationPolicy::Replace
+            },
+            if keep {
+                DestinationPlacement::DirectoryContents
+            } else {
+                DestinationPlacement::ExactPath
+            },
+            if keep {
+                RootExistence::Any
+            } else {
+                RootExistence::New
+            },
+        )
+        .unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        ops.set_scope_names(authority.scope_names());
+        let mut run = |mut request: Request| -> Result<proto::Response> {
+            let settlement = authority.authorize(&mut request, false)?;
+            let response = ops.handle(&request);
+            authority.settle(settlement, &response);
+            Ok(response)
+        };
+        let prepare = |inplace| Request::Prepare {
+            path: path_bytes(&target),
+            size: 5,
+            inplace,
+            copy_id: [1; 16],
+            mode: 0o644,
+            flags: 0,
+            acl: false,
+            scanned: proto::ScannedDestination::Unknown,
+            group: None,
+            attempt: 0,
+            create_if_missing: true,
+            condition: proto::TargetCondition::Any,
+            guard: None,
+        };
+        let response = run(prepare(false)).unwrap();
+        assert!(
+            matches!(response, proto::Response::Prepared(_)),
+            "{response:?}"
+        );
+        // An unrelated file arrives before the new file is published.
+        fs::write(&target, b"theirs").unwrap();
+        let error = run(prepare(true)).unwrap_err();
+        assert!(error.to_string().contains("only creates"), "{error}");
+        let data = b"HELLO".to_vec();
+        let write = run(Request::WriteRange {
+            path: path_bytes(&target),
+            inplace: true,
+            copy_id: [1; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data: data.into(),
+            guard: None,
+        });
+        assert!(write.is_err(), "keep={keep}: {write:?}");
+        assert_eq!(fs::read(&target).unwrap(), b"theirs", "keep={keep}");
+    }
 }

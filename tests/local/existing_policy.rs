@@ -289,6 +289,172 @@ fn prune_does_not_require_permission_to_replace_source_matches() {
     assert!(!t.path("dst/extra").exists());
 }
 
+/// In place, the name is written as it is opened, so `--only-existing` opens
+/// only the file the scan found; an `--as-new` file must be new, and the copy
+/// refuses a name that exists.
+#[test]
+fn inplace_files_open_their_names_as_the_existing_file_policy_requires() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"new a");
+    write(&t.path("src/b"), b"new b");
+    write(&t.path("dst/a"), b"old");
+    let inode = fs::metadata(t.path("dst/a")).unwrap().ino();
+    run_native_ok(&[
+        "cp",
+        "--inplace",
+        "--only-existing",
+        "--srcs-in",
+        &t.s("src"),
+        "--into",
+        &t.s("dst"),
+    ]);
+    assert_eq!(read(&t.path("dst/a")), b"new a");
+    assert_eq!(fs::metadata(t.path("dst/a")).unwrap().ino(), inode);
+    assert!(!t.path("dst/b").exists());
+
+    run_native_ok(&[
+        "cp",
+        "--inplace",
+        &t.s("src/b"),
+        "--as-new",
+        &t.s("dst/new"),
+    ]);
+    assert_eq!(read(&t.path("dst/new")), b"new b");
+    let refused = native_syq(&["cp", "--inplace", &t.s("src/b"), "--as-new", &t.s("dst/a")]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(read(&t.path("dst/a")), b"new a");
+}
+
+/// With `--inplace`, a file that must be new is staged: nothing is at its
+/// name until it is published, and nothing would be in place to update.
+#[cfg(debug_assertions)]
+#[test]
+fn a_file_that_must_be_new_is_staged_under_inplace() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"new contents");
+    fs::create_dir_all(t.path("dst")).unwrap();
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "-q",
+            "--inplace",
+            "--performance-tuning",
+            "copy-path=ranges",
+        ])
+        .arg(t.path("src/file"))
+        .arg("--as-new")
+        .arg(t.path("dst/new"))
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
+    assert!(!t.path("dst/new").exists());
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(read(&t.path("dst/new")), b"new contents");
+}
+
+/// An `--as-new --inplace` file whose worker connection is lost, right after
+/// its preparation or after its first write, is finished through a new
+/// receiver process: the file must be new, so it is staged, and the new
+/// process resumes it.
+#[test]
+fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
+    for request in ["prepare", "write"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        fs::create_dir(t.path("remote-home")).unwrap();
+        let data = prng(4 << 20, 61);
+        write(&t.path("src/file"), &data);
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args([
+                "--no-tcp",
+                "--no-progress",
+                "--inplace",
+                "--performance-tuning",
+                "workers=1,copy-path=ranges,request-size=1M",
+            ])
+            .arg(t.path("src/file"))
+            .args(["--to", "fake", "--as-new"])
+            .arg(t.path("dst"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DROP_AFTER_REQUEST", request)
+            .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
+            .run()
+            .unwrap();
+        assert!(
+            t.path("dropped").exists(),
+            "{request}: no connection was lost"
+        );
+        assert_output_ok(&output);
+        assert!(read(&t.path("dst")) == data, "{request}");
+        // The control session, the first worker and its replacement.
+        let sessions = fs::read_to_string(t.path("rsh.log"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(sessions, 3, "{request}");
+    }
+}
+
+/// Under `--if-exists=error` or `error-if-different`, a new `--inplace` file
+/// is staged and published without replacing anything: a worker connection
+/// lost right after the file's preparation is retried through a new
+/// receiver process, and the copy completes.
+#[test]
+fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
+    for policy in ["error", "error-if-different"] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        fs::create_dir(t.path("remote-home")).unwrap();
+        let data = prng(4 << 20, 62);
+        write(&t.path("src/file"), &data);
+        fs::create_dir(t.path("dst")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args([
+                "--no-tcp",
+                "--no-progress",
+                "--inplace",
+                &format!("--if-exists={policy}"),
+                "--performance-tuning",
+                "workers=1,copy-path=ranges,request-size=1M",
+                "--srcs-in",
+            ])
+            .arg(t.path("src"))
+            .args(["--to", "fake", "--into"])
+            .arg(t.path("dst"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("SYQ_TEST_DROP_AFTER_REQUEST", "prepare")
+            .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
+            .run()
+            .unwrap();
+        assert!(
+            t.path("dropped").exists(),
+            "{policy}: no connection was lost"
+        );
+        assert_output_ok(&output);
+        assert!(read(&t.path("dst/file")) == data, "{policy}");
+    }
+}
+
 /// A hard link is made under the conditions its name would be published
 /// under as a file: under the error policies, a name that appears after the
 /// scan is refused rather than replaced, while the default policy replaces

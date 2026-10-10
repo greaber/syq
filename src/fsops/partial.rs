@@ -484,6 +484,7 @@ impl FsOps {
             attempt,
             create_if_missing,
             scanned,
+            condition,
             group,
         } = options;
         let target = self.destination_mutation_target(path, guard)?;
@@ -504,11 +505,38 @@ impl FsOps {
         }
         if inplace {
             self.uncache_rooted(&target.root, &target.relative);
-            if self
+            let held_here = self
                 .held_basis
                 .as_ref()
-                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id)
-            {
+                .is_some_and(|held| held.location == target.location() && held.copy_id == *copy_id);
+            match condition {
+                // A file that must be new is staged, and published without
+                // replacing anything: in place there is nothing to update.
+                TargetCondition::Absent => {
+                    bail!(
+                        "{} must be new, so it is staged rather than written in place",
+                        target.label.display()
+                    )
+                }
+                // Only the file the scan found: opened, never created.
+                TargetCondition::Matches { .. } if !held_here => {
+                    let file = target.root.open_regular_read_write(&target.relative)?;
+                    require_open_target(&file, &target.label, condition)?;
+                    let opened = file.metadata()?;
+                    self.require_names_inside(&target, &file, None)?;
+                    receiver_mode::note_inplace_open(copy_id, &opened, false);
+                    self.set_copy_length(&file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    self.cache_opened_file(target.location(), attempt, false, file, opened);
+                    return Ok(Preparation::default());
+                }
+                TargetCondition::MatchesFingerprint { .. } => {
+                    bail!("in-place preparation accepts no fingerprint condition")
+                }
+                _ => {}
+            }
+            if held_here {
                 // The coordinator reuses hashes from this inode. Never resize
                 // or write a replacement name using that earlier comparison.
                 let held = self.held_basis.take().unwrap();
@@ -522,6 +550,8 @@ impl FsOps {
                         ino: metadata.ino(),
                     },
                 )?;
+                require_open_target(&file, &target.label, condition)?;
+                self.require_names_inside(&target, &file, None)?;
                 receiver_mode::note_inplace_open(copy_id, &metadata, false);
                 self.set_copy_length(&file, size)?;
                 self.cache_file(target.location(), attempt, false, file);
@@ -538,6 +568,7 @@ impl FsOps {
             if !expect_new {
                 match target.root.open_regular_read_write_known(&target.relative) {
                     Ok((file, opened)) => {
+                        self.require_names_inside(&target, &file, None)?;
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -567,6 +598,7 @@ impl FsOps {
                         let file = target.root.open_regular_read_write(&target.relative)?;
                         require_rooted_metadata(&file, metadata, &target.label)?;
                         let opened = file.metadata()?;
+                        self.require_names_inside(&target, &file, None)?;
                         receiver_mode::note_inplace_open(copy_id, &opened, false);
                         self.set_copy_length(&file, size).with_context(|| {
                             format!("resize confined file {}", target.label.display())
@@ -730,7 +762,7 @@ impl FsOps {
             .as_ref()
             .map(|target| target.location())
             .unwrap_or_else(|| FileLocation::Path(resolve(path)));
-        let (mut file, location, label) = if off > 0 {
+        let (mut file, location, label, links) = if off > 0 {
             let held = self
                 .held_basis
                 .take()
@@ -739,18 +771,17 @@ impl FsOps {
                 held.location == location && held.copy_id == *copy_id,
                 "retained comparison basis does not match requested file"
             );
-            (held.file, held.location, held.label)
+            (held.file, held.location, held.label, held.links)
         } else if let Some(target) = &rooted {
-            (
-                target.root.open_regular_read(&target.relative)?,
-                target.location(),
-                target.label.clone(),
-            )
+            let file = target.root.open_regular_read(&target.relative)?;
+            let links = self.links_when_held(&file)?;
+            (file, target.location(), target.label.clone(), links)
         } else {
             let p = resolve(path);
-            open_existing_regular(&p, false)
-                .with_context(|| format!("open {} as repair basis", p.display()))
-                .map(|file| (file, FileLocation::Path(p.clone()), p))?
+            let file = open_existing_regular(&p, false)
+                .with_context(|| format!("open {} as repair basis", p.display()))?;
+            let links = self.links_when_held(&file)?;
+            (file, FileLocation::Path(p.clone()), p, links)
         };
         require_open_target(&file, &label, condition)?;
         #[cfg(debug_assertions)]
@@ -771,6 +802,7 @@ impl FsOps {
             label,
             copy_id: *copy_id,
             file,
+            links,
         });
         #[cfg(debug_assertions)]
         if off == 0 {
@@ -821,6 +853,12 @@ impl FsOps {
     ) -> Result<Option<(u64, u64)>> {
         let (held, target) = self.take_held_basis(path, copy_id, guard)?;
         require_open_target(&held.file, &held.label, condition)?;
+        if self.scope_names.is_some() {
+            let current = held.file.metadata()?;
+            if scope_names::changes_metadata(&current, meta, flags) {
+                self.require_names_inside(&target, &held.file, Some(held.links))?;
+            }
+        }
         set_meta_file(&held.file, meta, flags)
             .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
         if guard.is_some() {
@@ -2157,6 +2195,9 @@ impl FsOps {
                 flags = (flags & !flags::RECEIVER_MODE) | flags::MODE;
             }
             let meta = &*meta;
+            if self.scope_names.is_some() {
+                self.require_names_inside(&rooted, &file, None)?;
+            }
             observed_overwrite(&self.operation, &file, data, old_len, self.sparse)
                 .with_context(|| format!("write {}", rooted.label.display()))?;
             let len = data.len() as u64;
@@ -2762,13 +2803,17 @@ impl FsOps {
             // the identity use it instead of a read after the data, which an
             // NFS client answers with a request. A reopened file is read as
             // before.
-            let (file, opened) = match self.uncache_rooted_opened(&target.root, &target.relative) {
-                Some(opened) => opened,
-                None => (
-                    target.root.open_regular_write(&target.relative, false)?,
-                    None,
-                ),
-            };
+            // A descriptor an earlier step opened, whether or not it kept the
+            // metadata read then, has been held open since.
+            let (file, opened, held) =
+                match self.uncache_rooted_opened(&target.root, &target.relative) {
+                    Some((file, opened)) => (file, opened, true),
+                    None => (
+                        target.root.open_regular_write(&target.relative, false)?,
+                        None,
+                        false,
+                    ),
+                };
             // The file is read at most once here. A fingerprint condition
             // holds the file's ctime as it is now, after the writes, so that
             // condition needs fresh metadata; every other condition, the
@@ -2782,6 +2827,11 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
+            self.require_names_inside(
+                target,
+                &file,
+                held.then(|| opened.as_ref().unwrap_or(&current).nlink()),
+            )?;
             check_destination_writes(&file, &target.label)?;
             if let Some(expected) = expected {
                 let reader = target.root.open_regular_read(&target.relative)?;
@@ -3177,8 +3227,9 @@ impl FsOps {
                     "SYQ_TEST_DESTINATION_LOOKUPS",
                     format_args!("lookup {}", paths.len()),
                 )?;
-                self.prune_lookup(paths, guard.as_ref())
-                    .map(Response::Stats)
+                let entries = self.prune_lookup(paths, guard.as_ref())?;
+                self.record_looked_up_names(paths, &entries, guard.as_ref());
+                Ok(Response::Stats(entries))
             })(),
             Request::PartialPaths {
                 paths,
@@ -3219,11 +3270,13 @@ impl FsOps {
                         .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
                 });
                 let others = if safe_to_stat_others {
-                    Some(if *strict_metadata {
+                    let entries = if *strict_metadata {
                         self.prune_lookup(others, guard)?
                     } else {
                         self.stat_many(others, false, guard)
-                    })
+                    };
+                    self.record_looked_up_names(others, &entries, guard);
+                    Some(entries)
                 } else {
                     None
                 };
@@ -3282,6 +3335,7 @@ impl FsOps {
                 scanned,
                 attempt,
                 create_if_missing,
+                condition,
                 guard,
                 group,
             } => self
@@ -3302,6 +3356,7 @@ impl FsOps {
                             guard: guard.as_ref(),
                         },
                         PrepareOptions {
+                            condition: *condition,
                             size: *size,
                             inplace: *inplace,
                             mode,

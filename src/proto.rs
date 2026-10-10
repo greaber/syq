@@ -1064,6 +1064,11 @@ pub enum WireRequest<Data> {
         scanned: ScannedDestination,
         attempt: u32,
         create_if_missing: bool,
+        /// What an in-place file's name must hold when it is opened: exactly
+        /// the scanned file, opened without creating one, or anything. A
+        /// file that must be new is staged rather than written in place,
+        /// and staged files meet their condition when they are published.
+        condition: TargetCondition,
         guard: Option<ContainerGuard>,
         /// The group publication gives the file, when it sets one. A new
         /// in-place file that would start with another group is created

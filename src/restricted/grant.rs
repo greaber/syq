@@ -59,15 +59,6 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.no_tcp_encryption {
         bail!("command-restricted transfers require encrypted data connections");
     }
-    if args.inplace
-        && (args.only_new_native_entries()
-            || args.existing
-            || (args.target_existence == Existence::New && args.placement == Placement::As))
-    {
-        bail!(
-            "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
-        );
-    }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
     if args
@@ -549,6 +540,7 @@ pub(crate) fn named_authority(
         request: request_id,
         digest,
         receipt_key: key.public_key().to_openssh()?,
+        max_delete: None,
     };
     let authority = RestrictedAuthority::new(
         &config,

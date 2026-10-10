@@ -110,6 +110,9 @@ pub(crate) struct Approved {
     pub request: crate::delegation::RequestId,
     pub digest: [u8; 32],
     pub receipt_key: String,
+    /// The approving machine's own deletion limit for this copy, when it has
+    /// one. Both machines run the same build.
+    pub max_delete: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -829,16 +832,24 @@ fn constrain(
         *filter_root = rebase(filter_root, destination)?;
     }
     // Ownership and special files act as for any copy by an ordinary
-    // account: the receiver never runs as root.
-    if request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace {
-        bail!("named destinations do not accept --inplace");
-    }
-    if request.copy.limits.max_deletions > max_delete {
-        bail!("requested deletion limit exceeds laptop --max-delete={max_delete}");
-    }
+    // account: the receiver never runs as root. In-place writes change no
+    // file with names outside the destination (`ScopeNames`).
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
+    // This machine's own --max-delete bounds pruning. The sender learns it
+    // from the approval and refuses every deletion when it plans more.
+    request.copy.limits.max_deletions = request
+        .copy
+        .limits
+        .max_deletions
+        .min(max_delete)
+        .min(request.copy.limits.max_entries);
+    if request.copy.policy.deletion == crate::delegation::DeletionPolicy::DeleteDestinationOnly
+        && request.copy.limits.max_deletions == 0
+    {
+        bail!("pruning needs a positive --max-delete on the approving machine: `syq persist receive on --max-delete N`");
+    }
     request.copy.limits.max_connections = request
         .copy
         .limits
@@ -852,14 +863,17 @@ pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
 }
 
-/// A receiving machine's own --max-delete bounds pruning it approves, and the
-/// sender cannot see that limit. The sending command states a ceiling within
-/// it, so that the sender refuses all deletions above it, as any --max-delete.
-pub(crate) fn require_deletion_ceiling(args: &crate::cli::Args) -> Result<()> {
-    if !args.dry_run && args.delete && args.max_delete.is_none() {
-        bail!("pruning through a receiving machine needs an explicit --max-delete, no higher than that machine's own");
+/// Plan deletions against the approving machine's own --max-delete, or the
+/// command's if lower, so that pruning stays all or nothing, and note when
+/// the machine's limit is the one in effect.
+fn apply_deletion_limit(args: &mut crate::cli::Args, approved: &Approved) {
+    let Some(limit) = approved.max_delete.filter(|_| args.delete) else {
+        return;
+    };
+    if args.max_delete.is_none_or(|stated| limit < stated) {
+        args.max_delete = Some(limit);
+        args.max_delete_from_approver = true;
     }
-    Ok(())
 }
 
 pub(crate) fn is_named(grant: &Option<String>) -> bool {
@@ -1028,7 +1042,6 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             recipient_public_key: public,
         },
     };
-    require_deletion_ceiling(args)?;
     let request = crate::restricted::named_request(args, policy.clone())?;
     crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
     let (_, reply) = exchange(
@@ -1044,6 +1057,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
     };
+    apply_deletion_limit(args, &approved);
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.locations.last_mut().unwrap().host = Some(format!("@{name}"));
     args.restricted_grant = Some(format!(
@@ -1372,6 +1386,7 @@ impl Receiver {
                     bail!("copy disconnected before approval could be used");
                 }
                 approved.token = random_token()?;
+                approved.max_delete = Some(self.max_delete.min(self.max_entries));
                 sessions.insert(
                     approved.token.clone(),
                     Session {

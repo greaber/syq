@@ -358,8 +358,8 @@ The receiving connection must stay open throughout the copy.
 Copies support directories, symlinks, modification times, filters, hashing,
 resume, mappings, the `--copy-metadata` options, `--sparse`, and the
 [overwrite policies](reference.md#choose-which-existing-files-to-update).
-`--inplace` is unsupported, and copies are refused while syq runs as root, so
-ownership and special files work as for any copy by an ordinary account.
+Copies are refused while syq runs as root, so ownership and special files work
+as for any copy by an ordinary account.
 Timestamp comparisons trust the source's reported modification times.
 
 Each copy is limited to 100 GiB and one million touched entries by default.
@@ -368,8 +368,9 @@ Lower limits requested by the sender also apply. Limits are per copy; repeated
 copies can fill the disk. Copies support at most 128 workers each.
 
 Pruning is disabled unless the laptop sets a positive `--max-delete`.
-A sending `--prune` command must also supply its own `--max-delete` ceiling,
-no higher than the laptop's. Validation failures leave the copy unstarted.
+A pruning copy that plans more deletions than the laptop's limit, or than its
+own `--max-delete` if lower, deletes nothing and exits 25. Validation failures
+leave the copy unstarted.
 Errors during copying fail visibly and may leave partial files for retry.
 The sender verifies a signed receipt before reporting success.
 

@@ -671,7 +671,14 @@ impl Worker {
                         meta,
                         flags: self.publication_flags(job),
                         inplace: self.opts.inplace,
-                        condition: job.target_condition,
+                        // Written in place, a file is opened as the
+                        // existing-file policy requires (--only-existing:
+                        // only the file the scan found).
+                        condition: if self.opts.inplace {
+                            self.existing_file_condition(job)
+                        } else {
+                            job.target_condition
+                        },
                         guard: job.container_guard.clone(),
                         replaces: job.dst_entry.is_some(),
                         scanned: job.scanned,
@@ -1601,6 +1608,35 @@ impl Worker {
         ))
     }
 
+    /// What an in-place file's name must hold when Prepare opens it, as the
+    /// copy's existing-file policy requires: exactly the scanned file under
+    /// --only-existing. A file that must be new is staged instead.
+    fn inplace_condition(&self, job: &WorkerJob) -> TargetCondition {
+        if !job.inplace {
+            return TargetCondition::Any;
+        }
+        self.existing_file_condition(job)
+    }
+
+    /// The condition a file's name must meet as the copy's existing-file
+    /// policy requires, for a file written in place: the planner's, or the
+    /// policy's own when the planner set none.
+    fn existing_file_condition(&self, job: &WorkerJob) -> TargetCondition {
+        match job.target_condition {
+            TargetCondition::Any => {}
+            condition => return condition,
+        }
+        match job.dst_entry.as_ref() {
+            Some(destination) if self.opts.existing && destination.kind == Kind::File => {
+                TargetCondition::Matches {
+                    dev: destination.dev,
+                    ino: destination.ino,
+                }
+            }
+            _ => TargetCondition::Any,
+        }
+    }
+
     fn prepare_file(
         &mut self,
         job: &WorkerJob,
@@ -1621,6 +1657,7 @@ impl Worker {
                 scanned: job.scanned,
                 attempt: job.attempt,
                 create_if_missing,
+                condition: self.inplace_condition(job),
                 guard: job.container_guard.clone(),
                 group: self.publication_group(job),
             })?,
@@ -2581,7 +2618,12 @@ impl Worker {
                 meta,
                 flags: self.publication_flags(&job),
                 scanned: job.scanned,
-                condition: job.target_condition,
+                // An in-place file met its condition when it was opened.
+                condition: if job.inplace {
+                    TargetCondition::Any
+                } else {
+                    job.target_condition
+                },
                 guard: job.container_guard.clone(),
             })?,
             "finalize destination",

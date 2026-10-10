@@ -89,7 +89,6 @@ their original limits.
 | `--no-tcp-encryption` | Unsupported; data connections must be encrypted |
 | `--mapping` | Listed destinations and necessary parent creation are authorized |
 | Fixed `workers` above 128 | Unsupported |
-| `--inplace` with `--as-new` | Unsupported |
 | `--detach` | Unsupported; the local broker must remain attached |
 | Native `rm` | Unsupported; use a normal SSH login |
 
@@ -199,7 +198,8 @@ SSH destination, while `--to @NAME` sends files to a receiving machine.
 Per-copy SSH authorization through a receiving machine does not support a root
 login on the destination, `--detach`, custom
 `--rsh` or `--syq-path`, `--no-bootstrap`, alternative `--peer-auth`
-or `--coordinate-at`, or `--no-tcp-encryption`. Uploads send file data directly from
+or `--coordinate-at`, or `--no-tcp-encryption`. The authorizing machine's copy
+limits apply, including its `--max-delete` for pruning. Uploads send file data directly from
 source to destination over encrypted TCP, falling back to SSH between those same
 servers. `--no-tcp` selects SSH data directly. SSH workers require an exact host
 key already trusted by the authorizing machine and writable
