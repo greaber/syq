@@ -3309,25 +3309,6 @@ impl FsOps {
         for (i, r) in meta_idx.iter().zip(mres) {
             out[*i] = r;
         }
-        // A link this copy made is a name inside the approved directories.
-        if let Some(names) = &self.scope_names {
-            for (op, outcome) in ops.iter().zip(&out) {
-                if let (
-                    Op::Hardlink {
-                        path,
-                        source,
-                        dev,
-                        ino,
-                        ..
-                    },
-                    None,
-                ) = (op, outcome)
-                {
-                    names.record(path, *dev, *ino);
-                    names.record(source, *dev, *ino);
-                }
-            }
-        }
         out
     }
 }

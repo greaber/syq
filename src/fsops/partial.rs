@@ -3227,9 +3227,8 @@ impl FsOps {
                     "SYQ_TEST_DESTINATION_LOOKUPS",
                     format_args!("lookup {}", paths.len()),
                 )?;
-                let entries = self.prune_lookup(paths, guard.as_ref())?;
-                self.record_looked_up_names(paths, &entries, guard.as_ref());
-                Ok(Response::Stats(entries))
+                self.prune_lookup(paths, guard.as_ref())
+                    .map(Response::Stats)
             })(),
             Request::PartialPaths {
                 paths,
@@ -3270,13 +3269,11 @@ impl FsOps {
                         .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
                 });
                 let others = if safe_to_stat_others {
-                    let entries = if *strict_metadata {
+                    Some(if *strict_metadata {
                         self.prune_lookup(others, guard)?
                     } else {
                         self.stat_many(others, false, guard)
-                    };
-                    self.record_looked_up_names(others, &entries, guard);
-                    Some(entries)
+                    })
                 } else {
                     None
                 };

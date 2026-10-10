@@ -7281,10 +7281,9 @@ fn kept_files_take_no_content() {
     assert_eq!(fs::read(root.join("target/kept")).unwrap(), b"kept");
 }
 
-/// A restricted receiver counts the names its own lookups returned, whether
-/// a stat or a planning batch asked. A file whose eight names were looked
-/// up together, all inside the signed scope, takes a time change through
-/// any of them.
+/// A file whose eight names are all inside the signed scope takes a time
+/// change through any of them, whatever the copy looked up first: the
+/// receiver lists the scope itself.
 #[test]
 fn names_a_lookup_returned_count_inside() {
     use std::os::unix::fs::MetadataExt;
@@ -7347,6 +7346,77 @@ fn names_a_lookup_returned_count_inside() {
         );
         assert_eq!(fs::metadata(&names[7]).unwrap().mtime(), 1_600_000_000);
     }
+}
+
+/// Links the receiver makes during the copy, after it listed the scope,
+/// count for later changes to their file: a file the copy linked inside
+/// takes a time change, until someone links it outside as well.
+#[test]
+fn links_the_receiver_makes_count_for_later_changes() {
+    use std::os::unix::fs::MetadataExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(root.join("outside")).unwrap();
+    fs::write(target.join("listed"), b"listed").unwrap();
+    fs::hard_link(target.join("listed"), target.join("listed-too")).unwrap();
+    fs::write(target.join("single"), b"single").unwrap();
+    let mut authority = time_preserving_test_authority_for(&root, 1 << 20, 64, false);
+    authority.extra_options.hardlinks = true;
+    let mut ops = crate::fsops::FsOps::new();
+    ops.set_scope_names(authority.scope_names());
+    let mut apply = |op: Op| {
+        let mut request = Request::Apply {
+            ops: vec![op],
+            guard: None,
+        };
+        let settlement = authority.authorize(&mut request, false).unwrap();
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        let proto::Response::Applied(errors) = response else {
+            panic!("{response:?}")
+        };
+        errors.into_iter().next().unwrap()
+    };
+    let touch = |name: &str, mtime: i64| Op::SetMeta {
+        path: path_bytes(&target.join(name)),
+        meta: proto::Meta {
+            mtime,
+            ..plain_meta()
+        },
+        flags: proto::flags::TIMES,
+        condition: proto::TargetCondition::Any,
+    };
+    // The first change to a file with two names lists the scope.
+    assert_eq!(apply(touch("listed", 1_600_000_000)), None);
+    let single = fs::metadata(target.join("single")).unwrap();
+    assert_eq!(
+        apply(Op::Hardlink {
+            path: path_bytes(&target.join("linked")),
+            source: path_bytes(&target.join("single")),
+            dev: single.dev(),
+            ino: single.ino(),
+            condition: proto::TargetCondition::Absent,
+        }),
+        None
+    );
+    assert_eq!(apply(touch("single", 1_600_000_001)), None);
+    assert_eq!(apply(touch("linked", 1_600_000_002)), None);
+    assert_eq!(
+        fs::metadata(target.join("single")).unwrap().mtime(),
+        1_600_000_002
+    );
+    fs::hard_link(target.join("single"), root.join("outside/o")).unwrap();
+    let refused = apply(touch("single", 1_600_000_003)).expect("refused");
+    assert!(
+        refused.as_str().contains("can't confirm are inside"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::metadata(root.join("outside/o")).unwrap().mtime(),
+        1_600_000_002
+    );
 }
 
 /// Under a grant that publishes in place, a file that must be new (here an

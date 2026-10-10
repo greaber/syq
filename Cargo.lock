@@ -3213,7 +3213,6 @@ dependencies = [
  "hpke",
  "http 1.5.0",
  "http-body",
- "icu_normalizer",
  "ignore",
  "jsonschema",
  "jwalk",

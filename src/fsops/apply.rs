@@ -452,9 +452,14 @@ fn apply_one_rooted(
             if let Some(owned) = owned {
                 owned.require_link((*dev, *ino), &target.label)?;
             }
-            // A new name must not appear while a check counts this file's.
-            let _linking = names.map(scope_names::ScopeNames::linking);
-            root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino), *condition)
+            let source = RelativePath::new(source)?;
+            let link = || root.publish_hardlink(&source, path, (*dev, *ino), *condition);
+            match names {
+                // The new name is counted as it is made, never while a check
+                // counts the file's.
+                Some(names) => names.link(root, &source, path, (*dev, *ino), link),
+                None => link().map(drop),
+            }
         }
         Op::SetMeta {
             meta,

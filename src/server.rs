@@ -1332,7 +1332,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                             &requested_root,
                             batch.iter().map(|entry| entry.path.as_slice()),
                         )?;
-                        ops.record_scope_names(&requested_root, &batch);
                     }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {

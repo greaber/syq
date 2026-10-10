@@ -1945,10 +1945,13 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
     let target = relative(b"target");
     let original = root.metadata(&source).unwrap();
     let identity = (original.dev, original.ino);
-    root.publish_hardlink(&source, &target, identity, Any)
-        .unwrap();
-    root.publish_hardlink(&source, &target, identity, Any)
-        .unwrap();
+    assert!(root
+        .publish_hardlink(&source, &target, identity, Any)
+        .unwrap());
+    // A name already linked to the file makes no new name.
+    assert!(!root
+        .publish_hardlink(&source, &target, identity, Any)
+        .unwrap());
     assert_eq!(root.metadata(&target).unwrap().ino, original.ino);
     assert_eq!(fs::read(tree.path().join("outside")).unwrap(), b"untouched");
     fs::remove_file(tree.path().join("source")).unwrap();
