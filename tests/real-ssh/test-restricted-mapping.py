@@ -182,9 +182,46 @@ def direct():
         for extra in [[], ["--only-existing"], ["--copy-metadata=permissions"]]:
             readonly = root + "/readonly-" + str(len(extra)) + ("-p" if "--copy-metadata=permissions" in extra else "")
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r}); (p/'parent').mkdir(parents=True); (p/'parent'/'item').write_bytes(b'old'); (p/'parent').chmod(0o2550)")
-            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update", "--temporarily-widen-dir-permissions"] + extra,
+            run(prefix + ["--mapping", "-", "--to", "destination", "--into", readonly, "--no-tcp", "--if-exists=update", "--widen-dirs=rsync"] + extra,
                 data=manifest([("file", "parent/item", "file")]))
             ssh("destination", f"from pathlib import Path; p=Path({readonly!r})/'parent'; assert (p/'item').read_bytes()==b'mapped contents'; assert p.stat().st_mode & 0o7777 == 0o2550; p.chmod(0o755)")
+        # A grant covers what the copy creates beneath its root, so a
+        # restricted receiver refuses to widen the directories around it.
+        refused = run(prefix + ["--mapping", "-", "--to", "destination", "--into", root + "/readonly-0", "--no-tcp", "--widen-dirs=all"],
+                      data=manifest([("file", "parent/item", "file")]), expected=1)
+        assert b"--widen-dirs=all is not available with a restricted receiver" in refused.stderr, refused.stderr
+        # A signed preview never changes permissions, with or without the
+        # option, so read-only grants need no authority for it. A directory it
+        # cannot search is reported rather than treated as empty.
+        for mode in [0o500, 0o600]:
+            for widen in [False, True]:
+                for placement in ["--into", "--as"]:
+                    preview_root = root + f"/readonly-preview-{mode:o}-{int(widen)}-{placement[2:]}"
+                    ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.mkdir(); (p/'item').write_bytes(b'keep preview')")
+                    if placement == "--into":
+                        sources = ["--mapping", "-"]
+                        destination = preview_root
+                        data = manifest([("file", "item", "file")])
+                    else:
+                        sources = ["file"]
+                        destination = preview_root + "/item"
+                        data = None
+                    # Enrollment is fixture setup, not something a signed
+                    # read-only preview may create. Exact-file placement uses
+                    # a different enrolled parent from container placement.
+                    run(["syq", "receiver", "enroll", "destination:" + destination])
+                    before = ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); p.chmod({mode}); print(p.stat().st_ctime_ns)").stdout.strip()
+                    command = prefix + sources + ["--to", "destination", placement, destination,
+                                                   "--no-tcp", "--if-exists=update", "--dry-run"]
+                    if widen:
+                        command.append("--widen-dirs=rsync")
+                    expected = 0 if mode == 0o500 else 23 if placement == "--into" else 1
+                    preview = run(command, data=data, expected=expected)
+                    if mode == 0o600:
+                        reported = b"not inspected" if placement == "--into" else b"Permission denied"
+                        assert reported in preview.stderr, preview.stderr
+                    after = ssh("destination", f"from pathlib import Path; p=Path({preview_root!r}); s=p.stat(); assert s.st_mode & 0o777 == {mode}; print(s.st_ctime_ns); p.chmod(0o700); assert (p/'item').read_bytes()==b'keep preview'; assert list(p.iterdir())==[p/'item']").stdout.strip()
+                    assert before == after, (mode, widen, placement, before, after)
         # An untouched writable parent needs no chmod (ctime must stay intact).
         stable = root + "/writable-parent"
         before = ssh("destination", f"from pathlib import Path; p=Path({stable!r})/'parent'; p.mkdir(parents=True); (p/'item').write_bytes(b'mapped contents'); __import__('os').utime(p/'item',(1600000000,1600000000)); print(p.stat().st_ctime_ns)").stdout.strip()

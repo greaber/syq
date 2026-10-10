@@ -485,13 +485,17 @@ pub(super) struct Destination {
     pub prefix: String,
 }
 impl Destination {
-    pub fn open(args: &Args) -> Result<Self> {
-        let path = crate::fsops::resolve(&args.locations.last().unwrap().path);
-        let policy = if args.follows_native_destination_paths() {
+    pub fn symlink_policy(args: &Args) -> OperatorSymlinkPolicy {
+        if args.follows_native_destination_paths() {
             OperatorSymlinkPolicy::FollowAll
         } else {
             OperatorSymlinkPolicy::Refuse
-        };
+        }
+    }
+
+    pub fn open(args: &Args) -> Result<Self> {
+        let path = crate::fsops::resolve(&args.locations.last().unwrap().path);
+        let policy = Self::symlink_policy(args);
         let final_component = if args.placement == Placement::Into {
             OperatorFinalComponent::Directory
         } else {
@@ -579,18 +583,39 @@ impl CreationPermissions {
         Ok(permitted)
     }
 
-    /// For a new file at `path` beneath `root`.
-    pub(super) fn for_file(&mut self, root: &Root, path: &RelativePath) -> Result<u32> {
-        let parent = path
-            .to_path_buf()
+    fn file_parent(path: &RelativePath) -> PathBuf {
+        path.to_path_buf()
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// For a new file at `path` beneath `root`.
+    pub(super) fn for_file(&mut self, root: &Root, path: &RelativePath) -> Result<u32> {
+        let parent = Self::file_parent(path);
         if let Some(permitted) = self.0.get(&parent) {
             return Ok(*permitted);
         }
         let permitted = root.creation_permissions(path)?;
         self.remember(parent, permitted);
+        Ok(permitted)
+    }
+
+    /// For a new file at `path` beneath `root`, through a cache that
+    /// concurrent downloads share. Reading a parent's default ACL opens the
+    /// parent, a round trip or two on a network filesystem, so that happens
+    /// outside the lock; the lock only covers the lookup and the store.
+    pub(super) fn shared_for_file(
+        cache: &std::sync::Mutex<Self>,
+        root: &Root,
+        path: &RelativePath,
+    ) -> Result<u32> {
+        let parent = Self::file_parent(path);
+        if let Some(permitted) = cache.lock().unwrap().0.get(&parent) {
+            return Ok(*permitted);
+        }
+        let permitted = root.creation_permissions(path)?;
+        cache.lock().unwrap().remember(parent, permitted);
         Ok(permitted)
     }
 }
@@ -764,5 +789,28 @@ mod tests {
         );
         let error = symlink_source(|meta| meta.ctime -= 1).unwrap_err();
         assert!(error.to_string().contains("symlink changed during S3 copy"));
+    }
+
+    #[test]
+    fn shared_creation_permissions_are_read_once_per_parent() {
+        let dir = crate::test_support::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("parent")).unwrap();
+        let root = Root::open(dir.path()).unwrap();
+        let cache = std::sync::Mutex::new(CreationPermissions::default());
+        let path = |name: &[u8]| RelativePath::new(name).unwrap();
+        let expected = root.creation_permissions(&path(b"parent/first")).unwrap();
+        assert_eq!(
+            CreationPermissions::shared_for_file(&cache, &root, &path(b"parent/first")).unwrap(),
+            expected
+        );
+        // A sibling uses the stored answer: with the parent gone, reading it
+        // again would fail.
+        std::fs::remove_dir(dir.path().join("parent")).unwrap();
+        assert_eq!(
+            CreationPermissions::shared_for_file(&cache, &root, &path(b"parent/second")).unwrap(),
+            expected
+        );
+        assert!(CreationPermissions::shared_for_file(&cache, &root, &path(b"other/file")).is_err());
+        assert!(!cache.is_poisoned());
     }
 }

@@ -198,7 +198,7 @@ pub trait Conn: Send {
         report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        warn: &mut dyn FnMut(String),
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64>;
     /// Stream descendants of disjoint selections relative to one registered base.
     /// Return false without invoking callbacks when this endpoint needs the
@@ -208,7 +208,7 @@ pub trait Conn: Send {
         _source: &RegisteredPath,
         _selections: &[PathBytes],
         _sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-        _warn: &mut dyn FnMut(String),
+        _warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<bool> {
         Ok(false)
     }
@@ -1278,7 +1278,7 @@ impl Conn for RemoteConn {
         report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        warn: &mut dyn FnMut(String),
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         self.send(Request::Scan {
             root: root.to_vec(),
@@ -1300,7 +1300,7 @@ impl Conn for RemoteConn {
                 }
                 Response::ScanIgnored(v) => ignored(v)?,
                 Response::ScanIgnoredCount(count) => ignored_count = count,
-                Response::ScanWarn(w) => warn(w),
+                Response::ScanWarnAt(w) => warn(w),
                 Response::ScanDone if saw_root => return Ok(ignored_count),
                 Response::ScanDone => bail!("{}: remote scan returned no root entry", self.label),
                 Response::Err(e) => bail!("{}: scan: {e}", self.label),

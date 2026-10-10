@@ -363,7 +363,7 @@ impl Conn for PipelineConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -427,11 +427,13 @@ fn pipeline_worker(
         links: false,
         perms: false,
         rsync_creation: false,
-        widen_directory_permissions: false,
+        widen_dirs: crate::cli::WidenDirs::None,
         hardlinks: false,
         sparse: false,
         inode_preservation: Default::default(),
         hardlink_completions: Mutex::new(Default::default()),
+        access_limited: Default::default(),
+        access_noted: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,
@@ -1865,7 +1867,7 @@ impl Conn for SetupConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -1903,6 +1905,7 @@ fn existing_destination_setup_pipelines_and_drains_failures() {
             OperatorSymlinkPolicy::FollowAll,
             &entry,
             path.to_vec(),
+            false,
         );
         // Unavailable filesystem counters are advisory, as before.
         assert_eq!(result.is_ok(), fail_at.is_none() || fail_at == Some(1));
@@ -1947,6 +1950,7 @@ fn existing_destination_setup_rejects_replaced_inode_without_writes() {
         OperatorSymlinkPolicy::FollowAll,
         &entry,
         path.to_vec(),
+        false,
     );
     assert!(result.is_err());
     assert_eq!(conn.received, 3);
@@ -2207,7 +2211,7 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
             _: bool,
             _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
             _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-            _: &mut dyn FnMut(String),
+            _: &mut dyn FnMut(crate::proto::ScanWarning),
         ) -> Result<u64> {
             unreachable!()
         }
@@ -4127,7 +4131,7 @@ impl<F: FnMut(Request) -> Response + Send> Conn for AnsweringConn<F> {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -4260,7 +4264,7 @@ impl Conn for QueuingSource {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -4860,7 +4864,7 @@ impl Conn for FailingConn {
         _: bool,
         _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-        _: &mut dyn FnMut(String),
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
         unreachable!()
     }
@@ -5715,8 +5719,154 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
     };
     assert_eq!(wire_os_kind(&error), Some("permission_denied"));
     let error = endpoint_error(error).context("prepare file");
-    assert!(copy_error_message(&error, true).contains(DIRECTORY_ACCESS_HINT));
-    assert!(!copy_error_message(&error, false).contains(DIRECTORY_ACCESS_HINT));
+    assert!(copy_error_message(&error, Some(DIRECTORY_ACCESS_HINT)).contains(DIRECTORY_ACCESS_HINT));
+    assert!(!copy_error_message(&error, None).contains(DIRECTORY_ACCESS_HINT));
     let plain = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES));
-    assert!(!copy_error_message(&plain, true).contains(DIRECTORY_ACCESS_HINT));
+    assert!(
+        !copy_error_message(&plain, Some(DIRECTORY_ACCESS_HINT)).contains(DIRECTORY_ACCESS_HINT)
+    );
+}
+
+#[test]
+fn strict_destination_inspection_uses_path_bytes_instead_of_a_small_count_limit() {
+    for long in [false, true] {
+        let prefix = if long {
+            format!("{}/", "a".repeat(250)).repeat(12)
+        } else {
+            String::new()
+        };
+        let paths: Vec<PathBytes> = (0..4096)
+            .map(|i| format!("{prefix}{i:04}").into_bytes())
+            .collect();
+        let observed = Arc::new(Mutex::new(Vec::<Vec<PathBytes>>::new()));
+        let requests = Arc::clone(&observed);
+        let mut conn = AnsweringConn {
+            answer: move |request| {
+                let Request::PruneLookup { paths, guard } = request else {
+                    panic!("wrong inspection request")
+                };
+                let guard = guard.expect("missing container guard");
+                assert_eq!(
+                    (guard.root.as_slice(), guard.dev, guard.ino),
+                    (b"root".as_slice(), 1, 2)
+                );
+                let bytes = paths
+                    .iter()
+                    .map(|path| source_request_bytes(path, None))
+                    .sum::<usize>();
+                assert!(bytes <= SOURCE_BATCH_PATH_BYTES);
+                let response = Response::Stats(vec![None; paths.len()]);
+                requests.lock().unwrap().push(paths);
+                response
+            },
+            replies: Default::default(),
+        };
+        let entries = inspect_destination_paths(
+            &mut conn,
+            paths.clone(),
+            Some(ContainerGuard {
+                root: b"root".to_vec(),
+                dev: 1,
+                ino: 2,
+            }),
+            "preview",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), paths.len());
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), if long { 4 } else { 1 });
+        assert_eq!(
+            observed.iter().flatten().collect::<Vec<_>>(),
+            paths.iter().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn strict_destination_inspection_keeps_denials_and_checks_reply_count() {
+    let denied = crate::fsops::wire_error(&std::io::Error::from_raw_os_error(libc::EACCES).into());
+    let mut conn = AnsweringConn {
+        answer: move |_| Response::EndpointError(denied.clone()),
+        replies: Default::default(),
+    };
+    let error = inspect_destination_paths(&mut conn, vec![b"denied".to_vec()], None, "preview")
+        .unwrap_err();
+    assert_eq!(os_kind_of(&error), Some("permission_denied"));
+    let mut conn = AnsweringConn {
+        answer: |_| Response::Stats(Vec::new()),
+        replies: Default::default(),
+    };
+    assert!(inspect_destination_paths(&mut conn, vec![b"file".to_vec()], None, "preview").is_err());
+    assert!(
+        inspect_destination_paths(&mut conn, Vec::new(), None, "preview")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn preview_lookups_skip_a_denied_directory_and_keep_going() {
+    let paths: Vec<PathBytes> = (0..1000)
+        .map(|i| {
+            if i % 10 == 3 {
+                format!("root/secret/{i:04}").into_bytes()
+            } else {
+                format!("root/open/{i:04}").into_bytes()
+            }
+        })
+        .collect();
+    let requests = Arc::new(Mutex::new(0usize));
+    let counted = Arc::clone(&requests);
+    let denied = crate::fsops::wire_error(&std::io::Error::from_raw_os_error(libc::EACCES).into());
+    let mut conn = AnsweringConn {
+        answer: move |request| {
+            let Request::PruneLookup { paths, .. } = request else {
+                panic!("wrong inspection request")
+            };
+            *counted.lock().unwrap() += 1;
+            if paths.iter().any(|path| path.starts_with(b"root/secret/")) {
+                Response::EndpointError(denied.clone())
+            } else {
+                Response::Stats(vec![None; paths.len()])
+            }
+        },
+        replies: Default::default(),
+    };
+    let mut blocked = std::collections::HashSet::new();
+    let mut reported = Vec::new();
+    let entries = planner::inspect_tolerating_denials(
+        &mut conn,
+        &paths,
+        None,
+        b"root",
+        &mut blocked,
+        &mut |directory, error| {
+            assert_eq!(os_kind_of(error), Some("permission_denied"));
+            reported.push(directory.to_vec());
+        },
+    )
+    .unwrap();
+    assert_eq!(entries.len(), paths.len());
+    assert_eq!(reported, [b"root/secret".to_vec()]);
+    assert!(blocked.contains(b"root/secret".as_slice()));
+    // One denied directory costs a search through halves, not a lookup per path.
+    assert!(
+        *requests.lock().unwrap() <= 2 * 11,
+        "{}",
+        requests.lock().unwrap()
+    );
+    // Other errors still end the preview.
+    let mut failing = AnsweringConn {
+        answer: |_| Response::Err("broken".into()),
+        replies: Default::default(),
+    };
+    assert!(planner::inspect_tolerating_denials(
+        &mut failing,
+        &paths,
+        None,
+        b"root",
+        &mut std::collections::HashSet::new(),
+        &mut |_, _| panic!("not a denial"),
+    )
+    .is_err());
 }

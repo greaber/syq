@@ -3120,8 +3120,38 @@ impl FsOps {
                 .check_operator_directory(path, *allow_missing, *symlink_policy)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
+            Request::CheckSearchableOperatorDirectory {
+                path,
+                allow_missing,
+                symlink_policy,
+            } => self
+                .check_searchable_operator_directory(path, *allow_missing, *symlink_policy)
+                .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
+                .map(Response::DirectorySelection),
             Request::CheckOperatorDirectoryAncestry { checks } => self
-                .check_operator_directory_ancestry(checks)
+                .check_operator_directory_ancestry(checks, None)
+                .map(Response::DirectoryRelations),
+            Request::ReceiverUser => Ok(Response::ReceiverUser(unsafe { libc::geteuid() })),
+            Request::PrepareDestinationPath {
+                path,
+                symlink_policy,
+                create_missing,
+            } => prepare_destination_path(
+                path,
+                *symlink_policy,
+                *create_missing,
+                &mut self.destination_path_access,
+            )
+            .map(|()| Response::Ok),
+            Request::RestoreDestinationPath => self
+                .destination_path_access
+                .restore()
+                .map(|()| Response::Ok),
+            Request::CheckOperatorDirectoryAncestryWithAccess {
+                checks,
+                selection_in_copy,
+            } => self
+                .check_operator_directory_ancestry(checks, Some(*selection_in_copy))
                 .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
                 base,
@@ -3227,6 +3257,7 @@ impl FsOps {
                 directories,
                 remember,
                 guard,
+                access,
             } => {
                 let minimum = self.destination_parallel_minimum(
                     guard.as_ref(),
@@ -3243,6 +3274,7 @@ impl FsOps {
                                 &target.root,
                                 &target.relative,
                                 *condition,
+                                *access,
                                 &target.label,
                             )?;
                             if let Some(widened) = widened.as_ref().filter(|_| *remember) {
@@ -3672,6 +3704,26 @@ impl FsOps {
                 | Request::StageBasis { path, guard, .. },
                 Response::EndpointError(error),
             ) => self.annotate_permission_failure(path, guard.as_ref(), 0o300, error),
+            (Request::PruneLookup { paths, guard: None }, Response::EndpointError(error)) => self
+                .annotate_operator_failure(
+                    Some(paths.first().map_or(&[][..], Vec::as_slice)),
+                    error,
+                ),
+            (
+                Request::CheckOperatorDirectory { path, .. }
+                | Request::CheckSearchableOperatorDirectory { path, .. },
+                Response::EndpointError(error),
+            ) => self.annotate_operator_failure(Some(path), error),
+            (Request::CreateOperatorDirectory { .. }, Response::EndpointError(error)) => {
+                self.annotate_operator_failure(None, error)
+            }
+            (Request::CopyLocal { dst, inplace, .. }, Response::EndpointError(error)) => self
+                .annotate_permission_failure(
+                    dst,
+                    None,
+                    if *inplace { 0o100 } else { 0o300 },
+                    error,
+                ),
             (Request::PutSmallBatch(puts), Response::Applied(errors)) => {
                 for (put, error) in puts.iter().zip(errors) {
                     if let Some(error) = error {

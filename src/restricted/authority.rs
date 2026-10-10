@@ -2153,6 +2153,8 @@ impl RestrictedAuthority {
                 directories,
                 remember,
                 guard,
+                // The receiver adds only owner permission, whatever it is.
+                access: _,
             } => {
                 // The receiver restores what it widened when asked to choose
                 // a mode, as it always is for a mapping parent, whose
@@ -2563,6 +2565,10 @@ impl RestrictedAuthority {
             }
             Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
+            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
+            | Request::CheckSearchableOperatorDirectory { .. }
+            | Request::PrepareDestinationPath { .. }
+            | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {
@@ -2586,7 +2592,10 @@ impl RestrictedAuthority {
                     bail!("the receipt is issued only on the signed control connection");
                 }
             }
-            Request::TransportStats | Request::Shutdown | Request::WriteStreamFence => {}
+            Request::TransportStats
+            | Request::ReceiverUser
+            | Request::Shutdown
+            | Request::WriteStreamFence => {}
         }
         Ok(())
     }

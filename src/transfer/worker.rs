@@ -187,8 +187,11 @@ impl Worker {
                             }
                             return Err(e);
                         }
-                        let message =
-                            copy_error_message(&e, self.opts.may_suggest_directory_access());
+                        let hint = self.opts.failure_hint().filter(|_| {
+                            fast.iter()
+                                .all(|&i| self.opts.failure_hint_at(&self.job(i).dst).is_some())
+                        });
+                        let message = copy_error_message(&e, hint);
                         for &i in &fast {
                             self.file_error(i, anyhow::anyhow!(message.clone()))?;
                         }
@@ -852,7 +855,7 @@ impl Worker {
             };
             if let Err(e) = res {
                 let os_kind = os_kind_of(&e);
-                let message = copy_error_message(&e, self.opts.may_suggest_directory_access());
+                let message = copy_error_message(&e, self.opts.failure_hint_at(&j.dst));
                 self.progress.error_classified(
                     &format!("syq: {}: {message}", j.rel),
                     Some("io"),
@@ -953,7 +956,7 @@ impl Worker {
         if self.sched.fail_file(idx) {
             let job = self.job(idx);
             let os_kind = os_kind_of(&e);
-            let message = copy_error_message(&e, self.opts.may_suggest_directory_access());
+            let message = copy_error_message(&e, self.opts.failure_hint_at(&job.dst));
             self.progress.error_classified(
                 &format!("syq: {}: {message}", job.rel),
                 Some("io"),
@@ -2904,6 +2907,14 @@ impl Worker {
             self.opts.dry_run_metadata_files.fetch_add(1, Relaxed);
             (None, "metadata_differs")
         } else {
+            // A real copy would rewrite the file: in its directory, unless
+            // it writes an existing file in place.
+            self.opts.note_directory_change(
+                &self.progress,
+                &job.dst,
+                !(self.opts.inplace
+                    && job.dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File)),
+            );
             self.progress.add_files(1);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
             (Some(job.entry.size), "content_differs")

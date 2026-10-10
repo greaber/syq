@@ -558,25 +558,31 @@ fn statvfs_counter<T: Into<u64>>(value: T) -> u64 {
     value.into()
 }
 
-/// Widen only an owned existing directory and report an actual change. The
-/// opened metadata handle pins the inode; a supplied identity prevents a stale
-/// plan from chmodding a replacement. No group/other bits are added.
+/// Add to an owned existing directory the owner permission bits `access`
+/// it lacks, and report an actual change. The opened metadata handle pins
+/// the inode; a supplied identity prevents a stale plan from chmodding a
+/// replacement. No group/other bits are added.
 pub(crate) fn widen_directory(
     root: &Root,
     path: &RelativePath,
     condition: TargetCondition,
+    access: u32,
     label: &Path,
 ) -> Result<Option<crate::proto::DirectoryMode>> {
+    anyhow::ensure!(
+        access != 0 && access & !0o700 == 0,
+        "directory access {access:o} is not owner permission"
+    );
     let metadata = root.metadata(path)?;
     apply::require_rooted_condition(metadata, condition, label)?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", label.display());
     let uid = unsafe { libc::geteuid() };
-    if uid == 0 || uid != metadata.uid || metadata.mode & 0o700 == 0o700 {
+    if uid == 0 || uid != metadata.uid || metadata.mode & access == access {
         return Ok(None);
     }
     let directory = root.open_metadata(path)?;
     apply::require_rooted_metadata(&directory, metadata, label)?;
-    set_mode_handle(&directory, metadata.mode | 0o700)?;
+    set_mode_handle(&directory, metadata.mode | access)?;
     Ok(Some(crate::proto::DirectoryMode {
         mode: metadata.mode & 0o7777,
         dev: metadata.dev,
@@ -598,6 +604,41 @@ pub(crate) fn restore_directory_mode(
         label.display()
     );
     set_mode_handle(&directory, saved.mode)
+}
+
+/// For an operator-supplied destination path whose lookup was denied: whether
+/// a directory on the way to it, or the path itself, is one the receiving
+/// user owns but lacks owner search permission on. Only a failure pays for
+/// these stats.
+pub(crate) fn operator_path_permission_hint(path: &[u8]) -> Option<String> {
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        return None;
+    }
+    let path = resolve(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut ancestors: Vec<&Path> = path.ancestors().collect();
+    ancestors.reverse();
+    for directory in ancestors {
+        let metadata = fs::metadata(directory).ok()?;
+        if metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o100 == 0 {
+            return Some(OWNED_DIRECTORY_PERMISSION_HINT.into());
+        }
+    }
+    None
+}
+
+const OWNED_DIRECTORY_PERMISSION_HINT: &str =
+    "an owned destination directory lacks the required owner permissions";
+
+fn mark_owned_directory_permissions(error: &mut WireError, hint: &str) {
+    error.io_kind = Some(WireIoKind::OwnedDirectoryPermissions);
+    error.message.push_str("; ");
+    error.message.push_str(hint);
 }
 
 /// Diagnose only a failed operation; the successful path does no extra stats.
@@ -632,9 +673,7 @@ pub(crate) fn directory_permission_hint(
             0o100
         };
         if metadata.is_dir() && metadata.uid == uid && metadata.mode & required != required {
-            return Some(
-                "an owned destination directory lacks the required owner permissions".into(),
-            );
+            return Some(OWNED_DIRECTORY_PERMISSION_HINT.into());
         }
     }
     None
@@ -693,6 +732,9 @@ pub struct FsOps {
     /// have, by root and directory, read once per connection.
     creation_permissions: Mutex<receiver_mode::CreationPermissions>,
     operator_selection: Option<OperatorDirectorySelection>,
+    /// Destination ancestors `--widen-dirs=all` widened, restored when the
+    /// copy asks or this connection ends.
+    destination_path_access: TemporaryDirectorySearchAccess,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
     allow_unconfined_source_paths: bool,
@@ -913,6 +955,7 @@ impl FsOps {
             prepared_small_copy: None,
             patch_stream: None,
             operator_selection: None,
+            destination_path_access: Default::default(),
             descriptor_session,
             source_roots: HashMap::new(),
             allow_unconfined_source_paths: false,
@@ -935,9 +978,25 @@ impl FsOps {
         Ok(anchor)
     }
 
+    fn check_searchable_operator_directory(
+        &mut self,
+        path: &[u8],
+        allow_missing: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    ) -> Result<Option<DirectoryAnchor>> {
+        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
+        // Looking up "." through the retained handle asks the kernel about
+        // search permission, including ACLs and the receiving user's identity.
+        open_operator_directory_at(&selection.directory, b".")
+            .context("search selected destination directory")?;
+        self.operator_selection = Some(selection);
+        Ok(anchor)
+    }
+
     fn check_operator_directory_ancestry(
         &self,
         checks: &[DirectoryAncestryCheck],
+        access: Option<bool>,
     ) -> Result<Vec<Vec<DirectoryRelation>>> {
         if checks.len() > DEFAULT_MAX_ROOTS {
             bail!(
@@ -960,7 +1019,17 @@ impl FsOps {
             };
             &registered_selection
         };
-        checks
+        // With `access`, owned directories the walk must enter may gain owner
+        // search permission until this reply; the value says whether the
+        // selected directory itself belongs to the copy.
+        let mut temporary = match access {
+            Some(selection_in_copy) => TemporaryDirectorySearchAccess::new(
+                true,
+                selection.protected_identity(selection_in_copy)?,
+            ),
+            None => TemporaryDirectorySearchAccess::default(),
+        };
+        let relations = checks
             .iter()
             .map(|check| {
                 if !check.source_root.is_directory() {
@@ -972,7 +1041,11 @@ impl FsOps {
                     .suffixes
                     .iter()
                     .map(|suffix| {
-                        let relation = selection.relation_to_source(&source, suffix)?;
+                        let relation = selection.relation_to_source_with_access(
+                            &source,
+                            suffix,
+                            &mut temporary,
+                        )?;
                         Ok(if check.source_is_directory {
                             relation
                         } else {
@@ -985,7 +1058,12 @@ impl FsOps {
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        match (relations, temporary.restore()) {
+            (Err(error), Err(restore)) => Err(error.context(format!("{restore:#}"))),
+            (Ok(_), Err(restore)) => Err(restore),
+            (relations, Ok(())) => relations,
+        }
     }
 
     fn create_operator_directory(
@@ -2436,11 +2514,16 @@ impl FsOps {
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
+            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
+            | Request::CheckSearchableOperatorDirectory { .. }
+            | Request::PrepareDestinationPath { .. }
+            | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. }
             | Request::DestinationFilesystemInfo { .. }
             | Request::TransportStats
+            | Request::ReceiverUser
             | Request::Receipt
             | Request::Shutdown
             | Request::PrepareSmallFiles(_)
@@ -2821,6 +2904,33 @@ impl FsOps {
         paths: &[PathBytes],
         guard: Option<&ContainerGuard>,
     ) -> Result<Vec<Option<Entry>>> {
+        // An anchored destination takes the ordinary lookups' fast path: NFS
+        // directories listed first, and each parent opened once for its
+        // names. Only a missing entry still reads as absent.
+        if let Some(root) = self
+            .destination_root
+            .clone()
+            .filter(|_| guard.is_none() && !paths.iter().any(|path| path.starts_with(b"/")))
+        {
+            #[cfg(target_os = "linux")]
+            list_nfs_directories_before_stats(&root, paths, &mut self.listing_requests);
+            let minimum = self.destination_parallel_minimum(
+                None,
+                paths.len(),
+                paths.iter().map(Vec::as_slice),
+            );
+            return parallel_map_init_from(
+                minimum,
+                paths,
+                || None,
+                |parent, path| {
+                    strict_stat_with_parent(&root, parent, path)
+                        .with_context(|| format!("inspect {}", resolve(path).display()))
+                },
+            )
+            .into_iter()
+            .collect();
+        }
         let minimum =
             self.destination_parallel_minimum(guard, paths.len(), paths.iter().map(Vec::as_slice));
         parallel_map_from(minimum, paths, |path| {
@@ -2984,9 +3094,29 @@ impl FsOps {
             return;
         };
         if let Some(hint) = directory_permission_hint(&target.root, &target.relative, access) {
-            error.io_kind = Some(WireIoKind::OwnedDirectoryPermissions);
-            error.message.push_str("; ");
-            error.message.push_str(&hint);
+            mark_owned_directory_permissions(error, &hint);
+        }
+    }
+
+    /// Annotate a denied lookup or creation of the operator destination,
+    /// before anything is anchored.
+    fn annotate_operator_failure(&self, path: Option<&[u8]>, error: &mut WireError) {
+        if error.io_kind != Some(WireIoKind::PermissionDenied) || self.destination_root.is_some() {
+            return;
+        }
+        let hint = match path {
+            Some(path) => operator_path_permission_hint(path),
+            // Creating the missing part of the destination needs write and
+            // search permission on the directory found nearest to it.
+            None => self.operator_selection.as_ref().and_then(|selection| {
+                let metadata = selection.directory.metadata().ok()?;
+                let uid = unsafe { libc::geteuid() };
+                (uid != 0 && metadata.uid() == uid && metadata.mode() & 0o300 != 0o300)
+                    .then(|| OWNED_DIRECTORY_PERMISSION_HINT.to_owned())
+            }),
+        };
+        if let Some(hint) = hint {
+            mark_owned_directory_permissions(error, &hint);
         }
     }
 
@@ -3081,13 +3211,30 @@ impl FsOps {
             .iter()
             .all(|op| matches!(op, Op::Unlink { .. } | Op::Rmdir { .. }))
         {
+            // Pruning can remove directories it widened; their identities
+            // are looked up only then.
+            let removed_identities: Vec<Option<(u64, u64)>> =
+                if self.receiver_directories.has_widened() {
+                    ops.iter()
+                        .map(|op| match op {
+                            Op::Rmdir { path } => self
+                                .destination_mutation_target(path, guard)
+                                .ok()
+                                .and_then(|target| target.root.metadata(&target.relative).ok())
+                                .map(|metadata| (metadata.dev, metadata.ino)),
+                            _ => None,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let selected = apply::selected_removals(
                 ops,
                 guard,
                 self.destination_root.clone(),
                 self.destination_prefix.as_deref(),
             );
-            return self
+            let results: Vec<Option<WireError>> = self
                 .deletions
                 .get_or_insert_with(Default::default)
                 .run(selected)
@@ -3097,9 +3244,13 @@ impl FsOps {
                         .map(|result| result.err().as_ref().map(wire_error))
                         .collect()
                 })
-                .unwrap_or_else(|error| {
-                    (0..ops.len()).map(|_| Some(wire_error(&error))).collect()
-                });
+                .unwrap_or_else(|error| (0..ops.len()).map(|_| Some(wire_error(&error))).collect());
+            for (identity, result) in removed_identities.iter().zip(&results) {
+                if let (Some(identity), None) = (identity, result) {
+                    self.receiver_directories.forget_widened(*identity);
+                }
+            }
+            return results;
         }
         let narrow = self.narrow_new_directories;
         // SetMeta depends on the object existing, so create everything first,
@@ -3410,6 +3561,61 @@ fn list_nfs_directories_before_stats(
         if settled {
             requests.insert(parent.to_vec(), None);
         }
+    }
+}
+
+/// `stat_with_parent` for lookups that must tell absence from an error: a
+/// missing entry or parent is absent, any other failure is returned. A parent
+/// that does not open falls back to resolving the whole path, so its error is
+/// the one a plain lookup gives.
+fn strict_stat_with_parent(
+    root: &Arc<Root>,
+    parent: &mut Option<HeldMetadataParent>,
+    path: &[u8],
+) -> Result<Option<Entry>> {
+    let absent = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)))
+    };
+    let lookup = |relative: &RelativePath| match root.metadata(relative) {
+        Ok(metadata) => rooted_entry(root, relative, Vec::new(), metadata).map(Some),
+        Err(error) if absent(&error) => Ok(None),
+        Err(error) => Err(error),
+    };
+    let Some(separator) = path.iter().rposition(|byte| *byte == b'/') else {
+        *parent = None;
+        return lookup(&RelativePath::new(path)?);
+    };
+    let parent_path = &path[..separator];
+    let name = &path[separator + 1..];
+    if matches!(name, b"" | b"." | b"..") {
+        *parent = None;
+        return lookup(&RelativePath::new(path)?);
+    }
+    if parent
+        .as_ref()
+        .is_none_or(|held| !Arc::ptr_eq(&held.root, root) || held.path != parent_path)
+    {
+        *parent = None;
+        match root.open_directory(&RelativePath::new(parent_path)?) {
+            Ok(directory) => {
+                *parent = Some(HeldMetadataParent {
+                    root: root.clone(),
+                    path: parent_path.to_vec(),
+                    directory,
+                })
+            }
+            Err(_) => return lookup(&RelativePath::new(path)?),
+        }
+    }
+    let directory = &parent.as_ref().expect("held parent").directory;
+    match root.metadata_in_directory(directory, name) {
+        Ok(metadata) => {
+            rooted_entry_in_directory(root, directory, name, Vec::new(), metadata, true).map(Some)
+        }
+        Err(error) if absent(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

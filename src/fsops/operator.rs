@@ -1,5 +1,139 @@
 use super::*;
 
+/// Owner search permission added only while checking a selected destination,
+/// to directories the copy itself would widen. Restore through the same
+/// handles before replying, including when ancestry rejects the copy.
+#[derive(Default)]
+pub(crate) struct TemporaryDirectorySearchAccess {
+    enabled: bool,
+    /// A directory outside the copy, such as the parent of an exact
+    /// placement, whose mode must not change.
+    protected: Option<(u64, u64)>,
+    changed: Vec<(File, u32)>,
+}
+
+impl TemporaryDirectorySearchAccess {
+    pub(crate) fn new(enabled: bool, protected: Option<(u64, u64)>) -> Self {
+        Self {
+            enabled,
+            protected,
+            changed: Vec::new(),
+        }
+    }
+
+    pub(super) fn prepare(&mut self, directory: &File) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.widen(directory, 0o100).map(|_| ())
+    }
+
+    /// Add the owner permission `bits` to `directory` when the receiving
+    /// user owns it and it lacks them, and report whether its mode changed.
+    fn widen(&mut self, directory: &File, bits: u32) -> Result<bool> {
+        let metadata = directory.metadata()?;
+        if is_superuser()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & bits == bits
+            || self.protected == Some((metadata.dev(), metadata.ino()))
+        {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "temporary search access requires a directory"
+        );
+        // Clone and reserve before chmod so a descriptor-limit or allocation
+        // failure cannot leave an unrecorded permission change behind.
+        let retained = directory.try_clone()?;
+        self.changed.try_reserve(1)?;
+        set_mode_handle(&retained, metadata.mode() | bits)?;
+        self.changed.push((retained, metadata.mode() & 0o7777));
+        Ok(true)
+    }
+
+    /// Open `name` beneath `directory`, adding search permission to
+    /// `directory` once if the kernel denies the lookup.
+    fn open(&mut self, directory: &File, name: &[u8]) -> Result<File> {
+        match open_operator_directory_at(directory, name) {
+            Err(error)
+                if self.enabled && error_is_kind(&error, io::ErrorKind::PermissionDenied) =>
+            {
+                self.prepare(directory)?;
+                open_operator_directory_at(directory, name)
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn restore(&mut self) -> Result<()> {
+        let mut failure = None;
+        while let Some((directory, mode)) = self.changed.pop() {
+            if let Err(error) = set_mode_handle(&directory, mode) {
+                failure.get_or_insert_with(|| {
+                    error.context("restore directory permissions after destination inspection")
+                });
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+/// For `--widen-dirs=all`: give each owned directory on the way to `path`
+/// the owner search permission looking it up needs and, when
+/// `create_missing` and part of the path is missing, the nearest existing
+/// one owner write and search permission to create the rest. `access` keeps
+/// every change until it restores them. A path that does not resolve is
+/// left for the copy itself to report.
+pub(crate) fn prepare_destination_path(
+    path: &[u8],
+    symlink_policy: OperatorSymlinkPolicy,
+    create_missing: bool,
+    access: &mut TemporaryDirectorySearchAccess,
+) -> Result<()> {
+    let path = resolve(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut failure = None;
+    let resolved = OperatorResolver::resolve_process_with_search(
+        path.as_os_str().as_bytes(),
+        symlink_policy,
+        OperatorFinalComponent::Entry {
+            follow_symlink: false,
+        },
+        true,
+        &mut Vec::new(),
+        &mut |directory| match access.widen(directory, 0o100) {
+            Ok(changed) => Ok(changed),
+            Err(error) => {
+                failure = Some(error);
+                Ok(false)
+            }
+        },
+    );
+    if let Some(error) = failure {
+        return Err(error.context("give a destination ancestor search permission"));
+    }
+    if let (Ok(PinnedPath::Missing(missing)), true) = (resolved, create_missing) {
+        let (directory, _) = missing.into_parts();
+        access
+            .widen(&directory, 0o300)
+            .context("give a destination ancestor write permission")?;
+    }
+    Ok(())
+}
+
+impl Drop for TemporaryDirectorySearchAccess {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            crate::output::diagnostic!("syq: {error:#}");
+        }
+    }
+}
+
 /// Completion follows the same operator-path symlink policy as the command.
 /// Keep the explicit root check even when following symlinks is requested.
 pub(crate) fn check_completion_directory(
@@ -126,10 +260,34 @@ impl OperatorDirectorySelection {
     /// are opened without following symlinks. Once a missing or non-directory
     /// component is reached, the remaining virtual suffix is interpreted
     /// component by component so `.` and `..` retain kernel path semantics.
+    #[cfg(test)]
     pub(super) fn relation_to_source(
         &self,
         source: &File,
         suffix: &[u8],
+    ) -> Result<DirectoryRelation> {
+        self.relation_to_source_with_access(
+            source,
+            suffix,
+            &mut TemporaryDirectorySearchAccess::default(),
+        )
+    }
+
+    /// Whether the copy may widen the selected directory itself: not when it
+    /// is the nearest existing ancestor of a missing destination.
+    pub(super) fn protected_identity(&self, selection_in_copy: bool) -> Result<Option<(u64, u64)>> {
+        if selection_in_copy && self.missing.is_empty() {
+            return Ok(None);
+        }
+        let metadata = self.directory.metadata()?;
+        Ok(Some((metadata.dev(), metadata.ino())))
+    }
+
+    pub(super) fn relation_to_source_with_access(
+        &self,
+        source: &File,
+        suffix: &[u8],
+        access: &mut TemporaryDirectorySearchAccess,
     ) -> Result<DirectoryRelation> {
         if suffix.starts_with(b"/") {
             bail!("destination ancestry suffix must be relative");
@@ -157,6 +315,9 @@ impl OperatorDirectorySelection {
                 .map(<[u8]>::to_vec),
         );
         let mut virtual_components: Vec<Vec<u8>> = Vec::new();
+        // Search access applies only while walking down from the selection;
+        // a `..` component can leave the copy, so later lookups never widen.
+        let mut left_selection = false;
 
         while let Some(component) = components.pop_front() {
             if component == b"." {
@@ -166,6 +327,7 @@ impl OperatorDirectorySelection {
                 if virtual_components.pop().is_none() {
                     directory = open_operator_directory_at(&directory, b"..")
                         .context("open retained destination parent")?;
+                    left_selection = true;
                 }
                 continue;
             }
@@ -173,7 +335,12 @@ impl OperatorDirectorySelection {
                 virtual_components.push(component);
                 continue;
             }
-            match open_operator_directory_at(&directory, &component) {
+            let opened = if left_selection {
+                open_operator_directory_at(&directory, &component)
+            } else {
+                access.open(&directory, &component)
+            };
+            match opened {
                 Ok(child) => directory = child,
                 Err(error) if absent_or_nondirectory(&error) => {
                     // A missing entry can become a directory; an existing leaf
@@ -192,18 +359,26 @@ impl OperatorDirectorySelection {
         }
 
         let destination_metadata = directory.metadata()?;
+        let mut no_access = TemporaryDirectorySearchAccess::default();
         let relation = opened_directory_relation(
             directory,
             source_metadata.dev(),
             source_metadata.ino(),
             !virtual_components.is_empty(),
+            if left_selection {
+                &mut no_access
+            } else {
+                access
+            },
         )?;
         if relation == DirectoryRelation::Separate && virtual_components.is_empty() {
+            // Source permissions are never changed.
             match opened_directory_relation(
                 source.try_clone()?,
                 destination_metadata.dev(),
                 destination_metadata.ino(),
                 false,
+                &mut TemporaryDirectorySearchAccess::default(),
             ) {
                 Ok(DirectoryRelation::Descendant) => return Ok(DirectoryRelation::Ancestor),
                 Ok(_) => {}
@@ -225,8 +400,10 @@ pub(super) fn opened_directory_relation(
     source_dev: u64,
     source_ino: u64,
     virtual_descendant: bool,
+    access: &mut TemporaryDirectorySearchAccess,
 ) -> Result<DirectoryRelation> {
     let mut below_candidate = virtual_descendant;
+    let mut reached_directory = true;
     loop {
         let metadata = directory
             .metadata()
@@ -238,8 +415,14 @@ pub(super) fn opened_directory_relation(
                 DirectoryRelation::Same
             });
         }
-        let parent = open_operator_directory_at(&directory, b"..")
-            .context("walk effective destination ancestry")?;
+        // The reached directory may need search access. Its ancestors lie
+        // above the copy and are never widened by this check.
+        let parent = if std::mem::take(&mut reached_directory) {
+            access.open(&directory, b"..")
+        } else {
+            open_operator_directory_at(&directory, b"..")
+        }
+        .context("walk effective destination ancestry")?;
         let parent_metadata = parent
             .metadata()
             .context("inspect effective destination parent")?;

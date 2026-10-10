@@ -663,7 +663,7 @@ def _copy_arguments(
     inplace: bool,
     max_delete: int | None,
     prune_before: bool = False,
-    temporarily_widen_dir_permissions: bool = False,
+    widen_dirs: str | None = None,
     transfer_strategy: str | None = None,
     hash_or_copy: bool = False,
     integrity_checking: str | None = None,
@@ -736,8 +736,10 @@ def _copy_arguments(
                 "--as, --as-new, and --as-existing require exactly one "
                 "ordinary source object"
             )
-    if temporarily_widen_dir_permissions:
-        argv.append("--temporarily-widen-dir-permissions")
+    if widen_dirs is not None:
+        if widen_dirs not in {"none", "rsync", "all"}:
+            raise SyqInvocationError("widen_dirs must be none, rsync, or all")
+        argv.append(f"--widen-dirs={widen_dirs}")
     if prune or prune_before:
         argv.append("--prune-before" if prune_before else "--prune")
     if dry_run:
@@ -1266,7 +1268,7 @@ class Client:
         results: BinaryIO | None = None,
         prune: bool = False,
         prune_before: bool = False,
-        temporarily_widen_dir_permissions: bool = False,
+        widen_dirs: str | None = None,
         dry_run: bool = False,
         hash: bool = False,
         hash_or_copy: bool = False,
@@ -1351,7 +1353,7 @@ class Client:
             as_existing=as_existing,
             prune=prune,
             prune_before=prune_before,
-            temporarily_widen_dir_permissions=temporarily_widen_dir_permissions,
+            widen_dirs=widen_dirs,
             dry_run=dry_run,
             hash=hash,
             hash_or_copy=hash_or_copy,

@@ -1347,16 +1347,68 @@ pub enum WireRequest<Data> {
     PatchEnd {
         commit: bool,
     },
-    /// Temporarily add owner access to existing destination directories.
-    /// Returns original modes only for directories actually changed. With
-    /// `remember`, the receiver keeps them to restore when it is later asked
-    /// to choose these directories' modes; without, the sender restores them
-    /// with the modes returned.
+    /// Temporarily add the owner permission bits `access` (within `0o700`)
+    /// that existing destination directories lack. Returns original modes
+    /// only for directories actually changed. With `remember`, the receiver
+    /// keeps the first mode it saved for each, to restore when it is later
+    /// asked to choose these directories' modes; without, the sender restores
+    /// them with the modes returned.
     WidenDirectories {
         directories: Vec<(PathBytes, TargetCondition)>,
         remember: bool,
         guard: Option<ContainerGuard>,
+        access: u32,
     },
+    /// Ancestry validation that may briefly add owner search permission to
+    /// owned directories it must enter. With `selection_in_copy` false, the
+    /// selected directory is the parent of an exact placement and keeps its
+    /// mode. The receiver restores modes before returning DirectoryRelations.
+    CheckOperatorDirectoryAncestryWithAccess {
+        checks: Vec<DirectoryAncestryCheck>,
+        selection_in_copy: bool,
+    },
+    /// Select an operator directory and require kernel-checked search access:
+    /// a copy that cannot widen its destination refuses one it cannot enter,
+    /// as rsync does.
+    CheckSearchableOperatorDirectory {
+        path: PathBytes,
+        allow_missing: bool,
+        symlink_policy: OperatorSymlinkPolicy,
+    },
+    /// The receiving process's effective user ID, so the sender can tell
+    /// which existing directories it owns. Asked only once an existing
+    /// directory without owner write or search permission is found.
+    ReceiverUser,
+    /// For `--widen-dirs=all`, before anything looks up the operator
+    /// destination `path`: give the owned directories on the way to it the
+    /// owner search permission reaching it needs and, with `create_missing`,
+    /// the nearest existing one write permission to create its missing part.
+    /// The connection keeps the saved modes until RestoreDestinationPath, or
+    /// restores them when it ends. Replies Ok.
+    PrepareDestinationPath {
+        path: PathBytes,
+        symlink_policy: OperatorSymlinkPolicy,
+        create_missing: bool,
+    },
+    /// Restore the modes PrepareDestinationPath changed. Replies Ok.
+    RestoreDestinationPath,
+}
+
+/// A non-fatal scan problem. `path` is where it happened, relative to the
+/// scanned root, as bytes: callers match it against paths they know, so it is
+/// never recovered from the message. `error` is the failure alone, and
+/// `message` the whole warning as shown.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ScanWarning {
+    pub path: Option<PathBytes>,
+    pub error: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ScanWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -1546,6 +1598,8 @@ pub enum Response {
     /// failures, for which the coordinator may safely fall back to SSH.
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
+    /// No longer sent; ScanWarnAt replaced it. Kept so later responses keep
+    /// their wire numbers.
     ScanWarn(String),
     /// Paths (relative to the root) skipped because the ignore patterns matched them.
     ScanIgnored(Vec<PathBytes>),
@@ -1665,6 +1719,11 @@ pub enum Response {
         anchor: DirectoryAnchor,
         created: bool,
     },
+    /// Reply to ReceiverUser: the receiving process's effective user ID.
+    ReceiverUser(u32),
+    /// A scan warning with its path. Replaces ScanWarn, which carried only
+    /// text.
+    ScanWarnAt(ScanWarning),
 }
 
 /// Hashes of the exact bytes copied (or existing retry bytes read).

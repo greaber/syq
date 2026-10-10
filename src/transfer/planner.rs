@@ -65,13 +65,26 @@ pub(super) struct Planner<'a> {
     /// Observed obstructions at implicit parents fail only mapped descendants.
     pub(super) blocked_mapping_parents: std::collections::HashSet<PathBytes>,
     /// One pending destination container, including a file-only copy's parent.
-    pub(super) container_access: Option<(PathBytes, TargetCondition)>,
+    /// The directory the copy goes into, with the owner permission it needs.
+    pub(super) container_access: Option<(PathBytes, TargetCondition, u32)>,
     /// Whether a destination container that lacks owner access is widened
     /// (`widens_destination_container`), decided once for every root.
     pub(super) widen_container: bool,
     /// Original receiver modes, only for directories actually widened.
     pub(super) directory_restorations:
         std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
+    /// The receiving account: None until asked, Some(None) for root, which
+    /// needs no access changes.
+    pub(super) receiver_uid: Option<Option<u32>>,
+    /// The destination directory's own entry when its owner lacks write or
+    /// search permission, checked with the first batch.
+    pub(super) root_access_check: Option<Entry>,
+    /// Directories already reported, as needing access or not inspected:
+    /// later batches can meet them again.
+    pub(super) access_reported: std::collections::HashSet<PathBytes>,
+    /// apply_deferred has tried the saved modes once and reported failures;
+    /// a retry when the planner is dropped does not report them again.
+    pub(super) restorations_attempted: bool,
     /// Directories this copy created may receive metadata from later sources.
     pub(super) created_dirs: std::collections::HashSet<PathBytes>,
     /// A new destination root created private until a contents source's
@@ -357,6 +370,9 @@ pub(super) struct Deletes {
     pub(super) leaves: Vec<(PathBytes, String, &'static str)>,
     /// Directories by depth, removed deepest-first once they are empty.
     pub(super) dirs: std::collections::BTreeMap<usize, Vec<(PathBytes, String, &'static str)>>,
+    /// Owned destination-only directories without owner write or search
+    /// permission that these removals need; widened only once they run.
+    pub(super) access: Vec<(PathBytes, TargetCondition)>,
 }
 
 impl Deletes {
@@ -367,6 +383,23 @@ impl Deletes {
                 .values()
                 .map(|items| items.len() as u64)
                 .sum::<u64>()
+    }
+}
+
+impl Drop for Planner<'_> {
+    fn drop(&mut self) {
+        // Early setup, planning or pruning errors must not bypass permission
+        // restoration. Normal completion has already restored these; a mode
+        // whose restoration failed, already reported, gets one quiet retry.
+        if !self.directory_restorations.is_empty() {
+            let reported = self.restorations_attempted;
+            if let Err(error) = self.apply_deferred(true) {
+                if !reported {
+                    self.progress
+                        .error(&format!("syq: restore directory permissions: {error:#}"));
+                }
+            }
+        }
     }
 }
 
@@ -1547,7 +1580,8 @@ impl Planner<'_> {
                         .filter(|_| is_destination_root)
                         .unwrap_or_else(|| operator_directory_mode(self.opts)),
                 };
-                let (selection, created) = create_operator_directory(self.dst, condition, mode)?;
+                let (selection, created) = create_operator_directory(self.dst, condition, mode)
+                    .map_err(|error| with_failure_hint(self.opts, error))?;
                 if is_destination_root && !created {
                     self.adopt_existing_root(&root, &selection);
                 }
@@ -1629,6 +1663,16 @@ impl Planner<'_> {
         if !mapped.dirs.is_empty() || !mapped.others.is_empty() {
             self.prepare_container_access()?;
         }
+        if let Some(entry) = self.root_access_check.take() {
+            let root = self.dst_root.clone();
+            if !self
+                .check_directory_access(vec![(root.clone(), entry)])?
+                .is_empty()
+            {
+                // Nothing beneath an uninspected root can be previewed.
+                self.blocked_directory_paths.insert(root);
+            }
+        }
         let opts = self.opts;
         let Mapped {
             directory_expression_sources,
@@ -1656,12 +1700,12 @@ impl Planner<'_> {
             } else {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
-            if opts.widen_directory_permissions
-                && !opts.dry_run
+            let fill = self.fill_access();
+            if opts.may_widen_directory_permissions()
                 && stats
                     .iter()
                     .flatten()
-                    .any(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700)
+                    .any(|entry| entry.kind == Kind::Dir && entry.mode & fill != fill)
             {
                 self.prepare_existing_directories(
                     dirs.iter().map(|(path, _, _)| path.clone()).collect(),
@@ -1669,6 +1713,20 @@ impl Planner<'_> {
                 stats = self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?;
                 // Previously unsearchable children may now be visible.
                 other_stats = None;
+            }
+            if !opts.dry_run {
+                let candidates = dirs
+                    .iter()
+                    .zip(&stats)
+                    .filter_map(|((path, _, _), stat)| {
+                        stat.as_ref()
+                            .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                            .map(|entry| (path.clone(), entry.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                if !candidates.is_empty() {
+                    self.check_directory_access(candidates)?;
+                }
             }
             let planned = self.filter_dirs(dirs, stats, dst_root)?;
             if opts.dry_run {
@@ -1709,6 +1767,10 @@ impl Planner<'_> {
         };
         let mut leaf_ops = LeafOps::default();
         for (p, dst_entry) in others.into_iter().zip(stats) {
+            // A preview reported this entry's directory as not inspected.
+            if opts.dry_run && Self::under_any(&self.blocked_directory_paths, &p.dst, dst_root) {
+                continue;
+            }
             let target_condition = self.exact_condition_for(&p.dst);
             let target_condition_holds = match (target_condition, &dst_entry) {
                 (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
@@ -1953,6 +2015,11 @@ impl Planner<'_> {
             // serialize all reads in the planner.
             self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
+            // Writing an existing file in place needs no directory write.
+            self.note_directory_change(
+                &dst_path,
+                !(opts.inplace && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File)),
+            );
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.bytes_total.fetch_add(e.size, Relaxed);
             self.progress.add_files(1);
@@ -2006,6 +2073,12 @@ impl Planner<'_> {
                 self.progress.println(&action);
             }
         } else {
+            if opts.changes_directory_certainly(&e, dst_entry.as_ref()) {
+                // Writing an existing file in place needs no directory write.
+                let replaces_entry =
+                    !(opts.inplace && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File));
+                self.note_directory_change(&dst_path, replaces_entry);
+            }
             self.enqueue(
                 (src_path, source),
                 dst_path,
@@ -2139,6 +2212,7 @@ impl Planner<'_> {
             );
             return;
         }
+        self.note_directory_change(&dst_path, true);
         if opts.dry_run {
             self.dry_run_changes.symlinks += 1;
             if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
@@ -2252,6 +2326,7 @@ impl Planner<'_> {
             );
             return;
         }
+        self.note_directory_change(&dst_path, true);
         if opts.dry_run {
             self.dry_run_changes.specials += 1;
             if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
@@ -2579,7 +2654,9 @@ impl Planner<'_> {
         self.private_root = None;
         self.destination_root_known_missing = false;
         self.destination_children_known_missing = false;
-        self.container_access = selected_container_access(self.widen_container, root, selection);
+        // The root was missing, so the copy creates what goes into it.
+        self.container_access =
+            selected_container_access(self.widen_container, root, selection, 0o300);
     }
 
     /// Give a private destination root whose final metadata sets no mode the
@@ -2610,6 +2687,13 @@ impl Planner<'_> {
     /// operations below it. Existing directory access is prepared separately.
     fn create_directories(&mut self, planned: &[PlannedDir], dst_root: &[u8]) -> Result<bool> {
         let opts = self.opts;
+        if !self.opts.access_limited.lock().unwrap().is_empty() {
+            for (path, _, _, st) in planned {
+                if !matches!(st, Some(d) if d.kind == Kind::Dir) {
+                    self.note_directory_change(path, true);
+                }
+            }
+        }
         let mut early = self.early_directory_metadata(planned)?;
         // Narrow existing directories before publishing anything inside them.
         if !early.existing.is_empty() {
@@ -2662,7 +2746,10 @@ impl Planner<'_> {
             if let Some(error) = error {
                 let os_kind = wire_os_kind(&error);
                 self.progress.error_classified(
-                    &format!("syq: {}", self.opts.wire_error_message(&error)),
+                    &format!(
+                        "syq: {}",
+                        self.opts.wire_error_message_at(&error, &self.dst_root)
+                    ),
                     Some("io"),
                     os_kind,
                 );
@@ -2732,7 +2819,7 @@ impl Planner<'_> {
                 if let Some(err) = &err {
                     failed += 1;
                     self.progress.error_classified(
-                        &format!("syq: {}", self.opts.wire_error_message(err)),
+                        &format!("syq: {}", self.opts.wire_error_message_at(err, name)),
                         Some("io"),
                         os_kind,
                     );
@@ -2803,6 +2890,7 @@ impl Planner<'_> {
                     // trace itself is deferred (see
                     // directory_creates).
                     if self.dry_run_changes.directories.insert(p.clone()) {
+                        self.note_directory_change(p, true);
                         self.dry_run_changes
                             .directory_creates
                             .push((p.clone(), "destination_missing"));
@@ -2983,8 +3071,9 @@ impl Planner<'_> {
             let error = e1.or(e2);
             let os_kind = error.as_ref().and_then(wire_os_kind);
             if let Some(e) = &error {
+                let path = join(&self.dst_root, &queued.dst_rel);
                 self.progress.error_classified(
-                    &format!("syq: {}", self.opts.wire_error_message(e)),
+                    &format!("syq: {}", self.opts.wire_error_message_at(e, &path)),
                     Some("io"),
                     os_kind,
                 );
@@ -3031,12 +3120,14 @@ impl Planner<'_> {
     }
 
     fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
-        // Keep the remote receiver's combined metadata lookup, but no longer
-        // ask it to compute temporary names for every source file.
+        // Keep the remote receiver's combined metadata lookup, but wait for
+        // container access first: an inaccessible child must not be cached as
+        // absent before apply_mapped makes its container searchable.
         if self.opts.inode_preservation.any()
             || !self.opts.dst_remote
             || self.buffer.is_some()
             || self.opts.dry_run
+            || self.container_access.is_some()
             || self.destination_children_known_missing
             || self.container_guard.is_some()
         {
@@ -3492,6 +3583,8 @@ impl Planner<'_> {
             paths.sort_unstable();
             paths
         });
+        // Destination-only directories a removal may find without access.
+        let mut access_candidates = Vec::new();
         for (root, sub) in roots.clone() {
             // Every root is walked with its own --ignore anchoring. A root nested in
             // this one (`syq rsync --delete a b/ dst`: dst/a inside dst) is left to
@@ -3513,37 +3606,129 @@ impl Planner<'_> {
                 self.opts.ignore.clone()
             };
             let mut found = Deletes::default();
+            let mut partial_parents = std::collections::HashMap::new();
+            let mut alias_parents = std::collections::HashSet::new();
+            // A native copy that may widen directories enters owned
+            // destination-only directories it cannot list, then walks beneath
+            // them; rsync leaves them unlisted, as rsync does. Anchored ignore
+            // patterns apply from the root, so with those the whole root is
+            // walked again instead.
+            let enter = self.opts.widen_dirs == crate::cli::WidenDirs::All
+                && self.opts.may_widen_directory_permissions();
+            let subtrees = ignore
+                .iter()
+                .all(|pattern| ignore_pattern_is_unanchored(pattern));
+            let mut attempted = std::collections::HashSet::new();
+            let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
             // Destination directories that hold an ignored path, so must stay.
             let mut protected: std::collections::HashSet<PathBytes> =
                 std::collections::HashSet::new();
-            let mut partial_parents = std::collections::HashMap::new();
-            let mut alias_parents = std::collections::HashSet::new();
-            let mut walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
-            let res = self.dst.scan(
-                &root,
-                None,
-                false,
-                &ignore,
-                true,
-                &mut |batch: Vec<Entry>| {
-                    for entry in batch {
-                        walk.push(entry, &root, &nested);
-                    }
-                    Ok(())
-                },
-                &mut |paths: Vec<PathBytes>| {
-                    for p in paths {
-                        // Every ancestor of an ignored path is protected.
-                        protected.extend(ancestor_prefixes(&p).map(|prefix| join(&root, prefix)));
-                    }
-                    Ok(())
-                },
-                &mut |w| {
-                    self.delete_walk_failed = true;
-                    self.progress.error(&format!("syq: delete: {w}"))
-                },
-            );
-            res?;
+            // Each walk warning with the directory its walk started from.
+            let mut warnings: Vec<(PathBytes, crate::proto::ScanWarning)> = Vec::new();
+            let mut bases = vec![root.clone()];
+            loop {
+                for base in std::mem::take(&mut bases) {
+                    let prefix = base
+                        .get(root.len()..)
+                        .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
+                        .unwrap_or_default();
+                    self.dst.scan(
+                        &base,
+                        None,
+                        false,
+                        &ignore,
+                        true,
+                        &mut |batch: Vec<Entry>| {
+                            for mut entry in batch {
+                                if base != root {
+                                    // Its own entry came from the walk above.
+                                    if entry.path.is_empty() {
+                                        continue;
+                                    }
+                                    entry.path = join(&prefix, &entry.path);
+                                }
+                                walk.push(entry, &root, &nested);
+                            }
+                            Ok(())
+                        },
+                        &mut |paths: Vec<PathBytes>| {
+                            for p in paths {
+                                // Every ancestor of an ignored path is protected.
+                                let p = join(&prefix, &p);
+                                protected.extend(
+                                    ancestor_prefixes(&p).map(|prefix| join(&root, prefix)),
+                                );
+                            }
+                            Ok(())
+                        },
+                        &mut |w| warnings.push((base.clone(), w)),
+                    )?;
+                }
+                if !enter || warnings.is_empty() {
+                    break;
+                }
+                // Shielded entries stay; nothing beneath them is entered.
+                walk.finish_scan(&root);
+                // Entering a directory takes owner read and search.
+                let unreadable: Vec<_> = walk
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.kind == Kind::Dir
+                            && entry.mode & 0o500 != 0o500
+                            && attempted.insert(entry.path.clone())
+                    })
+                    .map(|entry| (entry.path.clone(), directory_fingerprint(entry)))
+                    .collect();
+                let candidates: Vec<PathBytes> =
+                    unreadable.iter().map(|(path, _)| path.clone()).collect();
+                if unreadable.is_empty()
+                    || widen_directory_batch(
+                        self.dst,
+                        self.opts,
+                        self.progress,
+                        self.container_guard.clone(),
+                        &mut self.directory_restorations,
+                        unreadable,
+                        0o500,
+                    )? == 0
+                {
+                    break;
+                }
+                let widened: Vec<PathBytes> = candidates
+                    .into_iter()
+                    .filter(|path| self.directory_restorations.contains_key(path))
+                    .collect();
+                if subtrees {
+                    // Walking beneath them again answers their warnings.
+                    warnings.retain(|(base, warning)| {
+                        !warning.path.as_ref().is_some_and(|path| {
+                            let path = join(base, path);
+                            widened.iter().any(|directory| {
+                                path == *directory || path_is_inside(&path, directory)
+                            })
+                        })
+                    });
+                    bases = widened;
+                } else {
+                    walk = PruneWalk::new(&self.dst_seen, &root, sorted_claims.as_deref());
+                    protected.clear();
+                    warnings.clear();
+                    bases = vec![root.clone()];
+                }
+            }
+            for (base, warning) in warnings {
+                self.delete_walk_failed = true;
+                // A preview names the directory it could not inspect.
+                match warning.path.as_ref().filter(|_| self.opts.dry_run) {
+                    Some(path) => self.progress.error(&format!(
+                        "syq: {}: not inspected: {}",
+                        display(&join(&base, path)),
+                        warning.error
+                    )),
+                    None => self.progress.error(&format!("syq: delete: {warning}")),
+                }
+            }
             if self.delete_walk_failed {
                 return Ok(());
             }
@@ -3553,6 +3738,36 @@ impl Planner<'_> {
             if walk.entries.is_empty() {
                 continue;
             }
+            if self.opts.may_suggest_directory_access() {
+                access_candidates.extend(
+                    walk.entries
+                        .iter()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                        .map(|entry| (entry.path.clone(), entry.clone())),
+                );
+            }
+            // Destination-only directories whose entries a removal needs to
+            // change but whose owner lacks write or search permission. One
+            // already widened to be entered has a new change time, so only
+            // its identity is required.
+            let unwritable: std::collections::HashMap<PathBytes, TargetCondition> =
+                if self.opts.may_widen_directory_permissions() {
+                    walk.entries
+                        .iter()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                        .map(|entry| {
+                            let condition = if self.directory_restorations.contains_key(&entry.path)
+                            {
+                                target_identity(entry)
+                            } else {
+                                directory_fingerprint(entry)
+                            };
+                            (entry.path.clone(), condition)
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
             let aliases = lookup_prune_aliases(self.dst, &walk, self.container_guard.as_ref())?;
             let mut shielded = walk.shielded;
             let recovery_parents = walk.recovery_parents;
@@ -3616,6 +3831,20 @@ impl Planner<'_> {
                 }
             }
 
+            let mut access = std::collections::BTreeMap::new();
+            let mut needs_access = |path: &[u8], parent: bool| {
+                let path = if parent {
+                    parent_path(path)
+                } else {
+                    path.to_vec()
+                };
+                if let Some(condition) = unwritable.get(&path) {
+                    access.insert(path, *condition);
+                }
+            };
+            for (path, ..) in &found.leaves {
+                needs_access(path, true);
+            }
             self.deletes.leaves.append(&mut found.leaves);
             for (d, v) in found.dirs {
                 for (path, rel, kind) in v {
@@ -3635,6 +3864,8 @@ impl Planner<'_> {
                         self.progress
                             .eprintln(&format!("syq: not deleting {rel}: it holds ignored paths"));
                     } else {
+                        needs_access(&path, false);
+                        needs_access(&path, true);
                         self.deletes
                             .dirs
                             .entry(d)
@@ -3643,6 +3874,12 @@ impl Planner<'_> {
                     }
                 }
             }
+            self.deletes.access.extend(access);
+        }
+        if !access_candidates.is_empty() {
+            // Walked directories are listable, so none is reported here as
+            // uninspected; the rest are noted before their first removal.
+            self.check_directory_access(access_candidates)?;
         }
         Ok(())
     }
@@ -3722,6 +3959,7 @@ impl Planner<'_> {
         let opts = self.opts;
         let leaves = std::mem::take(&mut self.deletes.leaves);
         let dirs = std::mem::take(&mut self.deletes.dirs);
+        let mut access = std::mem::take(&mut self.deletes.access);
         let planned = leaves.len() as u64 + dirs.values().map(|v| v.len() as u64).sum::<u64>();
         self.progress.deletions_planned.store(planned, Relaxed);
         if let Some(max) = opts.max_delete {
@@ -3758,11 +3996,21 @@ impl Planner<'_> {
                 return Ok(0);
             }
         }
+        if !opts.dry_run && !access.is_empty() {
+            // Parents first; a removed directory's saved mode is dropped below.
+            access.sort_by_key(|(path, _)| path.iter().filter(|&&c| c == b'/').count());
+            access.dedup_by(|a, b| a.0 == b.0);
+            // Removing an entry takes owner write and search.
+            self.widen_directories(access, 0o300)?;
+        }
         let mut n = 0u64;
         let mut run = |me: &mut Self,
                        items: &[(PathBytes, String, &'static str)],
                        rmdir: bool|
          -> Result<()> {
+            for (path, ..) in items {
+                me.note_directory_change(path, true);
+            }
             for chunk in items.chunks(1000) {
                 if opts.dry_run {
                     for (p, rel, kind) in chunk {
@@ -3796,6 +4044,9 @@ impl Planner<'_> {
                     match err {
                         None => {
                             n += 1;
+                            if rmdir {
+                                me.directory_restorations.remove(p);
+                            }
                             me.progress.deletions_completed.fetch_add(1, Relaxed);
                             if opts.verbose > 0 {
                                 me.progress.println(&format!("deleting {rel}"));
@@ -3878,27 +4129,30 @@ impl Planner<'_> {
         Ok(stats)
     }
 
-    pub(super) fn stat_many(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+    pub(super) fn stat_many(&mut self, mut paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+        let strict_preview =
+            self.opts.dry_run && (self.opts.restricted_receiver || self.opts.rsync_creation);
+        let preserve = self.opts.inode_preservation.any();
         let entries = if self.opts.expressions.update.is_some() {
             // This existing endpoint operation distinguishes absence from an
             // unreadable path, unlike ordinary planning stats. It has the same
             // destination-observation authority and needs no wire extension.
-            let mut inspected = Vec::with_capacity(paths.len());
-            for chunk in paths.chunks(512) {
-                match ok(
-                    self.dst.call(Request::PruneLookup {
-                        paths: chunk.to_vec(),
-                        guard: self.container_guard.clone(),
-                    })?,
+            let lookup = if preserve {
+                paths.clone()
+            } else {
+                std::mem::take(&mut paths)
+            };
+            let inspected = if strict_preview {
+                self.inspect_preview(lookup)?
+            } else {
+                inspect_destination_paths(
+                    self.dst,
+                    lookup,
+                    self.container_guard.clone(),
                     "inspect destination for --copy-if",
-                )? {
-                    Response::Stats(entries) if entries.len() == chunk.len() => {
-                        inspected.extend(entries)
-                    }
-                    other => bail!("unexpected destination inspection response {other:?}"),
-                }
-            }
-            if self.opts.inode_preservation.any() && inspected.iter().any(Option::is_some) {
+                )?
+            };
+            if preserve && inspected.iter().any(Option::is_some) {
                 // Strict lookup supplies expression fields. Rich preservation
                 // still uses the existing metadata capture request.
                 let captured = stat_many(self.dst, paths, false)?;
@@ -3928,12 +4182,77 @@ impl Planner<'_> {
             } else {
                 inspected
             }
+        } else if strict_preview && preserve {
+            // One rich lookup, as an ordinary preview makes. Only the paths it
+            // did not find need the strict one, to tell a denial from absence.
+            let mut captured = stat_many(self.dst, paths.clone(), false)?;
+            let missing: Vec<usize> = (0..captured.len())
+                .filter(|&index| captured[index].is_none())
+                .collect();
+            if !missing.is_empty() {
+                let inspected = self
+                    .inspect_preview(missing.iter().map(|&index| paths[index].clone()).collect())?;
+                for (&index, entry) in missing.iter().zip(inspected) {
+                    captured[index] = entry;
+                }
+            }
+            captured
+        } else if strict_preview {
+            // Previews never change permissions, so a denied lookup stays an
+            // error rather than a missing file.
+            self.inspect_preview(paths)?
         } else {
             stat_many(self.dst, paths, false)?
         };
         self.progress
             .observe_destination_devices(entries.iter().flatten());
         Ok(entries)
+    }
+
+    /// Strict lookups for a preview. A denied directory does not end it: it
+    /// is reported once as not inspected and its contents are skipped, as
+    /// rsync reports a path it cannot stat and goes on.
+    fn inspect_preview(&mut self, paths: Vec<PathBytes>) -> Result<Vec<Option<Entry>>> {
+        // Inside a directory this preview found missing nothing exists.
+        let mut results = vec![None; paths.len()];
+        let needed: Vec<usize> = (0..paths.len())
+            .filter(|&index| {
+                !self
+                    .dry_run_changes
+                    .directories
+                    .contains(&parent_path(&paths[index]))
+            })
+            .collect();
+        if needed.is_empty() {
+            return Ok(results);
+        }
+        let lookups: Vec<PathBytes> = if needed.len() == paths.len() {
+            paths
+        } else {
+            needed.iter().map(|&index| paths[index].clone()).collect()
+        };
+        let reported = &mut self.access_reported;
+        let progress = self.progress;
+        let entries = inspect_tolerating_denials(
+            self.dst,
+            &lookups,
+            self.container_guard.clone(),
+            &self.dst_root,
+            &mut self.blocked_directory_paths,
+            &mut |directory, error| {
+                if reported.insert(directory.to_vec()) {
+                    progress.error_classified(
+                        &format!("syq: {}: not inspected: {error:#}", display(directory)),
+                        Some("io"),
+                        Some("permission_denied"),
+                    );
+                }
+            },
+        )?;
+        for (index, entry) in needed.into_iter().zip(entries) {
+            results[index] = entry;
+        }
+        Ok(results)
     }
 
     /// Avoid querying descendants of a directory conflict. The planner skips
@@ -4004,6 +4323,24 @@ impl Planner<'_> {
             for (index, entry) in visible_indexes.into_iter().zip(self.stat_many(visible)?) {
                 results[index] = entry;
             }
+            // Directories found uninspectable by those lookups hide theirs.
+            blocked.extend(self.blocked_directory_paths.iter().cloned());
+            // A directory this preview cannot search hides its contents.
+            let candidates = indexes
+                .iter()
+                .filter_map(|&index| {
+                    results[index]
+                        .as_ref()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
+                        .map(|entry| (dirs[index].0.clone(), entry.clone()))
+                })
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                for path in self.check_directory_access(candidates)? {
+                    blocked.insert(path.clone());
+                    self.blocked_directory_paths.insert(path);
+                }
+            }
             for index in indexes {
                 let path = &dirs[index].0;
                 let entry = &results[index];
@@ -4043,24 +4380,102 @@ impl Planner<'_> {
         }
     }
 
-    fn prepare_container_access(&mut self) -> Result<()> {
-        if let Some((path, condition)) = self.container_access.take() {
-            if condition == TargetCondition::Any {
-                self.prepare_existing_directories(vec![path])?;
-            } else {
-                self.widen_directories(vec![(path, condition)])?;
+    /// Whether the receiving account owns `entry`. The receiver is asked its
+    /// account once, only after a directory needing access has been found.
+    fn receiver_owns(&mut self, entry: &Entry) -> Result<bool> {
+        if self.receiver_uid.is_none() {
+            let uid = match ok(self.dst.call(Request::ReceiverUser)?, "receiving account")? {
+                Response::ReceiverUser(uid) => uid,
+                other => bail!("unexpected receiving account response {other:?}"),
+            };
+            self.receiver_uid = Some((uid != 0).then_some(uid));
+        }
+        Ok(self.receiver_uid.flatten() == Some(entry.uid))
+    }
+
+    /// Sort existing directories whose owner lacks write or search
+    /// permission, using the modes and owners the destination scan already
+    /// read. A dry run cannot look inside an owned one without search
+    /// permission: it reports it as not inspected and returns it, so its
+    /// contents are skipped. Without temporary access, the others are noted
+    /// for the first change planned inside them.
+    fn check_directory_access(
+        &mut self,
+        candidates: Vec<(PathBytes, Entry)>,
+    ) -> Result<Vec<PathBytes>> {
+        let mut uninspected = Vec::new();
+        let hint = self.opts.may_suggest_directory_access();
+        if !(hint || self.opts.dry_run) {
+            return Ok(uninspected);
+        }
+        for (path, entry) in candidates {
+            // Without the hint, only a preview's unsearchable directories matter.
+            if entry.kind != Kind::Dir
+                || entry.mode & 0o300 == 0o300
+                || !hint && entry.mode & 0o100 != 0
+                || self.opts.access_limited.lock().unwrap().contains_key(&path)
+                || self.access_reported.contains(&path)
+                || self.opts.access_noted.lock().unwrap().contains(&path)
+                || !self.receiver_owns(&entry)?
+            {
+                continue;
             }
+            if self.opts.dry_run && entry.mode & 0o100 == 0 {
+                self.access_reported.insert(path.clone());
+                self.progress.error_classified(
+                    &format!(
+                        "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
+                        display(&path),
+                        if hint {
+                            format!("; {}", self.opts.directory_access_hint())
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    Some("io"),
+                    Some("permission_denied"),
+                );
+                uninspected.push(path);
+            } else if hint {
+                self.opts
+                    .access_limited
+                    .lock()
+                    .unwrap()
+                    .insert(path, entry.mode);
+            }
+        }
+        Ok(uninspected)
+    }
+
+    /// Report, once and before the first change planned at `path`, that its
+    /// directory is owned but lacks the owner permission the change needs.
+    pub(super) fn note_directory_change(&mut self, path: &[u8], replaces_entry: bool) {
+        self.opts
+            .note_directory_change(self.progress, path, replaces_entry);
+    }
+
+    fn prepare_container_access(&mut self) -> Result<()> {
+        if let Some((path, condition, access)) = self.container_access.take() {
+            self.widen_directories(vec![(path, condition)], access)?;
         }
         Ok(())
     }
 
+    /// The owner permission a directory the copy fills needs: write and
+    /// search to change its entries, and read when pruning lists it.
+    fn fill_access(&self) -> u32 {
+        if self.opts.delete {
+            0o700
+        } else {
+            0o300
+        }
+    }
+
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.widen_directory_permissions
-            || self.opts.dry_run
-            || self.opts.preserve_existing_directory_metadata
-        {
+        if !self.opts.may_widen_directory_permissions() {
             return Ok(());
         }
+        let fill = self.fill_access();
         self.assert_mutation_root()?;
         paths.sort_by(|a, b| {
             a.iter()
@@ -4079,73 +4494,42 @@ impl Planner<'_> {
                     .iter()
                     .zip(stats)
                     .filter_map(|(path, entry)| {
-                        let entry = entry.filter(|entry| {
-                            entry.kind == Kind::Dir && entry.mode & 0o700 != 0o700
-                        })?;
-                        (!self.directory_restorations.contains_key(path)).then(|| {
-                            (
-                                path.clone(),
-                                TargetCondition::MatchesFingerprint {
-                                    dev: entry.dev,
-                                    ino: entry.ino,
-                                    ctime: entry.ctime,
-                                    ctime_nsec: entry.ctime_nsec,
-                                },
-                            )
-                        })
+                        let entry = entry
+                            .filter(|entry| entry.kind == Kind::Dir && entry.mode & fill != fill)?;
+                        Some((path.clone(), directory_fingerprint(&entry)))
                     })
                     .collect();
                 if directories.is_empty() {
                     continue;
                 }
-                self.widen_directories(directories)?;
+                self.widen_directories(directories, fill)?;
             }
         }
         Ok(())
     }
 
-    fn widen_directories(&mut self, directories: Vec<(PathBytes, TargetCondition)>) -> Result<()> {
-        let names: Vec<_> = directories.iter().map(|(path, _)| path.clone()).collect();
-        let response = ok(
-            self.dst.call(Request::WidenDirectories {
-                directories,
-                // Without -p the receiver restores the modes it saves.
-                remember: !self.opts.perms,
-                guard: self.container_guard.clone(),
-            })?,
-            "prepare directory permissions",
-        )?;
-        let Response::WidenedDirectories(results) = response else {
-            bail!("unexpected directory access response {response:?}");
-        };
-        anyhow::ensure!(
-            results.len() == names.len(),
-            "directory access response count mismatch"
-        );
-        for (path, result) in names.into_iter().zip(results) {
-            match result {
-                Ok(Some(mode)) => {
-                    self.directory_restorations.insert(path, mode);
-                }
-                Ok(None) => {}
-                Err(error) => self.progress.error_classified(
-                    &format!(
-                        "syq: {}: {}",
-                        display(&path),
-                        self.opts.wire_error_message(&error)
-                    ),
-                    Some("io"),
-                    wire_os_kind(&error),
-                ),
-            }
-        }
-        Ok(())
+    fn widen_directories(
+        &mut self,
+        directories: Vec<(PathBytes, TargetCondition)>,
+        access: u32,
+    ) -> Result<()> {
+        widen_directory_batch(
+            self.dst,
+            self.opts,
+            self.progress,
+            self.container_guard.clone(),
+            &mut self.directory_restorations,
+            directories,
+            access,
+        )
+        .map(|_| ())
     }
 
     pub(super) fn apply_deferred(&mut self, aborted: bool) -> Result<()> {
         if self.directory_restorations.is_empty() && (aborted || self.deferred.is_empty()) {
             return Ok(());
         }
+        let quiet = std::mem::replace(&mut self.restorations_attempted, true);
         self.assert_mutation_root()?;
         let mut d = if aborted {
             Vec::new()
@@ -4169,7 +4553,9 @@ impl Planner<'_> {
         } else {
             flags::RECEIVER_MODE
         };
-        let mut remaining = std::mem::take(&mut self.directory_restorations);
+        // Keep each saved mode until its restoration succeeds, so that an
+        // early error still restores it when the planner is dropped.
+        let mut remaining = self.directory_restorations.clone();
         for (path, meta, flags, _, condition) in &mut d {
             if let Some(saved) = remaining.remove(path) {
                 if *flags & (flags::MODE | flags::RECEIVER_MODE) == 0 {
@@ -4221,10 +4607,15 @@ impl Planner<'_> {
             let capacity_error = first_capacity_error(&errors);
             for ((path, ..), error) in chunk.iter().zip(errors) {
                 if let Some(error) = error {
+                    if quiet {
+                        continue;
+                    }
                     let dst = (!self.implicit_dirs.contains(path))
                         .then(|| strip_dst_root(path, &self.dst_root))
                         .flatten();
                     self.report_metadata_failure(dst, DeclaredKind::Dir, &error);
+                } else {
+                    self.directory_restorations.remove(path);
                 }
             }
             if let Some(error) = capacity_error {
@@ -4232,6 +4623,142 @@ impl Planner<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether an ignore pattern matches the same names from any directory, so a
+/// subtree can be walked on its own: it names no path with a `/` other than a
+/// trailing one.
+fn ignore_pattern_is_unanchored(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    let pattern = pattern.strip_prefix('!').unwrap_or(pattern);
+    !pattern.trim_end_matches('/').contains('/')
+}
+
+/// Strict destination lookups that survive denials. When a batch is denied,
+/// its paths are looked up again in halves to find the denied ones; each
+/// one's parent directory goes into `blocked` and to `report`, and paths
+/// beneath a blocked directory are skipped, reading as absent.
+pub(super) fn inspect_tolerating_denials(
+    conn: &mut dyn Conn,
+    paths: &[PathBytes],
+    guard: Option<ContainerGuard>,
+    dst_root: &[u8],
+    blocked: &mut std::collections::HashSet<PathBytes>,
+    report: &mut dyn FnMut(&[u8], &anyhow::Error),
+) -> Result<Vec<Option<Entry>>> {
+    let mut results = vec![None; paths.len()];
+    let visible: Vec<usize> = (0..paths.len())
+        .filter(|&index| !Planner::under_any(blocked, &paths[index], dst_root))
+        .collect();
+    if visible.is_empty() {
+        return Ok(results);
+    }
+    let batch = visible.iter().map(|&index| paths[index].clone()).collect();
+    match inspect_destination_paths(
+        conn,
+        batch,
+        guard.clone(),
+        "inspect destination for preview",
+    ) {
+        Ok(entries) => {
+            for (&index, entry) in visible.iter().zip(entries) {
+                results[index] = entry;
+            }
+        }
+        Err(error) if os_kind_of(&error) == Some("permission_denied") => {
+            if let [index] = visible[..] {
+                let parent = parent_path(&paths[index]);
+                report(&parent, &error);
+                blocked.insert(parent);
+            } else {
+                let (first, second) = visible.split_at(visible.len() / 2);
+                for half in [first, second] {
+                    let subset: Vec<PathBytes> =
+                        half.iter().map(|&index| paths[index].clone()).collect();
+                    let entries = inspect_tolerating_denials(
+                        conn,
+                        &subset,
+                        guard.clone(),
+                        dst_root,
+                        blocked,
+                        report,
+                    )?;
+                    for (&index, entry) in half.iter().zip(entries) {
+                        results[index] = entry;
+                    }
+                }
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(results)
+}
+
+/// Temporarily add owner access to `directories` and remember the original
+/// modes of those actually changed; returns how many changed. The receiver
+/// widens only owned directories, never as root.
+fn widen_directory_batch(
+    dst: &mut dyn Conn,
+    opts: &Opts,
+    progress: &Progress,
+    guard: Option<ContainerGuard>,
+    restorations: &mut std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
+    directories: Vec<(PathBytes, TargetCondition)>,
+    access: u32,
+) -> Result<usize> {
+    let mut widened = 0;
+    let mut directories = directories.into_iter().peekable();
+    while directories.peek().is_some() {
+        let batch: Vec<_> = directories.by_ref().take(1000).collect();
+        let names: Vec<_> = batch.iter().map(|(path, _)| path.clone()).collect();
+        let response = ok(
+            dst.call(Request::WidenDirectories {
+                directories: batch,
+                // Without -p the receiver restores the modes it saves.
+                remember: !opts.perms,
+                guard: guard.clone(),
+                access,
+            })?,
+            "prepare directory permissions",
+        )?;
+        let Response::WidenedDirectories(results) = response else {
+            bail!("unexpected directory access response {response:?}");
+        };
+        anyhow::ensure!(
+            results.len() == names.len(),
+            "directory access response count mismatch"
+        );
+        for (path, result) in names.into_iter().zip(results) {
+            match result {
+                // A directory widened again, for more permission, is
+                // restored to the mode it had before the first time.
+                Ok(Some(mode)) => {
+                    restorations.entry(path).or_insert(mode);
+                    widened += 1;
+                }
+                Ok(None) => {}
+                Err(error) => progress.error_classified(
+                    &format!(
+                        "syq: {}: {}",
+                        display(&path),
+                        opts.wire_error_message(&error)
+                    ),
+                    Some("io"),
+                    wire_os_kind(&error),
+                ),
+            }
+        }
+    }
+    Ok(widened)
+}
+
+fn directory_fingerprint(entry: &Entry) -> TargetCondition {
+    TargetCondition::MatchesFingerprint {
+        dev: entry.dev,
+        ino: entry.ino,
+        ctime: entry.ctime,
+        ctime_nsec: entry.ctime_nsec,
     }
 }
 

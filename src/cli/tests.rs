@@ -1,7 +1,7 @@
 use super::{
     native_engine_defaults, parse_native_copy, parse_native_endpoint, parse_native_rm, parse_size,
     read_files_from_reader, rsync_operator_symlink_policy, Args, EnvironmentOptions,
-    NativeCopyCommand, Placement, SourceSelection,
+    NativeCopyCommand, Placement, SourceSelection, WidenDirs,
 };
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Result};
@@ -1311,24 +1311,35 @@ fn prune_before_enables_pruning_and_requires_placement() {
         .contains("explicit placement"));
 }
 
+/// `syq cp` widens nothing unless asked; `syq rsync` widens what rsync does.
 #[test]
-fn temporary_directory_permissions_are_native_opt_in() {
+fn directory_widening_defaults_and_modes() {
     let argv = ["source", "--into", "destination"].map(std::ffi::OsString::from);
-    assert!(
-        !parse_native_copy(&argv)
-            .unwrap()
-            .temporarily_widen_dir_permissions
+    assert_eq!(
+        parse_native_copy(&argv).unwrap().widen_dirs,
+        WidenDirs::None
     );
-    let argv = [
-        "source",
-        "--into",
-        "destination",
-        "--temporarily-widen-dir-permissions",
-    ]
-    .map(std::ffi::OsString::from);
-    assert!(
-        parse_native_copy(&argv)
-            .unwrap()
-            .temporarily_widen_dir_permissions
-    );
+    for (value, mode) in [
+        ("none", WidenDirs::None),
+        ("rsync", WidenDirs::Rsync),
+        ("all", WidenDirs::All),
+    ] {
+        let option = format!("--widen-dirs={value}");
+        let argv = ["source", "--into", "destination", &option].map(std::ffi::OsString::from);
+        assert_eq!(parse_native_copy(&argv).unwrap().widen_dirs, mode);
+        let rsync = Args::try_parse_from([
+            "syq rsync",
+            "-r",
+            "a/",
+            "b",
+            &format!("--syq-widen-dirs={value}"),
+        ])
+        .unwrap();
+        assert_eq!(rsync.widen_dirs, mode);
+    }
+    let rsync = Args::try_parse_from(["syq rsync", "-r", "a/", "b"]).unwrap();
+    assert_eq!(rsync.widen_dirs, WidenDirs::Rsync);
+    let argv =
+        ["source", "--into", "destination", "--widen-dirs=some"].map(std::ffi::OsString::from);
+    assert!(parse_native_copy(&argv).is_err());
 }

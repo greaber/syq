@@ -15,7 +15,7 @@ use super::{
     Options,
 };
 use crate::{
-    cli::{Args, Existence, Placement, SourceSelection},
+    cli::{Args, Existence, Location, Placement, SourceSelection, WidenDirs},
     hashing::{Digest, HashAlgorithm},
     progress::Progress,
     rooted::{RelativePath, Root},
@@ -453,6 +453,24 @@ impl Engine {
                 self.prune(prune, None).await?;
             }
         } else {
+            // Dry runs never change permissions.
+            let widen = if self.args.dry_run {
+                WidenDirs::None
+            } else {
+                self.args.widen_dirs
+            };
+            // Under `all`, the owned directories on the way to the
+            // destination first get the owner access reaching it and creating
+            // its missing parents needs, until the copy ends.
+            let mut path_access = crate::fsops::TemporaryDirectorySearchAccess::default();
+            if widen == WidenDirs::All {
+                crate::fsops::prepare_destination_path(
+                    &self.args.locations.last().unwrap().path,
+                    Destination::symlink_policy(&self.args),
+                    !self.args.existing,
+                    &mut path_access,
+                )?;
+            }
             let destination = Arc::new(Destination::open(&self.args)?);
             let DownloadPlan {
                 jobs: mut plan,
@@ -468,17 +486,26 @@ impl Engine {
                 .store(plan.iter().map(|s| s.size).sum(), Relaxed);
             self.progress.scan_done.store(true, Relaxed);
             let directories = Arc::new(Directories::new(&plan)?);
+            // --if-exists=keep widens like any other policy; it only leaves
+            // existing directory metadata alone. `rsync` widens the
+            // destination itself only when a contents source fills it.
             let mut directory_access = directory_permissions::TemporaryAccess::new(
-                self.args.temporarily_widen_dir_permissions
-                    && !self.args.dry_run
-                    && !self.args.only_new_native_entries(),
+                widen,
+                self.args.native_mapping.is_none()
+                    && self.args.locations[..self.args.locations.len() - 1]
+                        .iter()
+                        .any(Location::copies_contents),
+                self.args.delete,
             );
             let mut copies_finished = false;
             let transferred = async {
                 if self.args.prune_before {
                     directory_access.prepare(&destination, &plan)?;
-                    self.prune(std::mem::take(&mut prune), Some(&destination))
-                        .await?;
+                    self.prune(
+                        std::mem::take(&mut prune),
+                        Some((&destination, &mut directory_access)),
+                    )
+                    .await?;
                 }
                 let mut service_times = service_times.into_iter();
                 parallel(plan, workers, |mut job| {
@@ -497,22 +524,20 @@ impl Engine {
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
-                            if !engine.args.temporarily_widen_dir_permissions
-                                && !engine.args.only_new_native_entries()
-                                && error.chain().any(|cause| {
+                            let suggestion =
+                                crate::transfer::failure_hint(engine.args.widen_dirs, false);
+                            if let Some(suggestion) = suggestion.filter(|_| {
+                                error.chain().any(|cause| {
                                     cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
                                         e.kind() == std::io::ErrorKind::PermissionDenied
                                     })
                                 })
-                            {
+                            }) {
                                 if let Ok(path) = RelativePath::new(job.path.as_bytes()) {
                                     if let Some(hint) = crate::fsops::directory_permission_hint(
                                         &dst.root, &path, 0o300,
                                     ) {
-                                        return error.context(format!(
-                                            "{hint}; {}",
-                                            crate::transfer::DIRECTORY_ACCESS_HINT
-                                        ));
+                                        return error.context(format!("{hint}; {suggestion}"));
                                     }
                                 }
                             }
@@ -538,19 +563,25 @@ impl Engine {
                     "copy finalization",
                 )?;
                 if !self.args.prune_before {
-                    self.prune(prune, Some(&destination)).await?;
+                    self.prune(prune, Some((&destination, &mut directory_access)))
+                        .await?;
                 }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            self.finish_directories(
-                &destination,
-                &directories,
-                directory_access.into_restorations(),
-                !copies_finished,
-            )
-            .await?;
+            let finished = self
+                .finish_directories(
+                    &destination,
+                    &directories,
+                    directory_access.into_restorations(),
+                    !copies_finished,
+                )
+                .await;
+            // The destination's ancestors are restored last.
+            let restored = path_access.restore();
+            finished?;
             transferred?;
+            restored?;
         }
         Ok(())
     }
@@ -559,7 +590,7 @@ impl Engine {
         &self,
         destination: &Destination,
         directories: &DirectoryMetadata,
-        mut widened: BTreeMap<String, crate::proto::DirectoryMode>,
+        mut widened: BTreeMap<Vec<u8>, crate::proto::DirectoryMode>,
         aborted: bool,
     ) -> Result<()> {
         if self.args.dry_run {
@@ -575,18 +606,13 @@ impl Engine {
                 .iter()
                 .map(|(path, meta, mode, explicit)| {
                     let path = directory_key(&RelativePath::new(path.as_bytes())?);
-                    Ok((
-                        String::from_utf8(path)?,
-                        Some((meta.clone(), *mode, *explicit)),
-                    ))
+                    Ok((path, Some((meta.clone(), *mode, *explicit))))
                 })
                 .collect::<Result<_>>()?
         };
         if !aborted {
             for path in directories.created.lock().unwrap().iter() {
-                entries
-                    .entry(String::from_utf8(path.clone())?)
-                    .or_insert(None);
+                entries.entry(path.clone()).or_insert(None);
             }
         }
         for path in widened.keys() {
@@ -595,13 +621,14 @@ impl Engine {
         let mut entries: Vec<_> = entries.into_iter().collect();
         entries.sort_by_key(|(path, _)| {
             std::cmp::Reverse(
-                path.bytes().filter(|&c| c == b'/').count() + usize::from(!path.is_empty()),
+                path.iter().filter(|&&c| c == b'/').count() + usize::from(!path.is_empty()),
             )
         });
         let mut first_error = None;
         let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
-            let relative = RelativePath::new(path.as_bytes())?;
+            let relative = RelativePath::new(&path)?;
+            let label = String::from_utf8_lossy(&path).into_owned();
             let saved = widened.remove(&path);
             // Require the inode we widened before applying any final metadata.
             let result = (|| {
@@ -609,7 +636,7 @@ impl Engine {
                     let now = destination.root.metadata(&relative)?;
                     anyhow::ensure!(
                         (now.dev, now.ino) == (saved.dev, saved.ino),
-                        "directory {path} changed before restoring permissions"
+                        "directory {label} changed before restoring permissions"
                     );
                 }
                 if let Some((meta, mode, explicit)) = &metadata {
@@ -643,7 +670,9 @@ impl Engine {
                         &destination.root,
                         &relative,
                         saved,
-                        std::path::Path::new(&path),
+                        std::path::Path::new(
+                            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path),
+                        ),
                     ) {
                         first_error.get_or_insert(error);
                     }
@@ -2819,7 +2848,7 @@ impl Engine {
             &self.args,
             existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
             explicit,
-            || self.file_permissions.lock().unwrap().for_file(root, &path),
+            || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
         )?;
         let m = file.metadata()?;
         if self.args.ignore_existing
@@ -2950,7 +2979,7 @@ impl Engine {
             })
             .await??;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
-                self.file_permissions.lock().unwrap().for_file(root, path)
+                local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
             })?;
             let m = file.metadata()?;
             if self.args.ignore_existing
