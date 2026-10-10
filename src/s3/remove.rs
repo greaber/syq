@@ -7,6 +7,12 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::Client;
+use aws_smithy_runtime_api::{
+    box_error::BoxError,
+    client::interceptors::{context::BeforeSerializationInterceptorContextRef, Intercept},
+    http::NonUtf8HeaderHandling,
+};
+use aws_smithy_types::config_bag::ConfigBag;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -147,8 +153,35 @@ async fn versions(client: &Client, bucket: &str, prefix: &str, exact: bool) -> R
     Ok(entries)
 }
 
+// Removal only needs the response status. Scope this to its existence probe:
+// HEAD and GET requests that copy metadata must still reject unreadable values.
+#[derive(Debug)]
+struct SkipUnusedHeaders;
+impl Intercept for SkipUnusedHeaders {
+    fn name(&self) -> &'static str {
+        "SkipUnusedHeaders"
+    }
+    fn read_before_execution(
+        &self,
+        _: &BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        cfg.interceptor_state()
+            .store_put(NonUtf8HeaderHandling::Skip);
+        Ok(())
+    }
+}
+
 async fn present(client: &Client, bucket: &str, key: &str) -> Result<bool> {
-    match client.head_object().bucket(bucket).key(key).send().await {
+    match client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .customize()
+        .interceptor(SkipUnusedHeaders)
+        .send()
+        .await
+    {
         Ok(_) => Ok(true),
         Err(error)
             if error

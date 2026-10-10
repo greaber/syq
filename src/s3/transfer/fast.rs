@@ -217,8 +217,11 @@ impl Engine {
                                 retry_delay = Some(crate::s3::retry::error_delay(attempt, &e));
                                 anyhow::Error::new(e.into_service_error())
                             } else {
-                                Permanent(format!("S3 GET failed: {}", e.into_service_error()))
-                                    .into()
+                                Permanent(format!(
+                                    "S3 GET failed: {}",
+                                    aws_smithy_types::error::display::DisplayErrorContext(&e)
+                                ))
+                                .into()
                             }
                         })?;
                     answered = true;

@@ -20,7 +20,28 @@ impl HttpConnector for Requests {
             .unwrap()
             .push((method.clone(), uri.clone(), body.clone()));
         HttpConnectorFuture::new(async move {
-            let mut response = if method == "DELETE" {
+            let mut response = if method == "HEAD" {
+                let key = uri.rsplit('/').next().unwrap();
+                let status = match key {
+                    "missing" => 404,
+                    "denied" => 403,
+                    "unavailable" => 503,
+                    _ => 200,
+                };
+                let header = if key == "content-disposition" {
+                    "content-disposition"
+                } else {
+                    "x-amz-meta-label"
+                };
+                HttpResponse::try_from(
+                    http::Response::builder()
+                        .status(status)
+                        .header(header, http::HeaderValue::from_bytes(b"caf\xe9").unwrap())
+                        .body(SdkBody::empty())
+                        .unwrap(),
+                )
+                .unwrap()
+            } else if method == "DELETE" {
                 let mut response = HttpResponse::new(204.try_into().unwrap(), SdkBody::empty());
                 let url = url::Url::parse(&uri).unwrap();
                 if let Some((_, id)) = url.query_pairs().find(|(key, _)| key == "versionId") {
@@ -56,6 +77,45 @@ impl HttpConnector for Requests {
     }
 }
 
+fn client(transport: Requests, endpoint: &str) -> Client {
+    Client::from_conf(
+        aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "fixture",
+            ))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .http_client(http_client_fn(move |_, _| {
+                SharedHttpConnector::new(transport.clone())
+            }))
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn removal_ignores_unreadable_metadata_only_for_its_existence_check() {
+    let requests = Requests(Arc::new(Mutex::new(Vec::new())));
+    let client = client(requests, "https://storage.example");
+    for key in ["content-disposition", "x-amz-meta-label"] {
+        assert!(present(&client, "bucket", key).await.unwrap());
+        // The same client must still reject unreadable metadata on a copy HEAD.
+        assert!(client
+            .head_object()
+            .bucket("bucket")
+            .key(key)
+            .send()
+            .await
+            .is_err());
+    }
+    assert!(!present(&client, "bucket", "missing").await.unwrap());
+    for key in ["denied", "unavailable"] {
+        assert!(present(&client, "bucket", key).await.is_err(), "{key}");
+    }
+}
+
 #[tokio::test]
 async fn tigris_version_deletion_uses_individual_requests_and_other_deletion_stays_batched() {
     for (endpoint, tigris) in [
@@ -87,21 +147,7 @@ async fn tigris_version_deletion_uses_individual_requests_and_other_deletion_sta
             .unwrap();
             for authorized in [false, true] {
                 let requests = Requests(Arc::new(Mutex::new(Vec::new())));
-                let transport = requests.clone();
-                let config = aws_sdk_s3::config::Builder::new()
-                    .behavior_version_latest()
-                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
-                    .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                        "test", "test", None, None, "fixture",
-                    ))
-                    .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
-                    .endpoint_url(endpoint)
-                    .force_path_style(true)
-                    .http_client(http_client_fn(move |_, _| {
-                        SharedHttpConnector::new(transport.clone())
-                    }))
-                    .build();
-                let client = Client::from_conf(config);
+                let client = client(requests.clone(), endpoint);
                 let targets: Vec<_> = (1..=if flag == Some("--s3-version-id=v1") {
                     1
                 } else {
