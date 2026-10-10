@@ -361,13 +361,12 @@ pub(super) fn enroll(
             .map(|(metadata, _, _)| metadata.id.to_string());
         bail!(privileged_receiver_message(existing.as_deref()));
     }
-    if !refresh_existing {
-        if active
+    if !refresh_existing
+        && active
             .as_ref()
             .is_some_and(|(metadata, _, _)| metadata.version == CONFIG_VERSION)
-        {
-            return Ok(active.take().unwrap());
-        }
+    {
+        return Ok(active.take().unwrap());
     }
     let retry_state = if active.is_some() {
         "remains active with its previous metadata; the receiver refresh can be retried"
