@@ -127,6 +127,97 @@ def verify(source, destination):
     assert actual['file']['inode'] == actual['alias']['inode'], actual
 
 
+def tree_snapshot(directory):
+    """Contents, metadata, and link groups beneath a destination directory."""
+    import json
+    return json.loads(remote(f'''
+import hashlib, json, os
+from pathlib import Path
+root = Path({str(directory)!r})
+result = {{}}
+inodes = {{}}
+paths = sorted(root.rglob('*'))
+# Listing a directory changes its access time, and reading a file changes
+# that of every name it has, so record every entry before reading any.
+for path in paths:
+    s = path.lstat()
+    key = str(path.relative_to(root))
+    entry = {{'mode': s.st_mode & 0o7777, 'mtime': s.st_mtime_ns,
+        'xattrs': {{n: os.getxattr(path, n).hex() for n in os.listxattr(path)}},
+        'link': inodes.setdefault(s.st_ino, key)}}
+    if path.is_file():
+        entry['atime'] = s.st_atime_ns
+        entry['sparse'] = s.st_blocks * 512 < s.st_size // 4
+    result[key] = entry
+for path in paths:
+    if path.is_file():
+        result[str(path.relative_to(root))]['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+print(json.dumps(result))
+'''))
+
+
+def restricted_copies():
+    """A restricted receiver applies the metadata an ordinary copy does, and
+    links a new name to a file an earlier copy left."""
+    import shlex
+    source = '/tmp/syq-real-ssh/restricted-metadata-source'
+    build = f'''
+import os, struct
+from pathlib import Path
+root = Path({source!r})
+(root / 'dir').mkdir(parents=True)
+acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in
+    [(1,7,0xffffffff),(2,6,12345),(4,5,0xffffffff),(16,4,0xffffffff),(32,0,0xffffffff)])
+file = root / 'dir' / 'file'
+with file.open('wb') as handle:
+    handle.write(b'x' * 9001)
+    handle.seek(4 * 1024 * 1024)
+    handle.write(b'y' * 31)
+    handle.truncate(8 * 1024 * 1024)
+os.link(file, root / 'dir' / 'alias')
+os.setxattr(file, 'user.binary', b'\\x00\\xffbytes')
+os.setxattr(file, 'user.empty', b'')
+os.setxattr(file, 'system.posix_acl_access', acl)
+os.setxattr(root / 'dir', 'system.posix_acl_default', acl)
+os.utime(file, ns=(1_000_000_000_123456789, file.stat().st_mtime_ns))
+'''
+    subprocess.run(['ssh', 'source', 'python3 -c ' + shlex.quote(build)], check=True, timeout=20)
+    options = ['--copy-metadata=mtime,permissions,hardlinks,acls,xattrs,atimes',
+               '--open-noatime', '--sparse', '--no-progress']
+    copies = {}
+    for receiver, route in [('restricted', []), ('ordinary', ['--coordinate-at', 'local'])]:
+        destination = f'/tmp/syq-real-ssh/{receiver}-metadata'
+        subprocess.run(['syq', 'cp', *options, *route, '--from', 'source', '--srcs-in', source,
+                        '--to', 'destination', '--into', destination], check=True, timeout=60)
+        copies[receiver] = tree_snapshot(destination)
+    restricted = copies['restricted']
+    assert restricted == copies['ordinary'], copies
+    assert restricted['dir/alias']['link'] == 'dir/alias', restricted
+    assert restricted['dir/file']['link'] == 'dir/alias', restricted
+    assert restricted['dir/file']['sparse'], restricted
+    assert restricted['dir/file']['atime'] == 1_000_000_000_123456789, restricted
+    assert {'user.binary', 'user.empty', 'system.posix_acl_access'} <= restricted['dir/file']['xattrs'].keys(), restricted
+
+    subprocess.run(['ssh', 'source', f'ln {source}/dir/file {source}/dir/third'], check=True, timeout=20)
+    destination = '/tmp/syq-real-ssh/restricted-metadata'
+    before = remote(f'import os; print(os.stat({destination + "/dir/file"!r}).st_ino)')
+    subprocess.run(['syq', 'cp', *options, '--from', 'source', '--srcs-in', source,
+                    '--to', 'destination', '--into', destination], check=True, timeout=60)
+    after = remote(f'''
+import os
+print(' '.join(str(os.stat({destination!r} + '/dir/' + name).st_ino) for name in ('file', 'alias', 'third')))
+''')
+    assert after.split() == [before.strip()] * 3, (before, after)
+    # Later core cases expect the destination to have no enrollment.
+    import json
+    for record in (Path.home() / '.local/state/syq/restricted').glob('*/metadata.json'):
+        enrollment = json.loads(record.read_bytes())
+        if enrollment['requested_parent'] == '/tmp/syq-real-ssh':
+            subprocess.run(['syq', 'receiver', 'revoke', bytes(enrollment['id']).hex()],
+                           check=True, timeout=30)
+    print('Restricted receivers copy metadata as ordinary receivers do', flush=True)
+
+
 def failed_copies():
     import hashlib
     import json
@@ -228,5 +319,6 @@ print(any(f.open('rb').read(4 << 20) == {data[:256]!r} * (4 * 4096) for f in p.g
 
 if __name__ == '__main__':
     successful_copies()
+    restricted_copies()
     failed_copies()
     print('Metadata reconciliation, failures, and recovery passed', flush=True)

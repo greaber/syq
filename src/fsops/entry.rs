@@ -199,6 +199,7 @@ impl FsOps {
         root: &[u8],
         source: Option<&RegisteredPath>,
         follow_root: bool,
+        guard: Option<&ContainerGuard>,
         entries: &mut [Entry],
     ) -> Result<()> {
         if !self.inode_preservation.any() {
@@ -211,6 +212,7 @@ impl FsOps {
                 &path,
                 reference.as_ref(),
                 follow_root && entry.path.is_empty(),
+                guard,
                 entry,
             )?;
         }
@@ -222,6 +224,7 @@ impl FsOps {
         path: &[u8],
         source: Option<&RegisteredPath>,
         follow: bool,
+        guard: Option<&ContainerGuard>,
         entry: &mut Entry,
     ) -> Result<()> {
         if !self.inode_preservation.any() {
@@ -241,6 +244,11 @@ impl FsOps {
         }
         let file = if let Some(source) = source {
             let target = self.registered_source_target(source)?;
+            target.root.open_metadata(&target.relative)?
+        } else if let Some(guard) = guard {
+            // A confined receiver reads what it was asked about beneath its
+            // root, never through a link to a name elsewhere.
+            let target = super::apply::guarded_target_unheld(path, guard)?;
             target.root.open_metadata(&target.relative)?
         } else if let Some(target) = self.rooted_destination_target(path, None)? {
             target.root.open_metadata(&target.relative)?
@@ -299,16 +307,13 @@ impl FsOps {
         }
         let mut entries = self.stat_many_unadorned_request(paths, sources, follow, guard)?;
         if self.inode_preservation.any() {
-            anyhow::ensure!(
-                guard.is_none(),
-                "signed receivers do not support ACL or xattr preservation"
-            );
             for (index, entry) in entries.iter_mut().enumerate() {
                 if let Some(entry) = entry {
                     self.capture_entry_metadata(
                         &paths[index],
                         sources.map(|s| &s[index]),
                         follow,
+                        guard,
                         entry,
                     )?;
                 }

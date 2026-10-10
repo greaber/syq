@@ -1326,11 +1326,15 @@ impl Receiver {
                     }
                 }
                 let generation = self.generation.load(Ordering::Acquire);
-                let automatic = self.auto_approve_root.as_ref().is_some_and(|root| {
-                    destination.starts_with(root)
-                        && !(destination == *root
-                            && request.copy.policy.placement == DestinationPlacement::ExactPath)
-                });
+                // ACLs, extended attributes and hard links reach beyond the
+                // files being written, so they always ask.
+                let extra = &request.constraints.extra_options;
+                let automatic = !(extra.acls || extra.xattrs || extra.hardlinks)
+                    && self.auto_approve_root.as_ref().is_some_and(|root| {
+                        destination.starts_with(root)
+                            && !(destination == *root
+                                && request.copy.policy.placement == DestinationPlacement::ExactPath)
+                    });
                 if automatic {
                     // Anchor the filesystem executor above the automatic root. Its
                     // no-follow traversal and signed scopes keep every operation

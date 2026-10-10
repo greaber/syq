@@ -78,7 +78,9 @@ See [Make TCP reachable](server-tuning.md#make-tcp-reachable) for server setup.
 
 By default, each incoming copy waits for approval **on your laptop**. The prompt
 names the server and the directory the command ran in, then shows what is
-copied where and the server's syq command; choose **Allow once** or **Deny**.
+copied where, a warning for each option that lets the server do more than copy
+files (such as pruning or copying permissions), and the server's syq command;
+choose **Allow once** or **Deny**.
 To see the complete request, including its limits, run
 `syq persist receive pending` in a local terminal. You can also approve or
 deny there:
@@ -128,7 +130,8 @@ Choose a directory for downloads that do not need approval:
 syq persist receive on --name laptop --auto-approve-root ~/Downloads/server
 ```
 
-Downloads confined to that directory need no approval; downloads elsewhere ask.
+Downloads confined to that directory need no approval; downloads elsewhere ask,
+as do downloads that copy ACLs, extended attributes, or hard links.
 `--root`, if configured, remains a hard boundary even with approval.
 Automatic approval trusts all processes running as the connected server accounts,
 including for overwrites inside that directory. You can
