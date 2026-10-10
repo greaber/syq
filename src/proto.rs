@@ -1380,19 +1380,18 @@ pub enum WireRequest<Data> {
 
 /// A non-fatal scan problem. `path` is where it happened, relative to the
 /// scanned root, as bytes: callers match it against paths they know, so it is
-/// never recovered from the message.
+/// never recovered from the message. `error` is the failure alone, and
+/// `message` the whole warning as shown.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ScanWarning {
     pub path: Option<PathBytes>,
     pub error: String,
+    pub message: String,
 }
 
 impl std::fmt::Display for ScanWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.path {
-            Some(path) => write!(f, "scan: {}: {}", String::from_utf8_lossy(path), self.error),
-            None => write!(f, "scan: {}", self.error),
-        }
+        f.write_str(&self.message)
     }
 }
 
