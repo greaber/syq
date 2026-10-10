@@ -4,7 +4,7 @@
 //! it, so under such a grant a hard link may give a new name only to a file
 //! this receiver created for the grant. The receiver records those files
 //! here by device and inode, read from the file it just created or
-//! published.
+//! published, and only when the grant copies hard links.
 //!
 //! Checking the link's identity before linking needs no lock held across
 //! the link. The publication links only the file with that identity: on
