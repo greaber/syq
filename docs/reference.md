@@ -342,7 +342,10 @@ partial file at the file's full size, so one is kept even when little was
 written to it. Remote copies, and copies with a bandwidth cap or
 `--performance-tuning copy-path=ranges`, reuse matching data from them. A copy
 within one machine that copies files whole does not: rerunning it copies those
-files whole again, so their partial files are removed.
+files whole again, so their partial files are removed. Nor does a copy to a
+filesystem whose link counts syq cannot trust, such as SSHFS, an rclone mount,
+FAT, or any filesystem it does not recognize: there it cannot rule out that a
+partial file has other names, so it starts those files over.
 
 Partial files may remain after a successful retry, as can temporary files
 left by a copy that was killed. To remove them:
@@ -423,8 +426,10 @@ S3 object when no usable stored hash is available. Copying `mtime` lets later
 runs use the size/time comparison. Other metadata can be selected the same way, for example
 `--copy-metadata=permissions,ownership`. `times` remains an alias for `mtime`.
 Explicit mapping `metadata.mtime` also sets the requested destination time.
-On SSHFS, setting a symlink's modification time would change the file it points
-to instead, so syq leaves symlink times alone on filesystems that behave that way.
+Syq sets symlink modification times only on filesystems where it knows the call
+sets the link itself, such as ext4, XFS, btrfs, ZFS, NFS and APFS. Elsewhere it
+leaves them alone: on SSHFS, for example, the call would change the file the link
+points to instead.
 S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 

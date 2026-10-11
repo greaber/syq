@@ -1663,6 +1663,22 @@ fn only_recovery_entry(directory: &Path, error: &str) -> PathBuf {
     directory.join(&kept[0])
 }
 
+/// Stand in for a filesystem without exchange, an atomic no-replace rename
+/// or hard links.
+fn assume_missing(root: &Root, exchange: bool, no_replace_rename: bool, links: bool) {
+    let mut profile = root.profile();
+    profile.exchange &= !exchange;
+    profile.atomic_no_replace_rename &= !no_replace_rename;
+    profile.hard_links &= !links;
+    root.assume_profile_for_test(profile);
+}
+
+fn assume_untrusted_link_counts(root: &Root) {
+    let mut profile = root.profile();
+    profile.link_counts_trusted = false;
+    root.assume_profile_for_test(profile);
+}
+
 /// The names in `directory`, sorted.
 fn sorted_names(directory: &Path) -> Vec<String> {
     let mut names: Vec<_> = fs::read_dir(directory)
@@ -1682,7 +1698,7 @@ fn matched_replacement_without_exchange_moves_the_expected_entry_aside() {
     for no_replace_rename in [false, true] {
         let tree = TestDir::new("matched-without-exchange");
         let root = Root::open(tree.path()).unwrap();
-        root.assume_missing_publication_support_for_test(true, no_replace_rename, false);
+        assume_missing(&root, true, no_replace_rename, false);
 
         let (staged, target) = (relative(b"staged"), relative(b"target"));
         fs::write(tree.path().join("staged"), b"new").unwrap();
@@ -1791,7 +1807,7 @@ fn matched_file_and_symlink_replacement_work_on_this_filesystem() {
 fn matched_replacement_without_exchange_puts_an_unexpected_entry_back() {
     let tree = TestDir::new("matched-without-exchange-unexpected");
     let root = Root::open(tree.path()).unwrap();
-    root.assume_missing_publication_support_for_test(true, false, false);
+    assume_missing(&root, true, false, false);
     let (staged, target) = (relative(b"staged"), relative(b"target"));
     fs::write(tree.path().join("staged"), b"new").unwrap();
     fs::write(tree.path().join("target"), b"old").unwrap();
@@ -1837,7 +1853,7 @@ fn matched_replacement_without_exchange_puts_an_unexpected_entry_back() {
 fn matched_replacement_without_exchange_keeps_what_a_later_writer_displaced() {
     let tree = TestDir::new("matched-without-exchange-later-writer");
     let root = Root::open(tree.path()).unwrap();
-    root.assume_missing_publication_support_for_test(true, false, false);
+    assume_missing(&root, true, false, false);
     let (staged, target) = (relative(b"staged"), relative(b"target"));
     fs::write(tree.path().join("staged"), b"new").unwrap();
     fs::write(tree.path().join("target"), b"old").unwrap();
@@ -1883,9 +1899,9 @@ fn absent_publication_falls_back_without_rename_flags_or_links() {
         let label = format!("{no_replace_rename} {links} {untrusted}");
         let tree = TestDir::new("absent-publication-fallback");
         let root = Root::open(tree.path()).unwrap();
-        root.assume_missing_publication_support_for_test(false, no_replace_rename, links);
+        assume_missing(&root, false, no_replace_rename, links);
         if untrusted {
-            root.assume_untrusted_link_counts_for_test();
+            assume_untrusted_link_counts(&root);
         }
         let (staged, target) = (relative(b"staged"), relative(b"target"));
         fs::write(tree.path().join("staged"), b"staged").unwrap();
@@ -1913,23 +1929,12 @@ fn absent_publication_falls_back_without_rename_flags_or_links() {
     }
 }
 
-/// The probe for filesystems that set a symlink's target when asked for the
-/// link's times finds that a local filesystem sets the link, and leaves no
-/// names behind.
-#[test]
-fn symlink_time_probe_leaves_nothing_behind() {
-    let tree = TestDir::new("symlink-time-probe");
-    let directory = File::open(tree.path()).unwrap();
-    assert!(!probe_symlink_times_follow(directory.as_raw_fd()));
-    assert!(sorted_names(tree.path()).is_empty());
-}
-
 #[test]
 fn absent_publication_never_unlinks_a_later_writer() {
     let tree = TestDir::new("absent-publication-race");
     let root = Root::open(tree.path()).unwrap();
     // The race is between the link and the removal of the staged name.
-    root.assume_missing_publication_support_for_test(false, true, false);
+    assume_missing(&root, false, true, false);
     let staged = relative(b"staged");
     let target = relative(b"target");
     fs::write(tree.path().join("staged"), b"staged").unwrap();

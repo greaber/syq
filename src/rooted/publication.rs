@@ -1,66 +1,42 @@
 //! Publishing a name where a filesystem lacks an atomic rename flag or hard
-//! links, learned per root as syq uses them.
+//! links.
 //!
 //! Exchange (`RENAME_EXCHANGE`, macOS `RENAME_SWAP`) is missing on HFS+,
 //! exFAT, NFS, SMB and FUSE filesystems such as SSHFS. A no-replace rename
-//! (`RENAME_NOREPLACE`, macOS `RENAME_EXCL`) is missing on most of those
-//! too, and hard links are missing on FAT, exFAT and rclone mounts. Each
-//! operation is tried first; a filesystem that refuses one as unsupported
-//! is remembered, so later publications skip straight to the fallback.
+//! (`RENAME_NOREPLACE`, macOS `RENAME_EXCL`) is not atomic on most of those,
+//! and hard links are missing on FAT, exFAT and rclone mounts. The
+//! filesystem's profile (`fsops::Profile`) says which to try; one that a
+//! filesystem refuses anyway is remembered, and later publications go
+//! straight to the fallback.
 
 use super::{metadata_at, rename_noreplace, retry_zero, RootMetadata};
+use crate::fsops::Profile;
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-// Zero, the default, means not yet known.
-const SUPPORTED: u8 = 1;
-const UNSUPPORTED: u8 = 2;
-
-/// One operation's support, learned from its first conclusive result.
+/// An operation a filesystem refused although its profile allowed it.
 #[derive(Default)]
-pub(super) struct Learned(AtomicU8);
+pub(super) struct Learned(AtomicBool);
 
 impl Learned {
     pub(super) fn unsupported(&self) -> bool {
-        self.0.load(Ordering::Relaxed) == UNSUPPORTED
+        self.0.load(Ordering::Relaxed)
     }
 
-    pub(super) fn record(&self, supported: bool) {
-        self.0.store(
-            if supported { SUPPORTED } else { UNSUPPORTED },
-            Ordering::Relaxed,
-        );
+    pub(super) fn record_refusal(&self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
-/// What the root's filesystem has shown it supports.
+/// Rename flags and links that a filesystem refused although its profile
+/// allowed them, as an older ZFS refuses exchange.
 #[derive(Default)]
 pub(super) struct Capabilities {
     pub(super) exchange: Learned,
     pub(super) no_replace_rename: Learned,
     pub(super) links: Learned,
-}
-
-impl Capabilities {
-    /// Tests stand in for filesystems that lack these operations.
-    pub(super) fn new() -> Self {
-        let capabilities = Self::default();
-        #[cfg(debug_assertions)]
-        {
-            if std::env::var_os("SYQ_TEST_NO_RENAME_EXCHANGE").is_some() {
-                capabilities.exchange.record(false);
-            }
-            if std::env::var_os("SYQ_TEST_NO_RENAME_NOREPLACE").is_some() {
-                capabilities.no_replace_rename.record(false);
-            }
-            if std::env::var_os("SYQ_TEST_NO_HARD_LINKS").is_some() {
-                capabilities.links.record(false);
-            }
-        }
-        capabilities
-    }
 }
 
 /// Whether a rename-flag call failed because the filesystem does not
@@ -108,12 +84,13 @@ pub(super) struct Placement<'a> {
 /// Give `from` the name `to` without replacing anything already there,
 /// failing with `EEXIST` when `to` exists. Tries, in turn:
 ///
-/// 1. an atomic no-replace rename, where the filesystem implements it
-///    atomically: local filesystems on Linux, and macOS volumes that
-///    advertise it. A network filesystem may check the target itself and
-///    then tell its server to replace (SMB), or ignore the flag (one of
-///    rclone's mount modes), so those skip to linking;
-/// 2. a hard link, which servers create atomically, when allowed;
+/// 1. an atomic no-replace rename, where the profile says the filesystem
+///    implements it atomically: verified local filesystems, and macOS
+///    volumes that advertise it. A network filesystem may check the target
+///    itself and then tell its server to replace (SMB), or ignore the flag
+///    (one of rclone's mount modes), so others skip to linking;
+/// 2. a hard link, which servers create atomically, when allowed and the
+///    filesystem may have links;
 /// 3. a check that `to` is absent, then a plain rename.
 ///
 /// The last step can replace only a name that appeared after its check.
@@ -123,7 +100,7 @@ pub(super) struct Placement<'a> {
 /// it may request renames an existing destination entry to another name.
 pub(super) fn move_without_replacing(
     capabilities: &Capabilities,
-    atomic_rename: bool,
+    profile: Profile,
     placement: &Placement<'_>,
 ) -> io::Result<Moved> {
     let Placement {
@@ -133,26 +110,20 @@ pub(super) fn move_without_replacing(
         to,
         allow_link,
     } = *placement;
-    if atomic_rename && !capabilities.no_replace_rename.unsupported() {
+    if profile.atomic_no_replace_rename && !capabilities.no_replace_rename.unsupported() {
         match rename_noreplace(from_directory, from, to_directory, to) {
-            Ok(()) => {
-                capabilities.no_replace_rename.record(true);
-                return Ok(Moved::Renamed);
-            }
+            Ok(()) => return Ok(Moved::Renamed),
             Err(error) if rename_flag_unsupported(&error) => {
-                capabilities.no_replace_rename.record(false);
+                capabilities.no_replace_rename.record_refusal();
             }
             Err(error) => return Err(error),
         }
     }
-    if allow_link && !capabilities.links.unsupported() {
+    if allow_link && profile.hard_links && !capabilities.links.unsupported() {
         match retry_zero(|| unsafe {
             libc::linkat(from_directory, from.as_ptr(), to_directory, to.as_ptr(), 0)
         }) {
-            Ok(()) => {
-                capabilities.links.record(true);
-                return Ok(Moved::Linked);
-            }
+            Ok(()) => return Ok(Moved::Linked),
             Err(error) if links_unavailable(&error) => {
                 // SSHFS reports a refused existing target as EPERM.
                 if metadata_at(to_directory, to).is_ok() {
@@ -160,7 +131,7 @@ pub(super) fn move_without_replacing(
                 }
                 // EIO may be transient; only a definite refusal is kept.
                 if error.raw_os_error() != Some(libc::EIO) {
-                    capabilities.links.record(false);
+                    capabilities.links.record_refusal();
                 }
             }
             Err(error) => return Err(error),

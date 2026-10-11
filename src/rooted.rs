@@ -224,12 +224,13 @@ pub(crate) struct Root {
     #[cfg(target_os = "linux")]
     bounds_replacement: OnceLock<bool>,
     network: OnceLock<bool>,
-    /// Which atomic renames and links the root's filesystem has shown it
-    /// supports.
+    /// The root filesystem's profile (see `profile`).
+    profile: OnceLock<crate::fsops::Profile>,
+    /// Rename flags the root's filesystems refused although their profile
+    /// allowed them.
     publication: publication::Capabilities,
-    link_counts_trusted: OnceLock<bool>,
-    /// Per device: whether setting a symlink's times would set its target's.
-    symlink_times_follow: Mutex<HashMap<u64, bool>>,
+    #[cfg(test)]
+    test_profile: Mutex<Option<crate::fsops::Profile>>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, target_os = "linux"))]
@@ -266,9 +267,10 @@ impl Root {
             #[cfg(target_os = "linux")]
             bounds_replacement: OnceLock::new(),
             network: OnceLock::new(),
-            publication: publication::Capabilities::new(),
-            link_counts_trusted: OnceLock::new(),
-            symlink_times_follow: Mutex::new(HashMap::new()),
+            profile: OnceLock::new(),
+            publication: publication::Capabilities::default(),
+            #[cfg(test)]
+            test_profile: Mutex::new(None),
             #[cfg(all(test, target_os = "linux"))]
             test_name_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, target_os = "linux"))]
@@ -337,123 +339,92 @@ impl Root {
         let _ = self.network.set(true);
     }
 
-    /// Whether the root's filesystem reports link counts and inode numbers
-    /// that checks can rely on (see `fsops::link_counts_trusted`). Where it
-    /// does not, a check made right after linking is skipped, and a rule
-    /// that looks for a file's other names must assume it may have some.
-    pub(crate) fn link_counts_trusted(&self) -> bool {
+    /// What syq relies on the filesystem `directory` is on for (see
+    /// `fsops::Profile`): the verified capabilities of a known filesystem
+    /// type, or the conservative profile for any other.
+    pub(crate) fn profile_of(&self, directory: &File) -> crate::fsops::Profile {
+        #[cfg(test)]
+        if let Some(profile) = *self.test_profile.lock().unwrap() {
+            return profile;
+        }
+        crate::fsops::profile(directory)
+    }
+
+    /// The profile of the root's own filesystem, cached.
+    pub(crate) fn profile(&self) -> crate::fsops::Profile {
+        #[cfg(test)]
+        if let Some(profile) = *self.test_profile.lock().unwrap() {
+            return profile;
+        }
         *self
-            .link_counts_trusted
-            .get_or_init(|| crate::fsops::link_counts_trusted(&self.directory))
+            .profile
+            .get_or_init(|| crate::fsops::profile(&self.directory))
     }
 
+    /// Whether the root's filesystem reports link counts and inode numbers
+    /// that checks can rely on. Where it does not, a rule that looks for a
+    /// file's other names must assume it may have some: the outside-names
+    /// rule of restricted receivers is to stage content changes and refuse
+    /// metadata-only changes in approved directories on such filesystems.
+    pub(crate) fn link_counts_trusted(&self) -> bool {
+        self.profile().link_counts_trusted
+    }
+
+    /// Stand in for a filesystem with `profile`.
     #[cfg(test)]
-    pub(crate) fn assume_untrusted_link_counts_for_test(&self) {
-        let _ = self.link_counts_trusted.set(false);
+    pub(crate) fn assume_profile_for_test(&self, profile: crate::fsops::Profile) {
+        *self.test_profile.lock().unwrap() = Some(profile);
     }
 
-    /// Stand in for a filesystem without exchange, no-replace rename or
-    /// hard links.
-    #[cfg(test)]
-    pub(crate) fn assume_missing_publication_support_for_test(
-        &self,
-        exchange: bool,
-        no_replace_rename: bool,
-        links: bool,
-    ) {
-        if exchange {
-            self.publication.exchange.record(false);
-        }
-        if no_replace_rename {
-            self.publication.no_replace_rename.record(false);
-        }
-        if links {
-            self.publication.links.record(false);
-        }
-    }
-
-    /// Whether a no-replace rename in `directory` is atomic. On Linux a
-    /// network filesystem may check the target itself and then tell its
-    /// server to replace (SMB), or ignore the flag (an rclone mount mode);
-    /// a macOS volume says whether it supports the flag.
-    fn no_replace_rename_is_atomic(&self, directory: RawFd) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = self;
-            crate::fsops::volume_capabilities(directory)
-                .is_some_and(|volume| volume.rename_exclusive)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = directory;
-            !self.on_network_file_system()
-        }
-    }
-
-    /// Give `from` the name `to` without replacing anything there; see
-    /// `publication::move_without_replacing`.
+    /// Give `from` the name `to` without replacing anything there, by the
+    /// steps `profile` allows; see `publication::move_without_replacing`.
     fn move_without_replacing(
         &self,
+        profile: crate::fsops::Profile,
         placement: &publication::Placement<'_>,
     ) -> io::Result<publication::Moved> {
-        let atomic = self.no_replace_rename_is_atomic(placement.to_directory);
-        publication::move_without_replacing(&self.publication, atomic, placement)
+        publication::move_without_replacing(&self.publication, profile, placement)
     }
 
-    /// Exchange two names atomically. Returns false, having changed
-    /// nothing, where the filesystem has no atomic exchange; that is
-    /// remembered, so later replacements go straight to the fallback.
+    /// Exchange two names atomically where `profile` says the filesystem
+    /// can. Returns false, having changed nothing, where it cannot; a
+    /// filesystem that refuses the call anyway (an older ZFS) is remembered,
+    /// so later replacements go straight to the fallback.
     fn exchange(
         &self,
+        profile: crate::fsops::Profile,
         old_parent: RawFd,
         old_name: &CStr,
         new_parent: RawFd,
         new_name: &CStr,
     ) -> io::Result<bool> {
-        if self.publication.exchange.unsupported() {
+        if !profile.exchange || self.publication.exchange.unsupported() {
             return Ok(false);
         }
         match rename_exchange(old_parent, old_name, new_parent, new_name) {
-            Ok(()) => {
-                self.publication.exchange.record(true);
-                Ok(true)
-            }
+            Ok(()) => Ok(true),
             Err(error) if publication::rename_flag_unsupported(&error) => {
-                self.publication.exchange.record(false);
+                self.publication.exchange.record_refusal();
                 Ok(false)
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Whether setting the times of a symlink in `directory`, on device
-    /// `dev`, would set its target's times instead. An SFTP server follows
-    /// the link, so on SSHFS the call changes the target, or fails when the
-    /// target does not exist. Local filesystems set the link itself; a
-    /// network filesystem is probed once per device, with a symlink whose
-    /// target cannot exist, in syq's own temporary names in `directory`.
-    pub(crate) fn symlink_times_follow(&self, directory: &File, dev: u64) -> bool {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("SYQ_TEST_SYMLINK_TIMES_FOLLOW").is_some() {
-            return true;
+    /// Whether to set the times of symlinks in `directory`, on device `dev`:
+    /// only where the call is known to set the link itself. An SFTP server
+    /// behind SSHFS follows the link and sets the target's times, or fails
+    /// when the target does not exist.
+    pub(crate) fn sets_symlink_times(&self, directory: &File, dev: u64) -> bool {
+        if dev == self.identity.dev {
+            self.profile().symlink_times
+        } else {
+            self.profile_of(directory).symlink_times
         }
-        if !crate::fsops::symlink_times_may_follow(directory, dev) {
-            return false;
-        }
-        if let Some(follow) = self.symlink_times_follow.lock().unwrap().get(&dev) {
-            return *follow;
-        }
-        let follow = probe_symlink_times_follow(directory.as_raw_fd());
-        self.symlink_times_follow
-            .lock()
-            .unwrap()
-            .insert(dev, follow);
-        follow
     }
 
-    /// Set a symlink's times, unless that would set its target's instead
-    /// (see `symlink_times_follow`); then leave them. Returns whether they
-    /// were set.
+    /// Set a symlink's times where `sets_symlink_times` allows; otherwise
+    /// leave them. Returns whether they were set.
     pub(crate) fn set_symlink_times(
         &self,
         path: &RelativePath,
@@ -461,7 +432,7 @@ impl Root {
     ) -> Result<bool> {
         let parent = self.resolve_parent(path)?;
         let dev = parent.directory.metadata()?.dev();
-        if self.symlink_times_follow(&parent.directory, dev) {
+        if !self.sets_symlink_times(&parent.directory, dev) {
             return Ok(false);
         }
         parent
@@ -1665,22 +1636,23 @@ impl Root {
             PublicationTestPoint::BeforeMatchedExchange,
         );
         let directory = parent.directory.as_raw_fd();
+        let profile = self.profile_of(&parent.directory);
         if !self
-            .exchange(directory, &temporary, directory, &parent.leaf)
+            .exchange(profile, directory, &temporary, directory, &parent.leaf)
             .inspect_err(|_| {
                 let _ = unlink_at(directory, &temporary, 0);
             })
             .with_context(|| format!("atomically replace confined path {}", path.label()))?
         {
             let aside = self
-                .publish_over_moved_aside(path, &parent, directory, &temporary, |entry| {
+                .publish_over_moved_aside(profile, path, &parent, directory, &temporary, |entry| {
                     publication::is_expected(entry, expected_dev, expected_ino, expected_type)
                 })
                 .inspect_err(|_| {
                     let _ = unlink_at(directory, &temporary, 0);
                 })?;
             let published = metadata_at(directory, &parent.leaf)?;
-            if self.link_counts_trusted()
+            if profile.link_counts_trusted
                 && (published.dev != replacement.dev
                     || published.ino != replacement.ino
                     || published.file_type() != expected_type
@@ -1774,17 +1746,19 @@ impl Root {
         use crate::proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
+        let parent = self.resolve_parent(target)?;
+        let profile = self.profile_of(&parent.directory);
         // Where names report their own inode numbers (SSHFS, rclone), the
         // representative's name need not show the number its file was
         // published with, so only its type can be checked.
-        if !opened.is_file() || (self.link_counts_trusted() && (opened.dev, opened.ino) != identity)
+        if !opened.is_file()
+            || (profile.link_counts_trusted && (opened.dev, opened.ino) != identity)
         {
             bail!(
                 "hardlink representative {} changed before publication",
                 source.label()
             );
         }
-        let parent = self.resolve_parent(target)?;
         let existing = match metadata_at(parent.directory.as_raw_fd(), &parent.leaf) {
             Ok(existing) => Some(existing),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1807,7 +1781,13 @@ impl Root {
             (MatchesFingerprint { .. }, _) => {
                 bail!("hardlink publication accepts no fingerprint condition")
             }
-            (_, Some(existing)) if (existing.dev, existing.ino) == identity => return Ok(()),
+            // Two names that seem to be one file are only taken for one
+            // where inode numbers can be trusted; elsewhere the link is made.
+            (_, Some(existing))
+                if profile.link_counts_trusted && (existing.dev, existing.ino) == identity =>
+            {
+                return Ok(())
+            }
             (_, Some(existing)) if existing.is_dir() => {
                 bail!("hardlink destination {} is a directory", target.label())
             }
@@ -1881,7 +1861,7 @@ impl Root {
             // Linux the link was still made from the checked descriptor.
             let linked = metadata_at(directory, &temporary)?;
             if !linked.is_file()
-                || (self.link_counts_trusted() && (linked.dev, linked.ino) != identity)
+                || (profile.link_counts_trusted && (linked.dev, linked.ino) != identity)
             {
                 bail!(
                     "hardlink representative {} changed while linking",
@@ -1903,10 +1883,11 @@ impl Root {
                 .with_context(|| format!("publish hardlink {}", target.label())),
                 Matches { dev, ino } => {
                     if !self
-                        .exchange(directory, &temporary, directory, &parent.leaf)
+                        .exchange(profile, directory, &temporary, directory, &parent.leaf)
                         .with_context(|| format!("publish hardlink {}", target.label()))?
                     {
                         let aside = self.publish_over_moved_aside(
+                            profile,
                             target,
                             &parent,
                             directory,
@@ -1942,8 +1923,14 @@ impl Root {
             }
         })();
         match (&result, condition) {
-            // A rename consumed the temporary name; anything else leaves it.
-            (Ok(()), Any) => {}
+            // A rename consumed the temporary name, unless the target was
+            // already a link to the same file: then POSIX makes the rename
+            // do nothing. That happens only where inode numbers cannot be
+            // trusted, as such names are not taken for one file there.
+            (Ok(()), Any) if profile.link_counts_trusted || existing.is_none() => {}
+            (Ok(()), Any) => {
+                let _ = unlink_at(directory, &temporary, 0);
+            }
             _ if consumed.get() => {}
             // What an exchange displaced is not ours to remove.
             (Err(_), Matches { dev, ino })
@@ -2006,16 +1993,20 @@ impl Root {
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
+        let profile = self.profile_of(&target_parent.directory);
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         let moved = self
-            .move_without_replacing(&publication::Placement {
-                from_directory: source_parent.directory.as_raw_fd(),
-                from: &source_parent.leaf,
-                to_directory: target_parent.directory.as_raw_fd(),
-                to: &target_parent.leaf,
-                allow_link: true,
-            })
+            .move_without_replacing(
+                profile,
+                &publication::Placement {
+                    from_directory: source_parent.directory.as_raw_fd(),
+                    from: &source_parent.leaf,
+                    to_directory: target_parent.directory.as_raw_fd(),
+                    to: &target_parent.leaf,
+                    allow_link: true,
+                },
+            )
             .with_context(|| {
                 format!(
                     "publish new confined path {} as {}",
@@ -2029,7 +2020,7 @@ impl Root {
         run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAbsentLink);
         // Where each name reports its own inode number and one link, as on
         // SSHFS, the published name cannot be compared with the staged file.
-        if self.link_counts_trusted() {
+        if profile.link_counts_trusted {
             let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
             let expected = match moved {
                 publication::Moved::Renamed => {
@@ -2093,10 +2084,12 @@ impl Root {
             target,
             PublicationTestPoint::BeforeMatchedExchange,
         );
+        let profile = self.profile_of(&target_parent.directory);
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         if !self
             .exchange(
+                profile,
                 source_parent.directory.as_raw_fd(),
                 &source_parent.leaf,
                 target_parent.directory.as_raw_fd(),
@@ -2105,6 +2098,7 @@ impl Root {
             .with_context(|| format!("atomically publish confined path {}", target.label()))?
         {
             let aside = self.publish_over_moved_aside(
+                profile,
                 target,
                 &target_parent,
                 source_parent.directory.as_raw_fd(),
@@ -2113,7 +2107,7 @@ impl Root {
             )?;
             #[cfg(any(target_os = "linux", test))]
             drop(permit);
-            if self.link_counts_trusted() {
+            if profile.link_counts_trusted {
                 let published =
                     metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
                 if !is_safe_staged_identity(published, staged_dev, staged_ino) {
@@ -2208,7 +2202,8 @@ impl Root {
             Ok(permit) => permit,
             Err(error) => return error.context(race),
         };
-        match self.move_to_recovery_name(parent.directory.as_raw_fd(), &parent.leaf) {
+        let profile = self.profile_of(&parent.directory);
+        match self.move_to_recovery_name(profile, parent.directory.as_raw_fd(), &parent.leaf) {
             Ok(Some(name)) => anyhow::anyhow!(
                 "{race}; kept the entry it displaced as {}",
                 sibling_label(staged, &name)
@@ -2225,18 +2220,26 @@ impl Root {
     /// it, never replacing anything there. `None` when the name is already
     /// empty. A rename moves exactly the entry at the name, whatever another
     /// writer may do to the name meanwhile; the recovery name is fresh.
-    fn move_to_recovery_name(&self, directory: RawFd, name: &CStr) -> Result<Option<CString>> {
+    fn move_to_recovery_name(
+        &self,
+        profile: crate::fsops::Profile,
+        directory: RawFd,
+        name: &CStr,
+    ) -> Result<Option<CString>> {
         for _ in 0..32 {
             let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
             let recovery = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
                 .expect("generated swap name contains no NUL");
-            match self.move_without_replacing(&publication::Placement {
-                from_directory: directory,
-                from: name,
-                to_directory: directory,
-                to: &recovery,
-                allow_link: false,
-            }) {
+            match self.move_without_replacing(
+                profile,
+                &publication::Placement {
+                    from_directory: directory,
+                    from: name,
+                    to_directory: directory,
+                    to: &recovery,
+                    allow_link: false,
+                },
+            ) {
                 Ok(_) => return Ok(Some(recovery)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2260,6 +2263,7 @@ impl Root {
     /// to check the publication and remove it.
     fn publish_over_moved_aside(
         &self,
+        profile: crate::fsops::Profile,
         target: &RelativePath,
         target_parent: &ResolvedParent<'_>,
         replacement_directory: RawFd,
@@ -2267,7 +2271,8 @@ impl Root {
         expected: impl Fn(RootMetadata) -> bool,
     ) -> Result<CString> {
         let directory = target_parent.directory.as_raw_fd();
-        let Some(aside) = self.move_to_recovery_name(directory, &target_parent.leaf)? else {
+        let Some(aside) = self.move_to_recovery_name(profile, directory, &target_parent.leaf)?
+        else {
             bail!(
                 "confined destination {} disappeared before publication",
                 target.label()
@@ -2283,13 +2288,16 @@ impl Root {
             )
         };
         let put_back = |race: &str| -> anyhow::Error {
-            match self.move_without_replacing(&publication::Placement {
-                from_directory: directory,
-                from: &aside,
-                to_directory: directory,
-                to: &target_parent.leaf,
-                allow_link: false,
-            }) {
+            match self.move_without_replacing(
+                profile,
+                &publication::Placement {
+                    from_directory: directory,
+                    from: &aside,
+                    to_directory: directory,
+                    to: &target_parent.leaf,
+                    allow_link: false,
+                },
+            ) {
                 Ok(_) => anyhow::anyhow!("confined destination {} {race}", target.label()),
                 Err(_) => kept(race),
             }
@@ -2299,13 +2307,16 @@ impl Root {
             Ok(_) => return Err(put_back("changed before publication")),
             Err(error) => return Err(put_back("could not be checked").context(error)),
         }
-        match self.move_without_replacing(&publication::Placement {
-            from_directory: replacement_directory,
-            from: replacement,
-            to_directory: directory,
-            to: &target_parent.leaf,
-            allow_link: false,
-        }) {
+        match self.move_without_replacing(
+            profile,
+            &publication::Placement {
+                from_directory: replacement_directory,
+                from: replacement,
+                to_directory: directory,
+                to: &target_parent.leaf,
+                allow_link: false,
+            },
+        ) {
             Ok(_) => Ok(aside),
             // A later writer took the name: theirs stays, and so does the
             // entry this replacement was to replace.
@@ -3068,61 +3079,6 @@ fn create_temporary_in(
     bail!("could not allocate a replacement sidecar name")
 }
 
-/// Find out whether setting a symlink's times in `directory` sets its
-/// target's instead: make a private file and a symlink to a path below that
-/// file, which cannot exist, and set the link's times. A filesystem that
-/// follows the link fails; one that sets the link succeeds. Anything else
-/// counts as following, so that a target is never touched. The probe's
-/// names are removed again.
-fn probe_symlink_times_follow(directory: RawFd) -> bool {
-    let Ok(file) = create_temporary_in(directory, |fd, name| {
-        open_at(
-            fd,
-            name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-        .map(drop)
-    }) else {
-        return true;
-    };
-    let mut target = file.as_bytes().to_vec();
-    target.extend_from_slice(b"/absent");
-    let target = CString::new(target).expect("generated name contains no NUL");
-    let link = create_temporary_in(directory, |fd, name| {
-        retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
-    });
-    let follow = match &link {
-        Ok(link) => {
-            let times = [
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_OMIT,
-                },
-                libc::timespec {
-                    tv_sec: 1_000_000_000,
-                    tv_nsec: 0,
-                },
-            ];
-            retry_zero(|| unsafe {
-                libc::utimensat(
-                    directory,
-                    link.as_ptr(),
-                    times.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            })
-            .is_err()
-        }
-        Err(_) => true,
-    };
-    if let Ok(link) = &link {
-        let _ = unlink_at(directory, link, 0);
-    }
-    let _ = unlink_at(directory, &file, 0);
-    follow
-}
-
 /// The label of `name` in the directory that holds `path`.
 fn sibling_label(path: &RelativePath, name: &CStr) -> String {
     let mut components = path.components.clone();
@@ -3202,9 +3158,10 @@ fn rename_exchange(
     })
 }
 
-/// Only volumes that advertise `RENAME_SWAP` are asked to swap: a FAT32
-/// volume completes the call as a plain rename over the target, losing it,
-/// and reports success. Others refuse it here with `ENOTSUP`, as HFS+ does.
+/// Only volumes whose profile allows it (they advertise `RENAME_SWAP`) are
+/// asked to swap: a FAT32 volume completes the call as a plain rename over
+/// the target, losing it, and reports success. Others are refused here with
+/// `ENOTSUP`, as HFS+ refuses the call itself.
 #[cfg(target_os = "macos")]
 fn rename_exchange(
     old_parent: RawFd,
@@ -3212,9 +3169,7 @@ fn rename_exchange(
     new_parent: RawFd,
     new_name: &CStr,
 ) -> io::Result<()> {
-    let swaps = |directory| {
-        crate::fsops::volume_capabilities(directory).is_some_and(|volume| volume.rename_swap)
-    };
+    let swaps = |directory| crate::fsops::macos_profile(directory).exchange;
     if !swaps(old_parent) || (new_parent != old_parent && !swaps(new_parent)) {
         return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
     }

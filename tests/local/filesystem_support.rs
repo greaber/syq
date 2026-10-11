@@ -173,27 +173,76 @@ fn symlink_times_are_left_where_setting_them_follows_the_link() {
     assert_eq!(names(&t.path("dst")), ["dangling", "file", "link"]);
 }
 
-/// The probe for that behavior runs on a filesystem that sets the link
-/// itself, finds so, sets the link's time and leaves no names behind.
+/// On a verified local filesystem the link's own times are set.
 #[test]
-fn symlink_time_probe_finds_a_local_filesystem_sets_the_link() {
+fn symlink_times_are_set_on_verified_filesystems() {
     let t = Tmp::new();
     fs::create_dir(t.path("src")).unwrap();
     write(&t.path("src/file"), b"file");
     std::os::unix::fs::symlink("file", t.path("src/link")).unwrap();
-    let link_time = 1_100_000_000;
-    set_link_mtime(&t.path("src/link"), link_time);
+    set_link_mtime(&t.path("src/link"), 1_100_000_000);
     fs::create_dir(t.path("dst")).unwrap();
     let output = native_with_env(
         &["cp", "--srcs-in", &t.s("src"), "--into", &t.s("dst")],
-        &["SYQ_TEST_NETWORK_FILESYSTEM"],
+        &[],
     );
     assert_ok(&output);
     assert_eq!(
         fs::symlink_metadata(t.path("dst/link")).unwrap().mtime(),
-        link_time
+        1_100_000_000
     );
-    assert_eq!(names(&t.path("dst")), ["file", "link"]);
+}
+
+/// A filesystem syq does not know gets the conservative profile: no
+/// exchange, the no-replace fallback chain, untrusted link counts and no
+/// symlink times. Copies there still come out right.
+#[test]
+fn copies_are_complete_with_the_conservative_profile() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/a"), b"linked");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    write(&t.path("src/large"), &vec![3u8; 3 << 20]);
+    std::os::unix::fs::symlink("a", t.path("src/link")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let conservative = ["SYQ_TEST_CONSERVATIVE_FILESYSTEM"];
+    let output = native_with_env(
+        &["rsync", "-rltH", &t.s("src/"), &t.s("dst/")],
+        &conservative,
+    );
+    assert_ok(&output);
+    assert_eq!(
+        fs::metadata(t.path("dst/a")).unwrap().ino(),
+        fs::metadata(t.path("dst/b")).unwrap().ino()
+    );
+    assert_eq!(read(&t.path("dst/large")), vec![3u8; 3 << 20]);
+    assert_eq!(fs::read_link(t.path("dst/link")).unwrap(), Path::new("a"));
+    // Unchanged files stay unchanged on a second run, and an update
+    // replaces exactly the files that changed.
+    write(&t.path("src/large"), &vec![4u8; 3 << 20]);
+    set_mtime(&t.path("src/large"), 1_300_000_000);
+    let output = native_with_env(
+        &["rsync", "-rltH", &t.s("src/"), &t.s("dst/")],
+        &conservative,
+    );
+    assert_ok(&output);
+    assert_eq!(read(&t.path("dst/large")), vec![4u8; 3 << 20]);
+    assert_eq!(names(&t.path("dst")), ["a", "b", "large", "link"]);
+    // New files without replacing anything.
+    fs::create_dir(t.path("new")).unwrap();
+    let output = native_with_env(
+        &[
+            "cp",
+            "--if-exists=error",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("new"),
+        ],
+        &conservative,
+    );
+    assert_ok(&output);
+    assert_eq!(names(&t.path("new")), ["a", "b", "large", "link"]);
 }
 
 /// On FAT, which keeps two-second modification times, a file whose time

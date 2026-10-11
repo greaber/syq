@@ -49,10 +49,8 @@ mod small_batch;
 pub(crate) use apply::*;
 pub(crate) use entry::*;
 #[cfg(target_os = "macos")]
-pub(crate) use fs_caps::volume_capabilities;
-pub(crate) use fs_caps::{
-    kind_has_two_second_mtimes, link_counts_trusted, symlink_times_may_follow,
-};
+pub(crate) use fs_caps::macos_profile;
+pub(crate) use fs_caps::{kind_has_two_second_mtimes, profile, Profile};
 pub(crate) use limits::*;
 pub(crate) use operator::*;
 pub(crate) use partial::*;
@@ -217,8 +215,8 @@ struct FileSystemTraits {
     synchronous: bool,
     measured_local_source: bool,
     local_userspace_copy: bool,
-    /// See `link_counts_trusted`.
-    untrusted_link_counts: bool,
+    /// What syq relies on this filesystem for (see `fs_caps`).
+    profile: Profile,
 }
 
 #[cfg(target_os = "linux")]
@@ -390,11 +388,7 @@ fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
                 t if t == libc::EXT4_SUPER_MAGIC as u32
                     || t == libc::XFS_SUPER_MAGIC as u32
             ),
-            untrusted_link_counts: fs_caps::linux_link_counts_untrusted(
-                file_system_type,
-                file,
-                key,
-            ),
+            profile: fs_caps::linux_profile(file_system_type, file, key),
         }
     }
 }
