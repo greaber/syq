@@ -101,10 +101,13 @@ pub(crate) struct Profile {
     /// before its final check-then-rename.
     pub(crate) hard_links: bool,
     /// Two names of one file show the same inode number and a link count
-    /// that includes both, and a number stays with its file. SSHFS and
-    /// rclone report one link for every name and give each name its own
-    /// number; FAT and exFAT keep no numbers for files; an SMB mount without
-    /// the server's file IDs (`noserverino`) makes them up per name.
+    /// that includes both, and a number stays with its file while it is in
+    /// use. SSHFS and rclone report one link for every name and give each
+    /// name its own number; the Linux SMB client reports one link for files
+    /// it has only listed or opened; macOS FAT and exFAT volumes report that
+    /// their object IDs are not persistent. Linux FAT and exFAT have no hard
+    /// links, so every count of one is true, and a file keeps the number it
+    /// was given while it is in use.
     ///
     /// Where this is false, checks that compare counts or numbers are not
     /// made, and nothing is skipped because two names seem to be one file.
@@ -262,7 +265,7 @@ pub(crate) fn profile(file: &File) -> Profile {
 }
 
 /// Linux: the profile for a filesystem type, from the type syq already
-/// reads and, for SMB and CephFS, the mount's options.
+/// reads and, for NFS and CephFS, the mount's options.
 #[cfg(target_os = "linux")]
 pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemKey) -> Profile {
     let t = file_system_type;
@@ -279,19 +282,26 @@ pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemK
     //   and keep stable inode numbers, and the kernel sets a symlink's own
     //   times on local filesystems (fs/utimes.c follows no link);
     // - NFS: the server keeps counts and file IDs, and SETATTR acts on the
-    //   object a file handle names, the link itself;
+    //   object a file handle names, the link itself. An open revalidates a
+    //   file's attributes; with `nocto` it does not, and a count can be as
+    //   stale as the attribute cache allows;
     // - CephFS: the MDS keeps counts (ceph_fill_inode) and sets attributes
     //   on the inode named; `ino32` folds inode numbers so they can collide;
-    // - SMB with the server's file IDs: counts from NumberOfLinks; whether a
-    //   server follows a symlink when setting its times is not known;
-    // - FAT and exFAT have no hard links, so every count is one.
+    // - FAT and exFAT have no hard links, so every count is one, and a file
+    //   keeps the number iunique gave it while its inode is in use
+    //   (fs/fat/inode.c:609, fs/exfat/inode.c:432).
+    // SMB counts are not trusted: a listing marks counts unknown
+    // (readdir.c:207), which gives a new inode a count of one (inode.c:165),
+    // and so does the CREATE response of an open (smb2pdu.c:3383); the real
+    // count arrives only when the attribute cache next expires. The client
+    // can also stop using the server's file IDs mid-mount
+    // (cifs_autodisable_serverino), and whether a server follows a symlink
+    // when setting its times is not known.
     let (link_counts_trusted, symlink_times) = match t {
         0xef53 | 0x5846_5342 | 0x9123_683e | 0x0102_1994 | 0x794c_7630 | ZFS_SUPER_MAGIC
-        | F2FS_SUPER_MAGIC | NTFS3_SUPER_MAGIC | 0x6969 => (true, true),
+        | F2FS_SUPER_MAGIC | NTFS3_SUPER_MAGIC => (true, true),
+        0x6969 => (!mount_has_option(file, key, b"nocto"), true),
         CEPH_SUPER_MAGIC => (!mount_has_option(file, key, b"ino32"), true),
-        CIFS_SUPER_MAGIC | SMB2_SUPER_MAGIC => {
-            (!mount_has_option(file, key, b"noserverino"), false)
-        }
         _ if fat || t == EXFAT_SUPER_MAGIC => (true, false),
         _ => (false, false),
     };
@@ -660,6 +670,7 @@ mod tests {
                 profile.exchange && !profile.atomic_no_replace_rename,
                 "{racy:x}"
             );
+            assert!(!profile.link_counts_trusted && !profile.symlink_times);
         }
         let fat = linux_profile(libc::MSDOS_SUPER_MAGIC as u32, &file, key);
         assert!(fat.two_second_mtimes && !fat.hard_links && fat.atomic_no_replace_rename);
