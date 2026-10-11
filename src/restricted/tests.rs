@@ -1237,6 +1237,184 @@ fn existence_authority(
     )
 }
 
+/// The signed grant bounds what the receiver widens: nothing unless approved;
+/// under `rsync`, directories the copy includes, to change their entries but
+/// never to enter one it could not read; under `all`, also the directory the
+/// copy goes into, here the enrolled root, whose identity the receiver pins.
+/// Never a directory above the root, nor one beside the copy.
+#[test]
+fn restricted_widening_follows_the_approved_mode() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(target.join("sub")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        proto::TargetCondition::Matches {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let widen = |path: &Path, access: u32, condition| Request::WidenDirectories {
+        access,
+        remember: true,
+        directories: vec![(path_bytes(path), condition)],
+        guard: None,
+    };
+    for mode in [
+        DirectoryWidening::None,
+        DirectoryWidening::Rsync,
+        DirectoryWidening::All,
+    ] {
+        let mut authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        authority.extra_options.widen_dirs = mode;
+        let sub = target.join("sub");
+        let allowed = |request: &mut Request| authority.authorize(request, false).is_ok();
+        assert_eq!(
+            allowed(&mut widen(&sub, 0o300, identity(&sub))),
+            mode != DirectoryWidening::None,
+            "{mode:?}"
+        );
+        assert_eq!(
+            allowed(&mut widen(&sub, 0o500, identity(&sub))),
+            mode == DirectoryWidening::All,
+            "{mode:?}"
+        );
+        for path in [temp.path(), &root.join("other")] {
+            assert!(
+                !allowed(&mut widen(path, 0o300, identity(path))),
+                "{mode:?}: {}",
+                path.display()
+            );
+        }
+        let mut outer = widen(&root, 0o300, proto::TargetCondition::Any);
+        let authorized = authority.authorize(&mut outer, false);
+        assert_eq!(
+            authorized.is_ok(),
+            mode == DirectoryWidening::All,
+            "{mode:?}"
+        );
+        let Ok(settlement) = authorized else {
+            continue;
+        };
+        let Request::WidenDirectories { directories, .. } = &outer else {
+            unreachable!()
+        };
+        assert_eq!(directories[0].1, identity(&root));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        let response = ops.handle(&outer);
+        authority.settle(settlement, &response);
+        let widened = fs::metadata(&root).unwrap().mode() & 0o777;
+        assert!(
+            matches!(response, proto::Response::WidenedDirectories(ref outcomes)
+                if outcomes.len() == 1 && outcomes[0].is_ok()),
+            "{response:?}"
+        );
+        assert_eq!(widened, 0o700);
+        // Its metadata can only be restored: whatever mode the sender asks
+        // for, it gets back the one it had.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let restore = Request::Apply {
+            ops: vec![Op::SetMeta {
+                path: path_bytes(&root),
+                meta: proto::Meta {
+                    mode: 0o777,
+                    ..plain_meta()
+                },
+                flags: proto::flags::MODE,
+                condition: identity(&root),
+            }],
+            guard: None,
+        };
+        let response = execute_authorized(&authority, &mut ops, restore);
+        assert!(
+            matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+            "{response:?}"
+        );
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o500);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// Under an approved `all`, a restricted receiver gives the owned directories
+/// from its enrolled root down to the destination, the root included, the
+/// search permission reaching it needs, as an ordinary receiver does, and
+/// restores them when asked. It never walks above the root, and refuses a
+/// destination named outside it.
+#[test]
+fn restricted_all_widens_ancestors_beneath_the_enrolled_root() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let middle = root.join("middle");
+    let destination = middle.join("target");
+    fs::create_dir_all(&destination).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o777;
+    let above = mode(temp.path());
+    let prepare = |path: &Path| Request::PrepareDestinationPath {
+        path: path_bytes(path),
+        symlink_policy: proto::OperatorSymlinkPolicy::FollowAll,
+        create_missing: true,
+        guard: None,
+    };
+    for widen in [
+        DirectoryWidening::None,
+        DirectoryWidening::Rsync,
+        DirectoryWidening::All,
+    ] {
+        let mut authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::DirectoryContents,
+            RootExistence::Any,
+        )
+        .unwrap();
+        // A destination deeper than its root, as a download's can be.
+        authority.destination = path_bytes(&destination);
+        authority.extra_options.widen_dirs = widen;
+        let mut request = prepare(&destination);
+        let authorized = authority.authorize(&mut request, false);
+        assert_eq!(
+            authorized.is_ok(),
+            widen == DirectoryWidening::All,
+            "{widen:?}"
+        );
+        let Ok(settlement) = authorized else {
+            continue;
+        };
+        assert!(authority
+            .authorize(&mut prepare(temp.path()), false)
+            .is_err());
+        fs::set_permissions(&middle, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut ops = crate::fsops::FsOps::new();
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        assert!(matches!(response, proto::Response::Ok), "{response:?}");
+        assert_eq!([mode(&root), mode(&middle)], [0o700, 0o700]);
+        assert_eq!(mode(temp.path()), above);
+        let response = execute_authorized(&authority, &mut ops, Request::RestoreDestinationPath);
+        assert!(matches!(response, proto::Response::Ok), "{response:?}");
+        assert_eq!(mode(&root), 0o600);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode(&middle), 0o600);
+        fs::set_permissions(&middle, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
 }
@@ -1599,6 +1777,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
             .unwrap();
             authority.copy.options.preserve_permissions = preserve;
             authority.copy.options.receiver_managed_modes = !preserve;
+            authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
             admit_test_mapping(&mut authority, "parent/item");
             // The connection that widens a directory restores it.
             let mut ops = crate::fsops::FsOps::new();
@@ -1621,6 +1800,7 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                 );
                 assert_eq!(fs::metadata(&parent).unwrap().mode(), original.mode());
                 let mut access = Request::WidenDirectories {
+                    access: 0o300,
                     remember: true,
                     directories: vec![(
                         path_bytes(&parent),
@@ -3603,7 +3783,8 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
     fs::set_permissions(&existing_directory, fs::Permissions::from_mode(0o500)).unwrap();
     let new_directory_mode = created_mode(&target, 0o777, true);
     let new_file_mode = created_mode(&target, 0o777, false);
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
     let mut ops = crate::fsops::FsOps::new();
     let path = |path: &Path| path.as_os_str().as_bytes().to_vec();
     let applied = |response: proto::Response| matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none));
@@ -3639,6 +3820,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
         &authority,
         &mut ops,
         Request::WidenDirectories {
+            access: 0o300,
             remember: true,
             directories: vec![(
                 path(&existing_directory),
@@ -4107,6 +4289,22 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
         scanned: crate::proto::ScannedDestination::Unknown,
     }]);
     assert!(authority.authorize(&mut small, false).is_err());
+
+    // Previews never widen, so a read-only grant needs no authority for it.
+    let existing = fs::metadata(&root).unwrap();
+    let mut widen = Request::WidenDirectories {
+        access: 0o700,
+        directories: vec![(
+            path_bytes(&root),
+            proto::TargetCondition::Matches {
+                dev: existing.dev(),
+                ino: existing.ino(),
+            },
+        )],
+        remember: true,
+        guard: None,
+    };
+    assert!(authority.authorize(&mut widen, false).is_err());
 
     let mut observation = Request::StatMany {
         paths: vec![target],
@@ -6278,6 +6476,7 @@ impl ParityReceiver {
             authority.copy.options.receiver_managed_modes = !preserve;
             authority.copy.options.preserve_devices = true;
             authority.copy.limits.max_entries = 1000;
+            authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
             authority
         });
         let ops = if restricted {
@@ -6386,6 +6585,7 @@ fn parity_modes(preserve: bool, inplace: bool) -> [Vec<(String, u32)>; 2] {
         // their final modes at the end.
         let observed = fs::metadata(target.join("read-only-dir")).unwrap();
         let widened = receiver.send(Request::WidenDirectories {
+            access: 0o300,
             remember: !preserve,
             directories: vec![(
                 path("read-only-dir"),

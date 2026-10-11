@@ -391,7 +391,7 @@ mod tests {
             _: bool,
             _: &mut dyn FnMut(Vec<crate::proto::Entry>) -> Result<()>,
             _: &mut dyn FnMut(Vec<crate::proto::PathBytes>) -> Result<()>,
-            _: &mut dyn FnMut(String),
+            _: &mut dyn FnMut(crate::proto::ScanWarning),
         ) -> Result<u64> {
             unreachable!("stream control does not scan")
         }

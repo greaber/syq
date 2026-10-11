@@ -424,6 +424,29 @@ pub(crate) struct ExtraCopyOptions {
     pub crtimes: bool,
     pub sparse: bool,
     pub open_noatime: bool,
+    pub widen_dirs: DirectoryWidening,
+}
+
+/// Which existing destination directories the receiver may briefly give the
+/// owner permission the copy needs, as `--widen-dirs` names them: none, the
+/// ones the copy includes, or also the directory the copy goes into. Never
+/// one above the enrolled root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum DirectoryWidening {
+    #[default]
+    None,
+    Rsync,
+    All,
+}
+
+impl From<crate::cli::WidenDirs> for DirectoryWidening {
+    fn from(mode: crate::cli::WidenDirs) -> Self {
+        match mode {
+            crate::cli::WidenDirs::None => Self::None,
+            crate::cli::WidenDirs::Rsync => Self::Rsync,
+            crate::cli::WidenDirs::All => Self::All,
+        }
+    }
 }
 
 impl ExtraCopyOptions {

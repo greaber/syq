@@ -401,6 +401,10 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::StatMany { .. }
         | Request::CheckOperatorDirectory { .. }
         | Request::CheckOperatorDirectoryAncestry { .. }
+        | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
+        | Request::CheckSearchableOperatorDirectory { .. }
+        | Request::PrepareDestinationPath { .. }
+        | Request::RestoreDestinationPath
         | Request::RegisterSourceRoots { .. }
         | Request::CreateOperatorDirectory { .. }
         | Request::AnchorDestination { .. }
@@ -421,6 +425,7 @@ fn file_payload_request(request: &Request) -> bool {
         | Request::FileHash { .. }
         | Request::Canonicalize { .. }
         | Request::TransportStats
+        | Request::ReceiverUser
         | Request::Receipt
         | Request::Shutdown
         | Request::ListDirDetails { .. }
@@ -965,6 +970,10 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     | Request::NativeRemove { .. }
                     | Request::CheckOperatorDirectory { .. }
                     | Request::CheckOperatorDirectoryAncestry { .. }
+                    | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
+                    | Request::CheckSearchableOperatorDirectory { .. }
+                    | Request::PrepareDestinationPath { .. }
+                    | Request::RestoreDestinationPath
                     | Request::RegisterSourceRoots { .. }
                     | Request::CreateOperatorDirectory { .. }
                     | Request::AnchorDestination { .. }
@@ -1334,7 +1343,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     }
                     let mut w = wref.borrow_mut();
                     for m in warns.borrow_mut().drain(..) {
-                        w.write_msg(&Response::ScanWarn(m))?;
+                        w.write_msg(&Response::ScanWarnAt(m))?;
                     }
                     if ops.preserving_inode_metadata() {
                         write_metadata_batches(
@@ -1413,7 +1422,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     )
                 };
                 for m in warns.borrow_mut().drain(..) {
-                    w.write_msg(&Response::ScanWarn(m))?;
+                    w.write_msg(&Response::ScanWarnAt(m))?;
                 }
                 match res {
                     Ok(count) => {

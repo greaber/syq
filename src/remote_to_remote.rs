@@ -1030,9 +1030,7 @@ fn run_remote(
             remote.push("--follow-dst".into());
         }
     }
-    if args.temporarily_widen_dir_permissions {
-        remote.push("--temporarily-widen-dir-permissions".into());
-    }
+    remote.push(format!("--widen-dirs={}", args.widen_dirs.as_str()));
     if args.prune_before {
         remote.push("--prune-before".into());
     } else if args.delete {

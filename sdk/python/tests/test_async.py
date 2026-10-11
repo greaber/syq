@@ -64,7 +64,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             coordinate_at="local",
             into_existing="out",
             dry_run=True,
-            temporarily_widen_dir_permissions=True,
+            widen_dirs="all",
             hash=True,
             receiver_max_entries=100,
             receiver_max_bytes="2G",
@@ -83,7 +83,7 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("--results", self.argv())
         self.assertNotIn("--quiet", self.argv())
-        self.assertIn("--temporarily-widen-dir-permissions", self.argv())
+        self.assertIn("--widen-dirs=all", self.argv())
         self.assertIn("--root", self.argv())
         self.assertIn("--follow-src", self.argv())
         self.assertIn("--follow-dst", self.argv())
