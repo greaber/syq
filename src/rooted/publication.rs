@@ -5,38 +5,36 @@
 //! exFAT, NFS, SMB and FUSE filesystems such as SSHFS. A no-replace rename
 //! (`RENAME_NOREPLACE`, macOS `RENAME_EXCL`) is not atomic on most of those,
 //! and hard links are missing on FAT, exFAT and rclone mounts. The
-//! filesystem's profile (`fsops::Profile`) says which to try; one that a
-//! filesystem refuses anyway is remembered, and later publications go
+//! filesystem's profile (`fsops::Profile`) says which to try. A filesystem
+//! that refuses one anyway, as OpenZFS before 2.2 refuses exchange, is
+//! remembered (`fsops::record_refusal`), and later publications there go
 //! straight to the fallback.
 
 use super::{metadata_at, rename_noreplace, retry_zero, RootMetadata};
-use crate::fsops::Profile;
+use crate::fsops::{Profile, Refusal};
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// An operation a filesystem refused although its profile allowed it.
-#[derive(Default)]
-pub(super) struct Learned(AtomicBool);
-
-impl Learned {
-    pub(super) fn unsupported(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn record_refusal(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
+#[cfg(test)]
+thread_local! {
+    /// Tests stand in for a filesystem whose profile allows exchange and
+    /// no-replace renames but whose kernel refuses them.
+    pub(super) static REFUSE_RENAME_FLAGS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Rename-flag calls made while refusing them.
+    pub(super) static REFUSED_RENAME_FLAG_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
-/// Rename flags and links that a filesystem refused although its profile
-/// allowed them, as an older ZFS refuses exchange.
-#[derive(Default)]
-pub(super) struct Capabilities {
-    pub(super) exchange: Learned,
-    pub(super) no_replace_rename: Learned,
-    pub(super) links: Learned,
+/// A refusal tests stand in for, or None to make the call.
+pub(super) fn simulated_refusal() -> Option<io::Error> {
+    #[cfg(test)]
+    if REFUSE_RENAME_FLAGS.get() {
+        REFUSED_RENAME_FLAG_CALLS.set(REFUSED_RENAME_FLAG_CALLS.get() + 1);
+        return Some(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    None
 }
 
 /// Whether a rename-flag call failed because the filesystem does not
@@ -99,9 +97,9 @@ pub(super) struct Placement<'a> {
 /// sender cannot move an existing file onto the name, because no operation
 /// it may request renames an existing destination entry to another name.
 pub(super) fn move_without_replacing(
-    capabilities: &Capabilities,
     profile: Profile,
     placement: &Placement<'_>,
+    record_refusal: &dyn Fn(Refusal),
 ) -> io::Result<Moved> {
     let Placement {
         from_directory,
@@ -110,16 +108,20 @@ pub(super) fn move_without_replacing(
         to,
         allow_link,
     } = *placement;
-    if profile.atomic_no_replace_rename && !capabilities.no_replace_rename.unsupported() {
-        match rename_noreplace(from_directory, from, to_directory, to) {
+    if profile.atomic_no_replace_rename {
+        let renamed = match simulated_refusal() {
+            Some(error) => Err(error),
+            None => rename_noreplace(from_directory, from, to_directory, to),
+        };
+        match renamed {
             Ok(()) => return Ok(Moved::Renamed),
             Err(error) if rename_flag_unsupported(&error) => {
-                capabilities.no_replace_rename.record_refusal();
+                record_refusal(Refusal::NoReplaceRename);
             }
             Err(error) => return Err(error),
         }
     }
-    if allow_link && profile.hard_links && !capabilities.links.unsupported() {
+    if allow_link && profile.hard_links {
         match retry_zero(|| unsafe {
             libc::linkat(from_directory, from.as_ptr(), to_directory, to.as_ptr(), 0)
         }) {
@@ -131,7 +133,7 @@ pub(super) fn move_without_replacing(
                 }
                 // EIO may be transient; only a definite refusal is kept.
                 if error.raw_os_error() != Some(libc::EIO) {
-                    capabilities.links.record_refusal();
+                    record_refusal(Refusal::HardLinks);
                 }
             }
             Err(error) => return Err(error),

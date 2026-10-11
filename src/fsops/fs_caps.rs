@@ -126,6 +126,47 @@ impl Profile {
     }
 }
 
+/// An operation a filesystem refused although its profile allowed it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Refusal {
+    Exchange,
+    NoReplaceRename,
+    HardLinks,
+}
+
+impl Profile {
+    /// This profile without the capability a filesystem refused.
+    pub(crate) fn without(mut self, refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::Exchange => self.exchange = false,
+            Refusal::NoReplaceRename => self.atomic_no_replace_rename = false,
+            Refusal::HardLinks => self.hard_links = false,
+        }
+        self
+    }
+}
+
+/// Remember for the rest of the process that the filesystem `file` is on
+/// refused an operation its profile allowed, so that later publications
+/// there take the conservative path at once. A profile can be wrong by
+/// version as well as by type: OpenZFS gained exchange and no-replace
+/// renames only in 2.2, and older kernels and overlay layers vary. Calls
+/// that fail this way change nothing, so learning from them needs no probe
+/// and costs nothing where the call works.
+pub(crate) fn record_refusal(file: &File, refusal: Refusal) {
+    #[cfg(target_os = "linux")]
+    super::update_profile(file, |profile| *profile = profile.without(refusal));
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        update_macos_profile(file.as_raw_fd(), |profile| {
+            *profile = profile.without(refusal)
+        });
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = (file, refusal);
+}
+
 /// The profile of the filesystem `file` is on.
 pub(crate) fn profile(file: &File) -> Profile {
     #[cfg(target_os = "linux")]
@@ -270,24 +311,49 @@ fn super_options(mounts: &[u8], mount: u64) -> Option<&[u8]> {
 /// plain rename over the target and reports success. It does not
 /// advertise the capability, but it is excluded by name as well.
 #[cfg(target_os = "macos")]
-pub(crate) fn macos_profile(fd: RawFd) -> Profile {
+fn volumes() -> &'static std::sync::Mutex<std::collections::HashMap<Vec<u8>, Profile>> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static VOLUMES: OnceLock<Mutex<HashMap<Vec<u8>, Profile>>> = OnceLock::new();
+    VOLUMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The mount point and filesystem type name of the volume holding `fd`.
+#[cfg(target_os = "macos")]
+fn volume_of(fd: RawFd) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     // SAFETY: fstatfs writes only into the local structure.
     if unsafe { libc::fstatfs(fd, stats.as_mut_ptr()) } != 0 {
-        return Profile::CONSERVATIVE;
+        return None;
     }
     let stats = unsafe { stats.assume_init() };
     // SAFETY: fstatfs NUL-terminates both names.
     let mount = unsafe { std::ffi::CStr::from_ptr(stats.f_mntonname.as_ptr()) };
-    let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes();
-    let volumes = VOLUMES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(known) = volumes.lock().unwrap().get(mount.to_bytes()) {
+    let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+    Some((mount.to_bytes().to_vec(), kind.to_bytes().to_vec()))
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_profile(fd: RawFd, update: impl FnOnce(&mut Profile)) {
+    let profile = macos_profile(fd);
+    if let Some((mount, _)) = volume_of(fd) {
+        update(volumes().lock().unwrap().entry(mount).or_insert(profile));
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_profile(fd: RawFd) -> Profile {
+    let Some((mount, kind)) = volume_of(fd) else {
+        return Profile::CONSERVATIVE;
+    };
+    let kind = kind.as_slice();
+    if let Some(known) = volumes().lock().unwrap().get(&mount) {
         return *known;
     }
-    let profile = match read_volume_capabilities(mount) {
+    let Ok(mount_name) = std::ffi::CString::new(mount.clone()) else {
+        return Profile::CONSERVATIVE;
+    };
+    let profile = match read_volume_capabilities(&mount_name) {
         None => Profile::CONSERVATIVE,
         Some(volume) => Profile {
             exchange: volume.rename_swap && kind != b"msdos",
@@ -300,11 +366,7 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
             two_second_mtimes: kind == b"msdos",
         },
     };
-    volumes
-        .lock()
-        .unwrap()
-        .insert(mount.to_bytes().to_vec(), profile);
-    profile
+    *volumes().lock().unwrap().entry(mount).or_insert(profile)
 }
 
 /// The atomic renames and identity reports a macOS volume advertises.
@@ -379,6 +441,32 @@ mod tests {
         for kind in ["exfat", "ext", "apfs", "hfs", "other", "nfs"] {
             assert!(!kind_has_two_second_mtimes(kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn a_refusal_removes_only_its_capability() {
+        let local = Profile::LOCAL;
+        assert_eq!(
+            local.without(Refusal::Exchange),
+            Profile {
+                exchange: false,
+                ..local
+            }
+        );
+        assert_eq!(
+            local.without(Refusal::NoReplaceRename),
+            Profile {
+                atomic_no_replace_rename: false,
+                ..local
+            }
+        );
+        assert_eq!(
+            local.without(Refusal::HardLinks),
+            Profile {
+                hard_links: false,
+                ..local
+            }
+        );
     }
 
     /// The conservative choices are the safe side of every capability.

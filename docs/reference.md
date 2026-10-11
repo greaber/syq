@@ -342,10 +342,7 @@ partial file at the file's full size, so one is kept even when little was
 written to it. Remote copies, and copies with a bandwidth cap or
 `--performance-tuning copy-path=ranges`, reuse matching data from them. A copy
 within one machine that copies files whole does not: rerunning it copies those
-files whole again, so their partial files are removed. Nor does a copy to a
-filesystem whose link counts syq cannot trust, such as SSHFS, an rclone mount,
-FAT, or any filesystem it does not recognize: there it cannot rule out that a
-partial file has other names, so it starts those files over.
+files whole again, so their partial files are removed.
 
 Partial files may remain after a successful retry, as can temporary files
 left by a copy that was killed. To remove them:

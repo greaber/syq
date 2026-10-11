@@ -50,7 +50,7 @@ pub(crate) use apply::*;
 pub(crate) use entry::*;
 #[cfg(target_os = "macos")]
 pub(crate) use fs_caps::macos_profile;
-pub(crate) use fs_caps::{kind_has_two_second_mtimes, profile, Profile};
+pub(crate) use fs_caps::{kind_has_two_second_mtimes, profile, record_refusal, Profile, Refusal};
 pub(crate) use limits::*;
 pub(crate) use operator::*;
 pub(crate) use partial::*;
@@ -444,15 +444,30 @@ impl FileSystemTraits {
 
 #[cfg(target_os = "linux")]
 fn file_system_traits(file: &File, key: FileSystemKey) -> FileSystemTraits {
-    static FILE_SYSTEMS: OnceLock<Mutex<HashMap<FileSystemKey, FileSystemTraits>>> =
-        OnceLock::new();
-    let file_systems = FILE_SYSTEMS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(traits) = file_systems.lock().unwrap().get(&key).copied() {
+    if let Some(traits) = file_systems().lock().unwrap().get(&key).copied() {
         return traits;
     }
     let traits = inspect_file_system(file, key);
-    file_systems.lock().unwrap().insert(key, traits);
+    file_systems().lock().unwrap().insert(key, traits);
     traits
+}
+
+#[cfg(target_os = "linux")]
+fn file_systems() -> &'static Mutex<HashMap<FileSystemKey, FileSystemTraits>> {
+    static FILE_SYSTEMS: OnceLock<Mutex<HashMap<FileSystemKey, FileSystemTraits>>> =
+        OnceLock::new();
+    FILE_SYSTEMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Linux: change the cached profile of the filesystem `file` is on.
+#[cfg(target_os = "linux")]
+fn update_profile(file: &File, update: impl FnOnce(&mut Profile)) {
+    let Ok((key, traits)) = opened_file_system(file) else {
+        return;
+    };
+    let mut file_systems = file_systems().lock().unwrap();
+    let entry = file_systems.entry(key).or_insert(traits);
+    update(&mut entry.profile);
 }
 
 #[cfg(target_os = "linux")]

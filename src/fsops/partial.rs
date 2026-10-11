@@ -398,11 +398,6 @@ impl FsOps {
     /// Bounded, best-effort discovery using equality on the readable prefix.
     /// A truncated prefix is currently indistinguishable from a full basename.
     pub(super) fn candidate_partials(&mut self, target: &RootedTarget) -> Vec<PathBytes> {
-        // A leftover sidecar is reused only where link counts show that it
-        // has no other names. Elsewhere a copy starts from a new sidecar.
-        if !target.root.link_counts_trusted() {
-            return Vec::new();
-        }
         let label = target.relative.to_path_buf();
         let parent = label.parent().unwrap_or_else(|| Path::new(""));
         let basename = label.file_name().unwrap_or_default().as_bytes();

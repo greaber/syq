@@ -226,9 +226,6 @@ pub(crate) struct Root {
     network: OnceLock<bool>,
     /// The root filesystem's profile (see `profile`).
     profile: OnceLock<crate::fsops::Profile>,
-    /// Rename flags the root's filesystems refused although their profile
-    /// allowed them.
-    publication: publication::Capabilities,
     #[cfg(test)]
     test_profile: Mutex<Option<crate::fsops::Profile>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -268,7 +265,6 @@ impl Root {
             bounds_replacement: OnceLock::new(),
             network: OnceLock::new(),
             profile: OnceLock::new(),
-            publication: publication::Capabilities::default(),
             #[cfg(test)]
             test_profile: Mutex::new(None),
             #[cfg(all(test, target_os = "linux"))]
@@ -366,6 +362,8 @@ impl Root {
     /// file's other names must assume it may have some: the outside-names
     /// rule of restricted receivers is to stage content changes and refuse
     /// metadata-only changes in approved directories on such filesystems.
+    // The outside-names rule of #778 is its first caller.
+    #[allow(dead_code)]
     pub(crate) fn link_counts_trusted(&self) -> bool {
         self.profile().link_counts_trusted
     }
@@ -376,35 +374,54 @@ impl Root {
         *self.test_profile.lock().unwrap() = Some(profile);
     }
 
-    /// Give `from` the name `to` without replacing anything there, by the
-    /// steps `profile` allows; see `publication::move_without_replacing`.
-    fn move_without_replacing(
-        &self,
-        profile: crate::fsops::Profile,
-        placement: &publication::Placement<'_>,
-    ) -> io::Result<publication::Moved> {
-        publication::move_without_replacing(&self.publication, profile, placement)
+    /// Remember that the filesystem `directory` is on refused an operation
+    /// its profile allowed (see `fsops::record_refusal`).
+    fn record_refusal(&self, directory: &File, refusal: crate::fsops::Refusal) {
+        #[cfg(test)]
+        if let Some(profile) = self.test_profile.lock().unwrap().as_mut() {
+            *profile = profile.without(refusal);
+            return;
+        }
+        crate::fsops::record_refusal(directory, refusal);
     }
 
-    /// Exchange two names atomically where `profile` says the filesystem
-    /// can. Returns false, having changed nothing, where it cannot; a
-    /// filesystem that refuses the call anyway (an older ZFS) is remembered,
-    /// so later replacements go straight to the fallback.
+    /// Give `from` the name `to`, in `directory`, without replacing anything
+    /// there, by the steps its filesystem's profile allows; see
+    /// `publication::move_without_replacing`.
+    fn move_without_replacing(
+        &self,
+        directory: &File,
+        placement: &publication::Placement<'_>,
+    ) -> io::Result<publication::Moved> {
+        publication::move_without_replacing(self.profile_of(directory), placement, &|refusal| {
+            self.record_refusal(directory, refusal)
+        })
+    }
+
+    /// Exchange two names atomically where the profile of `directory`'s
+    /// filesystem says it can. Returns false, having changed nothing, where
+    /// it cannot. A filesystem that refuses the call anyway, as OpenZFS
+    /// before 2.2 does, is remembered, so later replacements there go
+    /// straight to the fallback.
     fn exchange(
         &self,
-        profile: crate::fsops::Profile,
+        directory: &File,
         old_parent: RawFd,
         old_name: &CStr,
         new_parent: RawFd,
         new_name: &CStr,
     ) -> io::Result<bool> {
-        if !profile.exchange || self.publication.exchange.unsupported() {
+        if !self.profile_of(directory).exchange {
             return Ok(false);
         }
-        match rename_exchange(old_parent, old_name, new_parent, new_name) {
+        let exchanged = match publication::simulated_refusal() {
+            Some(error) => Err(error),
+            None => rename_exchange(old_parent, old_name, new_parent, new_name),
+        };
+        match exchanged {
             Ok(()) => Ok(true),
             Err(error) if publication::rename_flag_unsupported(&error) => {
-                self.publication.exchange.record_refusal();
+                self.record_refusal(directory, crate::fsops::Refusal::Exchange);
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -1638,14 +1655,20 @@ impl Root {
         let directory = parent.directory.as_raw_fd();
         let profile = self.profile_of(&parent.directory);
         if !self
-            .exchange(profile, directory, &temporary, directory, &parent.leaf)
+            .exchange(
+                &parent.directory,
+                directory,
+                &temporary,
+                directory,
+                &parent.leaf,
+            )
             .inspect_err(|_| {
                 let _ = unlink_at(directory, &temporary, 0);
             })
             .with_context(|| format!("atomically replace confined path {}", path.label()))?
         {
             let aside = self
-                .publish_over_moved_aside(profile, path, &parent, directory, &temporary, |entry| {
+                .publish_over_moved_aside(path, &parent, directory, &temporary, |entry| {
                     publication::is_expected(entry, expected_dev, expected_ino, expected_type)
                 })
                 .inspect_err(|_| {
@@ -1883,11 +1906,16 @@ impl Root {
                 .with_context(|| format!("publish hardlink {}", target.label())),
                 Matches { dev, ino } => {
                     if !self
-                        .exchange(profile, directory, &temporary, directory, &parent.leaf)
+                        .exchange(
+                            &parent.directory,
+                            directory,
+                            &temporary,
+                            directory,
+                            &parent.leaf,
+                        )
                         .with_context(|| format!("publish hardlink {}", target.label()))?
                     {
                         let aside = self.publish_over_moved_aside(
-                            profile,
                             target,
                             &parent,
                             directory,
@@ -1998,7 +2026,7 @@ impl Root {
         let permit = self.mutation_permit(target)?;
         let moved = self
             .move_without_replacing(
-                profile,
+                &target_parent.directory,
                 &publication::Placement {
                     from_directory: source_parent.directory.as_raw_fd(),
                     from: &source_parent.leaf,
@@ -2089,7 +2117,7 @@ impl Root {
         let permit = self.mutation_permit(target)?;
         if !self
             .exchange(
-                profile,
+                &target_parent.directory,
                 source_parent.directory.as_raw_fd(),
                 &source_parent.leaf,
                 target_parent.directory.as_raw_fd(),
@@ -2098,7 +2126,6 @@ impl Root {
             .with_context(|| format!("atomically publish confined path {}", target.label()))?
         {
             let aside = self.publish_over_moved_aside(
-                profile,
                 target,
                 &target_parent,
                 source_parent.directory.as_raw_fd(),
@@ -2202,8 +2229,7 @@ impl Root {
             Ok(permit) => permit,
             Err(error) => return error.context(race),
         };
-        let profile = self.profile_of(&parent.directory);
-        match self.move_to_recovery_name(profile, parent.directory.as_raw_fd(), &parent.leaf) {
+        match self.move_to_recovery_name(&parent.directory, &parent.leaf) {
             Ok(Some(name)) => anyhow::anyhow!(
                 "{race}; kept the entry it displaced as {}",
                 sibling_label(staged, &name)
@@ -2220,22 +2246,17 @@ impl Root {
     /// it, never replacing anything there. `None` when the name is already
     /// empty. A rename moves exactly the entry at the name, whatever another
     /// writer may do to the name meanwhile; the recovery name is fresh.
-    fn move_to_recovery_name(
-        &self,
-        profile: crate::fsops::Profile,
-        directory: RawFd,
-        name: &CStr,
-    ) -> Result<Option<CString>> {
+    fn move_to_recovery_name(&self, directory: &File, name: &CStr) -> Result<Option<CString>> {
         for _ in 0..32 {
             let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
             let recovery = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
                 .expect("generated swap name contains no NUL");
             match self.move_without_replacing(
-                profile,
+                directory,
                 &publication::Placement {
-                    from_directory: directory,
+                    from_directory: directory.as_raw_fd(),
                     from: name,
-                    to_directory: directory,
+                    to_directory: directory.as_raw_fd(),
                     to: &recovery,
                     allow_link: false,
                 },
@@ -2263,7 +2284,6 @@ impl Root {
     /// to check the publication and remove it.
     fn publish_over_moved_aside(
         &self,
-        profile: crate::fsops::Profile,
         target: &RelativePath,
         target_parent: &ResolvedParent<'_>,
         replacement_directory: RawFd,
@@ -2271,7 +2291,8 @@ impl Root {
         expected: impl Fn(RootMetadata) -> bool,
     ) -> Result<CString> {
         let directory = target_parent.directory.as_raw_fd();
-        let Some(aside) = self.move_to_recovery_name(profile, directory, &target_parent.leaf)?
+        let Some(aside) =
+            self.move_to_recovery_name(&target_parent.directory, &target_parent.leaf)?
         else {
             bail!(
                 "confined destination {} disappeared before publication",
@@ -2289,7 +2310,7 @@ impl Root {
         };
         let put_back = |race: &str| -> anyhow::Error {
             match self.move_without_replacing(
-                profile,
+                &target_parent.directory,
                 &publication::Placement {
                     from_directory: directory,
                     from: &aside,
@@ -2308,7 +2329,7 @@ impl Root {
             Err(error) => return Err(put_back("could not be checked").context(error)),
         }
         match self.move_without_replacing(
-            profile,
+            &target_parent.directory,
             &publication::Placement {
                 from_directory: replacement_directory,
                 from: replacement,

@@ -1801,6 +1801,66 @@ fn matched_file_and_symlink_replacement_work_on_this_filesystem() {
     assert_eq!(sorted_names(tree.path()), ["link", "target"]);
 }
 
+/// A profile can be wrong by version: OpenZFS before 2.2 refuses exchange
+/// and no-replace renames with EINVAL. A refused call falls back to the
+/// conservative path, and the refusal is remembered, so later publications
+/// on that filesystem do not try the call again.
+#[test]
+fn refused_rename_flags_fall_back_and_are_remembered() {
+    use super::publication::{REFUSED_RENAME_FLAG_CALLS, REFUSE_RENAME_FLAGS};
+    let tree = TestDir::new("refused-rename-flags");
+    let root = Root::open(tree.path()).unwrap();
+    let mut profile = root.profile();
+    profile.exchange = true;
+    profile.atomic_no_replace_rename = true;
+    profile.hard_links = true;
+    profile.link_counts_trusted = true;
+    root.assume_profile_for_test(profile);
+    REFUSE_RENAME_FLAGS.set(true);
+    REFUSED_RENAME_FLAG_CALLS.set(0);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        for round in 0..2 {
+            let staged = format!("staged{round}");
+            fs::write(tree.path().join(&staged), format!("new {round}")).unwrap();
+            let staged_metadata = fs::metadata(tree.path().join(&staged)).unwrap();
+            let old = root.metadata(&relative(b"target")).unwrap();
+            root.replace_regular_if_same(
+                &relative(staged.as_bytes()),
+                &relative(b"target"),
+                (staged_metadata.dev(), staged_metadata.ino()),
+                old.dev,
+                old.ino,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(tree.path().join("target")).unwrap(),
+                format!("new {round}").as_bytes()
+            );
+
+            let new = format!("new{round}");
+            fs::write(tree.path().join(&staged), b"fresh").unwrap();
+            let staged_metadata = fs::metadata(tree.path().join(&staged)).unwrap();
+            root.publish_new_regular(
+                &relative(staged.as_bytes()),
+                &relative(new.as_bytes()),
+                (staged_metadata.dev(), staged_metadata.ino()),
+            )
+            .unwrap();
+            assert_eq!(fs::read(tree.path().join(&new)).unwrap(), b"fresh");
+        }
+    }));
+    REFUSE_RENAME_FLAGS.set(false);
+    result.unwrap();
+    // Each flag was tried once, refused, and not tried again.
+    assert_eq!(REFUSED_RENAME_FLAG_CALLS.get(), 2);
+    let profile = root.profile();
+    assert!(!profile.exchange && !profile.atomic_no_replace_rename);
+    assert!(profile.hard_links);
+    assert_eq!(sorted_names(tree.path()), ["new0", "new1", "target"]);
+}
+
 /// Without exchange, an entry that is not the expected one when it is
 /// moved aside goes back to its name, untouched.
 #[test]
