@@ -288,11 +288,29 @@ class CoordinationTests(unittest.TestCase):
         self.assertIsNotNone(tmux, 'tmux is required to verify reviewer window launch')
         socket = str(self.root / 'tmux.sock')
         subprocess.run([tmux, '-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', 'coord-test', 'sleep 60'], check=True)
-        self.addCleanup(subprocess.run, [tmux, '-S', socket, 'kill-server'], capture_output=True)
+        self.addCleanup(self.stop_tmux, tmux, socket)
         self.stub('tmux', f"import os,sys\nos.execv({tmux!r}, [{tmux!r},'-S',{socket!r},*sys.argv[1:]])\n")
         for key in ('PATH', 'TEST_ROOT'):
             subprocess.run([tmux, '-S', socket, 'set-environment', key, self.env[key]], check=True)
         return tmux, socket
+
+    def stop_tmux(self, tmux, socket):
+        # A reviewer pane's `review worker` records in the state directory that
+        # its reviewer has exited, also when kill-server hangs it up. Wait for
+        # every pane's processes to finish before that directory is removed.
+        panes = subprocess.run([tmux, '-S', socket, 'list-panes', '-a', '-F', '#{pane_pid}'],
+                               capture_output=True, text=True).stdout.split()
+        subprocess.run([tmux, '-S', socket, 'kill-server'], capture_output=True)
+        deadline = time.monotonic() + 10
+        for group in map(int, panes):  # tmux starts each pane in its own session
+            while True:
+                try:
+                    os.killpg(group, 0 if time.monotonic() < deadline else signal.SIGKILL)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline + 5:
+                    self.fail(f'tmux pane process group {group} survived SIGKILL')
+                time.sleep(.02)
 
     def test_real_tmux_two_reviewers_keep_sessions_and_windows_across_rounds(self):
         self.review_setup()
