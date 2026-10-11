@@ -560,7 +560,13 @@ pub(super) fn set_meta_rooted(
             parent.chown(uid, gid)
         })
         .with_context(|| format!("change owner of confined path {}", target.label.display()))?;
-        if time_differs {
+        // A server that sets the target's times instead, as an SFTP server
+        // behind SSHFS does, leaves the link's times alone.
+        if time_differs
+            && !target
+                .root
+                .symlink_times_follow(parent.directory(), metadata.dev)
+        {
             let times = [
                 timespec(0, libc::UTIME_OMIT as u32),
                 timespec(meta.mtime, meta.mtime_nsec),
@@ -568,6 +574,11 @@ pub(super) fn set_meta_rooted(
             parent.set_times(&times).with_context(|| {
                 format!("set times on confined path {}", target.label.display())
             })?;
+        } else if time_differs && crate::output::debug() {
+            crate::output::diagnostic!(
+                "syq: not setting the times of symlink {}: this filesystem would set its target's",
+                target.label.display()
+            );
         }
         if let Some(handle) = &handle {
             crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;

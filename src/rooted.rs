@@ -58,6 +58,7 @@ mod macos_clone_support;
 #[cfg(any(target_os = "linux", test))]
 pub(crate) mod directory_gate;
 mod operator;
+mod publication;
 
 pub(crate) use operator::*;
 
@@ -223,6 +224,12 @@ pub(crate) struct Root {
     #[cfg(target_os = "linux")]
     bounds_replacement: OnceLock<bool>,
     network: OnceLock<bool>,
+    /// Which atomic renames and links the root's filesystem has shown it
+    /// supports.
+    publication: publication::Capabilities,
+    link_counts_trusted: OnceLock<bool>,
+    /// Per device: whether setting a symlink's times would set its target's.
+    symlink_times_follow: Mutex<HashMap<u64, bool>>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) test_name_limit: std::sync::atomic::AtomicUsize,
     #[cfg(all(test, target_os = "linux"))]
@@ -259,6 +266,9 @@ impl Root {
             #[cfg(target_os = "linux")]
             bounds_replacement: OnceLock::new(),
             network: OnceLock::new(),
+            publication: publication::Capabilities::new(),
+            link_counts_trusted: OnceLock::new(),
+            symlink_times_follow: Mutex::new(HashMap::new()),
             #[cfg(all(test, target_os = "linux"))]
             test_name_limit: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, target_os = "linux"))]
@@ -325,6 +335,139 @@ impl Root {
     #[cfg(test)]
     pub(crate) fn assume_network_file_system_for_test(&self) {
         let _ = self.network.set(true);
+    }
+
+    /// Whether the root's filesystem reports link counts and inode numbers
+    /// that checks can rely on (see `fsops::link_counts_trusted`). Where it
+    /// does not, a check made right after linking is skipped, and a rule
+    /// that looks for a file's other names must assume it may have some.
+    pub(crate) fn link_counts_trusted(&self) -> bool {
+        *self
+            .link_counts_trusted
+            .get_or_init(|| crate::fsops::link_counts_trusted(&self.directory))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assume_untrusted_link_counts_for_test(&self) {
+        let _ = self.link_counts_trusted.set(false);
+    }
+
+    /// Stand in for a filesystem without exchange, no-replace rename or
+    /// hard links.
+    #[cfg(test)]
+    pub(crate) fn assume_missing_publication_support_for_test(
+        &self,
+        exchange: bool,
+        no_replace_rename: bool,
+        links: bool,
+    ) {
+        if exchange {
+            self.publication.exchange.record(false);
+        }
+        if no_replace_rename {
+            self.publication.no_replace_rename.record(false);
+        }
+        if links {
+            self.publication.links.record(false);
+        }
+    }
+
+    /// Whether a no-replace rename in `directory` is atomic. On Linux a
+    /// network filesystem may check the target itself and then tell its
+    /// server to replace (SMB), or ignore the flag (an rclone mount mode);
+    /// a macOS volume says whether it supports the flag.
+    fn no_replace_rename_is_atomic(&self, directory: RawFd) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = self;
+            crate::fsops::volume_capabilities(directory)
+                .is_some_and(|volume| volume.rename_exclusive)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = directory;
+            !self.on_network_file_system()
+        }
+    }
+
+    /// Give `from` the name `to` without replacing anything there; see
+    /// `publication::move_without_replacing`.
+    fn move_without_replacing(
+        &self,
+        placement: &publication::Placement<'_>,
+    ) -> io::Result<publication::Moved> {
+        let atomic = self.no_replace_rename_is_atomic(placement.to_directory);
+        publication::move_without_replacing(&self.publication, atomic, placement)
+    }
+
+    /// Exchange two names atomically. Returns false, having changed
+    /// nothing, where the filesystem has no atomic exchange; that is
+    /// remembered, so later replacements go straight to the fallback.
+    fn exchange(
+        &self,
+        old_parent: RawFd,
+        old_name: &CStr,
+        new_parent: RawFd,
+        new_name: &CStr,
+    ) -> io::Result<bool> {
+        if self.publication.exchange.unsupported() {
+            return Ok(false);
+        }
+        match rename_exchange(old_parent, old_name, new_parent, new_name) {
+            Ok(()) => {
+                self.publication.exchange.record(true);
+                Ok(true)
+            }
+            Err(error) if publication::rename_flag_unsupported(&error) => {
+                self.publication.exchange.record(false);
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether setting the times of a symlink in `directory`, on device
+    /// `dev`, would set its target's times instead. An SFTP server follows
+    /// the link, so on SSHFS the call changes the target, or fails when the
+    /// target does not exist. Local filesystems set the link itself; a
+    /// network filesystem is probed once per device, with a symlink whose
+    /// target cannot exist, in syq's own temporary names in `directory`.
+    pub(crate) fn symlink_times_follow(&self, directory: &File, dev: u64) -> bool {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_SYMLINK_TIMES_FOLLOW").is_some() {
+            return true;
+        }
+        if !crate::fsops::symlink_times_may_follow(directory, dev) {
+            return false;
+        }
+        if let Some(follow) = self.symlink_times_follow.lock().unwrap().get(&dev) {
+            return *follow;
+        }
+        let follow = probe_symlink_times_follow(directory.as_raw_fd());
+        self.symlink_times_follow
+            .lock()
+            .unwrap()
+            .insert(dev, follow);
+        follow
+    }
+
+    /// Set a symlink's times, unless that would set its target's instead
+    /// (see `symlink_times_follow`); then leave them. Returns whether they
+    /// were set.
+    pub(crate) fn set_symlink_times(
+        &self,
+        path: &RelativePath,
+        times: &[libc::timespec; 2],
+    ) -> Result<bool> {
+        let parent = self.resolve_parent(path)?;
+        let dev = parent.directory.metadata()?.dev();
+        if self.symlink_times_follow(&parent.directory, dev) {
+            return Ok(false);
+        }
+        parent
+            .set_times(times)
+            .with_context(|| format!("set times on confined path {}", path.label()))?;
+        Ok(true)
     }
 
     /// Whether the directory `name` directly beneath this root lies on a
@@ -1521,15 +1664,36 @@ impl Root {
             path,
             PublicationTestPoint::BeforeMatchedExchange,
         );
-        if let Err(error) = rename_exchange(
-            parent.directory.as_raw_fd(),
-            &temporary,
-            parent.directory.as_raw_fd(),
-            &parent.leaf,
-        ) {
-            let _ = unlink_at(parent.directory.as_raw_fd(), &temporary, 0);
-            return Err(error)
-                .with_context(|| format!("atomically replace confined path {}", path.label()));
+        let directory = parent.directory.as_raw_fd();
+        if !self
+            .exchange(directory, &temporary, directory, &parent.leaf)
+            .inspect_err(|_| {
+                let _ = unlink_at(directory, &temporary, 0);
+            })
+            .with_context(|| format!("atomically replace confined path {}", path.label()))?
+        {
+            let aside = self
+                .publish_over_moved_aside(path, &parent, directory, &temporary, |entry| {
+                    publication::is_expected(entry, expected_dev, expected_ino, expected_type)
+                })
+                .inspect_err(|_| {
+                    let _ = unlink_at(directory, &temporary, 0);
+                })?;
+            let published = metadata_at(directory, &parent.leaf)?;
+            if self.link_counts_trusted()
+                && (published.dev != replacement.dev
+                    || published.ino != replacement.ino
+                    || published.file_type() != expected_type
+                    || published.nlink != 1)
+            {
+                bail!(
+                    "confined replacement for {} changed during replacement; kept the entry it displaced as {}",
+                    path.label(),
+                    sibling_label(path, &aside)
+                );
+            }
+            return unlink_at(directory, &aside, 0)
+                .with_context(|| format!("remove replaced confined path {}", path.label()));
         }
         #[cfg(test)]
         run_publication_test_hook(
@@ -1610,7 +1774,11 @@ impl Root {
         use crate::proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
-        if !opened.is_file() || (opened.dev, opened.ino) != identity {
+        // Where names report their own inode numbers (SSHFS, rclone), the
+        // representative's name need not show the number its file was
+        // published with, so only its type can be checked.
+        if !opened.is_file() || (self.link_counts_trusted() && (opened.dev, opened.ino) != identity)
+        {
             bail!(
                 "hardlink representative {} changed before publication",
                 source.label()
@@ -1696,6 +1864,8 @@ impl Root {
         // Set once a matched exchange has displaced the old destination
         // into the temporary name.
         let exchanged = std::cell::Cell::new(false);
+        // Set once the temporary name has been renamed to the target.
+        let consumed = std::cell::Cell::new(false);
         #[cfg(test)]
         run_publication_test_hook(
             self.identity,
@@ -1704,9 +1874,15 @@ impl Root {
         );
         let result = (|| {
             // On platforms without fd-relative link creation, a raced source
-            // name can create a different temporary inode. Never publish it.
+            // name can create a different temporary inode, and anywhere the
+            // temporary name can be replaced before it is published. Never
+            // publish another file. Where each name of a file reports its
+            // own inode number, as on SSHFS, the check cannot be made; on
+            // Linux the link was still made from the checked descriptor.
             let linked = metadata_at(directory, &temporary)?;
-            if !linked.is_file() || (linked.dev, linked.ino) != identity {
+            if !linked.is_file()
+                || (self.link_counts_trusted() && (linked.dev, linked.ino) != identity)
+            {
                 bail!(
                     "hardlink representative {} changed while linking",
                     source.label()
@@ -1726,8 +1902,22 @@ impl Root {
                 })
                 .with_context(|| format!("publish hardlink {}", target.label())),
                 Matches { dev, ino } => {
-                    rename_exchange(directory, &temporary, directory, &parent.leaf)
-                        .with_context(|| format!("publish hardlink {}", target.label()))?;
+                    if !self
+                        .exchange(directory, &temporary, directory, &parent.leaf)
+                        .with_context(|| format!("publish hardlink {}", target.label()))?
+                    {
+                        let aside = self.publish_over_moved_aside(
+                            target,
+                            &parent,
+                            directory,
+                            &temporary,
+                            |entry| (entry.dev, entry.ino) == (dev, ino),
+                        )?;
+                        consumed.set(true);
+                        return unlink_at(directory, &aside, 0).with_context(|| {
+                            format!("remove the entry hardlink {} replaced", target.label())
+                        });
+                    }
                     exchanged.set(true);
                     let swapped = metadata_at(directory, &temporary)?;
                     if (swapped.dev, swapped.ino) != (dev, ino) {
@@ -1754,6 +1944,7 @@ impl Root {
         match (&result, condition) {
             // A rename consumed the temporary name; anything else leaves it.
             (Ok(()), Any) => {}
+            _ if consumed.get() => {}
             // What an exchange displaced is not ours to remove.
             (Err(_), Matches { dev, ino })
                 if exchanged.get()
@@ -1799,9 +1990,11 @@ impl Root {
         Ok(())
     }
 
-    /// Publish a staged regular file only if the target name is still absent.
-    /// The hard link makes the final name visible atomically without replacing
-    /// a raced target; removing the staged name leaves one link on success.
+    /// Publish a staged regular file only if the target name is still absent,
+    /// by the first of these the filesystem supports (see
+    /// `publication::move_without_replacing`): a no-replace rename, a hard
+    /// link and then removal of the staged name, or a check that the name
+    /// is absent and then a rename.
     pub(crate) fn publish_new_regular(
         &self,
         source: &RelativePath,
@@ -1815,32 +2008,46 @@ impl Root {
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
-        retry_zero(|| unsafe {
-            libc::linkat(
-                source_parent.directory.as_raw_fd(),
-                source_parent.leaf.as_ptr(),
-                target_parent.directory.as_raw_fd(),
-                target_parent.leaf.as_ptr(),
-                0,
-            )
-        })
-        .with_context(|| {
-            format!(
-                "publish new confined path {} as {}",
-                source.label(),
-                target.label()
-            )
-        })?;
+        let moved = self
+            .move_without_replacing(&publication::Placement {
+                from_directory: source_parent.directory.as_raw_fd(),
+                from: &source_parent.leaf,
+                to_directory: target_parent.directory.as_raw_fd(),
+                to: &target_parent.leaf,
+                allow_link: true,
+            })
+            .with_context(|| {
+                format!(
+                    "publish new confined path {} as {}",
+                    source.label(),
+                    target.label()
+                )
+            })?;
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
         #[cfg(test)]
         run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterAbsentLink);
-        let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
-        if !is_safe_staged_identity_after_link(published, staged_dev, staged_ino) {
-            bail!(
-                "confined staged path {} changed during publication",
-                source.label()
-            );
+        // Where each name reports its own inode number and one link, as on
+        // SSHFS, the published name cannot be compared with the staged file.
+        if self.link_counts_trusted() {
+            let published = metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+            let expected = match moved {
+                publication::Moved::Renamed => {
+                    is_safe_staged_identity(published, staged_dev, staged_ino)
+                }
+                publication::Moved::Linked => {
+                    is_safe_staged_identity_after_link(published, staged_dev, staged_ino)
+                }
+            };
+            if !expected {
+                bail!(
+                    "confined staged path {} changed during publication",
+                    source.label()
+                );
+            }
+        }
+        if moved == publication::Moved::Renamed {
+            return Ok(());
         }
         #[cfg(any(target_os = "linux", test))]
         let _permit = self.mutation_permit(source)?;
@@ -1888,13 +2095,38 @@ impl Root {
         );
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
-        rename_exchange(
-            source_parent.directory.as_raw_fd(),
-            &source_parent.leaf,
-            target_parent.directory.as_raw_fd(),
-            &target_parent.leaf,
-        )
-        .with_context(|| format!("atomically publish confined path {}", target.label()))?;
+        if !self
+            .exchange(
+                source_parent.directory.as_raw_fd(),
+                &source_parent.leaf,
+                target_parent.directory.as_raw_fd(),
+                &target_parent.leaf,
+            )
+            .with_context(|| format!("atomically publish confined path {}", target.label()))?
+        {
+            let aside = self.publish_over_moved_aside(
+                target,
+                &target_parent,
+                source_parent.directory.as_raw_fd(),
+                &source_parent.leaf,
+                has_expected_identity,
+            )?;
+            #[cfg(any(target_os = "linux", test))]
+            drop(permit);
+            if self.link_counts_trusted() {
+                let published =
+                    metadata_at(target_parent.directory.as_raw_fd(), &target_parent.leaf)?;
+                if !is_safe_staged_identity(published, staged_dev, staged_ino) {
+                    bail!(
+                        "confined staged path {} changed during publication; kept the entry it displaced as {}",
+                        source.label(),
+                        sibling_label(target, &aside)
+                    );
+                }
+            }
+            return unlink_at(target_parent.directory.as_raw_fd(), &aside, 0)
+                .with_context(|| format!("remove displaced confined path {}", target.label()));
+        }
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
         #[cfg(test)]
@@ -1976,7 +2208,7 @@ impl Root {
             Ok(permit) => permit,
             Err(error) => return error.context(race),
         };
-        match move_to_recovery_name(parent) {
+        match self.move_to_recovery_name(parent.directory.as_raw_fd(), &parent.leaf) {
             Ok(Some(name)) => anyhow::anyhow!(
                 "{race}; kept the entry it displaced as {}",
                 sibling_label(staged, &name)
@@ -1986,6 +2218,101 @@ impl Root {
                 "{race}; the entry it displaced is still at {}: {error:#}",
                 staged.label()
             ),
+        }
+    }
+
+    /// Rename the entry `name` in `directory` to a new recovery name beside
+    /// it, never replacing anything there. `None` when the name is already
+    /// empty. A rename moves exactly the entry at the name, whatever another
+    /// writer may do to the name meanwhile; the recovery name is fresh.
+    fn move_to_recovery_name(&self, directory: RawFd, name: &CStr) -> Result<Option<CString>> {
+        for _ in 0..32 {
+            let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
+            let recovery = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
+                .expect("generated swap name contains no NUL");
+            match self.move_without_replacing(&publication::Placement {
+                from_directory: directory,
+                from: name,
+                to_directory: directory,
+                to: &recovery,
+                allow_link: false,
+            }) {
+                Ok(_) => return Ok(Some(recovery)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error).context("rename it to a recovery name"),
+            }
+        }
+        bail!("could not allocate a recovery name")
+    }
+
+    /// Replace the entry at `target` with `replacement` only while that
+    /// entry is the one expected, on a filesystem without atomic exchange.
+    /// The entry is first moved aside to a fresh recovery name, so that
+    /// what is checked is exactly what was moved; `replacement` then takes
+    /// the name without replacing whatever may have appeared there since.
+    /// Readers briefly find the name missing.
+    ///
+    /// Nothing another writer put at the name is lost: an unexpected entry
+    /// is put back, or kept at its recovery name, and reported, as is the
+    /// expected one when a new entry took the name meanwhile. On success the
+    /// expected entry is left at the returned recovery name for the caller
+    /// to check the publication and remove it.
+    fn publish_over_moved_aside(
+        &self,
+        target: &RelativePath,
+        target_parent: &ResolvedParent<'_>,
+        replacement_directory: RawFd,
+        replacement: &CStr,
+        expected: impl Fn(RootMetadata) -> bool,
+    ) -> Result<CString> {
+        let directory = target_parent.directory.as_raw_fd();
+        let Some(aside) = self.move_to_recovery_name(directory, &target_parent.leaf)? else {
+            bail!(
+                "confined destination {} disappeared before publication",
+                target.label()
+            );
+        };
+        #[cfg(test)]
+        run_publication_test_hook(self.identity, target, PublicationTestPoint::AfterMovedAside);
+        let kept = |race: &str| {
+            anyhow::anyhow!(
+                "confined destination {} {race}; kept the entry it displaced as {}",
+                target.label(),
+                sibling_label(target, &aside)
+            )
+        };
+        let put_back = |race: &str| -> anyhow::Error {
+            match self.move_without_replacing(&publication::Placement {
+                from_directory: directory,
+                from: &aside,
+                to_directory: directory,
+                to: &target_parent.leaf,
+                allow_link: false,
+            }) {
+                Ok(_) => anyhow::anyhow!("confined destination {} {race}", target.label()),
+                Err(_) => kept(race),
+            }
+        };
+        match metadata_at(directory, &aside) {
+            Ok(displaced) if expected(displaced) => {}
+            Ok(_) => return Err(put_back("changed before publication")),
+            Err(error) => return Err(put_back("could not be checked").context(error)),
+        }
+        match self.move_without_replacing(&publication::Placement {
+            from_directory: replacement_directory,
+            from: replacement,
+            to_directory: directory,
+            to: &target_parent.leaf,
+            allow_link: false,
+        }) {
+            Ok(_) => Ok(aside),
+            // A later writer took the name: theirs stays, and so does the
+            // entry this replacement was to replace.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(kept("changed during publication"))
+            }
+            Err(error) => Err(put_back("could not be replaced").context(error)),
         }
     }
 
@@ -2015,6 +2342,18 @@ impl Root {
         name: &'a CStr,
     ) -> RemovalEntry<'a> {
         RemovalEntry::new(parent.unwrap_or(&self.directory), name)
+    }
+
+    /// Remove `path` if it still names the singly linked regular file
+    /// `identity`, and say whether it did. Errors count as not removed.
+    pub(crate) fn unlink_if_same_regular(&self, path: &RelativePath, identity: (u64, u64)) -> bool {
+        let Ok(parent) = self.resolve_parent(path) else {
+            return false;
+        };
+        let directory = parent.directory.as_raw_fd();
+        metadata_at(directory, &parent.leaf)
+            .is_ok_and(|entry| is_safe_staged_identity(entry, identity.0, identity.1))
+            && unlink_at(directory, &parent.leaf, 0).is_ok()
     }
 
     /// Remove a non-directory leaf. Symlinks are removed themselves, never
@@ -2709,11 +3048,18 @@ fn create_temporary(
     parent: &ResolvedParent<'_>,
     create: impl Fn(RawFd, &CString) -> io::Result<()>,
 ) -> Result<CString> {
+    create_temporary_in(parent.directory.as_raw_fd(), create)
+}
+
+fn create_temporary_in(
+    directory: RawFd,
+    create: impl Fn(RawFd, &CString) -> io::Result<()>,
+) -> Result<CString> {
     for _ in 0..32 {
         let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
         let name = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
             .expect("generated swap name contains no NUL");
-        match create(parent.directory.as_raw_fd(), &name) {
+        match create(directory, &name) {
             Ok(()) => return Ok(name),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("create replacement sidecar"),
@@ -2722,26 +3068,59 @@ fn create_temporary(
     bail!("could not allocate a replacement sidecar name")
 }
 
-/// Rename the entry at `parent.leaf` to a new recovery name beside it,
-/// never replacing anything there. `None` when the name is already empty.
-fn move_to_recovery_name(parent: &ResolvedParent<'_>) -> Result<Option<CString>> {
-    for _ in 0..32 {
-        let counter = NEXT_SWAP_NAME.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(crate::fsops::recovery_name(std::process::id(), counter))
-            .expect("generated swap name contains no NUL");
-        match rename_noreplace(
-            parent.directory.as_raw_fd(),
-            &parent.leaf,
-            parent.directory.as_raw_fd(),
-            &name,
-        ) {
-            Ok(()) => return Ok(Some(name)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("rename it to a recovery name"),
+/// Find out whether setting a symlink's times in `directory` sets its
+/// target's instead: make a private file and a symlink to a path below that
+/// file, which cannot exist, and set the link's times. A filesystem that
+/// follows the link fails; one that sets the link succeeds. Anything else
+/// counts as following, so that a target is never touched. The probe's
+/// names are removed again.
+fn probe_symlink_times_follow(directory: RawFd) -> bool {
+    let Ok(file) = create_temporary_in(directory, |fd, name| {
+        open_at(
+            fd,
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .map(drop)
+    }) else {
+        return true;
+    };
+    let mut target = file.as_bytes().to_vec();
+    target.extend_from_slice(b"/absent");
+    let target = CString::new(target).expect("generated name contains no NUL");
+    let link = create_temporary_in(directory, |fd, name| {
+        retry_zero(|| unsafe { libc::symlinkat(target.as_ptr(), fd, name.as_ptr()) })
+    });
+    let follow = match &link {
+        Ok(link) => {
+            let times = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+                libc::timespec {
+                    tv_sec: 1_000_000_000,
+                    tv_nsec: 0,
+                },
+            ];
+            retry_zero(|| unsafe {
+                libc::utimensat(
+                    directory,
+                    link.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+            .is_err()
         }
+        Err(_) => true,
+    };
+    if let Ok(link) = &link {
+        let _ = unlink_at(directory, link, 0);
     }
-    bail!("could not allocate a recovery name")
+    let _ = unlink_at(directory, &file, 0);
+    follow
 }
 
 /// The label of `name` in the directory that holds `path`.
@@ -2756,9 +3135,9 @@ fn sibling_label(path: &RelativePath, name: &CStr) -> String {
 #[cfg(target_os = "linux")]
 fn rename_noreplace(
     old_parent: RawFd,
-    old_name: &CString,
+    old_name: &CStr,
     new_parent: RawFd,
-    new_name: &CString,
+    new_name: &CStr,
 ) -> io::Result<()> {
     retry_zero(|| unsafe {
         libc::renameat2(
@@ -2774,9 +3153,9 @@ fn rename_noreplace(
 #[cfg(target_os = "macos")]
 fn rename_noreplace(
     old_parent: RawFd,
-    old_name: &CString,
+    old_name: &CStr,
     new_parent: RawFd,
-    new_name: &CString,
+    new_name: &CStr,
 ) -> io::Result<()> {
     retry_zero(|| unsafe {
         libc::renameatx_np(
@@ -2792,9 +3171,9 @@ fn rename_noreplace(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_noreplace(
     _old_parent: RawFd,
-    _old_name: &CString,
+    _old_name: &CStr,
     _new_parent: RawFd,
-    _new_name: &CString,
+    _new_name: &CStr,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -2805,9 +3184,9 @@ fn rename_noreplace(
 #[cfg(target_os = "linux")]
 fn rename_exchange(
     old_parent: RawFd,
-    old_name: &CString,
+    old_name: &CStr,
     new_parent: RawFd,
-    new_name: &CString,
+    new_name: &CStr,
 ) -> io::Result<()> {
     // SAFETY: both names are NUL-terminated and outlive the call; the
     // descriptors are only read. The typed wrapper avoids passing `c_int`
@@ -2823,13 +3202,22 @@ fn rename_exchange(
     })
 }
 
+/// Only volumes that advertise `RENAME_SWAP` are asked to swap: a FAT32
+/// volume completes the call as a plain rename over the target, losing it,
+/// and reports success. Others refuse it here with `ENOTSUP`, as HFS+ does.
 #[cfg(target_os = "macos")]
 fn rename_exchange(
     old_parent: RawFd,
-    old_name: &CString,
+    old_name: &CStr,
     new_parent: RawFd,
-    new_name: &CString,
+    new_name: &CStr,
 ) -> io::Result<()> {
+    let swaps = |directory| {
+        crate::fsops::volume_capabilities(directory).is_some_and(|volume| volume.rename_swap)
+    };
+    if !swaps(old_parent) || (new_parent != old_parent && !swaps(new_parent)) {
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
     retry_zero(|| unsafe {
         libc::renameatx_np(
             old_parent,
@@ -2844,9 +3232,9 @@ fn rename_exchange(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_exchange(
     _old_parent: RawFd,
-    _old_name: &CString,
+    _old_name: &CStr,
     _new_parent: RawFd,
-    _new_name: &CString,
+    _new_name: &CStr,
 ) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -2894,6 +3282,7 @@ pub(crate) enum PublicationTestPoint {
     AfterAbsentLink,
     BeforeMatchedExchange,
     AfterMatchedExchange,
+    AfterMovedAside,
     AfterHardlinkTemporary,
 }
 

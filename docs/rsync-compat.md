@@ -60,7 +60,7 @@ ranges into sparse holes. See the
 | Link filtering or rewriting | `--safe-links`, `--munge-links` |
 | Other placement and filesystem controls | `-R` / `--relative`, `--partial-dir`, `-x` / `--one-file-system` |
 | Early deletion | `--delete-before`, `--delete-during`, `--force` |
-| Other comparison and output controls | `--size-only`, `--modify-window`, `--chmod`, `--log-file`, `-i` / `--itemize-changes` |
+| Other comparison and output controls | `--size-only`, `--modify-window` (FAT destinations are compared at two seconds automatically), `--chmod`, `--log-file`, `-i` / `--itemize-changes` |
 | Daemon connections | `rsync://`, `host::module` |
 
 Unsupported common flags are rejected with an explanation. Selected symlink

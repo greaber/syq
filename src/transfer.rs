@@ -219,6 +219,10 @@ pub struct Opts {
     /// reuse would compare, and copy the rest.
     pub hash_or_copy: bool,
     pub precise_mtime: bool,
+    /// The destination keeps modification times in two-second steps (FAT),
+    /// so they are compared at that granularity. Set once the destination
+    /// filesystem is known.
+    pub two_second_mtimes: AtomicBool,
     pub inplace: bool,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
@@ -346,9 +350,10 @@ impl Opts {
         let flags = self.matching_flags_for(path);
         let mut changes = 0;
         if flags & flags::TIMES != 0
-            && (source.mtime != destination.mtime
-                || (self.precise_mtime
-                    && !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+            && !self.mtime_matches(
+                (source.mtime, source.mtime_nsec),
+                (destination.mtime, destination.mtime_nsec),
+            )
         {
             changes |= flags::TIMES;
         }
@@ -381,9 +386,27 @@ impl Opts {
             && destination.kind == Kind::File
             && destination.size == source.size
             && self.flags & flags::TIMES != 0
-            && destination.mtime == source.mtime
-            && (!self.precise_mtime
-                || destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec))
+            && self.mtime_matches(
+                (source.mtime, source.mtime_nsec),
+                (destination.mtime, destination.mtime_nsec),
+            )
+    }
+
+    pub(crate) fn two_second_mtimes(&self) -> bool {
+        self.two_second_mtimes.load(Relaxed)
+    }
+
+    /// Whether a destination modification time records the source's, at the
+    /// precision the destination keeps: whole seconds and the significant
+    /// fraction digits the destination shows, or on FAT, which keeps
+    /// two-second steps, within a second either way (as rsync's
+    /// `--modify-window=1`).
+    pub(crate) fn mtime_matches(&self, source: (i64, u32), destination: (i64, u32)) -> bool {
+        if self.two_second_mtimes() {
+            return two_second_mtime_matches(source.0, destination.0);
+        }
+        source.0 == destination.0
+            && (!self.precise_mtime || destination_fraction_matches(source.1, destination.1))
     }
 
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
@@ -2166,6 +2189,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
+        two_second_mtimes: Default::default(),
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
@@ -3252,6 +3276,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let destination_filesystem = initial_destination_filesystem
         .as_ref()
         .and_then(|info| info.filesystem.clone());
+    #[cfg(debug_assertions)]
+    let test_two_second_mtimes = std::env::var_os("SYQ_TEST_TWO_SECOND_MTIMES").is_some();
+    #[cfg(not(debug_assertions))]
+    let test_two_second_mtimes = false;
+    if test_two_second_mtimes
+        || destination_filesystem
+            .as_ref()
+            .is_some_and(|filesystem| crate::fsops::kind_has_two_second_mtimes(&filesystem.kind))
+    {
+        opts.two_second_mtimes.store(true, Relaxed);
+    }
     let network_destination = initial_destination_filesystem
         .as_ref()
         .is_some_and(|info| info.network);
@@ -5292,14 +5327,27 @@ fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) ->
     kind != Kind::Socket || destination_supports_sockets
 }
 
-fn metadata_differs(source: &Meta, destination: &Meta, flags: u8) -> bool {
+/// `two_second` compares modification times as on FAT (see
+/// `Opts::mtime_matches`).
+fn metadata_differs(source: &Meta, destination: &Meta, flags: u8, two_second: bool) -> bool {
     (source.inode_metadata.is_some() && source.inode_metadata != destination.inode_metadata)
         || (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
-            && (source.mtime != destination.mtime
-                || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+            && if two_second {
+                !two_second_mtime_matches(source.mtime, destination.mtime)
+            } else {
+                source.mtime != destination.mtime
+                    || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)
+            })
+}
+
+/// FAT stores an even number of seconds: Linux and macOS round a written
+/// time down to one, other systems may round it up. Either way it stays
+/// within a second of the time written.
+fn two_second_mtime_matches(source: i64, destination: i64) -> bool {
+    source.abs_diff(destination) <= 1
 }
 
 fn publication_metadata_flags(requested: u8) -> u8 {

@@ -665,19 +665,22 @@ pub(super) fn apply_metadata(
         crate::fsops::set_mode_handle(&file, mode)?;
     }
     if (copied && args.times) || args.copy_mtime_metadata || explicit.mtime.is_some() {
-        root.set_times(
-            path,
-            &[
-                libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: libc::UTIME_OMIT,
-                },
-                libc::timespec {
-                    tv_sec: metadata.mtime as _,
-                    tv_nsec: metadata.nsec as _,
-                },
-            ],
-        )?;
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: metadata.mtime as _,
+                tv_nsec: metadata.nsec as _,
+            },
+        ];
+        if metadata.kind == super::client::ObjectKind::Symlink {
+            // Left alone where it would set the link's target instead.
+            root.set_symlink_times(path, &times)?;
+        } else {
+            root.set_times(path, &times)?;
+        }
     }
     Ok(())
 }

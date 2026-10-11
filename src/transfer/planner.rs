@@ -2044,7 +2044,12 @@ impl Planner<'_> {
             && !self.opts.dry_run;
         if !time_differs
             && !restore_link_atime
-            && !metadata_differs(&meta, &destination.meta(), flags)
+            && !metadata_differs(
+                &meta,
+                &destination.meta(),
+                flags,
+                self.opts.two_second_mtimes(),
+            )
         {
             return;
         }
@@ -2817,8 +2822,12 @@ impl Planner<'_> {
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
                         && !self.unselected_dirs.contains(p)
-                        && (metadata_differs(&meta, &d.meta(), meta_flags)
-                            || opts.metadata_fix_flags(dst_rel, e, d) != 0)
+                        && (metadata_differs(
+                            &meta,
+                            &d.meta(),
+                            meta_flags,
+                            opts.two_second_mtimes(),
+                        ) || opts.metadata_fix_flags(dst_rel, e, d) != 0)
                         && !self.implicit_dirs.contains(p) =>
                 {
                     self.dry_run_changes.metadata_directories.insert(p.clone());

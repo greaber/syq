@@ -436,6 +436,7 @@ fn pipeline_worker(
         checksum: false,
         hash_or_copy: false,
         precise_mtime: true,
+        two_second_mtimes: Default::default(),
         inplace: false,
         same_host: false,
         allow_sequential_nfs_fallback: false,

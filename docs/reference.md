@@ -357,9 +357,11 @@ recovery entries that need inspection before removal.
 
 ## Check file contents
 
-Syq normally skips files whose size and modification time match. Use `--hash`
-to compare their contents instead; a file whose contents already match is left
-alone:
+Syq normally skips files whose size and modification time match. FAT keeps
+modification times in two-second steps, so on a FAT destination times less
+than two seconds apart count as matching, as rsync's `--modify-window=1` would
+make them. Use `--hash` to compare contents instead; a file whose contents
+already match is left alone:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
@@ -421,6 +423,8 @@ S3 object when no usable stored hash is available. Copying `mtime` lets later
 runs use the size/time comparison. Other metadata can be selected the same way, for example
 `--copy-metadata=permissions,ownership`. `times` remains an alias for `mtime`.
 Explicit mapping `metadata.mtime` also sets the requested destination time.
+On SSHFS, setting a symlink's modification time would change the file it points
+to instead, so syq leaves symlink times alone on filesystems that behave that way.
 S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 

@@ -1663,10 +1663,273 @@ fn only_recovery_entry(directory: &Path, error: &str) -> PathBuf {
     directory.join(&kept[0])
 }
 
+/// The names in `directory`, sorted.
+fn sorted_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Without exchange (HFS+, exFAT, NFS, SMB, SSHFS), a matched replacement
+/// of a file, a symlink, a node or a hard link moves the expected entry
+/// aside, publishes, and removes it; with or without no-replace renames.
+#[test]
+fn matched_replacement_without_exchange_moves_the_expected_entry_aside() {
+    use crate::proto::TargetCondition::Matches;
+    for no_replace_rename in [false, true] {
+        let tree = TestDir::new("matched-without-exchange");
+        let root = Root::open(tree.path()).unwrap();
+        root.assume_missing_publication_support_for_test(true, no_replace_rename, false);
+
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), b"new").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        root.replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            Some((old.ctime, old.ctime_nsec)),
+        )
+        .unwrap();
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"new");
+        assert_eq!(root.metadata(&target).unwrap().ino, staged_metadata.ino());
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old_link = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+
+        let fifo = relative(b"fifo");
+        root.create_node(&fifo, MODE_FIFO | 0o644, 0).unwrap();
+        let old_fifo = root.metadata(&fifo).unwrap();
+        root.replace_node_if_same(&fifo, MODE_FIFO | 0o600, 0, old_fifo.dev, old_fifo.ino)
+            .unwrap();
+        assert_ne!(root.metadata(&fifo).unwrap().ino, old_fifo.ino);
+
+        fs::write(tree.path().join("existing"), b"existing").unwrap();
+        let existing = root.metadata(&relative(b"existing")).unwrap();
+        let representative = root.metadata(&target).unwrap();
+        root.publish_hardlink(
+            &target,
+            &relative(b"existing"),
+            (representative.dev, representative.ino),
+            Matches {
+                dev: existing.dev,
+                ino: existing.ino,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            root.metadata(&relative(b"existing")).unwrap().ino,
+            representative.ino
+        );
+        assert_eq!(
+            sorted_names(tree.path()),
+            ["existing", "fifo", "link", "target"],
+            "{no_replace_rename}"
+        );
+    }
+}
+
+/// Matched replacement of a file and a symlink with whatever this
+/// filesystem supports: exchange where it has one, the fallback elsewhere.
+/// Run with `TMPDIR` on HFS+, FAT32 or exFAT to check those filesystems; a
+/// FAT32 volume completes a swap as a plain rename, so it must not be asked.
+#[test]
+fn matched_file_and_symlink_replacement_work_on_this_filesystem() {
+    let tree = TestDir::new("matched-on-this-filesystem");
+    let root = Root::open(tree.path()).unwrap();
+    for round in 0..2 {
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), format!("new {round}")).unwrap();
+        if round == 0 {
+            fs::write(tree.path().join("target"), b"old").unwrap();
+        }
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        root.replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(tree.path().join("target")).unwrap(),
+            format!("new {round}").as_bytes()
+        );
+    }
+    let link = relative(b"link");
+    root.create_symlink(&link, b"old").unwrap();
+    let old_link = root.metadata(&link).unwrap();
+    root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+        .unwrap();
+    assert_eq!(
+        fs::read_link(tree.path().join("link")).unwrap(),
+        Path::new("new")
+    );
+    assert_eq!(sorted_names(tree.path()), ["link", "target"]);
+}
+
+/// Without exchange, an entry that is not the expected one when it is
+/// moved aside goes back to its name, untouched.
+#[test]
+fn matched_replacement_without_exchange_puts_an_unexpected_entry_back() {
+    let tree = TestDir::new("matched-without-exchange-unexpected");
+    let root = Root::open(tree.path()).unwrap();
+    root.assume_missing_publication_support_for_test(true, false, false);
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+
+    let target_path = tree.path().join("target");
+    let moved_path = tree.path().join("moved");
+    let _hook = install_publication_test_hook(
+        root.identity(),
+        &target,
+        PublicationTestPoint::BeforeMatchedExchange,
+        move || {
+            fs::rename(&target_path, &moved_path).unwrap();
+            fs::write(&target_path, b"other writer").unwrap();
+        },
+    );
+    let error = root
+        .replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed before publication"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read(tree.path().join("target")).unwrap(),
+        b"other writer"
+    );
+    assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"new");
+    assert_eq!(sorted_names(tree.path()), ["moved", "staged", "target"]);
+}
+
+/// Without exchange, a writer that takes the name while the expected entry
+/// is aside keeps it, and the expected entry is kept and reported.
+#[test]
+fn matched_replacement_without_exchange_keeps_what_a_later_writer_displaced() {
+    let tree = TestDir::new("matched-without-exchange-later-writer");
+    let root = Root::open(tree.path()).unwrap();
+    root.assume_missing_publication_support_for_test(true, false, false);
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+
+    let target_path = tree.path().join("target");
+    let _hook = install_publication_test_hook(
+        root.identity(),
+        &target,
+        PublicationTestPoint::AfterMovedAside,
+        move || fs::write(&target_path, b"later").unwrap(),
+    );
+    let error = root
+        .replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("changed during publication"), "{error}");
+    assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"later");
+    let kept = only_recovery_entry(tree.path(), &error);
+    assert_eq!(fs::read(kept).unwrap(), b"old");
+    assert_eq!(fs::read(tree.path().join("staged")).unwrap(), b"new");
+}
+
+/// A new name is published without replacing anything by a no-replace
+/// rename, else a hard link, else a check and a rename; an existing name is
+/// refused each way, and no staged name remains after success.
+#[test]
+fn absent_publication_falls_back_without_rename_flags_or_links() {
+    for (no_replace_rename, links, untrusted) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let label = format!("{no_replace_rename} {links} {untrusted}");
+        let tree = TestDir::new("absent-publication-fallback");
+        let root = Root::open(tree.path()).unwrap();
+        root.assume_missing_publication_support_for_test(false, no_replace_rename, links);
+        if untrusted {
+            root.assume_untrusted_link_counts_for_test();
+        }
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), b"staged").unwrap();
+        let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        root.publish_new_regular(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap();
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"staged");
+        assert_eq!(root.metadata(&target).unwrap().nlink, 1, "{label}");
+        assert_eq!(sorted_names(tree.path()), ["target"], "{label}");
+
+        fs::write(tree.path().join("staged"), b"again").unwrap();
+        let metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let error = root
+            .publish_new_regular(&staged, &target, (metadata.dev(), metadata.ino()))
+            .unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists)),
+            "{label}: {error:#}"
+        );
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"staged");
+        assert!(root.unlink_if_same_regular(&staged, (metadata.dev(), metadata.ino())));
+        assert_eq!(sorted_names(tree.path()), ["target"], "{label}");
+    }
+}
+
+/// The probe for filesystems that set a symlink's target when asked for the
+/// link's times finds that a local filesystem sets the link, and leaves no
+/// names behind.
+#[test]
+fn symlink_time_probe_leaves_nothing_behind() {
+    let tree = TestDir::new("symlink-time-probe");
+    let directory = File::open(tree.path()).unwrap();
+    assert!(!probe_symlink_times_follow(directory.as_raw_fd()));
+    assert!(sorted_names(tree.path()).is_empty());
+}
+
 #[test]
 fn absent_publication_never_unlinks_a_later_writer() {
     let tree = TestDir::new("absent-publication-race");
     let root = Root::open(tree.path()).unwrap();
+    // The race is between the link and the removal of the staged name.
+    root.assume_missing_publication_support_for_test(false, true, false);
     let staged = relative(b"staged");
     let target = relative(b"target");
     fs::write(tree.path().join("staged"), b"staged").unwrap();

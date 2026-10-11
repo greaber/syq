@@ -36,6 +36,7 @@ mod basis_copy;
 #[cfg(target_os = "linux")]
 mod btrfs;
 mod entry;
+mod fs_caps;
 mod limits;
 mod operator;
 pub(crate) mod owned;
@@ -47,6 +48,11 @@ mod small_batch;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
+#[cfg(target_os = "macos")]
+pub(crate) use fs_caps::volume_capabilities;
+pub(crate) use fs_caps::{
+    kind_has_two_second_mtimes, link_counts_trusted, symlink_times_may_follow,
+};
 pub(crate) use limits::*;
 pub(crate) use operator::*;
 pub(crate) use partial::*;
@@ -211,6 +217,8 @@ struct FileSystemTraits {
     synchronous: bool,
     measured_local_source: bool,
     local_userspace_copy: bool,
+    /// See `link_counts_trusted`.
+    untrusted_link_counts: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -307,7 +315,7 @@ fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
         0x6969 => "nfs",
         0x9123683e => "btrfs",
         0x794c7630 => "overlay",
-        _ => "other",
+        other => fs_caps::linux_kind(other as u32).unwrap_or("other"),
     }
     .to_string();
     #[cfg(target_os = "macos")]
@@ -381,6 +389,11 @@ fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
                 file_system_type,
                 t if t == libc::EXT4_SUPER_MAGIC as u32
                     || t == libc::XFS_SUPER_MAGIC as u32
+            ),
+            untrusted_link_counts: fs_caps::linux_link_counts_untrusted(
+                file_system_type,
+                file,
+                key,
             ),
         }
     }

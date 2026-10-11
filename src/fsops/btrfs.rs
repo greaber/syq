@@ -92,7 +92,7 @@ impl Compression {
     }
 }
 
-fn fdinfo_mount_id(file: &File) -> Option<u64> {
+pub(super) fn fdinfo_mount_id(file: &File) -> Option<u64> {
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
     mount_id_from_fdinfo(&info)
 }
