@@ -50,7 +50,9 @@ pub(crate) use apply::*;
 pub(crate) use entry::*;
 #[cfg(target_os = "macos")]
 pub(crate) use fs_caps::macos_profile;
-pub(crate) use fs_caps::{kind_has_two_second_mtimes, profile, record_refusal, Profile, Refusal};
+pub(crate) use fs_caps::{
+    kind_has_two_second_mtimes, kind_sets_symlink_times, profile, record_refusal, Profile, Refusal,
+};
 pub(crate) use limits::*;
 pub(crate) use operator::*;
 pub(crate) use partial::*;

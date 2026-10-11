@@ -223,6 +223,10 @@ pub struct Opts {
     /// so they are compared at that granularity. Set once the destination
     /// filesystem is known.
     pub two_second_mtimes: AtomicBool,
+    /// Symlink times are compared: the destination sets a symlink's own
+    /// times. Cleared once a destination filesystem that leaves them alone
+    /// is known, as where setting them would set the target's instead.
+    pub symlink_times: AtomicBool,
     pub inplace: bool,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
@@ -394,6 +398,10 @@ impl Opts {
 
     pub(crate) fn two_second_mtimes(&self) -> bool {
         self.two_second_mtimes.load(Relaxed)
+    }
+
+    pub(crate) fn symlink_times(&self) -> bool {
+        self.symlink_times.load(Relaxed)
     }
 
     /// Whether a destination modification time records the source's, at the
@@ -2190,6 +2198,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         hash_or_copy: args.hash_or_copy && !args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
         two_second_mtimes: Default::default(),
+        symlink_times: AtomicBool::new(true),
         inplace: args.inplace,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
@@ -3286,6 +3295,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             .is_some_and(|filesystem| crate::fsops::kind_has_two_second_mtimes(&filesystem.kind))
     {
         opts.two_second_mtimes.store(true, Relaxed);
+    }
+    #[cfg(debug_assertions)]
+    let test_symlink_times_follow = std::env::var_os("SYQ_TEST_SYMLINK_TIMES_FOLLOW").is_some();
+    #[cfg(not(debug_assertions))]
+    let test_symlink_times_follow = false;
+    if test_symlink_times_follow
+        || destination_filesystem
+            .as_ref()
+            .is_some_and(|filesystem| !crate::fsops::kind_sets_symlink_times(&filesystem.kind))
+    {
+        opts.symlink_times.store(false, Relaxed);
     }
     let network_destination = initial_destination_filesystem
         .as_ref()

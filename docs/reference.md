@@ -207,7 +207,10 @@ syq cp --srcs-in source --to server --into destination \
 
 All strategies keep size/time skips, explicit `--hash` comparisons, integrity
 checks, and partial-file resume. Changed files use atomic replacement unless
-`--inplace` is selected. The strategy does not fix worker counts or request
+`--inplace` is selected. A replacement that must not overwrite what another
+program put there meanwhile uses an atomic exchange; on a filesystem without one
+it briefly removes the name, and an interruption can leave the old file under a
+[`.syq-swap-` name](commands/clean-partials.md#which-files-are-removed). The strategy does not fix worker counts or request
 sizes; automatic tuning remains enabled.
 
 `syq rsync` uses rsync's spellings: `-W` / `--whole-file` selects whole-file
@@ -358,10 +361,11 @@ recovery entries that need inspection before removal.
 ## Check file contents
 
 Syq normally skips files whose size and modification time match. FAT keeps
-modification times in two-second steps, so on a FAT destination times less
-than two seconds apart count as matching, as rsync's `--modify-window=1` would
-make them. Use `--hash` to compare contents instead; a file whose contents
-already match is left alone:
+modification times in two-second steps, so when syq copies into a directory on
+FAT, times less than two seconds apart count as matching, as rsync's
+`--modify-window=1` would make them (not when it updates one named file or
+copies to a receiving machine). Use `--hash` to compare contents instead; a file
+whose contents already match is left alone:
 
 ```sh
 syq cp --hash --srcs-in project --into backup

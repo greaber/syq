@@ -25,6 +25,10 @@ thread_local! {
     /// Rename-flag calls made while refusing them.
     pub(super) static REFUSED_RENAME_FLAG_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Names other than fresh recovery names published by the
+    /// check-then-rename step.
+    pub(super) static CHECKED_RENAMES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// A refusal tests stand in for, or None to make the call.
@@ -74,8 +78,11 @@ pub(super) struct Placement<'a> {
     pub(super) from: &'a CStr,
     pub(super) to_directory: RawFd,
     pub(super) to: &'a CStr,
-    /// Whether linking and then removing the source name is acceptable:
-    /// it is for a private staged file, not for a name others may change.
+    /// Whether `from` may be linked to `to` and its own name then removed:
+    /// yes for a name only this publication uses, such as a staged file or
+    /// a recovery name; no for an entry another writer may replace
+    /// meanwhile, which must move by rename so that exactly what is at the
+    /// name moves.
     pub(super) allow_link: bool,
 }
 
@@ -87,17 +94,23 @@ pub(super) struct Placement<'a> {
 ///    volumes that advertise it. A network filesystem may check the target
 ///    itself and then tell its server to replace (SMB), or ignore the flag
 ///    (one of rclone's mount modes), so others skip to linking;
-/// 2. a hard link, which servers create atomically, when allowed and the
-///    filesystem may have links;
+/// 2. a hard link, which the kernel or server refuses atomically when the
+///    name exists, when allowed and the filesystem may have links;
 /// 3. a check that `to` is absent, then a plain rename.
 ///
-/// The last step can replace only a name that appeared after its check.
-/// A name that existed before is always refused, so a policy that keeps
-/// existing files keeps them, and every receiver uses this same order: a
-/// sender cannot move an existing file onto the name, because no operation
-/// it may request renames an existing destination entry to another name.
+/// Steps 1 and 2 never replace anything. Step 3 runs only where neither is
+/// available, as on rclone mounts and on FAT and exFAT volumes on macOS,
+/// and there a name another writer creates between the check and the
+/// rename is replaced. A name that existed before is always refused, so a
+/// policy that keeps existing files keeps them, and every receiver uses
+/// this same order: a sender cannot move an existing file onto the name,
+/// because no operation it may request renames an existing destination
+/// entry to another name.
+///
+/// A refusal of a step the profile allowed is passed to `record_refusal`
+/// and taken out of `profile`, so the rest of a publication skips it too.
 pub(super) fn move_without_replacing(
-    profile: Profile,
+    profile: &mut Profile,
     placement: &Placement<'_>,
     record_refusal: &dyn Fn(Refusal),
 ) -> io::Result<Moved> {
@@ -108,6 +121,10 @@ pub(super) fn move_without_replacing(
         to,
         allow_link,
     } = *placement;
+    let refuse = |profile: &mut Profile, refusal| {
+        *profile = profile.without(refusal);
+        record_refusal(refusal);
+    };
     if profile.atomic_no_replace_rename {
         let renamed = match simulated_refusal() {
             Some(error) => Err(error),
@@ -116,7 +133,7 @@ pub(super) fn move_without_replacing(
         match renamed {
             Ok(()) => return Ok(Moved::Renamed),
             Err(error) if rename_flag_unsupported(&error) => {
-                record_refusal(Refusal::NoReplaceRename);
+                refuse(profile, Refusal::NoReplaceRename)
             }
             Err(error) => return Err(error),
         }
@@ -133,11 +150,15 @@ pub(super) fn move_without_replacing(
                 }
                 // EIO may be transient; only a definite refusal is kept.
                 if error.raw_os_error() != Some(libc::EIO) {
-                    record_refusal(Refusal::HardLinks);
+                    refuse(profile, Refusal::HardLinks);
                 }
             }
             Err(error) => return Err(error),
         }
+    }
+    #[cfg(test)]
+    if !crate::fsops::is_recovery_name(std::os::unix::ffi::OsStrExt::from_bytes(to.to_bytes())) {
+        CHECKED_RENAMES.set(CHECKED_RENAMES.get() + 1);
     }
     match metadata_at(to_directory, to) {
         Ok(_) => return Err(io::Error::from_raw_os_error(libc::EEXIST)),

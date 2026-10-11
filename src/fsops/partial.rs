@@ -3751,11 +3751,14 @@ pub(super) fn publish_partial_rooted(
         ),
     };
     if let Err(error) = published {
-        // A file that could not be published is not left behind under its
-        // staging name. Only the staged file itself is removed: a name that
-        // now holds another entry, such as one a failed replacement kept, is
+        // What could not be published goes as an interrupted receiver's
+        // sweep would remove it; a partial worth resuming stays for a later
+        // copy. Only the staged file itself is removed: a name that now
+        // holds another entry, such as one a failed replacement kept, is
         // left alone.
-        if root.unlink_if_same_regular(source, staged_identity) {
+        if sidecars::discard_unpublished(staged_identity, metadata.len())
+            && root.unlink_if_same_regular(source, staged_identity)
+        {
             sidecars::forget(staged_identity);
         }
         return Err(error);

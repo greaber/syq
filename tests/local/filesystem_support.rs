@@ -276,3 +276,97 @@ fn fat_modification_times_compare_at_two_seconds() {
     set_mtime(&t.path("dst/odd"), 1_000_000_000);
     assert!(transferred(&[]));
 }
+
+/// A copy that cannot publish a file because another writer created its
+/// name meanwhile keeps the partial file it wrote, as an interrupted copy
+/// would: a rerun after that name is removed sends nothing again.
+#[test]
+fn a_refused_publication_keeps_a_resumable_partial() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let data = prng(4 << 20, 91);
+    write(&t.path("src/file"), &data);
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let args = [
+        "cp",
+        "--no-progress",
+        "--if-exists=error",
+        "--performance-tuning=copy-path=ranges,workers=1",
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .args([&t.s("src/file"), "--into", &t.s("dst")])
+        .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "the check before publication");
+    write(&t.path("dst/file"), b"another writer");
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(read(&t.path("dst/file")), b"another writer", "{output:?}");
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        partial_files(&t.path("dst")).len(),
+        1,
+        "{:?}",
+        names(&t.path("dst"))
+    );
+
+    fs::remove_file(t.path("dst/file")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(args)
+        .args(["--stats", &t.s("src/file"), "--into", &t.s("dst")])
+        .run()
+        .unwrap();
+    assert_ok(&output);
+    assert_eq!(read(&t.path("dst/file")), data);
+    let stats = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(stats.contains("bytes transferred: 0\n"), "{stats}");
+}
+
+/// Where symlink times are left alone, they are not compared either, so a
+/// rerun finds nothing to change.
+#[test]
+fn symlink_times_that_are_left_alone_settle() {
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    write(&t.path("src/file"), b"file");
+    for (index, name) in ["one", "two", "three"].iter().enumerate() {
+        std::os::unix::fs::symlink("file", t.path(&format!("src/{name}"))).unwrap();
+        set_link_mtime(
+            &t.path(&format!("src/{name}")),
+            1_200_000_000 + index as i64,
+        );
+    }
+    let follow = ["SYQ_TEST_SYMLINK_TIMES_FOLLOW"];
+    let copy = |extra: &[&str]| {
+        let mut args = vec!["rsync", "-rlt"];
+        args.extend_from_slice(extra);
+        let src = t.s("src/");
+        let dst = t.s("dst/");
+        args.extend_from_slice(&[&src, &dst]);
+        let output = native_with_env(&args, &follow);
+        assert_ok(&output);
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    copy(&[]);
+    for name in ["one", "two", "three"] {
+        assert_ne!(
+            fs::symlink_metadata(t.path(&format!("dst/{name}")))
+                .unwrap()
+                .mtime(),
+            1_200_000_000
+        );
+    }
+    let preview = copy(&["--dry-run"]);
+    assert!(preview.contains("changes: none"), "{preview}");
+    copy(&[]);
+    let preview = copy(&["--dry-run"]);
+    assert!(preview.contains("changes: none"), "{preview}");
+}

@@ -52,11 +52,12 @@ pub(crate) struct Profile {
     /// the server's file IDs (`noserverino`) makes them up per name.
     ///
     /// Where this is false, checks that compare counts or numbers are not
-    /// made, nothing is skipped because two names seem to be one file, and
-    /// leftover staging files are not reused. A rule that relies on a count
-    /// to find a file's other names (a restricted receiver's limit on files
-    /// that may have names outside its approved directories) must assume
-    /// any file may have them.
+    /// made, and nothing is skipped because two names seem to be one file.
+    /// Leftover partial files are still used: they are only read into a new
+    /// partial, block by block against the source. A rule that relies on a
+    /// count to find a file's other names (a restricted receiver's limit on
+    /// files that may have names outside its approved directories) must
+    /// assume any file may have them.
     pub(crate) link_counts_trusted: bool,
     /// Setting a symlink's times with `AT_SYMLINK_NOFOLLOW` sets the link's
     /// own. An SFTP server behind SSHFS follows the link and sets the
@@ -251,9 +252,33 @@ pub(super) fn linux_kind(file_system_type: u32) -> Option<&'static str> {
         Some(FAT_KIND)
     } else if file_system_type == EXFAT_SUPER_MAGIC {
         Some("exfat")
+    } else if file_system_type == ZFS_SUPER_MAGIC {
+        Some("zfs")
     } else {
         None
     }
+}
+
+/// Whether a destination of this reported kind sets a symlink's own times
+/// (see `Profile::symlink_times`): the coordinator compares symlink times
+/// only there, so that where they are left alone a rerun finds nothing to
+/// change. The kinds are those of the profiles that set them, on Linux and
+/// macOS; FAT and exFAT on Linux have no symlinks.
+pub(crate) fn kind_sets_symlink_times(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ext"
+            | "xfs"
+            | "tmpfs"
+            | "btrfs"
+            | "overlay"
+            | "zfs"
+            | "nfs"
+            | "apfs"
+            | "hfs"
+            | "msdos"
+            | "exfat"
+    )
 }
 
 /// The filesystem kind a Linux receiver reports for FAT (vfat or msdos).
@@ -497,6 +522,24 @@ mod tests {
         assert_eq!(super_options(mounts, 99), None);
     }
 
+    /// The profile behind each Linux kind that reports symlink times set.
+    #[cfg(target_os = "linux")]
+    fn linux_kind_profile_sets_symlink_times(kind: &str) -> bool {
+        let directory = crate::test_support::tempdir().unwrap();
+        let file = File::open(directory.path()).unwrap();
+        let file_system_type = match kind {
+            "ext" => libc::EXT4_SUPER_MAGIC as u32,
+            "xfs" => libc::XFS_SUPER_MAGIC as u32,
+            "tmpfs" => libc::TMPFS_MAGIC as u32,
+            "btrfs" => libc::BTRFS_SUPER_MAGIC as u32,
+            "overlay" => libc::OVERLAYFS_SUPER_MAGIC as u32,
+            "zfs" => ZFS_SUPER_MAGIC,
+            "nfs" => libc::NFS_SUPER_MAGIC as u32,
+            _ => return false,
+        };
+        linux_profile(file_system_type, &file, FileSystemKey::Device(0)).symlink_times
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn verified_types_get_their_profiles_and_others_the_conservative_one() {
@@ -525,6 +568,13 @@ mod tests {
         }
         assert_eq!(linux_kind(libc::MSDOS_SUPER_MAGIC as u32), Some(FAT_KIND));
         assert_eq!(linux_kind(EXFAT_SUPER_MAGIC), Some("exfat"));
+        assert_eq!(linux_kind(ZFS_SUPER_MAGIC), Some("zfs"));
+        for kind in ["ext", "xfs", "tmpfs", "btrfs", "overlay", "zfs", "nfs"] {
+            assert!(kind_sets_symlink_times(kind), "{kind}");
+            assert!(linux_kind_profile_sets_symlink_times(kind), "{kind}");
+        }
+        assert!(!kind_sets_symlink_times("other"));
+        assert!(!kind_sets_symlink_times(FAT_KIND));
         assert_eq!(linux_kind(libc::EXT4_SUPER_MAGIC as u32), None);
     }
 }

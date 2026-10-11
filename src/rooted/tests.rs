@@ -1861,6 +1861,94 @@ fn refused_rename_flags_fall_back_and_are_remembered() {
     assert_eq!(sorted_names(tree.path()), ["new0", "new1", "target"]);
 }
 
+/// Where hard links exist, a name is never published by checking that it
+/// is absent and then renaming, which could replace a file another writer
+/// creates in between: publication and putting an entry back link the name
+/// instead. Only where there are neither atomic no-replace renames nor hard
+/// links is the check used.
+#[test]
+fn names_are_linked_rather_than_checked_wherever_links_exist() {
+    use super::publication::CHECKED_RENAMES;
+    for links in [true, false] {
+        let tree = TestDir::new("linked-not-checked");
+        let root = Root::open(tree.path()).unwrap();
+        assume_missing(&root, true, true, !links);
+        CHECKED_RENAMES.set(0);
+
+        let (staged, target) = (relative(b"staged"), relative(b"target"));
+        fs::write(tree.path().join("staged"), b"new").unwrap();
+        fs::write(tree.path().join("target"), b"old").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        root.replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs::read(tree.path().join("target")).unwrap(), b"new");
+
+        let link = relative(b"link");
+        root.create_symlink(&link, b"old").unwrap();
+        let old_link = root.metadata(&link).unwrap();
+        root.replace_symlink_if_same(&link, b"new", old_link.dev, old_link.ino)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(tree.path().join("link")).unwrap(),
+            Path::new("new")
+        );
+
+        fs::write(tree.path().join("staged"), b"fresh").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        root.publish_new_regular(
+            &staged,
+            &relative(b"fresh"),
+            (staged_metadata.dev(), staged_metadata.ino()),
+        )
+        .unwrap();
+
+        // An unexpected entry goes back by the same steps.
+        fs::write(tree.path().join("staged"), b"newer").unwrap();
+        let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+        let old = root.metadata(&target).unwrap();
+        let target_path = tree.path().join("target");
+        let moved_path = tree.path().join("moved");
+        let _hook = install_publication_test_hook(
+            root.identity(),
+            &target,
+            PublicationTestPoint::BeforeMatchedExchange,
+            move || {
+                fs::rename(&target_path, &moved_path).unwrap();
+                fs::write(&target_path, b"other writer").unwrap();
+            },
+        );
+        let error = root
+            .replace_regular_if_same(
+                &staged,
+                &target,
+                (staged_metadata.dev(), staged_metadata.ino()),
+                old.dev,
+                old.ino,
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("changed before publication"));
+        assert_eq!(
+            fs::read(tree.path().join("target")).unwrap(),
+            b"other writer"
+        );
+
+        assert_eq!(CHECKED_RENAMES.get() == 0, links, "links {links}");
+        assert_eq!(
+            sorted_names(tree.path()),
+            ["fresh", "link", "moved", "staged", "target"]
+        );
+    }
+}
+
 /// Without exchange, an entry that is not the expected one when it is
 /// moved aside goes back to its name, untouched.
 #[test]
