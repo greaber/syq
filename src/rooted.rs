@@ -2152,6 +2152,47 @@ impl ResolvedParent<'_> {
         metadata_at(self.directory.as_raw_fd(), &self.leaf)
     }
 
+    /// The leaf's device and inode, and whether it is the root of a mount
+    /// (a bind mount of a file or directory, or another filesystem, put at
+    /// this name), which makes it no link of what it shows. On Linux one
+    /// `statx` answers both, where an ordinary stat would answer the first.
+    pub(crate) fn leaf_identity(&self) -> io::Result<((u64, u64), bool)> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+            crate::sys::retry_zero(|| unsafe {
+                libc::statx(
+                    self.directory.as_raw_fd(),
+                    self.leaf.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                    libc::STATX_INO | libc::STATX_MNT_ID,
+                    stat.as_mut_ptr(),
+                )
+            })?;
+            let stat = unsafe { stat.assume_init() };
+            let identity = (
+                libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+                stat.stx_ino,
+            );
+            let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+            let mounted = if stat.stx_attributes_mask & mount_root != 0 {
+                stat.stx_attributes & mount_root != 0
+            } else {
+                // Kernels before 5.8 say neither; a mount of another
+                // filesystem still shows its own device.
+                self.directory.metadata()?.dev() != identity.0
+            };
+            Ok((identity, mounted))
+        }
+        // macOS has no bind mounts an ordinary user can make, and a volume
+        // is mounted on a directory, never at a file's name.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let metadata = self.metadata()?;
+            Ok(((metadata.dev, metadata.ino), false))
+        }
+    }
+
     /// The directory that holds the leaf, for inspecting where a new entry
     /// would live. Mutations still go through `Root`.
     pub(crate) fn directory(&self) -> &File {

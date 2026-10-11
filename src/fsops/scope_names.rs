@@ -318,15 +318,16 @@ fn leads_to(root: &Root, name: &RelativePath, identity: (u64, u64)) -> bool {
     )
 }
 
-/// The entry the kept name `name` beneath `root` is, when it leads to the
-/// file `identity`: the identity of the directory holding it, as reached
-/// now, and its name there.
+/// The entry the kept name `name` beneath `root` is, when it is a link of
+/// the file `identity`: the identity of the directory holding it, as
+/// reached now, and its name there. A mount at the name (a bind mount of
+/// the file onto another name) shows the file but is no link of it.
 fn entry_of(root: &Root, name: &[u8], identity: (u64, u64)) -> Option<((u64, u64), Vec<u8>)> {
     let path = RelativePath::new(name).ok()?;
     let (_, leaf) = path.leaf().ok()?;
     let parent = root.resolve_parent(&path).ok()?;
-    let file = parent.metadata().ok()?;
-    if (file.dev, file.ino) != identity {
+    let (file, mounted) = parent.leaf_identity().ok()?;
+    if file != identity || mounted {
         return None;
     }
     let directory = parent.directory().metadata().ok()?;

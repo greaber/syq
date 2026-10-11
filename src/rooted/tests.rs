@@ -2099,3 +2099,23 @@ fn hardlink_publication_honors_its_target_condition() {
     // No temporary names remain.
     assert_eq!(names(), ["existing", "new", "source"]);
 }
+
+/// A name a filesystem is mounted at is a mount root, which no file's link
+/// is; a file's own name is not. (A bind mount of a file shows the same,
+/// but needs privileges to make: see the manual mount probes.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mounted_name_is_told_from_a_link() {
+    let root = Root::open(Path::new("/")).unwrap();
+    let proc = relative(b"proc");
+    let (_, mounted) = root.resolve_parent(&proc).unwrap().leaf_identity().unwrap();
+    assert!(mounted, "/proc is a mount root");
+    let tree = TestDir::new("leaf-identity");
+    fs::write(tree.path().join("file"), b"x").unwrap();
+    let root = Root::open(tree.path()).unwrap();
+    let file = relative(b"file");
+    let (identity, mounted) = root.resolve_parent(&file).unwrap().leaf_identity().unwrap();
+    let metadata = fs::metadata(tree.path().join("file")).unwrap();
+    assert_eq!(identity, (metadata.dev(), metadata.ino()));
+    assert!(!mounted);
+}
