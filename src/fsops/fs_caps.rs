@@ -1,15 +1,19 @@
 //! What syq relies on a destination filesystem for, as one profile per
 //! filesystem.
 //!
-//! There is no end to unusual filesystems, so syq does not assume good
-//! semantics. A filesystem type whose behavior was verified gets the
-//! capabilities it was found to have; every other type, including any syq
-//! cannot identify, gets the conservative profile. Each conservative choice
-//! is correct on every filesystem, only slower or less complete where the
-//! capability exists: matched replacement moves the old entry aside instead
-//! of exchanging, publication without replacing uses its fallback chain,
-//! checks that rely on link counts or inode numbers are not trusted, and
-//! symlink times are left alone.
+//! There is no end to unusual filesystems, so syq trusts a capability only
+//! where a test, source code or authoritative documentation shows it, and
+//! is conservative elsewhere. Each conservative choice is correct on every
+//! filesystem, only slower or less complete where the capability exists.
+//!
+//! - Atomic rename flags are tried where a filesystem that lacks them is
+//!   known to refuse them: the Linux in-tree filesystems below, whose
+//!   rename handlers reject flags they do not implement, and macOS volumes
+//!   that advertise them. A refusal falls back and is remembered. FUSE
+//!   passes the flags to a userspace server, which could ignore them, so
+//!   they are not tried there, nor on types not audited.
+//! - Link counts, inode numbers and symlink times cannot be checked by
+//!   their errors, so they are trusted only on filesystems with evidence.
 //!
 //! The profile comes from facts syq already reads cheaply: the filesystem
 //! type, mount options, and on macOS the capabilities a volume advertises.
@@ -28,6 +32,57 @@ const EXFAT_SUPER_MAGIC: u32 = 0x2011_bab0;
 /// ZFS's filesystem type, which libc does not name.
 #[cfg(target_os = "linux")]
 const ZFS_SUPER_MAGIC: u32 = 0x2fc1_2fc1;
+/// ntfs3's filesystem type ("ntfs").
+#[cfg(target_os = "linux")]
+const NTFS3_SUPER_MAGIC: u32 = 0x7366_746e;
+#[cfg(target_os = "linux")]
+const F2FS_SUPER_MAGIC: u32 = 0xf2f5_2010;
+#[cfg(target_os = "linux")]
+const CEPH_SUPER_MAGIC: u32 = 0x00c3_6400;
+#[cfg(target_os = "linux")]
+const SMB2_SUPER_MAGIC: u32 = 0xfe53_4d42;
+#[cfg(target_os = "linux")]
+const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
+#[cfg(target_os = "linux")]
+const GFS2_SUPER_MAGIC: u32 = 0x0116_1970;
+
+/// Linux filesystems whose rename handler rejects every flag it does not
+/// implement with `EINVAL` (kernel 7.2 source; OpenZFS 2.4 for ZFS, whose
+/// releases before 2.2 reject all flags), so a flag can be tried and a
+/// refusal falls back. The kernel itself rejects unknown flags
+/// (`do_renameat2` in fs/namei.c) and passes the rest to the handler.
+#[cfg(target_os = "linux")]
+const RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED: [u32; 29] = [
+    0xef53,      // ext2, ext3, ext4: ext4_rename2
+    0x5846_5342, // XFS: xfs_vn_rename
+    0x9123_683e, // btrfs: btrfs_rename2
+    0x0102_1994, // tmpfs: shmem_rename2
+    0x794c_7630, // overlayfs: ovl_rename_start
+    ZFS_SUPER_MAGIC,
+    F2FS_SUPER_MAGIC,
+    NTFS3_SUPER_MAGIC,
+    EXFAT_SUPER_MAGIC,
+    0x4d44,      // FAT: vfat_rename2, msdos_rename
+    0x4244,      // HFS
+    0x482b,      // HFS+
+    0x3153_464a, // JFS
+    0x3434,      // NILFS
+    0x1501_3346, // UDF
+    0x0001_1954, // UFS
+    0x7461_636f, // OCFS2: refuses every flag
+    GFS2_SUPER_MAGIC,
+    CEPH_SUPER_MAGIC, // refuses every flag
+    0x6969,           // NFS: refuses every flag
+    CIFS_SUPER_MAGIC,
+    SMB2_SUPER_MAGIC,
+    0x0102_1997, // 9p: refuses every flag
+    0x6b41_4653, // AFS: flags only to YFS servers, else ENOTSUPP
+    0x5346_414f, // AFS
+    0x2405_1905, // UBIFS
+    0x72b6,      // JFFS2
+    0x7375_7245, // Coda: refuses every flag
+    0x786f_4256, // vboxsf: refuses every flag
+];
 
 /// What syq may rely on a filesystem for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,9 +139,8 @@ impl Profile {
         two_second_mtimes: false,
     };
 
-    /// Local POSIX filesystems verified to support all of it: ext2/3/4,
-    /// XFS, btrfs, tmpfs, ZFS (exchange since 2.2; an older one refuses it,
-    /// and the refusal is remembered), overlayfs, APFS.
+    /// Every capability, as on the tested local filesystems.
+    #[cfg(test)]
     const LOCAL: Self = Self {
         exchange: true,
         atomic_no_replace_rename: true,
@@ -208,58 +262,46 @@ pub(crate) fn profile(file: &File) -> Profile {
 }
 
 /// Linux: the profile for a filesystem type, from the type syq already
-/// reads and, for SMB, the mount's options.
+/// reads and, for SMB and CephFS, the mount's options.
 #[cfg(target_os = "linux")]
 pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemKey) -> Profile {
-    match file_system_type {
-        t if t == libc::EXT4_SUPER_MAGIC as u32
-            || t == libc::XFS_SUPER_MAGIC as u32
-            || t == libc::BTRFS_SUPER_MAGIC as u32
-            || t == libc::TMPFS_MAGIC as u32
-            || t == libc::OVERLAYFS_SUPER_MAGIC as u32
-            || t == ZFS_SUPER_MAGIC =>
-        {
-            Profile::LOCAL
+    let t = file_system_type;
+    let tries_flags = RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED.contains(&t);
+    // SMB checks a no-replace target in the client and then asks the server
+    // to replace (smb2inode.c), and GFS2 drops the flag after the local
+    // check, so neither keeps another client or node from the name.
+    let no_replace_is_atomic =
+        tries_flags && !matches!(t, CIFS_SUPER_MAGIC | SMB2_SUPER_MAGIC | GFS2_SUPER_MAGIC);
+    let fat = t == libc::MSDOS_SUPER_MAGIC as u32;
+    // Link counts and symlink times, where there is evidence:
+    // - tested: ext4, XFS, btrfs, tmpfs, overlayfs, ZFS;
+    // - source: f2fs and ntfs3 count links (f2fs_i_links_write, ntfs_link)
+    //   and keep stable inode numbers, and the kernel sets a symlink's own
+    //   times on local filesystems (fs/utimes.c follows no link);
+    // - NFS: the server keeps counts and file IDs, and SETATTR acts on the
+    //   object a file handle names, the link itself;
+    // - CephFS: the MDS keeps counts (ceph_fill_inode) and sets attributes
+    //   on the inode named; `ino32` folds inode numbers so they can collide;
+    // - SMB with the server's file IDs: counts from NumberOfLinks; whether a
+    //   server follows a symlink when setting its times is not known;
+    // - FAT and exFAT have no hard links, so every count is one.
+    let (link_counts_trusted, symlink_times) = match t {
+        0xef53 | 0x5846_5342 | 0x9123_683e | 0x0102_1994 | 0x794c_7630 | ZFS_SUPER_MAGIC
+        | F2FS_SUPER_MAGIC | NTFS3_SUPER_MAGIC | 0x6969 => (true, true),
+        CEPH_SUPER_MAGIC => (!mount_has_option(file, key, b"ino32"), true),
+        CIFS_SUPER_MAGIC | SMB2_SUPER_MAGIC => {
+            (!mount_has_option(file, key, b"noserverino"), false)
         }
-        // The server keeps link counts and file IDs, and sets attributes on
-        // the object a handle names, never following a symlink.
-        t if t == libc::NFS_SUPER_MAGIC as u32 => Profile {
-            exchange: false,
-            atomic_no_replace_rename: false,
-            hard_links: true,
-            link_counts_trusted: true,
-            symlink_times: true,
-            two_second_mtimes: false,
-        },
-        0xfe53_4d42 | 0xff53_4d42 => Profile {
-            exchange: false,
-            atomic_no_replace_rename: false,
-            hard_links: true,
-            link_counts_trusted: !smb_without_server_inode_numbers(file, key),
-            symlink_times: false,
-            two_second_mtimes: false,
-        },
-        // The kernel checks the target of a no-replace rename itself, under
-        // the directory lock, so on these local filesystems it is atomic.
-        t if t == libc::MSDOS_SUPER_MAGIC as u32 => Profile {
-            exchange: false,
-            atomic_no_replace_rename: true,
-            hard_links: false,
-            link_counts_trusted: false,
-            symlink_times: false,
-            two_second_mtimes: true,
-        },
-        EXFAT_SUPER_MAGIC => Profile {
-            exchange: false,
-            atomic_no_replace_rename: true,
-            hard_links: false,
-            link_counts_trusted: false,
-            symlink_times: false,
-            two_second_mtimes: false,
-        },
-        // FUSE (SSHFS, rclone and any other server), SMB1, Ceph, 9p, NTFS
-        // and every type not verified.
-        _ => Profile::CONSERVATIVE,
+        _ if fat || t == EXFAT_SUPER_MAGIC => (true, false),
+        _ => (false, false),
+    };
+    Profile {
+        exchange: tries_flags,
+        atomic_no_replace_rename: no_replace_is_atomic,
+        hard_links: !(fat || t == EXFAT_SUPER_MAGIC),
+        link_counts_trusted,
+        symlink_times,
+        two_second_mtimes: fat,
     }
 }
 
@@ -275,6 +317,12 @@ pub(super) fn linux_kind(file_system_type: u32) -> Option<&'static str> {
         Some("exfat")
     } else if file_system_type == ZFS_SUPER_MAGIC {
         Some("zfs")
+    } else if file_system_type == F2FS_SUPER_MAGIC {
+        Some("f2fs")
+    } else if file_system_type == NTFS3_SUPER_MAGIC {
+        Some("ntfs3")
+    } else if file_system_type == CEPH_SUPER_MAGIC {
+        Some("ceph")
     } else {
         None
     }
@@ -284,7 +332,7 @@ pub(super) fn linux_kind(file_system_type: u32) -> Option<&'static str> {
 /// (see `Profile::symlink_times`): the coordinator compares symlink times
 /// only there, so that where they are left alone a rerun finds nothing to
 /// change. The kinds are those of the profiles that set them, on Linux and
-/// macOS; FAT and exFAT on Linux have no symlinks.
+/// macOS.
 pub(crate) fn kind_sets_symlink_times(kind: &str) -> bool {
     matches!(
         kind,
@@ -294,11 +342,12 @@ pub(crate) fn kind_sets_symlink_times(kind: &str) -> bool {
             | "btrfs"
             | "overlay"
             | "zfs"
+            | "f2fs"
+            | "ntfs3"
+            | "ceph"
             | "nfs"
             | "apfs"
             | "hfs"
-            | "msdos"
-            | "exfat"
     )
 }
 
@@ -312,13 +361,14 @@ pub(crate) fn kind_has_two_second_mtimes(kind: &str) -> bool {
     kind == FAT_KIND || kind == "msdos"
 }
 
+/// Whether a mount's options include `option`. Unknown options count as
+/// including it, the conservative answer for the options asked about.
 #[cfg(target_os = "linux")]
-fn smb_without_server_inode_numbers(file: &File, key: FileSystemKey) -> bool {
+fn mount_has_option(file: &File, key: FileSystemKey, option: &[u8]) -> bool {
     let mount = match key {
         FileSystemKey::Mount(id) => Some(id),
         FileSystemKey::Device(_) => super::btrfs::fdinfo_mount_id(file),
     };
-    // Unknown options count as made-up numbers.
     let Some(mount) = mount else {
         return true;
     };
@@ -328,7 +378,7 @@ fn smb_without_server_inode_numbers(file: &File, key: FileSystemKey) -> bool {
         .is_none_or(|options| {
             options
                 .split(|byte| *byte == b',')
-                .any(|option| option == b"noserverino")
+                .any(|item| item == option)
         })
 }
 
@@ -405,10 +455,14 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
             exchange: volume.rename_swap && kind != b"msdos",
             atomic_no_replace_rename: volume.rename_exclusive,
             hard_links: volume.hard_links,
-            link_counts_trusted: volume.hard_links && volume.persistent_ids,
-            // Verified on these volumes; FAT and exFAT keep symlinks as
-            // small files, whose own times are set.
-            symlink_times: matches!(kind, b"apfs" | b"hfs" | b"msdos" | b"exfat"),
+            // Tested on APFS and HFS+ only; other volumes may report
+            // capabilities they were not tested for.
+            link_counts_trusted: matches!(kind, b"apfs" | b"hfs")
+                && volume.hard_links
+                && volume.persistent_ids,
+            // Tested on APFS and HFS+; on NFS, SETATTR acts on the object a
+            // file handle names, the link itself.
+            symlink_times: matches!(kind, b"apfs" | b"hfs" | b"nfs"),
             two_second_mtimes: kind == b"msdos",
         },
     };
@@ -584,11 +638,36 @@ mod tests {
         ] {
             assert_eq!(linux_profile(local, &file, key), Profile::LOCAL);
         }
-        let nfs = linux_profile(libc::NFS_SUPER_MAGIC as u32, &file, key);
-        assert!(!nfs.exchange && nfs.link_counts_trusted && nfs.symlink_times);
+        for evidenced in [
+            F2FS_SUPER_MAGIC,
+            NTFS3_SUPER_MAGIC,
+            libc::NFS_SUPER_MAGIC as u32,
+        ] {
+            let profile = linux_profile(evidenced, &file, key);
+            assert!(profile.exchange && profile.link_counts_trusted && profile.symlink_times);
+        }
+        // Rename flags are tried where a refusal is certain, but counts and
+        // symlink times need evidence.
+        let p9 = linux_profile(0x0102_1997, &file, key);
+        assert!(p9.exchange && p9.atomic_no_replace_rename);
+        assert!(!p9.link_counts_trusted && !p9.symlink_times);
+        for racy in [CIFS_SUPER_MAGIC, SMB2_SUPER_MAGIC, GFS2_SUPER_MAGIC] {
+            let profile = linux_profile(racy, &file, key);
+            assert!(
+                profile.exchange && !profile.atomic_no_replace_rename,
+                "{racy:x}"
+            );
+        }
         let fat = linux_profile(libc::MSDOS_SUPER_MAGIC as u32, &file, key);
         assert!(fat.two_second_mtimes && !fat.hard_links && fat.atomic_no_replace_rename);
-        for unknown in [libc::FUSE_SUPER_MAGIC as u32, 0x5346_544e, 0x0102_1997] {
+        // FUSE (also virtiofs), the old NTFS driver's type, bcachefs (now
+        // outside the kernel tree) and anything unknown.
+        for unknown in [
+            libc::FUSE_SUPER_MAGIC as u32,
+            0x5346_544e,
+            0xca45_1a4e,
+            0x1234_5678,
+        ] {
             assert_eq!(
                 linux_profile(unknown, &file, key),
                 Profile::CONSERVATIVE,

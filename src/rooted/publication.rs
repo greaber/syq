@@ -41,12 +41,21 @@ pub(super) fn simulated_refusal() -> Option<io::Error> {
     None
 }
 
+/// The kernel's internal "not supported" code, which AFS returns for a
+/// rename flag its server lacks.
+#[cfg(target_os = "linux")]
+const KERNEL_ENOTSUPP: i32 = 524;
+
 /// Whether a rename-flag call failed because the filesystem does not
 /// implement the flag. Linux filesystems reject an unknown flag with
 /// `EINVAL`; for two names in one directory and the leaves syq publishes,
 /// `EINVAL` has no other cause. macOS volumes answer `ENOTSUP`.
 pub(super) fn rename_flag_unsupported(error: &io::Error) -> bool {
     error.raw_os_error().is_some_and(|code| {
+        #[cfg(target_os = "linux")]
+        if code == KERNEL_ENOTSUPP {
+            return true;
+        }
         matches!(code, libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) || code == libc::ENOTSUP
     })
 }
