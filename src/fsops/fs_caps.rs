@@ -348,6 +348,8 @@ pub(crate) fn kind_sets_symlink_times(kind: &str) -> bool {
             | "nfs"
             | "apfs"
             | "hfs"
+            | "msdos"
+            | "exfat"
     )
 }
 
@@ -460,9 +462,10 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
             link_counts_trusted: matches!(kind, b"apfs" | b"hfs")
                 && volume.hard_links
                 && volume.persistent_ids,
-            // Tested on APFS and HFS+; on NFS, SETATTR acts on the object a
-            // file handle names, the link itself.
-            symlink_times: matches!(kind, b"apfs" | b"hfs" | b"nfs"),
+            // Tested on APFS, HFS+, FAT and exFAT (where links are small
+            // files); on NFS, SETATTR acts on the object a file handle
+            // names, the link itself.
+            symlink_times: matches!(kind, b"apfs" | b"hfs" | b"msdos" | b"exfat" | b"nfs"),
             two_second_mtimes: kind == b"msdos",
         },
     };
