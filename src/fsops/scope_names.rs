@@ -6,13 +6,13 @@
 //! it finds as many as the file has links.
 //!
 //! The listing is read once per copy, on the first such file, with the
-//! parallel scan copies use for destinations: it never follows a symlink.
-//! It keeps the names of the files with more than one link, leaving out
-//! directories on another device (a file's links cannot cross devices) and
-//! any directory reached a second time (a bind mount, nested approved
-//! directories). Entries are what directories list: a directory that
-//! ignores case lists `a` once however it is spelled, so no name is ever
-//! compared with another.
+//! parallel scan copies use for destinations: it never follows a symlink,
+//! and enters each directory once however it is reached (a bind mount,
+//! nested approved directories). It keeps the names of the files with more
+//! than one link, by file: device and inode, so a filesystem mounted inside
+//! counts for its own files only. Entries are what directories list: a
+//! directory that ignores case lists `a` once however it is spelled, so no
+//! name is ever compared with another.
 //!
 //! Stale data only ever refuses. A check counts the names it kept that still
 //! lead to the file, so an entry removed, replaced or moved away since no
@@ -191,7 +191,7 @@ impl ScopeNames {
     /// change.
     fn list(&self, root: &Arc<Root>) -> Listing {
         let mut listing = Listing::new();
-        let mut visited = HashSet::new();
+        let visited = Arc::new(Mutex::new(HashSet::new()));
         // Outer directories first, so that one nested in another is not
         // scanned again.
         let mut scopes: Vec<_> = self.scopes.iter().collect();
@@ -204,7 +204,7 @@ impl ScopeNames {
             let Ok(path) = RelativePath::new(relative) else {
                 continue;
             };
-            if !(*descendants && list_tree(root, relative, &mut visited, &mut listing)) {
+            if !(*descendants && list_tree(root, relative, &visited, &mut listing)) {
                 exact.push(path);
             }
         }
@@ -212,6 +212,7 @@ impl ScopeNames {
         // once per directory and file: two approved spellings of one entry
         // must not count twice, and an entry in a directory scanned above
         // has been counted there.
+        let visited = visited.lock().unwrap();
         let mut counted = HashSet::new();
         for path in exact {
             let Ok(Some(file)) = root.metadata_optional(&path) else {
@@ -243,27 +244,34 @@ impl ScopeNames {
 
 /// Add to `listing` the names of the files with more than one link in the
 /// directory tree at `relative` beneath `root`, scanned as a copy scans a
-/// destination: without following a symlink. A directory on another device
-/// is left out, since a file's links cannot cross devices, and so is one
-/// already read under another name (`visited`: a bind mount, or an approved
-/// directory nested in another). Returns whether `relative` is a directory.
+/// destination: without following a symlink, and entering each directory
+/// once however it is reached (`visited`: a bind mount, or an approved
+/// directory nested in another). Names on every device are kept, each with
+/// its file's device: only names on a file's own device can be its links.
+/// Returns whether `relative` is a directory.
 fn list_tree(
     root: &Arc<Root>,
     relative: &[u8],
-    visited: &mut HashSet<(u64, u64)>,
+    visited: &Arc<Mutex<HashSet<(u64, u64)>>>,
     listing: &mut Listing,
 ) -> bool {
     let top = match RelativePath::new(relative).map(|path| root.metadata_optional(&path)) {
         Ok(Ok(Some(top))) if top.is_dir() => top,
         _ => return false,
     };
-    if !visited.insert((top.dev, top.ino)) {
+    if !visited.lock().unwrap().insert((top.dev, top.ino)) {
         return true;
     }
-    // Whether each directory scanned counts, by its path in the tree. The
-    // scan reports a directory before anything in it.
-    let mut counted = HashMap::from([(Vec::new(), true)]);
-    let _ = crate::scan::scan_descriptor(
+    let descend = {
+        let visited = visited.clone();
+        Arc::new(move |directory: &RootMetadata| {
+            visited
+                .lock()
+                .unwrap()
+                .insert((directory.dev, directory.ino))
+        })
+    };
+    let _ = crate::scan::scan_descriptor_descending(
         root.clone(),
         relative,
         None,
@@ -271,22 +279,10 @@ fn list_tree(
         false,
         &[],
         false,
+        Some(descend),
         &mut |batch| {
             for entry in batch {
-                if entry.path.is_empty() {
-                    continue;
-                }
-                let parent = entry
-                    .path
-                    .iter()
-                    .rposition(|byte| *byte == b'/')
-                    .map_or(&entry.path[..0], |slash| &entry.path[..slash]);
-                let inside = counted.get(parent).copied().unwrap_or(false);
-                if entry.kind == Kind::Dir {
-                    let counts =
-                        inside && entry.dev == top.dev && visited.insert((entry.dev, entry.ino));
-                    counted.insert(entry.path, counts);
-                } else if inside && entry.nlink > 1 {
+                if entry.kind != Kind::Dir && entry.nlink > 1 {
                     let name = if relative.is_empty() {
                         entry.path
                     } else {
