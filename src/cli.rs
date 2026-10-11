@@ -116,6 +116,32 @@ impl IfExists {
     }
 }
 
+/// Which existing directories you own a copy may temporarily give the owner
+/// permission it needs. Each is restored to its exact mode afterwards. Each
+/// mode widens everything the one before it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum WidenDirs {
+    /// Never change directory permissions
+    None,
+    /// Directories the copy includes, as rsync does, but not the directory it copies into
+    Rsync,
+    /// Also the directory the copy goes into and the directories above it
+    All,
+}
+
+impl WidenDirs {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Rsync => "rsync",
+            Self::All => "all",
+        }
+    }
+}
+
+/// What `syq cp` widens without `--widen-dirs`.
+pub const NATIVE_WIDEN_DIRS: WidenDirs = WidenDirs::None;
+
 /// Endpoint that owns the transfer coordinator for a native copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum CoordinateAt {
@@ -518,6 +544,14 @@ pub struct Args {
     /// Syq extension: securely open and read ignore patterns from raw-byte FILE (one per line, # comments); repeatable
     #[arg(long = "syq-ignore-from", value_name = "FILE")]
     pub ignore_from: Vec<OsString>,
+    /// Syq extension: which directories you own may briefly get the owner permission the copy needs; each is restored afterwards
+    #[arg(
+        long = "syq-widen-dirs",
+        value_enum,
+        value_name = "MODE",
+        default_value_t = WidenDirs::Rsync
+    )]
+    pub widen_dirs: WidenDirs,
     /// All ignore patterns, loaded before authorization or opening results.
     #[arg(skip)]
     pub ignore_lines: Vec<String>,
@@ -546,8 +580,6 @@ pub struct Args {
     pub delete: bool,
     #[arg(skip)]
     pub prune_before: bool,
-    #[arg(skip)]
-    pub temporarily_widen_dir_permissions: bool,
     /// With --delete, also remove destination paths that the --syq-ignore patterns exclude
     #[arg(long, requires = "delete")]
     pub delete_excluded: bool,
@@ -1329,9 +1361,9 @@ struct NativeCopyOperationalArgs {
     /// Match selected source metadata, including on unchanged files (repeatable/comma-separated)
     #[arg(long, value_name = "FEATURE", value_delimiter = ',')]
     copy_metadata: Vec<NativeCopyMetadata>,
-    /// Temporarily add owner read, write and search permission to existing destination directories
-    #[arg(long)]
-    temporarily_widen_dir_permissions: bool,
+    /// Which directories you own may briefly get the owner permission the copy needs; each is restored afterwards
+    #[arg(long, value_enum, value_name = "MODE", default_value_t = NATIVE_WIDEN_DIRS)]
+    widen_dirs: WidenDirs,
     /// Request reads without access-time updates; warn and continue if unavailable
     #[arg(long)]
     open_noatime: bool,
@@ -3021,7 +3053,7 @@ fn apply_native_copy_operational(
         ignore,
         ignore_from,
         copy_metadata,
-        temporarily_widen_dir_permissions,
+        widen_dirs,
         open_noatime,
         sparse,
         inplace,
@@ -3062,7 +3094,7 @@ fn apply_native_copy_operational(
         "--inplace cannot combine with --if-exists=keep or --if-exists=update-if-older"
     );
     args.inplace = inplace;
-    args.temporarily_widen_dir_permissions = temporarily_widen_dir_permissions;
+    args.widen_dirs = widen_dirs;
     args.open_noatime = open_noatime;
     args.sparse = sparse;
     for attribute in copy_metadata {

@@ -2,34 +2,59 @@
 //! early pruning needs a complete destination walk before downloads begin.
 
 use super::{Destination, Download, ObjectKind};
+use crate::cli::WidenDirs;
 use crate::proto::{DirectoryMode, TargetCondition};
 use crate::rooted::RelativePath;
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+/// Paths are bytes beneath the destination root: pruning can meet local
+/// names that are not UTF-8.
 pub(super) struct TemporaryAccess {
-    enabled: bool,
-    prepared: HashSet<String>,
-    widened: BTreeMap<String, DirectoryMode>,
+    mode: WidenDirs,
+    /// A contents source fills the destination directory itself.
+    contents: bool,
+    /// Pruning lists the directories the copy fills.
+    pruning: bool,
+    prepared: HashSet<Vec<u8>>,
+    widened: BTreeMap<Vec<u8>, DirectoryMode>,
 }
 
+/// Owner read and search, to list a directory.
+pub(super) const LIST: u32 = 0o500;
+/// Owner write and search, to change a directory's entries.
+pub(super) const CHANGE: u32 = 0o300;
+
 impl TemporaryAccess {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(super) fn new(mode: WidenDirs, contents: bool, pruning: bool) -> Self {
         Self {
-            enabled,
+            mode,
+            contents,
+            pruning,
             prepared: HashSet::new(),
             widened: BTreeMap::new(),
         }
     }
 
+    /// Only `all` enters a destination-only directory pruning cannot read;
+    /// `rsync`, as rsync does, only empties the ones it can.
+    pub(super) fn enters_unreadable(&self) -> bool {
+        self.mode == WidenDirs::All
+    }
+
     pub(super) fn prepare(&mut self, destination: &Destination, jobs: &[Download]) -> Result<()> {
-        if !self.enabled {
+        if self.mode == WidenDirs::None {
             return Ok(());
         }
         let mut paths = BTreeSet::new();
-        if destination.prefix.is_empty() {
-            paths.insert(String::new());
+        // The directory opened as the destination: under `all` always, the
+        // one the copy goes into; under `rsync` only one a contents source
+        // fills.
+        if self.mode == WidenDirs::All || destination.prefix.is_empty() && self.contents {
+            paths.insert(Vec::new());
         }
         for job in jobs {
             for (index, _) in job.path.match_indices('/') {
@@ -37,20 +62,23 @@ impl TemporaryAccess {
                 if super::super::prune::beneath(parent.as_bytes(), destination.prefix.as_bytes())
                     .is_some()
                 {
-                    paths.insert(parent.to_owned());
+                    paths.insert(parent.as_bytes().to_vec());
                 }
             }
             if job.kind == ObjectKind::Dir {
-                paths.insert(job.path.clone());
+                paths.insert(job.path.as_bytes().to_vec());
             }
         }
+        // Downloads change the entries of the directories they fill, which
+        // pruning also lists.
+        let access = if self.pruning { CHANGE | LIST } else { CHANGE };
         // Parents precede descendants. Remember successful inspections as well
         // as changes: siblings do not need another stat/chmod of their parent.
         for path in paths {
             if self.prepared.contains(&path) {
                 continue;
             }
-            let relative = RelativePath::new(path.as_bytes())?;
+            let relative = RelativePath::new(&path)?;
             if let Some(metadata) = destination.root.metadata_optional(&relative)? {
                 if metadata.is_dir() {
                     let condition = TargetCondition::MatchesFingerprint {
@@ -63,9 +91,10 @@ impl TemporaryAccess {
                         &destination.root,
                         &relative,
                         condition,
-                        Path::new(&path),
+                        access,
+                        Path::new(OsStr::from_bytes(&path)),
                     )? {
-                        self.widened.insert(path.clone(), saved);
+                        self.widened.entry(path.clone()).or_insert(saved);
                     }
                 }
             }
@@ -74,7 +103,52 @@ impl TemporaryAccess {
         Ok(())
     }
 
-    pub(super) fn into_restorations(self) -> BTreeMap<String, DirectoryMode> {
+    /// Give one existing directory that pruning must enter (`LIST`) or
+    /// empty (`CHANGE`) that owner permission, if the mode allows it. Returns
+    /// whether its mode changed. A directory widened before keeps the mode it
+    /// had first, and is identified without its changed change time.
+    pub(super) fn prepare_for_pruning(
+        &mut self,
+        root: &crate::rooted::Root,
+        path: &[u8],
+        metadata: &crate::rooted::RootMetadata,
+        access: u32,
+    ) -> Result<bool> {
+        if self.mode == WidenDirs::None {
+            return Ok(false);
+        }
+        let condition = if self.widened.contains_key(path) {
+            TargetCondition::Matches {
+                dev: metadata.dev,
+                ino: metadata.ino,
+            }
+        } else {
+            TargetCondition::MatchesFingerprint {
+                dev: metadata.dev,
+                ino: metadata.ino,
+                ctime: metadata.ctime,
+                ctime_nsec: metadata.ctime_nsec,
+            }
+        };
+        let saved = crate::fsops::widen_directory(
+            root,
+            &RelativePath::new(path)?,
+            condition,
+            access,
+            Path::new(OsStr::from_bytes(path)),
+        )?;
+        Ok(saved.is_some_and(|saved| {
+            self.widened.entry(path.to_vec()).or_insert(saved);
+            true
+        }))
+    }
+
+    /// A directory pruning removed has no mode to restore.
+    pub(super) fn forget(&mut self, path: &[u8]) {
+        self.widened.remove(path);
+    }
+
+    pub(super) fn into_restorations(self) -> BTreeMap<Vec<u8>, DirectoryMode> {
         self.widened
     }
 }
@@ -116,25 +190,28 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(true);
+        let mut access = TemporaryAccess::new(WidenDirs::Rsync, true, false);
         access.prepare(&destination, &[job("first/one")]).unwrap();
         assert_eq!(
             fs::metadata(temporary.path().join("later")).unwrap().mode() & 0o777,
             0o500
         );
-        assert!(!access.prepared.contains("later"));
+        assert!(!access.prepared.contains(b"later".as_slice()));
         access.prepare(&destination, &[job("first/two")]).unwrap();
         assert_eq!(
-            access.widened.get("first").map(|saved| saved.mode),
+            access
+                .widened
+                .get(b"first".as_slice())
+                .map(|saved| saved.mode),
             (unsafe { libc::geteuid() } != 0).then_some(0o500)
         );
         access.prepare(&destination, &[job("later/one")]).unwrap();
         for (path, saved) in access.into_restorations() {
             crate::fsops::restore_directory_mode(
                 &destination.root,
-                &RelativePath::new(path.as_bytes()).unwrap(),
+                &RelativePath::new(&path).unwrap(),
                 saved,
-                Path::new(&path),
+                Path::new(OsStr::from_bytes(&path)),
             )
             .unwrap();
         }
@@ -158,7 +235,7 @@ mod tests {
             root: Arc::new(Root::open(temporary.path()).unwrap()),
             prefix: String::new(),
         };
-        let mut access = TemporaryAccess::new(false);
+        let mut access = TemporaryAccess::new(WidenDirs::None, true, false);
         access
             .prepare(&destination, &[job("missing/file")])
             .unwrap();

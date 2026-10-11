@@ -331,7 +331,7 @@ The three directory settings are independent:
 |---|---|---|
 | `--cwd DIR` | Starting directory for relative paths | `--auto-cwd` |
 | `--root DIR` | Hard boundary for downloads, even with approval | `--no-root` |
-| `--auto-approve-root DIR` | Downloads confined here skip approval, unless they copy ACLs, extended attributes, or hard links | `--no-auto-approve-root` |
+| `--auto-approve-root DIR` | Downloads confined here skip approval, except with some options | `--no-auto-approve-root` |
 
 Each requires an existing directory with a UTF-8 path; neither root can be `/`.
 An explicit cwd must be inside the hard root, if set. Otherwise the starting

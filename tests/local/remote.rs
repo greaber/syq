@@ -2723,6 +2723,80 @@ fn missing_remote_directory_reports_shared_directory_created_once() {
     }
 }
 
+/// A remote receiver must not report children of an unsearchable container as
+/// absent before the container is widened: --if-exists=keep, --only-existing
+/// and `dst.exists` would then replace or skip the wrong files. `all` widens
+/// the parent of an exact placement as it does an `--into` target.
+#[test]
+fn native_remote_container_access_refreshes_cached_existence() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for placement in ["--into", "--as"] {
+        for policy in ["keep", "only-existing", "expression"] {
+            for present in [false, true] {
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                write(&t.path("src/file"), b"new source contents");
+                fs::create_dir(t.path("dst")).unwrap();
+                if present {
+                    write(&t.path("dst/file"), b"old destination contents");
+                }
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command
+                    .args(["cp", &t.s("src/file"), "--to", "fake", placement])
+                    .arg(if placement == "--into" {
+                        t.path("dst")
+                    } else {
+                        t.path("dst/file")
+                    })
+                    .args([
+                        "--widen-dirs=all",
+                        "--no-tcp",
+                        "-q",
+                        "--performance-tuning=workers=1",
+                        "--rsh",
+                    ])
+                    .arg(rsh)
+                    .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+                    .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                    .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("XDG_CONFIG_HOME", t.path("config"))
+                    .env("XDG_CACHE_HOME", t.path("cache"));
+                match policy {
+                    "only-existing" => {
+                        command.args(["--only-existing", "--if-exists=update"]);
+                    }
+                    "expression" => {
+                        command.args(["--copy-if", "not dst.exists", "--if-exists=update"]);
+                    }
+                    _ => {
+                        command.arg("--if-exists=keep");
+                    }
+                }
+                let output = command.run().unwrap();
+                let after = fs::metadata(t.path("dst")).unwrap();
+                fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+                let case = format!("{placement}, policy={policy}, present={present}");
+                assert_eq!(after.mode() & 0o7777, 0o600, "{case}");
+                assert_output_ok(&output);
+                if policy == "only-existing" && !present {
+                    assert!(!t.path("dst/file").exists(), "{case}");
+                } else {
+                    let expected = if policy != "only-existing" && present {
+                        b"old destination contents".as_slice()
+                    } else {
+                        b"new source contents".as_slice()
+                    };
+                    assert_eq!(read(&t.path("dst/file")), expected, "{case}");
+                }
+            }
+        }
+    }
+}
+
 /// A signed receiver never answers the emptiness probe, so a fresh tree
 /// there is a missing destination. Its descendants need no lookups either,
 /// whatever existing-file policy the grant forwards.

@@ -45,8 +45,20 @@ impl ReceiverDirectories {
         }
     }
 
+    /// A directory widened twice, for more permission, keeps the mode it
+    /// had before the first.
     pub(super) fn widened(&self, identity: (u64, u64), mode: u32) {
-        self.widened.lock().unwrap().insert(identity, mode);
+        self.widened.lock().unwrap().entry(identity).or_insert(mode);
+    }
+
+    pub(super) fn has_widened(&self) -> bool {
+        !self.widened.lock().unwrap().is_empty()
+    }
+
+    /// A removed directory's identity can come back for a new directory, which
+    /// must not take the mode saved when the old one was widened.
+    pub(super) fn forget_widened(&self, identity: (u64, u64)) {
+        self.widened.lock().unwrap().remove(&identity);
     }
 
     /// `op` with its receiver-chosen mode resolved. Only a directory this

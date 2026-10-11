@@ -88,7 +88,7 @@ In addition to the shared arguments above, it accepts:
 | `stream_concurrency` | Maximum callback entries active at once; default `4`, range `1..256`; transport worker and request limits are shared across entries |
 | `follow_dst` | Boolean: follow destination symlinks |
 | `prune_before` | Boolean: remove extras before copying to free space; implies pruning. Later copy failures do not restore removals |
-| `temporarily_widen_dir_permissions` | Boolean: temporarily add owner read, write and search permission to existing destination directories you own; restore after copying and pruning unless explicit permission metadata takes precedence |
+| `widen_dirs` | `"none"`, `"rsync"`, or `"all"`: which directories you own may temporarily get the owner permission the copy needs; `"rsync"` covers the directories the copy includes, and `"all"` also covers the directory it goes into and the directories above it. Each is restored afterwards, unless explicit permission metadata takes precedence. When omitted, `syq cp`'s default applies |
 | `prune`, `dry_run`, `hash` | Boolean: mirror, preview, or compare content |
 | `hash_or_copy` | Boolean: like `hash`, but compare only files the transfer strategy would compare (by default, files of unchanged size with a remote syq endpoint) and copy the rest, so identical files may be rewritten; cannot combine with `hash` |
 | `integrity_checking` | Comma-separated string, e.g. `"transfer=sha256"`; defaults to size/mtime comparison and no extra payload checks |

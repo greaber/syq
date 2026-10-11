@@ -130,8 +130,9 @@ Choose a directory for downloads that do not need approval:
 syq persist receive on --name laptop --auto-approve-root ~/Downloads/server
 ```
 
-Downloads confined to that directory need no approval; downloads elsewhere ask,
-as do downloads that copy ACLs, extended attributes, or hard links.
+Downloads confined to that directory need no approval; downloads elsewhere ask.
+Some options, such as copying ACLs or widening folders, still ask; the prompt
+says why.
 `--root`, if configured, remains a hard boundary even with approval.
 Automatic approval trusts all processes running as the connected server accounts,
 including for overwrites inside that directory. You can

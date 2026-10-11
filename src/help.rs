@@ -296,12 +296,7 @@ fn copy_heading(id: &str) -> (&'static str, usize) {
         | "as_fd" | "mapping" => ("Destination and mapping", 1),
         "if_exists" | "ignore_existing" | "existing" | "update" | "copy_if" | "inplace"
         | "prune" | "prune_before" | "max_delete" => ("Updates and deletion", 2),
-        "copy_metadata"
-        | "temporarily_widen_dir_permissions"
-        | "sparse"
-        | "open_noatime"
-        | "follow"
-        | "follow_src"
+        "copy_metadata" | "widen_dirs" | "sparse" | "open_noatime" | "follow" | "follow_src"
         | "follow_dst" => ("Metadata and symlinks", 3),
         "integrity_checking_arg" | "hash" | "hash_or_copy" => ("Verification", 4),
         "auth_from"

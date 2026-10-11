@@ -612,9 +612,13 @@ class NativeClientTests(unittest.TestCase):
         argv = self.argv()
         self.assertEqual(argv[argv.index("--auth-from") + 1], "@laptop")
 
-    def test_temporary_directory_permissions_option(self) -> None:
-        self.client.cp("source", into="target", temporarily_widen_dir_permissions=True)
-        self.assertIn("--temporarily-widen-dir-permissions", self.argv())
+    def test_directory_widening_option(self) -> None:
+        self.client.cp("source", into="target")
+        self.assertFalse(any(arg.startswith("--widen-dirs") for arg in self.argv()))
+        self.client.cp("source", into="target", widen_dirs="rsync")
+        self.assertIn("--widen-dirs=rsync", self.argv())
+        with self.assertRaises(syq.SyqInvocationError):
+            self.client.cp("source", into="target", widen_dirs="some")
 
     def test_prune_before_implies_pruning(self) -> None:
         events = []

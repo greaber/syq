@@ -122,6 +122,135 @@ fn native_copy_enforces_placement_preconditions_before_mutation() {
     assert!(!Path::new(&contents_target).exists());
 }
 
+/// A denied lookup is not an absent target: placement checks and
+/// --if-exists=keep must fail rather than replace a file they could not see.
+/// Only `all` widens the parent of an exact placement, and then the checks
+/// see what is really there; no dry run widens it.
+#[test]
+fn native_copy_placement_checks_keep_denied_and_missing_distinct() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for (placement, policy) in [
+        ("--as-new", "--if-exists=update"),
+        ("--as-existing", "--if-exists=update"),
+        ("--as", "--if-exists=keep"),
+    ] {
+        for exists in [false, true] {
+            for widen in [None, Some("--widen-dirs=rsync"), Some("--widen-dirs=all")] {
+                for dry_run in [false, true] {
+                    let t = Tmp::new();
+                    write(&t.path("src"), b"replacement contents");
+                    fs::create_dir(t.path("dst")).unwrap();
+                    if exists {
+                        write(&t.path("dst/file"), b"original sentinel");
+                    }
+                    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o600)).unwrap();
+                    let before = fs::metadata(t.path("dst")).unwrap();
+                    let src = t.s("src");
+                    let dst = t.s("dst/file");
+                    let mut args = vec!["cp", policy, &src, placement, &dst];
+                    args.extend(widen);
+                    if dry_run {
+                        args.push("--dry-run");
+                    }
+                    let output = native_syq(&args);
+                    let after = fs::metadata(t.path("dst")).unwrap();
+                    fs::set_permissions(t.path("dst"), fs::Permissions::from_mode(0o700)).unwrap();
+                    let stderr = stderr_of(&output);
+                    assert_eq!(after.mode() & 0o7777, 0o600, "{args:?}");
+                    if widen == Some("--widen-dirs=all") && !dry_run {
+                        // The parent was widened: the checks see the real entry.
+                        let refused = match placement {
+                            "--as-new" => exists.then_some("already exists"),
+                            "--as-existing" => (!exists).then_some("does not exist"),
+                            _ => None,
+                        };
+                        match refused {
+                            Some(reason) => {
+                                assert!(!output.status.success(), "{args:?}: {output:?}");
+                                assert!(stderr.contains(reason), "{args:?}: {output:?}");
+                            }
+                            None => assert_output_ok(&output),
+                        }
+                        let kept = exists && placement != "--as-existing";
+                        let expected: &[u8] = if kept {
+                            b"original sentinel"
+                        } else if refused.is_some() {
+                            b""
+                        } else {
+                            b"replacement contents"
+                        };
+                        if expected.is_empty() {
+                            assert!(!t.path("dst/file").exists(), "{args:?}");
+                        } else {
+                            assert_eq!(read(&t.path("dst/file")), expected, "{args:?}");
+                        }
+                        continue;
+                    }
+                    assert!(!output.status.success(), "{args:?}: {output:?}");
+                    assert!(stderr.contains("Permission denied"), "{args:?}: {output:?}");
+                    assert!(!stderr.contains("does not exist"), "{output:?}");
+                    assert!(!stderr.contains("already exists"), "{output:?}");
+                    assert_eq!(
+                        (before.ctime(), before.ctime_nsec()),
+                        (after.ctime(), after.ctime_nsec()),
+                        "{args:?}"
+                    );
+                    if exists {
+                        assert_eq!(read(&t.path("dst/file")), b"original sentinel");
+                    } else {
+                        assert!(!t.path("dst/file").exists());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Only `all` widens an owned directory above the destination; the
+/// placement check then sees the existing target and refuses it.
+#[test]
+fn native_copy_placement_access_widens_an_ancestor_only_for_all() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    for widen in ["--widen-dirs=rsync", "--widen-dirs=all"] {
+        let t = Tmp::new();
+        write(&t.path("src"), b"replacement contents");
+        write(&t.path("ancestor/dst/file"), b"original sentinel");
+        fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(t.path("ancestor")).unwrap();
+        let output = native_syq(&[
+            "cp",
+            widen,
+            &t.s("src"),
+            "--as-new",
+            &t.s("ancestor/dst/file"),
+        ]);
+        let after = fs::metadata(t.path("ancestor")).unwrap();
+        fs::set_permissions(t.path("ancestor"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let all = widen == "--widen-dirs=all";
+        assert!(
+            stderr_of(&output).contains(if all {
+                "already exists"
+            } else {
+                "Permission denied"
+            }),
+            "{output:?}"
+        );
+        assert_eq!(after.mode() & 0o7777, 0o600);
+        if !all {
+            assert_eq!(
+                (before.ctime(), before.ctime_nsec()),
+                (after.ctime(), after.ctime_nsec())
+            );
+        }
+        assert_eq!(read(&t.path("ancestor/dst/file")), b"original sentinel");
+    }
+}
+
 #[test]
 fn native_copy_requires_sources_before_the_destination() {
     let t = Tmp::new();

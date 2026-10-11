@@ -49,7 +49,7 @@
         "ignore",
         "ignore-from",
         "copy-metadata",
-        "temporarily-widen-dir-permissions",
+        "widen-dirs",
         "open-noatime",
         "sparse",
         "inplace",

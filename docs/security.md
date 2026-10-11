@@ -327,7 +327,7 @@ within those limits. The default starting directory is your home, without
 containment; `syq persist receive on --root DIRECTORY` confines copies to that
 directory. See [Use your laptop from a server](receive.md) for setup and
 approval controls. Automatic approval trusts those accounts to overwrite files
-inside its root; copies of ACLs, extended attributes, or hard links still ask.
+inside its root; some options still ask.
 Choose an inbox whose downloaded contents are not automatically executed or
 loaded as trusted configuration.
 
