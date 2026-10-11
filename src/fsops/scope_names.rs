@@ -171,10 +171,13 @@ impl ScopeNames {
         let mut listing = self.listing.lock().unwrap();
         let listing = listing.get_or_insert_with(|| self.list(root));
         let (dev, ino, nlink) = current()?;
+        // Each entry counts once, by the directory holding it as reached now
+        // and its name there: two kept paths into one directory (a bind
+        // mount, an HFS+ directory hard link) name the same entry.
         let inside = listing.get(&(dev, ino)).map_or(0, |names| {
             names
                 .iter()
-                .filter(|name| leads(root, name, (dev, ino)))
+                .filter_map(|name| entry_of(root, name, (dev, ino)))
                 .collect::<HashSet<_>>()
                 .len() as u64
         });
@@ -313,6 +316,21 @@ fn leads_to(root: &Root, name: &RelativePath, identity: (u64, u64)) -> bool {
         root.metadata_optional(name),
         Ok(Some(metadata)) if (metadata.dev, metadata.ino) == identity
     )
+}
+
+/// The entry the kept name `name` beneath `root` is, when it leads to the
+/// file `identity`: the identity of the directory holding it, as reached
+/// now, and its name there.
+fn entry_of(root: &Root, name: &[u8], identity: (u64, u64)) -> Option<((u64, u64), Vec<u8>)> {
+    let path = RelativePath::new(name).ok()?;
+    let (_, leaf) = path.leaf().ok()?;
+    let parent = root.resolve_parent(&path).ok()?;
+    let file = parent.metadata().ok()?;
+    if (file.dev, file.ino) != identity {
+        return None;
+    }
+    let directory = parent.directory().metadata().ok()?;
+    Some(((directory.dev(), directory.ino()), leaf.to_vec()))
 }
 
 /// As `leads_to`, for a kept name.
@@ -689,6 +707,31 @@ mod tests {
         fs::hard_link(base.join("scope/sub/a"), base.join("scope/b")).unwrap();
         let t = Fixture::with_scopes(base, &[("scope", true), ("scope/sub", true)]);
         t.check("scope/sub/a").unwrap();
+    }
+
+    /// Kept paths that reach one directory by two routes name its entries
+    /// once each. Without a mount, the second route here is another
+    /// spelling of the directory, where the filesystem folds case; a bind
+    /// mount or an HFS+ directory hard link reaches it the same way.
+    #[test]
+    fn two_paths_into_one_directory_count_its_entry_once() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let t = Fixture::new(temporary.path());
+        fs::create_dir(t.base.join("scope/sub")).unwrap();
+        fs::write(t.base.join("scope/sub/a"), b"shared").unwrap();
+        fs::hard_link(t.base.join("scope/sub/a"), t.base.join("outside/o")).unwrap();
+        let file = fs::metadata(t.base.join("scope/sub/a")).unwrap();
+        let routes = ["scope/sub/a", "scope/SUB/a"];
+        if !t.base.join(routes[1]).exists() {
+            eprintln!("this filesystem keeps sub and SUB apart; nothing to check");
+            return;
+        }
+        *t.names.listing.lock().unwrap() = Some(Listing::from([(
+            (file.dev(), file.ino()),
+            routes.map(|route| route.as_bytes().into()).to_vec(),
+        )]));
+        assert!(t.check("scope/sub/a").is_err());
+        assert_eq!(fs::read(t.base.join("outside/o")).unwrap(), b"shared");
     }
 
     /// Several names in one directory count as its entries; a name outside
