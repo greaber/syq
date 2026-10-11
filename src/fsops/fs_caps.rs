@@ -136,6 +136,27 @@ pub(crate) enum Refusal {
 }
 
 impl Profile {
+    /// The profile as bits, for an atomic cache.
+    pub(crate) const fn to_bits(self) -> u8 {
+        self.exchange as u8
+            | (self.atomic_no_replace_rename as u8) << 1
+            | (self.hard_links as u8) << 2
+            | (self.link_counts_trusted as u8) << 3
+            | (self.symlink_times as u8) << 4
+            | (self.two_second_mtimes as u8) << 5
+    }
+
+    pub(crate) const fn from_bits(bits: u8) -> Self {
+        Self {
+            exchange: bits & 1 != 0,
+            atomic_no_replace_rename: bits & 1 << 1 != 0,
+            hard_links: bits & 1 << 2 != 0,
+            link_counts_trusted: bits & 1 << 3 != 0,
+            symlink_times: bits & 1 << 4 != 0,
+            two_second_mtimes: bits & 1 << 5 != 0,
+        }
+    }
+
     /// This profile without the capability a filesystem refused.
     pub(crate) fn without(mut self, refusal: Refusal) -> Self {
         match refusal {
@@ -492,6 +513,14 @@ mod tests {
                 ..local
             }
         );
+    }
+
+    #[test]
+    fn profiles_survive_their_bits() {
+        for bits in 0..64 {
+            assert_eq!(Profile::from_bits(bits).to_bits(), bits);
+        }
+        assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
     }
 
     /// The conservative choices are the safe side of every capability.

@@ -48,7 +48,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(all(test, target_os = "macos"))]
@@ -63,6 +63,9 @@ mod publication;
 pub(crate) use operator::*;
 
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
+
+/// Set in `Root::root_profile` once the profile has been read.
+const PROFILE_KNOWN: u16 = 1 << 8;
 
 pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all directly supplied filesystem paths";
 
@@ -224,8 +227,12 @@ pub(crate) struct Root {
     #[cfg(target_os = "linux")]
     bounds_replacement: OnceLock<bool>,
     network: OnceLock<bool>,
-    /// The root filesystem's profile (see `profile`).
-    profile: OnceLock<crate::fsops::Profile>,
+    /// The profile of the root's own device as `Profile` bits, with
+    /// `PROFILE_KNOWN` set once read, so that publication there looks it up
+    /// without a system call or a lock.
+    root_profile: AtomicU16,
+    /// The profiles of other devices mounted beneath the root.
+    other_profiles: Mutex<HashMap<u64, crate::fsops::Profile>>,
     #[cfg(test)]
     test_profile: Mutex<Option<crate::fsops::Profile>>,
     #[cfg(all(test, target_os = "linux"))]
@@ -264,7 +271,8 @@ impl Root {
             #[cfg(target_os = "linux")]
             bounds_replacement: OnceLock::new(),
             network: OnceLock::new(),
-            profile: OnceLock::new(),
+            root_profile: AtomicU16::new(0),
+            other_profiles: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_profile: Mutex::new(None),
             #[cfg(all(test, target_os = "linux"))]
@@ -335,26 +343,48 @@ impl Root {
         let _ = self.network.set(true);
     }
 
-    /// What syq relies on the filesystem `directory` is on for (see
-    /// `fsops::Profile`): the verified capabilities of a known filesystem
-    /// type, or the conservative profile for any other.
-    pub(crate) fn profile_of(&self, directory: &File) -> crate::fsops::Profile {
+    /// What syq relies on the filesystem `directory`, on device `dev`, is
+    /// on for (see `fsops::Profile`): the verified capabilities of a known
+    /// filesystem type, or the conservative profile for any other. Cached
+    /// per device, with what the filesystem has refused since: on the
+    /// root's device a lookup is one atomic load.
+    pub(crate) fn profile_on(&self, dev: u64, directory: &File) -> crate::fsops::Profile {
         #[cfg(test)]
         if let Some(profile) = *self.test_profile.lock().unwrap() {
             return profile;
         }
-        crate::fsops::profile(directory)
+        if dev == self.identity.dev {
+            let bits = self.root_profile.load(Ordering::Relaxed);
+            if bits & PROFILE_KNOWN != 0 {
+                return crate::fsops::Profile::from_bits(bits as u8);
+            }
+            let read = crate::fsops::profile(&self.directory);
+            let known = PROFILE_KNOWN | u16::from(read.to_bits());
+            return match self.root_profile.compare_exchange(
+                bits,
+                known,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => read,
+                Err(current) => crate::fsops::Profile::from_bits(current as u8),
+            };
+        }
+        if let Some(profile) = self.other_profiles.lock().unwrap().get(&dev) {
+            return *profile;
+        }
+        let read = crate::fsops::profile(directory);
+        *self
+            .other_profiles
+            .lock()
+            .unwrap()
+            .entry(dev)
+            .or_insert(read)
     }
 
-    /// The profile of the root's own filesystem, cached.
+    /// The profile of the root's own filesystem.
     pub(crate) fn profile(&self) -> crate::fsops::Profile {
-        #[cfg(test)]
-        if let Some(profile) = *self.test_profile.lock().unwrap() {
-            return profile;
-        }
-        *self
-            .profile
-            .get_or_init(|| crate::fsops::profile(&self.directory))
+        self.profile_on(self.identity.dev, &self.directory)
     }
 
     /// Whether the root's filesystem reports link counts and inode numbers
@@ -375,7 +405,9 @@ impl Root {
     }
 
     /// Remember that the filesystem `directory` is on refused an operation
-    /// its profile allowed (see `fsops::record_refusal`).
+    /// its profile allowed (see `fsops::record_refusal`), here and for other
+    /// roots on that filesystem. Refusals are rare, so finding the device
+    /// here costs a system call that lookups do not.
     fn record_refusal(&self, directory: &File, refusal: crate::fsops::Refusal) {
         #[cfg(test)]
         if let Some(profile) = self.test_profile.lock().unwrap().as_mut() {
@@ -383,6 +415,25 @@ impl Root {
             return;
         }
         crate::fsops::record_refusal(directory, refusal);
+        let Ok(dev) = directory.metadata().map(|metadata| metadata.dev()) else {
+            return;
+        };
+        if dev == self.identity.dev {
+            let _ = self
+                .root_profile
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                    (bits & PROFILE_KNOWN != 0).then(|| {
+                        PROFILE_KNOWN
+                            | u16::from(
+                                crate::fsops::Profile::from_bits(bits as u8)
+                                    .without(refusal)
+                                    .to_bits(),
+                            )
+                    })
+                });
+        } else if let Some(profile) = self.other_profiles.lock().unwrap().get_mut(&dev) {
+            *profile = profile.without(refusal);
+        }
     }
 
     /// Give `from` the name `to`, in `directory`, without replacing anything
@@ -451,11 +502,7 @@ impl Root {
     /// behind SSHFS follows the link and sets the target's times, or fails
     /// when the target does not exist.
     pub(crate) fn sets_symlink_times(&self, directory: &File, dev: u64) -> bool {
-        if dev == self.identity.dev {
-            self.profile().symlink_times
-        } else {
-            self.profile_of(directory).symlink_times
-        }
+        self.profile_on(dev, directory).symlink_times
     }
 
     /// Set a symlink's times where `sets_symlink_times` allows; otherwise
@@ -1671,7 +1718,7 @@ impl Root {
             PublicationTestPoint::BeforeMatchedExchange,
         );
         let directory = parent.directory.as_raw_fd();
-        let mut profile = self.profile_of(&parent.directory);
+        let mut profile = self.profile_on(before.dev, &parent.directory);
         if !self
             .exchange(
                 &mut profile,
@@ -1796,7 +1843,8 @@ impl Root {
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
         let parent = self.resolve_parent(target)?;
-        let mut profile = self.profile_of(&parent.directory);
+        // A hard link names its file on the file's own device.
+        let mut profile = self.profile_on(opened.dev, &parent.directory);
         // Where names report their own inode numbers (SSHFS, rclone), the
         // representative's name need not show the number its file was
         // published with, so only its type can be checked.
@@ -2049,7 +2097,9 @@ impl Root {
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
-        let mut profile = self.profile_of(&target_parent.directory);
+        // A staged file is published by renaming or linking it, which stays
+        // on its device.
+        let mut profile = self.profile_on(staged_dev, &target_parent.directory);
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         let moved = self
@@ -2141,7 +2191,7 @@ impl Root {
             target,
             PublicationTestPoint::BeforeMatchedExchange,
         );
-        let mut profile = self.profile_of(&target_parent.directory);
+        let mut profile = self.profile_on(staged_dev, &target_parent.directory);
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         if !self
@@ -2260,7 +2310,11 @@ impl Root {
             Ok(permit) => permit,
             Err(error) => return error.context(race),
         };
-        let mut profile = self.profile_of(&parent.directory);
+        let dev = match parent.directory.metadata() {
+            Ok(metadata) => metadata.dev(),
+            Err(error) => return anyhow::Error::new(error).context(race),
+        };
+        let mut profile = self.profile_on(dev, &parent.directory);
         match self.move_to_recovery_name(&mut profile, &parent.directory, &parent.leaf) {
             Ok(Some(name)) => anyhow::anyhow!(
                 "{race}; kept the entry it displaced as {}",
