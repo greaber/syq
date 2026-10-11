@@ -2175,12 +2175,15 @@ impl ResolvedParent<'_> {
                 stat.stx_ino,
             );
             let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
-            let mounted = if stat.stx_attributes_mask & mount_root != 0 {
+            #[cfg(debug_assertions)]
+            let attribute_reported = stat.stx_attributes_mask & mount_root != 0
+                && std::env::var_os("SYQ_TEST_STATX_WITHOUT_MOUNT_ROOT").is_none();
+            #[cfg(not(debug_assertions))]
+            let attribute_reported = stat.stx_attributes_mask & mount_root != 0;
+            let mounted = if attribute_reported {
                 stat.stx_attributes & mount_root != 0
             } else {
-                // Kernels before 5.8 say neither; a mount of another
-                // filesystem still shows its own device.
-                self.directory.metadata()?.dev() != identity.0
+                self.lands_on_another_mount()
             };
             Ok((identity, mounted))
         }
@@ -2190,6 +2193,29 @@ impl ResolvedParent<'_> {
         {
             let metadata = self.metadata()?;
             Ok(((metadata.dev, metadata.ino), false))
+        }
+    }
+
+    /// Whether the leaf lands on another mount than its directory, by the
+    /// mount IDs /proc/self/fdinfo shows (Linux 3.15 and later), for kernels
+    /// before 5.8, whose statx reports no mount-root attribute. Only those
+    /// kernels pay for this, and only for the names a check confirms of a
+    /// file with more than one link. A mount ID that cannot be read counts
+    /// as another mount, which can only refuse a change.
+    #[cfg(target_os = "linux")]
+    fn lands_on_another_mount(&self) -> bool {
+        let leaf = open_at(
+            self.directory.as_raw_fd(),
+            &self.leaf,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        );
+        match (
+            leaf.ok().as_ref().and_then(crate::sys::fdinfo_mount_id),
+            crate::sys::fdinfo_mount_id(&self.directory),
+        ) {
+            (Some(leaf), Some(directory)) => leaf != directory,
+            _ => true,
         }
     }
 
