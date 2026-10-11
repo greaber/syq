@@ -289,7 +289,10 @@ class CoordinationTests(unittest.TestCase):
         socket = str(self.root / 'tmux.sock')
         subprocess.run([tmux, '-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', 'coord-test', 'sleep 60'], check=True)
         self.addCleanup(self.stop_tmux, tmux, socket)
-        subprocess.run([tmux, '-S', socket, 'set-option', '-g', 'remain-on-exit', 'on'], check=True)
+        # Keep the fixture window alive for cleanup; reviewer panes must rely
+        # on the product's own setting so the recovery test still covers it.
+        subprocess.run([tmux, '-S', socket, 'set-option', '-w', '-t', 'coord-test',
+                        'remain-on-exit', 'on'], check=True)
         self.stub('tmux', f"import os,sys\nos.execv({tmux!r}, [{tmux!r},'-S',{socket!r},*sys.argv[1:]])\n")
         for key in ('PATH', 'TEST_ROOT'):
             subprocess.run([tmux, '-S', socket, 'set-environment', key, self.env[key]], check=True)
