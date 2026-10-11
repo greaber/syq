@@ -451,7 +451,8 @@ also when the copy fails, unless you request permissions. Other processes can
 see the temporary permissions, and a crash or forced termination can leave
 them in place. Root skips widening. A restricted receiver widens only as the approved
 mode allows, never above the directory it was set up for, and its approval
-prompt says when a copy can make read-only folders writable.
+prompt says when a copy can open folders you own to read or change them:
+adding read shows the sender the names inside.
 
 Dry runs never change permissions. A dry run reports a directory you own but
 cannot search as not inspected, and exits with status 23.

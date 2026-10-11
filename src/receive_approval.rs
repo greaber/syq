@@ -590,7 +590,9 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
         (request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace)
             .then(|| "can change existing files through every name they have".to_owned()),
         (extra.widen_dirs != crate::delegation::DirectoryWidening::None)
-            .then(|| "can temporarily make read-only folders writable".to_owned()),
+            // Under `all`, or `rsync` with deletion, it can add read too,
+            // which shows the names inside, and through comparisons more.
+            .then(|| "can temporarily open folders you own to read or change them".to_owned()),
     ]
     .into_iter()
     .flatten()
@@ -1678,7 +1680,7 @@ mod tests {
             "can give other users access to files",
             "can set extended attributes, which some programs act on",
             "can link new names to files already in the destination",
-            "can temporarily make read-only folders writable",
+            "can temporarily open folders you own to read or change them",
         ];
         let summary = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
         let desktop = summary.desktop_description(false);
