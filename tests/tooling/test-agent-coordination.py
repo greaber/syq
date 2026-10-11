@@ -288,11 +288,82 @@ class CoordinationTests(unittest.TestCase):
         self.assertIsNotNone(tmux, 'tmux is required to verify reviewer window launch')
         socket = str(self.root / 'tmux.sock')
         subprocess.run([tmux, '-f', '/dev/null', '-S', socket, 'new-session', '-d', '-s', 'coord-test', 'sleep 60'], check=True)
-        self.addCleanup(subprocess.run, [tmux, '-S', socket, 'kill-server'], capture_output=True)
+        self.addCleanup(self.stop_tmux, tmux, socket)
+        # Keep the fixture window alive for cleanup; reviewer panes must rely
+        # on the product's own setting so the recovery test still covers it.
+        subprocess.run([tmux, '-S', socket, 'set-option', '-w', '-t', 'coord-test',
+                        'remain-on-exit', 'on'], check=True)
         self.stub('tmux', f"import os,sys\nos.execv({tmux!r}, [{tmux!r},'-S',{socket!r},*sys.argv[1:]])\n")
         for key in ('PATH', 'TEST_ROOT'):
             subprocess.run([tmux, '-S', socket, 'set-environment', key, self.env[key]], check=True)
         return tmux, socket
+
+    def stop_tmux(self, tmux, socket):
+        # kill-server returns before workers finish their final state writes.
+        # Stop and wait for every owned pane's process group while tmux can
+        # still reap the pane leaders, then remove the server and fixture files.
+        result = subprocess.run([tmux, '-S', socket, 'list-panes', '-a', '-F',
+                                 '#{pane_pid} #{pane_dead}'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            return  # Already stopped by a test.
+        groups = {int(pid) for pid, dead in (line.split() for line in result.stdout.splitlines())
+                  if dead == '0'}
+        try:
+            for signum in (signal.SIGTERM, signal.SIGKILL):
+                for group in groups:
+                    try:
+                        os.killpg(group, signum)
+                    except ProcessLookupError:
+                        pass
+                deadline = time.monotonic() + 5
+                next_progress = 0
+                while groups and time.monotonic() < deadline:
+                    for group in groups.copy():
+                        try:
+                            os.killpg(group, 0)
+                        except ProcessLookupError:
+                            groups.remove(group)
+                    if groups:
+                        now = time.monotonic()
+                        if now >= next_progress:
+                            print(f'Waiting for fixture process groups: {sorted(groups)}', flush=True)
+                            next_progress = now + 1
+                        time.sleep(0.05)
+                if not groups:
+                    break
+            self.assertFalse(groups, f'Fixture process groups did not exit: {sorted(groups)}')
+        finally:
+            subprocess.run([tmux, '-S', socket, 'kill-server'], capture_output=True, timeout=5)
+
+    def test_real_tmux_cleanup_waits_for_final_state_write(self):
+        tmux, socket = self.real_tmux()
+        self.stub('delayed-worker', """import os,signal,sys,time
+from pathlib import Path
+root=Path(os.environ['TEST_ROOT'])
+def stop(_signum, _frame):
+ time.sleep(0.2)
+ (root/'state').mkdir(exist_ok=True)
+ (root/'state'/'finished').write_text('final state write')
+ sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGHUP, stop)
+(root/'ready').touch()
+time.sleep(60)
+""")
+        subprocess.run([tmux, '-S', socket, 'new-window', '-d',
+                        str(self.bin / 'delayed-worker')], check=True)
+        deadline = time.monotonic() + 5
+        next_progress = 0
+        while not (self.root / 'ready').exists() and time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_progress:
+                print('Waiting for delayed fixture worker: ready file absent', flush=True)
+                next_progress = now + 1
+            time.sleep(0.05)
+        self.assertTrue((self.root / 'ready').exists(), 'Fixture ready file absent at deadline')
+        self.stop_tmux(tmux, socket)
+        self.assertEqual((self.state / 'finished').read_text(), 'final state write')
 
     def test_real_tmux_two_reviewers_keep_sessions_and_windows_across_rounds(self):
         self.review_setup()
