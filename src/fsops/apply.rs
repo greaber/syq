@@ -21,7 +21,6 @@ pub(super) fn apply_one(
     guard: Option<&ContainerGuard>,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<&[u8]>,
-    names: Option<&scope_names::ScopeNames>,
     owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
     let registered_target = if let Some(root) = destination_root {
@@ -76,14 +75,14 @@ pub(super) fn apply_one(
                 ino: *ino,
                 condition: *condition,
             };
-            return apply_one_rooted(&operation, &target.as_rooted(), names, owned);
+            return apply_one_rooted(&operation, &target.as_rooted(), owned);
         }
-        return apply_one_rooted(op, &target.as_rooted(), names, owned);
+        return apply_one_rooted(op, &target.as_rooted(), owned);
     }
     let Some(target) = registered_target else {
         bail!("{UNROOTED_MUTATION}");
     };
-    apply_one_rooted(op, &target, names, owned)
+    apply_one_rooted(op, &target, owned)
 }
 
 /// Resolve one authorized request's root, then keep the caller's explicit
@@ -361,7 +360,6 @@ pub(super) fn observe_rooted_condition(
 fn apply_one_rooted(
     op: &Op,
     target: &RootedTarget,
-    names: Option<&scope_names::ScopeNames>,
     owned: Option<&owned::OwnedObjects>,
 ) -> Result<()> {
     let root = &target.root;
@@ -452,21 +450,14 @@ fn apply_one_rooted(
             if let Some(owned) = owned {
                 owned.require_link((*dev, *ino), &target.label)?;
             }
-            let source = RelativePath::new(source)?;
-            let link = || root.publish_hardlink(&source, path, (*dev, *ino), *condition);
-            match names {
-                // The new name is counted as it is made, never while a check
-                // counts the file's.
-                Some(names) => names.link(root, &source, path, (*dev, *ino), link),
-                None => link().map(drop),
-            }
+            root.publish_hardlink(&RelativePath::new(source)?, path, (*dev, *ino), *condition)
         }
         Op::SetMeta {
             meta,
             flags,
             condition,
             ..
-        } => set_meta_confined(target, meta, *flags, *condition, names),
+        } => set_meta_rooted(target, meta, *flags, *condition),
         Op::SetFileMetaIfSame {
             condition,
             meta,
@@ -482,9 +473,6 @@ fn apply_one_rooted(
                 );
             }
             require_open_target_known(&opened, &target.label, *condition)?;
-            if scope_names::changes_metadata(&opened, meta, *flags) {
-                scope_names::require_names_inside(names, target, &file, None)?;
-            }
             set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
             require_rooted_named_identity_known(
                 &target.root,
@@ -505,24 +493,11 @@ fn apply_one_rooted(
     }
 }
 
-#[cfg(test)]
 pub(super) fn set_meta_rooted(
     target: &RootedTarget,
     meta: &Meta,
     flags: u8,
     condition: TargetCondition,
-) -> Result<()> {
-    set_meta_confined(target, meta, flags, condition, None)
-}
-
-/// As `set_meta_rooted`, changing no file in place that has names outside
-/// the approved directories `names` knows.
-fn set_meta_confined(
-    target: &RootedTarget,
-    meta: &Meta,
-    flags: u8,
-    condition: TargetCondition,
-    names: Option<&scope_names::ScopeNames>,
 ) -> Result<()> {
     if target.relative.is_empty() {
         let metadata = target.root.metadata(&target.relative)?;
@@ -567,18 +542,6 @@ fn set_meta_confined(
         && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec);
     if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
         return Ok(());
-    }
-    if let Some(names) = names.filter(|_| !metadata.is_dir()) {
-        names.require_inside(
-            &target.root,
-            &target.relative,
-            &target.label,
-            &|| {
-                let metadata = parent.metadata()?;
-                Ok((metadata.dev, metadata.ino, metadata.nlink))
-            },
-            None,
-        )?;
     }
     if is_link {
         let handle = meta

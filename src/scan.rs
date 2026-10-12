@@ -286,17 +286,12 @@ struct DirectoryStep {
     remainder: Option<DescriptorDirectory>,
 }
 
-/// Whether a descriptor scan descends into a directory it found, given the
-/// directory's metadata. Called on the scan's worker threads.
-pub(crate) type Descend = dyn Fn(&RootMetadata) -> bool + Send + Sync;
-
 struct DescriptorScan<'a> {
     root: &'a Root,
     scan_root: &'a [u8],
     hold_destination_for_test: bool,
     ignore: Option<&'a Gitignore>,
     report_ignored: bool,
-    descend: Option<&'a Descend>,
 }
 
 impl DescriptorScan<'_> {
@@ -366,7 +361,7 @@ impl DescriptorScan<'_> {
                 continue;
             }
             events.push(ScanEvent::Entry(entry));
-            if is_directory && self.descend.is_none_or(|descend| descend(&metadata)) {
+            if is_directory {
                 let child = if retained < retain {
                     match self
                         .root
@@ -415,7 +410,6 @@ impl DescriptorScan<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn produce_descriptor_scan(
     root: Arc<Root>,
     scan_root: PathBytes,
@@ -423,7 +417,6 @@ fn produce_descriptor_scan(
     hold_destination_for_test: bool,
     ignore: Option<Gitignore>,
     report_ignored: bool,
-    descend: Option<Arc<Descend>>,
     tx: SyncSender<ScanChunk>,
 ) -> u64 {
     const DIRECTORY_WORKERS: usize = 8;
@@ -437,7 +430,6 @@ fn produce_descriptor_scan(
         hold_destination_for_test,
         ignore: ignore.as_ref(),
         report_ignored,
-        descend: descend.as_deref(),
     };
     let mut ignored_count = 0;
     let mut chunk = Vec::with_capacity(FIRST_BATCH);
@@ -676,37 +668,6 @@ pub(crate) fn scan_descriptor(
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<u64> {
-    scan_descriptor_descending(
-        root,
-        scan_root,
-        expected_root,
-        follow_root,
-        hold_destination_for_test,
-        ignore,
-        report_ignored,
-        None,
-        sink,
-        ignored,
-        warn,
-    )
-}
-
-/// As `scan_descriptor`, descending only into the directories `descend`
-/// accepts (all, without it). A directory it refuses is still reported.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_descriptor_descending(
-    root: Arc<Root>,
-    scan_root: &[u8],
-    expected_root: Option<SourceLeafIdentity>,
-    follow_root: bool,
-    hold_destination_for_test: bool,
-    ignore: &[String],
-    report_ignored: bool,
-    descend: Option<Arc<Descend>>,
-    sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-    ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(ScanWarning),
-) -> Result<u64> {
     if follow_root {
         anyhow::bail!("a descriptor-rooted scan never follows a root symlink");
     }
@@ -752,7 +713,6 @@ pub(crate) fn scan_descriptor_descending(
                 hold_destination_for_test,
                 matcher,
                 report_ignored,
-                descend,
                 tx,
             )
         })
@@ -806,7 +766,7 @@ pub(crate) fn scan_descriptor_selected(
     let producer = std::thread::Builder::new()
         .name("syq-descriptor-scan-producer".into())
         .spawn(move || {
-            produce_descriptor_scan(root, scan_root, directories, false, None, false, None, tx)
+            produce_descriptor_scan(root, scan_root, directories, false, None, false, tx)
         })
         .context("start selected descriptor scan producer")?;
     let mut batch = Vec::with_capacity(FIRST_BATCH);
@@ -1091,45 +1051,6 @@ mod tests {
             let warning = find(&described, path.as_bytes());
             assert_eq!(warning.message, format!("scan: {path}: {}", warning.error));
         }
-    }
-
-    /// A directory the scan is told not to descend into is reported, and
-    /// nothing in it is.
-    #[test]
-    fn descriptor_scan_descends_only_where_it_is_told() {
-        use std::os::unix::fs::MetadataExt;
-        let temp = crate::test_support::tempdir().unwrap();
-        for path in ["entered/a", "skipped/b", "skipped/inner/c"] {
-            let path = temp.path().join(path);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, b"x").unwrap();
-        }
-        let skipped = fs::metadata(temp.path().join("skipped")).unwrap().ino();
-        let mut paths = Vec::new();
-        scan_descriptor_descending(
-            Arc::new(Root::open(temp.path()).unwrap()),
-            b"",
-            None,
-            false,
-            false,
-            &[],
-            false,
-            Some(Arc::new(move |directory: &RootMetadata| {
-                directory.ino != skipped
-            })),
-            &mut |batch| {
-                paths.extend(batch.into_iter().map(|entry| entry.path));
-                Ok(())
-            },
-            &mut |_| Ok(()),
-            &mut |_| {},
-        )
-        .unwrap();
-        paths.sort();
-        assert_eq!(
-            paths,
-            [&b""[..], b"entered", b"entered/a", b"skipped"].map(<[u8]>::to_vec)
-        );
     }
 
     #[test]

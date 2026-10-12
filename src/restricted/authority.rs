@@ -133,20 +133,12 @@ pub(crate) struct RestrictedAuthority {
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
-    /// The names this receiver knows files have inside the signed scopes,
-    /// shared with every connection's operations, which change no file in
-    /// place that has others.
-    pub(super) scope_names: std::sync::Arc<crate::fsops::scope_names::ScopeNames>,
     /// The files this receiver created for the grant, shared with every
     /// connection's operations.
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
 }
 
 impl RestrictedAuthority {
-    pub(crate) fn scope_names(&self) -> std::sync::Arc<crate::fsops::scope_names::ScopeNames> {
-        self.scope_names.clone()
-    }
-
     /// The files that may take new names by hard link, when the grant keeps
     /// existing objects and copies hard links: those this receiver created
     /// for the grant. Without hard links nothing is recorded.
@@ -225,6 +217,16 @@ impl RestrictedAuthority {
             // coordinator reports, so the receiver cannot enforce it.
             bail!("update-if-older existing-object policy is not enforceable by the receiver");
         }
+        if copy.policy.publication == PublicationPolicy::InPlace
+            && copy.policy.existing != ExistingDestinationPolicy::Replace
+        {
+            // In-place preparation opens, creates, or replaces the final
+            // pathname with no condition to attach, so it can neither retain
+            // a pre-existing object nor be pinned to one. A new root at the
+            // exact path is staged and published without replacing anything
+            // (`constrain_inplace`).
+            bail!("in-place publication cannot honor a signed existing-object policy");
+        }
         let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
         let filter_roots = filters.destination_roots.clone();
         let root_path = Path::new(&config.root);
@@ -250,16 +252,9 @@ impl RestrictedAuthority {
         let file_data_limit = (max_file_data_bytes_per_second > 0)
             .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         let receipt_stream = Some(crate::receipt::ReceiptStreamWriter::new(&receipt_policy)?);
-        let scope_names = std::sync::Arc::new(crate::fsops::scope_names::ScopeNames::new(
-            config.root.as_bytes().to_vec(),
-            copy.mutation_scopes
-                .iter()
-                .map(|scope| (scope.path.clone(), scope.descendants)),
-        ));
         let authority = Self {
             hashing,
             extra_options,
-            scope_names,
             owned: Default::default(),
             tcp_congestion,
             mapping: mapping.map(|authorization| {
@@ -1506,46 +1501,17 @@ impl RestrictedAuthority {
         Ok(())
     }
 
-    /// Bind an in-place file's opening to the signed existing-object policy.
-    /// A file the policy only allows creating (keeping existing files, or a
-    /// root that must be new) is staged and published without replacing
-    /// anything (`constrain_staged_new`), never written in place, unless
-    /// this grant created it; when the policy changes existing files only,
-    /// the request must name exactly the file the receiver observes.
-    pub(super) fn constrain_inplace(
-        &self,
-        path: &[u8],
-        condition: &mut proto::TargetCondition,
-    ) -> Result<()> {
-        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
-        let own = self.created_by_this_grant(path);
-        let label = String::from_utf8_lossy(path);
+    /// Refuse to write in place a root the grant requires to be new: it is
+    /// staged and published without replacing anything
+    /// (`constrain_staged_new`), unless this grant created it.
+    pub(super) fn constrain_inplace(&self, path: &[u8]) -> Result<()> {
         let root_must_be_new =
             self.root_existence == RootExistence::New && path == self.destination;
-        match self.copy.policy.existing {
-            ExistingDestinationPolicy::Replace if !root_must_be_new => {}
-            ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip if own => {}
-            ExistingDestinationPolicy::Replace | ExistingDestinationPolicy::Skip => bail!(
-                "signed grant only creates {label}: it is staged and published without replacing anything, not written in place"
-            ),
-            ExistingDestinationPolicy::MustExist if own => {}
-            ExistingDestinationPolicy::MustExist => {
-                let Some(metadata) = self.rooted_metadata(path)? else {
-                    bail!("signed grant creates nothing: {label} does not exist")
-                };
-                match *condition {
-                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
-                    Matches { .. } => bail!(
-                        "requested identity for {label} does not match the object the receiver observed"
-                    ),
-                    Any | Absent | MatchesFingerprint { .. } => bail!(
-                        "in-place preparation of {label} must name the existing file it changes, as the signed existing-object policy requires"
-                    ),
-                }
-            }
-            ExistingDestinationPolicy::UpdateIfOlder => {
-                bail!("update-if-older existing-object policy is not enforceable by the receiver")
-            }
+        if root_must_be_new && !self.created_by_this_grant(path) {
+            bail!(
+                "signed grant only creates {}: it is staged and published without replacing anything, not written in place",
+                String::from_utf8_lossy(path)
+            );
         }
         Ok(())
     }
@@ -2722,7 +2688,6 @@ impl RestrictedAuthority {
                 flags,
                 scanned,
                 create_if_missing,
-                condition,
                 guard,
                 ..
             } => {
@@ -2739,7 +2704,7 @@ impl RestrictedAuthority {
                 }
                 self.check_mutation_path(path, false)?;
                 if *inplace {
-                    self.constrain_inplace(path, condition)?;
+                    self.constrain_inplace(path)?;
                 } else {
                     self.constrain_prepare(path)?;
                     if in_place_grant {

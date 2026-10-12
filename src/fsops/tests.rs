@@ -272,7 +272,6 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
             .prepare(
                 target(path),
                 PrepareOptions {
-                    condition: crate::proto::TargetCondition::Any,
                     size: 8,
                     inplace: true,
                     mode,
@@ -311,7 +310,7 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
             },
             flags::MODE | flags::TIMES | flags::REPORT_IDENTITY,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: None,
             },
         )
@@ -414,7 +413,6 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
         .prepare(
             target(b"dir"),
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 8,
                 inplace: true,
                 mode: 0o644,
@@ -450,7 +448,6 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
             .prepare(
                 target(path),
                 PrepareOptions {
-                    condition: crate::proto::TargetCondition::Any,
                     size: 8,
                     inplace: false,
                     mode,
@@ -490,7 +487,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
             &meta(mode),
             flags::MODE | flags::TIMES | flags::REPORT_IDENTITY,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: None,
             },
         )
@@ -707,7 +704,6 @@ fn payload_integrity_checks_are_explicit() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 3,
                 inplace: false,
                 mode: 0o600,
@@ -792,7 +788,6 @@ fn expected_hash_failure_preserves_existing_destination() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 3,
                 inplace: false,
                 mode: 0o600,
@@ -836,7 +831,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             0,
             crate::proto::ScannedDestination::Unknown,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: None
             }
         )
@@ -853,7 +848,7 @@ fn expected_hash_failure_preserves_existing_destination() {
             0,
             crate::proto::ScannedDestination::Unknown,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: None,
             },
         )
@@ -1081,7 +1076,6 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 guard: Some(&guard),
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 3,
                 inplace: true,
                 mode: 0o600,
@@ -1121,7 +1115,7 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
             },
             0,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: Some(&guard),
             },
         )
@@ -1138,7 +1132,6 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 guard: Some(&guard),
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 1,
                 inplace: true,
                 mode: 0o600,
@@ -1173,7 +1166,7 @@ fn confinement_matrix_guarded_receiver_refuses_root_and_parent_swaps() {
             &[Op::Mkdir {
                 path: target.as_os_str().as_bytes().to_vec(),
                 mode: 0o755,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             }],
             Some(&guard),
         );
@@ -1764,7 +1757,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         ops: vec![Op::Mkdir {
             path,
             mode: 0o755,
-            condition: crate::proto::TargetCondition::Any,
+            condition: TargetCondition::Any,
         }],
         guard,
     };
@@ -1804,7 +1797,7 @@ fn destination_mutations_need_a_registered_root_or_a_guard() {
         &[Op::Mkdir {
             path: target_bytes.clone(),
             mode: 0o755,
-            condition: crate::proto::TargetCondition::Any,
+            condition: TargetCondition::Any,
         }],
         None,
     );
@@ -1871,7 +1864,7 @@ fn put_small_stages_with_final_mode_and_truncates_reused_sidecar() {
         },
         flags,
         inplace: false,
-        condition: crate::proto::TargetCondition::Any,
+        condition: TargetCondition::Any,
         guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
@@ -2977,7 +2970,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 2,
                 inplace: true,
                 mode: 0o600,
@@ -3001,7 +2993,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 1,
                 inplace: false,
                 mode: 0o600,
@@ -3125,7 +3116,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 6,
                 inplace: false,
                 mode: 0o600,
@@ -3174,7 +3164,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 7,
                 inplace: true,
                 mode: 0o600,
@@ -3207,7 +3196,7 @@ fn destination_writes_publish_inside_the_adopted_root() {
             &meta,
             0,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: None,
             },
         )
@@ -3261,7 +3250,6 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 4,
                 inplace: false,
                 mode: 0o600,
@@ -3355,7 +3343,6 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 4,
                 inplace: false,
                 mode: 0o600,
@@ -3438,8 +3425,8 @@ fn rooted_descriptor_cache_distinguishes_roots_with_the_same_relative_name() {
     fs::create_dir_all(&second).unwrap();
     fs::write(first.join("same"), b"first").unwrap();
     fs::write(second.join("same"), b"second").unwrap();
-    let first_root = Arc::new(Root::open(&first).unwrap());
-    let second_root = Arc::new(Root::open(&second).unwrap());
+    let first_root = Root::open(&first).unwrap();
+    let second_root = Root::open(&second).unwrap();
     let relative = RelativePath::new(b"same").unwrap();
     let mut operations = FsOps::new();
 
@@ -3557,23 +3544,23 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
             Op::Mkdir {
                 path: b"created".to_vec(),
                 mode: 0o755,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
             Op::Mkdir {
                 path: b"nested/parent/created".to_vec(),
                 mode: 0o755,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
             Op::Symlink {
                 path: b"link".to_vec(),
                 target: b"target".to_vec(),
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
             Op::Mknod {
                 path: b"pipe".to_vec(),
                 mode: MODE_FIFO | 0o600,
                 rdev: 0,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
             Op::Unlink {
                 path: b"remove".to_vec(),
@@ -3596,13 +3583,13 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
                 path: b"link".to_vec(),
                 meta: meta(0),
                 flags: flags::TIMES,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
             Op::SetMeta {
                 path: Vec::new(),
                 meta: meta(0o701),
                 flags: flags::MODE | flags::TIMES,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
         ],
         None,
@@ -3653,7 +3640,7 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
         &[Op::Mkdir {
             path: b"redirect/escaped".to_vec(),
             mode: 0o755,
-            condition: crate::proto::TargetCondition::Any,
+            condition: TargetCondition::Any,
         }],
         None,
     );
@@ -3933,7 +3920,6 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                     guard: None,
                 },
                 PrepareOptions {
-                    condition: crate::proto::TargetCondition::Any,
                     size: len,
                     inplace: false,
                     mode: 0o600,
@@ -4069,7 +4055,6 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
         let prepared = ops.prepare(
             target(),
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: new.len() as u64,
                 inplace: false,
                 mode: 0o644,
@@ -4135,7 +4120,7 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
             &meta,
             flags::MODE,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: None,
             },
         )
@@ -4189,7 +4174,6 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                 .prepare(
                     target(),
                     PrepareOptions {
-                        condition: crate::proto::TargetCondition::Any,
                         size: old.len() as u64,
                         inplace: false,
                         mode: 0o644,
@@ -4228,7 +4212,6 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                 .prepare(
                     target(),
                     PrepareOptions {
-                        condition: crate::proto::TargetCondition::Any,
                         size: new.len() as u64,
                         inplace: false,
                         mode: retry_mode,
@@ -4278,7 +4261,7 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                 &meta,
                 flags::MODE,
                 TargetMutation {
-                    condition: crate::proto::TargetCondition::Any,
+                    condition: TargetCondition::Any,
                     guard: None,
                 },
             )
@@ -4345,7 +4328,6 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                     ops.prepare(
                         target(),
                         PrepareOptions {
-                            condition: crate::proto::TargetCondition::Any,
                             size: len as u64,
                             inplace: false,
                             mode,
@@ -4388,7 +4370,6 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                         guard: None,
                     };
                     let options = PrepareOptions {
-                        condition: crate::proto::TargetCondition::Any,
                         size: 1,
                         inplace: false,
                         mode: 0o644,
@@ -4440,7 +4421,7 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                     &meta,
                     flags::MODE,
                     TargetMutation {
-                        condition: crate::proto::TargetCondition::Any,
+                        condition: TargetCondition::Any,
                         guard: None,
                     },
                 )
@@ -4503,7 +4484,6 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         guard: None,
     };
     let options = |mode, attempt| PrepareOptions {
-        condition: crate::proto::TargetCondition::Any,
         size: old.len() as u64,
         inplace: false,
         mode,
@@ -4689,7 +4669,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 1024,
                 inplace: false,
                 mode: 0o600,
@@ -4711,7 +4690,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 1024,
                 inplace: false,
                 mode: 0o600,
@@ -4745,7 +4723,6 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                     guard: None,
                 },
                 PrepareOptions {
-                    condition: crate::proto::TargetCondition::Any,
                     size: 1024,
                     inplace: false,
                     mode: 0o600,
@@ -4815,7 +4792,6 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
                 guard: Some(&guard),
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 1024,
                 inplace: false,
                 mode: 0o600,
@@ -6843,7 +6819,7 @@ fn reused_parent_errors_keep_paths_and_os_error_codes() {
             Op::Mkdir {
                 path: long_name.clone(),
                 mode: 0o755,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
             Op::SetMeta {
                 path: b"missing-metadata-target".to_vec(),
@@ -6856,7 +6832,7 @@ fn reused_parent_errors_keep_paths_and_os_error_codes() {
                     mtime_nsec: 0,
                 },
                 flags: flags::TIMES,
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
             },
         ],
         None,
@@ -6902,7 +6878,6 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: data.len() as u64,
                 inplace: false,
                 mode: 0o600,
@@ -7034,7 +7009,6 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
                 guard: None,
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 0,
                 inplace: true,
                 mode: 0o600,
@@ -7431,7 +7405,7 @@ fn equality_windows_keep_the_same_destination_inode() {
         copy_id: id,
         block,
         len: block,
-        condition: crate::proto::TargetCondition::Any,
+        condition: TargetCondition::Any,
         guard: None,
     };
     let first = ops.handle(&request(0));
@@ -7465,7 +7439,7 @@ fn directory_changes_share_each_directory_between_two_threads() {
     let mkdir = |path: String| Op::Mkdir {
         path: path.into_bytes(),
         mode: 0o755,
-        condition: crate::proto::TargetCondition::Any,
+        condition: TargetCondition::Any,
     };
     // Two busy directories, many directories of one entry each, and
     // operations that the selection leaves out.
@@ -7767,7 +7741,6 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
             ops.prepare(
                 partial,
                 PrepareOptions {
-                    condition: crate::proto::TargetCondition::Any,
                     size: data.len() as u64,
                     inplace: false,
                     mode: 0o600,
@@ -8032,7 +8005,7 @@ fn creations_wait_for_their_parents_created_in_the_same_request() {
     let mkdir = |path: &[u8]| Op::Mkdir {
         path: path.to_vec(),
         mode: 0o700,
-        condition: crate::proto::TargetCondition::Any,
+        condition: TargetCondition::Any,
     };
     let ops = [
         mkdir(b"a/b/c"),
@@ -8040,7 +8013,7 @@ fn creations_wait_for_their_parents_created_in_the_same_request() {
         Op::Symlink {
             path: b"a/b/link".to_vec(),
             target: b"target".to_vec(),
-            condition: crate::proto::TargetCondition::Any,
+            condition: TargetCondition::Any,
         },
         mkdir(b"x/y"),
         mkdir(b"a/b"),
@@ -8082,7 +8055,6 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
                 guard: Some(&guard),
             },
             PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
                 size: 3,
                 inplace: true,
                 mode: source_mode & 0o777,
@@ -8124,7 +8096,7 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
             flags::RECEIVER_MODE,
             ScannedDestination::Absent,
             TargetMutation {
-                condition: crate::proto::TargetCondition::Any,
+                condition: TargetCondition::Any,
                 guard: Some(&guard),
             },
         )
@@ -8133,145 +8105,6 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
     assert_eq!(
         fs::metadata(&target).unwrap().mode() & 0o7777,
         0o444 & !crate::fsops::limits::process_umask()
-    );
-}
-
-/// An in-place open of the file a scan found checks its names as the
-/// other opens do. Only a restricted receiver tracks names, and it
-/// discards the scan, so this guards that path should that change.
-#[test]
-fn an_in_place_open_of_a_scanned_file_refuses_one_with_names_outside() {
-    let dir = crate::test_support::tempdir().unwrap();
-    let base = dir.path();
-    fs::create_dir(base.join("scope")).unwrap();
-    fs::create_dir(base.join("outside")).unwrap();
-    fs::write(base.join("scope/a"), b"old").unwrap();
-    fs::set_permissions(base.join("scope/a"), fs::Permissions::from_mode(0o644)).unwrap();
-    fs::hard_link(base.join("scope/a"), base.join("outside/a")).unwrap();
-    let bytes = |path: &Path| path.as_os_str().as_bytes().to_vec();
-    let identity = Root::open(base).unwrap().identity();
-    let guard = ContainerGuard {
-        root: bytes(base),
-        dev: identity.dev,
-        ino: identity.ino,
-    };
-    let mut operations = FsOps::new();
-    operations.set_scope_names(Arc::new(scope_names::ScopeNames::new(
-        bytes(base),
-        [(bytes(&base.join("scope")), true)],
-    )));
-    let target = bytes(&base.join("scope/a"));
-    let error = operations
-        .prepare(
-            PartialTarget {
-                path: &target,
-                id: &[7; 16],
-                guard: Some(&guard),
-            },
-            PrepareOptions {
-                condition: crate::proto::TargetCondition::Any,
-                size: 3,
-                inplace: true,
-                mode: 0o644,
-                attempt: 0,
-                create_if_missing: true,
-                scanned: ScannedDestination::File(0o644),
-                group: None,
-            },
-        )
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("can't confirm are inside"),
-        "{error:#}"
-    );
-    assert_eq!(fs::read(base.join("outside/a")).unwrap(), b"old");
-}
-
-/// An in-place file held since a comparison and its preparation, moved
-/// outside the scope before it is finished, is not changed there: the
-/// descriptor finalize uses has been held open, whether or not the
-/// metadata read at its open was kept.
-#[test]
-fn a_held_in_place_file_moved_outside_is_not_finished_there() {
-    let dir = crate::test_support::tempdir().unwrap();
-    let base = dir.path();
-    fs::create_dir(base.join("scope")).unwrap();
-    fs::create_dir(base.join("outside")).unwrap();
-    fs::write(base.join("scope/a"), b"held").unwrap();
-    fs::set_permissions(base.join("scope/a"), fs::Permissions::from_mode(0o600)).unwrap();
-    let bytes = |path: &Path| path.as_os_str().as_bytes().to_vec();
-    let identity = Root::open(base).unwrap().identity();
-    let guard = ContainerGuard {
-        root: bytes(base),
-        dev: identity.dev,
-        ino: identity.ino,
-    };
-    let mut operations = FsOps::new();
-    operations.set_scope_names(Arc::new(scope_names::ScopeNames::new(
-        bytes(base),
-        [(bytes(&base.join("scope")), true)],
-    )));
-    let target = bytes(&base.join("scope/a"));
-    let copy_id = [8; 16];
-    operations
-        .hash_and_hold(
-            &target,
-            &copy_id,
-            MIN_HASH_BLOCK_BYTES,
-            4,
-            TargetCondition::Any,
-            Some(&guard),
-        )
-        .unwrap();
-    operations
-        .prepare(
-            PartialTarget {
-                path: &target,
-                id: &copy_id,
-                guard: Some(&guard),
-            },
-            PrepareOptions {
-                condition: TargetCondition::Any,
-                size: 4,
-                inplace: true,
-                mode: 0o644,
-                attempt: 0,
-                create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
-                group: None,
-            },
-        )
-        .unwrap();
-    fs::rename(base.join("scope/a"), base.join("outside/a")).unwrap();
-    let error = operations
-        .finalize_expected(
-            None,
-            &target,
-            true,
-            &copy_id,
-            &Meta {
-                inode_metadata: None,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                mtime: 0,
-                mtime_nsec: 0,
-            },
-            flags::MODE,
-            ScannedDestination::Unknown,
-            TargetMutation {
-                condition: TargetCondition::Any,
-                guard: Some(&guard),
-            },
-        )
-        .unwrap_err();
-    assert!(
-        format!("{error:#}").contains("can't confirm are inside"),
-        "{error:#}"
-    );
-    assert_eq!(
-        fs::metadata(base.join("outside/a")).unwrap().mode() & 0o7777,
-        0o600
     );
 }
 

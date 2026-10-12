@@ -1599,15 +1599,14 @@ impl Root {
     /// This deliberately does not use the single-link staging-file helpers.
     /// `condition` says what the new name may replace: anything but a
     /// directory (`Any`), nothing (`Absent`), or exactly one object
-    /// (`Matches`). Returns whether it made a new name: false when the name
-    /// already led to the file.
+    /// (`Matches`).
     pub(crate) fn publish_hardlink(
         &self,
         source: &RelativePath,
         target: &RelativePath,
         identity: (u64, u64),
         condition: crate::proto::TargetCondition,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         use crate::proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
@@ -1640,7 +1639,7 @@ impl Root {
             (MatchesFingerprint { .. }, _) => {
                 bail!("hardlink publication accepts no fingerprint condition")
             }
-            (_, Some(existing)) if (existing.dev, existing.ino) == identity => return Ok(false),
+            (_, Some(existing)) if (existing.dev, existing.ino) == identity => return Ok(()),
             (_, Some(existing)) if existing.is_dir() => {
                 bail!("hardlink destination {} is a directory", target.label())
             }
@@ -1668,8 +1667,7 @@ impl Root {
                     libc::AT_SYMLINK_FOLLOW,
                 )
             })
-            .with_context(|| format!("publish hardlink {}", target.label()))
-            .map(|()| true);
+            .with_context(|| format!("publish hardlink {}", target.label()));
         }
         let temporary = create_temporary(&parent, |fd, name| {
             #[cfg(target_os = "linux")]
@@ -1765,7 +1763,7 @@ impl Root {
                 let _ = unlink_at(directory, &temporary, 0);
             }
         }
-        result.map(|()| true)
+        result
     }
 
     /// Atomically publish a staged regular file with ordinary rename
@@ -2150,73 +2148,6 @@ impl ResolvedParent<'_> {
 
     pub(crate) fn metadata(&self) -> io::Result<RootMetadata> {
         metadata_at(self.directory.as_raw_fd(), &self.leaf)
-    }
-
-    /// The leaf's device and inode, and whether it is the root of a mount
-    /// (a bind mount of a file or directory, or another filesystem, put at
-    /// this name), which makes it no link of what it shows. On Linux one
-    /// `statx` answers both, where an ordinary stat would answer the first.
-    pub(crate) fn leaf_identity(&self) -> io::Result<((u64, u64), bool)> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
-            crate::sys::retry_zero(|| unsafe {
-                libc::statx(
-                    self.directory.as_raw_fd(),
-                    self.leaf.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                    libc::STATX_INO | libc::STATX_MNT_ID,
-                    stat.as_mut_ptr(),
-                )
-            })?;
-            let stat = unsafe { stat.assume_init() };
-            let identity = (
-                libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
-                stat.stx_ino,
-            );
-            let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
-            #[cfg(debug_assertions)]
-            let attribute_reported = stat.stx_attributes_mask & mount_root != 0
-                && std::env::var_os("SYQ_TEST_STATX_WITHOUT_MOUNT_ROOT").is_none();
-            #[cfg(not(debug_assertions))]
-            let attribute_reported = stat.stx_attributes_mask & mount_root != 0;
-            let mounted = if attribute_reported {
-                stat.stx_attributes & mount_root != 0
-            } else {
-                self.lands_on_another_mount()
-            };
-            Ok((identity, mounted))
-        }
-        // macOS has no bind mounts an ordinary user can make, and a volume
-        // is mounted on a directory, never at a file's name.
-        #[cfg(not(target_os = "linux"))]
-        {
-            let metadata = self.metadata()?;
-            Ok(((metadata.dev, metadata.ino), false))
-        }
-    }
-
-    /// Whether the leaf lands on another mount than its directory, by the
-    /// mount IDs /proc/self/fdinfo shows (Linux 3.15 and later), for kernels
-    /// before 5.8, whose statx reports no mount-root attribute. Only those
-    /// kernels pay for this, and only for the names a check confirms of a
-    /// file with more than one link. A mount ID that cannot be read counts
-    /// as another mount, which can only refuse a change.
-    #[cfg(target_os = "linux")]
-    fn lands_on_another_mount(&self) -> bool {
-        let leaf = open_at(
-            self.directory.as_raw_fd(),
-            &self.leaf,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        );
-        match (
-            leaf.ok().as_ref().and_then(crate::sys::fdinfo_mount_id),
-            crate::sys::fdinfo_mount_id(&self.directory),
-        ) {
-            (Some(leaf), Some(directory)) => leaf != directory,
-            _ => true,
-        }
     }
 
     /// The directory that holds the leaf, for inspecting where a new entry

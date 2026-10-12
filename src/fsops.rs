@@ -42,7 +42,6 @@ pub(crate) mod owned;
 mod partial;
 mod paths;
 mod receiver_mode;
-pub(crate) mod scope_names;
 mod sidecars;
 mod small_batch;
 
@@ -753,9 +752,6 @@ pub struct FsOps {
     /// been listed or turned out not to be on NFS.
     #[cfg(target_os = "linux")]
     listing_requests: HashMap<PathBytes, Option<usize>>,
-    /// On a confined receiver, the names it knows files have inside its
-    /// approved directories; it changes no file in place that has others.
-    scope_names: Option<Arc<scope_names::ScopeNames>>,
 }
 
 struct ComparisonWindow {
@@ -771,9 +767,6 @@ struct HeldBasis {
     label: PathBuf,
     copy_id: CopyId,
     file: File,
-    /// The file's link count when it was first opened to be held, read
-    /// only by a receiver that checks names (`FsOps::links_when_held`).
-    links: u64,
 }
 
 struct SourceRootHandle {
@@ -881,8 +874,6 @@ struct PrepareOptions {
     create_if_missing: bool,
     /// What the sender's scan found at the path.
     scanned: ScannedDestination,
-    /// What an in-place file's name must hold when it is opened.
-    condition: TargetCondition,
     /// The group publication gives an in-place file, when it sets one.
     group: Option<u32>,
 }
@@ -978,7 +969,6 @@ impl FsOps {
             network_entries: HashMap::new(),
             #[cfg(target_os = "linux")]
             listing_requests: HashMap::new(),
-            scope_names: None,
         }
     }
 
@@ -2798,7 +2788,7 @@ impl FsOps {
     fn cached_rooted(
         &mut self,
         label: &Path,
-        root: &Arc<Root>,
+        root: &Root,
         relative: &RelativePath,
         attempt: u32,
         private: bool,
@@ -2817,21 +2807,6 @@ impl FsOps {
                 self.fds.remove(&victim);
             }
             let file = root.open_regular_write(relative, false)?;
-            // A file written in place by name is the inode there now.
-            if let Some(names) = self.scope_names.as_ref().filter(|_| !private) {
-                if !file.metadata()?.is_dir() {
-                    names.require_inside(
-                        root,
-                        relative,
-                        label,
-                        &|| {
-                            let opened = file.metadata()?;
-                            Ok((opened.dev(), opened.ino(), opened.nlink()))
-                        },
-                        None,
-                    )?;
-                }
-            }
             if private {
                 require_safe_partial(&file, label)?;
                 let named = root.metadata(relative)?;
@@ -3313,7 +3288,6 @@ impl FsOps {
             !short.is_empty() && self.destination_on_network_file_system(guard, &short),
         );
         let directories = &self.receiver_directories;
-        let scope_names = self.scope_names.as_deref();
         let owned = self.owned.as_deref();
         let destination_root = self.destination_root.clone();
         let destination_prefix = self.destination_prefix.as_deref();
@@ -3395,7 +3369,6 @@ impl FsOps {
                     guard,
                     destination_root.clone(),
                     destination_prefix,
-                    scope_names,
                     owned,
                 ),
             };
@@ -3433,7 +3406,6 @@ impl FsOps {
                 guard,
                 destination_root.clone(),
                 destination_prefix,
-                scope_names,
                 owned,
             );
             // After its group change, even a refused one, as creating it

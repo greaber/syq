@@ -1945,13 +1945,10 @@ fn hardlink_publication_is_confined_and_rejects_a_replaced_representative() {
     let target = relative(b"target");
     let original = root.metadata(&source).unwrap();
     let identity = (original.dev, original.ino);
-    assert!(root
-        .publish_hardlink(&source, &target, identity, Any)
-        .unwrap());
-    // A name already linked to the file makes no new name.
-    assert!(!root
-        .publish_hardlink(&source, &target, identity, Any)
-        .unwrap());
+    root.publish_hardlink(&source, &target, identity, Any)
+        .unwrap();
+    root.publish_hardlink(&source, &target, identity, Any)
+        .unwrap();
     assert_eq!(root.metadata(&target).unwrap().ino, original.ino);
     assert_eq!(fs::read(tree.path().join("outside")).unwrap(), b"untouched");
     fs::remove_file(tree.path().join("source")).unwrap();
@@ -2098,28 +2095,4 @@ fn hardlink_publication_honors_its_target_condition() {
     assert_eq!(root.metadata(&existing).unwrap().ino, original.ino);
     // No temporary names remain.
     assert_eq!(names(), ["existing", "new", "source"]);
-}
-
-/// A name a filesystem is mounted at is a mount root, which no file's link
-/// is; a file's own name is not. Both by the statx attribute and by the
-/// mount IDs kernels before 5.8 are asked for instead. (A bind mount of a
-/// file shows the same, but needs privileges to make: see the manual mount
-/// probes, run with `SYQ_TEST_STATX_WITHOUT_MOUNT_ROOT` too.)
-#[cfg(target_os = "linux")]
-#[test]
-fn a_mounted_name_is_told_from_a_link() {
-    let root = Root::open(Path::new("/")).unwrap();
-    let proc = root.resolve_parent(&relative(b"proc")).unwrap();
-    let (_, mounted) = proc.leaf_identity().unwrap();
-    assert!(mounted, "/proc is a mount root");
-    assert!(proc.lands_on_another_mount());
-    let tree = TestDir::new("leaf-identity");
-    fs::write(tree.path().join("file"), b"x").unwrap();
-    let root = Root::open(tree.path()).unwrap();
-    let file = root.resolve_parent(&relative(b"file")).unwrap();
-    let (identity, mounted) = file.leaf_identity().unwrap();
-    let metadata = fs::metadata(tree.path().join("file")).unwrap();
-    assert_eq!(identity, (metadata.dev(), metadata.ino()));
-    assert!(!mounted);
-    assert!(!file.lands_on_another_mount());
 }

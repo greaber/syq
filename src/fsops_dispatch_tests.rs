@@ -17,7 +17,7 @@ fn put(path: &[u8]) -> SmallPut {
         },
         flags: 0,
         inplace: false,
-        condition: crate::proto::TargetCondition::Any,
+        condition: TargetCondition::Any,
         guard: None,
         replaces: false,
         scanned: crate::proto::ScannedDestination::Unknown,
@@ -299,7 +299,6 @@ fn optimistic_partial_reopens_legacy_short_name_across_workers() {
         scanned: crate::proto::ScannedDestination::Unknown,
         attempt: 0,
         create_if_missing: false,
-        condition: crate::proto::TargetCondition::Any,
         guard: None,
         group: None,
     });

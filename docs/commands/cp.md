@@ -184,15 +184,15 @@ makes a read-only one writable only as
 interrupted write could leave a file that a retry skips. With
 `--if-exists=error-if-different`, a retry rejects differing final contents,
 including incomplete output from an interrupted in-place copy. The default
-`update` policy can repair that incomplete file. With `--inplace`,
-`--only-existing` opens only the file the scan found. A file that must be new,
-an `--as-new` file or a new file under `--if-exists=error` or
+`update` policy can repair that incomplete file. With `--inplace`, a file that
+must be new, an `--as-new` file or a new file under `--if-exists=error` or
 `error-if-different`, is still written under a temporary name and then renamed
 into place: there is nothing to update in place, and an interrupted copy
-resumes it. A restricted receiver or receiving machine publishes an `--as-new`
-file without replacing one; other destinations check only that the path is
-free before the copy starts, so a file put there in the meantime is
-overwritten. S3 destinations do not support `--inplace`.
+resumes it. A restricted receiver publishes an `--as-new` file without
+replacing one; other destinations check only that the path is free before the
+copy starts, so a file put there in the meantime is overwritten. S3 and named
+receiving destinations do not support `--inplace`; see
+[Copy limits](../persistence-reference.md#copy-limits).
 
 These policies do not disable requested pruning. Descriptor-specific
 restrictions are listed under [file descriptors](#file-descriptors).

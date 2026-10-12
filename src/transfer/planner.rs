@@ -3499,10 +3499,7 @@ impl Planner<'_> {
         // published without replacing anything, so readers see no partial
         // file and a retry finishes what an interrupted attempt left.
         let inplace = self.opts.inplace
-            && matches!(
-                target_condition,
-                TargetCondition::Any | TargetCondition::Matches { .. }
-            )
+            && target_condition == TargetCondition::Any
             && !(self.opts.new_target && dst == self.dst_root)
             && self.container_guard.is_none();
         let src_rel = self.mapping_source_rel(&rel_bytes);

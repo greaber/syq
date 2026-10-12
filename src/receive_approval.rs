@@ -588,7 +588,7 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .hardlinks
             .then(|| "can link new names to files already in the destination".to_owned()),
         (request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace)
-            .then(|| "can rewrite existing files in place".to_owned()),
+            .then(|| "can change existing files through every name they have".to_owned()),
         (extra.widen_dirs != crate::delegation::DirectoryWidening::None)
             // Under `all`, or `rsync` with deletion, it can add read too,
             // which shows the names inside, and through comparisons more.

@@ -92,9 +92,15 @@ impl Compression {
     }
 }
 
-use crate::sys::fdinfo_mount_id;
-#[cfg(test)]
-use crate::sys::mount_id_from_fdinfo;
+fn fdinfo_mount_id(file: &File) -> Option<u64> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
+    mount_id_from_fdinfo(&info)
+}
+
+fn mount_id_from_fdinfo(info: &str) -> Option<u64> {
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+}
 
 #[cfg(test)]
 thread_local! {

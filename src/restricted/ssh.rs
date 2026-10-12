@@ -287,7 +287,6 @@ mod tests {
             scanned: crate::proto::ScannedDestination::Unknown,
             attempt: 0,
             create_if_missing: true,
-            condition: crate::proto::TargetCondition::Any,
             guard: None,
             group: None,
         };

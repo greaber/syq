@@ -9,20 +9,6 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 
-/// The mount `file` was opened through, as /proc/self/fdinfo names it
-/// (Linux 3.15 and later), or None where it cannot be read.
-#[cfg(target_os = "linux")]
-pub(crate) fn fdinfo_mount_id(file: &File) -> Option<u64> {
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
-    mount_id_from_fdinfo(&info)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn mount_id_from_fdinfo(info: &str) -> Option<u64> {
-    info.lines()
-        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
-}
-
 /// Wait until `fd` is readable or `timeout` passes. If `poll` itself fails,
 /// sleep for the timeout instead, so a caller's retry loop cannot spin.
 pub(crate) fn wait_readable(fd: RawFd, timeout: std::time::Duration) {
