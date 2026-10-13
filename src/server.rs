@@ -274,9 +274,15 @@ impl Drop for ConnectionPermit {
 /// `local_receiver` marks the child process that receives a local copy.
 pub fn run(local_receiver: bool) -> Result<()> {
     let _termination = clean_up_on_termination();
+    let (prefix, hello) = peek_hello();
+    if let Some(ticket) = hello.as_ref().and_then(handed_worker_ticket) {
+        return hand_off_worker(&ticket, &prefix);
+    }
     let descriptor_session = DescriptorSessionSlot::default();
+    descriptor_session
+        .serve_handed_connections(handed_connection_handler(descriptor_session.clone()));
     let result = serve(
-        io::stdin(),
+        io::Cursor::new(prefix).chain(io::stdin()),
         io::stdout().lock(),
         true,
         None,
@@ -298,6 +304,186 @@ pub fn run(local_receiver: bool) -> Result<()> {
     descriptor_session.close();
     crate::process::termination::wait_if_terminating();
     result
+}
+
+/// Records every byte read through it.
+struct Recording<'a, R> {
+    inner: R,
+    recorded: &'a mut Vec<u8>,
+}
+
+impl<R: Read> Read for Recording<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(bytes)?;
+        self.recorded.extend_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+}
+
+/// Read the client's Hello from standard input, unbuffered by `io::stdin`,
+/// with every byte read for it. A Hello that cannot be read is left to
+/// `serve`, which reads the same bytes again and reports what is wrong.
+fn peek_hello() -> (Vec<u8>, Option<Request>) {
+    // SAFETY: borrows descriptor 0 without closing it.
+    let input = std::mem::ManuallyDrop::new(unsafe {
+        <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(0)
+    });
+    let mut recorded = Vec::new();
+    let hello = {
+        let mut reader = FrameReader::new(Recording {
+            inner: &*input,
+            recorded: &mut recorded,
+        });
+        reader.set_limit(MAX_HANDSHAKE_FRAME);
+        reader
+            .read_budgeted::<Request>()
+            .ok()
+            .map(|hello| hello.into_parts().0)
+    };
+    (recorded, hello)
+}
+
+/// The descriptor session whose process serves this destination worker:
+/// the copy's receiver, which registered the destination root.
+fn handed_worker_ticket(hello: &Request) -> Option<crate::descriptor_broker::DescriptorTicket> {
+    match hello {
+        Request::Hello {
+            identity,
+            role:
+                ConnectionRole::DestinationWorker {
+                    destination: Some(destination),
+                    ..
+                },
+            ..
+        } if identity == crate::identity::build() => Some(destination.ticket.clone()),
+        _ => None,
+    }
+}
+
+/// Give an SSH session's worker connection to the copy's receiver, which
+/// serves it on a thread as it serves a TCP worker, and wait until it has.
+/// The bytes already read (`prefix`) go with it.
+fn hand_off_worker(
+    ticket: &crate::descriptor_broker::DescriptorTicket,
+    prefix: &[u8],
+) -> Result<()> {
+    let handed = match crate::descriptor_broker::hand_off_pipes(ticket, prefix, 0, 1) {
+        Ok(handed) => handed,
+        Err(error) => {
+            // The coordinator learns of it as of any worker that cannot start.
+            let mut writer = FrameWriter::new(io::stdout().lock(), false);
+            let _ = writer.write_msg(&Response::Err(format!(
+                "hand the worker connection to the receiver: {error:#}"
+            )));
+            return Err(error);
+        }
+    };
+    // Only the receiver holds the session's input and output now, so it
+    // alone reads and answers them, and they close when it is done.
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .context("open /dev/null")?;
+    for descriptor in [0, 1] {
+        if unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), descriptor) } < 0 {
+            return Err(io::Error::last_os_error()).context("release the worker connection");
+        }
+    }
+    handed.wait()
+}
+
+/// Most connections handed to one receiver that it serves at once, as for
+/// TCP connections.
+const MAX_LIVE_HANDED_CONNECTIONS: u32 = MAX_LIVE_TCP_CONNECTIONS;
+
+/// Serve the worker connections other processes hand to this receiver,
+/// each on a thread of its own.
+fn handed_connection_handler(
+    descriptor_session: DescriptorSessionSlot,
+) -> crate::descriptor_broker::ConnectionHandler {
+    let live = Arc::new(AtomicU32::new(0));
+    Arc::new(move |connection| {
+        use crate::descriptor_broker::HandedConnection;
+        if live.fetch_add(1, Relaxed) >= MAX_LIVE_HANDED_CONNECTIONS {
+            live.fetch_sub(1, Relaxed);
+            connection.refuse();
+            return Ok(());
+        }
+        let session = descriptor_session.clone();
+        let served = live.clone();
+        let spawned = std::thread::Builder::new()
+            .name("syq-handed-worker".into())
+            .spawn(move || {
+                let HandedConnection {
+                    prefix,
+                    transport,
+                    mut control,
+                } = connection;
+                if HandedConnection::accept(&mut control).is_ok() {
+                    let result = serve_handed(prefix, transport, session);
+                    HandedConnection::report_end(control, &result);
+                }
+                served.fetch_sub(1, Relaxed);
+            });
+        if spawned.is_err() {
+            // The connection went with the closure: its process sees no answer.
+            live.fetch_sub(1, Relaxed);
+        }
+        Ok(())
+    })
+}
+
+/// Serve one handed-over worker connection. It is a data connection: it may
+/// not become a control.
+fn serve_handed(
+    prefix: Vec<u8>,
+    transport: crate::descriptor_broker::HandedTransport,
+    descriptor_session: DescriptorSessionSlot,
+) -> Result<()> {
+    #[cfg(debug_assertions)]
+    record_handed_connection_for_test();
+    let session = |named_socket| ServeSession {
+        owns_process: false,
+        handshake_pending: None,
+        ssh_worker_ticket: None,
+        allow_tcp: false,
+        metadata_control: false,
+        loopback_only: false,
+        named_socket,
+        authority: None,
+        source_authority: None,
+        descriptor_session: descriptor_session.clone(),
+    };
+    match transport {
+        crate::descriptor_broker::HandedTransport::Pipes { input, output } => serve(
+            io::Cursor::new(prefix).chain(input),
+            output,
+            false,
+            None,
+            None,
+            None,
+            session(None),
+        ),
+        crate::descriptor_broker::HandedTransport::Socket(socket) => serve(
+            socket.try_clone()?,
+            socket.try_clone()?,
+            false,
+            None,
+            None,
+            None,
+            session(Some(socket)),
+        ),
+    }
+}
+
+/// Record, for tests, that this process served a handed-over worker.
+#[cfg(debug_assertions)]
+fn record_handed_connection_for_test() {
+    let _ = crate::fsops::record_test_event(
+        "SYQ_TEST_HANDED_WORKER_EVENTS",
+        format_args!("served {}", std::process::id()),
+    );
 }
 
 pub(crate) fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {

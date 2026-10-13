@@ -2137,6 +2137,48 @@ impl RemoteSpec {
         Err(last.unwrap())
     }
 
+    /// A connection over a Unix socket the receiver serves directly.
+    fn stream_connection(
+        &self,
+        stream: std::os::unix::net::UnixStream,
+        compress: bool,
+        role: ConnectionRole,
+    ) -> Result<RemoteConn> {
+        let observation =
+            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+        let replies = reply_queue(self.read_ahead, &role);
+        let (rx, reader, batch_receipts) = spawn_observed_reader(
+            Box::new(stream.try_clone()?),
+            replies,
+            reply_bytes(&role),
+            observation.clone(),
+        )?;
+        let conn = RemoteConn {
+            batch_receipts,
+            transport_stop: None,
+            observation,
+            child: None,
+            approved_login: None,
+            w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
+            rx: Some(rx),
+            replies,
+            deferred: Default::default(),
+            reader: Some(reader),
+            label: self.label(),
+            dead: false,
+            rpc_observation: None,
+            write_stream: None,
+            peer: None,
+            tcp_socket: None,
+            named_socket: Some(stream),
+            multiplexed_ssh: false,
+            detached: false,
+        };
+        let conn = hello(conn, compress, Vec::new(), role)?;
+        self.record_peer(&conn);
+        Ok(conn)
+    }
+
     fn connect_once(
         &self,
         compress: bool,
@@ -2160,39 +2202,27 @@ impl RemoteSpec {
             None
         };
         if let Some(stream) = return_stream {
-            let observation =
-                std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-            let replies = reply_queue(self.read_ahead, &role);
-            let (rx, reader, batch_receipts) = spawn_observed_reader(
-                Box::new(stream.try_clone()?),
-                replies,
-                reply_bytes(&role),
-                observation.clone(),
-            )?;
-            let conn = RemoteConn {
-                batch_receipts,
-                transport_stop: None,
-                observation,
-                child: None,
-                approved_login: None,
-                w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
-                rx: Some(rx),
-                replies,
-                deferred: Default::default(),
-                reader: Some(reader),
-                label: self.label(),
-                dead: false,
-                rpc_observation: None,
-                write_stream: None,
-                peer: None,
-                tcp_socket: None,
-                named_socket: Some(stream),
-                multiplexed_ssh: false,
-                detached: false,
-            };
-            let conn = hello(conn, compress, Vec::new(), role)?;
-            self.record_peer(&conn);
-            return Ok(conn);
+            return self.stream_connection(stream, compress, role);
+        }
+        // A local receiver serves its workers itself: one end of a socket
+        // pair goes to it, in place of a receiver process for each worker.
+        if self.local_process {
+            if let ConnectionRole::DestinationWorker {
+                destination: Some(destination),
+                ..
+            } = &role
+            {
+                let (stream, receiver) = std::os::unix::net::UnixStream::pair()?;
+                crate::descriptor_broker::hand_off_socket(
+                    &destination.ticket,
+                    std::os::fd::AsRawFd::as_raw_fd(&receiver),
+                )
+                .map_err(|error| {
+                    WorkerInitializationError(format!("{}: {error:#}", self.label()))
+                })?;
+                drop(receiver);
+                return self.stream_connection(stream, compress, role);
+            }
         }
         let mut server_args = vec!["--server".into()];
         if let Some(grant) = self
