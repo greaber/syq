@@ -1305,12 +1305,14 @@ impl FsOps {
         let (partial, label, opened) =
             with_rooted_partial(&target, &put.copy_id, |relative, label| {
                 // Nothing reads a small file's sidecar, so it is opened for
-                // writing only, and, where the filesystem's link counts can
-                // be trusted, without exclusive creation, which costs an NFS
-                // client a further request. Whatever the name held is opened
-                // too: a new empty file of ours is used as created, and
-                // anything else, or an open the kernel refused, takes the
-                // checked path that ranged writes apply.
+                // writing only, and, where the root's filesystem's link
+                // counts can be trusted, without exclusive creation, which
+                // costs an NFS client a further request. Whatever the name
+                // held is opened too: a new empty file of ours, on a
+                // filesystem whose counts are trusted (judged through the
+                // file: another can be mounted below the root), is used as
+                // created, and anything else, or an open the kernel
+                // refused, takes the checked path that ranged writes apply.
                 if !target.root.link_counts_trusted()
                     || creates_foreign_owners(target.root.identity().dev)
                 {
@@ -1323,7 +1325,10 @@ impl FsOps {
                 }
                 self.uncache_rooted(&target.root, relative);
                 match self.open_or_create_partial(&target.root, relative, mode, true) {
-                    Ok((file, created)) if is_fresh_partial(&created, mode) => {
+                    Ok((file, created))
+                        if is_fresh_partial(&created, mode)
+                            && target.root.link_counts_trusted_on(created.dev(), &file) =>
+                    {
                         Ok(Some((file, created, None)))
                     }
                     Ok(_) => self.checked_small_stage(

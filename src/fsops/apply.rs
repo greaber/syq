@@ -505,7 +505,7 @@ fn apply_one_rooted(
 /// only to a directory: anything else found at its name, such as a file
 /// someone put there in its place, is refused before any change, so that it
 /// never takes the directory's owner, group or mode. Its identity is checked
-/// only where the filesystem keeps inode numbers
+/// only where the directory's own filesystem keeps inode numbers
 /// (`Profile::link_counts_trusted`): elsewhere a directory's number can
 /// change while it stays, and the type check stands alone.
 pub(super) fn set_meta_rooted(
@@ -515,13 +515,17 @@ pub(super) fn set_meta_rooted(
     condition: TargetCondition,
     directory: bool,
 ) -> Result<()> {
-    let condition = match condition {
-        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
-            if directory && !target.root.link_counts_trusted() =>
-        {
-            TargetCondition::Any
-        }
-        condition => condition,
+    // The condition for a directory on a filesystem whose profile `trusted`
+    // gives, asked only for a directory bound to an identity.
+    let for_directory = |trusted: &mut dyn FnMut() -> Result<bool>| -> Result<TargetCondition> {
+        Ok(match condition {
+            TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
+                if directory && !trusted()? =>
+            {
+                TargetCondition::Any
+            }
+            condition => condition,
+        })
     };
     let require_directory = |is_dir: bool| {
         if directory && !is_dir {
@@ -534,8 +538,9 @@ pub(super) fn set_meta_rooted(
     };
     if target.relative.is_empty() {
         let metadata = target.root.metadata(&target.relative)?;
-        require_rooted_condition(metadata, condition, &target.label)?;
         require_directory(metadata.is_dir())?;
+        let condition = for_directory(&mut || Ok(target.root.link_counts_trusted()))?;
+        require_rooted_condition(metadata, condition, &target.label)?;
         let handle = target.root.open_metadata(&target.relative)?;
         require_rooted_metadata(&handle, metadata, &target.label)?;
         let opened = handle.metadata()?;
@@ -565,8 +570,24 @@ pub(super) fn set_meta_rooted(
     let metadata = parent
         .metadata()
         .with_context(|| format!("stat confined path {}", target.label.display()))?;
-    require_rooted_condition(metadata, condition, &target.label)?;
     require_directory(metadata.is_dir())?;
+    // A directory below the root can be another filesystem's mount point,
+    // so its profile is its own filesystem's, read through a handle of the
+    // directory when that device's profile is not known yet. The handle
+    // then serves the metadata step.
+    let mut handle = None;
+    let condition = for_directory(&mut || {
+        if let Some(profile) = target.root.known_profile(metadata.dev) {
+            return Ok(profile.link_counts_trusted);
+        }
+        let opened = parent
+            .open_metadata()
+            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
+        let trusted = target.root.link_counts_trusted_on(metadata.dev, &opened);
+        handle = Some(opened);
+        Ok(trusted)
+    })?;
+    require_rooted_condition(metadata, condition, &target.label)?;
     let is_link = metadata.is_symlink();
     let owner_differs = (flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
@@ -620,9 +641,12 @@ pub(super) fn set_meta_rooted(
             crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
         }
     } else {
-        let handle = parent
-            .open_metadata()
-            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
+        let handle = match handle {
+            Some(handle) => handle,
+            None => parent.open_metadata().with_context(|| {
+                format!("open confined metadata handle {}", target.label.display())
+            })?,
+        };
         let opened = handle.metadata()?;
         if opened.dev() != metadata.dev || opened.ino() != metadata.ino {
             bail!(

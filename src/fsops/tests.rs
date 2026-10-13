@@ -8871,3 +8871,128 @@ fn an_existing_inplace_file_swapped_out_between_attempts_is_opened_again() {
     assert_eq!(fs::read(&path).unwrap(), b"new");
     assert_eq!(fs::read(temporary.path().join("aside")).unwrap(), b"old");
 }
+
+/// Two directories on different filesystems below one root: `/`, and a
+/// new one in `/dev/shm`, with its path from the root and the devices of
+/// the root and of the directory.
+#[cfg(target_os = "linux")]
+fn below_the_root_on_another_filesystem() -> (tempfile::TempDir, Vec<u8>, u64, u64) {
+    let directory = tempfile::tempdir_in("/dev/shm").unwrap();
+    let below = directory.path().strip_prefix("/").unwrap();
+    let (root_dev, directory_dev) = (
+        fs::metadata("/").unwrap().dev(),
+        fs::metadata(directory.path()).unwrap().dev(),
+    );
+    assert_ne!(root_dev, directory_dev, "the test needs two filesystems");
+    let relative = below.as_os_str().as_bytes().to_vec();
+    (directory, relative, root_dev, directory_dev)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_directorys_identity_is_judged_by_its_own_filesystem() {
+    // A directory below the root can be another filesystem's mount point:
+    // whether its scanned identity binds its metadata is that filesystem's
+    // profile's to say, not the root's.
+    let (shm, below, root_dev, directory_dev) = below_the_root_on_another_filesystem();
+    let path = shm.path().join("directory");
+    for (root_trusted, directory_trusted) in [(false, true), (true, false)] {
+        let _ = fs::remove_dir(&path);
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let found = fs::metadata(&path).unwrap();
+        let _profiles = crate::fsops::override_profiles_for_test(move |dev, _| {
+            let trusted = if dev == root_dev {
+                root_trusted
+            } else {
+                assert_eq!(dev, directory_dev);
+                directory_trusted
+            };
+            Profile {
+                link_counts_trusted: trusted,
+                ..Profile::LOCAL
+            }
+        });
+        let target = RootedTarget {
+            root: Arc::new(Root::open(Path::new("/")).unwrap()),
+            relative: RelativePath::new(&[&below[..], b"/directory"].concat()).unwrap(),
+            label: path.clone(),
+            create_missing_parents: false,
+            query_partial_name_limit: false,
+        };
+        let meta = Meta {
+            inode_metadata: None,
+            mode: 0o750,
+            uid: found.uid(),
+            gid: found.gid(),
+            mtime: 0,
+            mtime_nsec: 0,
+        };
+        // An identity other than the directory's.
+        let renumbered = TargetCondition::Matches {
+            dev: found.dev(),
+            ino: found.ino() + 1,
+        };
+        let applied = set_meta_rooted(&target, &meta, flags::MODE, renumbered, true);
+        let mode = fs::metadata(&path).unwrap().mode() & 0o7777;
+        if directory_trusted {
+            assert!(applied.is_err(), "root trusted {root_trusted}");
+            assert_eq!(mode, 0o700);
+        } else {
+            applied.unwrap();
+            assert_eq!(mode, 0o750);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stage_is_opened_without_exclusive_creation_only_on_a_trusted_filesystem() {
+    // An empty stage of ours at the name is used as created only where the
+    // stage's own filesystem's link counts show that no other name leads
+    // to it; on another one mounted below a trusted root it is replaced.
+    let (shm, below, root_dev, directory_dev) = below_the_root_on_another_filesystem();
+    let id = [225; 16];
+    for directory_trusted in [true, false] {
+        let _profiles = crate::fsops::override_profiles_for_test(move |dev, _| {
+            let trusted = dev == root_dev || (dev == directory_dev && directory_trusted);
+            Profile {
+                link_counts_trusted: trusted,
+                ..Profile::LOCAL
+            }
+        });
+        let mut ops = destination_ops(Path::new("/"));
+        let name = format!("file-{directory_trusted}");
+        let path = |name: &str| [&below[..], b"/", name.as_bytes()].concat();
+        let prepare = |ops: &mut FsOps, name: &str| {
+            ops.prepare(
+                PartialTarget {
+                    path: &path(name),
+                    id: &id,
+                    guard: None,
+                },
+                PrepareOptions {
+                    size: 8,
+                    inplace: false,
+                    mode: 0o644,
+                    attempt: 0,
+                    create_if_missing: true,
+                    scanned: ScannedDestination::Absent,
+                    group: None,
+                },
+            )
+            .unwrap()
+        };
+        // Another file's Prepare lists the directory's leftover stages
+        // first, as one in the same directory would; then an empty file
+        // appears at this file's stage name.
+        prepare(&mut ops, &format!("other-{directory_trusted}"));
+        let stage = partial_path(&shm.path().join(&name), &id).unwrap();
+        fs::write(&stage, b"").unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
+        let planted = fs::metadata(&stage).unwrap().ino();
+        prepare(&mut ops, &name);
+        let used = fs::metadata(&stage).unwrap().ino() == planted;
+        assert_eq!(used, directory_trusted);
+    }
+}

@@ -583,13 +583,16 @@ impl FsOps {
                     // through the descriptor too, and keeps owner access
                     // until publication sets the final mode, as an in-place
                     // file does; that chmod is paid only by files whose
-                    // final mode lacks it. Where the filesystem's link
-                    // counts can be trusted (`Profile::link_counts_trusted`),
-                    // it is opened without exclusive creation, which costs
-                    // an NFS client a SETATTR, and used only when the open
-                    // landed on a new empty file of ours: a count of one
-                    // shows that no other name leads to it. Elsewhere it is
-                    // created exclusively.
+                    // final mode lacks it. Where the root's filesystem's
+                    // link counts can be trusted
+                    // (`Profile::link_counts_trusted`), it is opened without
+                    // exclusive creation, which costs an NFS client a
+                    // SETATTR, and used only when the open landed on a new
+                    // empty file of ours on a filesystem whose counts are
+                    // trusted too, judged through the file itself, since
+                    // another filesystem can be mounted below the root: a
+                    // count of one shows that no other name leads to it.
+                    // Elsewhere it is created exclusively.
                     let staged = mode | 0o600;
                     self.uncache_rooted(&target.root, relative);
                     let fresh = |created: &fs::Metadata| {
@@ -599,7 +602,10 @@ impl FsOps {
                         && !creates_foreign_owners(target.root.identity().dev)
                     {
                         match self.open_or_create_partial(&target.root, relative, staged, false) {
-                            Ok((file, created)) if fresh(&created) => {
+                            Ok((file, created))
+                                if fresh(&created)
+                                    && target.root.link_counts_trusted_on(created.dev(), &file) =>
+                            {
                                 return Ok(Some((file, None, Some(created), None)));
                             }
                             Ok(_) => {}
