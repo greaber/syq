@@ -8809,6 +8809,28 @@ fn a_new_inplace_file_swapped_out_between_attempts_fails_the_file() {
     prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Absent).unwrap();
     fs::rename(&path, temporary.path().join("aside")).unwrap();
     fs::write(&path, b"planted").unwrap();
+    // A Finalize that fails keeps the moved file held.
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+    assert!(ops
+        .finalize(
+            b"file",
+            true,
+            &id,
+            &meta,
+            flags::MODE,
+            TargetMutation {
+                condition: TargetCondition::Absent,
+                guard: None,
+            },
+        )
+        .is_err());
     for attempt in [1, 2] {
         let error =
             prepare_inplace(&mut ops, &id, attempt, 3, ScannedDestination::Unknown).unwrap_err();

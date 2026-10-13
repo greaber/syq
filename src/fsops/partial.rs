@@ -2836,15 +2836,19 @@ impl FsOps {
             target, held, inplace, copy_id, meta, flags, scanned, mutation, expected,
         );
         if result.is_err() {
+            // A stage that publication removed is let go. An in-place file
+            // stays held whatever its name holds now: a retry then finds a
+            // new file that moved away, and fails it.
             let (file, opened, relative, created) = kept;
-            let identity = file
-                .metadata()
-                .map(|metadata| (metadata.dev(), metadata.ino()));
-            let named = target.root.metadata_optional(&relative);
-            if let (Ok(identity), Ok(Some(named))) = (identity, named) {
-                if (named.dev, named.ino) == identity {
-                    stages::hold(held_for, &relative, &file, opened, created)?;
-                }
+            let at_name = || -> Result<bool> {
+                let held = file.metadata()?;
+                Ok(target
+                    .root
+                    .metadata_optional(&relative)?
+                    .is_some_and(|named| (named.dev, named.ino) == (held.dev(), held.ino())))
+            };
+            if inplace || at_name().unwrap_or(false) {
+                stages::hold(held_for, &relative, &file, opened, created)?;
             }
         }
         result
