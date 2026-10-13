@@ -86,6 +86,13 @@ pub(crate) fn check_copy(
     ensure_same(request, &derived)
 }
 
+/// Whether `command` is a dry run of a copy that prunes. Its read-only
+/// request deletes nothing, so only the command says so.
+pub(crate) fn dry_run_prunes(command: &[Vec<u8>]) -> Result<bool> {
+    let args = parse(command)?;
+    Ok(args.dry_run && crate::restricted::requests_pruning(&args))
+}
+
 /// Validate the authorizer chosen on the requesting host. An omitted or `auto`
 /// flag can select this registered receiving name without consulting this
 /// machine's preferences; an explicit name must match the addressed receiver.

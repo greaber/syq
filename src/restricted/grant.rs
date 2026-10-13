@@ -106,6 +106,13 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Whether `args` asks to delete destination extras. `--max-delete 0` means
+/// nothing may be deleted, which a grant states directly as a forbidding
+/// policy rather than a zero budget.
+pub(crate) fn requests_pruning(args: &Args) -> bool {
+    args.delete && args.max_delete != Some(0)
+}
+
 pub(super) fn grant_for(
     args: &Args,
     sources: &[Location],
@@ -116,9 +123,7 @@ pub(super) fn grant_for(
     validate_restricted_args(args)?;
     let issued_at = now()?;
     let read_only = args.dry_run;
-    // `--max-delete 0` means nothing may be deleted, which the grant states
-    // directly as a forbidding policy rather than a zero budget.
-    let deletion = if !read_only && args.delete && args.max_delete != Some(0) {
+    let deletion = if !read_only && requests_pruning(args) {
         DeletionPolicy::DeleteDestinationOnly
     } else {
         DeletionPolicy::Forbid

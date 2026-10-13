@@ -367,9 +367,10 @@ Change these ceilings with `syq persist receive on --max-bytes 20G --max-entries
 Lower limits requested by the sender also apply. Limits are per copy; repeated
 copies can fill the disk. Copies support at most 128 workers each.
 
-Pruning is disabled unless the laptop sets a positive `--max-delete`.
-A pruning copy that plans more deletions than the laptop's `--max-delete` or
-`--max-entries`, or than its own `--max-delete`, deletes nothing and exits 25.
+Pruning is disabled unless the laptop sets a positive `--max-delete`; until
+then, a pruning copy is refused, and so is a dry run of it. A pruning copy
+that plans more deletions than the laptop's `--max-delete` or `--max-entries`,
+or than its own `--max-delete`, deletes nothing and exits 25.
 A dry run of it exits 25 too, so you can check first. Validation failures
 leave the copy unstarted.
 Errors during copying fail visibly and may leave partial files for retry.

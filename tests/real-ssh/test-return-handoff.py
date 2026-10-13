@@ -172,6 +172,17 @@ finally:
     run("ssh", "source", prune)
     assert not (destination / "extra-1").exists()
     assert (destination / "kept").read_bytes() == b"kept"
+    # With pruning off on the laptop, the copy is refused, and so is its dry
+    # run, the same way, though nothing is left to delete.
+    run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+    refusals = []
+    for command in [preview, prune]:
+        result = subprocess.run(["ssh", "source", command], capture_output=True, timeout=40)
+        reasons = [line for line in result.stderr.splitlines() if b"pruning needs a positive --max-delete" in line]
+        assert result.returncode != 0 and reasons, result
+        refusals.append((result.returncode, reasons))
+    assert refusals[0] == refusals[1], refusals
 finally:
     run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")

@@ -814,12 +814,16 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
     Ok((destination, container))
 }
 
+/// Fit `request` within this machine's limits at `destination`, or refuse it.
+/// `dry_run_prunes` marks a dry run of a pruning copy, which is refused
+/// where pruning is off, as the copy itself would be.
 fn constrain(
     mut request: CopyRequest,
     destination: &Path,
     max_bytes: u64,
     max_entries: u64,
     max_delete: u64,
+    dry_run_prunes: bool,
 ) -> Result<CopyRequest> {
     if request.copy.mutation_scopes.len() > 1024 {
         bail!("too many copy scopes");
@@ -839,14 +843,11 @@ fn constrain(
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
-    request.copy.limits.max_deletions = request
-        .copy
-        .limits
-        .max_deletions
-        .min(deletion_ceiling(&request, max_delete));
-    if request.copy.policy.deletion == crate::delegation::DeletionPolicy::DeleteDestinationOnly
-        && request.copy.limits.max_deletions == 0
-    {
+    let ceiling = deletion_ceiling(&request, max_delete);
+    request.copy.limits.max_deletions = request.copy.limits.max_deletions.min(ceiling);
+    let prunes = dry_run_prunes
+        || request.copy.policy.deletion == crate::delegation::DeletionPolicy::DeleteDestinationOnly;
+    if prunes && ceiling == 0 {
         bail!("pruning needs a positive --max-delete on the approving machine: `syq persist receive on --max-delete N`");
     }
     request.copy.limits.max_connections = request
@@ -1340,6 +1341,7 @@ impl Receiver {
                     self.max_bytes,
                     self.max_entries,
                     self.max_delete,
+                    crate::approval_command::dry_run_prunes(&command)?,
                 )?;
                 let max_delete = deletion_ceiling(&request, self.max_delete);
                 {

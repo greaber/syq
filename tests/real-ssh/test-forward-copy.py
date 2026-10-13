@@ -337,6 +337,22 @@ try:
     copy("/tmp/syq-real-ssh/forward/pruned", source="/tmp/syq-real-ssh/forward-prune-source",
          extra=("--prune",))
     remote("test ! -e /tmp/syq-real-ssh/forward/pruned/extra-1 && test -e /tmp/syq-real-ssh/forward/pruned/kept")
+    # With pruning off on the laptop, the copy is refused before it asks for
+    # approval, and so is its dry run, the same way, with nothing to delete.
+    run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
+    run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
+
+    def refused(*extra):
+        argv = ["syq", "cp", "/tmp/syq-real-ssh/forward-prune-source", "--to", "destination",
+                "--as", "/tmp/syq-real-ssh/forward/pruned", "--no-progress", *extra]
+        command = "test -z \"${SSH_AUTH_SOCK:-}\" && test ! -e ~/.ssh/id_ed25519 && exec timeout 75 " + shlex.join(argv)
+        result = subprocess.run(["ssh", "source", command], capture_output=True, text=True, timeout=90)
+        assert result.returncode not in (0, 124), result
+        reasons = [line for line in result.stderr.splitlines() if "pruning needs a positive --max-delete" in line]
+        assert reasons, result
+        assert json.loads(run("syq", "persist", "receive", "pending", "--json")) == [], result
+        return result.returncode, reasons
+    assert refused("--prune", "--dry-run") == refused("--prune")
 finally:
     run("syq", "persist", "receive", "on", "--max-delete", "0", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")

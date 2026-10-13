@@ -256,6 +256,7 @@ impl Receiver {
             self.max_bytes,
             self.max_entries,
             self.max_delete,
+            crate::approval_command::dry_run_prunes(&command)?,
         )?;
         let max_delete = super::deletion_ceiling(&request, self.max_delete);
         crate::delegation::validate_return_request(&request)?;
@@ -844,7 +845,10 @@ fn receive() -> Result<i32> {
             &destination,
             crate::delegation::MAX_COPY_BYTES,
             crate::delegation::MAX_ENTRIES,
+            // The laptop applied its own deletion limit, and refused a
+            // pruning dry run where pruning is off, before forwarding.
             u64::MAX,
+            false,
         )?;
         crate::restricted::named_authority(&container, request)
     })();
