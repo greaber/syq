@@ -2026,3 +2026,85 @@ fn later_sources_stamp_shared_directories(count: usize, network: bool) {
         }
     }
 }
+
+/// Start `syq rsync -a src/ dst/` and wait until it is about to give the
+/// directories it copied their final metadata. Returns the copy and the
+/// file whose creation lets it continue.
+#[cfg(debug_assertions)]
+fn copy_held_before_directory_metadata(t: &Tmp) -> (std::process::Child, PathBuf) {
+    let ready = t.path("metadata-ready");
+    let continuation = t.path("metadata-continue");
+    let mut child = compat_command()
+        .args(["-a", &t.s("src/"), &t.s("dst/"), "--no-progress"])
+        .env("SYQ_TEST_DIRECTORY_METADATA_READY_FILE", &ready)
+        .env("SYQ_TEST_DIRECTORY_METADATA_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "final directory metadata");
+    (child, continuation)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn final_directory_metadata_refuses_a_file_put_in_the_directorys_place() {
+    // Someone who can rename entries in the destination swaps a file of
+    // their own in for a directory the copy created and filled. The
+    // directory's metadata must not reach that file: as root it would give
+    // it the directory's owner and group, and a setgid directory mode would
+    // make it a setgid program.
+    let t = Tmp::new();
+    write(&t.path("src/directory/file"), b"contents");
+    fs::set_permissions(t.path("src/directory"), fs::Permissions::from_mode(0o750)).unwrap();
+    set_mtime(&t.path("src/directory"), 1_500_000_000);
+    let (child, continuation) = copy_held_before_directory_metadata(&t);
+
+    fs::rename(t.path("dst/directory"), t.path("moved")).unwrap();
+    write(&t.path("dst/directory"), b"planted");
+    fs::set_permissions(t.path("dst/directory"), fs::Permissions::from_mode(0o644)).unwrap();
+    set_mtime(&t.path("dst/directory"), 1_600_000_000);
+    release_confinement_barrier(&continuation);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("no longer a directory"),
+        "{}",
+        stderr_of(&output)
+    );
+    let planted = fs::symlink_metadata(t.path("dst/directory")).unwrap();
+    assert!(planted.is_file());
+    assert_eq!(planted.mode() & 0o7777, 0o644);
+    assert_eq!(planted.mtime(), 1_600_000_000);
+    assert_eq!(read(&t.path("dst/directory")), b"planted");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn final_directory_metadata_refuses_another_directory_put_in_place_of_an_existing_one() {
+    // The final metadata of a directory that was already there goes only to
+    // the directory the copy found, not to one swapped in for it.
+    let t = Tmp::new();
+    write(&t.path("src/directory/file"), b"contents");
+    fs::set_permissions(t.path("src/directory"), fs::Permissions::from_mode(0o750)).unwrap();
+    set_mtime(&t.path("src/directory"), 1_500_000_000);
+    fs::create_dir_all(t.path("dst/directory")).unwrap();
+    let (child, continuation) = copy_held_before_directory_metadata(&t);
+
+    fs::rename(t.path("dst/directory"), t.path("moved")).unwrap();
+    fs::create_dir(t.path("dst/directory")).unwrap();
+    fs::set_permissions(t.path("dst/directory"), fs::Permissions::from_mode(0o755)).unwrap();
+    set_mtime(&t.path("dst/directory"), 1_600_000_000);
+    release_confinement_barrier(&continuation);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let planted = fs::symlink_metadata(t.path("dst/directory")).unwrap();
+    assert_eq!(planted.mode() & 0o7777, 0o755);
+    assert_eq!(planted.mtime(), 1_600_000_000);
+    assert!(fs::read_dir(t.path("dst/directory"))
+        .unwrap()
+        .next()
+        .is_none());
+}

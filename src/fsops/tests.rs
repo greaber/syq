@@ -3584,12 +3584,14 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
                 meta: meta(0),
                 flags: flags::TIMES,
                 condition: TargetCondition::Any,
+                directory: false,
             },
             Op::SetMeta {
                 path: Vec::new(),
                 meta: meta(0o701),
                 flags: flags::MODE | flags::TIMES,
                 condition: TargetCondition::Any,
+                directory: false,
             },
         ],
         None,
@@ -4920,6 +4922,7 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         &meta,
         flags::MODE | flags::TIMES,
         TargetCondition::Any,
+        true,
     )
     .unwrap();
     let before = fs::symlink_metadata(&dir).unwrap();
@@ -4931,6 +4934,7 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         &meta,
         flags::MODE | flags::TIMES,
         TargetCondition::Any,
+        true,
     )
     .unwrap();
     let after = fs::symlink_metadata(&dir).unwrap();
@@ -4938,6 +4942,60 @@ fn guarded_root_metadata_updates_once_then_becomes_a_noop() {
         (after.ctime(), after.ctime_nsec()),
         (before.ctime(), before.ctime_nsec())
     );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn directory_metadata_reaches_only_a_directory() {
+    // A file or symlink found where a directory's metadata is to go, such
+    // as one someone put there in its place, keeps its own metadata.
+    let dir = test_dir();
+    fs::create_dir(&dir).unwrap();
+    let root = Arc::new(Root::open(&dir).unwrap());
+    fs::write(dir.join("planted"), b"planted").unwrap();
+    fs::set_permissions(dir.join("planted"), fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink("planted", dir.join("link")).unwrap();
+    fs::create_dir(dir.join("directory")).unwrap();
+    let planted = fs::symlink_metadata(dir.join("planted")).unwrap();
+    let target = |name: &str| RootedTarget {
+        root: root.clone(),
+        relative: RelativePath::new(name.as_bytes()).unwrap(),
+        label: dir.join(name),
+        create_missing_parents: false,
+        query_partial_name_limit: false,
+    };
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o750,
+        uid: planted.uid(),
+        gid: planted.gid(),
+        mtime: 1_500_000_000,
+        mtime_nsec: 0,
+    };
+    let all = flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES;
+    for name in ["planted", "link"] {
+        let error =
+            set_meta_rooted(&target(name), &meta, all, TargetCondition::Any, true).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no longer a directory"),
+            "{error:#}"
+        );
+    }
+    let after = fs::symlink_metadata(dir.join("planted")).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o644);
+    assert_eq!(
+        (after.mtime(), after.mtime_nsec()),
+        (planted.mtime(), planted.mtime_nsec())
+    );
+    assert!(fs::symlink_metadata(dir.join("link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    set_meta_rooted(&target("directory"), &meta, all, TargetCondition::Any, true).unwrap();
+    let directory = fs::symlink_metadata(dir.join("directory")).unwrap();
+    assert_eq!(directory.mode() & 0o7777, 0o750);
+    assert_eq!(directory.mtime(), 1_500_000_000);
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -6833,6 +6891,7 @@ fn reused_parent_errors_keep_paths_and_os_error_codes() {
                 },
                 flags: flags::TIMES,
                 condition: TargetCondition::Any,
+                directory: false,
             },
         ],
         None,
