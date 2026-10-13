@@ -984,6 +984,19 @@ fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
     assert_eq!(constrained.copy.limits.max_deletions, 5);
     let constrained = constrain(prune.clone(), temporary.path(), 1000, 3, 5).unwrap();
     assert_eq!(constrained.copy.limits.max_deletions, 3);
+    // The approval reports the limit the grant enforces: here the sender's
+    // own --max-delete 2, below the machine's 5.
+    let mut stated = pruning.clone();
+    stated.max_delete = Some(2);
+    let (lower, _) = request(&stated);
+    let destination = temporary.path().join("output");
+    fs::create_dir_all(&destination).unwrap();
+    let constrained = constrain(lower, &destination, 1000, 1000, 5).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 2);
+    let (authority, approved) =
+        crate::restricted::named_authority(temporary.path(), constrained).unwrap();
+    assert_eq!(approved.max_delete, Some(2));
+    drop(authority);
 
     // The sender plans against the machine's limit, or its own if lower.
     let approved = Approved {

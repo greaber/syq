@@ -1521,12 +1521,11 @@ impl RestrictedAuthority {
     /// new file is safer than writing it in place, and costs nothing more:
     /// there is nothing to update.
     fn constrain_staged_new(&self, path: &[u8]) -> Result<()> {
-        let label = String::from_utf8_lossy(path);
-        if self.copy.policy.existing == ExistingDestinationPolicy::MustExist {
-            bail!("signed grant creates nothing: {label} is changed in place");
-        }
         if self.rooted_metadata(path)?.is_some() {
-            bail!("signed grant writes {label} in place: only a new file is staged");
+            bail!(
+                "signed grant writes {} in place: only a new file is staged",
+                String::from_utf8_lossy(path)
+            );
         }
         Ok(())
     }

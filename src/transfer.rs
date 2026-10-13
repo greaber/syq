@@ -4868,7 +4868,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             print_transfer_summary(
                 &terminal,
                 elapsed,
-                &deletion_summary(delete_plan, deleted, opts.max_delete),
+                &deletion_summary(
+                    delete_plan,
+                    deleted,
+                    opts.max_delete,
+                    opts.max_delete_from_approver,
+                ),
             );
         }
     }

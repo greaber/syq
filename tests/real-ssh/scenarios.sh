@@ -1086,6 +1086,14 @@ ssh destination 'mkdir -p /tmp/syq-real-ssh/inplace-policy'
 syq cp --inplace --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
     --to destination --as-new /tmp/syq-real-ssh/inplace-policy/created
 ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/created)" = new'
+# A name that exists is refused and keeps its contents.
+ssh destination 'printf theirs > /tmp/syq-real-ssh/inplace-policy/taken'
+if taken_output=$(syq cp --inplace --no-progress --from source --src /tmp/syq-real-ssh/inplace-policy-source/b \
+    --to destination --as-new /tmp/syq-real-ssh/inplace-policy/taken 2>&1); then
+    printf 'an --inplace --as-new copy onto an existing name unexpectedly succeeded:\n%s\n' "$taken_output" >&2
+    exit 1
+fi
+ssh destination 'test "$(cat /tmp/syq-real-ssh/inplace-policy/taken)" = theirs'
 
 printf 'case: restricted receiver keeps or replaces each name of a linked destination\n'
 # Eight names of one destination file. The odd names' sources changed in

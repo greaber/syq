@@ -1392,7 +1392,6 @@ impl Receiver {
                     bail!("copy disconnected before approval could be used");
                 }
                 approved.token = random_token()?;
-                approved.max_delete = Some(self.max_delete.min(self.max_entries));
                 sessions.insert(
                     approved.token.clone(),
                     Session {

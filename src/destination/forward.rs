@@ -319,7 +319,6 @@ impl Receiver {
         let session =
             ssh::SessionGuard::insert(self, target.clone(), approved.token.clone(), generation)?;
         approved.token = session.token();
-        approved.max_delete = Some(self.max_delete.min(self.max_entries));
         let result = (|| {
             let input = child.child.stdin.take().unwrap();
             let output = child.child.stdout.take().unwrap();

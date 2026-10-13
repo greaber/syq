@@ -7551,3 +7551,158 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
     assert!(write.is_err(), "{write:?}");
     assert_eq!(fs::read(&target).unwrap(), b"theirs");
 }
+
+/// Under an in-place grant that may replace files, a new file inside the
+/// destination (not its root), as `--inplace --if-exists=error` sends it, is
+/// staged and published without replacing anything: one put at its name
+/// before publication keeps its contents.
+#[test]
+fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
+    use proto::TargetCondition::Absent;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(root.join("target")).unwrap();
+    let authority = test_authority_with_existence(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        0,
+        FilterPolicy::default(),
+        PublicationPolicy::InPlace,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    let mut ops = crate::fsops::FsOps::new();
+    let mut run = |mut request: Request| -> Result<(Request, proto::Response)> {
+        let settlement = authority.authorize(&mut request, false)?;
+        let response = ops.handle(&request);
+        authority.settle(settlement, &response);
+        Ok((request, response))
+    };
+    let failed = |response: &proto::Response| {
+        matches!(
+            response,
+            proto::Response::Err(_) | proto::Response::EndpointError(_)
+        )
+    };
+    let staged = |file: &Path, copy_id: proto::CopyId| {
+        vec![
+            Request::Prepare {
+                path: path_bytes(file),
+                size: 5,
+                inplace: false,
+                copy_id,
+                mode: 0o644,
+                flags: 0,
+                acl: false,
+                scanned: crate::proto::ScannedDestination::Unknown,
+                group: None,
+                attempt: 0,
+                create_if_missing: true,
+                guard: None,
+            },
+            Request::WriteRange {
+                path: path_bytes(file),
+                inplace: false,
+                copy_id,
+                attempt: 0,
+                off: 0,
+                hash: crate::fsops::content_digest(b"hello"),
+                data: b"hello".to_vec().into(),
+                guard: None,
+            },
+        ]
+    };
+    let finalize = |file: &Path, copy_id: proto::CopyId| {
+        let mut request = finalize_request(file, Absent);
+        if let Request::Finalize {
+            copy_id: id, meta, ..
+        } = &mut request
+        {
+            *id = copy_id;
+            meta.mode = 0o100644;
+        }
+        request
+    };
+    // Staged, it is published at its name.
+    let new = root.join("target/new");
+    for request in staged(&new, [1; 16]) {
+        let (_, response) = run(request).unwrap();
+        assert!(!failed(&response), "{response:?}");
+    }
+    let (finalize_new, response) = run(finalize(&new, [1; 16])).unwrap();
+    assert!(
+        matches!(
+            finalize_new,
+            Request::Finalize {
+                condition: Absent,
+                ..
+            }
+        ),
+        "{finalize_new:?}"
+    );
+    assert!(!failed(&response), "{response:?}");
+    assert_eq!(fs::read(&new).unwrap(), b"hello");
+    // A file put at the name before publication keeps its contents.
+    let raced = root.join("target/raced");
+    for request in staged(&raced, [2; 16]) {
+        run(request).unwrap();
+    }
+    fs::write(&raced, b"theirs").unwrap();
+    let (_, response) = run(finalize(&raced, [2; 16])).unwrap();
+    assert!(failed(&response), "{response:?}");
+    assert_eq!(fs::read(&raced).unwrap(), b"theirs");
+}
+
+/// `--inplace --as-new` on the command-restricted path never reaches an
+/// existing file: a grant whose new root exists is refused when it is
+/// redeemed, and a root that appears after that is neither staged over
+/// nor written in place.
+#[test]
+fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let target = root.join("target");
+    let grant = || {
+        test_authority_with_existence(
+            &root,
+            DeletionPolicy::Forbid,
+            1024,
+            0,
+            FilterPolicy::default(),
+            PublicationPolicy::InPlace,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::New,
+        )
+    };
+    fs::write(&target, b"theirs").unwrap();
+    assert!(grant().is_err());
+    fs::remove_file(&target).unwrap();
+    let authority = grant().unwrap();
+    fs::write(&target, b"theirs").unwrap();
+    for inplace in [false, true] {
+        let mut prepare = Request::Prepare {
+            path: path_bytes(&target),
+            size: 5,
+            inplace,
+            copy_id: [1; 16],
+            mode: 0o644,
+            flags: 0,
+            acl: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
+            group: None,
+            attempt: 0,
+            create_if_missing: true,
+            guard: None,
+        };
+        assert!(
+            authority.authorize(&mut prepare, false).is_err(),
+            "inplace={inplace}"
+        );
+    }
+    assert_eq!(fs::read(&target).unwrap(), b"theirs");
+}

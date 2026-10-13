@@ -539,7 +539,7 @@ pub(crate) fn named_authority(
         ssh_keygen: String::new(),
         receiver_path: executable.to_string_lossy().into_owned(),
     };
-    let approved = crate::destination::Approved {
+    let mut approved = crate::destination::Approved {
         token: String::new(),
         destination: request.copy.destination.clone(),
         enrollment: id,
@@ -557,5 +557,8 @@ pub(crate) fn named_authority(
         Instant::now() + std::time::Duration::from_secs(FINISH_WINDOW_SECONDS as u64),
         &protected,
     )?;
+    // The sender plans its deletions against the very limit this grant
+    // enforces: the machine's own --max-delete, within the copy's limits.
+    approved.max_delete = Some(authority.copy.limits.max_deletions);
     Ok((std::sync::Arc::new(authority), approved))
 }

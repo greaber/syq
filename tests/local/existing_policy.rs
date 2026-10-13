@@ -289,6 +289,30 @@ fn prune_does_not_require_permission_to_replace_source_matches() {
     assert!(!t.path("dst/extra").exists());
 }
 
+/// `--inplace --as-new` onto a name that exists is refused before anything
+/// is written, and the file there keeps its contents and inode.
+#[test]
+fn an_inplace_as_new_copy_onto_an_existing_name_is_refused() {
+    let t = Tmp::new();
+    write(&t.path("src/file"), b"new contents");
+    write(&t.path("dst/existing"), b"old");
+    let inode = fs::metadata(t.path("dst/existing")).unwrap().ino();
+    let refused = native_syq(&[
+        "cp",
+        "--inplace",
+        &t.s("src/file"),
+        "--as-new",
+        &t.s("dst/existing"),
+    ]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("already exists"),
+        "{refused:?}"
+    );
+    assert_eq!(read(&t.path("dst/existing")), b"old");
+    assert_eq!(fs::metadata(t.path("dst/existing")).unwrap().ino(), inode);
+}
+
 /// With `--inplace`, a file that must be new is staged: nothing is at its
 /// name until it is published, and nothing would be in place to update.
 #[cfg(debug_assertions)]
@@ -327,7 +351,8 @@ fn a_file_that_must_be_new_is_staged_under_inplace() {
 /// An `--as-new --inplace` file whose worker connection is lost, right after
 /// its preparation or after its first write, is finished through a new
 /// receiver process: the file must be new, so it is staged, and the new
-/// process resumes it.
+/// process resumes it. Nothing is at its name until it is published.
+#[cfg(debug_assertions)]
 #[test]
 fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
     for request in ["prepare", "write"] {
@@ -336,7 +361,8 @@ fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
         fs::create_dir(t.path("remote-home")).unwrap();
         let data = prng(4 << 20, 61);
         write(&t.path("src/file"), &data);
-        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        let (ready, continuation) = (t.path("ready"), t.path("continue"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(["cp", "--rsh"])
             .arg(&rsh)
             .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
@@ -356,8 +382,19 @@ fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
             .env("XDG_CACHE_HOME", t.path("cache"))
             .env("SYQ_TEST_DROP_AFTER_REQUEST", request)
             .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
-            .run()
+            .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+            .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
+        assert!(
+            !t.path("dst").exists(),
+            "{request}: the file was written in place"
+        );
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
         assert!(
             t.path("dropped").exists(),
             "{request}: no connection was lost"
@@ -376,7 +413,9 @@ fn an_as_new_inplace_file_is_finished_by_another_receiver_process() {
 /// Under `--if-exists=error` or `error-if-different`, a new `--inplace` file
 /// is staged and published without replacing anything: a worker connection
 /// lost right after the file's preparation is retried through a new
-/// receiver process, and the copy completes.
+/// receiver process, and the copy completes. Nothing is at its name until
+/// it is published.
+#[cfg(debug_assertions)]
 #[test]
 fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
     for policy in ["error", "error-if-different"] {
@@ -386,7 +425,8 @@ fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
         let data = prng(4 << 20, 62);
         write(&t.path("src/file"), &data);
         fs::create_dir(t.path("dst")).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        let (ready, continuation) = (t.path("ready"), t.path("continue"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args(["cp", "--rsh"])
             .arg(&rsh)
             .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
@@ -408,8 +448,19 @@ fn a_protected_new_inplace_file_survives_a_lost_worker_connection() {
             .env("XDG_CACHE_HOME", t.path("cache"))
             .env("SYQ_TEST_DROP_AFTER_REQUEST", "prepare")
             .env("SYQ_TEST_DROP_MARKER", t.path("dropped"))
-            .run()
+            .env("SYQ_TEST_SOURCE_RECHECK_READY_FILE", &ready)
+            .env("SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE", &continuation)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "source recheck before publication");
+        assert!(
+            !t.path("dst/file").exists(),
+            "{policy}: the file was written in place"
+        );
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
         assert!(
             t.path("dropped").exists(),
             "{policy}: no connection was lost"
