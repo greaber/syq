@@ -275,8 +275,8 @@ impl Worker {
     }
 
     /// Small files are sent without a per-file protocol round trip. The
-    /// default publishes sidecars atomically; explicit --inplace batches write
-    /// final names directly when no placement guard requires staging.
+    /// default publishes sidecars atomically; `--in-place=new` writes a new
+    /// file at its name directly when no placement guard requires staging.
     pub(super) fn fast_eligible(&self, idx: usize) -> bool {
         let jobs = self.sched.jobs.lock().unwrap();
         let j = &jobs[idx];
@@ -290,10 +290,6 @@ impl Worker {
             && jobs
                 .destination(idx)
                 .is_none_or(|existing| self.replaces_in_batch(j, existing))
-            && (!self.opts.inplace || j.inplace)
-            // A restricted receiver's in-place grant refuses batched
-            // publication.
-            && !(self.opts.restricted_receiver && self.opts.inplace)
     }
 
     /// An existing file can take the same batch as a new file when this copy
@@ -367,9 +363,6 @@ impl Worker {
             && !self.opts.has_expected_for(j)
             && !self.opts.tuning.force_ranges()
             && j.entry.size <= self.compare_group_limits().0
-            // In place, only the blocks that differ are written; that is the
-            // per-file path.
-            && !self.opts.inplace
             && j.target_condition == TargetCondition::Any
             && !self.inspects_destination(j)
             && jobs.destination(idx).is_some_and(|existing| {
@@ -673,7 +666,7 @@ impl Worker {
                         hash,
                         meta,
                         flags: self.publication_flags(job),
-                        inplace: self.opts.inplace,
+                        inplace: job.inplace,
                         condition: job.target_condition,
                         guard: job.container_guard.clone(),
                         replaces: job.dst_entry.is_some(),
@@ -1019,23 +1012,36 @@ impl Worker {
         let _ = &opts;
 
         if self.opts.protects_existing_contents() && job.dst_entry.is_some() {
-            self.sched.ranges_ready(idx, vec![]);
-            anyhow::ensure!(
-                self.opts.if_exists != Some(crate::cli::IfExists::Error),
-                "destination already exists: {} (--if-exists=error)",
-                job.rel
-            );
-            let diff = self.diff_final_and_hold(&job)?;
-            anyhow::ensure!(
-                diff.ranges.is_empty() && diff.held_len == Some(size),
-                "{}",
-                self.opts.file_difference_message(&job.rel)
-            );
-            self.finish_matched_basis(idx, &job)?;
-            job.done.store(size, Relaxed);
-            self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-            self.progress.bytes_total.fetch_sub(size, Relaxed);
-            return self.finish_matched_file(idx);
+            let checked = (|| {
+                anyhow::ensure!(
+                    self.opts.if_exists != Some(crate::cli::IfExists::Error),
+                    "destination already exists: {} (--if-exists=error)",
+                    job.rel
+                );
+                let diff = self.diff_final_and_hold(&job)?;
+                anyhow::ensure!(
+                    diff.ranges.is_empty() && diff.held_len == Some(size),
+                    "{}",
+                    self.opts.file_difference_message(&job.rel)
+                );
+                Ok(())
+            })();
+            // A content-identical file the receiver will not keep is
+            // replaced below, as a changed file is.
+            if checked.is_err() || !job.replace {
+                self.sched.ranges_ready(idx, vec![]);
+                checked?;
+                if let Err(error) = self.finish_matched_basis(idx, &job) {
+                    if self.replace_instead(idx, &error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                job.done.store(size, Relaxed);
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                self.progress.bytes_total.fetch_sub(size, Relaxed);
+                return self.finish_matched_file(idx);
+            }
         }
 
         match self.try_expected_match(idx, &job) {
@@ -1055,6 +1061,9 @@ impl Worker {
             Ok(false) => {}
             Err(error) => {
                 self.sched.ranges_ready(idx, vec![]);
+                if self.replace_instead(idx, &error) {
+                    return Ok(());
+                }
                 if self.transport_dead() {
                     self.sched.requeue(idx);
                 }
@@ -1062,9 +1071,9 @@ impl Worker {
             }
         }
 
-        // Placement guards must be enforced by the final mutation. Stage even
-        // an explicit --inplace transfer until that checked update; an
-        // existing target is still updated through its held inode at finalize.
+        // Only a new file is written in place (`--in-place=new`). Placement
+        // guards must be enforced by the final mutation, so a guarded file
+        // is staged even then.
         let inplace = job.inplace;
         // A file a grouped comparison already found different, or could not
         // patch, is copied whole without comparing it again.
@@ -1082,7 +1091,7 @@ impl Worker {
         // file finishes through its retained inode. Remote copies keep their
         // single exchange below.
         let mut known_different = false;
-        if checksum && self.opts.same_host && !reuse_blocks && size > 0 {
+        if checksum && self.opts.same_host && !reuse_blocks && size > 0 && !job.replace {
             if let Some(existing) = final_file {
                 let matched = existing.size == size
                     && match self.matches_final_windows(&job) {
@@ -1098,6 +1107,9 @@ impl Worker {
                 if matched {
                     if let Err(error) = self.finish_matched_basis(idx, &job) {
                         self.sched.ranges_ready(idx, vec![]);
+                        if self.replace_instead(idx, &error) {
+                            return Ok(());
+                        }
                         if self.transport_dead() {
                             self.sched.requeue(idx);
                         }
@@ -1196,7 +1208,7 @@ impl Worker {
             // absent until the content comparison shows a difference.
             let prepared = self.prepare_file(
                 &job,
-                inplace || !final_is_file || (!reuse_blocks && !checksum),
+                inplace || !final_is_file || (!reuse_blocks && (!checksum || job.replace)),
             )?;
 
             if prepared.partial_size.is_some() || prepared.has_candidates || final_is_file {
@@ -1224,6 +1236,20 @@ impl Worker {
                     return Ok((vec![], true));
                 }
                 return Ok((self.resume_ranges(idx, &job)?, true));
+            }
+            // A file the receiver will not keep is replaced as a changed file
+            // is, whatever its contents: with block reuse, a stage is seeded
+            // from it (a clone where the filesystem can make one) and then
+            // compared, so it is read at most once; otherwise it is copied
+            // whole into the sidecar Prepare created.
+            if job.replace && final_is_file && !inplace {
+                if !reuse_blocks || size == 0 {
+                    return Ok((full(), true));
+                }
+                if !self.bandwidth_limited_remote_source() {
+                    self.stage_comparison(idx, &job, true)?;
+                    return Ok((full(), true));
+                }
             }
             // Probe equality without creating a sidecar. A difference restarts
             // the staged pipeline; equal prefixes need not survive that restart.
@@ -1267,7 +1293,7 @@ impl Worker {
             }
             if final_is_file {
                 let diff = self.diff_final_and_hold(&job)?;
-                if diff.ranges.is_empty() && diff.held_len == Some(size) {
+                if diff.ranges.is_empty() && diff.held_len == Some(size) && !job.replace {
                     self.finish_matched_basis(idx, &job)?;
                     return Ok((vec![], false));
                 }
@@ -1286,6 +1312,9 @@ impl Worker {
             Ok(result) => result,
             Err(e) => {
                 self.sched.ranges_ready(idx, vec![]);
+                if self.replace_instead(idx, &e) {
+                    return Ok(());
+                }
                 if self.transport_dead() {
                     self.sched.requeue(idx);
                 }
@@ -1339,6 +1368,23 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// When the receiver refused to keep this file because it will not change
+    /// its metadata in place (`fsops::vouch`), copy it again as a file to
+    /// replace, and say so. The job's scheduling has been settled.
+    fn replace_instead(&self, idx: usize, error: &anyhow::Error) -> bool {
+        if !crate::fsops::vouch::is_replace_required(error) {
+            return false;
+        }
+        let mut jobs = self.sched.jobs.lock().unwrap();
+        if jobs[idx].replace {
+            return false;
+        }
+        jobs[idx].replace = true;
+        drop(jobs);
+        self.sched.requeue(idx);
+        true
     }
 
     /// Read-only equality probe. On a difference, discard the comparison and
@@ -2768,6 +2814,9 @@ impl Worker {
     // hardlink representative without an expected digest is otherwise kept
     // on matching size and time alone, which --hash-or-copy does not trust.
     pub(super) fn try_expected_match(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
+        if job.replace {
+            return Ok(false);
+        }
         let expected = self.opts.expected_hashes_for(job);
         if expected.is_none()
             && !(self.opts.hardlinks && job.entry.nlink > 1 && !self.opts.hash_or_copy)
@@ -2806,18 +2855,22 @@ impl Worker {
                         condition => condition,
                     },
                     meta: self.opts.metadata_for(&job.rel_bytes, &job.entry),
+                    // A hard-link representative is to get new names: the
+                    // receiver checks its owner (`fsops::vouch`).
                     flags: self
                         .opts
-                        .metadata_fix_flags(&job.rel_bytes, &job.entry, destination),
+                        .metadata_fix_flags(&job.rel_bytes, &job.entry, destination)
+                        | (self.publication_flags(job) & flags::REPORT_IDENTITY),
                 }],
                 guard: job.container_guard.clone(),
             })?,
             "update metadata after expected digest match",
         )?;
         match response {
-            Response::Applied(results) if results.len() == 1 => {
-                if let Some(error) = &results[0] {
-                    bail!("update metadata after expected digest match: {error}");
+            Response::Applied(mut results) if results.len() == 1 => {
+                if let Some(error) = results.pop().flatten() {
+                    return Err(crate::conn::endpoint_error(error))
+                        .context("update metadata after expected digest match");
                 }
             }
             other => bail!("unexpected metadata response: {other:?}"),
@@ -2859,7 +2912,7 @@ impl Worker {
             _ => Ok(false),
         };
         self.sched.ranges_ready(idx, vec![]);
-        let matched = match result {
+        let contents_match = match result {
             Ok(matched) => matched,
             Err(error) => {
                 if self.transport_dead() {
@@ -2868,8 +2921,11 @@ impl Worker {
                 return Err(error);
             }
         };
+        // A file the receiver would not keep is replaced even when its
+        // contents match (`fsops::vouch`).
+        let matched = contents_match && !job.replace;
         anyhow::ensure!(
-            matched || !self.opts.protects_existing_contents() || job.dst_entry.is_none(),
+            contents_match || !self.opts.protects_existing_contents() || job.dst_entry.is_none(),
             "{}",
             self.opts.file_difference_message(&job.rel)
         );
@@ -2907,17 +2963,19 @@ impl Worker {
             self.opts.dry_run_metadata_files.fetch_add(1, Relaxed);
             (None, "metadata_differs")
         } else {
-            // A real copy would rewrite the file: in its directory, unless
-            // it writes an existing file in place.
-            self.opts.note_directory_change(
-                &self.progress,
-                &job.dst,
-                !(self.opts.inplace
-                    && job.dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File)),
-            );
+            // A real copy would rewrite the file in its directory.
+            self.opts
+                .note_directory_change(&self.progress, &job.dst, true);
             self.progress.add_files(1);
             self.progress.bytes_done.fetch_add(job.entry.size, Relaxed);
-            (Some(job.entry.size), "content_differs")
+            (
+                Some(job.entry.size),
+                if contents_match {
+                    "metadata_differs"
+                } else {
+                    "content_differs"
+                },
+            )
         };
         if let Some(results) = self.progress.results_writer() {
             results.emit_trace(&crate::results::TraceRecord {
@@ -2933,6 +2991,11 @@ impl Worker {
             self.progress.println(&if matched {
                 format!(
                     "update metadata {} (requested file metadata differs)",
+                    display(&job.dst)
+                )
+            } else if contents_match {
+                format!(
+                    "replace file {} (requested file metadata differs, and it cannot be changed in place)",
                     display(&job.dst)
                 )
             } else {

@@ -73,9 +73,8 @@ pub(super) struct Planner<'a> {
     /// Original receiver modes, only for directories actually widened.
     pub(super) directory_restorations:
         std::collections::HashMap<PathBytes, crate::proto::DirectoryMode>,
-    /// The receiving account: None until asked, Some(None) for root, which
-    /// needs no access changes.
-    pub(super) receiver_uid: Option<Option<u32>>,
+    /// The receiving account's user ID, None until asked.
+    pub(super) receiver_uid: Option<u32>,
     /// The destination directory's own entry when its owner lacks write or
     /// search permission, checked with the first batch.
     pub(super) root_access_check: Option<Entry>,
@@ -1964,10 +1963,19 @@ impl Planner<'_> {
             );
             return;
         }
-        if same
+        // Content is up to date, but its metadata differs, and the receiver
+        // cannot change it in place: the file is replaced as a changed file
+        // is (`must_replace`).
+        let quick = same
             && opts.trusts_size_and_time()
-            && (opts.dry_run || opts.expected_for(&dst_rel).is_none())
-        {
+            && (opts.dry_run || opts.expected_for(&dst_rel).is_none());
+        let replace = quick
+            && dst_entry.as_ref().is_some_and(|d| {
+                (opts.metadata_fix_flags(&dst_rel, &e, d) != 0
+                    || opts.inode_metadata_differs(&dst_rel, &e, d))
+                    && self.must_replace(&dst_rel, &e, d)
+            });
+        if quick && !replace {
             // Content is up to date, but still reconcile metadata
             // (mode/owner/group) the way rsync does — a skipped file
             // shouldn't keep stale permissions.
@@ -1993,8 +2001,8 @@ impl Planner<'_> {
                         }
                         return;
                     }
-                    leaf_ops.meta_fixes.push((
-                        Op::SetFileMetaIfSame {
+                    leaf_ops.meta_fixes.push(MetaFix {
+                        op: Op::SetFileMetaIfSame {
                             path: dst_path.clone(),
                             condition: match target_condition {
                                 TargetCondition::Any => target_identity(d),
@@ -2003,9 +2011,19 @@ impl Planner<'_> {
                             meta: opts.metadata_for(&dst_rel, &e),
                             flags: ff,
                         },
-                        dst_rel,
-                        DeclaredKind::File,
-                    ));
+                        dst_rel: dst_rel.clone(),
+                        kind: DeclaredKind::File,
+                        // Replaced instead if the receiver will not change it
+                        // in place.
+                        replacement: Some(Box::new(Replacement {
+                            source: (src_path, source),
+                            dst: dst_path,
+                            rel,
+                            dst_rel,
+                            entry: e,
+                            destination: d.clone(),
+                        })),
+                    });
                     return;
                 }
             }
@@ -2022,11 +2040,7 @@ impl Planner<'_> {
             // serialize all reads in the planner.
             self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
-            // Writing an existing file in place needs no directory write.
-            self.note_directory_change(
-                &dst_path,
-                !(opts.inplace && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File)),
-            );
+            self.note_directory_change(&dst_path, true);
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.bytes_total.fetch_add(e.size, Relaxed);
             self.progress.add_files(1);
@@ -2053,6 +2067,9 @@ impl Planner<'_> {
             if opts.verbose > 0 {
                 let shown = display(&dst_path);
                 let action = match &dst_entry {
+                    _ if replace => format!(
+                        "replace file {shown} (requested file metadata differs, and it cannot be changed in place)"
+                    ),
                     None => format!("create file {shown} (destination missing)"),
                     Some(d) if d.kind != Kind::File => format!(
                         "replace with file {shown} (destination is {})",
@@ -2081,10 +2098,7 @@ impl Planner<'_> {
             }
         } else {
             if opts.changes_directory_certainly(&e, dst_entry.as_ref()) {
-                // Writing an existing file in place needs no directory write.
-                let replaces_entry =
-                    !(opts.inplace && dst_entry.as_ref().is_some_and(|d| d.kind == Kind::File));
-                self.note_directory_change(&dst_path, replaces_entry);
+                self.note_directory_change(&dst_path, true);
             }
             self.enqueue(
                 (src_path, source),
@@ -2098,7 +2112,9 @@ impl Planner<'_> {
     }
 
     /// An existing link or special entry needs no content copy, but an explicit
-    /// metadata request still applies. Ordinary preservation behavior is unchanged.
+    /// metadata request still applies: the entry is created again with it,
+    /// in place of the old one, since syq changes no existing entry's
+    /// metadata in place but a directory's or a file's it can vouch for.
     fn plan_explicit_leaf_metadata(
         &mut self,
         path: &PathBytes,
@@ -2131,51 +2147,80 @@ impl Planner<'_> {
             && link_times
             && self.opts.inode_preservation.atimes
             && !self.opts.dry_run;
-        if !time_differs
-            && !restore_link_atime
-            && !metadata_differs(
+        let differs = time_differs
+            || metadata_differs(
                 &meta,
                 &destination.meta(),
                 flags,
                 self.opts.two_second_mtimes(),
-            )
-        {
+            );
+        if !differs && !restore_link_atime {
             return;
         }
+        let symlink = source.kind == Kind::Symlink;
+        self.note_directory_change(path, true);
         if self.opts.dry_run {
-            self.dry_run_changes.metadata_files += 1;
+            if symlink {
+                self.dry_run_changes.symlinks += 1;
+            } else {
+                self.dry_run_changes.specials += 1;
+            }
             self.emit_trace(
-                if source.kind == Kind::Symlink {
+                if symlink {
                     "create_symlink"
                 } else {
                     "create_special"
                 },
                 rel,
-                if source.kind == Kind::Symlink {
-                    "symlink"
-                } else {
-                    "special"
-                },
+                if symlink { "symlink" } else { "special" },
                 None,
                 "metadata_differs",
             );
-        } else {
-            ops.meta_fixes.push((
-                Op::SetMeta {
-                    path: path.clone(),
-                    meta,
-                    flags,
-                    condition: target_identity(destination),
-                    directory: false,
-                },
-                rel.to_vec(),
-                if source.kind == Kind::Symlink {
-                    DeclaredKind::Symlink
-                } else {
-                    DeclaredKind::Special
-                },
-            ));
+            if self.opts.verbose > 0 {
+                self.progress.println(&format!(
+                    "replace {} {} (requested metadata differs)",
+                    kind_label(source.kind),
+                    display(path)
+                ));
+            }
+            return;
         }
+        let shown = display(path);
+        ops.names.push(QueuedLeafOp {
+            dst_rel: rel.to_vec(),
+            action: if symlink {
+                "create_symlink"
+            } else {
+                "create_special"
+            },
+            kind: if symlink { "symlink" } else { "special" },
+            name: format!("{shown} (metadata)"),
+            // Restoring a link's access time that may not have changed is
+            // reported only when it fails.
+            quiet: !differs,
+        });
+        // The receiver leaves an entry that already holds this metadata as
+        // it is, as when only a link's access time needed restoring and it
+        // did not change.
+        let condition = target_identity(destination);
+        ops.ops.push(if symlink {
+            Op::Symlink {
+                path: path.clone(),
+                target: source.link.clone().unwrap_or_default(),
+                condition,
+                meta,
+                flags,
+            }
+        } else {
+            Op::Mknod {
+                path: path.clone(),
+                mode: source.mode,
+                rdev: source.rdev,
+                condition,
+                meta,
+                flags,
+            }
+        });
     }
 
     /// Queue the creation or replacement of a mapped symlink unless the
@@ -2277,21 +2322,15 @@ impl Planner<'_> {
             action: "create_symlink",
             kind: "symlink",
             name: format!("{rel} -> {}", display(&target)),
+            quiet: false,
         });
+        // The symlink gets its metadata before it is published.
         leaf_ops.ops.push(Op::Symlink {
             path: dst_path.clone(),
             target,
             condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
-        });
-        leaf_ops.ops.push(Op::SetMeta {
-            // Apply runs successful leaf creation/replacement
-            // before metadata; a failed guarded replacement skips
-            // this phase entirely.
-            condition: TargetCondition::Any,
-            path: dst_path,
             meta: opts.metadata_for(&dst_rel, &e),
             flags: opts.flags_for(&dst_rel) & !flags::MODE,
-            directory: false,
         });
     }
 
@@ -2392,11 +2431,13 @@ impl Planner<'_> {
             action: "create_special",
             kind: "special",
             name: rel,
+            quiet: false,
         });
         let meta = opts.metadata_for(&dst_rel, &e);
         let flags = opts.flags_for(&dst_rel);
         // Without a mode to apply, the node takes the source's permission
-        // bits as creating it limits them, and none of its special bits.
+        // bits as creating it limits them, and none of its special bits. It
+        // gets its metadata before it is published.
         leaf_ops.ops.push(Op::Mknod {
             path: dst_path.clone(),
             mode: if flags & flags::MODE == 0 {
@@ -2406,13 +2447,8 @@ impl Planner<'_> {
             },
             rdev: e.rdev,
             condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
-        });
-        leaf_ops.ops.push(Op::SetMeta {
-            condition: TargetCondition::Any,
-            path: dst_path,
             meta,
             flags,
-            directory: false,
         });
     }
 
@@ -3055,19 +3091,37 @@ impl Planner<'_> {
     }
 
     /// Apply metadata corrections for files whose content is already current.
-    fn flush_meta_fixes(&mut self, meta_fixes: Vec<(Op, PathBytes, DeclaredKind)>) -> Result<()> {
+    fn flush_meta_fixes(&mut self, meta_fixes: Vec<MetaFix>) -> Result<()> {
         if meta_fixes.is_empty() {
             return Ok(());
         }
         let (ops, entries): (Vec<_>, Vec<_>) = meta_fixes
             .into_iter()
-            .map(|(op, dst, kind)| (op, (dst, kind)))
+            .map(|fix| (fix.op, (fix.dst_rel, fix.kind, fix.replacement)))
             .unzip();
         let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
-        for ((dst, kind), error) in entries.iter().zip(errors) {
-            if let Some(error) = error {
-                self.report_metadata_failure(Some(dst), *kind, &error);
+        for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
+            match (error, replacement) {
+                (None, _) => {}
+                // The receiver will not change this file's metadata in
+                // place: it is copied as a changed file and replaced.
+                (Some(error), Some(replacement))
+                    if crate::fsops::vouch::is_replace_required_wire(&error) =>
+                {
+                    let Replacement {
+                        source,
+                        dst,
+                        rel,
+                        dst_rel,
+                        entry,
+                        destination,
+                    } = *replacement;
+                    self.progress.files_unchanged.fetch_sub(1, Relaxed);
+                    self.progress.bytes_unchanged.fetch_sub(entry.size, Relaxed);
+                    self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), true);
+                }
+                (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),
             }
         }
         if let Some(error) = capacity_error {
@@ -3107,11 +3161,12 @@ impl Planner<'_> {
         let opts = self.opts;
         let errs = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errs);
-        // Two ops per item: creation then metadata.
+        // One op per item: the creation, which carries its metadata.
         for (i, queued) in op_names.iter().enumerate() {
-            let e1 = errs.get(2 * i).cloned().flatten();
-            let e2 = errs.get(2 * i + 1).cloned().flatten();
-            let error = e1.or(e2);
+            let error = errs.get(i).cloned().flatten();
+            if queued.quiet && error.is_none() {
+                continue;
+            }
             let os_kind = error.as_ref().and_then(wire_os_kind);
             if let Some(e) = &error {
                 let path = join(&self.dst_root, &queued.dst_rel);
@@ -3526,17 +3581,40 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) -> usize {
+        self.enqueue_with(source_path, dst, rel, rel_bytes, entry, dst_entry, false)
+    }
+
+    /// `enqueue`, replacing an existing destination file whatever its
+    /// contents when `replace`, as when the receiver refused to change its
+    /// metadata in place.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_with(
+        &mut self,
+        source_path: (PathBytes, RegisteredPath),
+        dst: PathBytes,
+        rel: String,
+        rel_bytes: PathBytes,
+        entry: Entry,
+        dst_entry: Option<Entry>,
+        replace: bool,
+    ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
+        // `--in-place=new` writes only a file the copy creates at its name:
+        // an existing one is staged and replaces it, as without the option.
         // A file that must be new (an --as-new file, or a new file the error
-        // policies protect) has nothing to update in place: it is staged and
-        // published without replacing anything, so readers see no partial
-        // file and a retry finishes what an interrupted attempt left.
+        // policies protect) is staged too and published without replacing
+        // anything, so readers see no partial file and a retry finishes what
+        // an interrupted attempt left.
         let inplace = self.opts.inplace
+            && dst_entry.is_none()
             && target_condition == TargetCondition::Any
             && !(self.opts.new_target && dst == self.dst_root)
             && self.container_guard.is_none();
         let src_rel = self.mapping_source_rel(&rel_bytes);
+        let replace = dst_entry.as_ref().is_some_and(|destination| {
+            replace || self.must_replace(&rel_bytes, &entry, destination)
+        });
         let scanned = match &dst_entry {
             Some(d) if d.kind == Kind::File => {
                 crate::proto::ScannedDestination::File(d.mode & 0o7777)
@@ -3552,6 +3630,7 @@ impl Planner<'_> {
                 compare_final: false,
                 compared: false,
                 resume_partial: false,
+                replace,
                 recompared: 0,
                 src,
                 source,
@@ -4471,10 +4550,61 @@ impl Planner<'_> {
         }
     }
 
-    /// Whether the receiving account owns `entry`. The receiver is asked its
-    /// account once, only after a directory needing access has been found.
+    /// Whether the receiving account owns `entry`, root needing no access
+    /// changes. The receiver is asked its account once, only after a
+    /// directory needing access has been found.
     fn receiver_owns(&mut self, entry: &Entry) -> Result<bool> {
         receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)
+    }
+
+    /// The receiving account's user ID, asked once.
+    fn receiver_uid(&mut self) -> Result<u32> {
+        receiver_uid(&mut *self.dst, &mut self.receiver_uid)
+    }
+
+    /// Whether the existing file `destination` must be replaced rather than
+    /// kept for `source`, so that the copy replaces it from the start and
+    /// reads it at most once, as a donor: keeping it would change its
+    /// metadata, and the receiver cannot vouch for that (`fsops::vouch`),
+    /// or it is to get new names as a hard-link representative and its
+    /// owner is not one the receiver accepts. This predicts the receiver's
+    /// decision from the scan; the receiver decides for itself, and a file
+    /// it refuses is replaced then (`Worker::replace_instead`).
+    pub(super) fn must_replace(&mut self, rel: &[u8], source: &Entry, destination: &Entry) -> bool {
+        if destination.kind != Kind::File {
+            return false;
+        }
+        let representative = self.opts.hardlinks && source.nlink > 1;
+        let changes = self.opts.metadata_fix_flags(rel, source, destination) != 0
+            || self.opts.inode_metadata_differs(rel, source, destination);
+        if !changes && !representative {
+            return false;
+        }
+        // Without the receiving account the receiver decides alone.
+        let Ok(uid) = self.receiver_uid() else {
+            return false;
+        };
+        let meta = self.opts.metadata_for(rel, source);
+        let flags = self.opts.flags_for(rel);
+        let owned = if uid != 0 {
+            destination.uid == uid
+        } else {
+            destination.uid
+                == if flags & flags::OWNER != 0 {
+                    meta.uid
+                } else {
+                    0
+                }
+                && (flags & flags::GROUP == 0 || destination.gid == meta.gid)
+        };
+        if representative && !owned {
+            return true;
+        }
+        changes
+            && (destination.nlink != 1
+                || !owned
+                || !self.opts.destination_link_counts_trusted.load(Relaxed)
+                || (flags & flags::MODE != 0 && meta.mode & 0o6000 & !destination.mode != 0))
     }
 
     /// Sort existing directories whose owner lacks write or search
@@ -4788,25 +4918,29 @@ pub(super) fn inspect_tolerating_denials(
     Ok(results)
 }
 
+/// Whether the receiving account, asked once into `cache`, owns `entry`.
+/// Root needs no access changes.
+fn receiver_owns(dst: &mut dyn Conn, cache: &mut Option<u32>, entry: &Entry) -> Result<bool> {
+    let uid = receiver_uid(dst, cache)?;
+    Ok(uid != 0 && uid == entry.uid)
+}
+
+/// The receiving account's user ID, asked once into `cache`.
+fn receiver_uid(dst: &mut dyn Conn, cache: &mut Option<u32>) -> Result<u32> {
+    if let Some(uid) = *cache {
+        return Ok(uid);
+    }
+    let uid = match ok(dst.call(Request::ReceiverUser)?, "receiving account")? {
+        Response::ReceiverUser(uid) => uid,
+        other => bail!("unexpected receiving account response {other:?}"),
+    };
+    *cache = Some(uid);
+    Ok(uid)
+}
+
 /// Temporarily add owner access to `directories` and remember the original
 /// modes of those actually changed; returns how many changed. The receiver
 /// widens only owned directories, never as root.
-/// Whether the receiving account, asked once into `cache`, owns `entry`.
-fn receiver_owns(
-    dst: &mut dyn Conn,
-    cache: &mut Option<Option<u32>>,
-    entry: &Entry,
-) -> Result<bool> {
-    if cache.is_none() {
-        let uid = match ok(dst.call(Request::ReceiverUser)?, "receiving account")? {
-            Response::ReceiverUser(uid) => uid,
-            other => bail!("unexpected receiving account response {other:?}"),
-        };
-        *cache = Some((uid != 0).then_some(uid));
-    }
-    Ok(cache.flatten() == Some(entry.uid))
-}
-
 fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,
@@ -4958,7 +5092,28 @@ struct LeafOps {
     ops: Vec<Op>,
     names: Vec<QueuedLeafOp>,
     // Metadata-only operations retain the same retry identity as content copies.
-    meta_fixes: Vec<(Op, PathBytes, DeclaredKind)>,
+    meta_fixes: Vec<MetaFix>,
+}
+
+/// A metadata-only change to an existing destination entry.
+struct MetaFix {
+    op: Op,
+    dst_rel: PathBytes,
+    kind: DeclaredKind,
+    /// How to copy a file the receiver will not change in place instead.
+    replacement: Option<Box<Replacement>>,
+}
+
+/// A planned file copy, kept for a file planned to keep its contents in case
+/// the receiver will not change its metadata in place: it is then copied and
+/// replaced (`fsops::vouch`).
+struct Replacement {
+    source: (PathBytes, RegisteredPath),
+    dst: PathBytes,
+    rel: String,
+    dst_rel: PathBytes,
+    entry: Entry,
+    destination: Entry,
 }
 
 /// A queued symlink/special creation: the display string for -v plus the
@@ -4968,6 +5123,8 @@ pub(super) struct QueuedLeafOp {
     pub(super) action: &'static str,
     pub(super) kind: &'static str,
     pub(super) name: String,
+    /// Report the operation only if it fails.
+    pub(super) quiet: bool,
 }
 
 /// The container-relative spelling of a full destination path; None for the

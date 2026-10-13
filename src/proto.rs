@@ -537,7 +537,7 @@ pub struct SmallBlock {
     pub hash: ContentDigest,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Meta {
     pub mode: u32,
     pub uid: u32,
@@ -618,16 +618,24 @@ pub enum Op {
         mode: u32,
         condition: TargetCondition,
     },
+    /// Create a symlink, given `meta` under `flags` before it is published
+    /// at `path`: a later change of its metadata creates it again.
     Symlink {
         path: PathBytes,
         target: PathBytes,
         condition: TargetCondition,
+        meta: Meta,
+        flags: u8,
     },
+    /// Create a device node, FIFO or socket, given its metadata as a
+    /// symlink is.
     Mknod {
         path: PathBytes,
         mode: u32,
         rdev: u64,
         condition: TargetCondition,
+        meta: Meta,
+        flags: u8,
     },
     SetMeta {
         path: PathBytes,
@@ -675,9 +683,11 @@ impl Op {
                 path.len() + meta.size_hint() + 64
             }
             Self::Hardlink { path, source, .. } => path.len() + source.len() + 64,
-            Self::Symlink { path, target, .. } => path.len() + target.len() + 64,
+            Self::Symlink {
+                path, target, meta, ..
+            } => path.len() + target.len() + meta.size_hint() + 64,
+            Self::Mknod { path, meta, .. } => path.len() + meta.size_hint() + 96,
             Self::Mkdir { path, .. }
-            | Self::Mknod { path, .. }
             | Self::Remove { path }
             | Self::Unlink { path }
             | Self::Rmdir { path } => path.len() + 96,
@@ -1769,6 +1779,9 @@ pub struct DestinationFilesystemInfo {
     /// FUSE), where each file operation can cost a round trip. Senders and
     /// receivers share an exact build, so the field needs no fallback.
     pub network: bool,
+    /// The directory's filesystem reports link counts and inode numbers the
+    /// receiver trusts (`fsops::Profile::link_counts_trusted`).
+    pub link_counts_trusted: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1800,6 +1813,10 @@ pub enum WireIoKind {
     Other,
     /// Permission denied, with receiver evidence that owner directory access is missing.
     OwnedDirectoryPermissions,
+    /// The receiver will not change this existing file's metadata in place:
+    /// it cannot vouch for the file (`fsops::vouch`). The copy replaces it
+    /// as it replaces a changed file.
+    ReplaceRequired,
 }
 
 impl WireError {

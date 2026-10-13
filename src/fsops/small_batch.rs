@@ -543,6 +543,11 @@ impl FsOps {
         if current.len() != len {
             return Ok(None);
         }
+        // A file the receiver cannot vouch for is replaced instead, by a
+        // stage built from its blocks (`vouch`).
+        if !vouch::allows(target, file, &current, meta, flags)? {
+            return Ok(None);
+        }
         #[cfg(debug_assertions)]
         fail_set_meta_for_test(&target.label)?;
         set_meta_file_known(file, meta, flags, &current)
@@ -2613,10 +2618,17 @@ mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         fs::write(temporary.path().join("existing"), b"old contents").unwrap();
         fs::write(temporary.path().join("inplace"), b"old in-place contents").unwrap();
+        // Another name of the file an in-place put finds keeps its contents:
+        // only a new file is written in place.
+        fs::hard_link(
+            temporary.path().join("inplace"),
+            temporary.path().join("outside"),
+        )
+        .unwrap();
         let before = fs::metadata(temporary.path().join("inplace"))
             .unwrap()
             .ino();
-        let mut inplace = put("inplace", b"written through the old inode");
+        let mut inplace = put("inplace", b"replaces the old inode");
         inplace.inplace = true;
         let mut puts = [
             put("new", b"new"),
@@ -2629,18 +2641,19 @@ mod tests {
         for (name, contents) in [
             ("new", &b"new"[..]),
             ("existing", b"replacement"),
-            ("inplace", b"written through the old inode"),
+            ("inplace", b"replaces the old inode"),
+            ("outside", b"old in-place contents"),
             ("after", b"after"),
         ] {
             assert_eq!(fs::read(temporary.path().join(name)).unwrap(), contents);
         }
-        assert_eq!(
+        assert_ne!(
             fs::metadata(temporary.path().join("inplace"))
                 .unwrap()
                 .ino(),
             before
         );
-        assert_eq!(entries(temporary.path()), 4);
+        assert_eq!(entries(temporary.path()), 5);
     }
 
     #[test]
@@ -2921,24 +2934,37 @@ mod tests {
     }
 
     #[test]
-    fn an_inplace_put_opens_its_destination_directly() {
-        // With no condition on the destination, the in-place path opens the
-        // name at once instead of looking it up first. An existing regular
-        // file keeps its inode and loses its contents; a symlink or FIFO at
-        // the name is replaced by a file, leaving a symlink's target alone; a
-        // directory is refused.
+    fn an_inplace_put_writes_only_a_file_it_creates() {
+        // A new file is created exclusively at its name and written there.
+        // Whatever else the name holds is replaced through a stage: an
+        // existing regular file gets a new inode and keeps its contents
+        // through its other names; a symlink or FIFO at the name is replaced
+        // by a file, leaving a symlink's target alone; a directory is
+        // refused.
         let temporary = crate::test_support::tempdir().unwrap();
         let mut ops = receiver(temporary.path());
         let mut inplace = put("file", b"contents");
         inplace.inplace = true;
         inplace.flags = flags::REPORT_IDENTITY;
         let destination = temporary.path().join("file");
+        let identity = ops.put_small(&inplace).unwrap();
+        let created = fs::metadata(&destination).unwrap();
+        assert_eq!(identity, Some((created.dev(), created.ino())));
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
         fs::write(temporary.path().join("victim"), b"victim").unwrap();
+        fs::remove_file(&destination).unwrap();
         fs::write(&destination, b"an older and longer version").unwrap();
+        fs::hard_link(&destination, temporary.path().join("outside")).unwrap();
         let before = fs::metadata(&destination).unwrap();
         let identity = ops.put_small(&inplace).unwrap();
-        assert_eq!(identity, Some((before.dev(), before.ino())));
+        let published = fs::metadata(&destination).unwrap();
+        assert_ne!(published.ino(), before.ino());
+        assert_eq!(identity, Some((published.dev(), published.ino())));
         assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        assert_eq!(
+            fs::read(temporary.path().join("outside")).unwrap(),
+            b"an older and longer version"
+        );
         for planted in ["symlink", "fifo"] {
             fs::remove_file(&destination).unwrap();
             match planted {
@@ -2967,21 +2993,24 @@ mod tests {
         fs::remove_file(&destination).unwrap();
         fs::create_dir(&destination).unwrap();
         let error = ops.put_small(&inplace).unwrap_err();
-        assert!(error.to_string().contains("is a directory"), "{error}");
+        assert!(
+            format!("{error:#}")
+                .to_lowercase()
+                .contains("is a directory"),
+            "{error:#}"
+        );
+        assert!(destination.is_dir());
         fs::remove_dir(&destination).unwrap();
         let identity = ops.put_small(&inplace).unwrap();
         let published = fs::metadata(&destination).unwrap();
         assert_eq!(identity, Some((published.dev(), published.ino())));
         assert_eq!(fs::read(&destination).unwrap(), b"contents");
-        // Writing clears an existing file's set-id bits for an unprivileged
-        // writer; the metadata read before the write must not hide that from
-        // the chmod that restores them.
+        // A new file gets its set-id bits after its data.
         for wanted in [0o4755, 0o2755] {
+            fs::remove_file(&destination).unwrap();
             let mut setid = inplace.clone();
             setid.meta.mode = wanted;
             setid.flags = flags::MODE;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(wanted)).unwrap();
-            assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, wanted);
             ops.put_small(&setid).unwrap();
             assert_eq!(
                 fs::metadata(&destination).unwrap().mode() & 0o7777,

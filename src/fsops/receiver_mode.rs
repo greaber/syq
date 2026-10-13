@@ -170,44 +170,6 @@ impl ReceiverDirectories {
     }
 }
 
-/// How a file to be written in place was opened: created by this copy, or
-/// found with this mode before anything was written to it.
-#[derive(Clone, Copy, Debug)]
-enum InplaceOpen {
-    Created,
-    Found(u32),
-}
-
-/// Files this process opened to write a copy's data in place, which
-/// finalize gives the mode creating them would have given them or, since
-/// writes clear set-ID bits, the mode they were found with. Finalize may
-/// come on another connection than the open, so the record is shared by the
-/// process; the copy ID keeps one copy's files from another's.
-fn inplace_opened() -> &'static Mutex<InplaceOpens> {
-    static OPENED: OnceLock<Mutex<InplaceOpens>> = OnceLock::new();
-    OPENED.get_or_init(Default::default)
-}
-
-/// In-place opens by copy and file identity.
-type InplaceOpens = HashMap<(CopyId, u64, u64), InplaceOpen>;
-
-/// Record a file this process just opened to write `copy_id`'s data in
-/// place: one it `created`, or one it found as `opened` says. A retry's
-/// open, after writes that may have cleared set-ID bits, keeps the first
-/// record.
-pub(super) fn note_inplace_open(copy_id: &CopyId, opened: &fs::Metadata, created: bool) {
-    let open = if created {
-        InplaceOpen::Created
-    } else {
-        InplaceOpen::Found(opened.mode() & 0o7777)
-    };
-    inplace_opened()
-        .lock()
-        .unwrap()
-        .entry((*copy_id, opened.dev(), opened.ino()))
-        .or_insert(open);
-}
-
 impl FsOps {
     /// The mode creating a file at `target` from `proposed` gives it: the
     /// proposal's permission bits limited by its directory's default ACL if
@@ -263,48 +225,25 @@ impl FsOps {
     }
 
     /// The metadata and flags for finalizing a file written in place, when
-    /// the receiver chooses its mode: a file the copy created gets the mode
-    /// creating it would have given it, without the owner access its other
-    /// writers needed, and an existing file the mode it had before the
-    /// writes, which clear its set-ID bits. This process records the files
-    /// it opened; a copy whose writers run in other processes says what its
-    /// scan found. `None` leaves the metadata as it is.
+    /// the receiver chooses its mode: the copy created it, so it gets the
+    /// mode creating it would have given it, without the owner access its
+    /// other writers needed. `None` leaves the metadata as it is.
     pub(super) fn inplace_final_mode(
         &self,
         target: &RootedTarget,
-        copy_id: &CopyId,
-        current: &fs::Metadata,
         meta: &Meta,
         flags: u8,
-        scanned: ScannedDestination,
     ) -> Result<Option<(Meta, u8)>> {
-        let opened =
-            inplace_opened()
-                .lock()
-                .unwrap()
-                .remove(&(*copy_id, current.dev(), current.ino()));
         if flags & flags::RECEIVER_MODE == 0 {
             return Ok(None);
         }
-        let flags = flags & !flags::RECEIVER_MODE;
-        // A file this receiver created, or one the scan found absent before
-        // the copy, is new: one this process merely found may be an earlier
-        // attempt's, made by another process with the owner access its
-        // writers needed, as the small-file in-place path decides too. Then
-        // what this receiver found, then what the scan found.
-        let mode = match (opened, scanned) {
-            (Some(InplaceOpen::Created), _) | (_, ScannedDestination::Absent) => {
-                self.new_file_mode(target, meta.mode)?
-            }
-            (Some(InplaceOpen::Found(mode)), _) | (None, ScannedDestination::File(mode)) => mode,
-            (None, ScannedDestination::Unknown) => return Ok(Some((meta.clone(), flags))),
-        };
+        let mode = self.new_file_mode(target, meta.mode)?;
         Ok(Some((
             Meta {
                 mode: mode & 0o7777,
                 ..meta.clone()
             },
-            flags | flags::MODE,
+            (flags & !flags::RECEIVER_MODE) | flags::MODE,
         )))
     }
 

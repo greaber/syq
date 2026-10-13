@@ -173,7 +173,24 @@ pub(crate) enum DeletionPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublicationPolicy {
     AtomicStaged,
+    /// The in-place policy of earlier releases, under which a receiver
+    /// wrote existing files in place. A receiver now treats it as
+    /// `InPlaceNew`, which allows less; approving it still warns, since an
+    /// earlier receiver would write existing files in place.
     InPlace,
+    /// `--in-place=new`: new files may be written directly at their final
+    /// names, and existing files are replaced as under `AtomicStaged`. A
+    /// variant of its own, so that a receiver from before it, which would
+    /// read `InPlace` as permission to write existing files in place,
+    /// refuses the grant instead.
+    InPlaceNew,
+}
+
+impl PublicationPolicy {
+    /// Whether new files may be written directly at their final names.
+    pub(crate) fn writes_new_files_in_place(self) -> bool {
+        !matches!(self, Self::AtomicStaged)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

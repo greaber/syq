@@ -587,6 +587,9 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
         extra
             .hardlinks
             .then(|| "can link new names to files already in the destination".to_owned()),
+        // Only a request in the in-place policy of earlier releases, which a
+        // receiver from before `--in-place=new` would carry out by writing
+        // existing files in place.
         (request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace)
             .then(|| "can change existing files through every name they have".to_owned()),
         (extra.widen_dirs != crate::delegation::DirectoryWidening::None)

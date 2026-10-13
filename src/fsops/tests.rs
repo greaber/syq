@@ -252,13 +252,14 @@ fn selected_hash_is_independent_of_payload_integrity() {
 }
 
 #[test]
-fn an_inplace_ranged_copy_opens_its_destination_directly() {
-    // An in-place destination is opened read-write, created when absent,
-    // without a lookup first; the metadata read at the open serves the
-    // condition check, the metadata step and the identity. A new file
-    // keeps owner access until publication; an existing file keeps its
-    // inode; a symlink or FIFO at the name is replaced; a directory is
-    // refused; a read-only final mode is applied at publication.
+fn an_inplace_ranged_copy_writes_only_a_file_it_creates() {
+    // A new in-place destination is created exclusively at its name, and
+    // the metadata read at its creation serves the condition check, the
+    // metadata step and the identity. It keeps owner access until
+    // publication, which applies a read-only final mode. Whatever else the
+    // name holds is replaced through a stage: an existing file gets a new
+    // inode and keeps its contents through its other names; a symlink or
+    // FIFO at the name is replaced; a directory is refused.
     let directory = crate::test_support::tempdir().unwrap();
     let copy_id = [6; 16];
     let mut operations = destination_ops(directory.path());
@@ -277,7 +278,6 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
                     mode,
                     attempt: 0,
                     create_if_missing: true,
-                    scanned: ScannedDestination::Unknown,
                     group: None,
                 },
             )
@@ -341,43 +341,28 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
     assert_eq!(identity, Some((published.dev(), published.ino())));
     assert_eq!(created.ino(), published.ino());
 
-    // Existing: the inode is kept, its longer contents replaced.
+    // Existing: replaced by a new inode; another name keeps the old one.
     fs::write(directory.path().join("old"), b"an older and longer version").unwrap();
+    fs::hard_link(
+        directory.path().join("old"),
+        directory.path().join("outside"),
+    )
+    .unwrap();
     let before = fs::metadata(directory.path().join("old")).unwrap();
     prepare(&mut operations, b"old", 0o644);
+    assert_eq!(
+        fs::read(directory.path().join("old")).unwrap(),
+        b"an older and longer version"
+    );
     write(&mut operations, b"old");
     let identity = publish(&mut operations, b"old", 0o644).unwrap();
-    assert_eq!(identity, Some((before.dev(), before.ino())));
-    check("old", 0o644);
-
-    // Existing and read-only: an unprivileged account cannot open it for
-    // writing at all; root can, and must not widen it on the way in, since
-    // a receiver choosing the file's own mode later reads the widened one.
-    // Only root reaches this (run the test under `unshare -r` for it).
-    if unsafe { libc::geteuid() } == 0 {
-        fs::write(
-            directory.path().join("sealed"),
-            b"an older and longer version",
-        )
-        .unwrap();
-        fs::set_permissions(
-            directory.path().join("sealed"),
-            fs::Permissions::from_mode(0o444),
-        )
-        .unwrap();
-        prepare(&mut operations, b"sealed", 0o444);
-        assert_eq!(
-            fs::metadata(directory.path().join("sealed"))
-                .unwrap()
-                .mode()
-                & 0o7777,
-            0o444,
-            "root must not widen an existing read-only file on the way in"
-        );
-        write(&mut operations, b"sealed");
-        publish(&mut operations, b"sealed", 0o444).unwrap();
-        check("sealed", 0o444);
-    }
+    let published = check("old", 0o644);
+    assert_ne!(published.ino(), before.ino());
+    assert_eq!(identity, Some((published.dev(), published.ino())));
+    assert_eq!(
+        fs::read(directory.path().join("outside")).unwrap(),
+        b"an older and longer version"
+    );
 
     // A symlink or FIFO at the name is replaced by a file; the symlink's
     // target is left alone.
@@ -407,23 +392,15 @@ fn an_inplace_ranged_copy_opens_its_destination_directly() {
         b"victim"
     );
 
-    // A directory at the name is refused.
+    // A directory at the name is refused when the stage would replace it.
     fs::create_dir(directory.path().join("dir")).unwrap();
-    let error = operations
-        .prepare(
-            target(b"dir"),
-            PrepareOptions {
-                size: 8,
-                inplace: true,
-                mode: 0o644,
-                attempt: 0,
-                create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
-                group: None,
-            },
-        )
-        .unwrap_err();
+    prepare(&mut operations, b"dir", 0o644);
+    write(&mut operations, b"dir");
+    let error = publish(&mut operations, b"dir", 0o644).unwrap_err();
     assert!(error.to_string().contains("is a directory"), "{error}");
+    assert!(fs::symlink_metadata(directory.path().join("dir"))
+        .unwrap()
+        .is_dir());
 }
 
 #[test]
@@ -453,7 +430,6 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
                     mode,
                     attempt: 0,
                     create_if_missing: true,
-                    scanned: ScannedDestination::Unknown,
                     group: None,
                 },
             )
@@ -709,7 +685,6 @@ fn payload_integrity_checks_are_explicit() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -793,7 +768,6 @@ fn expected_hash_failure_preserves_existing_destination() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -1045,7 +1019,7 @@ fn existing_regular_open_does_not_follow_leaf_symlinks() {
 }
 
 #[test]
-fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
+fn guarded_inplace_updates_are_confined_and_replace_an_existing_target() {
     let dir = test_dir();
     let root_path = dir.join("root");
     let outside = dir.join("outside");
@@ -1081,7 +1055,6 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -1121,8 +1094,9 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
         )
         .unwrap();
 
+    // Only a new file is written in place: the existing one is replaced.
     assert_eq!(fs::read(&target).unwrap(), b"new");
-    assert_eq!(fs::metadata(&target).unwrap().ino(), inode);
+    assert_ne!(fs::metadata(&target).unwrap().ino(), inode);
     let escaped = root_path.join("escape/sentinel");
     assert!(operations
         .prepare(
@@ -1137,7 +1111,6 @@ fn guarded_inplace_updates_are_confined_and_keep_the_target_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -1516,6 +1489,8 @@ fn matching_condition_can_replace_a_same_type_special_file() {
                 dev: before.dev(),
                 ino: before.ino(),
             },
+            meta: Default::default(),
+            flags: 0,
         }],
         None,
     );
@@ -2863,10 +2838,9 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
     fs::write(selected.join("inplace"), b"replacement").unwrap();
 
     let copy_id = [31; 16];
-    // A sidecar at the name an in-place file's staged copy would use. The
-    // in-place preparation below leaves it alone: every invocation has its
-    // own copy id, so a stranded sidecar never carries this one, and the
-    // lookup that once removed it cost a request on NFS for every file.
+    // A sidecar at the name an in-place file's stage uses. An existing file
+    // is never written in place, so the in-place preparation below replaces
+    // it with a new stage in the adopted root.
     let stale_name = partial_path(&selected.join("inplace"), &copy_id).unwrap();
     let stale = moved.join(stale_name.file_name().unwrap());
     fs::write(&stale, b"stale").unwrap();
@@ -2975,13 +2949,12 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
         .unwrap();
-    assert_eq!(fs::metadata(moved.join("inplace")).unwrap().len(), 2);
-    assert_eq!(fs::read(&stale).unwrap(), b"stale");
+    assert_eq!(fs::read(moved.join("inplace")).unwrap(), b"original");
+    assert_ne!(fs::read(&stale).unwrap(), b"stale");
     assert_eq!(fs::read(selected.join("inplace")).unwrap(), b"replacement");
 
     symlink(&outside, moved.join("redirect")).unwrap();
@@ -2998,7 +2971,6 @@ fn destination_file_state_uses_the_adopted_root_and_refuses_symlink_parents() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -3121,7 +3093,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -3169,7 +3140,6 @@ fn destination_writes_publish_inside_the_adopted_root() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -3255,7 +3225,6 @@ fn rooted_ranged_write_does_not_follow_a_swapped_parent() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -3348,7 +3317,6 @@ fn rooted_finalize_rejects_replacement_of_the_opened_partial() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -3567,16 +3535,21 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
                 mode: 0o755,
                 condition: TargetCondition::Any,
             },
+            // A symlink gets its metadata as it is created.
             Op::Symlink {
                 path: b"link".to_vec(),
                 target: b"target".to_vec(),
                 condition: TargetCondition::Any,
+                meta: meta(0),
+                flags: flags::TIMES,
             },
             Op::Mknod {
                 path: b"pipe".to_vec(),
                 mode: MODE_FIFO | 0o600,
                 rdev: 0,
                 condition: TargetCondition::Any,
+                meta: Default::default(),
+                flags: 0,
             },
             Op::Unlink {
                 path: b"remove".to_vec(),
@@ -3596,23 +3569,20 @@ fn destination_apply_uses_the_adopted_root_not_its_old_name() {
                 flags: flags::MODE,
             },
             Op::SetMeta {
-                path: b"link".to_vec(),
-                meta: meta(0),
-                flags: flags::TIMES,
-                condition: TargetCondition::Any,
-                directory: false,
-            },
-            Op::SetMeta {
                 path: Vec::new(),
                 meta: meta(0o701),
                 flags: flags::MODE | flags::TIMES,
                 condition: TargetCondition::Any,
-                directory: false,
+                directory: true,
             },
         ],
         None,
     );
-    assert_eq!(errors, vec![None; 9]);
+    assert_eq!(errors, vec![None; 8]);
+    assert_eq!(
+        fs::symlink_metadata(moved.join("link")).unwrap().mtime(),
+        1_700_000_000
+    );
 
     assert!(moved.join("created").is_dir());
     assert!(moved.join("nested/parent/created").is_dir());
@@ -3943,7 +3913,6 @@ fn seed_basis_without_a_usable_donor_returns_no_reusable_blocks() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: true,
-                    scanned: ScannedDestination::Unknown,
                     group: None,
                 },
             )
@@ -4140,7 +4109,6 @@ fn seeding_never_writes_old_bytes_into_a_leftover_someone_may_hold_open() {
                 mode: 0o644,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         );
@@ -4259,7 +4227,6 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         mode: 0o644,
                         attempt: 0,
                         create_if_missing: true,
-                        scanned: ScannedDestination::Unknown,
                         group: None,
                     },
                 )
@@ -4297,7 +4264,6 @@ fn a_retry_never_writes_into_a_sidecar_opened_while_its_mode_was_wider() {
                         mode: retry_mode,
                         attempt: 1,
                         create_if_missing: true,
-                        scanned: ScannedDestination::Unknown,
                         group: None,
                     },
                 )
@@ -4413,7 +4379,6 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                             mode,
                             attempt,
                             create_if_missing: true,
-                            scanned: ScannedDestination::Unknown,
                             group: None,
                         },
                     )
@@ -4455,7 +4420,6 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
                         mode: 0o644,
                         attempt: 0,
                         create_if_missing: true,
-                        scanned: ScannedDestination::Unknown,
                         group: None,
                     };
                     ops.prepare(other, options).unwrap();
@@ -4576,7 +4540,6 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         mode,
         attempt,
         create_if_missing: true,
-        scanned: ScannedDestination::Unknown,
         group: None,
     };
     ops.prepare(target(), options(0o644, 0)).unwrap();
@@ -4780,7 +4743,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: false,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -4801,7 +4763,6 @@ fn observation_only_prepare_does_not_create_a_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -4834,7 +4795,6 @@ fn observation_only_prepare_preserves_unsafe_sidecars() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: false,
-                    scanned: ScannedDestination::Unknown,
                     group: None,
                 },
             )
@@ -4903,7 +4863,6 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: false,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -7011,12 +6970,16 @@ fn metadata_parent_reuse_keeps_final_ancestor_replacement_check() {
     let opened = handle.metadata().unwrap();
     fs::rename(tree.path().join("parent"), tree.path().join("held")).unwrap();
     std::os::unix::fs::symlink(outside.path(), tree.path().join("parent")).unwrap();
-    parent
-        .set_times(&[
+    // Times are set through the handle, never by a name.
+    set_handle_times(
+        &handle,
+        &[
             timespec(0, libc::UTIME_OMIT as u32),
             timespec(1_600_000_000, 0),
-        ])
-        .unwrap();
+        ],
+    )
+    .unwrap();
+    drop(parent);
     assert_eq!(
         fs::metadata(tree.path().join("held/leaf")).unwrap().mtime(),
         1_600_000_000
@@ -7112,7 +7075,6 @@ fn sparse_identity_conditioned_publication_keeps_holes_and_replaces_inode() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         )
@@ -7250,7 +7212,6 @@ fn inplace_prepare_rejects_replaced_hashed_basis_before_mutation() {
                 mode: 0o600,
                 attempt: 0,
                 create_if_missing: true,
-                scanned: ScannedDestination::Unknown,
                 group: None,
             },
         );
@@ -7982,7 +7943,6 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
                     mode: 0o600,
                     attempt: 0,
                     create_if_missing: true,
-                    scanned: ScannedDestination::Unknown,
                     group: None,
                 },
             )
@@ -8250,6 +8210,8 @@ fn creations_wait_for_their_parents_created_in_the_same_request() {
             path: b"a/b/link".to_vec(),
             target: b"target".to_vec(),
             condition: TargetCondition::Any,
+            meta: Default::default(),
+            flags: 0,
         },
         mkdir(b"x/y"),
         mkdir(b"a/b"),
@@ -8296,7 +8258,6 @@ fn an_in_place_retry_gives_a_file_the_scan_found_absent_a_new_files_mode() {
                 mode: source_mode & 0o777,
                 attempt: 1,
                 create_if_missing: true,
-                scanned: ScannedDestination::Absent,
                 group: None,
             },
         )
@@ -8643,7 +8604,6 @@ fn a_retry_reads_a_held_stage_whose_finalize_removed_read_permission() {
             mode: 0o200,
             attempt: 0,
             create_if_missing: true,
-            scanned: ScannedDestination::Absent,
             group: None,
         },
     )
@@ -8707,7 +8667,6 @@ fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
             mode: 0o644,
             attempt: 0,
             create_if_missing: true,
-            scanned: ScannedDestination::Absent,
             group: None,
         },
     )
@@ -8746,13 +8705,7 @@ fn finalizing_again_after_a_failed_finalize_publishes_the_held_stage() {
 }
 
 /// Prepare `file` in place in `ops` for attempt `attempt`, `size` bytes.
-fn prepare_inplace(
-    ops: &mut FsOps,
-    id: &CopyId,
-    attempt: u32,
-    size: u64,
-    scanned: ScannedDestination,
-) -> Result<Preparation> {
+fn prepare_inplace(ops: &mut FsOps, id: &CopyId, attempt: u32, size: u64) -> Result<Preparation> {
     ops.prepare(
         PartialTarget {
             path: b"file",
@@ -8765,7 +8718,6 @@ fn prepare_inplace(
             mode: 0o644,
             attempt,
             create_if_missing: true,
-            scanned,
             group: None,
         },
     )
@@ -8781,12 +8733,12 @@ fn an_inplace_retry_writes_the_file_it_holds_without_opening_the_name() {
     let id = [222; 16];
     let path = temporary.path().join("file");
     let mut ops = destination_ops(temporary.path());
-    prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Absent).unwrap();
+    prepare_inplace(&mut ops, &id, 0, 3).unwrap();
     // Opening the name for writing now fails, so the retry can write only
     // through the descriptor it holds.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
     let mut other = destination_ops(temporary.path());
-    prepare_inplace(&mut other, &id, 1, 3, ScannedDestination::Absent).unwrap();
+    prepare_inplace(&mut other, &id, 1, 3).unwrap();
     let target = PartialTarget {
         path: b"file",
         id: &id,
@@ -8806,7 +8758,7 @@ fn a_new_inplace_file_swapped_out_between_attempts_fails_the_file() {
     let id = [223; 16];
     let path = temporary.path().join("file");
     let mut ops = destination_ops(temporary.path());
-    prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Absent).unwrap();
+    prepare_inplace(&mut ops, &id, 0, 3).unwrap();
     fs::rename(&path, temporary.path().join("aside")).unwrap();
     fs::write(&path, b"planted").unwrap();
     // A Finalize that fails keeps the moved file held.
@@ -8832,8 +8784,7 @@ fn a_new_inplace_file_swapped_out_between_attempts_fails_the_file() {
         )
         .is_err());
     for attempt in [1, 2] {
-        let error =
-            prepare_inplace(&mut ops, &id, attempt, 3, ScannedDestination::Unknown).unwrap_err();
+        let error = prepare_inplace(&mut ops, &id, attempt, 3).unwrap_err();
         assert!(
             format!("{error:#}").contains("was replaced while this copy wrote it in place"),
             "{error:#}"
@@ -8843,18 +8794,78 @@ fn a_new_inplace_file_swapped_out_between_attempts_fails_the_file() {
 }
 
 #[test]
-fn an_existing_inplace_file_swapped_out_between_attempts_is_opened_again() {
-    // An existing file is written in place as before: the retry lets go of
-    // the file it held and opens whatever is at the name.
+fn an_existing_file_under_an_inplace_request_is_never_written() {
+    // syq writes only into files it created: an in-place request for a
+    // name that holds a file writes a stage, which a retry keeps writing
+    // whatever is put at the name meanwhile, and Finalize publishes it over
+    // whatever the name then holds, as any changed file is replaced.
     let temporary = crate::test_support::tempdir().unwrap();
     let id = [224; 16];
     let path = temporary.path().join("file");
     fs::write(&path, b"old").unwrap();
+    fs::hard_link(&path, temporary.path().join("outside")).unwrap();
     let mut ops = destination_ops(temporary.path());
-    prepare_inplace(&mut ops, &id, 0, 3, ScannedDestination::Unknown).unwrap();
+    prepare_inplace(&mut ops, &id, 0, 3).unwrap();
     fs::rename(&path, temporary.path().join("aside")).unwrap();
     fs::write(&path, b"another").unwrap();
-    prepare_inplace(&mut ops, &id, 1, 3, ScannedDestination::Unknown).unwrap();
+    let mut other = destination_ops(temporary.path());
+    prepare_inplace(&mut other, &id, 1, 3).unwrap();
+    other
+        .write_range(
+            PartialTarget {
+                path: b"file",
+                id: &id,
+                guard: None,
+            },
+            true,
+            1,
+            0,
+            content_digest(b"new"),
+            b"new",
+        )
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"another");
+    other
+        .finalize(
+            b"file",
+            true,
+            &id,
+            &Meta {
+                inode_metadata: None,
+                mode: 0o640,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags::MODE,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
+    for name in ["aside", "outside"] {
+        assert_eq!(fs::read(temporary.path().join(name)).unwrap(), b"old");
+        assert_ne!(
+            fs::metadata(temporary.path().join(name)).unwrap().mode() & 0o7777,
+            0o640
+        );
+    }
+}
+
+#[test]
+fn finalizing_a_new_inplace_file_checks_that_its_name_still_leads_to_it() {
+    // A file renamed into the place of a new in-place file after its data
+    // was written gets none of the copy's metadata, and the copy fails the
+    // file rather than report it finished.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let id = [225; 16];
+    let path = temporary.path().join("file");
+    let mut ops = destination_ops(temporary.path());
+    prepare_inplace(&mut ops, &id, 0, 3).unwrap();
     ops.write_range(
         PartialTarget {
             path: b"file",
@@ -8862,14 +8873,43 @@ fn an_existing_inplace_file_swapped_out_between_attempts_is_opened_again() {
             guard: None,
         },
         true,
-        1,
+        0,
         0,
         content_digest(b"new"),
         b"new",
     )
     .unwrap();
-    assert_eq!(fs::read(&path).unwrap(), b"new");
-    assert_eq!(fs::read(temporary.path().join("aside")).unwrap(), b"old");
+    fs::rename(&path, temporary.path().join("aside")).unwrap();
+    fs::write(&path, b"planted").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = ops
+        .finalize(
+            b"file",
+            true,
+            &id,
+            &Meta {
+                inode_metadata: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                mtime_nsec: 0,
+            },
+            flags::MODE | flags::TIMES,
+            TargetMutation {
+                condition: TargetCondition::Any,
+                guard: None,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed during update"),
+        "{error:#}"
+    );
+    let planted = fs::metadata(&path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"planted");
+    assert_eq!(planted.mode() & 0o7777, 0o600);
+    assert_ne!(planted.mtime(), 0);
 }
 
 /// Two directories on different filesystems below one root: `/`, and a
@@ -8977,7 +9017,6 @@ fn a_stage_is_opened_without_exclusive_creation_only_on_a_trusted_filesystem() {
                     mode: 0o644,
                     attempt: 0,
                     create_if_missing: true,
-                    scanned: ScannedDestination::Absent,
                     group: None,
                 },
             )

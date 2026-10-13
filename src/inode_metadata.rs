@@ -437,6 +437,59 @@ mod platform {
         Ok(narrowed)
     }
 
+    /// Whether `apply_acls` and `apply_xattrs` with `metadata` and `mode`
+    /// would change `file`, judged as they judge it.
+    pub(super) fn would_change(file: &File, metadata: &InodeMetadata, mode: u32) -> Result<bool> {
+        if let Some(acls) = &metadata.acls {
+            let current = file.metadata()?;
+            let access = acls
+                .access
+                .as_deref()
+                .map(|access| access_for_mode(access, mode))
+                .transpose()?;
+            if get(file, ACCESS)? != access
+                || (current.is_dir() && get(file, DEFAULT)?.as_deref() != acls.default.as_deref())
+                || (!current.is_dir() && acls.default.is_some())
+            {
+                return Ok(true);
+            }
+        }
+        if let Some(attributes) = &metadata.xattrs {
+            for name in names(file)? {
+                if selected(&name, attributes.privileged)
+                    && attributes
+                        .values
+                        .binary_search_by(|(n, _)| n.cmp(&name))
+                        .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            for (name, value) in &attributes.values {
+                if get(file, name)?.as_deref() != Some(value) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `metadata` would give `file` a file capability it does not
+    /// have.
+    pub(super) fn adds_capability(file: &File, metadata: &InodeMetadata) -> Result<bool> {
+        const CAPABILITY: &[u8] = b"security.capability";
+        let Some(wanted) = metadata.xattrs.as_ref().and_then(|attributes| {
+            attributes
+                .values
+                .iter()
+                .find(|(name, _)| name == CAPABILITY)
+                .map(|(_, value)| value)
+        }) else {
+            return Ok(false);
+        };
+        Ok(get(file, CAPABILITY)?.as_ref() != Some(wanted))
+    }
+
     pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
         if let Some(attributes) = &metadata.xattrs {
             let mut previous: Option<&[u8]> = None;
@@ -565,11 +618,6 @@ pub(crate) fn default_permissions(directory: &File) -> Result<u32> {
     Ok(0o777 & !crate::fsops::process_umask())
 }
 
-pub(crate) fn apply(file: &File, metadata: Option<&InodeMetadata>, mode: u32) -> Result<()> {
-    apply_acls(file, metadata, mode, false)?;
-    apply_inner(file, metadata, mode, false)
-}
-
 /// Set the Linux POSIX ACLs. Call this before setting the mode: a stage is
 /// created private, which masks the entries it inherits from its directory's
 /// default ACL, and a chmod to the final mode first would widen that mask,
@@ -610,6 +658,68 @@ pub(crate) fn apply_after_acls_before_publication(
     mode: u32,
 ) -> Result<()> {
     apply_inner(file, metadata, mode, true)
+}
+
+/// Whether applying `metadata` with the final `mode` would change `file`:
+/// its ACLs, extended attributes, access time or birth time. Where a part
+/// cannot be compared it counts as a change.
+pub(crate) fn would_change(
+    file: &File,
+    metadata: Option<&InodeMetadata>,
+    mode: u32,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(metadata) = metadata else {
+        return Ok(false);
+    };
+    #[cfg(target_os = "linux")]
+    if platform::would_change(file, metadata, mode)? {
+        return Ok(true);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mode;
+        if metadata.acls.is_some() || metadata.xattrs.is_some() {
+            return Ok(true);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(acl) = &metadata.macos_acl {
+        if &macos_acl::read(file)? != acl {
+            return Ok(true);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    if metadata.macos_acl.is_some() {
+        return Ok(true);
+    }
+    let current = file.metadata()?;
+    if let Some(atime) = metadata.atime {
+        if (current.atime(), current.atime_nsec() as u32) != (atime.seconds, atime.nanoseconds) {
+            return Ok(true);
+        }
+    }
+    if let Some(crtime) = metadata.crtime {
+        let created = current
+            .created()
+            .ok()
+            .and_then(|created| Timestamp::from_system_time(created).ok());
+        if created != Some(crtime) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether applying `metadata` would give `file` a file capability it does
+/// not already have. Only Linux has them.
+pub(crate) fn adds_capability(file: &File, metadata: Option<&InodeMetadata>) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Some(metadata) = metadata {
+        return platform::adds_capability(file, metadata);
+    }
+    let _ = (file, metadata);
+    Ok(false)
 }
 
 /// A staging inode cannot inherit access grants from its destination parent.

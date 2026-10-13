@@ -2601,24 +2601,31 @@ impl Engine {
             );
             if !self.args.dry_run {
                 directories.create_missing_parents(root, &path)?;
-                if !same {
-                    if existing.is_some() {
-                        root.replace_symlink(&path, &bytes)?;
-                    } else {
-                        root.create_symlink(&path, &bytes)?;
+                // A symlink gets its metadata as it is created, and a later
+                // change of it creates it again.
+                let (meta, flags) = local::symlink_metadata(&metadata, &self.args, explicit, !same);
+                let replacement = match existing {
+                    None => Some(crate::rooted::LeafReplacement::Nothing),
+                    Some(_) if !same => Some(crate::rooted::LeafReplacement::Any),
+                    Some(current) if symlink_metadata_differs(root, current, &meta, flags) => {
+                        Some(crate::rooted::LeafReplacement::Same {
+                            dev: current.dev,
+                            ino: current.ino,
+                        })
                     }
+                    Some(_) => None,
+                };
+                if let Some(replacement) = replacement {
+                    root.publish_symlink(
+                        &path,
+                        &bytes,
+                        replacement,
+                        crate::fsops::new_symlink_metadata(root, &meta, flags),
+                    )?;
+                }
+                if !same {
                     self.progress.symlinks_created.fetch_add(1, Relaxed);
                 }
-                local::apply_metadata(
-                    root,
-                    &path,
-                    &metadata,
-                    &self.args,
-                    None,
-                    explicit,
-                    !same,
-                    &mut Default::default(),
-                )?;
             }
             if same {
                 return Ok(None);
@@ -2650,6 +2657,18 @@ impl Engine {
                 .await
                 .is_ok();
         }
+        // A file whose metadata the receiver cannot change in place is
+        // downloaded again to replace it; a kept one gets its metadata now.
+        if unchanged {
+            unchanged = local::keep_unchanged_file(
+                root,
+                &path,
+                &metadata,
+                &self.args,
+                explicit,
+                self.args.dry_run,
+            )?;
+        }
         if unchanged {
             if self.args.dry_run {
                 let current = existing.expect("unchanged file exists");
@@ -2677,17 +2696,6 @@ impl Engine {
                         });
                     }
                 }
-            } else {
-                local::apply_metadata(
-                    root,
-                    &path,
-                    &metadata,
-                    &self.args,
-                    existing.map(|m| m.mode & 0o7777),
-                    explicit,
-                    false,
-                    &mut Default::default(),
-                )?;
             }
             self.progress
                 .bytes_unchanged
@@ -2730,21 +2738,50 @@ impl Engine {
                 saved = None;
             }
         }
-        let (record, file) = if let Some(old) = saved {
-            let partial = RelativePath::new(old.partial.as_bytes())?;
-            match root.metadata_optional(&partial)? {
-                Some(m) if m.dev == old.dev && m.ino == old.ino && m.is_file() && m.nlink == 1 => {
-                    (old, root.open_regular_read_write(&partial)?)
-                }
-                None => {
+        // syq writes only into files it created in this run: the partial an
+        // earlier run recorded is only read, as a donor of the parts its
+        // record vouches for, into a new partial.
+        let donor = match saved {
+            Some(old) => {
+                let partial = RelativePath::new(old.partial.as_bytes())?;
+                let donor = root.open_regular_read(&partial).ok().filter(|file| {
+                    file.metadata().is_ok_and(|m| {
+                        (m.dev(), m.ino()) == (old.dev, old.ino) && m.is_file() && m.nlink() == 1
+                    })
+                });
+                // A recorded partial that is gone, or no longer the file
+                // recorded, gives nothing, and is left as it is.
+                if donor.is_none() {
                     state.clear()?;
-                    self.new_download_state(root, &job.path, &object, &state)?
                 }
-                _ => bail!("partial download changed identity; refusing to overwrite it"),
+                donor.map(|file| (old, file))
             }
-        } else {
-            self.new_download_state(root, &job.path, &object, &state)?
+            None => None,
         };
+        let (mut record, file) = self.new_download_state(root, &job.path, &object, &state)?;
+        let mut seeded = std::collections::BTreeSet::new();
+        if let Some((old, donor)) = donor {
+            let size = object.size;
+            let (parts, algorithm) = (old.parts.clone(), old.hash_algorithm);
+            let new_algorithm = record.hash_algorithm;
+            let output = file.try_clone()?;
+            let copied = tokio::task::spawn_blocking(move || {
+                seed_download_parts(
+                    &donor,
+                    &output,
+                    (size, part_size),
+                    &parts,
+                    (algorithm, new_algorithm),
+                )
+            })
+            .await??;
+            for (index, hash) in copied {
+                record.parts.insert(index, hash);
+                seeded.insert(index);
+            }
+            state.save(&record)?;
+            remove_partial(root, &old)?;
+        }
         let _cleanup = if state.has_record() {
             None
         } else {
@@ -2783,9 +2820,14 @@ impl Engine {
                 } else {
                     None
                 };
+                let seeded = seeded.contains(&index);
                 async move {
                     let offset = index * part_size;
                     let length = part_size.min(object.size - offset);
+                    if seeded {
+                        self.progress.bytes_unchanged.fetch_add(length, Relaxed);
+                        return Ok::<_, anyhow::Error>(());
+                    }
                     let previous = record.lock().await.parts.get(&index).cloned();
                     if let Some(hash) = previous {
                         let f = file.clone();
@@ -3260,6 +3302,44 @@ fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -
     }
     Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
+/// Copy into `output` each part of an earlier run's partial `donor` whose
+/// recorded hash (`parts`, by part index, in the first algorithm) its bytes
+/// still match, for a download of `size` bytes in parts of `part_size`.
+/// Each part is read once and written as read. Returns the parts copied,
+/// with their hashes in the second algorithm, the new record's.
+fn seed_download_parts(
+    donor: &File,
+    output: &File,
+    (size, part_size): (u64, u64),
+    parts: &BTreeMap<u64, String>,
+    (algorithm, new_algorithm): (HashAlgorithm, HashAlgorithm),
+) -> Result<Vec<(u64, String)>> {
+    let mut copied = Vec::new();
+    let mut buffer = Vec::new();
+    for (&index, hash) in parts {
+        let offset = index.saturating_mul(part_size);
+        if offset >= size {
+            continue;
+        }
+        let length = part_size.min(size - offset) as usize;
+        buffer.resize(length, 0);
+        if donor.read_exact_at(&mut buffer, offset).is_err() {
+            continue;
+        }
+        if Digest::hash_bytes(algorithm, &buffer).value != *hash {
+            continue;
+        }
+        output.write_all_at(&buffer, offset)?;
+        let hash = if new_algorithm == algorithm {
+            hash.clone()
+        } else {
+            Digest::hash_bytes(new_algorithm, &buffer).value
+        };
+        copied.push((index, hash));
+    }
+    Ok(copied)
+}
+
 fn remove_partial(root: &Root, record: &DownloadState) -> Result<()> {
     let path = RelativePath::new(record.partial.as_bytes())?;
     if let Some(m) = root.metadata_optional(&path)? {
@@ -3378,4 +3458,26 @@ mod tests {
             assert!(!record.acknowledged_part(1, "opaque-etag", checksum, 41));
         }
     }
+}
+
+/// Whether giving the existing symlink `current` the metadata `meta` under
+/// `flags` would change it: its owner, group or, where the filesystem sets
+/// a link's own times, its modification time.
+fn symlink_metadata_differs(
+    root: &Root,
+    current: crate::rooted::RootMetadata,
+    meta: &crate::proto::Meta,
+    flags: u8,
+) -> bool {
+    use crate::proto::flags;
+    let superuser = unsafe { libc::geteuid() } == 0;
+    (flags & flags::OWNER != 0
+        && (superuser || flags & flags::REQUIRE_OWNER != 0)
+        && current.uid != meta.uid)
+        || (flags & flags::GROUP != 0 && current.gid != meta.gid)
+        || (flags & flags::TIMES != 0
+            && !root
+                .known_profile(current.dev)
+                .is_some_and(|profile| !profile.symlink_times)
+            && (current.mtime, current.mtime_nsec) != (meta.mtime, meta.mtime_nsec))
 }

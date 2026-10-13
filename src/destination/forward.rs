@@ -86,9 +86,6 @@ pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     {
         bail!("return authorization owns its SSH connection and requires encrypted direct data transport; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --no-tcp-encryption, --peer-auth, or --coordinate-at");
     }
-    if args.inplace {
-        bail!("return authorization does not accept --inplace");
-    }
     crate::restricted::validate_restricted_args(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
@@ -1328,10 +1325,10 @@ mod tests {
         assert!(eligible_target(&args).is_err());
     }
 
-    /// As on other routes to an ordinary account, ownership and special
-    /// files are accepted; in-place writes are not.
+    /// As on other routes to an ordinary account, ownership, special files
+    /// and `--in-place=new` are accepted.
     #[test]
-    fn return_authorization_accepts_ownership_and_special_files() {
+    fn return_authorization_accepts_ownership_special_files_and_in_place() {
         let root = crate::test_support::tempdir().unwrap();
         let mut args = args(root.path(), "output");
         args.owner = true;
@@ -1342,7 +1339,7 @@ mod tests {
         args.delete = true;
         assert_eq!(eligible_target(&args).unwrap(), "server");
         args.inplace = true;
-        assert!(eligible_target(&args).is_err());
+        assert_eq!(eligible_target(&args).unwrap(), "server");
     }
 
     fn forward_command(source: &Path) -> Vec<Vec<u8>> {

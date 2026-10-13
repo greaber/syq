@@ -961,13 +961,16 @@ fn named_copy_accepts_ownership_and_special_files() {
 }
 
 #[test]
-fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
+fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut inplace = args(&temporary.path().join("source"), "output");
     inplace.inplace = true;
-    let (refused, _) = request(&inplace);
-    let error = constrain(refused, temporary.path(), 1000, 1000, 0, false).unwrap_err();
-    assert!(error.to_string().contains("--inplace"), "{error:#}");
+    let (accepted, _) = request(&inplace);
+    assert_eq!(
+        accepted.copy.policy.publication,
+        crate::delegation::PublicationPolicy::InPlaceNew
+    );
+    constrain(accepted, temporary.path(), 1000, 1000, 0, false).unwrap();
 
     // Without --max-delete, the request may delete what this machine allows.
     let mut pruning = args(&temporary.path().join("source"), "output");

@@ -298,7 +298,7 @@ class NativeClientTests(unittest.TestCase):
             copy_metadata=["times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes"],
             open_noatime=True,
             sparse=True,
-            inplace=True,
+            in_place="new",
             on_event=events.append,
         )
 
@@ -329,7 +329,7 @@ class NativeClientTests(unittest.TestCase):
             "--copy-metadata", "times", "permissions", "ownership", "hardlinks", "acls", "xattrs", "atimes", "crtimes",
             "--open-noatime",
             "--sparse",
-            "--inplace",
+            "--in-place=new",
         ):
             self.assertIn(expected, argv)
         self.assertTrue(

@@ -556,7 +556,7 @@ fn native_copy_policies_lower_to_the_shared_engine() {
         "--ignore",
         "!keep.tmp",
         "--copy-metadata=permissions,ownership,specials",
-        "--inplace",
+        "--in-place=new",
         "source",
         "--into",
         "destination",
@@ -573,6 +573,18 @@ fn native_copy_policies_lower_to_the_shared_engine() {
     assert!(args.inplace);
     assert!(args.min_size.is_none());
     assert!(args.max_size.is_none());
+}
+
+#[test]
+fn native_inplace_is_refused_naming_in_place_new_and_rsync_inplace_selects_it() {
+    let argv = ["--inplace", "source", "--into", "destination"].map(std::ffi::OsString::from);
+    let error = parse_native_copy(&argv).unwrap_err().to_string();
+    assert!(error.contains("--in-place=new"), "{error}");
+    let argv =
+        ["--in-place=update", "source", "--into", "destination"].map(std::ffi::OsString::from);
+    assert!(parse_native_copy(&argv).is_err());
+    let args = Args::try_parse_from(["syq rsync", "--inplace", "source", "destination"]).unwrap();
+    assert!(args.inplace);
 }
 
 #[test]

@@ -98,7 +98,8 @@ In addition to the shared arguments above, it accepts:
 | `copy_metadata` | Metadata string or iterable; applies even on unchanged files: `mtime`, `times` (alias for `mtime`), `permissions`, `ownership`, `specials`, `hardlinks`, `acls`, `xattrs`, `atimes`, `crtimes`; S3-to-S3 copies also accept `content-type`, `content-encoding`, `content-language`, `content-disposition`, `cache-control`, `expires`, `website-redirect`, `user-metadata`, `tags`, `storage-class`; see [S3 metadata](https://greaber.github.io/syq/object-storage.html#copies-between-s3-buckets) and [filesystem preservation](https://greaber.github.io/syq/reference.html#preserve-metadata) for platform and route support |
 | `open_noatime` | Boolean: request file reads without access-time updates; warns and continues if unavailable |
 | `sparse` | Boolean: turn written zero ranges into sparse holes on filesystem destinations |
-| `inplace`, `no_compress` | Boolean: update destination files in place or disable compression |
+| `in_place` | `"new"`: write new files directly at their final names, with no staging file; existing files are still replaced |
+| `no_compress` | Boolean: disable compression |
 | `max_delete` | Nonnegative integer deletion limit; requires `prune=True` or `prune_before=True` |
 | `resource_limits` | Comma-separated ceilings that keep automatic tuning, e.g. `"bandwidth=10M,workers=4"`; a concurrency key conflicts with the same key in `performance_tuning` |
 | `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/reference.html#choose-a-transfer-strategy) |
@@ -428,7 +429,7 @@ syq's existing object metadata format; omitted attributes use new-file defaults.
 
 Skip policies and dry runs do not invoke excluded callbacks. Callbacks always
 transfer when selected; they have no saved content identity for comparison or
-restart recovery. They cannot use `hash`, content comparison, `inplace`, pruning,
+restart recovery. They cannot use `hash`, content comparison, `in_place`, pruning,
 or source-tree ignore rules. Filter entries in your script. Named receiver
 grants authorize paths and do not accept callbacks. Callbacks run locally;
 mixed pathname transfers between SSH hosts require `coordinate_at="local"`.

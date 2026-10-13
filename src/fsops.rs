@@ -46,6 +46,7 @@ mod receiver_mode;
 mod sidecars;
 mod small_batch;
 mod stages;
+pub(crate) mod vouch;
 
 pub(crate) use apply::*;
 pub(crate) use entry::*;
@@ -750,6 +751,23 @@ fn is_superuser() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// The mode, owner and group a small copy would change on the existing file
+/// `stat` describes to give it `meta`, among those `flags` selects.
+#[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
+fn small_copy_repair(flags: u8, stat: &libc::stat, meta: &Meta) -> u8 {
+    let mut repair = 0;
+    if flags & flags::MODE != 0 && stat.st_mode as u32 & 0o7777 != meta.mode & 0o7777 {
+        repair |= flags::MODE;
+    }
+    if flags & flags::OWNER != 0 && stat.st_uid != meta.uid {
+        repair |= flags::OWNER;
+    }
+    if flags & flags::GROUP != 0 && stat.st_gid != meta.gid {
+        repair |= flags::GROUP;
+    }
+    repair
+}
+
 struct PreparedSmallCopy {
     request: SmallCopyRequest,
     anchor: DirectoryAnchor,
@@ -941,8 +959,6 @@ struct PrepareOptions {
     mode: u32,
     attempt: u32,
     create_if_missing: bool,
-    /// What the sender's scan found at the path.
-    scanned: ScannedDestination,
     /// The group publication gives an in-place file, when it sets one.
     group: Option<u32>,
 }
@@ -1367,6 +1383,36 @@ impl FsOps {
                 outcome: SmallCopyOutcome::UnsupportedTarget,
             }));
         }
+        // An unchanged file whose metadata the receiver cannot change in
+        // place must be replaced from the source, whose contents this path
+        // does not fetch for it: the general engine copies such a batch.
+        let directory = selection.directory.metadata()?;
+        let link_counts_trusted = fs_caps::profile(&selection.directory).link_counts_trusted;
+        if request
+            .files
+            .iter()
+            .zip(&destinations)
+            .zip(unchanged.iter().zip(&permitted))
+            .any(|((file, stat), (unchanged, permitted))| {
+                let Some(stat) = stat.as_ref().filter(|_| *unchanged && *permitted) else {
+                    return false;
+                };
+                let repair = small_copy_repair(request.flags, stat, &file.meta);
+                repair != 0
+                    && !vouch::lookup_allows(
+                        stat,
+                        link_counts_trusted,
+                        (directory.gid(), directory.mode()),
+                        &file.meta,
+                        repair,
+                    )
+            })
+        {
+            return Ok(Response::SmallFilesCopied(SmallCopyResponse {
+                anchor,
+                outcome: SmallCopyOutcome::UnsupportedTarget,
+            }));
+        }
         // The offer contains whole-file payloads. Only existing files that
         // need content work can benefit from multi-block reuse; keep new
         // files, rejected entries and quick-check matches on this path.
@@ -1458,8 +1504,11 @@ impl FsOps {
         // Existing files with different mtimes may still have identical
         // content. Compare one bounded block locally, as the worker does,
         // without another data connection or a rewrite of the destination.
+        // A matching file the receiver cannot vouch for is replaced from
+        // its payload instead (`same` but not `unchanged`).
         let mut matched_content: Vec<Option<(RootedTarget, File)>> =
             (0..request.files.len()).map(|_| None).collect();
+        let mut same = unchanged.clone();
         for (i, file) in request.files.iter().enumerate() {
             if (request.reuse_block_size.is_none()
                 && request.if_exists != crate::cli::IfExists::ErrorIfDifferent)
@@ -1494,10 +1543,22 @@ impl FsOps {
                 }
                 Ok((bytes.as_slice() == data[i].unwrap()).then_some((target, opened)))
             })();
+            let check = check.and_then(|held| {
+                let Some((target, opened)) = held else {
+                    return Ok(None);
+                };
+                let current = opened.metadata()?;
+                let stat = destinations[i].as_ref().unwrap();
+                let repair = (request.matching_flags & flags::TIMES)
+                    | small_copy_repair(request.flags, stat, &file.meta);
+                let keep = vouch::allows(&target, &opened, &current, &file.meta, repair)?;
+                Ok(Some(keep.then_some((target, opened))))
+            });
             match check {
                 Ok(Some(held)) => {
-                    unchanged[i] = true;
-                    matched_content[i] = Some(held);
+                    same[i] = true;
+                    unchanged[i] = held.is_some();
+                    matched_content[i] = held;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1512,7 +1573,7 @@ impl FsOps {
         if request.if_exists == crate::cli::IfExists::ErrorIfDifferent
             && destinations
                 .iter()
-                .zip(&unchanged)
+                .zip(&same)
                 .any(|(destination, same)| destination.is_some() && !same)
         {
             return Ok(Response::SmallFilesCopied(SmallCopyResponse {
@@ -1561,118 +1622,120 @@ impl FsOps {
         )?;
         // Each publication/metadata repair has its own outcome. Unchanged
         // files keep their inode and reconcile only requested mode/ownership.
-        let results = request
-            .files
-            .iter()
-            .zip(destinations)
-            .zip(staged)
-            .zip(matched_content)
-            .enumerate()
-            .map(|(i, (((file, destination), item), matched_content))| {
-                if !permitted[i] {
-                    return SmallCopyFileResult {
-                        disposition: SmallCopyDisposition::Excluded,
-                        error: None,
-                    };
-                }
-                let condition = destination
-                    .as_ref()
-                    .map_or(TargetCondition::Absent, |stat| TargetCondition::Matches {
-                        dev: stat.st_dev as u64,
-                        ino: stat.st_ino as u64,
+        let results =
+            request
+                .files
+                .iter()
+                .zip(destinations)
+                .zip(staged)
+                .zip(matched_content)
+                .enumerate()
+                .map(|(i, (((file, destination), item), matched_content))| {
+                    // A matching file the receiver would not keep is replaced:
+                    // that file, and no other.
+                    let replaced = destination.as_ref().filter(|_| same[i]).map(|stat| {
+                        TargetCondition::Matches {
+                            dev: stat.st_dev as u64,
+                            ino: stat.st_ino as u64,
+                        }
                     });
-                match item {
-                    Some(item) => SmallCopyFileResult {
-                        disposition: SmallCopyDisposition::Copied,
-                        error: publish_partial_rooted(
-                            &item.root,
-                            &item.partial,
-                            &item.target,
-                            &item.file,
-                            if matches!(
-                                request.if_exists,
-                                crate::cli::IfExists::Error
-                                    | crate::cli::IfExists::ErrorIfDifferent
-                            ) {
-                                TargetCondition::Absent
-                            } else {
-                                TargetCondition::Any
-                            },
-                            None,
-                        )
-                        .err()
-                        .map(|error| wire_error(&error)),
-                    },
-                    None => {
-                        let stat = destination.expect("unchanged file has a destination");
-                        let mut repair = if matched_content.is_some() {
-                            request.matching_flags & flags::TIMES
-                        } else {
-                            0
+                    if !permitted[i] {
+                        return SmallCopyFileResult {
+                            disposition: SmallCopyDisposition::Excluded,
+                            error: None,
                         };
-                        if request.flags & flags::MODE != 0
-                            && stat.st_mode as u32 & 0o7777 != file.meta.mode & 0o7777
-                        {
-                            repair |= flags::MODE;
-                        }
-                        if request.flags & flags::OWNER != 0 && stat.st_uid != file.meta.uid {
-                            repair |= flags::OWNER;
-                        }
-                        if request.flags & flags::GROUP != 0 && stat.st_gid != file.meta.gid {
-                            repair |= flags::GROUP;
-                        }
-                        let disposition = if matched_content.is_some() {
-                            SmallCopyDisposition::ContentMatched
-                        } else {
-                            SmallCopyDisposition::QuickChecked
-                        };
-                        let error = if let Some((target, held)) = matched_content {
-                            // A content match repairs timestamps through the
-                            // readable inode that was hashed; O_PATH metadata
-                            // handles intentionally cannot change timestamps.
-                            (|| -> Result<()> {
-                                require_rooted_named_identity(
-                                    &target.root,
-                                    &target.relative,
-                                    &target.label,
-                                    &held,
-                                    condition,
-                                )?;
-                                set_meta_file(&held, &file.meta, repair)?;
-                                require_rooted_named_identity(
-                                    &target.root,
-                                    &target.relative,
-                                    &target.label,
-                                    &held,
-                                    condition,
-                                )
-                            })()
-                            .err()
-                            .map(|error| wire_error(&error))
-                        } else if repair == 0 {
-                            None
-                        } else {
-                            match self.destination_relative(&file.path) {
-                                Ok(path) => self
-                                    .apply(
-                                        &[Op::SetFileMetaIfSame {
-                                            path,
-                                            condition,
-                                            meta: file.meta.clone(),
-                                            flags: repair,
-                                        }],
-                                        None,
-                                    )
-                                    .pop()
-                                    .flatten(),
-                                Err(error) => Some(wire_error(&error)),
-                            }
-                        };
-                        SmallCopyFileResult { disposition, error }
                     }
-                }
-            })
-            .collect();
+                    let condition = destination
+                        .as_ref()
+                        .map_or(TargetCondition::Absent, |stat| TargetCondition::Matches {
+                            dev: stat.st_dev as u64,
+                            ino: stat.st_ino as u64,
+                        });
+                    match item {
+                        Some(item) => SmallCopyFileResult {
+                            disposition: SmallCopyDisposition::Copied,
+                            error: publish_partial_rooted(
+                                &item.root,
+                                &item.partial,
+                                &item.target,
+                                &item.file,
+                                if let Some(replaced) = replaced {
+                                    replaced
+                                } else if matches!(
+                                    request.if_exists,
+                                    crate::cli::IfExists::Error
+                                        | crate::cli::IfExists::ErrorIfDifferent
+                                ) {
+                                    TargetCondition::Absent
+                                } else {
+                                    TargetCondition::Any
+                                },
+                                None,
+                            )
+                            .err()
+                            .map(|error| wire_error(&error)),
+                        },
+                        None => {
+                            let stat = destination.expect("unchanged file has a destination");
+                            let repair = if matched_content.is_some() {
+                                request.matching_flags & flags::TIMES
+                            } else {
+                                0
+                            } | small_copy_repair(request.flags, &stat, &file.meta);
+                            let disposition = if matched_content.is_some() {
+                                SmallCopyDisposition::ContentMatched
+                            } else {
+                                SmallCopyDisposition::QuickChecked
+                            };
+                            let error = if let Some((target, held)) = matched_content {
+                                // A content match repairs timestamps through the
+                                // readable inode that was hashed; O_PATH metadata
+                                // handles intentionally cannot change timestamps.
+                                (|| -> Result<()> {
+                                    require_rooted_named_identity(
+                                        &target.root,
+                                        &target.relative,
+                                        &target.label,
+                                        &held,
+                                        condition,
+                                    )?;
+                                    let current = held.metadata()?;
+                                    vouch::require(&target, &held, &current, &file.meta, repair)?;
+                                    set_meta_file_known(&held, &file.meta, repair, &current)?;
+                                    require_rooted_named_identity(
+                                        &target.root,
+                                        &target.relative,
+                                        &target.label,
+                                        &held,
+                                        condition,
+                                    )
+                                })()
+                                .err()
+                                .map(|error| wire_error(&error))
+                            } else if repair == 0 {
+                                None
+                            } else {
+                                match self.destination_relative(&file.path) {
+                                    Ok(path) => self
+                                        .apply(
+                                            &[Op::SetFileMetaIfSame {
+                                                path,
+                                                condition,
+                                                meta: file.meta.clone(),
+                                                flags: repair,
+                                            }],
+                                            None,
+                                        )
+                                        .pop()
+                                        .flatten(),
+                                    Err(error) => Some(wire_error(&error)),
+                                }
+                            };
+                            SmallCopyFileResult { disposition, error }
+                        }
+                    }
+                })
+                .collect();
         Ok(Response::SmallFilesCopied(SmallCopyResponse {
             anchor,
             outcome: SmallCopyOutcome::Published(results),
@@ -2372,6 +2435,7 @@ impl FsOps {
             available_inodes,
             empty,
             network: on_network_file_system(&directory, metadata.dev()),
+            link_counts_trusted: fs_caps::profile(&directory).link_counts_trusted,
         })
     }
 

@@ -430,7 +430,39 @@ impl FileSession {
                         if let Some((meta, flags)) =
                             with_overrides(&existing, base, destination.metadata.overrides)?
                         {
-                            crate::fsops::set_meta_file(&existing, &meta, flags)?;
+                            let current = existing.metadata()?;
+                            let label = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+                                &destination.target.to_bytes(),
+                            ));
+                            let place = crate::fsops::vouch::Place {
+                                root: &destination.root,
+                                relative: &destination.target,
+                                label: &label,
+                            };
+                            if crate::fsops::vouch::allows(
+                                place, &existing, &current, &meta, flags,
+                            )? {
+                                crate::fsops::set_meta_file(&existing, &meta, flags)?;
+                            } else {
+                                // The receiver changes no metadata in place
+                                // on a file it cannot vouch for: the stage,
+                                // which holds the same contents, replaces
+                                // that file, and only that one.
+                                stream.file.sync_all()?;
+                                crate::fsops::set_meta_file(
+                                    &stream.file,
+                                    &overlaid(&current, &meta, flags),
+                                    crate::proto::flags::MODE | crate::proto::flags::TIMES | flags,
+                                )?;
+                                destination.root.replace_regular_if_same(
+                                    &destination.temporary,
+                                    &destination.target,
+                                    (stream.original.dev(), stream.original.ino()),
+                                    current.dev(),
+                                    current.ino(),
+                                    Some((current.ctime(), current.ctime_nsec() as u32)),
+                                )?;
+                            }
                         }
                         slot.take();
                         return Ok(Response::Ok);
@@ -516,6 +548,26 @@ fn with_overrides(
     };
     attributes.apply(&mut meta);
     Ok(Some((meta, flags | attributes.apply_flags())))
+}
+
+/// `metadata` with the parts of `meta` that `flags` selects laid over it.
+fn overlaid(metadata: &Metadata, meta: &crate::proto::Meta, flags: u8) -> crate::proto::Meta {
+    use crate::proto::flags;
+    let mut overlaid = super::metadata::from_file(metadata);
+    if flags & flags::MODE != 0 {
+        overlaid.mode = meta.mode;
+    }
+    if flags & flags::OWNER != 0 {
+        overlaid.uid = meta.uid;
+    }
+    if flags & flags::GROUP != 0 {
+        overlaid.gid = meta.gid;
+    }
+    if flags & flags::TIMES != 0 {
+        (overlaid.mtime, overlaid.mtime_nsec) = (meta.mtime, meta.mtime_nsec);
+    }
+    overlaid.inode_metadata = meta.inode_metadata.clone();
+    overlaid
 }
 
 fn same_contents(left: &File, right: &File) -> Result<bool> {

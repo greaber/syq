@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::CStr;
 
 pub(super) fn op_path(op: &Op) -> &[u8] {
     match op {
@@ -371,72 +372,31 @@ fn apply_one_rooted(
         Op::Symlink {
             target: link,
             condition,
+            meta,
+            flags,
             ..
         } => {
-            if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match root.create_symlink(path, link) {
-                    Ok(()) => return Ok(()),
-                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
-                        if *condition == TargetCondition::Absent {
-                            bail!(
-                                "destination {} appeared before no-replace creation",
-                                target.label.display()
-                            );
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
+            let replacement = leaf_replacement(target, *condition, MODE_SYMLINK)?;
+            if symlink_already_holds(target, replacement, link, meta, *flags)? {
+                return Ok(());
             }
-            match observe_rooted_condition(target, *condition)? {
-                // A matched replacement swaps the new leaf in atomically, so a
-                // concurrent replacement of the observed object is refused
-                // rather than deleted.
-                Some(metadata) if *condition != TargetCondition::Any => {
-                    if !metadata.is_symlink() {
-                        bail!(
-                            "destination {} cannot change type under a matched condition",
-                            target.label.display()
-                        );
-                    }
-                    root.replace_symlink_if_same(path, link, metadata.dev, metadata.ino)
-                }
-                Some(_) => root.replace_symlink(path, link),
-                None => root.create_symlink(path, link),
-            }
+            root.publish_symlink(path, link, replacement, |directory, name| {
+                set_new_leaf_metadata(root, directory, name, MODE_SYMLINK, meta, *flags)
+            })
         }
         Op::Mknod {
             mode,
             rdev,
             condition,
+            meta,
+            flags,
             ..
         } => {
-            if matches!(condition, TargetCondition::Any | TargetCondition::Absent) {
-                match root.create_node(path, *mode, *rdev) {
-                    Ok(()) => return Ok(()),
-                    Err(error) if error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
-                        if *condition == TargetCondition::Absent {
-                            bail!(
-                                "destination {} appeared before no-replace creation",
-                                target.label.display()
-                            );
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            match observe_rooted_condition(target, *condition)? {
-                Some(metadata) if *condition != TargetCondition::Any => {
-                    if file_type_bits(metadata.mode) != file_type_bits(*mode) {
-                        bail!(
-                            "destination {} cannot change type under a matched condition",
-                            target.label.display()
-                        );
-                    }
-                    root.replace_node_if_same(path, *mode, *rdev, metadata.dev, metadata.ino)
-                }
-                Some(_) => root.replace_node(path, *mode, *rdev),
-                None => root.create_node(path, *mode, *rdev),
-            }
+            let file_type = file_type_bits(*mode);
+            let replacement = leaf_replacement(target, *condition, file_type)?;
+            root.publish_node(path, *mode, *rdev, replacement, |directory, name| {
+                set_new_leaf_metadata(root, directory, name, file_type, meta, *flags)
+            })
         }
         Op::Hardlink {
             source,
@@ -481,6 +441,9 @@ fn apply_one_rooted(
                 );
             }
             require_open_target_known(&opened, &target.label, *condition)?;
+            // Only a file the receiver can vouch for is changed in place;
+            // the copy replaces any other (`vouch`).
+            vouch::require(target, &file, &opened, meta, *flags)?;
             set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
             require_rooted_named_identity_known(
                 &target.root,
@@ -501,13 +464,281 @@ fn apply_one_rooted(
     }
 }
 
-/// Apply `meta` to the object at `target`. A `directory`'s metadata goes
-/// only to a directory: anything else found at its name, such as a file
-/// someone put there in its place, is refused before any change, so that it
-/// never takes the directory's owner, group or mode. Its identity is checked
-/// only where the directory's own filesystem keeps inode numbers
+/// The type bits of a symlink.
+const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
+
+/// What a new symlink or node of type `file_type` at `target` may replace
+/// under `condition`.
+fn leaf_replacement(
+    target: &RootedTarget,
+    condition: TargetCondition,
+    file_type: u32,
+) -> Result<crate::rooted::LeafReplacement> {
+    use crate::rooted::LeafReplacement;
+    Ok(match condition {
+        TargetCondition::Absent => LeafReplacement::Nothing,
+        TargetCondition::Any => LeafReplacement::Any,
+        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
+            let Some(metadata) = observe_rooted_condition(target, condition)? else {
+                bail!(
+                    "destination {} changed before it could be replaced",
+                    target.label.display()
+                );
+            };
+            if file_type_bits(metadata.mode) != file_type {
+                bail!(
+                    "destination {} cannot change type under a matched condition",
+                    target.label.display()
+                );
+            }
+            LeafReplacement::Same {
+                dev: metadata.dev,
+                ino: metadata.ino,
+            }
+        }
+    })
+}
+
+/// Whether the symlink a matched replacement would replace already holds
+/// everything the new one would: its target and the metadata `flags`
+/// selects, as when only its access time was to be restored and it had
+/// not changed. It is then left as it is. ACLs, extended attributes and
+/// birth times are not compared here.
+fn symlink_already_holds(
+    target: &RootedTarget,
+    replacement: crate::rooted::LeafReplacement,
+    link: &[u8],
+    meta: &Meta,
+    flags: u8,
+) -> Result<bool> {
+    let crate::rooted::LeafReplacement::Same { dev, ino } = replacement else {
+        return Ok(false);
+    };
+    let Some(current) = target.root.metadata_optional(&target.relative)? else {
+        return Ok(false);
+    };
+    let symlink = current.is_symlink();
+    let owner = flags & flags::OWNER != 0
+        && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
+        && current.uid != meta.uid;
+    let group = flags & flags::GROUP != 0 && current.gid != meta.gid;
+    let mode = flags & flags::MODE != 0
+        && !(symlink && cfg!(target_os = "linux"))
+        && current.mode & 0o7777 != meta.mode & 0o7777;
+    // A symlink's times are not set where the filesystem would set its
+    // target's instead (`Profile::symlink_times`).
+    let times = flags & flags::TIMES != 0
+        && !(symlink
+            && target
+                .root
+                .known_profile(current.dev)
+                .is_some_and(|profile| !profile.symlink_times))
+        && (current.mtime, current.mtime_nsec) != (meta.mtime, meta.mtime_nsec);
+    let inode = match meta.inode_metadata.as_deref() {
+        None => false,
+        Some(inode) => {
+            inode.acls.is_some()
+                || inode.macos_acl.is_some()
+                || inode.xattrs.is_some()
+                || inode.crtime.is_some()
+                || inode.atime.is_some_and(|atime| atime != current.atime)
+        }
+    };
+    if !symlink
+        || (current.dev, current.ino) != (dev, ino)
+        || owner
+        || group
+        || mode
+        || times
+        || inode
+    {
+        return Ok(false);
+    }
+    Ok(target.root.read_link(&target.relative)? == link)
+}
+
+/// The step that gives a new symlink, before `Root::publish_symlink`
+/// publishes it, `meta` under `flags` (`set_new_leaf_metadata`).
+pub(crate) fn new_symlink_metadata<'a>(
+    root: &'a Root,
+    meta: &'a Meta,
+    flags: u8,
+) -> impl FnOnce(&File, &CStr) -> Result<()> + 'a {
+    move |directory, name| set_new_leaf_metadata(root, directory, name, MODE_SYMLINK, meta, flags)
+}
+
+/// Give a new symlink or node of type `file_type`, just created at `name`
+/// in `directory` and not yet published, `meta` under `flags`, through a
+/// descriptor of it: the entry is what this receiver created, and nothing
+/// is applied by its final name. A symlink's times are set only where the
+/// filesystem sets the link's own (`Profile::symlink_times`), and on macOS
+/// a device node, which may not be opened without opening the device, is
+/// changed by its temporary name, checked first.
+fn set_new_leaf_metadata(
+    root: &Root,
+    directory: &File,
+    name: &CStr,
+    file_type: u32,
+    meta: &Meta,
+    flags: u8,
+) -> Result<()> {
+    let flags = flags & !flags::RECEIVER_MODE;
+    if flags & (flags::MODE | flags::OWNER | flags::GROUP | flags::TIMES) == 0
+        && meta.inode_metadata.is_none()
+    {
+        return Ok(());
+    }
+    let symlink = file_type == MODE_SYMLINK;
+    #[cfg(target_os = "macos")]
+    if file_type == libc::S_IFCHR as u32 || file_type == libc::S_IFBLK as u32 {
+        return set_new_device_metadata(directory, name, meta, flags);
+    }
+    #[cfg(target_os = "linux")]
+    let open = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let open = libc::O_EVTONLY
+        | libc::O_NONBLOCK
+        | libc::O_CLOEXEC
+        | if symlink {
+            libc::O_SYMLINK
+        } else {
+            libc::O_NOFOLLOW
+        };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let open = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let handle = crate::sys::open_at(directory.as_raw_fd(), name, open, 0)
+        .context("open a new entry to set its metadata")?;
+    let current = handle.metadata()?;
+    anyhow::ensure!(
+        file_type_bits(current.mode()) == file_type
+            && current.nlink() == 1
+            && current.uid() == unsafe { libc::geteuid() },
+        "the new entry changed before its metadata was set"
+    );
+    let flags = if symlink && !root.sets_symlink_times(directory, current.dev()) {
+        flags & !flags::TIMES
+    } else {
+        flags
+    };
+    // A symlink has no mode of its own to set on Linux.
+    let flags = if symlink && cfg!(target_os = "linux") {
+        flags & !flags::MODE
+    } else {
+        flags
+    };
+    set_handle_metadata(&handle, meta, flags, &current)
+}
+
+/// Apply `meta` under `flags` to the object `handle` refers to, whose
+/// metadata `current` was read through it, never by a name. The times go
+/// first: macOS may lower a birth time when an older modification time is
+/// set, and the birth time follows.
+fn set_handle_metadata(
+    handle: &File,
+    meta: &Meta,
+    flags: u8,
+    current: &fs::Metadata,
+) -> Result<()> {
+    if flags & flags::TIMES != 0
+        && (current.mtime(), current.mtime_nsec() as u32) != (meta.mtime, meta.mtime_nsec)
+    {
+        set_handle_times(
+            handle,
+            &[
+                timespec(0, libc::UTIME_OMIT as u32),
+                timespec(meta.mtime, meta.mtime_nsec),
+            ],
+        )?;
+    }
+    set_meta_handle_known_portable(handle, meta, flags & !flags::TIMES, current)
+}
+
+/// Set the times of the object `handle` refers to, which may be a symlink
+/// or a directory, through `handle`.
+pub(crate) fn set_handle_times(handle: &File, times: &[libc::timespec; 2]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::utimensat(
+            handle.as_raw_fd(),
+            c"".as_ptr(),
+            times.as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = unsafe { libc::futimens(handle.as_raw_fd(), times.as_ptr()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// macOS: give a new device node, at `name` in `directory`, its metadata by
+/// that name, which only this receiver uses, once it shows itself to be the
+/// node created.
+#[cfg(target_os = "macos")]
+fn set_new_device_metadata(directory: &File, name: &CStr, meta: &Meta, flags: u8) -> Result<()> {
+    let current = crate::rooted::metadata_at(directory.as_raw_fd(), name)?;
+    anyhow::ensure!(
+        current.nlink == 1 && current.uid == unsafe { libc::geteuid() },
+        "the new entry changed before its metadata was set"
+    );
+    let fd = directory.as_raw_fd();
+    apply_owner_if_changed(flags, meta, current.uid, current.gid, |uid, gid| {
+        let result = unsafe {
+            libc::fchownat(
+                fd,
+                name.as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })?;
+    if flags & flags::MODE != 0 {
+        let result = unsafe {
+            libc::fchmodat(
+                fd,
+                name.as_ptr(),
+                (meta.mode & 0o7777) as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    if flags & flags::TIMES != 0 {
+        let times = [
+            timespec(0, libc::UTIME_OMIT as u32),
+            timespec(meta.mtime, meta.mtime_nsec),
+        ];
+        let result = unsafe {
+            libc::utimensat(fd, name.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+/// Apply `meta` to the directory at `target`. It goes only to a directory:
+/// anything else found at its name, such as a file someone put there in its
+/// place, is refused before any change, so that it never takes the
+/// directory's owner, group or mode. Every change, times included, goes
+/// through a handle of the directory, never its name. Its identity is
+/// checked only where its own filesystem keeps inode numbers
 /// (`Profile::link_counts_trusted`): elsewhere a directory's number can
-/// change while it stays, and the type check stands alone.
+/// change while it stays, and the type check stands alone. Any other
+/// entry's metadata changes by creating it again (`Op::Symlink`,
+/// `Op::Mknod`) or, for a file, as the copy finishes it.
 pub(super) fn set_meta_rooted(
     target: &RootedTarget,
     meta: &Meta,
@@ -515,176 +746,59 @@ pub(super) fn set_meta_rooted(
     condition: TargetCondition,
     directory: bool,
 ) -> Result<()> {
-    // The condition for a directory on a filesystem whose profile `trusted`
-    // gives, asked only for a directory bound to an identity.
-    let for_directory = |trusted: &mut dyn FnMut() -> Result<bool>| -> Result<TargetCondition> {
-        Ok(match condition {
-            TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
-                if directory && !trusted()? =>
-            {
-                TargetCondition::Any
-            }
-            condition => condition,
-        })
-    };
     let require_directory = |is_dir: bool| {
-        if directory && !is_dir {
+        if !is_dir {
+            if directory {
+                bail!(
+                    "destination {} is no longer a directory",
+                    target.label.display()
+                );
+            }
             bail!(
-                "destination {} is no longer a directory",
+                "{} is not changed in place: only a directory's metadata is",
                 target.label.display()
             );
         }
         Ok(())
     };
-    if target.relative.is_empty() {
-        let metadata = target.root.metadata(&target.relative)?;
-        require_directory(metadata.is_dir())?;
-        let condition = for_directory(&mut || Ok(target.root.link_counts_trusted()))?;
-        require_rooted_condition(metadata, condition, &target.label)?;
-        let handle = target.root.open_metadata(&target.relative)?;
-        require_rooted_metadata(&handle, metadata, &target.label)?;
-        let opened = handle.metadata()?;
-        require_directory(opened.is_dir())?;
-        require_open_target_known(&opened, &target.label, condition)?;
-        if flags & flags::TIMES != 0
-            && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec)
-        {
-            let times = [
-                timespec(0, libc::UTIME_OMIT as u32),
-                timespec(meta.mtime, meta.mtime_nsec),
-            ];
-            target.root.set_times(&target.relative, &times)?;
-        }
-        // Birth time follows mtime: macOS may lower birth time when setting
-        // an older modification time.
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
-        return require_rooted_named_identity_known(
-            &target.root,
-            &target.relative,
-            &target.label,
-            &opened,
-            condition,
-        );
-    }
-    let parent = target.root.resolve_parent(&target.relative)?;
-    let metadata = parent
-        .metadata()
-        .with_context(|| format!("stat confined path {}", target.label.display()))?;
+    let metadata = target.root.metadata(&target.relative)?;
     require_directory(metadata.is_dir())?;
-    // A directory below the root can be another filesystem's mount point,
-    // so its profile is its own filesystem's, read through a handle of the
-    // directory when that device's profile is not known yet. The handle
-    // then serves the metadata step.
-    let mut handle = None;
-    let condition = for_directory(&mut || {
-        if let Some(profile) = target.root.known_profile(metadata.dev) {
-            return Ok(profile.link_counts_trusted);
+    let handle = target
+        .root
+        .open_metadata(&target.relative)
+        .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
+    require_rooted_metadata(&handle, metadata, &target.label)?;
+    let opened = handle.metadata()?;
+    require_directory(opened.is_dir())?;
+    let condition = match condition {
+        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
+            if !target.root.link_counts_trusted_on(opened.dev(), &handle) =>
+        {
+            TargetCondition::Any
         }
-        let opened = parent
-            .open_metadata()
-            .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
-        let trusted = target.root.link_counts_trusted_on(metadata.dev, &opened);
-        handle = Some(opened);
-        Ok(trusted)
-    })?;
+        condition => condition,
+    };
     require_rooted_condition(metadata, condition, &target.label)?;
-    let is_link = metadata.is_symlink();
+    require_open_target_known(&opened, &target.label, condition)?;
     let owner_differs = (flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
-        && metadata.uid != meta.uid)
-        || (flags & flags::GROUP != 0 && metadata.gid != meta.gid);
-    let mode_differs =
-        flags & flags::MODE != 0 && !is_link && metadata.mode & 0o7777 != meta.mode & 0o7777;
+        && opened.uid() != meta.uid)
+        || (flags & flags::GROUP != 0 && opened.gid() != meta.gid);
+    let mode_differs = flags & flags::MODE != 0 && opened.mode() & 0o7777 != meta.mode & 0o7777;
     let time_differs = flags & flags::TIMES != 0
-        && (metadata.mtime != meta.mtime || metadata.mtime_nsec != meta.mtime_nsec);
+        && (opened.mtime(), opened.mtime_nsec() as u32) != (meta.mtime, meta.mtime_nsec);
     if !owner_differs && !mode_differs && !time_differs && meta.inode_metadata.is_none() {
         return Ok(());
     }
-    if is_link {
-        let handle = meta
-            .inode_metadata
-            .as_ref()
-            .map(|_| {
-                parent.open_metadata().with_context(|| {
-                    format!("open confined metadata handle {}", target.label.display())
-                })
-            })
-            .transpose()?;
-        if let Some(handle) = &handle {
-            require_rooted_metadata(handle, metadata, &target.label)?;
-        }
-        apply_owner_if_changed(flags, meta, metadata.uid, metadata.gid, |uid, gid| {
-            parent.chown(uid, gid)
-        })
-        .with_context(|| format!("change owner of confined path {}", target.label.display()))?;
-        // Only where setting them is known to set the link's own: an SFTP
-        // server behind SSHFS sets the target's instead.
-        if time_differs
-            && target
-                .root
-                .sets_symlink_times(parent.directory(), metadata.dev)
-        {
-            let times = [
-                timespec(0, libc::UTIME_OMIT as u32),
-                timespec(meta.mtime, meta.mtime_nsec),
-            ];
-            parent.set_times(&times).with_context(|| {
-                format!("set times on confined path {}", target.label.display())
-            })?;
-        } else if time_differs && crate::output::debug() {
-            crate::output::diagnostic!(
-                "syq: not setting the times of symlink {}: this filesystem may set its target's",
-                target.label.display()
-            );
-        }
-        if let Some(handle) = &handle {
-            crate::inode_metadata::apply(handle, meta.inode_metadata.as_deref(), meta.mode)?;
-        }
-    } else {
-        let handle = match handle {
-            Some(handle) => handle,
-            None => parent.open_metadata().with_context(|| {
-                format!("open confined metadata handle {}", target.label.display())
-            })?,
-        };
-        let opened = handle.metadata()?;
-        if opened.dev() != metadata.dev || opened.ino() != metadata.ino {
-            bail!(
-                "confined destination {} changed while opening it",
-                target.label.display()
-            );
-        }
-        require_directory(opened.is_dir())?;
-        require_open_target_known(&opened, &target.label, condition)?;
-        // Timestamp mutation is performed separately with no-follow
-        // descriptor-relative semantics. All other metadata is applied to
-        // the stable opened inode, so a raced leaf symlink cannot redirect it.
-        if time_differs {
-            let times = [
-                timespec(0, libc::UTIME_OMIT as u32),
-                timespec(meta.mtime, meta.mtime_nsec),
-            ];
-            parent.set_times(&times).with_context(|| {
-                format!("set times on confined path {}", target.label.display())
-            })?;
-        }
-        // Birth time follows mtime: macOS may lower birth time when setting
-        // an older modification time.
-        set_meta_handle_known_portable(&handle, meta, flags & !flags::TIMES, &opened)?;
-        // The final lookup resolves from Root again. Release the reused
-        // parent first so that check does not raise peak descriptor usage.
-        drop(parent);
-        return require_rooted_named_identity_known(
-            &target.root,
-            &target.relative,
-            &target.label,
-            &opened,
-            condition,
-        );
-    }
-    drop(parent);
-    let after = target.root.metadata(&target.relative)?;
-    require_rooted_identity(after, condition, &target.label)
+    set_handle_metadata(&handle, meta, flags, &opened)?;
+    // The final lookup resolves from Root again.
+    require_rooted_named_identity_known(
+        &target.root,
+        &target.relative,
+        &target.label,
+        &opened,
+        condition,
+    )
 }
 
 /// The target an operation on `path` resolves to, as `apply_one` resolves it.
@@ -782,7 +896,7 @@ pub(super) fn new_file_group_may_differ(
 
 /// Whether an object created in a directory with `parent`'s group and mode
 /// might start with a group other than `group`.
-fn group_may_differ(parent: Option<(u32, u32)>, group: u32) -> bool {
+pub(super) fn group_may_differ(parent: Option<(u32, u32)>, group: u32) -> bool {
     let Some((parent_group, parent_mode)) = parent else {
         return true;
     };
@@ -960,34 +1074,6 @@ pub(super) fn create_rooted_directory_or_existing(
             Ok(None)
         }
         Err(error) => Err(error),
-    }
-}
-
-pub(super) fn require_rooted_identity(
-    metadata: RootMetadata,
-    condition: TargetCondition,
-    label: &Path,
-) -> Result<()> {
-    match condition {
-        TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => {
-            bail!(
-                "destination {} appeared before metadata update",
-                label.display()
-            )
-        }
-        TargetCondition::Matches { dev, ino }
-        | TargetCondition::MatchesFingerprint { dev, ino, .. }
-            if (metadata.dev, metadata.ino) == (dev, ino) =>
-        {
-            Ok(())
-        }
-        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            bail!(
-                "destination {} changed during metadata update",
-                label.display()
-            )
-        }
     }
 }
 

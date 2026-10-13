@@ -60,11 +60,6 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.no_tcp_encryption {
         bail!("command-restricted transfers require encrypted data connections");
     }
-    if args.inplace && (args.only_new_native_entries() || args.existing) {
-        bail!(
-            "--inplace cannot be combined with --only-new or --only-existing on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
-        );
-    }
     // Range-check every ceiling here, before automatic enrollment can touch
     // hostB, rather than leaving it to grant validation after the fact.
     if args
@@ -218,7 +213,7 @@ pub(super) fn grant_for(
                 existing,
                 deletion,
                 publication: if args.inplace {
-                    PublicationPolicy::InPlace
+                    PublicationPolicy::InPlaceNew
                 } else {
                     PublicationPolicy::AtomicStaged
                 },

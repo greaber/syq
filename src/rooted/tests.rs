@@ -504,9 +504,11 @@ fn staged_type_replacements_preserve_old_entries_on_failure() {
     fs::write(tree.path().join("item"), b"previous contents").unwrap();
     let root = Root::open(tree.path()).unwrap();
     let path = relative(b"item");
-    let error = root.replace_entry(&path, |_, _| {
-        Err(io::Error::from_raw_os_error(libc::ENOSPC))
-    });
+    let error = root.replace_entry(
+        &path,
+        |_, _| Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+        |_, _| Ok(()),
+    );
     assert!(error.is_err());
     assert_eq!(
         fs::read(tree.path().join("item")).unwrap(),
