@@ -76,6 +76,7 @@ fn serve(mut stream: TrackedStream, key: &PrivateKey) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use signature::Verifier;
     use ssh_agent_lib::proto::{Request, SignRequest};
     use ssh_agent_lib::ssh_encoding::Decode;
     use std::os::unix::net::UnixStream;
