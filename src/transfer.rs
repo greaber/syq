@@ -231,7 +231,17 @@ pub struct Opts {
     /// reuse would compare, and copy the rest.
     pub hash_or_copy: bool,
     pub precise_mtime: bool,
+    /// The destination keeps modification times in two-second steps (FAT),
+    /// so they are compared at that granularity. Set once the destination
+    /// filesystem is known.
+    pub two_second_mtimes: AtomicBool,
+    /// Symlink times are compared: the destination sets a symlink's own
+    /// times. Cleared once a destination filesystem that leaves them alone
+    /// is known, as where setting them would set the target's instead.
+    pub symlink_times: AtomicBool,
     pub inplace: bool,
+    /// The placement requires a new destination (`--as-new`, `--into-new`).
+    pub new_target: bool,
     pub same_host: bool,
     /// Automatic copies and explicit -j1 may use one direct userspace writer
     /// for the proven local-filesystem -> asynchronous-NFS topology.
@@ -252,6 +262,8 @@ pub struct Opts {
     pub delete_excluded: bool,
     /// --max-delete: delete nothing if more than this many deletions are planned.
     pub max_delete: Option<u64>,
+    /// The approving machine's --max-delete is the one in effect.
+    pub max_delete_from_approver: bool,
     /// -u: skip files that are newer on the destination.
     pub update: bool,
     /// --ignore-existing: never touch a destination path that already exists.
@@ -376,9 +388,10 @@ impl Opts {
         let flags = self.matching_flags_for(path);
         let mut changes = 0;
         if flags & flags::TIMES != 0
-            && (source.mtime != destination.mtime
-                || (self.precise_mtime
-                    && !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+            && !self.mtime_matches(
+                (source.mtime, source.mtime_nsec),
+                (destination.mtime, destination.mtime_nsec),
+            )
         {
             changes |= flags::TIMES;
         }
@@ -411,9 +424,31 @@ impl Opts {
             && destination.kind == Kind::File
             && destination.size == source.size
             && self.flags & flags::TIMES != 0
-            && destination.mtime == source.mtime
-            && (!self.precise_mtime
-                || destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec))
+            && self.mtime_matches(
+                (source.mtime, source.mtime_nsec),
+                (destination.mtime, destination.mtime_nsec),
+            )
+    }
+
+    pub(crate) fn two_second_mtimes(&self) -> bool {
+        self.two_second_mtimes.load(Relaxed)
+    }
+
+    pub(crate) fn symlink_times(&self) -> bool {
+        self.symlink_times.load(Relaxed)
+    }
+
+    /// Whether a destination modification time records the source's, at the
+    /// precision the destination keeps: whole seconds and the significant
+    /// fraction digits the destination shows, or on FAT, which keeps
+    /// two-second steps, within a second either way (as rsync's
+    /// `--modify-window=1`).
+    pub(crate) fn mtime_matches(&self, source: (i64, u32), destination: (i64, u32)) -> bool {
+        if self.two_second_mtimes() {
+            return two_second_mtime_matches(source.0, destination.0);
+        }
+        source.0 == destination.0
+            && (!self.precise_mtime || destination_fraction_matches(source.1, destination.1))
     }
 
     fn expected_for(&self, path: &[u8]) -> Option<&crate::hashing::Digest> {
@@ -2332,7 +2367,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,
         precise_mtime: !matches!(args.placement, Placement::Rsync),
+        two_second_mtimes: Default::default(),
+        symlink_times: AtomicBool::new(true),
         inplace: args.inplace,
+        new_target: args.target_existence == Existence::New,
         same_host: !src_ep.is_remote() && !dst_ep.is_remote(),
         allow_sequential_nfs_fallback: args.connections_default || args.connections == 1,
         src_remote: src_ep.is_remote(),
@@ -2347,6 +2385,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         delete: args.delete,
         delete_excluded: args.delete_excluded,
         max_delete: args.max_delete,
+        max_delete_from_approver: args.max_delete_from_approver,
         expressions: args.expressions.clone(),
         update: args.update,
         ignore_existing: args.ignore_existing,
@@ -3488,6 +3527,28 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let destination_filesystem = initial_destination_filesystem
         .as_ref()
         .and_then(|info| info.filesystem.clone());
+    #[cfg(debug_assertions)]
+    let test_two_second_mtimes = std::env::var_os("SYQ_TEST_TWO_SECOND_MTIMES").is_some();
+    #[cfg(not(debug_assertions))]
+    let test_two_second_mtimes = false;
+    if test_two_second_mtimes
+        || destination_filesystem
+            .as_ref()
+            .is_some_and(|filesystem| crate::fsops::kind_has_two_second_mtimes(&filesystem.kind))
+    {
+        opts.two_second_mtimes.store(true, Relaxed);
+    }
+    #[cfg(debug_assertions)]
+    let test_symlink_times_follow = std::env::var_os("SYQ_TEST_SYMLINK_TIMES_FOLLOW").is_some();
+    #[cfg(not(debug_assertions))]
+    let test_symlink_times_follow = false;
+    if test_symlink_times_follow
+        || destination_filesystem
+            .as_ref()
+            .is_some_and(|filesystem| !crate::fsops::kind_sets_symlink_times(&filesystem.kind))
+    {
+        opts.symlink_times.store(false, Relaxed);
+    }
     let network_destination = initial_destination_filesystem
         .as_ref()
         .is_some_and(|info| info.network);
@@ -4510,9 +4571,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             && jobs.iter().enumerate().all(|(idx, job)| {
                                 job.entry.size <= fast_file_size_limit(&opts, None)
                                     && jobs.destination(idx).is_none()
-                                    && (!opts.inplace
-                                        || (job.target_condition == TargetCondition::Any
-                                            && job.container_guard.is_none()))
+                                    && (!opts.inplace || job.inplace)
                             }),
                         jobs.len(),
                         jobs.iter()
@@ -4864,7 +4923,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             print_transfer_summary(
                 &terminal,
                 elapsed,
-                &deletion_summary(delete_plan, deleted, opts.max_delete),
+                &deletion_summary(
+                    delete_plan,
+                    deleted,
+                    opts.max_delete,
+                    opts.max_delete_from_approver,
+                ),
             );
         }
     }
@@ -5661,14 +5725,27 @@ fn special_creation_supported(destination_supports_sockets: bool, kind: Kind) ->
     kind != Kind::Socket || destination_supports_sockets
 }
 
-fn metadata_differs(source: &Meta, destination: &Meta, flags: u8) -> bool {
+/// `two_second` compares modification times as on FAT (see
+/// `Opts::mtime_matches`).
+fn metadata_differs(source: &Meta, destination: &Meta, flags: u8, two_second: bool) -> bool {
     (source.inode_metadata.is_some() && source.inode_metadata != destination.inode_metadata)
         || (flags & flags::MODE != 0 && source.mode & 0o7777 != destination.mode & 0o7777)
         || (flags & flags::OWNER != 0 && source.uid != destination.uid)
         || (flags & flags::GROUP != 0 && source.gid != destination.gid)
         || (flags & flags::TIMES != 0
-            && (source.mtime != destination.mtime
-                || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)))
+            && if two_second {
+                !two_second_mtime_matches(source.mtime, destination.mtime)
+            } else {
+                source.mtime != destination.mtime
+                    || !destination_fraction_matches(source.mtime_nsec, destination.mtime_nsec)
+            })
+}
+
+/// FAT stores an even number of seconds: Linux and macOS round a written
+/// time down to one, other systems may round it up. Either way it stays
+/// within a second of the time written.
+fn two_second_mtime_matches(source: i64, destination: i64) -> bool {
+    source.abs_diff(destination) <= 1
 }
 
 fn publication_metadata_flags(requested: u8) -> u8 {

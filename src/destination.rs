@@ -110,6 +110,9 @@ pub(crate) struct Approved {
     pub request: crate::delegation::RequestId,
     pub digest: [u8; 32],
     pub receipt_key: String,
+    /// The approving machine's own deletion limit for this copy, when it has
+    /// one. Both machines run the same build.
+    pub max_delete: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -811,12 +814,16 @@ fn resolve_destination(cwd: &Path, root: Option<&Path>, path: &[u8]) -> Result<(
     Ok((destination, container))
 }
 
+/// Fit `request` within this machine's limits at `destination`, or refuse it.
+/// `dry_run_prunes` marks a dry run of a pruning copy, which is refused
+/// where pruning is off, as the copy itself would be.
 fn constrain(
     mut request: CopyRequest,
     destination: &Path,
     max_bytes: u64,
     max_entries: u64,
     max_delete: u64,
+    dry_run_prunes: bool,
 ) -> Result<CopyRequest> {
     if request.copy.mutation_scopes.len() > 1024 {
         bail!("too many copy scopes");
@@ -833,12 +840,16 @@ fn constrain(
     if request.copy.policy.publication == crate::delegation::PublicationPolicy::InPlace {
         bail!("named destinations do not accept --inplace");
     }
-    if request.copy.limits.max_deletions > max_delete {
-        bail!("requested deletion limit exceeds laptop --max-delete={max_delete}");
-    }
     request.copy.limits.max_total_bytes = request.copy.limits.max_total_bytes.min(max_bytes);
     request.copy.limits.max_file_bytes = request.copy.limits.max_file_bytes.min(max_bytes);
     request.copy.limits.max_entries = request.copy.limits.max_entries.min(max_entries);
+    let ceiling = deletion_ceiling(&request, max_delete);
+    request.copy.limits.max_deletions = request.copy.limits.max_deletions.min(ceiling);
+    let prunes = dry_run_prunes
+        || request.copy.policy.deletion == crate::delegation::DeletionPolicy::DeleteDestinationOnly;
+    if prunes && ceiling == 0 {
+        bail!("pruning needs a positive --max-delete on the approving machine: `syq persist receive on --max-delete N`");
+    }
     request.copy.limits.max_connections = request
         .copy
         .limits
@@ -847,19 +858,32 @@ fn constrain(
     Ok(request)
 }
 
+/// The most deletions a copy constrained by [`constrain`] may make here:
+/// this machine's own --max-delete, within the copy's entry limit. A pruning
+/// grant enforces it, or the sender's own --max-delete if lower. The
+/// approval carries it to the sender, which refuses every deletion when it
+/// plans more. A dry run's read-only grant deletes nothing, but its reply
+/// carries this too, so the dry run plans against what a real run would get.
+fn deletion_ceiling(request: &CopyRequest, max_delete: u64) -> u64 {
+    max_delete.min(request.copy.limits.max_entries)
+}
+
 /// The SSH destination a copy through the receiving machine's access would use.
 pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
 }
 
-/// A receiving machine's own --max-delete bounds pruning it approves, and the
-/// sender cannot see that limit. The sending command states a ceiling within
-/// it, so that the sender refuses all deletions above it, as any --max-delete.
-pub(crate) fn require_deletion_ceiling(args: &crate::cli::Args) -> Result<()> {
-    if !args.dry_run && args.delete && args.max_delete.is_none() {
-        bail!("pruning through a receiving machine needs an explicit --max-delete, no higher than that machine's own");
+/// Plan deletions against the approving machine's own --max-delete, or the
+/// command's if lower, so that pruning stays all or nothing, and note when
+/// the machine's limit is the one in effect.
+fn apply_deletion_limit(args: &mut crate::cli::Args, approved: &Approved) {
+    let Some(limit) = approved.max_delete.filter(|_| args.delete) else {
+        return;
+    };
+    if args.max_delete.is_none_or(|stated| limit < stated) {
+        args.max_delete = Some(limit);
+        args.max_delete_from_approver = true;
     }
-    Ok(())
 }
 
 pub(crate) fn is_named(grant: &Option<String>) -> bool {
@@ -1028,7 +1052,6 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             recipient_public_key: public,
         },
     };
-    require_deletion_ceiling(args)?;
     let request = crate::restricted::named_request(args, policy.clone())?;
     crate::output::diagnostic!("syq: requesting permission from @{name} (up to 300 seconds; approve on the receiving machine with its desktop prompt or syq persist receive pending)");
     let (_, reply) = exchange(
@@ -1044,6 +1067,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let Reply::Approved(approved) = reply else {
         bail!("unexpected named destination response");
     };
+    apply_deletion_limit(args, &approved);
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.locations.last_mut().unwrap().host = Some(format!("@{name}"));
     args.restricted_grant = Some(format!(
@@ -1317,7 +1341,9 @@ impl Receiver {
                     self.max_bytes,
                     self.max_entries,
                     self.max_delete,
+                    crate::approval_command::dry_run_prunes(&command)?,
                 )?;
+                let max_delete = deletion_ceiling(&request, self.max_delete);
                 {
                     let mut sessions = self.sessions.lock().unwrap();
                     sessions.retain(|_, s| s.opened || s.issued.elapsed() < START_TIMEOUT);
@@ -1376,6 +1402,7 @@ impl Receiver {
                     bail!("copy disconnected before approval could be used");
                 }
                 approved.token = random_token()?;
+                approved.max_delete = Some(max_delete);
                 sessions.insert(
                     approved.token.clone(),
                     Session {

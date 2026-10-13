@@ -2108,23 +2108,37 @@ impl Planner<'_> {
         ops: &mut LeafOps,
     ) {
         let requested = self.opts.mapping_metadata.get(rel);
-        let flags = self.opts.matching_flags_for(rel);
+        let mut flags = self.opts.matching_flags_for(rel);
+        // Where the destination leaves symlink times alone, as rsync does
+        // when it cannot set them, they are not compared either, so that a
+        // rerun finds nothing to change.
+        let link_times = source.kind != Kind::Symlink || self.opts.symlink_times();
+        if !link_times {
+            flags &= !flags::TIMES;
+        }
         if flags == 0 && source.inode_metadata.is_none() {
             return;
         }
         let meta = self.opts.metadata_for(rel, source);
         // Explicit nanoseconds must be attempted even if preservation's quick
         // comparison would tolerate truncation by the destination filesystem.
-        let time_differs = requested.is_some_and(|r| r.mtime.is_some())
+        let time_differs = link_times
+            && requested.is_some_and(|r| r.mtime.is_some())
             && (meta.mtime, meta.mtime_nsec) != (destination.mtime, destination.mtime_nsec);
         // Comparing a symlink target can change its access time after the
         // destination stat. Even matching captured times need restoration.
         let restore_link_atime = source.kind == Kind::Symlink
+            && link_times
             && self.opts.inode_preservation.atimes
             && !self.opts.dry_run;
         if !time_differs
             && !restore_link_atime
-            && !metadata_differs(&meta, &destination.meta(), flags)
+            && !metadata_differs(
+                &meta,
+                &destination.meta(),
+                flags,
+                self.opts.two_second_mtimes(),
+            )
         {
             return;
         }
@@ -2152,6 +2166,7 @@ impl Planner<'_> {
                     meta,
                     flags,
                     condition: target_identity(destination),
+                    directory: false,
                 },
                 rel.to_vec(),
                 if source.kind == Kind::Symlink {
@@ -2276,6 +2291,7 @@ impl Planner<'_> {
             path: dst_path,
             meta: opts.metadata_for(&dst_rel, &e),
             flags: opts.flags_for(&dst_rel) & !flags::MODE,
+            directory: false,
         });
     }
 
@@ -2396,6 +2412,7 @@ impl Planner<'_> {
             path: dst_path,
             meta,
             flags,
+            directory: false,
         });
     }
 
@@ -2638,6 +2655,7 @@ impl Planner<'_> {
                         ino: d.ino,
                     },
                 ),
+                directory: true,
             };
             // A private root changes group only after this batch's
             // subdirectories have inherited its starting group, as they would
@@ -2686,6 +2704,7 @@ impl Planner<'_> {
             },
             flags: flags::RECEIVER_MODE,
             condition,
+            directory: true,
         }])?;
         Ok(())
     }
@@ -2914,8 +2933,12 @@ impl Planner<'_> {
                 Some(d)
                     if !opts.preserve_existing_directory_metadata
                         && !self.unselected_dirs.contains(p)
-                        && (metadata_differs(&meta, &d.meta(), meta_flags)
-                            || opts.metadata_fix_flags(dst_rel, e, d) != 0)
+                        && (metadata_differs(
+                            &meta,
+                            &d.meta(),
+                            meta_flags,
+                            opts.two_second_mtimes(),
+                        ) || opts.metadata_fix_flags(dst_rel, e, d) != 0)
                         && !self.implicit_dirs.contains(p) =>
                 {
                     self.dry_run_changes.metadata_directories.insert(p.clone());
@@ -3009,13 +3032,22 @@ impl Planner<'_> {
                     None => {}
                 }
             }
-            self.deferred.push((
-                p.clone(),
-                meta,
-                flags,
-                depth,
-                self.metadata_condition_for(p),
-            ));
+            // An existing directory's final metadata goes only to the
+            // directory the scan found there. One this copy created is held
+            // only to being a directory (`Op::SetMeta::directory`).
+            let condition = match (self.metadata_condition_for(p), s) {
+                (TargetCondition::Any, Some(found))
+                    if found.kind == Kind::Dir && !self.created_dirs.contains(p) =>
+                {
+                    TargetCondition::Matches {
+                        dev: found.dev,
+                        ino: found.ino,
+                    }
+                }
+                (condition, _) => condition,
+            };
+            self.deferred
+                .push((p.clone(), meta, flags, depth, condition));
         }
         Ok(())
     }
@@ -3494,6 +3526,14 @@ impl Planner<'_> {
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
+        // A file that must be new (an --as-new file, or a new file the error
+        // policies protect) has nothing to update in place: it is staged and
+        // published without replacing anything, so readers see no partial
+        // file and a retry finishes what an interrupted attempt left.
+        let inplace = self.opts.inplace
+            && target_condition == TargetCondition::Any
+            && !(self.opts.new_target && dst == self.dst_root)
+            && self.container_guard.is_none();
         let src_rel = self.mapping_source_rel(&rel_bytes);
         let scanned = match &dst_entry {
             Some(d) if d.kind == Kind::File => {
@@ -3521,9 +3561,7 @@ impl Planner<'_> {
                 container_guard: self.container_guard.clone(),
                 attempt: 0,
                 done: Arc::new(AtomicU64::new(0)),
-                inplace: self.opts.inplace
-                    && target_condition == TargetCondition::Any
-                    && self.container_guard.is_none(),
+                inplace,
                 src_rel,
                 scanned,
             },
@@ -4009,9 +4047,15 @@ impl Planner<'_> {
         self.progress.deletions_planned.store(planned, Relaxed);
         if let Some(max) = opts.max_delete {
             if planned > max {
-                self.progress.eprintln(&format!(
-                    "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
-                ));
+                self.progress.eprintln(&if opts.max_delete_from_approver {
+                    format!(
+                        "syq: {planned} deletions planned, more than the {max} the approving machine allows; deleting nothing (its --max-delete and --max-entries both limit pruning; raise them there with `syq persist receive on`)"
+                    )
+                } else {
+                    format!(
+                        "syq: {planned} deletions planned, more than --max-delete {max}; deleting nothing"
+                    )
+                });
                 if let Some(results) = self.progress.results_writer().filter(|_| !opts.dry_run) {
                     let blocked = leaves
                         .iter()
@@ -4628,6 +4672,14 @@ impl Planner<'_> {
         }
         d.retain(|(_, _, flags, _, _)| *flags != 0);
         d.sort_by(|a, b| b.3.cmp(&a.3));
+        #[cfg(debug_assertions)]
+        if !d.is_empty() {
+            crate::fsops::test_race_barrier(
+                "SYQ_TEST_DIRECTORY_METADATA_READY_FILE",
+                "SYQ_TEST_DIRECTORY_METADATA_CONTINUE_FILE",
+                "final directory metadata",
+            )?;
+        }
         let mut pending = d.as_slice();
         while !pending.is_empty() {
             let (chunk, rest) = pending.split_at(directory_metadata_batch_len(pending));
@@ -4639,6 +4691,7 @@ impl Planner<'_> {
                     meta: m.clone(),
                     flags: *f,
                     condition: *condition,
+                    directory: true,
                 })
                 .collect();
             let errors = self.apply(ops)?;

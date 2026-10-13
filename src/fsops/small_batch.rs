@@ -2684,6 +2684,30 @@ mod tests {
         }
     }
 
+    /// A put that cannot be published, as a new name that now exists, does
+    /// not leave its staged file behind.
+    #[test]
+    fn a_refused_publication_leaves_no_staging_file() {
+        for batched in [false, true] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            fs::write(temporary.path().join("file"), b"existing").unwrap();
+            let mut put = put("file", b"new contents");
+            put.condition = TargetCondition::Absent;
+            let mut ops = receiver(temporary.path());
+            let result = if batched {
+                ops.put_small_batch(&mut [put]).pop().unwrap()
+            } else {
+                ops.put_small(&put).map_err(|error| wire_error(&error))
+            };
+            assert!(result.is_err(), "{batched}");
+            assert_eq!(
+                fs::read(temporary.path().join("file")).unwrap(),
+                b"existing"
+            );
+            assert_eq!(entries(temporary.path()), 1, "{batched}");
+        }
+    }
+
     /// Publication exchanges the sidecar with the target it observed. When
     /// another writer replaced the target first, the exchange leaves that
     /// writer's file at the sidecar name. A retry must never write into it:

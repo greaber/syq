@@ -60,13 +60,9 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if args.no_tcp_encryption {
         bail!("command-restricted transfers require encrypted data connections");
     }
-    if args.inplace
-        && (args.only_new_native_entries()
-            || args.existing
-            || (args.target_existence == Existence::New && args.placement == Placement::As))
-    {
+    if args.inplace && (args.only_new_native_entries() || args.existing) {
         bail!(
-            "--inplace cannot be combined with --only-new, --only-existing, or --as-new on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
+            "--inplace cannot be combined with --only-new or --only-existing on the command-restricted path: in-place writes open the final pathname directly, so the receiver can neither make them no-replace nor pin them to an observed object"
         );
     }
     // Range-check every ceiling here, before automatic enrollment can touch
@@ -110,6 +106,13 @@ pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Whether `args` asks to delete destination extras. `--max-delete 0` means
+/// nothing may be deleted, which a grant states directly as a forbidding
+/// policy rather than a zero budget.
+pub(crate) fn requests_pruning(args: &Args) -> bool {
+    args.delete && args.max_delete != Some(0)
+}
+
 pub(super) fn grant_for(
     args: &Args,
     sources: &[Location],
@@ -120,9 +123,7 @@ pub(super) fn grant_for(
     validate_restricted_args(args)?;
     let issued_at = now()?;
     let read_only = args.dry_run;
-    // `--max-delete 0` means nothing may be deleted, which the grant states
-    // directly as a forbidding policy rather than a zero budget.
-    let deletion = if !read_only && args.delete && args.max_delete != Some(0) {
+    let deletion = if !read_only && requests_pruning(args) {
         DeletionPolicy::DeleteDestinationOnly
     } else {
         DeletionPolicy::Forbid
@@ -550,6 +551,7 @@ pub(crate) fn named_authority(
         request: request_id,
         digest,
         receipt_key: key.public_key().to_openssh()?,
+        max_delete: None,
     };
     let authority = RestrictedAuthority::new(
         &config,

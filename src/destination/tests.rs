@@ -360,7 +360,7 @@ fn named_destination_allows_128_workers_and_preserves_smaller_allowances() {
     for (requested, expected) in [(2, 2), (32, 32), (64, 64), (128, 128), (256, 128)] {
         let mut request = request.clone();
         request.copy.limits.max_connections = requested;
-        let constrained = constrain(request, temporary.path(), 1000, 1000, 0).unwrap();
+        let constrained = constrain(request, temporary.path(), 1000, 1000, 0, false).unwrap();
         assert_eq!(constrained.copy.limits.max_connections, expected);
     }
 }
@@ -368,6 +368,20 @@ fn named_destination_allows_128_workers_and_preserves_smaller_allowances() {
 pub(super) fn broker(
     root: &Path,
     approval: Approval,
+) -> (
+    PrivateBroker,
+    Arc<Receiver>,
+    Registration,
+    mpsc::Receiver<Prompt>,
+) {
+    broker_with_max_delete(root, approval, 0)
+}
+
+/// The same, permitting pruning of up to `max_delete` entries per copy.
+fn broker_with_max_delete(
+    root: &Path,
+    approval: Approval,
+    max_delete: u64,
 ) -> (
     PrivateBroker,
     Arc<Receiver>,
@@ -392,7 +406,7 @@ pub(super) fn broker(
         secret: random_token().unwrap(),
         max_bytes: 10_000_000,
         max_entries: 1000,
-        max_delete: 0,
+        max_delete,
         approval,
         prompts,
         sessions: Mutex::new(HashMap::new()),
@@ -947,23 +961,185 @@ fn named_copy_accepts_ownership_and_special_files() {
 }
 
 #[test]
-fn named_requests_keep_inplace_refused_and_need_a_stated_deletion_ceiling() {
+fn named_requests_keep_inplace_refused_and_prune_within_the_machines_limit() {
     let temporary = crate::test_support::tempdir().unwrap();
     let mut inplace = args(&temporary.path().join("source"), "output");
     inplace.inplace = true;
-    let (request, _) = request(&inplace);
-    let error = constrain(request, temporary.path(), 1000, 1000, 0).unwrap_err();
+    let (refused, _) = request(&inplace);
+    let error = constrain(refused, temporary.path(), 1000, 1000, 0, false).unwrap_err();
     assert!(error.to_string().contains("--inplace"), "{error:#}");
 
+    // Without --max-delete, the request may delete what this machine allows.
     let mut pruning = args(&temporary.path().join("source"), "output");
     pruning.delete = true;
-    let error = require_deletion_ceiling(&pruning).unwrap_err();
-    assert!(error.to_string().contains("--max-delete"), "{error:#}");
-    pruning.max_delete = Some(3);
-    require_deletion_ceiling(&pruning).unwrap();
-    pruning.max_delete = None;
-    pruning.dry_run = true;
-    require_deletion_ceiling(&pruning).unwrap();
+    let (prune, _) = request(&pruning);
+    let error = constrain(prune.clone(), temporary.path(), 1000, 1000, 0, false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("pruning needs a positive --max-delete"),
+        "{error:#}"
+    );
+    let constrained = constrain(prune.clone(), temporary.path(), 1000, 1000, 5, false).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 5);
+    let constrained = constrain(prune.clone(), temporary.path(), 1000, 3, 5, false).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 3);
+    // The approval carries the ceiling that bounds the grant, for a dry
+    // run's read-only grant too, whose own limit is zero.
+    let mut stated = pruning.clone();
+    stated.max_delete = Some(2);
+    let (lower, _) = request(&stated);
+    let constrained = constrain(lower, temporary.path(), 1000, 1000, 5, false).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 2);
+    assert_eq!(deletion_ceiling(&constrained, 5), 5);
+    let mut preview = pruning.clone();
+    preview.dry_run = true;
+    let (preview, _) = request(&preview);
+    let constrained = constrain(preview, temporary.path(), 1000, 3, 5, false).unwrap();
+    assert_eq!(constrained.copy.limits.max_deletions, 0);
+    assert_eq!(deletion_ceiling(&constrained, 5), 3);
+
+    // The sender plans against the machine's limit, or its own if lower.
+    let approved = Approved {
+        token: String::new(),
+        destination: Vec::new(),
+        enrollment: crate::enrollment::EnrollmentId::random(),
+        request: crate::delegation::RequestId::fresh(1).unwrap(),
+        digest: [0; 32],
+        receipt_key: String::new(),
+        max_delete: None,
+    };
+    for (stated, machine, planned, from_machine) in [
+        (None, Some(5), Some(5), true),
+        (Some(3), Some(5), Some(3), false),
+        (Some(9), Some(5), Some(5), true),
+        (None, None, None, false),
+        (Some(9), None, Some(9), false),
+    ] {
+        let mut approved = approved.clone();
+        approved.max_delete = machine;
+        pruning.max_delete = stated;
+        pruning.max_delete_from_approver = false;
+        apply_deletion_limit(&mut pruning, &approved);
+        assert_eq!(
+            (pruning.max_delete, pruning.max_delete_from_approver),
+            (planned, from_machine),
+            "{stated:?} {machine:?}"
+        );
+    }
+}
+
+/// Pruning stays all or nothing against the receiving machine's own limit:
+/// more planned deletions than it allows remove nothing, as any --max-delete.
+#[test]
+fn named_pruning_plans_against_the_receiving_machines_limit() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    for name in ["kept", "extra-1", "extra-2"] {
+        fs::write(root.join("source").join(name), b"old").unwrap();
+    }
+    {
+        let (_broker, _receiver, registration, _) =
+            broker_with_max_delete(&root, Approval::Always, 1);
+        assert_eq!(named_copy(&registration, &source, &["--prune"]), 25);
+        assert!(root.join("source/extra-1").exists());
+        assert!(root.join("source/extra-2").exists());
+    }
+    let (_broker, _receiver, registration, _) = broker_with_max_delete(&root, Approval::Always, 2);
+    assert_eq!(named_copy(&registration, &source, &["--prune"]), 0);
+    assert!(!root.join("source/extra-1").exists());
+    assert!(!root.join("source/extra-2").exists());
+    assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"kept");
+}
+
+/// A dry run asks for a read-only grant, which deletes nothing, yet it
+/// plans against the limit a real run would get: the machine's own.
+#[test]
+fn a_named_pruning_dry_run_plans_against_the_machines_limit() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    for name in ["kept", "extra-1", "extra-2"] {
+        fs::write(root.join("source").join(name), b"old").unwrap();
+    }
+    {
+        let (_broker, _receiver, registration, _) =
+            broker_with_max_delete(&root, Approval::Always, 100);
+        assert_eq!(
+            named_copy(&registration, &source, &["--prune", "--dry-run"]),
+            0
+        );
+    }
+    let (_broker, _receiver, registration, _) = broker_with_max_delete(&root, Approval::Always, 1);
+    assert_eq!(
+        named_copy(&registration, &source, &["--prune", "--dry-run"]),
+        25
+    );
+    for name in ["extra-1", "extra-2"] {
+        assert!(root.join("source").join(name).exists());
+    }
+    assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"old");
+}
+
+/// Pruning is off until the machine sets a positive --max-delete. A pruning
+/// copy is refused before it is approved, and a dry run of it is refused the
+/// same way, even with nothing to delete, so that it predicts the copy.
+#[test]
+fn a_named_pruning_dry_run_is_refused_where_pruning_is_off() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir_all(root.join("source")).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    fs::write(root.join("source/kept"), b"kept").unwrap();
+    let (_broker, _receiver, registration, _) = broker_with_max_delete(&root, Approval::Always, 0);
+    let reply = |options: &[&str]| {
+        let (command, request, _) = requested(&source, options);
+        exchange(
+            &registration,
+            Message::Request {
+                cwd: String::new(),
+                command,
+                request: Box::new(request),
+            },
+            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
+        )
+        .map(|(_, reply)| reply)
+    };
+    let refusal = |options: &[&str]| match reply(options) {
+        Err(error) => format!("{error:#}"),
+        Ok(_) => panic!("{options:?} was approved"),
+    };
+    let copy = refusal(&["--prune"]);
+    assert!(
+        copy.contains("pruning needs a positive --max-delete"),
+        "{copy}"
+    );
+    assert_eq!(refusal(&["--prune", "--dry-run"]), copy);
+    // A dry run that does not prune, or whose own --max-delete 0 already
+    // forbids deletions, is approved, as the copy would be.
+    for options in [
+        &["--dry-run"][..],
+        &["--prune", "--max-delete", "0", "--dry-run"],
+    ] {
+        assert!(
+            matches!(reply(options), Ok(Reply::Approved(_))),
+            "{options:?}"
+        );
+    }
+    assert!(matches!(
+        reply(&["--prune", "--max-delete", "0"]),
+        Ok(Reply::Approved(_))
+    ));
 }
 
 #[test]
@@ -1001,6 +1177,8 @@ fn named_copy(registration: &Registration, source: &Path, options: &[&str]) -> i
     let mut args = crate::approval_command::parse(&command).unwrap();
     let policy = request.constraints.receipt_policy.clone();
     let approved = approve(registration, command, request);
+    // As `prepare` does with the approval.
+    apply_deletion_limit(&mut args, &approved);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
     args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));

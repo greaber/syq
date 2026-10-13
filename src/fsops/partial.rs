@@ -3810,7 +3810,7 @@ pub(super) fn publish_partial_rooted(
     let staged_dev = metadata.dev();
     let staged_ino = metadata.ino();
     let staged_identity = (staged_dev, staged_ino);
-    match condition {
+    let published = match condition {
         TargetCondition::Any => root.rename_regular_if_same(source, target, staged_identity),
         TargetCondition::Absent => root.publish_new_regular(source, target, staged_identity),
         TargetCondition::Matches { dev, ino } => {
@@ -3829,7 +3829,20 @@ pub(super) fn publish_partial_rooted(
             ino,
             Some((ctime, ctime_nsec)),
         ),
-    }?;
+    };
+    if let Err(error) = published {
+        // What could not be published goes as an interrupted receiver's
+        // sweep would remove it; a partial worth resuming stays for a later
+        // copy. Only the staged file itself is removed: a name that now
+        // holds another entry, such as one a failed replacement kept, is
+        // left alone.
+        if sidecars::discard_unpublished(staged_identity, metadata.len())
+            && root.unlink_if_same_regular(source, staged_identity)
+        {
+            sidecars::forget(staged_identity);
+        }
+        return Err(error);
+    }
     sidecars::forget(staged_identity);
     if let Some(owned) = owned {
         owned.record(&metadata);

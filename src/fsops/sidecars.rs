@@ -268,6 +268,17 @@ impl Registry {
         }
     }
 
+    /// What the registered sidecar with this identity holds, if any.
+    pub(super) fn kind(&self, identity: (u64, u64)) -> Option<Sidecar> {
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let own = thread_shard();
+        std::iter::once(own)
+            .chain((0..SHARDS).filter(|shard| *shard != own))
+            .find_map(|shard| self.lock(shard).get(&identity).map(|entry| entry.kind))
+    }
+
     /// Stop creating sidecars and remove those registered: stages, and
     /// partials too short to resume when `partials` is set. Other partials
     /// stay registered for a later sweep that includes them. Removal stops
@@ -401,6 +412,17 @@ pub(super) fn begin() -> Result<Creation<'static>> {
 /// The sidecar with this identity was published or removed.
 pub(super) fn forget(identity: (u64, u64)) {
     SIDECARS.forget(identity)
+}
+
+/// Whether a sidecar that could not be published goes, as a sweep would
+/// remove it: a stage, or a partial too short to resume. A partial worth
+/// resuming stays for a later copy to reuse. A process that does not
+/// register its sidecars knows only the length.
+pub(super) fn discard_unpublished(identity: (u64, u64), len: u64) -> bool {
+    match SIDECARS.kind(identity) {
+        Some(Sidecar::Stage) => true,
+        Some(Sidecar::Partial) | None => len < RESUMABLE_PARTIAL_MIN,
+    }
 }
 
 /// Register this process's sidecars from now on: it serves one copy and

@@ -634,6 +634,10 @@ pub enum Op {
         meta: Meta,
         flags: u8,
         condition: TargetCondition,
+        /// A directory's metadata: the receiver refuses anything else at
+        /// `path`, so that an object put there in place of the directory
+        /// never takes the directory's owner, group or mode.
+        directory: bool,
     },
     /// Apply metadata to a regular file only if the path still satisfies the
     /// planner's condition.

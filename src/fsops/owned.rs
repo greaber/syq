@@ -9,7 +9,9 @@
 //! Checking the link's identity before linking needs no lock held across
 //! the link. The publication links only the file with that identity: on
 //! Linux through the descriptor it opened and checked, elsewhere checking
-//! the new link before publishing it. Nor can any other step such a grant
+//! the new link before publishing it. Both checks compare inode numbers, so
+//! where a filesystem's numbers cannot show which file a name leads to
+//! (`fsops::Profile::link_counts_trusted`), the link is refused. Nor can any other step such a grant
 //! permits make a name lead to an existing file: the names of existing
 //! objects are never replaced, existing objects are never renamed, and
 //! every link leads to a recorded file. A name this grant created therefore
