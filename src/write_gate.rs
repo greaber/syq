@@ -1,5 +1,7 @@
 //! Serialize Linux range writes while keeping reception and hashing parallel.
-//! The registry is process-local; independent SSH helpers do not share it.
+//! Every worker of a copy runs in its receiver process, so the registry
+//! covers them all. Writes are serialized only on filesystems where that
+//! helps (`serializes_range_writes`).
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -44,10 +46,54 @@ impl Registry {
     }
 }
 
+/// Whether writes to one file on the device of `file` are serialized. On
+/// most filesystems concurrent writes to one file contend inside it, and
+/// taking them one at a time saves CPU at the same speed (#336). ZFS locks
+/// only the ranges written, so there serializing costs throughput. The
+/// answer comes from the filesystem's type, read once per device; it would
+/// belong to a per-filesystem capability profile, were there one.
+#[cfg(any(target_os = "linux", test))]
+fn serializes_range_writes(file: &File, dev: u64) -> bool {
+    static DEVICES: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+    let devices = DEVICES.get_or_init(Default::default);
+    if let Some(&serializes) = devices.lock().unwrap().get(&dev) {
+        return serializes;
+    }
+    let serializes = !filesystem_locks_ranges(file);
+    devices.lock().unwrap().insert(dev, serializes);
+    serializes
+}
+
+/// Whether `file` is on a filesystem that locks only the ranges written.
+#[cfg(all(target_os = "linux", not(test)))]
+fn filesystem_locks_ranges(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: fstatfs writes the struct on success and reads nothing else.
+    let read = unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } == 0;
+    read && locks_ranges(unsafe { stats.assume_init() }.f_type as u32)
+}
+
+/// Tests serialize on every filesystem, so the gate itself is exercised
+/// wherever they run; `locks_ranges` is tested on its own.
+#[cfg(test)]
+fn filesystem_locks_ranges(_file: &File) -> bool {
+    false
+}
+
+/// Whether the Linux filesystem type `f_type` locks only the ranges written.
+#[cfg(any(target_os = "linux", test))]
+fn locks_ranges(f_type: u32) -> bool {
+    /// `ZFS_SUPER_MAGIC`, which libc does not name.
+    const ZFS: u32 = 0x2fc1_2fc1;
+    f_type == ZFS
+}
+
 pub(crate) struct CachedFile {
     file: File,
+    /// The file's write gate, or `None` where writes are not serialized.
     #[cfg(any(target_os = "linux", test))]
-    gate: OnceLock<Arc<Mutex<()>>>,
+    gate: OnceLock<Option<Arc<Mutex<()>>>>,
 }
 
 impl CachedFile {
@@ -68,21 +114,22 @@ impl CachedFile {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn write_gate(&self) -> io::Result<&Arc<Mutex<()>>> {
+    fn write_gate(&self) -> io::Result<Option<&Arc<Mutex<()>>>> {
         if let Some(gate) = self.gate.get() {
-            return Ok(gate);
+            return Ok(gate.as_ref());
         }
         static GATES: OnceLock<Mutex<Registry>> = OnceLock::new();
         // The open descriptor pins this inode for the lifetime of the cached gate.
         // Register lazily so reads and native copies do not pay for a write gate.
         let metadata = self.file.metadata()?;
-        let key = (metadata.dev(), metadata.ino());
-        let gate = GATES
-            .get_or_init(|| Mutex::new(Registry::new()))
-            .lock()
-            .unwrap()
-            .gate(key);
-        Ok(self.gate.get_or_init(|| gate))
+        let gate = serializes_range_writes(&self.file, metadata.dev()).then(|| {
+            GATES
+                .get_or_init(|| Mutex::new(Registry::new()))
+                .lock()
+                .unwrap()
+                .gate((metadata.dev(), metadata.ino()))
+        });
+        Ok(self.gate.get_or_init(|| gate).as_ref())
     }
 
     pub(crate) fn write_range_at(&self, data: &[u8], offset: u64, sparse: bool) -> io::Result<()> {
@@ -91,7 +138,7 @@ impl CachedFile {
         #[cfg(any(target_os = "linux", test))]
         let gate = self.write_gate()?;
         #[cfg(any(target_os = "linux", test))]
-        let _writer = gate.lock().unwrap();
+        let _writer = gate.map(|gate| gate.lock().unwrap());
         if sparse {
             crate::sparse::write_at(&self.file, data, offset, true)
         } else {
@@ -104,6 +151,14 @@ impl CachedFile {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_zfs_skips_the_write_gate() {
+        assert!(locks_ranges(0x2fc1_2fc1));
+        for f_type in [0xef53, 0x5846_5342, 0x6969, 0x0102_1994, 0x9123_683e] {
+            assert!(!locks_ranges(f_type), "{f_type:#x}");
+        }
+    }
 
     #[test]
     fn registry_sweeps_leave_room_for_live_gates_and_reclaim_idle_entries() {
@@ -140,7 +195,7 @@ mod tests {
                 scope.spawn(move || {
                     let file = CachedFile::new(File::options().write(true).open(path).unwrap());
                     for _ in 0..32 {
-                        let gate = file.write_gate().unwrap();
+                        let gate = file.write_gate().unwrap().unwrap();
                         let _writer = gate.lock().unwrap();
                         assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
                         std::thread::yield_now();
@@ -160,19 +215,19 @@ mod tests {
         let alias = dir.path().join("alias");
         let original = CachedFile::new(File::create(&path).unwrap());
         original.write_range_at(b"old", 0, false).unwrap();
-        let gate = Arc::downgrade(original.write_gate().unwrap());
+        let gate = Arc::downgrade(original.write_gate().unwrap().unwrap());
         std::fs::hard_link(&path, &alias).unwrap();
         let other = CachedFile::new(File::options().write(true).open(&alias).unwrap());
         assert!(Arc::ptr_eq(
-            original.write_gate().unwrap(),
-            other.write_gate().unwrap()
+            original.write_gate().unwrap().unwrap(),
+            other.write_gate().unwrap().unwrap()
         ));
 
         std::fs::remove_file(&path).unwrap();
         let replacement = CachedFile::new(File::create(&path).unwrap());
         assert!(!Arc::ptr_eq(
-            original.write_gate().unwrap(),
-            replacement.write_gate().unwrap()
+            original.write_gate().unwrap().unwrap(),
+            replacement.write_gate().unwrap().unwrap()
         ));
         original.write_range_at(b"OLD", 0, false).unwrap();
         replacement.write_range_at(b"new", 0, false).unwrap();
@@ -183,8 +238,8 @@ mod tests {
         drop(original);
         let reopened = CachedFile::new(File::options().write(true).open(&alias).unwrap());
         assert!(Arc::ptr_eq(
-            other.write_gate().unwrap(),
-            reopened.write_gate().unwrap()
+            other.write_gate().unwrap().unwrap(),
+            reopened.write_gate().unwrap().unwrap()
         ));
         drop(other);
         drop(reopened);
@@ -197,8 +252,8 @@ mod tests {
         let path = dir.path().join("first");
         let first = CachedFile::new(File::create(&path).unwrap());
         let second = CachedFile::new(File::create(dir.path().join("second")).unwrap());
-        let first_gate = first.write_gate().unwrap();
-        let second_gate = second.write_gate().unwrap();
+        let first_gate = first.write_gate().unwrap().unwrap();
+        let second_gate = second.write_gate().unwrap().unwrap();
         assert!(!Arc::ptr_eq(first_gate, second_gate));
         {
             let _held = first_gate.lock().unwrap();
