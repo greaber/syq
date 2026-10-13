@@ -50,6 +50,8 @@ pub(crate) use apply::*;
 pub(crate) use entry::*;
 #[cfg(target_os = "macos")]
 pub(crate) use fs_caps::macos_profile;
+#[cfg(test)]
+pub(crate) use fs_caps::override_profiles_for_test;
 pub(crate) use fs_caps::{
     kind_has_two_second_mtimes, kind_sets_symlink_times, profile, record_refusal, Profile, Refusal,
 };
@@ -217,8 +219,12 @@ struct FileSystemTraits {
     synchronous: bool,
     measured_local_source: bool,
     local_userspace_copy: bool,
-    /// What syq relies on this filesystem for (see `fs_caps`).
-    profile: Profile,
+    /// The filesystem's type, from which `profile` is read.
+    file_system_type: u32,
+    /// What syq relies on this filesystem for (see `fs_caps`), read when a
+    /// publication first needs it: for NFS and CephFS that reads the mount
+    /// table, which a filesystem syq only reads from never needs.
+    profile: Option<Profile>,
 }
 
 #[cfg(target_os = "linux")]
@@ -390,7 +396,8 @@ fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
                 t if t == libc::EXT4_SUPER_MAGIC as u32
                     || t == libc::XFS_SUPER_MAGIC as u32
             ),
-            profile: fs_caps::linux_profile(file_system_type, file, key),
+            file_system_type,
+            profile: None,
         }
     }
 }
@@ -461,15 +468,46 @@ fn file_systems() -> &'static Mutex<HashMap<FileSystemKey, FileSystemTraits>> {
     FILE_SYSTEMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Linux: the profile of the filesystem `file` is on, read when first
+/// needed and then cached with the filesystem's other traits.
+#[cfg(target_os = "linux")]
+fn file_system_profile(file: &File) -> Option<Profile> {
+    let (key, traits) = opened_file_system(file).ok()?;
+    if let Some(profile) = traits.profile {
+        return Some(profile);
+    }
+    Some(cached_profile(file, key, traits, |_| {}))
+}
+
 /// Linux: change the cached profile of the filesystem `file` is on.
 #[cfg(target_os = "linux")]
 fn update_profile(file: &File, update: impl FnOnce(&mut Profile)) {
-    let Ok((key, traits)) = opened_file_system(file) else {
-        return;
-    };
+    if let Ok((key, traits)) = opened_file_system(file) {
+        cached_profile(file, key, traits, update);
+    }
+}
+
+/// The cached profile of the filesystem `key`, read first if it has not
+/// been, after `update`.
+#[cfg(target_os = "linux")]
+fn cached_profile(
+    file: &File,
+    key: FileSystemKey,
+    traits: FileSystemTraits,
+    update: impl FnOnce(&mut Profile),
+) -> Profile {
+    // Read outside the lock: for NFS and CephFS it reads the mount table.
+    let read = traits
+        .profile
+        .unwrap_or_else(|| fs_caps::linux_profile(traits.file_system_type, file, key));
     let mut file_systems = file_systems().lock().unwrap();
-    let entry = file_systems.entry(key).or_insert(traits);
-    update(&mut entry.profile);
+    let profile = file_systems
+        .entry(key)
+        .or_insert(traits)
+        .profile
+        .get_or_insert(read);
+    update(profile);
+    *profile
 }
 
 #[cfg(target_os = "linux")]

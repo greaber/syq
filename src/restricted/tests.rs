@@ -7027,14 +7027,10 @@ fn keeping_existing_files_links_only_to_files_the_copy_created() {
 #[test]
 fn keeping_existing_files_refuses_links_it_cannot_tie_to_a_created_file() {
     use std::os::unix::fs::MetadataExt;
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            std::env::remove_var("SYQ_TEST_UNTRUSTED_LINK_COUNTS");
-        }
-    }
-    let _restore = Restore;
-    std::env::set_var("SYQ_TEST_UNTRUSTED_LINK_COUNTS", "1");
+    let _untrusted = crate::fsops::override_profiles_for_test(|_, profile| crate::fsops::Profile {
+        link_counts_trusted: false,
+        ..profile
+    });
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let authority = keeping_link_authority(&root);
@@ -7063,7 +7059,14 @@ fn keeping_existing_files_refuses_links_it_cannot_tie_to_a_created_file() {
         }),
     )
     .unwrap();
-    assert!(applied(&response)[0].is_some(), "{response:?}");
+    // Refused because the link cannot be tied to the file, not because a
+    // trusted inode number showed another file.
+    assert!(
+        applied(&response)[0]
+            .as_ref()
+            .is_some_and(|error| error.as_str().contains("cannot be tied")),
+        "{response:?}"
+    );
     assert!(fs::symlink_metadata(root.join("target/stolen")).is_err());
     assert_eq!(kept_state(&root), (0o600, 1));
 }

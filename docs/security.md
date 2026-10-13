@@ -251,6 +251,14 @@ HostA cannot:
 - Reuse the grant for another copy or use the restricted key to run a shell.
 - Forge hostB's receipt.
 
+A grant that permits only creating new files refuses hard links on
+filesystems whose inode numbers syq cannot trust, such as SMB, SSHFS, and
+types syq does not recognize, because it cannot tell which file a link would
+name. On filesystems with neither an atomic no-replace rename nor hard links,
+such as FAT and exFAT on macOS and rclone mounts, it still refuses files that
+already exist, but a file another program creates at a name in the instant
+between syq's check and its rename can be replaced.
+
 The filesystem limitations above still apply, including effects through
 hard links. HostB's account and receiver remain trusted to
 enforce the grant and report accurately. A verified receipt describes their

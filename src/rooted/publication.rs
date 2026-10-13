@@ -29,6 +29,10 @@ thread_local! {
     /// check-then-rename step.
     pub(super) static CHECKED_RENAMES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Tests stand in for a filesystem that fails each link step of a
+    /// publication with this error.
+    pub(super) static LINK_ERROR: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// A refusal tests stand in for, or None to make the call.
@@ -60,16 +64,58 @@ pub(super) fn rename_flag_unsupported(error: &io::Error) -> bool {
     })
 }
 
-/// Whether `linkat` failed because the filesystem has no hard links:
-/// `EPERM` from Linux FAT and FUSE servers without links, `ENOTSUP` from
-/// macOS FAT, exFAT and SMB, `EIO` from rclone mounts.
-fn links_unavailable(error: &io::Error) -> bool {
+/// Whether `linkat` failed with an error that says the filesystem has no
+/// hard links: `ENOTSUP` from macOS FAT, exFAT and SMB, `ENOSYS` from a
+/// server without them.
+fn links_unsupported(error: &io::Error) -> bool {
     error.raw_os_error().is_some_and(|code| {
-        matches!(
-            code,
-            libc::EPERM | libc::ENOSYS | libc::EOPNOTSUPP | libc::EIO
-        ) || code == libc::ENOTSUP
+        matches!(code, libc::ENOSYS | libc::EOPNOTSUPP) || code == libc::ENOTSUP
     })
+}
+
+/// Whether a failed link falls back to the final check-then-rename: where
+/// the filesystem has no hard links; on `EPERM`, which Linux gives for a
+/// filesystem without links (and FUSE for a server without them), SSHFS
+/// for an existing target, and Linux for a file that may not be linked,
+/// such as another user's under `fs.protected_hardlinks`; and on `EIO`
+/// only where the filesystem was not audited, as an rclone mount answers
+/// a link with it. On an audited filesystem `EIO` is an I/O error.
+fn link_falls_back(error: &io::Error, profile: &Profile) -> bool {
+    links_unsupported(error)
+        || error.raw_os_error() == Some(libc::EPERM)
+        || (error.raw_os_error() == Some(libc::EIO) && !profile.audited)
+}
+
+/// Whether `from` may be linked to `to` and its own name then removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Link {
+    /// No: `from` moves by rename. It is an entry another writer may
+    /// replace meanwhile, which must move so that exactly what is at the
+    /// name moves, or an entry being put back that is not a regular file,
+    /// such as a directory, which cannot be linked.
+    Never,
+    /// Yes, for a name only this publication uses that is not a staged
+    /// file: an entry moved aside, a new symlink or node, or a new name of
+    /// an existing file. Its link may be refused for reasons of its own, as
+    /// Linux refuses another user's file under `fs.protected_hardlinks`, so
+    /// a refusal is not remembered.
+    Entry,
+    /// Yes, for a staged file this receiver created, and a refusal that
+    /// says the filesystem has no hard links is remembered: nothing about
+    /// the file can be the reason.
+    Staged,
+}
+
+impl Link {
+    /// How an entry being put back may move: by linking a regular file,
+    /// and renaming anything else.
+    pub(super) fn putting_back(entry: RootMetadata) -> Self {
+        if entry.is_file() {
+            Self::Entry
+        } else {
+            Self::Never
+        }
+    }
 }
 
 /// How a name was published without replacing another.
@@ -87,24 +133,19 @@ pub(super) struct Placement<'a> {
     pub(super) from: &'a CStr,
     pub(super) to_directory: RawFd,
     pub(super) to: &'a CStr,
-    /// Whether `from` may be linked to `to` and its own name then removed:
-    /// yes for a name only this publication uses, such as a staged file or
-    /// a recovery name; no for an entry another writer may replace
-    /// meanwhile, which must move by rename so that exactly what is at the
-    /// name moves.
-    pub(super) allow_link: bool,
+    pub(super) link: Link,
 }
 
 /// Give `from` the name `to` without replacing anything already there,
 /// failing with `EEXIST` when `to` exists. Tries, in turn:
 ///
 /// 1. an atomic no-replace rename, where the profile says the filesystem
-///    implements it atomically: verified local filesystems, and macOS
-///    volumes that advertise it. A network filesystem may check the target
-///    itself and then tell its server to replace (SMB), or ignore the flag
-///    (one of rclone's mount modes), so others skip to linking;
+///    implements it atomically: audited Linux filesystems, and macOS APFS
+///    and HFS+ volumes. A network filesystem may check the target itself
+///    and then tell its server to replace (SMB), or ignore the flag (one of
+///    rclone's mount modes), so others skip to linking;
 /// 2. a hard link, which the kernel or server refuses atomically when the
-///    name exists, when allowed and the filesystem may have links;
+///    name exists, when `link` allows and the filesystem may have links;
 /// 3. a check that `to` is absent, then a plain rename.
 ///
 /// Steps 1 and 2 never replace anything. Step 3 runs only where neither is
@@ -117,7 +158,11 @@ pub(super) struct Placement<'a> {
 /// entry to another name.
 ///
 /// A refusal of a step the profile allowed is passed to `record_refusal`
-/// and taken out of `profile`, so the rest of a publication skips it too.
+/// and taken out of `profile`, so the rest of a publication skips it too:
+/// a rename flag the filesystem rejects, whatever the entry (Linux and the
+/// filesystems check flags before the names), and hard links only when a
+/// staged file's link fails with an error that says they are missing.
+/// `EXDEV`, `EPERM`, `EACCES` and `EIO` are never taken for refusals.
 pub(super) fn move_without_replacing(
     profile: &mut Profile,
     placement: &Placement<'_>,
@@ -128,7 +173,7 @@ pub(super) fn move_without_replacing(
         from,
         to_directory,
         to,
-        allow_link,
+        link,
     } = *placement;
     let refuse = |profile: &mut Profile, refusal| {
         *profile = profile.without(refusal);
@@ -147,18 +192,25 @@ pub(super) fn move_without_replacing(
             Err(error) => return Err(error),
         }
     }
-    if allow_link && profile.hard_links {
-        match retry_zero(|| unsafe {
-            libc::linkat(from_directory, from.as_ptr(), to_directory, to.as_ptr(), 0)
-        }) {
+    if link != Link::Never && profile.hard_links {
+        #[cfg(test)]
+        let simulated = LINK_ERROR.get().map(io::Error::from_raw_os_error);
+        #[cfg(not(test))]
+        let simulated = None;
+        let linked = match simulated {
+            Some(error) => Err(error),
+            None => retry_zero(|| unsafe {
+                libc::linkat(from_directory, from.as_ptr(), to_directory, to.as_ptr(), 0)
+            }),
+        };
+        match linked {
             Ok(()) => return Ok(Moved::Linked),
-            Err(error) if links_unavailable(&error) => {
+            Err(error) if link_falls_back(&error, profile) => {
                 // SSHFS reports a refused existing target as EPERM.
                 if metadata_at(to_directory, to).is_ok() {
                     return Err(io::Error::from_raw_os_error(libc::EEXIST));
                 }
-                // EIO may be transient; only a definite refusal is kept.
-                if error.raw_os_error() != Some(libc::EIO) {
+                if link == Link::Staged && links_unsupported(&error) {
                     refuse(profile, Refusal::HardLinks);
                 }
             }

@@ -4753,6 +4753,22 @@ fn observation_only_rooted_prepare_preserves_an_unsafe_sidecar() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A filesystem's profile is read when a publication first asks for it, so
+/// inspecting a filesystem syq only reads from never reads it: for NFS and
+/// CephFS that would read the mount table.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_filesystems_profile_is_read_when_first_asked_for() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let file = File::open(directory.path()).unwrap();
+    let (key, _) = opened_file_system(&file).unwrap();
+    assert_eq!(inspect_file_system(&file, key).profile, None);
+    let profile = super::fs_caps::profile(&file);
+    let cached = file_systems().lock().unwrap()[&key].profile;
+    assert!(cached.is_some());
+    assert_eq!(super::fs_caps::profile(&file), profile);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn fresh_nfs_partial_is_not_allocated_or_sized_before_writes() {

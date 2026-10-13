@@ -180,6 +180,12 @@ contents are accepted unchanged. A content conflict leaves that file's metadata
 alone too. `--as-new` and `--into-new` constrain the placement root; `--if-exists`
 applies to individual selected entries.
 
+With `error`, `error-if-different` and `--as-new`, a file that already exists
+at the name is always refused. On filesystems with neither an atomic no-replace
+rename nor hard links, such as FAT and exFAT on macOS and rclone mounts, syq
+checks that the name is free and then renames, so a file another program
+creates there in the instant between the two can be replaced.
+
 See [Update policies](commands/cp.md#update-policies) for supported combinations.
 
 ## Choose a transfer strategy
@@ -360,9 +366,9 @@ recovery entries that need inspection before removal.
 Syq normally skips files whose size and modification time match. FAT keeps
 modification times in two-second steps, so when syq copies into a directory on
 FAT, times less than two seconds apart count as matching, as rsync's
-`--modify-window=1` would make them (not when it updates one named file or
-copies to a restricted receiver). Use `--hash` to compare contents instead; a file
-whose contents already match is left alone:
+`--modify-window=1` would make them (not when it updates one named file, copies
+with `--existing`, or copies to a restricted receiver). Use `--hash` to compare
+contents instead; a file whose contents already match is left alone:
 
 ```sh
 syq cp --hash --srcs-in project --into backup
@@ -427,7 +433,9 @@ Explicit mapping `metadata.mtime` also sets the requested destination time.
 Syq sets symlink modification times only on filesystems where it knows the call
 sets the link itself, such as ext4, XFS, btrfs, ZFS, NFS and APFS. Elsewhere it
 leaves them alone: on SSHFS, for example, the call would change the file the link
-points to instead.
+points to instead. Reruns then ignore those symlinks' times, except when syq
+updates one named file, copies with `--existing`, or copies to a restricted
+receiver: those copies report such symlinks as changed on every rerun.
 S3-to-S3 copies also support [content headers, user metadata, tags, and storage
 class](object-storage.md#copies-between-s3-buckets).
 

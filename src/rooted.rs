@@ -1717,7 +1717,8 @@ impl Root {
             PublicationTestPoint::BeforeMatchedExchange,
         );
         let directory = parent.directory.as_raw_fd();
-        let mut profile = self.profile_on(before.dev, &parent.directory);
+        // The replacement was created in the parent, on its filesystem.
+        let mut profile = self.profile_on(replacement.dev, &parent.directory);
         if !self
             .exchange(
                 &mut profile,
@@ -1737,8 +1738,7 @@ impl Root {
                     &mut profile,
                     path,
                     &parent,
-                    directory,
-                    &temporary,
+                    (directory, &temporary, publication::Link::Entry),
                     |entry| {
                         publication::is_expected(entry, expected_dev, expected_ino, expected_type)
                     },
@@ -1858,8 +1858,11 @@ impl Root {
         let file = self.open_metadata(source)?;
         let opened = root_metadata_from_std(&file.metadata()?)?;
         let parent = self.resolve_parent(target)?;
-        // A hard link names its file on the file's own device.
-        let mut profile = self.profile_on(opened.dev, &parent.directory);
+        // A hard link names its file on the file's own filesystem, so the
+        // profile is that filesystem's, read through the file itself. A
+        // link from another filesystem fails with EXDEV, which teaches
+        // nothing.
+        let mut profile = self.profile_on(opened.dev, &file);
         if identity_relied_on && !profile.link_counts_trusted {
             bail!(
                 "hard link {} cannot be tied to the file it would name on this filesystem, \
@@ -2016,8 +2019,7 @@ impl Root {
                             &mut profile,
                             target,
                             &parent,
-                            directory,
-                            &temporary,
+                            (directory, &temporary, publication::Link::Entry),
                             |entry| (entry.dev, entry.ino) == (dev, ino),
                         )?;
                         consumed.set(true);
@@ -2120,8 +2122,8 @@ impl Root {
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
         // A staged file is published by renaming or linking it, which stays
-        // on its device.
-        let mut profile = self.profile_on(staged_dev, &target_parent.directory);
+        // on its filesystem.
+        let mut profile = self.profile_on(staged_dev, &source_parent.directory);
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         let moved = self
@@ -2133,7 +2135,7 @@ impl Root {
                     from: &source_parent.leaf,
                     to_directory: target_parent.directory.as_raw_fd(),
                     to: &target_parent.leaf,
-                    allow_link: true,
+                    link: publication::Link::Staged,
                 },
             )
             .with_context(|| {
@@ -2213,7 +2215,7 @@ impl Root {
             target,
             PublicationTestPoint::BeforeMatchedExchange,
         );
-        let mut profile = self.profile_on(staged_dev, &target_parent.directory);
+        let mut profile = self.profile_on(staged_dev, &source_parent.directory);
         #[cfg(any(target_os = "linux", test))]
         let permit = self.mutation_permit(target)?;
         if !self
@@ -2231,8 +2233,11 @@ impl Root {
                 &mut profile,
                 target,
                 &target_parent,
-                source_parent.directory.as_raw_fd(),
-                &source_parent.leaf,
+                (
+                    source_parent.directory.as_raw_fd(),
+                    &source_parent.leaf,
+                    publication::Link::Staged,
+                ),
                 has_expected_identity,
             )?;
             #[cfg(any(target_os = "linux", test))]
@@ -2372,7 +2377,7 @@ impl Root {
                     from: name,
                     to_directory: directory.as_raw_fd(),
                     to: &recovery,
-                    allow_link: false,
+                    link: publication::Link::Never,
                 },
             ) {
                 Ok(_) => return Ok(Some(recovery)),
@@ -2399,15 +2404,18 @@ impl Root {
     /// in the moment between a check and a rename be replaced. On success
     /// the expected entry is left at the returned recovery name for the
     /// caller to check the publication and remove it.
+    ///
+    /// `replacement` is its directory, its name, and whether it may be
+    /// linked (see `publication::Link`).
     fn publish_over_moved_aside(
         &self,
         profile: &mut crate::fsops::Profile,
         target: &RelativePath,
         target_parent: &ResolvedParent<'_>,
-        replacement_directory: RawFd,
-        replacement: &CStr,
+        replacement: (RawFd, &CStr, publication::Link),
         expected: impl Fn(RootMetadata) -> bool,
     ) -> Result<CString> {
+        let (replacement_directory, replacement, replacement_link) = replacement;
         let directory = target_parent.directory.as_raw_fd();
         let Some(aside) =
             self.move_to_recovery_name(profile, &target_parent.directory, &target_parent.leaf)?
@@ -2426,7 +2434,10 @@ impl Root {
                 sibling_label(target, &aside)
             )
         };
-        let put_back = |profile: &mut crate::fsops::Profile, race: &str| -> anyhow::Error {
+        let put_back = |profile: &mut crate::fsops::Profile,
+                        link: publication::Link,
+                        race: &str|
+         -> anyhow::Error {
             match self.move_own_name_without_replacing(
                 profile,
                 &target_parent.directory,
@@ -2435,18 +2446,24 @@ impl Root {
                     from: &aside,
                     to_directory: directory,
                     to: &target_parent.leaf,
-                    allow_link: true,
+                    link,
                 },
             ) {
                 Ok(()) => anyhow::anyhow!("confined destination {} {race}", target.label()),
                 Err(_) => kept(race),
             }
         };
-        match metadata_at(directory, &aside) {
-            Ok(displaced) if expected(displaced) => {}
-            Ok(_) => return Err(put_back(profile, "changed before publication")),
-            Err(error) => return Err(put_back(profile, "could not be checked").context(error)),
-        }
+        let displaced = match metadata_at(directory, &aside) {
+            Ok(displaced) if expected(displaced) => displaced,
+            Ok(displaced) => {
+                let link = publication::Link::putting_back(displaced);
+                return Err(put_back(profile, link, "changed before publication"));
+            }
+            Err(error) => {
+                let link = publication::Link::Never;
+                return Err(put_back(profile, link, "could not be checked").context(error));
+            }
+        };
         match self.move_own_name_without_replacing(
             profile,
             &target_parent.directory,
@@ -2455,7 +2472,7 @@ impl Root {
                 from: replacement,
                 to_directory: directory,
                 to: &target_parent.leaf,
-                allow_link: true,
+                link: replacement_link,
             },
         ) {
             Ok(()) => Ok(aside),
@@ -2464,7 +2481,10 @@ impl Root {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 Err(kept("changed during publication"))
             }
-            Err(error) => Err(put_back(profile, "could not be replaced").context(error)),
+            Err(error) => {
+                let link = publication::Link::putting_back(displaced);
+                Err(put_back(profile, link, "could not be replaced").context(error))
+            }
         }
     }
 
@@ -3299,10 +3319,10 @@ fn rename_exchange(
     })
 }
 
-/// Only volumes whose profile allows it (they advertise `RENAME_SWAP`) are
-/// asked to swap: a FAT32 volume completes the call as a plain rename over
-/// the target, losing it, and reports success. Others are refused here with
-/// `ENOTSUP`, as HFS+ refuses the call itself.
+/// Only volumes whose profile allows it (APFS volumes that advertise
+/// `RENAME_SWAP`) are asked to swap: a FAT32 volume completes the call as a
+/// plain rename over the target, losing it, and reports success. Others are
+/// refused here with `ENOTSUP`, as HFS+ refuses the call itself.
 #[cfg(target_os = "macos")]
 fn rename_exchange(
     old_parent: RawFd,

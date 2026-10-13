@@ -1949,6 +1949,215 @@ fn names_are_linked_rather_than_checked_wherever_links_exist() {
     }
 }
 
+/// Stand in for a filesystem whose links fail with `error` until the guard
+/// drops.
+fn fail_links_with(error: i32) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::publication::LINK_ERROR.set(None);
+        }
+    }
+    super::publication::LINK_ERROR.set(Some(error));
+    Reset
+}
+
+/// Write `contents` as `name` in `tree` and publish it as the new name
+/// `target`, as a staged file is published.
+fn publish_staged(root: &Root, tree: &TestDir, name: &str, target: &str) -> Result<()> {
+    fs::write(tree.path().join(name), target).unwrap();
+    let staged = fs::metadata(tree.path().join(name)).unwrap();
+    root.publish_new_regular(
+        &relative(name.as_bytes()),
+        &relative(target.as_bytes()),
+        (staged.dev(), staged.ino()),
+    )
+}
+
+/// Swap the target for another writer's `entry` just before a matched
+/// replacement, and check that the replacement puts it back.
+fn replace_while_another_writer_swaps_in(
+    root: &Root,
+    tree: &TestDir,
+    entry: impl Fn(&Path) + Send + Sync + 'static,
+) {
+    let (staged, target) = (relative(b"staged"), relative(b"target"));
+    fs::write(tree.path().join("staged"), b"new").unwrap();
+    fs::write(tree.path().join("target"), b"old").unwrap();
+    let staged_metadata = fs::metadata(tree.path().join("staged")).unwrap();
+    let old = root.metadata(&target).unwrap();
+    let target_path = tree.path().join("target");
+    let saved_path = tree.path().join("saved");
+    let _hook = install_publication_test_hook(
+        root.identity(),
+        &target,
+        PublicationTestPoint::BeforeMatchedExchange,
+        move || {
+            fs::rename(&target_path, &saved_path).unwrap();
+            entry(&target_path);
+        },
+    );
+    let error = root
+        .replace_regular_if_same(
+            &staged,
+            &target,
+            (staged_metadata.dev(), staged_metadata.ino()),
+            old.dev,
+            old.ino,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed before publication"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(tree.path().join("saved")).unwrap(), b"old");
+}
+
+/// Putting back an unexpected directory moves it by rename: a directory
+/// cannot be linked, and the refusal must not mark the filesystem as
+/// without hard links.
+#[test]
+fn putting_back_a_directory_keeps_hard_links() {
+    let tree = TestDir::new("put-back-directory");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    replace_while_another_writer_swaps_in(&root, &tree, |target| fs::create_dir(target).unwrap());
+    assert!(tree.path().join("target").is_dir());
+    assert!(root.profile().hard_links, "{:?}", root.profile());
+}
+
+/// A filesystem is remembered as without hard links only when it says so
+/// (`EOPNOTSUPP`, `ENOSYS`) for a staged file, which this receiver created.
+/// `EPERM` can be the file's own: Linux refuses to link another user's
+/// file under `fs.protected_hardlinks`. It falls back without being
+/// remembered.
+#[test]
+fn a_link_refused_with_eperm_is_not_remembered() {
+    let tree = TestDir::new("link-eperm");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    let refused = fail_links_with(libc::EPERM);
+    publish_staged(&root, &tree, "staged", "refused").unwrap();
+    assert!(root.profile().hard_links, "{:?}", root.profile());
+    drop(refused);
+    let _unsupported = fail_links_with(libc::EOPNOTSUPP);
+    publish_staged(&root, &tree, "staged", "unsupported").unwrap();
+    assert!(!root.profile().hard_links, "{:?}", root.profile());
+    assert_eq!(sorted_names(tree.path()), ["refused", "unsupported"]);
+}
+
+/// An entry being put back is another writer's, and may be refused a link
+/// for reasons of its own, so even an error that says the filesystem has
+/// no hard links is not remembered there.
+#[test]
+fn a_link_refused_while_putting_back_an_entry_is_not_remembered() {
+    let tree = TestDir::new("link-put-back");
+    let root = Root::open(tree.path()).unwrap();
+    assume_missing(&root, true, true, false);
+    let _unsupported = fail_links_with(libc::EOPNOTSUPP);
+    replace_while_another_writer_swaps_in(&root, &tree, |target| {
+        fs::write(target, b"other writer").unwrap()
+    });
+    assert_eq!(
+        fs::read(tree.path().join("target")).unwrap(),
+        b"other writer"
+    );
+    assert!(root.profile().hard_links, "{:?}", root.profile());
+}
+
+/// `EIO` from a link is an I/O error on a filesystem whose type was
+/// audited, and fails the publication. Only where the type was not, as on
+/// FUSE, where an rclone mount answers a link with `EIO`, does it fall back
+/// to check-then-rename. Neither is remembered.
+#[test]
+fn an_io_error_from_a_link_falls_back_only_where_the_filesystem_was_not_audited() {
+    for audited in [true, false] {
+        let tree = TestDir::new("link-eio");
+        let root = Root::open(tree.path()).unwrap();
+        let mut profile = crate::fsops::Profile::LOCAL;
+        profile.exchange = false;
+        profile.atomic_no_replace_rename = false;
+        profile.audited = audited;
+        root.assume_profile_for_test(profile);
+        let _failing = fail_links_with(libc::EIO);
+        let published = publish_staged(&root, &tree, "staged", "new");
+        if audited {
+            let error = published.unwrap_err();
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EIO))),
+                "{error:#}"
+            );
+            assert_eq!(sorted_names(tree.path()), ["staged"]);
+        } else {
+            published.unwrap();
+            assert_eq!(sorted_names(tree.path()), ["new"]);
+        }
+        assert!(root.profile().hard_links, "audited {audited}");
+    }
+}
+
+/// A hard link names its file on the file's own filesystem, so it is
+/// published by that filesystem's profile. A link from another filesystem
+/// fails with `EXDEV`, which teaches nothing, and must not leave the
+/// destination's profile cached for the source's device.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_across_filesystems_keeps_each_filesystems_profile() {
+    use crate::fsops::Profile;
+    let destination = crate::test_support::tempdir().unwrap();
+    let source = tempfile::tempdir_in("/dev/shm").unwrap();
+    let source_path = source.path().join("source");
+    fs::write(&source_path, b"source").unwrap();
+    let source_metadata = fs::metadata(&source_path).unwrap();
+    let (source_dev, destination_dev) = (
+        source_metadata.dev(),
+        fs::metadata(destination.path()).unwrap().dev(),
+    );
+    assert_ne!(
+        source_dev, destination_dev,
+        "the test needs two filesystems"
+    );
+    // The source's filesystem stands in for one trusted with nothing, the
+    // destination's for a local one.
+    let _profiles = crate::fsops::override_profiles_for_test(move |dev, _| {
+        if dev == source_dev {
+            Profile::CONSERVATIVE
+        } else {
+            Profile::LOCAL
+        }
+    });
+    let root = Root::open(Path::new("/")).unwrap();
+    let beneath_root =
+        |path: &Path| relative(path.strip_prefix("/").unwrap().as_os_str().as_bytes());
+    let error = root
+        .publish_hardlink(
+            &beneath_root(&source_path),
+            &beneath_root(&destination.path().join("link")),
+            (source_dev, source_metadata.ino()),
+            crate::proto::TargetCondition::Absent,
+        )
+        .unwrap_err();
+    assert!(
+        error.chain().any(|cause| cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::EXDEV))),
+        "{error:#}"
+    );
+    let source_directory = File::open(source.path()).unwrap();
+    assert_eq!(
+        root.profile_on(source_dev, &source_directory),
+        Profile::CONSERVATIVE
+    );
+    let destination_directory = File::open(destination.path()).unwrap();
+    assert_eq!(
+        root.profile_on(destination_dev, &destination_directory),
+        Profile::LOCAL
+    );
+}
+
 /// Without exchange, an entry that is not the expected one when it is
 /// moved aside goes back to its name, untouched.
 #[test]

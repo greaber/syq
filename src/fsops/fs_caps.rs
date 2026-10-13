@@ -8,16 +8,18 @@
 //!
 //! - Atomic rename flags are tried where a filesystem that lacks them is
 //!   known to refuse them: the Linux in-tree filesystems below, whose
-//!   rename handlers reject flags they do not implement, and macOS volumes
-//!   that advertise them. A refusal falls back and is remembered. FUSE
-//!   passes the flags to a userspace server, which could ignore them, so
-//!   they are not tried there, nor on types not audited.
+//!   rename handlers reject flags they do not implement, and macOS APFS
+//!   and HFS+ volumes that advertise them, where tests show them working.
+//!   A refusal falls back and is remembered. FUSE passes the flags to a
+//!   userspace server, which could ignore them, so they are not tried
+//!   there, nor on types not audited.
 //! - Link counts, inode numbers and symlink times cannot be checked by
 //!   their errors, so they are trusted only on filesystems with evidence.
 //!
 //! The profile comes from facts syq already reads cheaply: the filesystem
 //! type, mount options, and on macOS the capabilities a volume advertises.
-//! It is cached per mount or volume. Nothing is probed.
+//! It is read when a publication first needs it and cached per mount or
+//! volume. Nothing is probed.
 
 use std::fs::File;
 #[cfg(target_os = "macos")]
@@ -123,6 +125,12 @@ pub(crate) struct Profile {
     pub(crate) symlink_times: bool,
     /// Modification times are kept in two-second steps (FAT).
     pub(crate) two_second_mtimes: bool,
+    /// The filesystem's type was audited, so its errors mean what its
+    /// source or tests show: `EIO` is an I/O error. A FUSE server or a type
+    /// not audited may answer an operation it lacks with `EIO`, as an
+    /// rclone mount answers a hard link, so only there does a link that
+    /// fails with `EIO` fall back to check-then-rename.
+    pub(crate) audited: bool,
 }
 
 impl Default for Profile {
@@ -140,17 +148,19 @@ impl Profile {
         link_counts_trusted: false,
         symlink_times: false,
         two_second_mtimes: false,
+        audited: false,
     };
 
     /// Every capability, as on the tested local filesystems.
     #[cfg(test)]
-    const LOCAL: Self = Self {
+    pub(crate) const LOCAL: Self = Self {
         exchange: true,
         atomic_no_replace_rename: true,
         hard_links: true,
         link_counts_trusted: true,
         symlink_times: true,
         two_second_mtimes: false,
+        audited: true,
     };
 
     /// Tests stand in for filesystems that lack these capabilities.
@@ -201,6 +211,7 @@ impl Profile {
             | (self.link_counts_trusted as u8) << 3
             | (self.symlink_times as u8) << 4
             | (self.two_second_mtimes as u8) << 5
+            | (self.audited as u8) << 6
     }
 
     pub(crate) const fn from_bits(bits: u8) -> Self {
@@ -211,6 +222,7 @@ impl Profile {
             link_counts_trusted: bits & 1 << 3 != 0,
             symlink_times: bits & 1 << 4 != 0,
             two_second_mtimes: bits & 1 << 5 != 0,
+            audited: bits & 1 << 6 != 0,
         }
     }
 
@@ -246,11 +258,38 @@ pub(crate) fn record_refusal(file: &File, refusal: Refusal) {
     let _ = (file, refusal);
 }
 
+/// Given the device a profile is looked up for and its profile, the
+/// profile a test stands in for.
+#[cfg(test)]
+type TestProfiles = Box<dyn Fn(u64, Profile) -> Profile>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests stand in for filesystems with other profiles.
+    static TEST_PROFILES: std::cell::RefCell<Option<TestProfiles>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Until the returned guard drops, profiles looked up on this thread are
+/// what `profiles` makes of the device and real profile.
+#[cfg(test)]
+pub(crate) fn override_profiles_for_test(
+    profiles: impl Fn(u64, Profile) -> Profile + 'static,
+) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_PROFILES.with_borrow_mut(|profiles| *profiles = None);
+        }
+    }
+    TEST_PROFILES.with_borrow_mut(|current| *current = Some(Box::new(profiles)));
+    Restore
+}
+
 /// The profile of the filesystem `file` is on.
 pub(crate) fn profile(file: &File) -> Profile {
     #[cfg(target_os = "linux")]
-    let profile =
-        super::opened_file_system(file).map_or(Profile::CONSERVATIVE, |(_, traits)| traits.profile);
+    let profile = super::file_system_profile(file).unwrap_or(Profile::CONSERVATIVE);
     #[cfg(target_os = "macos")]
     let profile = {
         use std::os::fd::AsRawFd;
@@ -261,6 +300,15 @@ pub(crate) fn profile(file: &File) -> Profile {
         let _ = file;
         Profile::CONSERVATIVE
     };
+    #[cfg(test)]
+    let profile = TEST_PROFILES.with_borrow(|profiles| match profiles {
+        Some(profiles) => {
+            use std::os::unix::fs::MetadataExt;
+            file.metadata()
+                .map_or(profile, |metadata| profiles(metadata.dev(), profile))
+        }
+        None => profile,
+    });
     profile.with_test_overrides()
 }
 
@@ -312,6 +360,7 @@ pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemK
         link_counts_trusted,
         symlink_times,
         two_second_mtimes: fat,
+        audited: tries_flags,
     }
 }
 
@@ -462,16 +511,22 @@ fn volume_of(fd: RawFd) -> Option<Volume> {
 }
 
 /// What a volume of this type may be trusted with, whatever it advertises
-/// or a cached profile says. FAT32 (`msdos`) completes `RENAME_SWAP` as a
-/// plain rename over the target and reports success, so it never swaps;
-/// inode numbers were tested on APFS and HFS+ only; symlink times on APFS,
-/// HFS+, FAT and exFAT (where links are small files), and on NFS, SETATTR
-/// acts on the object a file handle names, the link itself.
-#[cfg(target_os = "macos")]
+/// or a cached profile says. A volume can advertise a rename flag it does
+/// not keep: FAT32 (`msdos`) completes `RENAME_SWAP` as a plain rename over
+/// the target and reports success. So the flags are tried only where tests
+/// show them working: `RENAME_SWAP` on APFS, and `RENAME_EXCL` on APFS and
+/// HFS+ (which refuses a swap). Inode numbers were tested on APFS and HFS+
+/// only; symlink times on APFS, HFS+, FAT and exFAT (where links are small
+/// files), and on NFS, SETATTR acts on the object a file handle names, the
+/// link itself.
+#[cfg(any(target_os = "macos", test))]
 fn within_kind(mut profile: Profile, kind: &[u8]) -> Profile {
-    profile.exchange &= kind != b"msdos";
+    profile.exchange &= kind == b"apfs";
+    profile.atomic_no_replace_rename &= matches!(kind, b"apfs" | b"hfs");
     profile.link_counts_trusted &= matches!(kind, b"apfs" | b"hfs");
-    profile.symlink_times &= matches!(kind, b"apfs" | b"hfs" | b"msdos" | b"exfat" | b"nfs");
+    let tested = matches!(kind, b"apfs" | b"hfs" | b"msdos" | b"exfat" | b"nfs");
+    profile.symlink_times &= tested;
+    profile.audited &= tested;
     profile.two_second_mtimes = kind == b"msdos";
     profile
 }
@@ -510,6 +565,7 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
                 link_counts_trusted: capabilities.hard_links && capabilities.persistent_ids,
                 symlink_times: true,
                 two_second_mtimes: false,
+                audited: true,
             },
             &volume.kind,
         ),
@@ -623,10 +679,32 @@ mod tests {
 
     #[test]
     fn profiles_survive_their_bits() {
-        for bits in 0..64 {
+        for bits in 0..128 {
             assert_eq!(Profile::from_bits(bits).to_bits(), bits);
         }
         assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
+    }
+
+    /// A macOS volume's rename flags are tried only on volume types where
+    /// tests show them working, whatever the volume advertises: a swap on
+    /// APFS, an exclusive rename on APFS and HFS+.
+    #[test]
+    fn macos_rename_flags_are_trusted_only_on_tested_volume_types() {
+        let advertised = Profile::LOCAL;
+        let apfs = within_kind(advertised, b"apfs");
+        assert!(apfs.exchange && apfs.atomic_no_replace_rename && apfs.audited);
+        let hfs = within_kind(advertised, b"hfs");
+        assert!(!hfs.exchange && hfs.atomic_no_replace_rename && hfs.audited);
+        for kind in ["msdos", "exfat", "nfs", "smbfs", "macfuse", "other"] {
+            let profile = within_kind(advertised, kind.as_bytes());
+            assert!(
+                !profile.exchange && !profile.atomic_no_replace_rename,
+                "{kind}: {profile:?}"
+            );
+        }
+        for kind in ["smbfs", "macfuse", "other"] {
+            assert!(!within_kind(advertised, kind.as_bytes()).audited, "{kind}");
+        }
     }
 
     /// The conservative choices are the safe side of every capability.
@@ -778,15 +856,17 @@ mod volume_tests {
         Attached(point.to_path_buf())
     }
 
-    /// A FAT32 volume mounted where an APFS volume was gets FAT32's own
-    /// profile: no swap, which it would complete as a plain rename over
-    /// the target, and untrusted inode numbers.
+    /// Volumes mounted in turn at one mount point each get their own
+    /// profile: APFS swaps and renames exclusively; HFS+ renames
+    /// exclusively but refuses a swap; FAT32 neither, as it would complete
+    /// a swap as a plain rename over the target, and its inode numbers are
+    /// not trusted.
     #[test]
     fn a_reused_mount_point_gets_its_own_volumes_profile() {
         let tree = crate::test_support::tempdir().unwrap();
         let point = tree.path().join("mounted");
         std::fs::create_dir(&point).unwrap();
-        for (name, filesystem) in [("apfs", "APFS"), ("fat", "MS-DOS FAT32")] {
+        for (name, filesystem) in [("apfs", "APFS"), ("hfs", "HFS+"), ("fat", "MS-DOS FAT32")] {
             let image = tree.path().join(format!("{name}.dmg"));
             hdiutil(&[
                 "create".as_ref(),
@@ -800,16 +880,19 @@ mod volume_tests {
                 image.as_os_str(),
             ]);
         }
-        {
-            let _attached = attach(&tree.path().join("apfs.dmg"), &point);
+        let profile_of = |name: &str| {
+            let _attached = attach(&tree.path().join(format!("{name}.dmg")), &point);
             let volume = File::open(&point).unwrap();
-            let apfs = macos_profile(volume.as_raw_fd());
-            assert!(apfs.exchange && apfs.link_counts_trusted, "{apfs:?}");
-        }
-        let _attached = attach(&tree.path().join("fat.dmg"), &point);
-        let volume = File::open(&point).unwrap();
-        let fat = macos_profile(volume.as_raw_fd());
-        assert!(!fat.exchange && !fat.link_counts_trusted, "{fat:?}");
+            macos_profile(volume.as_raw_fd())
+        };
+        let apfs = profile_of("apfs");
+        assert!(apfs.exchange && apfs.atomic_no_replace_rename, "{apfs:?}");
+        assert!(apfs.link_counts_trusted, "{apfs:?}");
+        let hfs = profile_of("hfs");
+        assert!(!hfs.exchange && hfs.atomic_no_replace_rename, "{hfs:?}");
+        let fat = profile_of("fat");
+        assert!(!fat.exchange && !fat.atomic_no_replace_rename, "{fat:?}");
+        assert!(!fat.link_counts_trusted, "{fat:?}");
         assert!(fat.two_second_mtimes, "{fat:?}");
     }
 }
