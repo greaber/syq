@@ -788,7 +788,14 @@ impl HandedOff {
     /// Wait for the connection to end. An error carries the failure the
     /// serving process reported, or says that it ended without reporting.
     pub(crate) fn wait(mut self) -> Result<()> {
-        self.0.set_read_timeout(None)?;
+        // macOS refuses to change the timeout once the receiver has closed
+        // its end, as when the connection already ended; what it sent is
+        // still there to read.
+        if let Err(error) = self.0.set_read_timeout(None) {
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                return Err(error.into());
+            }
+        }
         let mut status = [0u8];
         if self.0.read_exact(&mut status).is_err() {
             bail!("the receiver ended while serving this connection");
